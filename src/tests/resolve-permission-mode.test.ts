@@ -12,7 +12,6 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("acceptEdits")).toBe("acceptEdits");
     expect(resolvePermissionMode("dontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("plan")).toBe("plan");
-    expect(resolvePermissionMode("delegate")).toBe("delegate");
     expect(resolvePermissionMode("bypassPermissions")).toBe("bypassPermissions");
   });
 

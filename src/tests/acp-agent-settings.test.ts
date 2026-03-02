@@ -98,12 +98,12 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.modes.currentModeId).toBe("dontAsk");
   });
 
-  it("supports delegate mode defaults", async () => {
+  it("supports acceptEdits mode defaults", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
       JSON.stringify({
         permissions: {
-          defaultMode: "delegate",
+          defaultMode: "acceptEdits",
         },
       }),
     );
@@ -122,8 +122,8 @@ describe("ClaudeAcpAgent settings", () => {
       _meta: { disableBuiltInTools: true },
     });
 
-    expect(getCapturedOptions().permissionMode).toBe("delegate");
-    expect(response.modes.currentModeId).toBe("delegate");
+    expect(getCapturedOptions().permissionMode).toBe("acceptEdits");
+    expect(response.modes.currentModeId).toBe("acceptEdits");
   });
 
   it("defaults to 'default' when no permissions.defaultMode is set", async () => {

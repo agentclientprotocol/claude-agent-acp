@@ -235,7 +235,6 @@ const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
   plan: "plan",
-  delegate: "delegate",
   bypasspermissions: "bypassPermissions",
   bypass: "bypassPermissions",
 };
