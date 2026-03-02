@@ -23,7 +23,12 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
 } from "../tools.js";
-import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, type ToolUseCache } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  promptToClaude,
+  ClaudeAcpAgent,
+  type ToolUseCache,
+} from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -1281,7 +1286,12 @@ describe("stop reason propagation", () => {
       cancelled: false,
       permissionMode: "default",
       settingsManager: {} as any,
-      accumulatedUsage: { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
       configOptions: [],
       promptRunning: false,
       pendingMessages: new Map(),
@@ -1306,7 +1316,12 @@ describe("stop reason propagation", () => {
   it("should return max_tokens when success result has stop_reason max_tokens and is_error true", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
-      createResultMessage({ subtype: "success", stop_reason: "max_tokens", is_error: true, result: "Token limit reached" }),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "max_tokens",
+        is_error: true,
+        result: "Token limit reached",
+      }),
     ]);
 
     const response = await agent.prompt({
@@ -1320,7 +1335,12 @@ describe("stop reason propagation", () => {
   it("should return max_tokens when error_during_execution has stop_reason max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
-      createResultMessage({ subtype: "error_during_execution", stop_reason: "max_tokens", is_error: true, errors: ["some error"] }),
+      createResultMessage({
+        subtype: "error_during_execution",
+        stop_reason: "max_tokens",
+        is_error: true,
+        errors: ["some error"],
+      }),
     ]);
 
     const response = await agent.prompt({
@@ -1348,7 +1368,12 @@ describe("stop reason propagation", () => {
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
-      createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: true, result: "Something went wrong" }),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Something went wrong",
+      }),
     ]);
 
     await expect(
