@@ -145,7 +145,6 @@ type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
-  healthy: boolean;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
@@ -422,15 +421,6 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
-    }
-
-    if (!session.healthy) {
-      session.input.end();
-      delete this.sessions[params.sessionId];
-      throw RequestError.internalError(
-        undefined,
-        "The Claude Code process has exited. Please start a new session.",
-      );
     }
 
     session.cancelled = false;
@@ -725,13 +715,12 @@ export class ClaudeAcpAgent implements Agent {
         message.includes("process terminated by signal") ||
         message.includes("Failed to write to process stdin")
       ) {
-        this.logger.error(`Session ${params.sessionId}: Claude Code process died: ${message}`);
-        session.healthy = false;
+        this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
         session.input.end();
         delete this.sessions[params.sessionId];
         throw RequestError.internalError(
           undefined,
-          "The Claude Code process exited unexpectedly. Please start a new session.",
+          "The Claude Agent process exited unexpectedly. Please start a new session.",
         );
       }
       throw error;
@@ -764,11 +753,6 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
-    if (!session.healthy) {
-      session.input.end();
-      delete this.sessions[params.sessionId];
-      return;
-    }
     await session.query.interrupt();
   }
 
@@ -1231,7 +1215,6 @@ export class ClaudeAcpAgent implements Agent {
       query: q,
       input: input,
       cancelled: false,
-      healthy: true,
       permissionMode,
       settingsManager,
       accumulatedUsage: {
