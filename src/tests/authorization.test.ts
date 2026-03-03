@@ -40,12 +40,40 @@ describe("authorization", () => {
     return [agent, mockQuery];
   }
 
+  it("gateway auth not offered without capability", async () => {
+    const [agent] = await createAgentMock();
+
+    const initializeResponse = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    expect(initializeResponse.authMethods).not.toContainEqual(
+      expect.objectContaining({ id: "gateway" }),
+    );
+  });
+
+  it("gateway auth offered when client advertises auth._meta.gateway capability", async () => {
+    const [agent] = await createAgentMock();
+
+    const initializeResponse = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        auth: { _meta: { gateway: true } },
+      } as any,
+    });
+    expect(initializeResponse.authMethods).toContainEqual(
+      expect.objectContaining({ id: "gateway" }),
+    );
+  });
+
   it("uses gateway env after gateway auth", async () => {
     const [agent, mockQuery] = await createAgentMock();
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: {},
+      clientCapabilities: {
+        auth: { _meta: { gateway: true } },
+      } as any,
     });
     expect(initializeResponse.authMethods).toContainEqual(
       expect.objectContaining({ id: "gateway" }),
@@ -90,10 +118,15 @@ describe("authorization", () => {
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: {},
+      clientCapabilities: {
+        auth: { _meta: { gateway: true } },
+      } as any,
     });
     expect(initializeResponse.authMethods).not.toContainEqual(
       expect.objectContaining({ id: "claude-login" }),
+    );
+    expect(initializeResponse.authMethods).toContainEqual(
+      expect.objectContaining({ id: "gateway" }),
     );
   });
 

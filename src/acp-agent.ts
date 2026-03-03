@@ -198,6 +198,18 @@ export type NewSessionMeta = {
 };
 
 /**
+ * Extended ClientCapabilities with `auth` field.
+ * TODO: Remove once `auth` is added to the ACP SDK schema.
+ */
+type ClientCapabilitiesWithAuth = ClientCapabilities & {
+  auth?: {
+    _meta?: {
+      gateway?: boolean;
+    };
+  };
+};
+
+/**
  * Extra metadata for 'gateway' authentication requests.
  */
 type GatewayAuthMeta = {
@@ -289,6 +301,10 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
+    // Only offered when the client advertises `auth._meta.gateway` capability.
+    const clientCaps = request.clientCapabilities as ClientCapabilitiesWithAuth | undefined;
+    const supportsGatewayAuth = clientCaps?.auth?._meta?.gateway === true;
+
     const gatewayAuthMethod: AuthMethod = {
       id: "gateway",
       name: "Custom model gateway",
@@ -346,7 +362,10 @@ export class ClaudeAcpAgent implements Agent {
         title: "Claude Agent",
         version: packageJson.version,
       },
-      authMethods: shouldHideClaudeAuth() ? [gatewayAuthMethod] : [authMethod, gatewayAuthMethod],
+      authMethods: [
+        ...(shouldHideClaudeAuth() ? [] : [authMethod]),
+        ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
+      ],
     };
   }
 
