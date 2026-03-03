@@ -310,7 +310,8 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     // If client supports terminal-auth capability, use that instead.
-    if (request.clientCapabilities?._meta?.["terminal-auth"] === true) {
+    const supportsTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+    if (supportsTerminalAuth) {
       let command: string;
       let args: string[];
 
@@ -361,7 +362,8 @@ export class ClaudeAcpAgent implements Agent {
         version: packageJson.version,
       },
       authMethods: [
-        ...(shouldHideClaudeAuth() ? [] : [authMethod]),
+        // Terminal auth can also be used for API keys, so don't gate it on --hide-claude-auth.
+        ...(shouldHideClaudeAuth() && !supportsTerminalAuth ? [] : [authMethod]),
         ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
       ],
     };

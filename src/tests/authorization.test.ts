@@ -112,7 +112,7 @@ describe("authorization", () => {
     );
   });
 
-  it("hide claude authentication", async () => {
+  it("hide claude authentication without terminal-auth", async () => {
     const [agent] = await createAgentMock();
     vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
 
@@ -127,6 +127,21 @@ describe("authorization", () => {
     );
     expect(initializeResponse.authMethods).toContainEqual(
       expect.objectContaining({ id: "gateway" }),
+    );
+  });
+
+  it("terminal auth still offered when --hide-claude-auth is set", async () => {
+    const [agent] = await createAgentMock();
+    vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
+
+    const initializeResponse = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { "terminal-auth": true },
+      },
+    });
+    expect(initializeResponse.authMethods).toContainEqual(
+      expect.objectContaining({ id: "claude-login" }),
     );
   });
 
