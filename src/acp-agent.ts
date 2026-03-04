@@ -1327,6 +1327,13 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
+    if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
+      throw RequestError.authRequired(
+        undefined,
+        "This integration does not support using claude.ai subscriptions.",
+      );
+    }
+
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
     const availableModes = [
