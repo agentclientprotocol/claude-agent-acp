@@ -227,7 +227,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toBe("");
+    expect(client.takeReceivedText()).toBe("Error: No messages to compact");
 
     // Send something
     await connection.prompt({

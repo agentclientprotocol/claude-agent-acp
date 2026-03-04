@@ -157,10 +157,8 @@ describe("createSession options merging", () => {
       mcpServers: [],
     });
 
-    expect(capturedOptions!.env).toMatchObject({
-      HOME: process.env.HOME,
-      PATH: process.env.PATH,
-    });
+    expect(capturedOptions?.env?.HOME).toBe(process.env.HOME);
+    expect(capturedOptions?.env?.PATH).toBe(process.env.PATH);
   });
 
   it("merges user-provided env vars on top of process.env", async () => {
@@ -178,11 +176,9 @@ describe("createSession options merging", () => {
       },
     });
 
-    expect(capturedOptions!.env).toMatchObject({
-      HOME: process.env.HOME,
-      PATH: process.env.PATH,
-      CUSTOM_VAR: "custom-value",
-    });
+    expect(capturedOptions?.env?.HOME).toBe(process.env.HOME);
+    expect(capturedOptions?.env?.PATH).toBe(process.env.PATH);
+    expect(capturedOptions?.env?.CUSTOM_VAR).toBe("custom-value");
   });
 
   it("allows user-provided env vars to override process.env entries", async () => {
@@ -200,9 +196,7 @@ describe("createSession options merging", () => {
       },
     });
 
-    expect(capturedOptions!.env).toMatchObject({
-      HOME: "/custom/home",
-    });
+    expect(capturedOptions?.env?.HOME).toBe("/custom/home");
   });
 
   it("merges user-provided mcpServers with ACP mcpServers", async () => {

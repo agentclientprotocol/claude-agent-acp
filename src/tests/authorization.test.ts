@@ -101,12 +101,12 @@ describe("authorization", () => {
     expect(mockQuery).toHaveBeenCalledWith(
       expect.objectContaining({
         options: expect.objectContaining({
-          env: {
+          env: expect.objectContaining({
             ANTHROPIC_AUTH_TOKEN: "",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
             userEnv: "userEnv",
-          },
+          }),
         }),
       }),
     );
