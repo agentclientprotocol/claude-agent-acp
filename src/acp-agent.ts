@@ -695,6 +695,10 @@ export class ClaudeAcpAgent implements Agent {
                 // the loop of the next prompt continues running
                 return { stopReason: "end_turn" };
               }
+              if ("isReplay" in message && message.isReplay) {
+                // not pending or unrelated replay message
+                break;
+              }
             }
 
             // Store latest assistant usage (excluding subagents)
