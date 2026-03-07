@@ -514,6 +514,22 @@ export class ClaudeAcpAgent implements Agent {
     session.promptRunning = true;
     let handedOff = false;
 
+    // Background task completions from between prompts generate their own
+    // system/task_notification, system/init, stream_events, assistant/user
+    // messages, and result messages BEFORE the real response starts.
+    //
+    // The message sequence for a background task completion is:
+    //   task_notification → init → [streaming turn] → result
+    //
+    // The real prompt response starts with:
+    //   init → [streaming turn] → result
+    //
+    // We distinguish them: an init preceded by task_notification starts a
+    // background turn; an init NOT preceded by task_notification starts the
+    // real response. We drain all background turns before processing.
+    let lastWasTaskNotification = false;
+    let backgroundTurnInProgress = false;
+
     try {
       while (true) {
         const { value: message, done } = await session.query.next();
@@ -529,6 +545,12 @@ export class ClaudeAcpAgent implements Agent {
           case "system":
             switch (message.subtype) {
               case "init":
+                if (lastWasTaskNotification) {
+                  backgroundTurnInProgress = true;
+                  lastWasTaskNotification = false;
+                } else {
+                  backgroundTurnInProgress = false;
+                }
                 break;
               case "status": {
                 if (message.status === "compacting") {
@@ -565,12 +587,14 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "task_notification":
+                lastWasTaskNotification = true;
+                break;
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
               case "task_started":
-              case "task_notification":
               case "task_progress":
               case "elicitation_complete":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
@@ -583,6 +607,12 @@ export class ClaudeAcpAgent implements Agent {
           case "result": {
             if (session.cancelled) {
               return { stopReason: "cancelled" };
+            }
+
+            if (backgroundTurnInProgress) {
+              // This result ends a background task processing turn.
+              backgroundTurnInProgress = false;
+              break;
             }
 
             // Accumulate usage from this result
@@ -666,6 +696,9 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           case "stream_event": {
+            if (backgroundTurnInProgress) {
+              break;
+            }
             for (const notification of streamEventToAcpNotifications(
               message,
               params.sessionId,
@@ -681,6 +714,9 @@ export class ClaudeAcpAgent implements Agent {
           case "user":
           case "assistant": {
             if (session.cancelled) {
+              break;
+            }
+            if (backgroundTurnInProgress) {
               break;
             }
 
