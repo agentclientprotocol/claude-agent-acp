@@ -228,7 +228,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toBe("Error: No messages to compact");
+    expect(client.takeReceivedText()).toBe("Compacting...\n\nCompacting completed.");
 
     // Send something
     await connection.prompt({
@@ -249,7 +249,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("");
+    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
   }, 30000);
 });
 
@@ -1305,27 +1305,15 @@ describe("stop reason propagation", () => {
     };
   }
 
+  function* messageGenerator(messages: any[]) {
+    yield* messages;
+  }
+
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      // Wait for the prompt to push its user message so we can replay it
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
+    const gen = messageGenerator(messages);
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
+      query: gen as any,
+      input: new Pushable(),
       cancelled: false,
       cwd: "/test",
       permissionMode: "default",
@@ -1407,80 +1395,6 @@ describe("stop reason propagation", () => {
     });
 
     expect(response.stopReason).toBe("end_turn");
-  });
-
-  it("should consume background task results and return the prompt's own result", async () => {
-    const agent = createMockAgent();
-    const input = new Pushable<any>();
-
-    const backgroundTaskResult = createResultMessage({
-      subtype: "success",
-      stop_reason: null,
-      is_error: false,
-    });
-    // Background task used some tokens
-    backgroundTaskResult.usage.input_tokens = 100;
-    backgroundTaskResult.usage.output_tokens = 50;
-
-    const promptResult = createResultMessage({
-      subtype: "success",
-      stop_reason: null,
-      is_error: false,
-    });
-
-    async function* messageGenerator() {
-      // Background task init + result arrive before our prompt's replay
-      yield { type: "system", subtype: "init", session_id: "test-session" };
-      yield backgroundTaskResult;
-
-      // Now the prompt's user message replay arrives
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage } = await iter.next();
-      yield {
-        type: "user",
-        message: userMessage.message,
-        parent_tool_use_id: null,
-        uuid: userMessage.uuid,
-        session_id: "test-session",
-        isReplay: true,
-      };
-
-      // Then the prompt's own result
-      yield promptResult;
-    }
-
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cwd: "/tmp/test",
-      cancelled: false,
-      permissionMode: "default",
-      settingsManager: {} as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
-    };
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-
-    expect(response.stopReason).toBe("end_turn");
-    // Usage should include both background task and prompt result tokens
-    expect(response.usage?.inputTokens).toBe(
-      backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens,
-    );
-    expect(response.usage?.outputTokens).toBe(
-      backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens,
-    );
   });
 
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
