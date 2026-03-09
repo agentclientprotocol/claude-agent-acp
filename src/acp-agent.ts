@@ -110,6 +110,7 @@ type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
+  cwd: string;
   permissionMode: PermissionMode;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
@@ -497,17 +498,23 @@ export class ClaudeAcpAgent implements Agent {
 
     const userMessage = promptToClaude(params);
 
+    const promptUuid = randomUUID();
+    userMessage.uuid = promptUuid;
+
+    let promptReplayed = false;
+
     if (session.promptRunning) {
-      const uuid = randomUUID();
-      userMessage.uuid = uuid;
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
       const cancelled = await new Promise<boolean>((resolve) => {
-        session.pendingMessages.set(uuid, { resolve, order });
+        session.pendingMessages.set(promptUuid, { resolve, order });
       });
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
+      // The replay resolved the promise, mark in this loop too,
+      // so we don't treat the next result as a background task's result.
+      promptReplayed = true;
     } else {
       session.input.push(userMessage);
     }
@@ -582,10 +589,6 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           case "result": {
-            if (session.cancelled) {
-              return { stopReason: "cancelled" };
-            }
-
             // Accumulate usage from this result
             session.accumulatedUsage.inputTokens += message.usage.input_tokens;
             session.accumulatedUsage.outputTokens += message.usage.output_tokens;
@@ -611,6 +614,18 @@ export class ClaudeAcpAgent implements Agent {
                   },
                 },
               });
+            }
+
+            if (!promptReplayed) {
+              // This result is from a background task that finished after
+              // the previous prompt loop ended. Consume it and continue
+              // waiting for our own prompt's result.
+              this.logger.log(`Session ${params.sessionId}: consuming background task result`);
+              break;
+            }
+
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
             }
 
             // Build the usage response
@@ -673,7 +688,10 @@ export class ClaudeAcpAgent implements Agent {
               this.toolUseCache,
               this.client,
               this.logger,
-              { clientCapabilities: this.clientCapabilities },
+              {
+                clientCapabilities: this.clientCapabilities,
+                cwd: session.cwd,
+              },
             )) {
               await this.client.sessionUpdate(notification);
             }
@@ -685,8 +703,14 @@ export class ClaudeAcpAgent implements Agent {
               break;
             }
 
-            // Check for queued prompt replay
+            // Check for prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
+              if (message.uuid === promptUuid) {
+                // Our own prompt was replayed back — we're now processing
+                // our prompt's response (not a background task's).
+                promptReplayed = true;
+                break;
+              }
               const pending = session.pendingMessages.get(message.uuid as string);
               if (pending) {
                 pending.resolve(false);
@@ -785,6 +809,7 @@ export class ClaudeAcpAgent implements Agent {
               {
                 clientCapabilities: this.clientCapabilities,
                 parentToolUseId: message.parent_tool_use_id,
+                cwd: session.cwd,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -959,7 +984,11 @@ export class ClaudeAcpAgent implements Agent {
         toolUseCache,
         this.client,
         this.logger,
-        { registerHooks: false, clientCapabilities: this.clientCapabilities },
+        {
+          registerHooks: false,
+          clientCapabilities: this.clientCapabilities,
+          cwd: this.sessions[sessionId]?.cwd,
+        },
       )) {
         await this.client.sessionUpdate(notification);
       }
@@ -1006,6 +1035,7 @@ export class ClaudeAcpAgent implements Agent {
             ...toolInfoFromToolUse(
               { name: toolName, input: toolInput, id: toolUseID },
               supportsTerminalOutput,
+              session?.cwd,
             ),
           },
         });
@@ -1070,6 +1100,7 @@ export class ClaudeAcpAgent implements Agent {
           ...toolInfoFromToolUse(
             { name: toolName, input: toolInput, id: toolUseID },
             supportsTerminalOutput,
+            session?.cwd,
           ),
         },
       });
@@ -1370,6 +1401,7 @@ export class ClaudeAcpAgent implements Agent {
       query: q,
       input: input,
       cancelled: false,
+      cwd: params.cwd,
       permissionMode,
       settingsManager,
       accumulatedUsage: {
@@ -1685,6 +1717,7 @@ export function toAcpNotifications(
     registerHooks?: boolean;
     clientCapabilities?: ClientCapabilities;
     parentToolUseId?: string | null;
+    cwd?: string;
   },
 ): SessionNotification[] {
   const registerHooks = options?.registerHooks !== false;
@@ -1813,7 +1846,7 @@ export function toAcpNotifications(
               toolCallId: chunk.id,
               sessionUpdate: "tool_call_update",
               rawInput,
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
             };
           } else {
             // First encounter (streaming content_block_start or replay) —
@@ -1831,7 +1864,7 @@ export function toAcpNotifications(
               sessionUpdate: "tool_call",
               rawInput,
               status: "pending",
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput),
+              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
             };
           }
         }
@@ -1937,7 +1970,10 @@ export function streamEventToAcpNotifications(
   toolUseCache: ToolUseCache,
   client: AgentSideConnection,
   logger: Logger,
-  options?: { clientCapabilities?: ClientCapabilities },
+  options?: {
+    clientCapabilities?: ClientCapabilities;
+    cwd?: string;
+  },
 ): SessionNotification[] {
   const event = message.event;
   switch (event.type) {
@@ -1952,6 +1988,7 @@ export function streamEventToAcpNotifications(
         {
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
+          cwd: options?.cwd,
         },
       );
     case "content_block_delta":
@@ -1965,6 +2002,7 @@ export function streamEventToAcpNotifications(
         {
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
+          cwd: options?.cwd,
         },
       );
     // No content
