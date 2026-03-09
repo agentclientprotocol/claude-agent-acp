@@ -60,7 +60,6 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
 import {
