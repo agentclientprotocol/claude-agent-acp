@@ -1328,6 +1328,7 @@ describe("stop reason propagation", () => {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      messageIdMap: new Map(),
     };
   }
 
