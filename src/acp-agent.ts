@@ -153,7 +153,7 @@ export type NewSessionMeta = {
      */
     options?: Options;
   };
-  additionalRoots?: unknown[];
+  additionalRoots?: string[];
 };
 
 /**
@@ -1242,10 +1242,7 @@ export class ClaudeAcpAgent implements Agent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
-    const additionalRoots = !Array.isArray(sessionMeta?.additionalRoots)
-      ? []
-      : sessionMeta.additionalRoots
-          .filter((value): value is string => typeof value === "string");
+    const additionalRoots = sessionMeta?.additionalRoots ?? [];
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS

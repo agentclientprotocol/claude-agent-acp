@@ -62,7 +62,7 @@ describe("additionalRoots", () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "claude-root-"));
     tempDirs.push(root);
     await newSession({
-      additionalRoots: ["", root, 7],
+      additionalRoots: ["", root],
       claudeCode: { options: { additionalDirectories: ["/workspace/shared"] } },
     });
     expect(capturedOptions!.additionalDirectories).toEqual(["/workspace/shared", "", root]);
