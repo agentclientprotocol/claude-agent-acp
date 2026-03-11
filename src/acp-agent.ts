@@ -37,7 +37,7 @@ import {
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
-  WriteTextFileResponse,
+  WriteTextFileResponse
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
@@ -52,7 +52,7 @@ import {
   SDKPartialAssistantMessage,
   SDKResultMessage,
   SDKUserMessage,
-  SlashCommand,
+  SlashCommand
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -69,7 +69,7 @@ import {
   registerHookCallback,
   toolInfoFromToolUse,
   toolUpdateFromEditToolResponse,
-  toolUpdateFromToolResult,
+  toolUpdateFromToolResult
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
@@ -1205,7 +1205,6 @@ export class ClaudeAcpAgent implements Agent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
-    const additionalRoots = sessionMeta?.additionalRoots ?? [];
 
     // Configure thinking tokens from environment variable
     const maxThinkingTokens = process.env.MAX_THINKING_TOKENS
@@ -1285,13 +1284,10 @@ export class ClaudeAcpAgent implements Agent {
       ...creationOpts,
     };
 
-    const additionalDirectories = [
+    options.additionalDirectories = [
       ...(userProvidedOptions?.additionalDirectories ?? []),
-      ...additionalRoots,
+      ...(sessionMeta?.additionalRoots ?? []),
     ];
-    if (additionalDirectories.length > 0) {
-      options.additionalDirectories = Array.from(new Set(additionalDirectories));
-    }
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
