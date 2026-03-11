@@ -37,7 +37,7 @@ import {
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
-  WriteTextFileResponse
+  WriteTextFileResponse,
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
@@ -52,7 +52,7 @@ import {
   SDKPartialAssistantMessage,
   SDKResultMessage,
   SDKUserMessage,
-  SlashCommand
+  SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -69,7 +69,7 @@ import {
   registerHookCallback,
   toolInfoFromToolUse,
   toolUpdateFromEditToolResponse,
-  toolUpdateFromToolResult
+  toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
