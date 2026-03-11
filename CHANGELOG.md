@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.0
+
+- Update to claude-agent-sdk 0.2.71
+- show project-relative paths in tool call titles
+- Lib: pass through tools array to control built-in tool availability
+- fix: skip user replay
+- fix: handle renamed Agent tool in toolInfoFromToolUse
+
 ## 0.20.2
 
 - Update to @anthropic-ai/claude-agent-sdk@0.2.68

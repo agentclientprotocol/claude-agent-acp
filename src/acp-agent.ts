@@ -60,7 +60,6 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
 import {
@@ -157,18 +156,6 @@ export type NewSessionMeta = {
 };
 
 /**
- * Extended ClientCapabilities with `auth` field.
- * TODO: Remove once `auth` is added to the ACP SDK schema.
- */
-type ClientCapabilitiesWithAuth = ClientCapabilities & {
-  auth?: {
-    _meta?: {
-      gateway?: boolean;
-    };
-  };
-};
-
-/**
  * Extra metadata for 'gateway' authentication requests.
  */
 type GatewayAuthMeta = {
@@ -220,6 +207,12 @@ export type ToolUseCache = {
 
 function isStaticBinary(): boolean {
   return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
+}
+
+export async function claudeCliPath(): Promise<string> {
+  return isStaticBinary()
+    ? (await import("@anthropic-ai/claude-agent-sdk/embed")).default
+    : import.meta.resolve("@anthropic-ai/claude-agent-sdk").replace("sdk.mjs", "cli.js");
 }
 
 function shouldHideClaudeAuth(): boolean {
@@ -289,17 +282,9 @@ export class ClaudeAcpAgent implements Agent {
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
 
-    // Default authMethod
-    const authMethod: any = {
-      description: "Run `claude /login` in the terminal",
-      name: "Log in with Claude",
-      id: "claude-login",
-    };
-
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
-    const clientCaps = request.clientCapabilities as ClientCapabilitiesWithAuth | undefined;
-    const supportsGatewayAuth = clientCaps?.auth?._meta?.gateway === true;
+    const supportsGatewayAuth = request.clientCapabilities?.auth?._meta?.gateway === true;
 
     const gatewayAuthMethod: AuthMethod = {
       id: "gateway",
@@ -312,25 +297,22 @@ export class ClaudeAcpAgent implements Agent {
       },
     };
 
+    const terminalAuthMethod: any = {
+      description: "Run `claude /login` in the terminal",
+      name: "Log in with Claude",
+      id: "claude-login",
+      type: "terminal",
+      args: ["--cli"],
+    };
+    const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
+
     // If client supports terminal-auth capability, use that instead.
-    const supportsTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
-    if (supportsTerminalAuth) {
-      let command: string;
-      let args: string[];
-
-      if (isStaticBinary()) {
-        command = process.execPath;
-        args = ["--cli"];
-      } else {
-        const cliPath = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk/cli.js"));
-        command = "node";
-        args = [cliPath];
-      }
-
-      authMethod._meta = {
+    const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+    if (supportsMetaTerminalAuth) {
+      terminalAuthMethod._meta = {
         "terminal-auth": {
-          command,
-          args,
+          command: process.execPath,
+          args: [...process.argv.slice(1), "--cli"],
           label: "Claude Login",
         },
       };
@@ -365,8 +347,9 @@ export class ClaudeAcpAgent implements Agent {
         version: packageJson.version,
       },
       authMethods: [
-        // Terminal auth can also be used for API keys, so don't gate it on --hide-claude-auth.
-        ...(shouldHideClaudeAuth() && !supportsTerminalAuth ? [] : [authMethod]),
+        ...(!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)
+          ? [terminalAuthMethod]
+          : []),
         ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
       ],
     };
@@ -499,23 +482,17 @@ export class ClaudeAcpAgent implements Agent {
 
     const userMessage = promptToClaude(params);
 
-    const promptUuid = randomUUID();
-    userMessage.uuid = promptUuid;
-
-    let promptReplayed = false;
-
     if (session.promptRunning) {
+      const uuid = randomUUID();
+      userMessage.uuid = uuid;
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
       const cancelled = await new Promise<boolean>((resolve) => {
-        session.pendingMessages.set(promptUuid, { resolve, order });
+        session.pendingMessages.set(uuid, { resolve, order });
       });
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
-      // The replay resolved the promise, mark in this loop too,
-      // so we don't treat the next result as a background task's result.
-      promptReplayed = true;
     } else {
       session.input.push(userMessage);
     }
@@ -590,6 +567,10 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           case "result": {
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
+            }
+
             // Accumulate usage from this result
             session.accumulatedUsage.inputTokens += message.usage.input_tokens;
             session.accumulatedUsage.outputTokens += message.usage.output_tokens;
@@ -615,18 +596,6 @@ export class ClaudeAcpAgent implements Agent {
                   },
                 },
               });
-            }
-
-            if (!promptReplayed) {
-              // This result is from a background task that finished after
-              // the previous prompt loop ended. Consume it and continue
-              // waiting for our own prompt's result.
-              this.logger.log(`Session ${params.sessionId}: consuming background task result`);
-              break;
-            }
-
-            if (session.cancelled) {
-              return { stopReason: "cancelled" };
             }
 
             // Build the usage response
@@ -704,14 +673,8 @@ export class ClaudeAcpAgent implements Agent {
               break;
             }
 
-            // Check for prompt replay
+            // Check for queued prompt replay
             if (message.type === "user" && "uuid" in message && message.uuid) {
-              if (message.uuid === promptUuid) {
-                // Our own prompt was replayed back — we're now processing
-                // our prompt's response (not a background task's).
-                promptReplayed = true;
-                break;
-              }
               const pending = session.pendingMessages.get(message.uuid as string);
               if (pending) {
                 pending.resolve(false);
@@ -1284,8 +1247,7 @@ export class ClaudeAcpAgent implements Agent {
       canUseTool: this.canUseTool(sessionId),
       // note: although not documented by the types, passing an absolute path
       // here works to find zed's managed node version.
-      executable: process.execPath as any,
-      executableArgs: isStaticBinary() ? ["--cli"] : undefined,
+      executable: isStaticBinary() ? undefined : (process.execPath as any),
       ...(process.env.CLAUDE_CODE_EXECUTABLE
         ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
         : isStaticBinary()

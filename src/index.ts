@@ -2,12 +2,11 @@
 
 // Load managed settings and apply environment variables
 import { loadManagedSettings, applyEnvironmentSettings } from "./utils.js";
-import { runAcp } from "./acp-agent.js";
+import { claudeCliPath, runAcp } from "./acp-agent.js";
 
 if (process.argv.includes("--cli")) {
   process.argv = process.argv.filter((arg) => arg !== "--cli");
-  // @ts-expect-error -- no types
-  await import("@anthropic-ai/claude-agent-sdk/cli.js");
+  await import(await claudeCliPath());
 } else {
   const managedSettings = loadManagedSettings();
   if (managedSettings) {

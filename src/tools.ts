@@ -75,7 +75,7 @@ import {
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
-} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+} from "@anthropic-ai/claude-code/sdk-tools.js";
 
 interface ToolInfo {
   title: string;

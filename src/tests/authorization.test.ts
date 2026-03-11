@@ -72,7 +72,7 @@ describe("authorization", () => {
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {
-        auth: { _meta: { gateway: true } },
+        auth: { terminal: true, _meta: { gateway: true } },
       } as any,
     });
     expect(initializeResponse.authMethods).toContainEqual(
@@ -130,7 +130,7 @@ describe("authorization", () => {
     );
   });
 
-  it("terminal auth still offered when --hide-claude-auth is set", async () => {
+  it("hide terminal auth even when terminal-auth is set", async () => {
     const [agent] = await createAgentMock();
     vi.stubGlobal("process", { ...process, argv: ["--hide-claude-auth"] });
 
@@ -140,9 +140,7 @@ describe("authorization", () => {
         _meta: { "terminal-auth": true },
       },
     });
-    expect(initializeResponse.authMethods).toContainEqual(
-      expect.objectContaining({ id: "claude-login" }),
-    );
+    expect(initializeResponse.authMethods).toStrictEqual([]);
   });
 
   it("show claude authentication", async () => {
@@ -150,7 +148,7 @@ describe("authorization", () => {
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: {},
+      clientCapabilities: { auth: { terminal: true } },
     });
 
     expect(initializeResponse.authMethods).toContainEqual(
