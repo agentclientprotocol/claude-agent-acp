@@ -76,6 +76,20 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionCreateResultBlock
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
   | BetaTextEditorCodeExecutionToolResultError;
+import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import { Logger } from "./acp-agent.js";
+import {
+  AgentInput,
+  BashInput,
+  FileEditInput,
+  FileReadInput,
+  FileWriteInput,
+  GlobInput,
+  GrepInput,
+  TodoWriteInput,
+  WebFetchInput,
+  WebSearchInput,
+} from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 
 interface ToolInfo {
   title: string;

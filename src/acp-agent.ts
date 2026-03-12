@@ -288,7 +288,9 @@ export class ClaudeAcpAgent implements Agent {
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
-    const supportsGatewayAuth = request.clientCapabilities?.auth?._meta?.gateway === true;
+    // auth is an ACP extension not yet in the ClientCapabilities type
+    const caps = request.clientCapabilities as any;
+    const supportsGatewayAuth = caps?.auth?._meta?.gateway === true;
 
     const gatewayAuthMethod: AuthMethod = {
       id: "gateway",
@@ -308,7 +310,7 @@ export class ClaudeAcpAgent implements Agent {
       type: "terminal",
       args: ["--cli"],
     };
-    const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
+    const supportsTerminalAuth = caps?.auth?.terminal === true;
 
     // If client supports terminal-auth capability, use that instead.
     const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
