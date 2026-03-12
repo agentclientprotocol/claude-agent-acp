@@ -465,8 +465,9 @@ describe("Background task notification leak", () => {
           prompt: [{ type: "text", text: "run it" }],
         });
 
-        // Advance fake timers to fire both setTimeout(0) callbacks:
-        // the test's message push and the production code's yield.
+        // Flush microtasks first so the production code's setTimeout(0)
+        // is registered, then advance fake timers to fire both callbacks.
+        await Promise.resolve();
         await vi.advanceTimersByTimeAsync(0);
 
         const result = await promptPromise;

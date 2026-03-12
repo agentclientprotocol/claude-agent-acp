@@ -1251,6 +1251,9 @@ describe("Bash terminal output", () => {
     //
     // The fire-and-forget callbacks use .then() chains (microtasks).
     // Flush them deterministically instead of using real setTimeout delays.
+    // Depth 5 covers: async callback execution (1-2) + .then cleanup (1)
+    // + .catch chain (1) + headroom (1). If future changes add awaits
+    // to registerHookCallback's fire-and-forget path, increase this.
     async function flushMicrotasks() {
       for (let i = 0; i < 5; i++) await Promise.resolve();
     }
