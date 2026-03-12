@@ -845,7 +845,7 @@ describe("Background task notification leak", () => {
     it("normal turns without bg tasks should be unaffected", async () => {
       const messages = makeNormalTurnMessages("Hello");
       const mockQuery = createMockQuery(messages);
-      const { client, updates } = createMockClient();
+      const { client } = createMockClient();
       const agent = createAgentWithSession(mockQuery, client);
 
       const result = await agent.prompt({

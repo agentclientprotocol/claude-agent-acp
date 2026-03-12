@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Runs the same checks as CI (.github/workflows/ci.yml).
+# Usage: bin/test
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "=== Check formatting ==="
+# Only check git-tracked files to match CI (clean checkout).
+# Untracked x.* scratch files would otherwise cause false failures.
+git ls-files -z '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.md' '*.yml' '*.yaml' '*.css' '*.html' \
+  | xargs -0 npx prettier --check
+
+echo ""
+echo "=== Run linter ==="
+npm run lint
+
+echo ""
+echo "=== Build ==="
+npm run build
+
+echo ""
+echo "=== Run tests ==="
+npm run test:run
+
+echo ""
+echo "=== All CI checks passed ==="
