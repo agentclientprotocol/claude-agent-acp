@@ -1,28 +1,45 @@
 #!/usr/bin/env bash
-# Runs the same checks as CI (.github/workflows/ci.yml).
+# Runs the same checks as CI by parsing .github/workflows/ci.yml directly.
+# If CI steps change, this script automatically picks them up.
 #
-# CI runs on a clean checkout, so `npm run format:check` only sees
-# tracked files. Locally we may have untracked x.* scratch files that
-# fail prettier. To match CI behavior, we check only git-tracked files.
+# Local adaptation: `npm run format:check` is replaced with a
+# git-tracked-files-only variant because CI runs on a clean checkout
+# but locally we have untracked x.* scratch files that fail prettier.
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-echo "=== Check formatting (git-tracked files only) ==="
-git ls-files -z '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.md' '*.yml' '*.yaml' '*.css' '*.html' \
-  | xargs -0 npx prettier --check
+ci_yaml=".github/workflows/ci.yml"
 
-echo ""
-echo "=== Run linter ==="
-npm run lint
+if ! command -v yq &>/dev/null; then
+  echo "error: yq is required (brew install yq)" >&2
+  exit 1
+fi
 
-echo ""
-echo "=== Build ==="
-npm run build
+# Extract run steps (skip npm ci — deps are already installed locally)
+mapfile -t names < <(yq '.jobs.build.steps[] | select(.run) | .name' "$ci_yaml")
+mapfile -t commands < <(yq '.jobs.build.steps[] | select(.run) | .run' "$ci_yaml")
 
-echo ""
-echo "=== Run tests ==="
-npm run test:run
+for i in "${!commands[@]}"; do
+  cmd="${commands[$i]}"
+  name="${names[$i]}"
 
-echo ""
+  # Skip dependency install — already done locally
+  if [[ "$cmd" == "npm ci" ]]; then
+    continue
+  fi
+
+  echo "=== ${name} ==="
+
+  # Local override: format:check on git-tracked files only
+  if [[ "$cmd" == "npm run format:check" ]]; then
+    git ls-files -z '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.md' '*.yml' '*.yaml' '*.css' '*.html' \
+      | xargs -0 npx prettier --check
+  else
+    eval "$cmd"
+  fi
+
+  echo ""
+done
+
 echo "=== All CI checks passed ==="
