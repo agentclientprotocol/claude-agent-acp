@@ -474,6 +474,87 @@ describe("Background task notification leak", () => {
       expect(allText).toContain("background task from the subagent completed");
     });
 
+    it("logs warning and returns when task_notification never arrives (the race)", async () => {
+      // When the bg task hasn't finished by the time we peek the queue
+      // after the yield, prompt() should return with a warning — not
+      // hang. This is the acknowledged race condition documented in the
+      // code and codex reviews.
+      const normalTurn = makeNormalTurnMessages("Done.");
+      const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+      normalTurn.splice(resultIdx, 0, {
+        type: "system",
+        subtype: "task_started",
+        task_id: "never-completes",
+        tool_use_id: "toolu_never_1",
+        description: "Very long running task",
+        task_type: "local_bash",
+        session_id: SESSION_ID,
+      });
+      // No internal turn messages appended — task_notification never arrives.
+
+      const mockQuery = createMockQuery(normalTurn);
+      const logs: string[] = [];
+      const spyLogger = {
+        log: (...args: any[]) => logs.push(args.join(" ")),
+        error: () => {},
+      };
+      const { client } = createMockClient();
+      const agent = createAgentWithSession(mockQuery, client);
+      (agent as any).logger = spyLogger;
+
+      const result = await agent.prompt({
+        sessionId: SESSION_ID,
+        prompt: [{ type: "text", text: "run it" }],
+      });
+
+      // Should still return (not hang)
+      expect(result.stopReason).toBe("end_turn");
+      // Should have logged the warning about unresolved tasks
+      expect(logs.some((l) => l.includes("[bg-task-leak]") && l.includes("never-completes"))).toBe(
+        true,
+      );
+    });
+
+    it("clears pendingTaskIds when task_notification reports failed status", async () => {
+      // A task_notification with status "failed" should still clear the
+      // pending task, preventing false-positive internal turn detection.
+      const normalTurn = makeNormalTurnMessages("Task failed.");
+      const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+      // Insert task_started, then a failed task_notification BEFORE the result
+      normalTurn.splice(resultIdx, 0, {
+        type: "system",
+        subtype: "task_started",
+        task_id: "fail-task-1",
+        tool_use_id: "toolu_fail_1",
+        description: "Will fail",
+        task_type: "local_bash",
+        session_id: SESSION_ID,
+      });
+      // Re-find resultIdx since we just spliced
+      const newResultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+      normalTurn.splice(newResultIdx, 0, {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "fail-task-1",
+        tool_use_id: "toolu_fail_1",
+        status: "failed",
+        summary: "Command failed with exit code 1",
+        session_id: SESSION_ID,
+      });
+
+      const mockQuery = createMockQuery(normalTurn);
+      const { client } = createMockClient();
+      const agent = createAgentWithSession(mockQuery, client);
+
+      // Should return cleanly — task was resolved by the failed notification
+      const result = await agent.prompt({
+        sessionId: SESSION_ID,
+        prompt: [{ type: "text", text: "go" }],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+    });
+
     it("normal turns without bg tasks should be unaffected", async () => {
       const messages = makeNormalTurnMessages("Hello");
       const mockQuery = createMockQuery(messages);
