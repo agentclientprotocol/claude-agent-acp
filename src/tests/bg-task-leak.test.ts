@@ -122,7 +122,7 @@ function createAgentWithSession(
 const SESSION_ID = "test-session";
 
 /** Minimal result message (from SDK trace line 148). */
-function makeResultMessage(text: string, inputTokens = 10, outputTokens = 5) {
+function makeResultMessage(text: string, inputTokens = 10, outputTokens = 5): any {
   return {
     type: "result",
     subtype: "success",
@@ -156,7 +156,7 @@ function makeResultMessage(text: string, inputTokens = 10, outputTokens = 5) {
 }
 
 /** Normal turn: init → streaming → assistant → result. No bg tasks. */
-function makeNormalTurnMessages(text = "Hello") {
+function makeNormalTurnMessages(text = "Hello"): any[] {
   return [
     { type: "system", subtype: "init", session_id: SESSION_ID },
     {
@@ -217,7 +217,7 @@ function makeNormalTurnMessages(text = "Hello") {
  * Internal turn messages that follow the first result when a bg task completes.
  * Extracted from SDK trace lines 149-172.
  */
-function makeBgTaskInternalTurnMessages() {
+function makeBgTaskInternalTurnMessages(): any[] {
   const bgText =
     "\n\nThe background task from the subagent completed. Still waiting on your answer.";
   return [
