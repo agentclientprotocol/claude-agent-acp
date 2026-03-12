@@ -564,7 +564,8 @@ export class ClaudeAcpAgent implements Agent {
                 // internal turn (task_notification → assistant → result)
                 // may follow the user's result message. Only track
                 // local_bash tasks — the SDK already defers results for
-                // local_agent tasks (via its internal iP() check).
+                // local_agent tasks (via its internal iP() check —
+                // minified name, likely hasRunningDeferrableTasks).
                 if (message.task_id && (message as any).task_type === "local_bash") {
                   pendingTaskIds.add(message.task_id);
                 }

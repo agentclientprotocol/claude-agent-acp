@@ -43,7 +43,8 @@ import { Pushable } from "../utils.js";
  * After all messages are consumed, next() blocks forever (simulates idle SDK).
  */
 function createMockQuery(messages: any[]): Query {
-  // Simulate the SDK's internal queue structure (q4.queue in cli.js).
+  // Simulate the SDK's internal queue structure (q4 in cli.js —
+  // minified name, likely InputStreamQueue or MessageBuffer).
   // The real SDK's Query wraps an inputStream with a queue array.
   // Messages are pre-loaded into the queue so that
   // `query.inputStream.queue.length` returns the number of unconsumed
