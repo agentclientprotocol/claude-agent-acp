@@ -392,6 +392,88 @@ describe("Background task notification leak", () => {
       expect(secondPromptText).toContain("Created summary file");
     });
 
+    it("local_agent task_started should NOT trigger internal turn detection", async () => {
+      // The SDK already defers results for local_agent tasks, so agent
+      // subagent task_started events should be ignored by our workaround.
+      // This was a real bug found in E2E: agent task IDs were inflating
+      // pendingTaskIds and were never resolved (no task_notification).
+      const normalTurn = makeNormalTurnMessages("Done.");
+      const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+      normalTurn.splice(resultIdx, 0, {
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-task-123",
+        tool_use_id: "toolu_agent_1",
+        description: "Subagent exploring codebase",
+        task_type: "local_agent",
+        session_id: SESSION_ID,
+      });
+
+      const mockQuery = createMockQuery(normalTurn);
+      const { client } = createMockClient();
+      const agent = createAgentWithSession(mockQuery, client);
+
+      // Should return promptly at the result — local_agent task_started
+      // must NOT cause the code to peek for task_notification.
+      const result = await agent.prompt({
+        sessionId: SESSION_ID,
+        prompt: [{ type: "text", text: "explore" }],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+    });
+
+    it("consumes internal turn when task_notification arrives during event loop yield", async () => {
+      // Simulates the real-world race: task_notification isn't in the
+      // queue at peek time but arrives during the setTimeout(0) yield.
+      // This was the primary failure mode in E2E testing.
+      const normalTurn = makeNormalTurnMessages("Shall I proceed?");
+      const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+      normalTurn.splice(resultIdx, 0, {
+        type: "system",
+        subtype: "task_started",
+        task_id: "delayed-task",
+        tool_use_id: "toolu_delayed_1",
+        description: "Sleep then print",
+        task_type: "local_bash",
+        session_id: SESSION_ID,
+      });
+
+      // Only pre-load messages up to and including the first result.
+      // The internal turn messages will be pushed into the queue
+      // asynchronously during the setTimeout(0) yield.
+      const internalTurnMessages = makeBgTaskInternalTurnMessages();
+      // Override the task_id to match our delayed-task
+      (internalTurnMessages[0] as any).task_id = "delayed-task";
+
+      const mockQuery = createMockQuery(normalTurn);
+      const { client, updates } = createMockClient();
+      const agent = createAgentWithSession(mockQuery, client);
+
+      // Schedule internal turn messages to arrive after a microtask —
+      // simulating the SDK's async enqueue of task_notification.
+      const queue = (mockQuery as any).inputStream.queue as any[];
+      setTimeout(() => {
+        for (const msg of internalTurnMessages) {
+          queue.push(msg);
+        }
+      }, 0);
+
+      const result = await agent.prompt({
+        sessionId: SESSION_ID,
+        prompt: [{ type: "text", text: "run it" }],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+
+      // The internal turn's assistant text should have been forwarded
+      const allText = updates
+        .filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk")
+        .map((u: any) => u.update?.content?.text ?? "")
+        .join("");
+      expect(allText).toContain("background task from the subagent completed");
+    });
+
     it("normal turns without bg tasks should be unaffected", async () => {
       const messages = makeNormalTurnMessages("Hello");
       const mockQuery = createMockQuery(messages);
