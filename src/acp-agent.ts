@@ -1369,6 +1369,104 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
+    // MCP OAuth: detect servers that need authentication and trigger the
+    // SDK's built-in OAuth flow.  The Claude Code CLI subprocess handles
+    // the full PKCE flow (RFC 9728 discovery, dynamic client registration,
+    // localhost callback server, token exchange, keychain storage).
+    //
+    // The `mcp_authenticate` control message is an undocumented internal
+    // API of the Claude Code CLI.  It triggers OAuth discovery for the
+    // named server and returns an `authUrl` for user consent.  The CLI
+    // starts a localhost callback server to receive the authorization code.
+    if (!creationOpts?.resume && Object.keys(mcpServers).length > 0) {
+      // Give MCP connections time to attempt (they start during init)
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      try {
+        const mcpStatuses = await q.mcpServerStatus();
+        for (const server of mcpStatuses) {
+          if (server.status === "needs-auth") {
+            this.logger.log(
+              `[MCP OAuth] Server "${server.name}" needs auth, triggering OAuth flow...`,
+            );
+            try {
+              // @ts-expect-error — mcp_authenticate is not in the public SDK types
+              const authResponse = await q.request({
+                subtype: "mcp_authenticate",
+                serverName: server.name,
+              });
+              const result = authResponse?.response ?? authResponse;
+
+              if (result?.authUrl && result?.requiresUserAction) {
+                const { execSync: execSyncCmd } = await import("child_process");
+
+                // Open the auth URL in the user's browser.  Mirrors the
+                // approach used by the CLI's internal openUrl function
+                // (minified as $Y): respects $BROWSER, uses platform-
+                // specific commands, and detects headless environments.
+                let opened = false;
+                try {
+                  const browserEnv = process.env.BROWSER;
+                  if (process.platform === "win32") {
+                    if (browserEnv) {
+                      execSyncCmd(`${browserEnv} "${result.authUrl}"`, { stdio: "ignore" });
+                    } else {
+                      execSyncCmd(`rundll32 url,OpenURL ${result.authUrl}`, { stdio: "ignore" });
+                    }
+                    opened = true;
+                  } else {
+                    const cmd = browserEnv || (process.platform === "darwin" ? "open" : "xdg-open");
+                    execSyncCmd(`${cmd} "${result.authUrl}"`, { stdio: "ignore" });
+                    opened = true;
+                  }
+                } catch {
+                  opened = false;
+                }
+
+                if (opened) {
+                  this.logger.log(`[MCP OAuth] Opening browser for "${server.name}"...`);
+                } else {
+                  this.logger.error(
+                    `[MCP OAuth] Cannot open browser (headless environment?). ` +
+                      `Server "${server.name}" requires OAuth. ` +
+                      `Authenticate manually or provide Authorization headers. ` +
+                      `Auth URL: ${result.authUrl}`,
+                  );
+                  continue;
+                }
+
+                // Poll until connected (up to 60s)
+                const deadline = Date.now() + 60000;
+                while (Date.now() < deadline) {
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                  const newStatuses = await q.mcpServerStatus();
+                  const newStatus = newStatuses.find((s) => s.name === server.name);
+                  if (newStatus?.status === "connected") {
+                    this.logger.log(`[MCP OAuth] Server "${server.name}" connected!`);
+                    break;
+                  }
+                  if (newStatus?.status !== "needs-auth" && newStatus?.status !== "pending") {
+                    this.logger.error(
+                      `[MCP OAuth] Server "${server.name}" unexpected status: ${newStatus?.status}`,
+                    );
+                    break;
+                  }
+                }
+              } else if (result?.requiresUserAction === false) {
+                this.logger.log(
+                  `[MCP OAuth] Server "${server.name}" authenticated automatically (cached tokens)`,
+                );
+              }
+            } catch (authError) {
+              this.logger.error(`[MCP OAuth] Auth failed for "${server.name}": ${authError}`);
+            }
+          }
+        }
+      } catch (statusError) {
+        this.logger.error(`[MCP OAuth] mcpServerStatus() failed: ${statusError}`);
+      }
+    }
+
     if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
       throw RequestError.authRequired(
         undefined,
