@@ -427,51 +427,60 @@ describe("Background task notification leak", () => {
       // Simulates the real-world race: task_notification isn't in the
       // queue at peek time but arrives during the setTimeout(0) yield.
       // This was the primary failure mode in E2E testing.
-      const normalTurn = makeNormalTurnMessages("Shall I proceed?");
-      const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
-      normalTurn.splice(resultIdx, 0, {
-        type: "system",
-        subtype: "task_started",
-        task_id: "delayed-task",
-        tool_use_id: "toolu_delayed_1",
-        description: "Sleep then print",
-        task_type: "local_bash",
-        session_id: SESSION_ID,
-      });
+      //
+      // Uses fake timers so both the production setTimeout(0) yield and
+      // the test's deferred message push are deterministic.
+      vi.useFakeTimers();
+      try {
+        const normalTurn = makeNormalTurnMessages("Shall I proceed?");
+        const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
+        normalTurn.splice(resultIdx, 0, {
+          type: "system",
+          subtype: "task_started",
+          task_id: "delayed-task",
+          tool_use_id: "toolu_delayed_1",
+          description: "Sleep then print",
+          task_type: "local_bash",
+          session_id: SESSION_ID,
+        });
 
-      // Only pre-load messages up to and including the first result.
-      // The internal turn messages will be pushed into the queue
-      // asynchronously during the setTimeout(0) yield.
-      const internalTurnMessages = makeBgTaskInternalTurnMessages();
-      // Override the task_id to match our delayed-task
-      (internalTurnMessages[0] as any).task_id = "delayed-task";
+        const internalTurnMessages = makeBgTaskInternalTurnMessages();
+        (internalTurnMessages[0] as any).task_id = "delayed-task";
 
-      const mockQuery = createMockQuery(normalTurn);
-      const { client, updates } = createMockClient();
-      const agent = createAgentWithSession(mockQuery, client);
+        const mockQuery = createMockQuery(normalTurn);
+        const { client, updates } = createMockClient();
+        const agent = createAgentWithSession(mockQuery, client);
 
-      // Schedule internal turn messages to arrive after a microtask —
-      // simulating the SDK's async enqueue of task_notification.
-      const queue = (mockQuery as any).inputStream.queue as any[];
-      setTimeout(() => {
-        for (const msg of internalTurnMessages) {
-          queue.push(msg);
-        }
-      }, 0);
+        // Schedule internal turn messages to arrive during the yield.
+        const queue = (mockQuery as any).inputStream.queue as any[];
+        setTimeout(() => {
+          for (const msg of internalTurnMessages) {
+            queue.push(msg);
+          }
+        }, 0);
 
-      const result = await agent.prompt({
-        sessionId: SESSION_ID,
-        prompt: [{ type: "text", text: "run it" }],
-      });
+        // Start prompt (don't await yet — it will block at setTimeout(0))
+        const promptPromise = agent.prompt({
+          sessionId: SESSION_ID,
+          prompt: [{ type: "text", text: "run it" }],
+        });
 
-      expect(result.stopReason).toBe("end_turn");
+        // Advance fake timers to fire both setTimeout(0) callbacks:
+        // the test's message push and the production code's yield.
+        await vi.advanceTimersByTimeAsync(0);
 
-      // The internal turn's assistant text should have been forwarded
-      const allText = updates
-        .filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk")
-        .map((u: any) => u.update?.content?.text ?? "")
-        .join("");
-      expect(allText).toContain("background task from the subagent completed");
+        const result = await promptPromise;
+
+        expect(result.stopReason).toBe("end_turn");
+
+        const allText = updates
+          .filter((u: any) => u.update?.sessionUpdate === "agent_message_chunk")
+          .map((u: any) => u.update?.content?.text ?? "")
+          .join("");
+        expect(allText).toContain("background task from the subagent completed");
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("logs warning and returns when task_notification never arrives (the race)", async () => {

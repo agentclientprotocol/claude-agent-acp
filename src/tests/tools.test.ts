@@ -1249,6 +1249,12 @@ describe("Bash terminal output", () => {
     //   6. Hook NEVER blocks — always returns { continue: true } immediately
     //   7. Subagent child tool uses (callback arrives much later) work correctly
     //
+    // The fire-and-forget callbacks use .then() chains (microtasks).
+    // Flush them deterministically instead of using real setTimeout delays.
+    async function flushMicrotasks() {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    }
+    //
     function postToolUseInput(
       toolUseId: string,
       toolName: string,
@@ -1329,8 +1335,8 @@ describe("Bash terminal output", () => {
         },
       });
 
-      // The callback fires asynchronously — give it a tick.
-      await new Promise((r) => setTimeout(r, 5));
+      // The callback fires asynchronously — flush microtasks.
+      await flushMicrotasks();
 
       expect(received).toHaveLength(1);
       expect(received[0]).toEqual({
@@ -1368,7 +1374,7 @@ describe("Bash terminal output", () => {
       registerHookCallback("toolu_noerr_b", {
         onPostToolUseHook: async () => {},
       }, spyLogger);
-      await new Promise((r) => setTimeout(r, 5));
+      await flushMicrotasks();
 
       expect(errors).toHaveLength(0);
     });
@@ -1403,7 +1409,7 @@ describe("Bash terminal output", () => {
         },
       });
 
-      await new Promise((r) => setTimeout(r, 5));
+      await flushMicrotasks();
       expect(callOrder).toEqual(["toolu_indep_a", "toolu_indep_b"]);
     });
 
@@ -1459,7 +1465,7 @@ describe("Bash terminal output", () => {
 
       // Simulate delay — subagent finishes and messages are relayed.
       // (In real life this could be 30+ seconds.)
-      await new Promise((r) => setTimeout(r, 50));
+      // No real delay needed — just flush microtasks after registration.
 
       // Now registration arrives for all three.
       for (const id of ["toolu_sub_1", "toolu_sub_2", "toolu_sub_3"]) {
@@ -1470,7 +1476,7 @@ describe("Bash terminal output", () => {
         });
       }
 
-      await new Promise((r) => setTimeout(r, 10));
+      await flushMicrotasks();
 
       expect(received).toHaveLength(3);
       expect(received.map((r) => r.id).sort()).toEqual([
@@ -1509,7 +1515,7 @@ describe("Bash terminal output", () => {
         { signal: AbortSignal.abort() },
       );
 
-      await new Promise((r) => setTimeout(r, 10));
+      await flushMicrotasks();
 
       // The stale callback should NOT have been invoked.
       expect(callbackCalled).toHaveLength(0);
@@ -1561,7 +1567,7 @@ describe("Bash terminal output", () => {
         });
       }
 
-      await new Promise((r) => setTimeout(r, 10));
+      await flushMicrotasks();
 
       expect(received.sort()).toEqual(["toolu_bat_a", "toolu_bat_b", "toolu_bat_c"]);
     });
@@ -1604,7 +1610,7 @@ describe("Bash terminal output", () => {
         },
       }, spyLogger);
 
-      await new Promise((r) => setTimeout(r, 10));
+      await flushMicrotasks();
 
       // Error should be logged, not thrown.
       expect(errors.some((e) => e.includes("stashed hook callback error") && e.includes("toolu_err_1"))).toBe(true);
