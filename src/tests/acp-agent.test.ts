@@ -1463,6 +1463,7 @@ describe("stop reason propagation", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      abortController: new AbortController(),
       configOptions: [],
       promptRunning: false,
       pendingMessages: new Map(),
