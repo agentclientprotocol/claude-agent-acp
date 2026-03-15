@@ -1503,6 +1503,272 @@ describe("stop reason propagation", () => {
       }),
     ).rejects.toThrow("Internal error");
   });
+
+  // Regression tests for #400 (87a0886): promptReplayed bug causes prompt to
+  // hang forever when no user message replay arrives before the result.
+
+  function injectSessionNoReplay(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      // Consume the user message from input (as Claude Code does) but do NOT
+      // replay it back through the query iterator — this matches real-world
+      // behaviour observed in wire logs.
+      const iter = input[Symbol.asyncIterator]();
+      await iter.next();
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      permissionMode: "default",
+      settingsManager: {} as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+    };
+  }
+
+  it("should return result even when user message is not replayed", async () => {
+    const agent = createMockAgent();
+    injectSessionNoReplay(agent, [
+      createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("should return result when init precedes result with stream events and no replay", async () => {
+    // When our prompt's processing starts with an init, there will always
+    // be stream_events (Claude streaming its response) before the result.
+    // The stream_event clears the backgroundInitPending flag so the result
+    // is accepted as ours.
+    const agent = createMockAgent();
+    injectSessionNoReplay(agent, [
+      { type: "system", subtype: "init", session_id: "test-session" },
+      {
+        type: "stream_event",
+        event: { type: "message_start", message: { role: "assistant", content: [] } },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("should consume init-then-result as background task even with later activity", async () => {
+    // Background task produces init → result (no stream events between).
+    // Our prompt then generates stream_events → result.
+    const agent = createMockAgent();
+
+    const backgroundTaskResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    backgroundTaskResult.usage.input_tokens = 100;
+    backgroundTaskResult.usage.output_tokens = 50;
+
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+
+    injectSessionNoReplay(agent, [
+      // Background task: init immediately followed by result
+      { type: "system", subtype: "init", session_id: "test-session" },
+      backgroundTaskResult,
+      // Our prompt's processing: stream events then result
+      {
+        type: "stream_event",
+        event: { type: "message_start", message: { role: "assistant", content: [] } },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      promptResult,
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(response.usage?.inputTokens).toBe(
+      backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens,
+    );
+    expect(response.usage?.outputTokens).toBe(
+      backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens,
+    );
+  });
+
+  it("should return result when stream events precede result without replay", async () => {
+    const agent = createMockAgent();
+    injectSessionNoReplay(agent, [
+      {
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("should still consume background task result when replay IS present", async () => {
+    // This preserves the original intent of #400: if a background task result
+    // arrives before our replay, consume it and use the post-replay result.
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    const backgroundTaskResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    backgroundTaskResult.usage.input_tokens = 100;
+    backgroundTaskResult.usage.output_tokens = 50;
+
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+
+    async function* messageGenerator() {
+      // Background task init + result arrive before our prompt's replay
+      yield { type: "system", subtype: "init", session_id: "test-session" };
+      yield backgroundTaskResult;
+
+      // Now the prompt's user message replay arrives
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+
+      // Then the prompt's own result
+      yield promptResult;
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cwd: "/tmp/test",
+      cancelled: false,
+      permissionMode: "default",
+      settingsManager: {} as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      abortController: new AbortController(),
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Usage should include both background task and prompt result tokens
+    expect(response.usage?.inputTokens).toBe(
+      backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens,
+    );
+    expect(response.usage?.outputTokens).toBe(
+      backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens,
+    );
+  });
+
+  it("should return result with replay arriving after user message with different uuid", async () => {
+    // Simulates Claude Code replaying the user message but with a different
+    // UUID than the one set on the input message.
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      await iter.next();
+      // Replay with a DIFFERENT uuid than what was set on the input
+      yield {
+        type: "user",
+        message: { role: "user", content: [{ type: "text", text: "test" }] },
+        parent_tool_use_id: null,
+        uuid: randomUUID(), // different uuid!
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: null, is_error: false });
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      permissionMode: "default",
+      settingsManager: {} as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
 });
 
 describe("session/close", () => {
