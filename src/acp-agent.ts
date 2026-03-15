@@ -502,7 +502,16 @@ export class ClaudeAcpAgent implements Agent {
     // Track background task IDs from system/task_started messages.
     // Resolved when we see system/task_notification with a terminal status.
     // Used to decide whether to poll for internal turns after a result.
-    const pendingTaskIds = new Map<string, { outputPath: string | null }>();
+    const pendingTaskIds = new Map<
+      string,
+      {
+        outputPath: string | null;
+        taskType: string;
+        toolUseId: string | null;
+        firstSeenAt: number;
+        lastActivityAt: number;
+      }
+    >();
     // Cache output paths parsed from terminal_output before task_started arrives.
     // The SDK may emit terminal_output before task_started depending on ordering.
     const earlyOutputPaths = new Map<string, string>();
@@ -580,7 +589,14 @@ export class ClaudeAcpAgent implements Agent {
                 // minified name, likely hasRunningDeferrableTasks).
                 if (message.task_id && (message as any).task_type === "local_bash") {
                   const earlyPath = earlyOutputPaths.get(message.task_id);
-                  pendingTaskIds.set(message.task_id, { outputPath: earlyPath ?? null });
+                  const now = Date.now();
+                  pendingTaskIds.set(message.task_id, {
+                    outputPath: earlyPath ?? null,
+                    taskType: (message as any).task_type,
+                    toolUseId: (message as any).tool_use_id ?? null,
+                    firstSeenAt: now,
+                    lastActivityAt: now,
+                  });
                   if (earlyPath) earlyOutputPaths.delete(message.task_id);
                 }
                 break;
@@ -701,8 +717,20 @@ export class ClaudeAcpAgent implements Agent {
                   // land while also monitoring output file growth as a heartbeat.
                   const INACTIVITY_TIMEOUT_MS = 30_000;
                   const POLL_INTERVAL_MS = 1_000;
+                  const PROGRESS_LOG_INTERVAL_MS = 30_000;
                   let lastActivity = Date.now();
+                  let lastProgressLog = 0; // force immediate first log
                   const fileSizes = new Map<string, number>();
+
+                  // Log entry into the poll loop immediately
+                  for (const [taskId, entry] of pendingTaskIds) {
+                    this.logger.log(
+                      `[bg-task-poll] entering poll loop — ` +
+                        `task_id=${taskId} task_type=${entry.taskType} ` +
+                        `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
+                        `outputPath=${entry.outputPath ?? "unknown"}`,
+                    );
+                  }
 
                   while (Date.now() - lastActivity < INACTIVITY_TIMEOUT_MS) {
                     // Yield to event loop
@@ -711,6 +739,29 @@ export class ClaudeAcpAgent implements Agent {
                     // Bail early if the session was cancelled during the wait
                     if (session.cancelled) {
                       return { stopReason: "cancelled" };
+                    }
+
+                    const now = Date.now();
+
+                    // Throttled progress log every PROGRESS_LOG_INTERVAL_MS
+                    if (PROGRESS_LOG_INTERVAL_MS <= now - lastProgressLog) {
+                      lastProgressLog = now;
+                      for (const [taskId, entry] of pendingTaskIds) {
+                        const sinceActivity = Math.round((now - lastActivity) / 1000);
+                        const remaining = Math.max(
+                          0,
+                          Math.round(
+                            (INACTIVITY_TIMEOUT_MS - (now - lastActivity)) / 1000,
+                          ),
+                        );
+                        this.logger.log(
+                          `[bg-task-poll] waiting — ` +
+                            `task_id=${taskId} task_type=${entry.taskType} ` +
+                            `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
+                            `outputPath=${entry.outputPath ?? "unknown"} ` +
+                            `inactiveFor=${sinceActivity}s remaining=${remaining}s`,
+                        );
+                      }
                     }
 
                     // Check if task_notification arrived anywhere in the queue.
@@ -731,14 +782,19 @@ export class ClaudeAcpAgent implements Agent {
                     }
 
                     // Check output files for activity
-                    for (const [taskId, { outputPath }] of pendingTaskIds) {
-                      if (!outputPath) continue;
+                    for (const [taskId, entry] of pendingTaskIds) {
+                      if (!entry.outputPath) continue;
                       try {
-                        const stat = await fsp.stat(outputPath);
+                        const stat = await fsp.stat(entry.outputPath);
                         const prevSize = fileSizes.get(taskId) ?? -1;
                         if (stat.size !== prevSize) {
                           fileSizes.set(taskId, stat.size);
-                          lastActivity = Date.now(); // Reset inactivity timer
+                          lastActivity = Date.now();
+                          entry.lastActivityAt = lastActivity;
+                          this.logger.log(
+                            `[bg-task-poll] output activity — ` +
+                              `task_id=${taskId} size=${stat.size}`,
+                          );
                         }
                       } catch {
                         // File may not exist yet — that's fine
@@ -750,12 +806,16 @@ export class ClaudeAcpAgent implements Agent {
                   // continue the outer while loop to consume the internal turn
                   if (savedPromptResponse) break;
 
-                  // Inactivity timeout — log and return
-                  this.logger.log(
-                    `[bg-task-timeout] inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) reached with ` +
-                      `${pendingTaskIds.size} unresolved background task(s) ` +
-                      `[${[...pendingTaskIds.keys()].join(", ")}]`,
-                  );
+                  // Inactivity timeout — log structured details and return
+                  for (const [taskId, entry] of pendingTaskIds) {
+                    this.logger.log(
+                      `[bg-task-timeout] inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) — ` +
+                        `task_id=${taskId} task_type=${entry.taskType} ` +
+                        `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
+                        `outputPath=${entry.outputPath ?? "unknown"} ` +
+                        `aliveSince=${Math.round((Date.now() - entry.firstSeenAt) / 1000)}s`,
+                    );
+                  }
                 }
 
                 // No pending tasks, or inactivity timeout — return the response.
