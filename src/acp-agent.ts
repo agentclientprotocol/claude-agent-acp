@@ -60,6 +60,7 @@ import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -500,8 +501,11 @@ export class ClaudeAcpAgent implements Agent {
     let savedPromptResponse: PromptResponse | undefined;
     // Track background task IDs from system/task_started messages.
     // Resolved when we see system/task_notification with a terminal status.
-    // Used to decide whether to peek at the queue after a result.
-    const pendingTaskIds = new Set<string>();
+    // Used to decide whether to poll for internal turns after a result.
+    const pendingTaskIds = new Map<string, { outputPath: string | null }>();
+    // Cache output paths parsed from terminal_output before task_started arrives.
+    // The SDK may emit terminal_output before task_started depending on ordering.
+    const earlyOutputPaths = new Map<string, string>();
 
     try {
       while (true) {
@@ -575,7 +579,9 @@ export class ClaudeAcpAgent implements Agent {
                 // local_agent tasks (via its internal iP() check —
                 // minified name, likely hasRunningDeferrableTasks).
                 if (message.task_id && (message as any).task_type === "local_bash") {
-                  pendingTaskIds.add(message.task_id);
+                  const earlyPath = earlyOutputPaths.get(message.task_id);
+                  pendingTaskIds.set(message.task_id, { outputPath: earlyPath ?? null });
+                  if (earlyPath) earlyOutputPaths.delete(message.task_id);
                 }
                 break;
               case "task_notification": {
@@ -671,52 +677,88 @@ export class ClaudeAcpAgent implements Agent {
                 // result. See x.sdk-trace-bg-leak.ndjson for the observed
                 // message sequence.
                 //
+                // Strategy: poll with an inactivity timeout instead of peeking
+                // once and returning. This closes the race where
+                // task_notification hasn't been enqueued yet at peek time.
+                //
                 // Defense layers:
-                // 1. Only peek if we saw task_started during the turn
+                // 1. Only poll if we saw task_started during the turn
                 //    (pendingTaskIds tracks unresolved background tasks)
-                // 2. Peek at SDK internal queue (inputStream.queue[0]) to
-                //    check if task_notification is already buffered
-                // 3. Log a warning if tasks are pending but queue is empty
-                //    (the theoretical race codex identified)
+                // 2. Each poll iteration scans the SDK internal queue
+                //    (inputStream.queue) for any buffered task_notification
+                // 3. Output file growth resets the inactivity timer as a
+                //    heartbeat — keeps the loop alive while the task runs
+                // 4. Cancellation is checked each iteration
+                // 5. After 30s of inactivity, log timeout and return
                 //
                 // This accesses SDK internals (not a public API). The SDK
                 // doesn't expose an idle/hasPending signal.
                 // See: x.codex-review-fix2.md, x.codex-review-fix3.md
                 if (0 < pendingTaskIds.size) {
-                  // Yield to the event loop (macrotask via setTimeout)
-                  // before peeking. The SDK enqueues task_notification
-                  // asynchronously after the result; yielding gives it
-                  // a chance to land. This is best-effort — if the
-                  // notification arrives later, the warning below fires.
-                  await new Promise((r) => setTimeout(r, 0));
-                  const queryInternal = session.query as any;
-                  const nextQueued = queryInternal.inputStream?.queue?.[0];
-                  if (
-                    nextQueued &&
-                    nextQueued.type === "system" &&
-                    nextQueued.subtype === "task_notification"
-                  ) {
-                    // Next message is a task_notification — an internal turn
-                    // from a background task completion. Keep consuming.
-                    savedPromptResponse = { stopReason: "end_turn", usage };
-                    break;
+                  // Poll for background task completion instead of peeking once.
+                  // The SDK enqueues task_notification asynchronously after the
+                  // result; polling with an inactivity timeout gives it time to
+                  // land while also monitoring output file growth as a heartbeat.
+                  const INACTIVITY_TIMEOUT_MS = 30_000;
+                  const POLL_INTERVAL_MS = 1_000;
+                  let lastActivity = Date.now();
+                  const fileSizes = new Map<string, number>();
+
+                  while (Date.now() - lastActivity < INACTIVITY_TIMEOUT_MS) {
+                    // Yield to event loop
+                    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+
+                    // Bail early if the session was cancelled during the wait
+                    if (session.cancelled) {
+                      return { stopReason: "cancelled" };
+                    }
+
+                    // Check if task_notification arrived anywhere in the queue.
+                    // Other system messages (e.g., init) may be queued before it,
+                    // so scanning past queue[0] avoids sleeping until timeout.
+                    const queryInternal = session.query as any;
+                    const queueArr = queryInternal.inputStream?.queue;
+                    const hasTaskNotification =
+                      Array.isArray(queueArr) &&
+                      queueArr.some(
+                        (m: any) => m.type === "system" && m.subtype === "task_notification",
+                      );
+                    if (hasTaskNotification) {
+                      // Internal turn ready to consume — save response,
+                      // continue outer while loop
+                      savedPromptResponse = { stopReason: "end_turn", usage };
+                      break;
+                    }
+
+                    // Check output files for activity
+                    for (const [taskId, { outputPath }] of pendingTaskIds) {
+                      if (!outputPath) continue;
+                      try {
+                        const stat = await fsp.stat(outputPath);
+                        const prevSize = fileSizes.get(taskId) ?? -1;
+                        if (stat.size !== prevSize) {
+                          fileSizes.set(taskId, stat.size);
+                          lastActivity = Date.now(); // Reset inactivity timer
+                        }
+                      } catch {
+                        // File may not exist yet — that's fine
+                      }
+                    }
                   }
 
-                  // Pending tasks exist but queue is empty. This is the race
-                  // condition where task_notification hasn't been enqueued yet.
-                  // Log a warning — the next prompt() may see leaked messages.
-                  // This gives us observability to file upstream with evidence.
-                  if (!nextQueued) {
-                    this.logger.log(
-                      `[bg-task-leak] result received with ${pendingTaskIds.size} unresolved ` +
-                        `background task(s) [${[...pendingTaskIds].join(", ")}] but no ` +
-                        `task_notification in queue — possible internal turn leak into next prompt`,
-                    );
-                  }
+                  // If we broke out because task_notification arrived,
+                  // continue the outer while loop to consume the internal turn
+                  if (savedPromptResponse) break;
+
+                  // Inactivity timeout — log and return
+                  this.logger.log(
+                    `[bg-task-timeout] inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) reached with ` +
+                      `${pendingTaskIds.size} unresolved background task(s) ` +
+                      `[${[...pendingTaskIds.keys()].join(", ")}]`,
+                  );
                 }
 
-                // No pending tasks, or pending but queue doesn't have
-                // task_notification — return the response.
+                // No pending tasks, or inactivity timeout — return the response.
                 if (savedPromptResponse) {
                   savedPromptResponse.usage = usage;
                   return savedPromptResponse;
@@ -765,6 +807,27 @@ export class ClaudeAcpAgent implements Agent {
                 cwd: session.cwd,
               },
             )) {
+              // Extract background task output file path from terminal_output
+              // data. The SDK emits "Command running in background with ID: {id}.
+              // Output is being written to: {path}" as terminal output when a
+              // bash task starts in the background. The terminal_output may arrive
+              // before or after task_started, so we cache the path in
+              // earlyOutputPaths if the task isn't tracked yet.
+              const termData = (notification.update as any)?._meta?.terminal_output?.data;
+              if (typeof termData === "string") {
+                const bgMatch = termData.match(
+                  /Command running in background with ID: (\S+)\.\s*Output is being written to: (.+)$/,
+                );
+                if (bgMatch) {
+                  const [, taskId, outputPath] = bgMatch;
+                  const entry = pendingTaskIds.get(taskId);
+                  if (entry) {
+                    entry.outputPath = outputPath;
+                  } else {
+                    earlyOutputPaths.set(taskId, outputPath);
+                  }
+                }
+              }
               await this.client.sessionUpdate(notification);
             }
             break;
