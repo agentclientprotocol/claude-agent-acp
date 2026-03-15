@@ -681,6 +681,10 @@ export class ClaudeAcpAgent implements Agent {
               });
             }
 
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
+            }
+
             if (backgroundInitPending) {
               // This result immediately followed an init with no
               // intervening activity — it belongs to a background task
@@ -690,6 +694,19 @@ export class ClaudeAcpAgent implements Agent {
               backgroundInitPending = false;
               break;
             }
+
+            // Build the usage response
+            const usage: PromptResponse["usage"] = {
+              inputTokens: session.accumulatedUsage.inputTokens,
+              outputTokens: session.accumulatedUsage.outputTokens,
+              cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+              cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+              totalTokens:
+                session.accumulatedUsage.inputTokens +
+                session.accumulatedUsage.outputTokens +
+                session.accumulatedUsage.cachedReadTokens +
+                session.accumulatedUsage.cachedWriteTokens,
+            };
 
             switch (message.subtype) {
               case "success": {
