@@ -95,10 +95,36 @@ function createAgentWithSession(
   sessionId = "test-session",
 ) {
   const agent = new ClaudeAcpAgent(mockClient);
+  // Create an input stream that injects a user replay message into the
+  // mock query's queue when prompt() pushes. The real SDK replays the
+  // user message through the query iterator; the mock must do the same
+  // so that promptReplayed becomes true before the result arrives.
+  const queue = (mockQuery as any).inputStream.queue as any[];
+  const input = new Pushable<SDKUserMessage>();
+  const origPush = input.push.bind(input);
+  input.push = (msg: SDKUserMessage) => {
+    // Insert replay message right before the first result so the
+    // prompt loop sees it in time.
+    const resultIdx = queue.findIndex((m: any) => m.type === "result");
+    const replay = {
+      type: "user",
+      message: { role: "user", content: (msg as any).content ?? [] },
+      uuid: (msg as any).uuid,
+      isReplay: true,
+      session_id: sessionId,
+      parent_tool_use_id: null,
+    };
+    if (0 <= resultIdx) {
+      queue.splice(resultIdx, 0, replay);
+    } else {
+      queue.push(replay);
+    }
+    return origPush(msg);
+  };
   // Inject a fake session directly
   (agent as any).sessions[sessionId] = {
     query: mockQuery,
-    input: new Pushable<SDKUserMessage>(),
+    input,
     cancelled: false,
     cwd: "/test",
     permissionMode: "default",
