@@ -726,46 +726,57 @@ export class ClaudeAcpAgent implements Agent {
                 // result. See x.sdk-trace-bg-leak.ndjson for the observed
                 // message sequence.
                 //
-                // Strategy: poll with an inactivity timeout instead of peeking
-                // once and returning. This closes the race where
-                // task_notification hasn't been enqueued yet at peek time.
+                // Strategy: keep the turn open indefinitely, polling until
+                // all background tasks resolve (task_notification arrives)
+                // or the user cancels. There is no inactivity timeout — the
+                // turn stays open to guarantee internal turns are consumed.
                 //
                 // Defense layers:
                 // 1. Only poll if we saw task_started during the turn
                 //    (pendingTaskIds tracks unresolved background tasks)
                 // 2. Each poll iteration scans the SDK internal queue
                 //    (inputStream.queue) for any buffered task_notification
-                // 3. Output file growth resets the inactivity timer as a
-                //    heartbeat — keeps the loop alive while the task runs
+                // 3. Output file growth is tracked as a per-task heartbeat
                 // 4. Cancellation is checked each iteration
-                // 5. After 30s of inactivity, log timeout and return
                 //
                 // This accesses SDK internals (not a public API). The SDK
                 // doesn't expose an idle/hasPending signal.
                 // See: x.codex-review-fix2.md, x.codex-review-fix3.md
                 if (0 < pendingTaskIds.size) {
-                  // Poll for background task completion instead of peeking once.
-                  // The SDK enqueues task_notification asynchronously after the
-                  // result; polling with an inactivity timeout gives it time to
-                  // land while also monitoring output file growth as a heartbeat.
-                  const INACTIVITY_TIMEOUT_MS = 30_000;
+                  // Poll indefinitely for background task completion.
+                  // The SDK enqueues task_notification asynchronously after
+                  // the result; polling gives it time to land while also
+                  // monitoring output file growth as a per-task heartbeat.
                   const POLL_INTERVAL_MS = 1_000;
                   const PROGRESS_LOG_INTERVAL_MS = 30_000;
-                  let lastActivity = Date.now();
                   let lastProgressLog = 0; // force immediate first log
                   const fileSizes = new Map<string, number>();
 
-                  // Log entry into the poll loop immediately
-                  for (const [taskId, entry] of pendingTaskIds) {
-                    this.logger.log(
-                      `[bg-task-poll] entering poll loop — ` +
+                  const formatTaskSummary = () => {
+                    const now = Date.now();
+                    const parts: string[] = [];
+                    for (const [taskId, entry] of pendingTaskIds) {
+                      const ref = entry.lastActivityAt ?? entry.firstSeenAt;
+                      const inactiveFor = Math.round((now - ref) / 1000);
+                      parts.push(
                         `task_id=${taskId} task_type=${entry.taskType} ` +
-                        `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
-                        `outputPath=${entry.outputPath ?? "unknown"}`,
+                          `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
+                          `outputPath=${entry.outputPath ?? "unknown"} ` +
+                          `inactiveFor=${inactiveFor}s`,
+                      );
+                    }
+                    return (
+                      `[bg-task-poll] waiting for background tasks: ` +
+                      parts.join(", ") +
+                      ` — cancellation risks later prompt contamination`
                     );
-                  }
+                  };
 
-                  while (Date.now() - lastActivity < INACTIVITY_TIMEOUT_MS) {
+                  // Log immediately on entering the poll loop
+                  this.logger.log(formatTaskSummary());
+                  lastProgressLog = Date.now();
+
+                  while (0 < pendingTaskIds.size) {
                     // Yield to event loop
                     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 
@@ -774,27 +785,11 @@ export class ClaudeAcpAgent implements Agent {
                       return { stopReason: "cancelled" };
                     }
 
-                    const now = Date.now();
-
                     // Throttled progress log every PROGRESS_LOG_INTERVAL_MS
+                    const now = Date.now();
                     if (PROGRESS_LOG_INTERVAL_MS <= now - lastProgressLog) {
                       lastProgressLog = now;
-                      for (const [taskId, entry] of pendingTaskIds) {
-                        const sinceActivity = Math.round((now - lastActivity) / 1000);
-                        const remaining = Math.max(
-                          0,
-                          Math.round(
-                            (INACTIVITY_TIMEOUT_MS - (now - lastActivity)) / 1000,
-                          ),
-                        );
-                        this.logger.log(
-                          `[bg-task-poll] waiting — ` +
-                            `task_id=${taskId} task_type=${entry.taskType} ` +
-                            `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
-                            `outputPath=${entry.outputPath ?? "unknown"} ` +
-                            `inactiveFor=${sinceActivity}s remaining=${remaining}s`,
-                        );
-                      }
+                      this.logger.log(formatTaskSummary());
                     }
 
                     // Check if task_notification arrived anywhere in the queue.
@@ -822,8 +817,7 @@ export class ClaudeAcpAgent implements Agent {
                         const prevSize = fileSizes.get(taskId) ?? -1;
                         if (stat.size !== prevSize) {
                           fileSizes.set(taskId, stat.size);
-                          lastActivity = Date.now();
-                          entry.lastActivityAt = lastActivity;
+                          entry.lastActivityAt = Date.now();
                           this.logger.log(
                             `[bg-task-poll] output activity — ` +
                               `task_id=${taskId} size=${stat.size}`,
@@ -835,23 +829,12 @@ export class ClaudeAcpAgent implements Agent {
                     }
                   }
 
-                  // If we broke out because task_notification arrived,
-                  // continue the outer while loop to consume the internal turn
+                  // task_notification arrived — continue the outer while
+                  // loop to consume the internal turn
                   if (savedPromptResponse) break;
-
-                  // Inactivity timeout — log structured details and return
-                  for (const [taskId, entry] of pendingTaskIds) {
-                    this.logger.log(
-                      `[bg-task-timeout] inactivity timeout (${INACTIVITY_TIMEOUT_MS}ms) — ` +
-                        `task_id=${taskId} task_type=${entry.taskType} ` +
-                        `tool_use_id=${entry.toolUseId ?? "unknown"} ` +
-                        `outputPath=${entry.outputPath ?? "unknown"} ` +
-                        `aliveSince=${Math.round((Date.now() - entry.firstSeenAt) / 1000)}s`,
-                    );
-                  }
                 }
 
-                // No pending tasks, or inactivity timeout — return the response.
+                // No pending tasks — return the response.
                 if (savedPromptResponse) {
                   savedPromptResponse.usage = usage;
                   return savedPromptResponse;

@@ -36,20 +36,6 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import type { Query, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { Pushable } from "../utils.js";
 
-// Mock fs/promises for tests that need to control fs.stat behavior.
-// The mock starts in passthrough mode; individual tests override via mockStat.
-let mockStatImpl: ((path: string) => Promise<{ size: number }>) | null = null;
-vi.mock("node:fs/promises", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return {
-    ...actual,
-    stat: async (path: string, ...args: any[]) => {
-      if (mockStatImpl) return mockStatImpl(path);
-      return actual.stat(path, ...args);
-    },
-  };
-});
-
 // ── Mock helpers ─────────────────────────────────────────────────────
 
 /**
@@ -557,9 +543,10 @@ describe("Background task notification leak", () => {
       }
     });
 
-    it("logs timeout and returns when task_notification never arrives", async () => {
-      // When the bg task hasn't finished after the inactivity timeout
-      // (30s), prompt() should return with a log message — not hang.
+    it("emits aggregated waiting log immediately and every 30s, escaped by cancellation", async () => {
+      // The poll loop stays open indefinitely. Verify that it emits the
+      // aggregated log immediately on entry and again after 30s, then
+      // use cancellation as the escape hatch.
       vi.useFakeTimers();
       try {
         const normalTurn = makeNormalTurnMessages("Done.");
@@ -567,13 +554,12 @@ describe("Background task notification leak", () => {
         normalTurn.splice(resultIdx, 0, {
           type: "system",
           subtype: "task_started",
-          task_id: "never-completes",
-          tool_use_id: "toolu_never_1",
-          description: "Very long running task",
+          task_id: "log-task",
+          tool_use_id: "toolu_log_1",
+          description: "Long running task",
           task_type: "local_bash",
           session_id: SESSION_ID,
         });
-        // No internal turn messages appended — task_notification never arrives.
 
         const mockQuery = createMockQuery(normalTurn);
         const logs: string[] = [];
@@ -590,18 +576,28 @@ describe("Background task notification leak", () => {
           prompt: [{ type: "text", text: "run it" }],
         });
 
-        // Advance past the 30s inactivity timeout
+        // Advance 1s to enter the poll loop (immediate log fires before first sleep)
         await Promise.resolve();
-        await vi.advanceTimersByTimeAsync(31_000);
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        // Should have the immediate entry log
+        const entryLogs = logs.filter((l) => l.includes("[bg-task-poll] waiting for background tasks"));
+        expect(1 <= entryLogs.length).toBe(true);
+        expect(entryLogs[0]).toContain("log-task");
+        expect(entryLogs[0]).toContain("cancellation risks later prompt contamination");
+
+        // Advance 30s more for the throttled repeat log
+        await vi.advanceTimersByTimeAsync(30_000);
+        const repeatLogs = logs.filter((l) => l.includes("[bg-task-poll] waiting for background tasks"));
+        expect(2 <= repeatLogs.length).toBe(true);
+
+        // Cancel to escape the indefinite loop
+        const session = (agent as any).sessions[SESSION_ID];
+        session.cancelled = true;
+        await vi.advanceTimersByTimeAsync(1_000);
 
         const result = await promptPromise;
-
-        // Should still return (not hang)
-        expect(result.stopReason).toBe("end_turn");
-        // Should have logged the timeout about unresolved tasks
-        expect(
-          logs.some((l) => l.includes("[bg-task-timeout]") && l.includes("never-completes")),
-        ).toBe(true);
+        expect(result.stopReason).toBe("cancelled");
       } finally {
         vi.useRealTimers();
       }
@@ -962,68 +958,6 @@ describe("Background task notification leak", () => {
           .join("");
         expect(allText).toContain("background task from the subagent completed");
       } finally {
-        vi.useRealTimers();
-      }
-    });
-
-    it("poll loop calls fs.stat on captured output path", async () => {
-      // Verifies that when an output path is captured from terminal_output,
-      // the poll loop calls fs.stat on that path. We check by recording
-      // all paths passed to stat.
-      vi.useFakeTimers();
-      const statPaths: string[] = [];
-      mockStatImpl = async (p: string) => {
-        statPaths.push(p);
-        throw new Error("ENOENT"); // File doesn't exist yet
-      };
-
-      try {
-        const normalTurn = makeNormalTurnMessages("Running bg task.");
-        const resultIdx = normalTurn.findIndex((m: any) => m.type === "result");
-        normalTurn.splice(resultIdx, 0, {
-          type: "system",
-          subtype: "task_started",
-          task_id: "path-task",
-          tool_use_id: "toolu_path_1",
-          description: "Task with output path",
-          task_type: "local_bash",
-          session_id: SESSION_ID,
-        });
-
-        // Inject stream event with background task output path message.
-        // The extraction regex in the prompt loop parses this from
-        // terminal_output._meta data on tool_call_update notifications.
-        // Since stream events go through streamEventToAcpNotifications
-        // which needs tool use caching, we inject the path via a simpler
-        // mechanism: the text_delta content won't generate _meta, but
-        // we can still verify the poll loop by injecting the path directly.
-        //
-        // Note: full integration of path extraction from _meta is covered
-        // by the "inactivity timeout resets" test — this test focuses on
-        // verifying stat is called with the right path.
-        const mockQuery = createMockQuery(normalTurn);
-        const { client } = createMockClient();
-        const agent = createAgentWithSession(mockQuery, client);
-        (agent as any).logger = { log: () => {}, error: () => {} };
-
-        const promptPromise = agent.prompt({
-          sessionId: SESSION_ID,
-          prompt: [{ type: "text", text: "go" }],
-        });
-
-        // Advance past the timeout — since no output path is captured
-        // (stream events don't generate _meta in mock), stat won't be
-        // called but the test verifies the timeout path works.
-        await Promise.resolve();
-        await vi.advanceTimersByTimeAsync(31_000);
-
-        const result = await promptPromise;
-        expect(result.stopReason).toBe("end_turn");
-        // No output paths were captured in the mock (no _meta on text_delta),
-        // so stat should not have been called.
-        expect(statPaths.length).toBe(0);
-      } finally {
-        mockStatImpl = null;
         vi.useRealTimers();
       }
     });
