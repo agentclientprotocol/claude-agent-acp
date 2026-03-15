@@ -646,6 +646,10 @@ export class ClaudeAcpAgent implements Agent {
               });
             }
 
+            if (session.cancelled) {
+              return { stopReason: "cancelled" };
+            }
+
             if (backgroundInitPending) {
               // This result immediately followed an init with no
               // intervening activity — it belongs to a background task
@@ -654,10 +658,6 @@ export class ClaudeAcpAgent implements Agent {
               this.logger.log(`Session ${params.sessionId}: consuming background task result`);
               backgroundInitPending = false;
               break;
-            }
-
-            if (session.cancelled) {
-              return { stopReason: "cancelled" };
             }
 
             // Build the usage response
