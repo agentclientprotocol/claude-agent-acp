@@ -421,7 +421,7 @@ export class ClaudeAcpAgent implements Agent {
     return result;
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+  async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
     const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
     const sessions = [];
 
