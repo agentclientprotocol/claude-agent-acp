@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
-import { resolveClaudeInvocationPaths } from "../claude-config.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -93,10 +92,20 @@ describe("session config options", () => {
       input: null,
       cancelled: false,
       cwd: "/test",
-      invocationPaths: resolveClaudeInvocationPaths(),
-      permissionMode: "default",
       settingsManager: {},
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      modes: structuredClone(MOCK_MODES),
+      models: structuredClone(MOCK_MODELS),
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
     };
   }
 
@@ -225,6 +234,61 @@ describe("session config options", () => {
         (n) => n.update.sessionUpdate === "config_option_update",
       );
       expect(configUpdate).toBeUndefined();
+    });
+
+    it("resolves model alias 'opus' to full model ID", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "opus",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-5");
+
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-opus-4-5");
+    });
+
+    it("resolves model alias 'sonnet' to full model ID", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "sonnet",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+    });
+
+    it("resolves display name to model ID", async () => {
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "Claude Sonnet",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+    });
+
+    it("still works with exact model ID", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-5",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+      const modelOption = response.configOptions.find((o) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-sonnet-4-5");
+    });
+
+    it("throws for completely invalid model value", async () => {
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: SESSION_ID,
+          configId: "model",
+          value: "gpt-4",
+        }),
+      ).rejects.toThrow("Invalid value for config option model: gpt-4");
     });
 
     it("returns full configOptions in the response", async () => {

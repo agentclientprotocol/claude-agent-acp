@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
   Agent,
@@ -1306,19 +1306,38 @@ describe("stop reason propagation", () => {
     };
   }
 
-  function* messageGenerator(messages: any[]) {
-    yield* messages;
-  }
-
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const gen = messageGenerator(messages);
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      // Wait for the prompt to push its user message so we can replay it
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
     agent.sessions["test-session"] = {
-      query: gen as any,
-      input: new Pushable(),
+      query: messageGenerator() as any,
+      input,
       cancelled: false,
       cwd: "/test",
       invocationPaths: resolveClaudeInvocationPaths(),
-      permissionMode: "default",
+      modes: {
+        currentModeId: "default",
+        availableModes: [],
+      },
+      models: {
+        currentModelId: "default",
+        availableModels: [],
+      },
       settingsManager: {} as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1330,6 +1349,7 @@ describe("stop reason propagation", () => {
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
+      abortController: new AbortController(),
     };
   }
 
@@ -1399,6 +1419,89 @@ describe("stop reason propagation", () => {
     expect(response.stopReason).toBe("end_turn");
   });
 
+  it("should consume background task results and return the prompt's own result", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    const backgroundTaskResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    // Background task used some tokens
+    backgroundTaskResult.usage.input_tokens = 100;
+    backgroundTaskResult.usage.output_tokens = 50;
+
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+
+    async function* messageGenerator() {
+      // Background task init + result arrive before our prompt's replay
+      yield { type: "system", subtype: "init", session_id: "test-session" };
+      yield backgroundTaskResult;
+
+      // Now the prompt's user message replay arrives
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+
+      // Then the prompt's own result
+      yield promptResult;
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cwd: "/tmp/test",
+      cancelled: false,
+      invocationPaths: resolveClaudeInvocationPaths(),
+      modes: {
+        currentModeId: "default",
+        availableModes: [],
+      },
+      models: {
+        currentModelId: "default",
+        availableModels: [],
+      },
+      settingsManager: {} as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      abortController: new AbortController(),
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Usage should include both background task and prompt result tokens
+    expect(response.usage?.inputTokens).toBe(
+      backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens,
+    );
+    expect(response.usage?.outputTokens).toBe(
+      backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens,
+    );
+  });
+
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
@@ -1416,5 +1519,90 @@ describe("stop reason propagation", () => {
         prompt: [{ type: "text", text: "test" }],
       }),
     ).rejects.toThrow("Internal error");
+  });
+});
+
+describe("session/close", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), { interrupt: vi.fn() });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd: "/test",
+      invocationPaths: resolveClaudeInvocationPaths(),
+      modes: {
+        currentModeId: "default",
+        availableModes: [],
+      },
+      models: {
+        currentModelId: "default",
+        availableModels: [],
+      },
+      settingsManager: {} as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+    };
+    return agent.sessions[sessionId]!;
+  }
+
+  it("should close an existing session and remove it", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "session-1");
+
+    expect(agent.sessions["session-1"]).toBeDefined();
+
+    const result = await agent.unstable_closeSession({ sessionId: "session-1" });
+
+    expect(result).toEqual({});
+    expect(agent.sessions["session-1"]).toBeUndefined();
+    expect(session.query.interrupt).toHaveBeenCalled();
+  });
+
+  it("should abort the session's abort controller", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "session-2");
+
+    expect(session.abortController.signal.aborted).toBe(false);
+
+    await agent.unstable_closeSession({ sessionId: "session-2" });
+
+    expect(session.abortController.signal.aborted).toBe(true);
+  });
+
+  it("should throw when closing a non-existent session", async () => {
+    const agent = createMockAgent();
+
+    await expect(agent.unstable_closeSession({ sessionId: "non-existent" })).rejects.toThrow(
+      "Session not found",
+    );
+  });
+
+  it("should not affect other sessions when closing one", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-a");
+    injectSession(agent, "session-b");
+
+    await agent.unstable_closeSession({ sessionId: "session-a" });
+
+    expect(agent.sessions["session-a"]).toBeUndefined();
+    expect(agent.sessions["session-b"]).toBeDefined();
   });
 });
