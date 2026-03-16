@@ -1344,7 +1344,7 @@ export class ClaudeAcpAgent implements Agent {
       ...(process.env.CLAUDE_CODE_EXECUTABLE
         ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
         : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: process.execPath }
+          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
           : {}),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
