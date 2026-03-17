@@ -1350,7 +1350,11 @@ export class ClaudeAcpAgent implements Agent {
       throw error;
     }
 
-    if (shouldHideClaudeAuth() && initializationResult.account.subscriptionType) {
+    if (
+      shouldHideClaudeAuth() &&
+      initializationResult.account.subscriptionType &&
+      this.gatewayAuthMeta === null
+    ) {
       throw RequestError.authRequired(
         undefined,
         "This integration does not support using claude.ai subscriptions.",
