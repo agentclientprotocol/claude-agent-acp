@@ -47,8 +47,9 @@ describe("additionalRoots", () => {
     } as unknown as AgentSideConnection);
   });
 
-  afterEach(async () =>
-    void (await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true }))))
+  afterEach(
+    async () =>
+      void (await Promise.all(tempDirs.map((dir) => rm(dir, { recursive: true, force: true })))),
   );
 
   it("passes through relative roots as provided", async () => {
