@@ -368,10 +368,14 @@ export function toolInfoFromToolUse(
     }
 
     case "ExitPlanMode": {
+      const planInput = toolUse.input as { plan?: string };
       return {
         title: "Ready to code?",
         kind: "switch_mode",
-        content: [],
+        content:
+          planInput?.plan
+            ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
+            : [],
       };
     }
 
