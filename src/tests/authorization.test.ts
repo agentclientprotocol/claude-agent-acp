@@ -148,7 +148,7 @@ describe("authorization", () => {
 
     const initializeResponse = await agent.initialize({
       protocolVersion: 1,
-      clientCapabilities: { auth: { terminal: true } },
+      clientCapabilities: { auth: { terminal: true } } as any,
     });
 
     expect(initializeResponse.authMethods).toContainEqual(

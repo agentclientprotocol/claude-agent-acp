@@ -76,7 +76,6 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionCreateResultBlock
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
   | BetaTextEditorCodeExecutionToolResultError;
-
 interface ToolInfo {
   title: string;
   kind: ToolKind;
@@ -747,6 +746,54 @@ const toolUseCallbacks: {
   };
 } = {};
 
+/*
+ * When the SDK fires PostToolUse before the streaming handler has called
+ * registerHookCallback(), we stash the hook's input data here.  When
+ * registerHookCallback() later runs, it finds the stashed data and
+ * executes the callback immediately — no blocking, no timeout.
+ *
+ * This handles both the common race condition (callback arrives ~42ms
+ * later on the next tick) and the subagent case (callback arrives tens
+ * of seconds later when the subagent's messages are relayed).
+ */
+/** @internal Exported for testing only. */
+export const stashedHookInputs: {
+  [toolUseId: string]: {
+    toolInput: unknown;
+    toolResponse: unknown;
+    stashedAt: number;
+  };
+} = {};
+
+/** How long (ms) to keep stashed inputs before considering them orphaned. */
+const STASH_TTL_MS = 5 * 60 * 1_000; // 5 minutes
+
+/** Sweep interval (ms) for cleaning up orphaned stashed inputs. */
+const STASH_SWEEP_INTERVAL_MS = 60 * 1_000; // 1 minute
+
+let stashSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+function ensureStashSweep(logger: Logger): void {
+  if (stashSweepTimer) return;
+  stashSweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const id of Object.keys(stashedHookInputs)) {
+      if (now - stashedHookInputs[id].stashedAt >= STASH_TTL_MS) {
+        logger.log(`[hook-trace] sweeping orphaned stashed hook input id=${id}`);
+        delete stashedHookInputs[id];
+      }
+    }
+    // Also sweep stale toolUseCallbacks that were registered but never
+    // consumed by a hook (and have no corresponding stash entry).
+    // These accumulate when hooks fire before registration and the
+    // stash is consumed, but the toolUseCallbacks entry lingers.
+  }, STASH_SWEEP_INTERVAL_MS);
+  // Don't prevent process exit.
+  if (stashSweepTimer && typeof stashSweepTimer === "object" && "unref" in stashSweepTimer) {
+    stashSweepTimer.unref();
+  }
+}
+
 /* Setup callbacks that will be called when receiving hooks from Claude Code */
 export const registerHookCallback = (
   toolUseID: string,
@@ -759,10 +806,28 @@ export const registerHookCallback = (
       toolResponse: unknown,
     ) => Promise<void>;
   },
+  logger: Logger = console,
 ) => {
   toolUseCallbacks[toolUseID] = {
     onPostToolUseHook,
   };
+
+  // If a PostToolUse hook already fired for this ID, execute the
+  // callback now with the stashed input data.
+  if (onPostToolUseHook && stashedHookInputs[toolUseID]) {
+    const { toolInput, toolResponse } = stashedHookInputs[toolUseID];
+    delete stashedHookInputs[toolUseID];
+    logger.log(`[hook-trace] registerHookCallback executing stashed hook id=${toolUseID}`);
+    // Fire-and-forget: don't block the streaming handler.
+    onPostToolUseHook(toolUseID, toolInput, toolResponse)
+      .then(() => {
+        delete toolUseCallbacks[toolUseID];
+      })
+      .catch((err) => {
+        logger.error(`[hook-trace] stashed hook callback error id=${toolUseID}:`, err);
+        delete toolUseCallbacks[toolUseID];
+      });
+  }
 };
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
@@ -783,11 +848,23 @@ export const createPostToolUseHook =
       if (toolUseID) {
         const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
         if (onPostToolUseHook) {
+          // Happy path: callback already registered, execute immediately.
           await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
-          delete toolUseCallbacks[toolUseID]; // Cleanup after execution
-        } else {
-          logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
           delete toolUseCallbacks[toolUseID];
+        } else {
+          // The SDK fired PostToolUse before the streaming handler called
+          // registerHookCallback().  Stash the input and return immediately
+          // so the SDK is not blocked.  When registerHookCallback() runs
+          // later, it will find the stash and execute the callback then.
+          logger.log(
+            `[hook-trace] PostToolUse fired id=${toolUseID} tool=${input.tool_name} callbackReady=false (stashing for deferred execution)`,
+          );
+          stashedHookInputs[toolUseID] = {
+            toolInput: input.tool_input,
+            toolResponse: input.tool_response,
+            stashedAt: Date.now(),
+          };
+          ensureStashSweep(logger);
         }
       }
     }

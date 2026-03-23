@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -11,7 +11,12 @@ import {
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
-import { toolUpdateFromToolResult, createPostToolUseHook } from "../tools.js";
+import {
+  toolUpdateFromToolResult,
+  createPostToolUseHook,
+  registerHookCallback,
+  stashedHookInputs,
+} from "../tools.js";
 
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AgentSideConnection;
@@ -873,7 +878,7 @@ describe("Bash terminal output", () => {
       const hook = createPostToolUseHook(mockLogger);
       await hook(
         {
-          hook_event_name: "PostToolUse",
+          hook_event_name: "PostToolUse" as const,
           tool_name: "Edit",
           tool_input: {
             file_path: "/Users/test/project/file.ts",
@@ -951,7 +956,7 @@ describe("Bash terminal output", () => {
       const hook = createPostToolUseHook(mockLogger);
       await hook(
         {
-          hook_event_name: "PostToolUse",
+          hook_event_name: "PostToolUse" as const,
           tool_name: "Edit",
           tool_input: {
             file_path: "/Users/test/project/file.ts",
@@ -1031,7 +1036,7 @@ describe("Bash terminal output", () => {
       const hook = createPostToolUseHook(mockLogger);
       await hook(
         {
-          hook_event_name: "PostToolUse",
+          hook_event_name: "PostToolUse" as const,
           tool_name: "Bash",
           tool_input: { command: "echo hi" },
           tool_response: "hi",
@@ -1131,7 +1136,7 @@ describe("Bash terminal output", () => {
       const hook = createPostToolUseHook(mockLogger);
       await hook(
         {
-          hook_event_name: "PostToolUse",
+          hook_event_name: "PostToolUse" as const,
           tool_name: "Bash",
           tool_input: { command: "ls -la" },
           tool_response: "file1.txt",
@@ -1212,7 +1217,7 @@ describe("Bash terminal output", () => {
       const hook = createPostToolUseHook(mockLogger);
       await hook(
         {
-          hook_event_name: "PostToolUse",
+          hook_event_name: "PostToolUse" as const,
           tool_name: "Bash",
           tool_input: { command: "echo hi" },
           tool_response: "hi",
@@ -1232,6 +1237,389 @@ describe("Bash terminal output", () => {
       expect(hookMeta.terminal_info).toBeUndefined();
       expect(hookMeta.terminal_output).toBeUndefined();
       expect(hookMeta.terminal_exit).toBeUndefined();
+    });
+  });
+
+  describe("PostToolUse callback execution contract (fire-and-stash)", () => {
+    // These tests verify the observable contract between PostToolUse
+    // hooks and registerHookCallback using the non-blocking
+    // fire-and-stash model:
+    //
+    //   1. Callback registered THEN hook fires → callback executes synchronously
+    //   2. Hook fires THEN callback registered → input is stashed, callback
+    //      executes when registration arrives (no blocking, no timeout)
+    //   3. No errors logged in either ordering
+    //   4. Callback receives correct toolInput and toolResponse
+    //   5. Multiple hooks with mixed ordering don't interfere
+    //   6. Hook NEVER blocks — always returns { continue: true } immediately
+    //   7. Subagent child tool uses (callback arrives much later) work correctly
+    //
+    // The fire-and-forget callbacks use .then() chains (microtasks).
+    // Flush them deterministically instead of using real setTimeout delays.
+    // Depth 5 covers: async callback execution (1-2) + .then cleanup (1)
+    // + .catch chain (1) + headroom (1). If future changes add awaits
+    // to registerHookCallback's fire-and-forget path, increase this.
+    async function flushMicrotasks() {
+      for (let i = 0; i < 5; i++) await Promise.resolve();
+    }
+    //
+    function postToolUseInput(
+      toolUseId: string,
+      toolName: string,
+      toolInput: unknown = {},
+      toolResponse: unknown = "",
+    ) {
+      return {
+        hook_event_name: "PostToolUse" as const,
+        tool_name: toolName,
+        tool_input: toolInput,
+        tool_response: toolResponse,
+        tool_use_id: toolUseId,
+        session_id: "test-session",
+        transcript_path: "/tmp/test",
+        cwd: "/tmp",
+      };
+    }
+
+    // Clean up stashed state between tests to avoid cross-contamination.
+    afterEach(() => {
+      for (const key of Object.keys(stashedHookInputs)) {
+        delete stashedHookInputs[key];
+      }
+    });
+
+    it("executes callback immediately when registered before hook fires", async () => {
+      const received: { id: string; input: unknown; response: unknown }[] = [];
+
+      registerHookCallback("toolu_before_1", {
+        onPostToolUseHook: async (id, input, response) => {
+          received.push({ id, input, response });
+        },
+      });
+
+      const hook = createPostToolUseHook(mockLogger);
+      const result = await hook(
+        postToolUseInput("toolu_before_1", "Bash", { command: "ls" }, "file.txt"),
+        "toolu_before_1",
+        { signal: AbortSignal.abort() },
+      );
+
+      expect(result).toEqual({ continue: true });
+      expect(received).toHaveLength(1);
+      expect(received[0]).toEqual({
+        id: "toolu_before_1",
+        input: { command: "ls" },
+        response: "file.txt",
+      });
+      // Stash should be empty — happy path doesn't use it.
+      expect(stashedHookInputs["toolu_before_1"]).toBeUndefined();
+    });
+
+    it("stashes input and executes callback when registered after hook fires (42ms race condition)", async () => {
+      // This is the original bug from PR #353: the SDK fires PostToolUse
+      // ~42ms before the streaming handler processes the tool_use block.
+      const received: { id: string; input: unknown; response: unknown }[] = [];
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Hook fires first — no callback registered yet.
+      const result = await hook(
+        postToolUseInput("toolu_race_1", "Read", { file_path: "/tmp/f" }, "contents"),
+        "toolu_race_1",
+        { signal: AbortSignal.abort() },
+      );
+
+      // Hook returns immediately (non-blocking).
+      expect(result).toEqual({ continue: true });
+
+      // Input should be stashed.
+      expect(stashedHookInputs["toolu_race_1"]).toBeDefined();
+      expect(stashedHookInputs["toolu_race_1"].toolInput).toEqual({ file_path: "/tmp/f" });
+      expect(stashedHookInputs["toolu_race_1"].toolResponse).toBe("contents");
+
+      // Registration arrives on the next tick (simulates streaming lag).
+      registerHookCallback("toolu_race_1", {
+        onPostToolUseHook: async (id, input, response) => {
+          received.push({ id, input, response });
+        },
+      });
+
+      // The callback fires asynchronously — flush microtasks.
+      await flushMicrotasks();
+
+      expect(received).toHaveLength(1);
+      expect(received[0]).toEqual({
+        id: "toolu_race_1",
+        input: { file_path: "/tmp/f" },
+        response: "contents",
+      });
+      // Stash should be cleaned up after execution.
+      expect(stashedHookInputs["toolu_race_1"]).toBeUndefined();
+    });
+
+    it("does not log errors regardless of registration ordering", async () => {
+      const errors: string[] = [];
+      const spyLogger: Logger = {
+        log: () => {},
+        error: (...args: any[]) => {
+          errors.push(args.map(String).join(" "));
+        },
+      };
+
+      const hook = createPostToolUseHook(spyLogger);
+
+      // Case A: register-then-fire
+      registerHookCallback("toolu_noerr_a", {
+        onPostToolUseHook: async () => {},
+      });
+      await hook(postToolUseInput("toolu_noerr_a", "Bash"), "toolu_noerr_a", {
+        signal: AbortSignal.abort(),
+      });
+
+      // Case B: fire-then-register
+      await hook(postToolUseInput("toolu_noerr_b", "Grep"), "toolu_noerr_b", {
+        signal: AbortSignal.abort(),
+      });
+      registerHookCallback(
+        "toolu_noerr_b",
+        {
+          onPostToolUseHook: async () => {},
+        },
+        spyLogger,
+      );
+      await flushMicrotasks();
+
+      expect(errors).toHaveLength(0);
+    });
+
+    it("keeps hooks independent when some are pre-registered and some are late", async () => {
+      const callOrder: string[] = [];
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Register callback A upfront.
+      registerHookCallback("toolu_indep_a", {
+        onPostToolUseHook: async (id) => {
+          callOrder.push(id);
+        },
+      });
+
+      // Fire hook B first (no registration yet), then hook A.
+      await hook(postToolUseInput("toolu_indep_b", "Read"), "toolu_indep_b", {
+        signal: AbortSignal.abort(),
+      });
+
+      await hook(postToolUseInput("toolu_indep_a", "Bash"), "toolu_indep_a", {
+        signal: AbortSignal.abort(),
+      });
+
+      // A should have executed immediately (happy path).
+      expect(callOrder).toEqual(["toolu_indep_a"]);
+
+      // Now register B — it should find the stash and execute.
+      registerHookCallback("toolu_indep_b", {
+        onPostToolUseHook: async (id) => {
+          callOrder.push(id);
+        },
+      });
+
+      await flushMicrotasks();
+      expect(callOrder).toEqual(["toolu_indep_a", "toolu_indep_b"]);
+    });
+
+    it("hook NEVER blocks — returns { continue: true } immediately even when callback is missing", async () => {
+      // This is the critical regression test.  The old blocking model
+      // waited up to 5 seconds; the new model must return instantly.
+      const hook = createPostToolUseHook(mockLogger);
+
+      const start = Date.now();
+      const result = await hook(
+        postToolUseInput("toolu_noblock_1", "Bash", { command: "slow" }, "output"),
+        "toolu_noblock_1",
+        { signal: AbortSignal.abort() },
+      );
+      const elapsed = Date.now() - start;
+
+      expect(result).toEqual({ continue: true });
+      // Must complete in well under 1 second — the old code would take 5s.
+      expect(elapsed).toBeLessThan(100);
+      // Input should be stashed for later.
+      expect(stashedHookInputs["toolu_noblock_1"]).toBeDefined();
+    });
+
+    it("subagent child tool uses: callback arrives much later and still executes", async () => {
+      // Reproduces the real-world scenario from protocol logs: the SDK
+      // fires PostToolUse for subagent child tool uses, but the callback
+      // isn't registered until the subagent finishes (potentially tens
+      // of seconds later).
+      const received: { id: string; input: unknown; response: unknown }[] = [];
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Subagent child tools fire their hooks.
+      await hook(
+        postToolUseInput("toolu_sub_1", "Bash", { command: "ls" }, "file.txt"),
+        "toolu_sub_1",
+        { signal: AbortSignal.abort() },
+      );
+      await hook(
+        postToolUseInput("toolu_sub_2", "Glob", { pattern: "*.ts" }, "found.ts"),
+        "toolu_sub_2",
+        { signal: AbortSignal.abort() },
+      );
+      await hook(
+        postToolUseInput("toolu_sub_3", "Read", { file_path: "/f" }, "data"),
+        "toolu_sub_3",
+        { signal: AbortSignal.abort() },
+      );
+
+      // All three should be stashed (no blocking).
+      expect(Object.keys(stashedHookInputs)).toContain("toolu_sub_1");
+      expect(Object.keys(stashedHookInputs)).toContain("toolu_sub_2");
+      expect(Object.keys(stashedHookInputs)).toContain("toolu_sub_3");
+
+      // Simulate delay — subagent finishes and messages are relayed.
+      // (In real life this could be 30+ seconds.)
+      // No real delay needed — just flush microtasks after registration.
+
+      // Now registration arrives for all three.
+      for (const id of ["toolu_sub_1", "toolu_sub_2", "toolu_sub_3"]) {
+        registerHookCallback(id, {
+          onPostToolUseHook: async (toolId, input, response) => {
+            received.push({ id: toolId, input, response });
+          },
+        });
+      }
+
+      await flushMicrotasks();
+
+      expect(received).toHaveLength(3);
+      expect(received.map((r) => r.id).sort()).toEqual([
+        "toolu_sub_1",
+        "toolu_sub_2",
+        "toolu_sub_3",
+      ]);
+      expect(received.find((r) => r.id === "toolu_sub_1")!.input).toEqual({ command: "ls" });
+      expect(received.find((r) => r.id === "toolu_sub_2")!.response).toBe("found.ts");
+      expect(received.find((r) => r.id === "toolu_sub_3")!.input).toEqual({ file_path: "/f" });
+
+      // All stashes should be cleaned up.
+      expect(stashedHookInputs["toolu_sub_1"]).toBeUndefined();
+      expect(stashedHookInputs["toolu_sub_2"]).toBeUndefined();
+      expect(stashedHookInputs["toolu_sub_3"]).toBeUndefined();
+    });
+
+    it("stale callbacks from earlier turns are not consumed by later hooks for different IDs", async () => {
+      // Verifies that a PostToolUse hook for ID X does not accidentally
+      // consume a callback registered for ID Y, even though Y's callback
+      // sits in the map.
+      const callbackCalled: string[] = [];
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Register callback for "stale" ID — its hook will never fire.
+      registerHookCallback("toolu_stale_iso_1", {
+        onPostToolUseHook: async (id) => {
+          callbackCalled.push(id);
+        },
+      });
+
+      // Fire hook for a completely different ID.
+      await hook(postToolUseInput("toolu_diff_iso_1", "Bash"), "toolu_diff_iso_1", {
+        signal: AbortSignal.abort(),
+      });
+
+      await flushMicrotasks();
+
+      // The stale callback should NOT have been invoked.
+      expect(callbackCalled).toHaveLength(0);
+      // The different ID should be stashed.
+      expect(stashedHookInputs["toolu_diff_iso_1"]).toBeDefined();
+    });
+
+    it("batch of subagent hooks all stash and resolve correctly when callbacks arrive", async () => {
+      // Protocol logs show hooks arriving in batches (e.g., 3 Bash + 2
+      // Glob from a single Agent subagent call).
+      const received: string[] = [];
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Fire 3 hooks in quick succession — none have callbacks yet.
+      const resultA = await hook(postToolUseInput("toolu_bat_a", "Bash"), "toolu_bat_a", {
+        signal: AbortSignal.abort(),
+      });
+      const resultB = await hook(postToolUseInput("toolu_bat_b", "Glob"), "toolu_bat_b", {
+        signal: AbortSignal.abort(),
+      });
+      const resultC = await hook(postToolUseInput("toolu_bat_c", "Read"), "toolu_bat_c", {
+        signal: AbortSignal.abort(),
+      });
+
+      // All return immediately.
+      expect(resultA).toEqual({ continue: true });
+      expect(resultB).toEqual({ continue: true });
+      expect(resultC).toEqual({ continue: true });
+
+      // All stashed.
+      expect(Object.keys(stashedHookInputs).sort()).toEqual([
+        "toolu_bat_a",
+        "toolu_bat_b",
+        "toolu_bat_c",
+      ]);
+
+      // Register callbacks (simulating subagent message relay).
+      for (const id of ["toolu_bat_a", "toolu_bat_b", "toolu_bat_c"]) {
+        registerHookCallback(id, {
+          onPostToolUseHook: async (toolId) => {
+            received.push(toolId);
+          },
+        });
+      }
+
+      await flushMicrotasks();
+
+      expect(received.sort()).toEqual(["toolu_bat_a", "toolu_bat_b", "toolu_bat_c"]);
+    });
+
+    it("always returns { continue: true } even in the stash case", async () => {
+      const hook = createPostToolUseHook(mockLogger);
+
+      // Fire without registration — should stash and return immediately.
+      const result = await hook(postToolUseInput("toolu_cont_1", "Agent"), "toolu_cont_1", {
+        signal: AbortSignal.abort(),
+      });
+
+      expect(result).toEqual({ continue: true });
+    });
+
+    it("callback error in stash path is caught and logged, not thrown", async () => {
+      const errors: string[] = [];
+      const spyLogger: Logger = {
+        log: () => {},
+        error: (...args: any[]) => {
+          errors.push(args.map(String).join(" "));
+        },
+      };
+
+      const hook = createPostToolUseHook(spyLogger);
+
+      // Fire hook — stash input.
+      await hook(postToolUseInput("toolu_err_1", "Bash", {}, ""), "toolu_err_1", {
+        signal: AbortSignal.abort(),
+      });
+
+      // Register a callback that throws.
+      registerHookCallback(
+        "toolu_err_1",
+        {
+          onPostToolUseHook: async () => {
+            throw new Error("callback boom");
+          },
+        },
+        spyLogger,
+      );
+
+      await flushMicrotasks();
+
+      // Error should be logged, not thrown.
+      expect(
+        errors.some((e) => e.includes("stashed hook callback error") && e.includes("toolu_err_1")),
+      ).toBe(true);
     });
   });
 });
