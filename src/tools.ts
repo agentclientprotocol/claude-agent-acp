@@ -481,7 +481,7 @@ export function toolUpdateFromToolResult(
         result.type === "bash_code_execution_result"
       ) {
         const bashResult = result as BetaBashCodeExecutionResultBlock;
-        output = bashResult.stdout || bashResult.stderr || "";
+        output = [bashResult.stdout, bashResult.stderr].filter(Boolean).join("\n");
         exitCode = bashResult.return_code;
       } else if (typeof result === "string") {
         output = result;
