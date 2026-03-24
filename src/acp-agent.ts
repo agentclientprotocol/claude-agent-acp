@@ -479,8 +479,7 @@ export class ClaudeAcpAgent implements Agent {
     // background task result.
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     const isLocalOnlyCommand =
-      firstText.startsWith("/") &&
-      LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
     if (isLocalOnlyCommand) {
       promptReplayed = true;
     }
