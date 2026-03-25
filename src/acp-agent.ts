@@ -557,6 +557,12 @@ export class ClaudeAcpAgent implements Agent {
                 promptReplayed = true;
                 break;
               }
+              case "session_state_changed": {
+                if (message.state === "idle") {
+                  return { stopReason: "end_turn", usage: sessionUsage(session) };
+                }
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -566,7 +572,6 @@ export class ClaudeAcpAgent implements Agent {
               case "task_progress":
               case "elicitation_complete":
               case "api_retry":
-              case "session_state_changed":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -619,17 +624,7 @@ export class ClaudeAcpAgent implements Agent {
             }
 
             // Build the usage response
-            const usage: PromptResponse["usage"] = {
-              inputTokens: session.accumulatedUsage.inputTokens,
-              outputTokens: session.accumulatedUsage.outputTokens,
-              cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
-              cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
-              totalTokens:
-                session.accumulatedUsage.inputTokens +
-                session.accumulatedUsage.outputTokens +
-                session.accumulatedUsage.cachedReadTokens +
-                session.accumulatedUsage.cachedWriteTokens,
-            };
+            const usage = sessionUsage(session);
 
             switch (message.subtype) {
               case "success": {
@@ -656,9 +651,9 @@ export class ClaudeAcpAgent implements Agent {
                     await this.client.sessionUpdate(notification);
                   }
                 }
-                return { stopReason: "end_turn", usage };
+                break;
               }
-              case "error_during_execution":
+              case "error_during_execution": {
                 if (message.stop_reason === "max_tokens") {
                   return { stopReason: "max_tokens", usage };
                 }
@@ -668,7 +663,8 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                return { stopReason: "end_turn", usage };
+                break;
+              }
               case "error_max_budget_usd":
               case "error_max_turns":
               case "error_max_structured_output_retries":
@@ -715,6 +711,7 @@ export class ClaudeAcpAgent implements Agent {
                 promptReplayed = true;
                 break;
               }
+
               const pending = session.pendingMessages.get(message.uuid as string);
               if (pending) {
                 pending.resolve(false);
@@ -722,7 +719,7 @@ export class ClaudeAcpAgent implements Agent {
                 handedOff = true;
                 // the current loop stops with end_turn,
                 // the loop of the next prompt continues running
-                return { stopReason: "end_turn" };
+                return { stopReason: "end_turn", usage: sessionUsage(session) };
               }
               if ("isReplay" in message && message.isReplay) {
                 // not pending or unrelated replay message
@@ -1350,6 +1347,8 @@ export class ClaudeAcpAgent implements Agent {
         ...process.env,
         ...userProvidedOptions?.env,
         ...createEnvForGateway(this.gatewayAuthMeta),
+        // Opt-in to session state events like when the agent is idle
+        CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
       },
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
@@ -1513,6 +1512,20 @@ export class ClaudeAcpAgent implements Agent {
       configOptions,
     };
   }
+}
+
+function sessionUsage(session: Session) {
+  return {
+    inputTokens: session.accumulatedUsage.inputTokens,
+    outputTokens: session.accumulatedUsage.outputTokens,
+    cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+    cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+    totalTokens:
+      session.accumulatedUsage.inputTokens +
+      session.accumulatedUsage.outputTokens +
+      session.accumulatedUsage.cachedReadTokens +
+      session.accumulatedUsage.cachedWriteTokens,
+  };
 }
 
 function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
