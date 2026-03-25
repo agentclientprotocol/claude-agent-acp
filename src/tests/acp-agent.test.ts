@@ -1336,6 +1336,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1478,6 +1479,7 @@ describe("stop reason propagation", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1554,6 +1556,7 @@ describe("session/close", () => {
         currentModelId: "default",
         availableModels: [],
       },
+      modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
