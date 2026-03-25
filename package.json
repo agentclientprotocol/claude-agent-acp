@@ -60,22 +60,22 @@
   "author": "Zed Industries",
   "license": "Apache-2.0",
   "dependencies": {
-    "@agentclientprotocol/sdk": "0.16.1",
-    "@anthropic-ai/claude-agent-sdk": "0.2.76",
+    "@agentclientprotocol/sdk": "0.17.0",
+    "@anthropic-ai/claude-agent-sdk": "0.2.83",
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.78.0",
+    "@anthropic-ai/sdk": "0.80.0",
     "@eslint/js": "10.0.1",
     "@types/node": "25.5.0",
-    "@typescript-eslint/eslint-plugin": "8.57.0",
-    "@typescript-eslint/parser": "8.57.0",
-    "eslint": "10.0.3",
+    "@typescript-eslint/eslint-plugin": "8.57.2",
+    "@typescript-eslint/parser": "8.57.2",
+    "eslint": "10.1.0",
     "eslint-config-prettier": "10.1.8",
     "globals": "17.4.0",
     "prettier": "3.8.1",
     "ts-node": "10.9.2",
     "typescript": "5.9.3",
-    "vitest": "4.1.0"
+    "vitest": "4.1.1"
   }
 }
