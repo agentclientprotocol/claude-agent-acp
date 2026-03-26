@@ -663,7 +663,7 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                break;
+                return { stopReason: "end_turn", usage: sessionUsage(session) };
               }
               case "error_max_budget_usd":
               case "error_max_turns":
