@@ -25,9 +25,14 @@ export interface ClaudeCodeSettings {
 }
 
 /**
- * Reads and parses a JSON settings file, returning an empty object if not found or invalid
+ * Reads and parses a JSON settings file, returning an empty object if not found or invalid.
+ * Silently ignores missing files (ENOENT) but logs warnings for other errors
+ * (malformed JSON, permission errors, etc.) to aid debugging.
  */
-async function loadSettingsFile(filePath: string | null): Promise<ClaudeCodeSettings> {
+async function loadSettingsFile(
+  filePath: string | null,
+  logger?: { error: (...args: any[]) => void },
+): Promise<ClaudeCodeSettings> {
   if (!filePath) {
     return {};
   }
@@ -35,7 +40,11 @@ async function loadSettingsFile(filePath: string | null): Promise<ClaudeCodeSett
   try {
     const content = await fs.promises.readFile(filePath, "utf-8");
     return JSON.parse(content) as ClaudeCodeSettings;
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return {};
+    }
+    logger?.error(`Failed to load settings from ${filePath}:`, error);
     return {};
   }
 }
@@ -130,10 +139,10 @@ export class SettingsManager {
    */
   private async loadAllSettings(): Promise<void> {
     const [userSettings, projectSettings, localSettings, enterpriseSettings] = await Promise.all([
-      loadSettingsFile(this.getUserSettingsPath()),
-      loadSettingsFile(this.getProjectSettingsPath()),
-      loadSettingsFile(this.getLocalSettingsPath()),
-      loadSettingsFile(getManagedSettingsPath()),
+      loadSettingsFile(this.getUserSettingsPath(), this.logger),
+      loadSettingsFile(this.getProjectSettingsPath(), this.logger),
+      loadSettingsFile(this.getLocalSettingsPath(), this.logger),
+      loadSettingsFile(getManagedSettingsPath(), this.logger),
     ]);
 
     this.userSettings = userSettings;
