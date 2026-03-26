@@ -2,6 +2,20 @@ import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import { ClaudeAcpAgent } from "../acp-agent.js";
 import { AgentSideConnection } from "@agentclientprotocol/sdk";
 
+const mockQuery = vi.hoisted(() =>
+  vi.fn(() => ({
+    initializationResult: vi.fn().mockResolvedValue({
+      models: [{ value: "id", displayName: "name", description: "description" }],
+    }),
+    setModel: vi.fn(),
+    supportedCommands: vi.fn().mockResolvedValue([]),
+  })),
+);
+
+vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+  query: mockQuery,
+}));
+
 describe("authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -17,20 +31,6 @@ describe("authorization", () => {
   });
 
   async function createAgentMock(): Promise<[ClaudeAcpAgent, Mock]> {
-    const mockQuery = vi.hoisted(() =>
-      vi.fn(() => ({
-        initializationResult: vi.fn().mockResolvedValue({
-          models: [{ value: "id", displayName: "name", description: "description" }],
-        }),
-        setModel: vi.fn(),
-        supportedCommands: vi.fn().mockResolvedValue([]),
-      })),
-    );
-
-    vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-      query: mockQuery,
-    }));
-
     const connectionMock = {
       sessionUpdate: async (_: any) => {},
     } as AgentSideConnection;
