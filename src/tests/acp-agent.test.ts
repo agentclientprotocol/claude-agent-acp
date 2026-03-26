@@ -1355,7 +1355,7 @@ describe("stop reason propagation", () => {
     const agent = createMockAgent();
     injectSession(agent, [
       createResultMessage({ subtype: "success", stop_reason: "max_tokens", is_error: false }),
-      { type: "system", subtype: "session_state_changed", state: "idle" }
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1375,7 +1375,7 @@ describe("stop reason propagation", () => {
         is_error: true,
         result: "Token limit reached",
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" }
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1395,7 +1395,7 @@ describe("stop reason propagation", () => {
         is_error: true,
         errors: ["some error"],
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" }
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
