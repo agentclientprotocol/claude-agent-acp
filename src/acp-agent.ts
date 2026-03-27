@@ -1256,7 +1256,8 @@ export class ClaudeAcpAgent implements Agent {
     const mcpServers: Record<string, McpServerConfig> = {};
     if (Array.isArray(params.mcpServers)) {
       for (const server of params.mcpServers) {
-        if ("type" in server) {
+        if ("type" in server && (server.type === "http" || server.type === "sse")) {
+          // HTTP or SSE type MCP server
           mcpServers[server.name] = {
             type: server.type,
             url: server.url,
@@ -1265,6 +1266,7 @@ export class ClaudeAcpAgent implements Agent {
               : undefined,
           };
         } else {
+          // Stdio type MCP server (with or without explicit type field)
           mcpServers[server.name] = {
             type: "stdio",
             command: server.command,
