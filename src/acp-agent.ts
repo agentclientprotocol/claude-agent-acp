@@ -468,6 +468,8 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     let lastAssistantTotalUsage: number | null = null;
+    let lastAssistantModel: string | null = null;
+    let lastContextWindowSize: number = 200000;
 
     const userMessage = promptToClaude(params);
 
@@ -527,9 +529,26 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "compact_boundary": {
-                // We don't know the exact size, but since we compacted,
-                // we set it to zero. The client gets the exact size on the next message.
+                // Send used:0 immediately so the client doesn't keep showing
+                // the stale pre-compaction context size until the next turn.
+                //
+                // This is a deliberate approximation: we don't know the exact
+                // post-compaction token count (only the SDK's next API call
+                // reveals that). But used:0 is directionally correct — context
+                // just dropped dramatically — and the real value replaces it
+                // within seconds when the next result message arrives.
+                // The alternative (no update) leaves the client showing e.g.
+                // "944k/1m" right after the user sees "Compacting completed",
+                // which is confusing and wrong.
                 lastAssistantTotalUsage = 0;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "usage_update",
+                    used: 0,
+                    size: lastContextWindowSize,
+                  },
+                });
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -578,10 +597,23 @@ export class ClaudeAcpAgent implements Agent {
             session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
             session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
 
-            // Calculate context window size from modelUsage (minimum across all models used)
-            const contextWindows = Object.values(message.modelUsage).map((m) => m.contextWindow);
-            const contextWindowSize =
-              contextWindows.length > 0 ? Math.min(...contextWindows) : 200000;
+            // Calculate context window size from the current model's usage.
+            // The modelUsage keys may use the requested model alias (e.g. "claude-opus-4-6")
+            // while message.model on assistant messages has the resolved API response model
+            // (e.g. "claude-opus-4-6-20250514"), so we fall back to prefix matching.
+            const currentModel = lastAssistantModel;
+            const matchingModelUsage = currentModel
+              ? (message.modelUsage[currentModel] ??
+                Object.entries(message.modelUsage)
+                  .filter(([key]) => currentModel.startsWith(key) || key.startsWith(currentModel))
+                  .sort((a, b) => b[0].length - a[0].length)[0]?.[1])
+              : undefined;
+            // Fallback to 200k: this is hit when lastAssistantModel is null (e.g. the
+            // assistant message lacked a model field) or no modelUsage key matches.
+            // 200k is a conservative default — the Anthropic API should always populate
+            // BetaMessage.model, so this path is unlikely in practice.
+            const contextWindowSize = matchingModelUsage?.contextWindow ?? 200000;
+            lastContextWindowSize = contextWindowSize;
 
             // Send usage_update notification
             if (lastAssistantTotalUsage !== null) {
@@ -707,6 +739,11 @@ export class ClaudeAcpAgent implements Agent {
             }
 
             // Store latest assistant usage (excluding subagents)
+            // Sum all token types as a proxy for post-turn context occupancy:
+            // current turn's output will become next turn's input.
+            // Note: per the Anthropic API, input_tokens excludes cache tokens —
+            // cache_read and cache_creation are reported separately, so summing
+            // all four fields is not double-counting.
             if ((message.message as any).usage && message.parent_tool_use_id === null) {
               const messageWithUsage = message.message as unknown as SDKResultMessage;
               lastAssistantTotalUsage =
@@ -714,6 +751,16 @@ export class ClaudeAcpAgent implements Agent {
                 messageWithUsage.usage.output_tokens +
                 messageWithUsage.usage.cache_read_input_tokens +
                 messageWithUsage.usage.cache_creation_input_tokens;
+            }
+            // Track the current top-level model for context window size lookup
+            // (exclude subagent messages to stay in sync with lastAssistantTotalUsage)
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model &&
+              message.message.model !== "<synthetic>"
+            ) {
+              lastAssistantModel = message.message.model;
             }
 
             // Slash commands like /compact can generate invalid output... doesn't match
