@@ -40,7 +40,6 @@ import {
   TerminalOutputResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
-  StopReason,
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
@@ -511,7 +510,7 @@ export class ClaudeAcpAgent implements Agent {
 
     session.promptRunning = true;
     let handedOff = false;
-    let stopReason: StopReason = "end_turn";
+    let stopReason: "end_turn" | "max_tokens" | "cancelled" = "end_turn";
     // Saved prompt response when consuming internal turns from background
     // task completions. See the "success" result handler below.
     let savedPromptResponse: PromptResponse | undefined;
@@ -647,6 +646,12 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "task_progress":
                 break;
+              case "session_state_changed": {
+                if (message.state === "idle") {
+                  return { stopReason, usage: sessionUsage(session) };
+                }
+                break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
@@ -869,7 +874,6 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                stopReason = "end_turn";
                 break;
               }
               case "error_max_budget_usd":
@@ -881,7 +885,6 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                stopReason = "max_turn_requests";
                 break;
               default:
                 unreachable(message, this.logger);
