@@ -1710,7 +1710,14 @@ describe("usage_update computation", () => {
       input,
       cancelled: false,
       cwd: "/test",
-      permissionMode: "default",
+      modes: {
+        currentModeId: "default",
+        availableModes: [],
+      },
+      models: {
+        currentModelId: "default",
+        availableModels: [],
+      },
       settingsManager: {} as any,
       accumulatedUsage: {
         inputTokens: 0,
@@ -1752,6 +1759,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1790,6 +1798,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1829,6 +1838,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1869,6 +1879,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1924,6 +1935,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1954,6 +1966,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -1982,6 +1995,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2026,6 +2040,7 @@ describe("usage_update computation", () => {
           },
         },
       }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });

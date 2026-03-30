@@ -48,6 +48,7 @@ import {
   listSessions,
   McpServerConfig,
   ModelInfo,
+  ModelUsage,
   Options,
   PermissionMode,
   Query,
