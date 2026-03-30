@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Runs the same checks as CI by parsing .github/workflows/ci.yml directly.
+# If CI steps change, this script automatically picks them up.
+#
+# Local adaptations:
+# - `npm ci` checks if node_modules is in sync with package-lock.json
+#   and runs a clean install if not (CI always does npm ci).
+# - `npm run format:check` checks only git-tracked files because CI
+#   runs on a clean checkout but locally we have untracked x.* scratch
+#   files that fail prettier.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+ci_yaml=".github/workflows/ci.yml"
+
+if ! command -v yq &>/dev/null; then
+  echo "error: yq is required (brew install yq)" >&2
+  exit 1
+fi
+
+# Extract run steps
+mapfile -t names < <(yq '.jobs.build.steps[] | select(.run) | .name' "$ci_yaml")
+mapfile -t commands < <(yq '.jobs.build.steps[] | select(.run) | .run' "$ci_yaml")
+
+for i in "${!commands[@]}"; do
+  cmd="${commands[$i]}"
+  name="${names[$i]}"
+
+  echo "=== ${name} ==="
+
+  if [[ "$cmd" == "npm ci" ]]; then
+    # Check if node_modules matches package-lock.json. If not, run
+    # npm ci to match what CI does. This catches stale-dependency bugs
+    # like sdk-tools.d.ts resolving locally but not in CI.
+    if npm ls --all >/dev/null 2>&1; then
+      echo "(node_modules in sync — skipping npm ci)"
+    else
+      echo "(node_modules out of sync — running npm ci)"
+      npm ci
+    fi
+  elif [[ "$cmd" == "npm run format:check" ]]; then
+    # Local override: format:check on git-tracked files only
+    git ls-files -z '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.md' '*.yml' '*.yaml' '*.css' '*.html' \
+      | xargs -0 npx prettier --check
+  else
+    eval "$cmd"
+  fi
+
+  echo ""
+done
+
+echo "=== All CI checks passed ==="
