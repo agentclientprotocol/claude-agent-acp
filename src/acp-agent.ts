@@ -234,6 +234,7 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
+  auto: "auto",
   default: "default",
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
@@ -1464,6 +1465,11 @@ export class ClaudeAcpAgent implements Agent {
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
     const availableModes = [
+      {
+        id: "auto",
+        name: "Auto",
+        decription: "Use a model classifier to approve/deny permission prompts.",
+      },
       {
         id: "default",
         name: "Default",
