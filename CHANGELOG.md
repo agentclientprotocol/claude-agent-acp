@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.25.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.24.2...v0.25.0) (2026-04-03)
+
+
+### Features
+
+* Add auto permission mode support ([#501](https://github.com/agentclientprotocol/claude-agent-acp/issues/501)) ([a161453](https://github.com/agentclientprotocol/claude-agent-acp/commit/a16145396fe2e6ead8734478961b2de65707e335))
+* Add separate Claude and Console terminal logins ([#502](https://github.com/agentclientprotocol/claude-agent-acp/issues/502)) ([063cd35](https://github.com/agentclientprotocol/claude-agent-acp/commit/063cd353809df8f3dda9e57d8ea848c0a6d44257))
+* Update to claude-agent-sdk 0.2.91 ([#500](https://github.com/agentclientprotocol/claude-agent-acp/issues/500)) ([65a2230](https://github.com/agentclientprotocol/claude-agent-acp/commit/65a223038576d72b74e1483fed10e982a1f842bd))
+
+
+### Bug Fixes
+
+* log warnings for malformed settings files instead of silent fallback ([#486](https://github.com/agentclientprotocol/claude-agent-acp/issues/486)) ([ae6c388](https://github.com/agentclientprotocol/claude-agent-acp/commit/ae6c38831415f9fc1de2d3dd1d4a247becbbd32f))
+* prevent race conditions in SettingsManager setCwd and debounce ([#485](https://github.com/agentclientprotocol/claude-agent-acp/issues/485)) ([7506223](https://github.com/agentclientprotocol/claude-agent-acp/commit/7506223cffb1aba4b4560feda11f69a1395a8c9d))
+* use current model's context window for usage_update size ([#412](https://github.com/agentclientprotocol/claude-agent-acp/issues/412)) ([d07799d](https://github.com/agentclientprotocol/claude-agent-acp/commit/d07799d7b3b4e438c8b158266c79723a0b592c07))
+
 ## [0.24.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.24.1...v0.24.2) (2026-03-27)
 
 
