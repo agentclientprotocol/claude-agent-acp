@@ -307,23 +307,40 @@ export class ClaudeAcpAgent implements Agent {
       },
     };
 
-    const terminalAuthMethod: any = {
-      description: "Run `claude /login` in the terminal",
-      name: "Log in with Claude",
-      id: "claude-login",
-      type: "terminal",
-      args: ["--cli"],
-    };
     const supportsTerminalAuth = request.clientCapabilities?.auth?.terminal === true;
+    const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
+
+    const claudeLoginMethod: any = {
+      description: "Use Claude subscription ",
+      name: "Claude Subscription",
+      id: "claude-ai-login",
+      type: "terminal",
+      args: ["--cli", "auth", "login", "--claudeai"],
+    };
+
+    const consoleLoginMethod: any = {
+      description: "Use Anthropic Console (API usage billing)",
+      name: "Anthropic Console",
+      id: "console-login",
+      type: "terminal",
+      args: ["--cli", "auth", "login", "--console"],
+    };
 
     // If client supports terminal-auth capability, use that instead.
-    const supportsMetaTerminalAuth = request.clientCapabilities?._meta?.["terminal-auth"] === true;
     if (supportsMetaTerminalAuth) {
-      terminalAuthMethod._meta = {
+      const baseArgs = process.argv.slice(1);
+      claudeLoginMethod._meta = {
         "terminal-auth": {
           command: process.execPath,
-          args: [...process.argv.slice(1), "--cli"],
+          args: [...baseArgs, "--cli", "auth", "login", "--claudeai"],
           label: "Claude Login",
+        },
+      };
+      consoleLoginMethod._meta = {
+        "terminal-auth": {
+          command: process.execPath,
+          args: [...baseArgs, "--cli", "auth", "login", "--console"],
+          label: "Anthropic Console Login",
         },
       };
     }
@@ -359,8 +376,9 @@ export class ClaudeAcpAgent implements Agent {
       },
       authMethods: [
         ...(!shouldHideClaudeAuth() && (supportsTerminalAuth || supportsMetaTerminalAuth)
-          ? [terminalAuthMethod]
+          ? [claudeLoginMethod]
           : []),
+        ...(supportsTerminalAuth || supportsMetaTerminalAuth ? [consoleLoginMethod] : []),
         ...(supportsGatewayAuth ? [gatewayAuthMethod] : []),
       ],
     };
