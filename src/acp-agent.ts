@@ -1698,7 +1698,16 @@ async function getAvailableModels(
 
   let currentModel = models[0];
 
-  if (settings.model) {
+  // Model priority (highest to lowest):
+  // 1. ANTHROPIC_MODEL environment variable
+  // 2. settings.model (user configuration)
+  // 3. models[0] (default first model)
+  if (process.env.ANTHROPIC_MODEL) {
+    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+    if (match) {
+      currentModel = match;
+    }
+  } else if (settings.model) {
     const match = resolveModelPreference(models, settings.model);
     if (match) {
       currentModel = match;
