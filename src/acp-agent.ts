@@ -109,6 +109,20 @@ type AccumulatedUsage = {
   cachedWriteTokens: number;
 };
 
+type UsageSnapshot = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+};
+
+const ZERO_USAGE: UsageSnapshot = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_creation_input_tokens: 0,
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -488,6 +502,7 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     let lastAssistantTotalUsage: number | null = null;
+    let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
     let lastContextWindowSize: number = 200000;
 
@@ -704,6 +719,51 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           case "stream_event": {
+            if (message.parent_tool_use_id === null) {
+              if (message.event.type === "message_start") {
+                const usage = message.event.message.usage;
+                lastAssistantUsage = usage
+                  ? {
+                      input_tokens: usage.input_tokens ?? 0,
+                      output_tokens: usage.output_tokens ?? 0,
+                      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+                      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+                    }
+                  : null;
+                if (
+                  message.event.message.model &&
+                  message.event.message.model !== "<synthetic>"
+                ) {
+                  lastAssistantModel = message.event.message.model;
+                }
+              } else if (message.event.type === "message_delta") {
+                const usage = message.event.usage as Partial<UsageSnapshot> | undefined;
+                if (usage) {
+                  const prev: UsageSnapshot = lastAssistantUsage ?? ZERO_USAGE;
+                  lastAssistantUsage = {
+                    input_tokens: usage.input_tokens ?? prev.input_tokens,
+                    output_tokens: usage.output_tokens ?? prev.output_tokens,
+                    cache_read_input_tokens:
+                      usage.cache_read_input_tokens ?? prev.cache_read_input_tokens,
+                    cache_creation_input_tokens:
+                      usage.cache_creation_input_tokens ?? prev.cache_creation_input_tokens,
+                  };
+                }
+              }
+
+              const nextUsage = lastAssistantUsage ? totalTokens(lastAssistantUsage) : null;
+              if (nextUsage !== null && nextUsage !== lastAssistantTotalUsage) {
+                lastAssistantTotalUsage = nextUsage;
+                await this.client.sessionUpdate({
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: "usage_update",
+                    used: nextUsage,
+                    size: lastContextWindowSize,
+                  },
+                });
+              }
+            }
             for (const notification of streamEventToAcpNotifications(
               message,
               params.sessionId,
@@ -754,11 +814,13 @@ export class ClaudeAcpAgent implements Agent {
             // all four fields is not double-counting.
             if ((message.message as any).usage && message.parent_tool_use_id === null) {
               const messageWithUsage = message.message as unknown as SDKResultMessage;
-              lastAssistantTotalUsage =
-                messageWithUsage.usage.input_tokens +
-                messageWithUsage.usage.output_tokens +
-                messageWithUsage.usage.cache_read_input_tokens +
-                messageWithUsage.usage.cache_creation_input_tokens;
+              lastAssistantUsage = {
+                input_tokens: messageWithUsage.usage.input_tokens,
+                output_tokens: messageWithUsage.usage.output_tokens,
+                cache_read_input_tokens: messageWithUsage.usage.cache_read_input_tokens,
+                cache_creation_input_tokens: messageWithUsage.usage.cache_creation_input_tokens,
+              };
+              lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
             }
             // Track the current top-level model for context window size lookup
             // (exclude subagent messages to stay in sync with lastAssistantTotalUsage)
@@ -1567,6 +1629,15 @@ function sessionUsage(session: Session) {
       session.accumulatedUsage.cachedReadTokens +
       session.accumulatedUsage.cachedWriteTokens,
   };
+}
+
+function totalTokens(usage: UsageSnapshot): number {
+  return (
+    usage.input_tokens +
+    usage.output_tokens +
+    usage.cache_read_input_tokens +
+    usage.cache_creation_input_tokens
+  );
 }
 
 function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
