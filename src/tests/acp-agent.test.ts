@@ -1351,6 +1351,9 @@ describe("stop reason propagation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
   }
 
@@ -1493,6 +1496,9 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
 
     const response = await agent.prompt({
@@ -1527,6 +1533,236 @@ describe("stop reason propagation", () => {
         prompt: [{ type: "text", text: "test" }],
       }),
     ).rejects.toThrow("Internal error");
+  });
+});
+
+describe("Usage config_option_update push from SDK messages", () => {
+  function createAgentWithCapture() {
+    const updates: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [
+        {
+          id: "usage",
+          name: "Usage",
+          type: "select",
+          currentValue: "context",
+          options: [],
+        } as any,
+      ],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
+    };
+  }
+
+  function idleMessage() {
+    return { type: "system", subtype: "session_state_changed", state: "idle" };
+  }
+
+  function resultMessage(overrides: Partial<{ total_cost_usd: number }> = {}) {
+    return {
+      type: "result" as const,
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: overrides.total_cost_usd ?? 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function rateLimitEvent(info: {
+    rateLimitType: string;
+    utilization?: number;
+    resetsAt?: number;
+    status?: "allowed" | "allowed_warning" | "rejected";
+  }) {
+    return {
+      type: "rate_limit_event" as const,
+      rate_limit_info: {
+        status: info.status ?? "allowed_warning",
+        rateLimitType: info.rateLimitType,
+        utilization: info.utilization,
+        resetsAt: info.resetsAt,
+      },
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  it("rate_limit_event with five_hour updates state and pushes config_option_update", async () => {
+    const { agent, updates } = createAgentWithCapture();
+    const nowS = Math.floor(Date.now() / 1000);
+    injectSession(agent, [
+      rateLimitEvent({
+        rateLimitType: "five_hour",
+        utilization: 0.62,
+        resetsAt: nowS + 2 * 3600,
+      }),
+      resultMessage(),
+      idleMessage(),
+    ]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(agent.sessions["test-session"]!.usageRateLimits.five_hour).toEqual(
+      expect.objectContaining({ rateLimitType: "five_hour", utilization: 0.62 }),
+    );
+
+    const usagePushes = updates.filter(
+      (n) =>
+        "update" in n &&
+        (n.update as { sessionUpdate: string }).sessionUpdate === "config_option_update",
+    );
+    expect(usagePushes.length).toBeGreaterThan(0);
+
+    const push = usagePushes[0].update as { configOptions: any[] };
+    const usageOption = push.configOptions.find((o) => o.id === "usage");
+    expect(usageOption).toBeDefined();
+    expect(usageOption.options.some((o: { value: string }) => o.value === "five_hour")).toBe(true);
+    const fiveHour = usageOption.options.find((o: { value: string }) => o.value === "five_hour");
+    expect(fiveHour.name).toContain("5h");
+    expect(fiveHour.name).toContain("62%");
+  });
+
+  it("rate_limit_event with unhandled type (overage) is ignored", async () => {
+    const { agent, updates } = createAgentWithCapture();
+    injectSession(agent, [
+      rateLimitEvent({ rateLimitType: "overage", utilization: 0.5 }),
+      resultMessage(),
+      idleMessage(),
+    ]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(agent.sessions["test-session"]!.usageRateLimits).toEqual({});
+    const fiveHourPushes = updates.filter((n) => {
+      if (!("update" in n)) return false;
+      const u = n.update as { sessionUpdate: string; configOptions?: any[] };
+      if (u.sessionUpdate !== "config_option_update") return false;
+      const opt = u.configOptions?.find((o) => o.id === "usage");
+      return opt?.options?.some((o: { value: string }) => o.value === "five_hour");
+    });
+    expect(fiveHourPushes).toHaveLength(0);
+  });
+
+  it("rate_limit_event with seven_day_opus stores opus bucket and pushes week option", async () => {
+    const { agent, updates } = createAgentWithCapture();
+    injectSession(agent, [
+      rateLimitEvent({ rateLimitType: "seven_day_opus", utilization: 0.18 }),
+      resultMessage(),
+      idleMessage(),
+    ]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(agent.sessions["test-session"]!.usageRateLimits.seven_day_opus).toBeDefined();
+
+    const weekPush = updates.find((n) => {
+      if (!("update" in n)) return false;
+      const u = n.update as { sessionUpdate: string; configOptions?: any[] };
+      if (u.sessionUpdate !== "config_option_update") return false;
+      const opt = u.configOptions?.find((o) => o.id === "usage");
+      return opt?.options?.some((o: { value: string }) => o.value === "week");
+    });
+    expect(weekPush).toBeDefined();
+  });
+
+  it("every rate_limit_event produces its own config_option_update push", async () => {
+    const { agent, updates } = createAgentWithCapture();
+    injectSession(agent, [
+      rateLimitEvent({ rateLimitType: "five_hour", utilization: 0.4 }),
+      rateLimitEvent({ rateLimitType: "seven_day_opus", utilization: 0.18 }),
+      resultMessage(),
+      idleMessage(),
+    ]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    const usagePushes = updates.filter((n) => {
+      if (!("update" in n)) return false;
+      return (n.update as { sessionUpdate: string }).sessionUpdate === "config_option_update";
+    });
+    // Two rate_limit_events each trigger a push; the result message adds
+    // no push here because no stream events ran to populate lastAssistantTotalUsage.
+    expect(usagePushes).toHaveLength(2);
+
+    const last = usagePushes[usagePushes.length - 1].update as { configOptions: any[] };
+    const usageOption = last.configOptions.find((o) => o.id === "usage");
+    const values = usageOption.options.map((o: { value: string }) => o.value);
+    expect(values).toContain("five_hour");
+    expect(values).toContain("week");
   });
 });
 
@@ -1569,6 +1805,9 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
     return agent.sessions[sessionId]!;
   }
@@ -1664,6 +1903,9 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
     return agent.sessions[sessionId]!;
   }
@@ -1897,6 +2139,9 @@ describe("usage_update computation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
   }
 
@@ -2785,6 +3030,9 @@ describe("emitRawSDKMessages", () => {
       abortController: new AbortController(),
       emitRawSDKMessages,
       contextWindowSize: 200000,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
   }
 

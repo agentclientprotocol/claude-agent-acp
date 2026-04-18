@@ -54,6 +54,7 @@ import {
   Query,
   query,
   SDKPartialAssistantMessage,
+  SDKRateLimitInfo,
   SDKUserMessage,
   SlashCommand,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -73,6 +74,7 @@ import {
   toolUpdateFromEditToolResponse,
   toolUpdateFromToolResult,
 } from "./tools.js";
+import { buildUsageConfigOption, UsageRateLimitKey, UsageView } from "./usage.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
 export const CLAUDE_CONFIG_DIR =
@@ -147,6 +149,14 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Which metric the "Usage" dropdown is currently displaying. */
+  usageView: UsageView;
+  /** Latest context tokens used (total) and window size, used to render the
+   *  `Ctx:` view. Null until the first assistant message reports usage. */
+  usageContext: { used: number; size: number } | null;
+  /** Latest rate-limit info keyed by `rateLimitType`. Updated from
+   *  `rate_limit_event` SDK messages. */
+  usageRateLimits: Partial<Record<UsageRateLimitKey, SDKRateLimitInfo>>;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -735,6 +745,11 @@ export class ClaudeAcpAgent implements Agent {
                   },
                 },
               });
+              session.usageContext = {
+                used: lastAssistantTotalUsage,
+                size: session.contextWindowSize,
+              };
+              await this.pushUsageOption(params.sessionId);
             }
 
             if (session.cancelled) {
@@ -975,8 +990,21 @@ export class ClaudeAcpAgent implements Agent {
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
-          case "rate_limit_event":
             break;
+          case "rate_limit_event": {
+            const info = message.rate_limit_info;
+            const key = info.rateLimitType;
+            if (
+              key === "five_hour" ||
+              key === "seven_day_opus" ||
+              key === "seven_day_sonnet" ||
+              key === "seven_day"
+            ) {
+              session.usageRateLimits = { ...session.usageRateLimits, [key]: info };
+              await this.pushUsageOption(params.sessionId);
+            }
+            break;
+          }
           default:
             unreachable(message);
             break;
@@ -1407,7 +1435,32 @@ export class ClaudeAcpAgent implements Agent {
         session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
+    } else if (configId === "usage") {
+      if (value === "context" || value === "five_hour" || value === "week") {
+        session.usageView = value;
+      }
     }
+  }
+
+  /** Rebuild the `usage` config option from current session state and send a
+   *  `config_option_update` notification. Called on every SDK event that
+   *  changes usage data (`rate_limit_event`, `result`). */
+  private async pushUsageOption(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const usageOption = buildUsageConfigOption(
+      session.usageView,
+      session.usageContext,
+      session.usageRateLimits,
+    );
+    session.configOptions = session.configOptions.map((o) => (o.id === "usage" ? usageOption : o));
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
   }
 
   private async getOrCreateSession(params: {
@@ -1691,7 +1744,12 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
-    const configOptions = buildConfigOptions(modes, models);
+    const initialUsageState = {
+      view: "context" as UsageView,
+      context: null,
+      rateLimits: {},
+    };
+    const configOptions = buildConfigOptions(modes, models, initialUsageState);
 
     this.sessions[sessionId] = {
       query: q,
@@ -1716,6 +1774,9 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      usageView: "context",
+      usageContext: null,
+      usageRateLimits: {},
     };
 
     return {
@@ -1803,8 +1864,13 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
+  usage?: {
+    view: UsageView;
+    context: { used: number; size: number } | null;
+    rateLimits: Partial<Record<UsageRateLimitKey, SDKRateLimitInfo>>;
+  },
 ): SessionConfigOption[] {
-  return [
+  const options: SessionConfigOption[] = [
     {
       id: "mode",
       name: "Mode",
@@ -1832,6 +1898,10 @@ function buildConfigOptions(
       })),
     },
   ];
+  if (usage) {
+    options.push(buildUsageConfigOption(usage.view, usage.context, usage.rateLimits));
+  }
+  return options;
 }
 
 // Claude Code CLI persists display strings like "opus[1m]" in settings,
