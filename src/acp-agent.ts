@@ -1090,11 +1090,17 @@ export class ClaudeAcpAgent implements Agent {
   async unstable_setSessionModel(
     params: SetSessionModelRequest,
   ): Promise<SetSessionModelResponse | void> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
     }
-    await this.sessions[params.sessionId].query.setModel(params.modelId);
-    await this.updateConfigOption(params.sessionId, "model", params.modelId);
+    // Resolve aliases (e.g. "opus", "opus[1m]") to canonical model IDs so
+    // downstream lookups in modelInfos succeed and the effort option isn't
+    // silently dropped.
+    const resolved = resolveModelPreference(session.modelInfos, params.modelId);
+    const modelId = resolved?.value ?? params.modelId;
+    await session.query.setModel(modelId);
+    await this.updateConfigOption(params.sessionId, "model", modelId);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1163,11 +1169,10 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
-    } else if (params.configId === "effort") {
-      await this.sessions[params.sessionId].query.applyFlagSettings({
-        effortLevel: resolvedValue as Settings["effortLevel"],
-      });
     }
+    // Effort SDK sync is handled inside applyConfigOptionValue so that direct
+    // effort changes and effort changes induced by a model switch go through
+    // the same path.
 
     await this.applyConfigOptionValue(session, params.configId, resolvedValue);
 
@@ -1457,6 +1462,11 @@ export class ClaudeAcpAgent implements Agent {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
+      if (configId === "effort") {
+        await session.query.applyFlagSettings({
+          effortLevel: value as Settings["effortLevel"],
+        });
+      }
     }
   }
 
@@ -1901,17 +1911,23 @@ function buildConfigOptions(
   if (supportedLevels.length > 0) {
     const effortOptions = supportedLevels.map((level) => ({
       value: level,
-      name: level.charAt(0).toUpperCase() + level.slice(1),
+      name: level
+        .split(/[_-]/)
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join(" "),
     }));
 
-    // Keep the current level if valid, otherwise prefer a sensible default
+    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
+    // recommended default for capable models), then high (the API default).
     const includes = (l: string) => (supportedLevels as string[]).includes(l);
     const validEffort =
       currentEffortLevel && includes(currentEffortLevel)
         ? currentEffortLevel
-        : includes("medium")
-          ? "medium"
-          : supportedLevels[0];
+        : includes("xhigh")
+          ? "xhigh"
+          : includes("high")
+            ? "high"
+            : supportedLevels[0];
 
     options.push({
       id: "effort",

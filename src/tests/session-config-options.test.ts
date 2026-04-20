@@ -483,8 +483,8 @@ describe("session config options", () => {
         (o: any) => o.id === "effort",
       );
       expect(effortOption).toBeDefined();
-      expect(effortOption.currentValue).toBe("medium");
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "medium" });
+      expect(effortOption.currentValue).toBe("high");
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "high" });
     });
 
     it("preserves effort in config_option_update when new model supports same level", async () => {
@@ -696,8 +696,8 @@ describe("session config options", () => {
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
       expect(effortOption).toBeDefined();
-      // No previous effort, so defaults to "medium"
-      expect(effortOption?.currentValue).toBe("medium");
+      // No previous effort, so defaults to "high" (the API default)
+      expect(effortOption?.currentValue).toBe("high");
     });
 
     it("clamps effort to valid value when new model has different supported levels", async () => {
@@ -731,10 +731,10 @@ describe("session config options", () => {
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
       expect(effortOption).toBeDefined();
-      // "max" is not in sonnet's levels, so should fall back to "medium"
-      expect(effortOption?.currentValue).toBe("medium");
+      // "max" is not in sonnet's levels, so should fall back to "high" (the API default)
+      expect(effortOption?.currentValue).toBe("high");
       // SDK should be told about the clamped value
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "medium" });
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: "high" });
     });
 
     it("preserves effort value when new model supports the same level", async () => {
