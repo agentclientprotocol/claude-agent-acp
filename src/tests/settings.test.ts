@@ -89,5 +89,37 @@ describe("SettingsManager", () => {
       settings = settingsManager.getSettings();
       expect(settings.permissions?.defaultMode).toBe("plan");
     });
+
+    it("should merge availableModels with later sources taking precedence", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.json"),
+        JSON.stringify({
+          availableModels: ["claude-3-5-sonnet", "claude-3-5-haiku"],
+        }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      let settings = settingsManager.getSettings();
+      expect(settings.availableModels).toEqual(["claude-3-5-sonnet", "claude-3-5-haiku"]);
+
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.local.json"),
+        JSON.stringify({
+          availableModels: ["claude-3-7-sonnet"],
+        }),
+      );
+
+      settingsManager.dispose();
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      settings = settingsManager.getSettings();
+      expect(settings.availableModels).toEqual(["claude-3-7-sonnet"]);
+    });
   });
 });

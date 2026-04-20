@@ -22,6 +22,7 @@ export interface ClaudeCodeSettings {
   permissions?: PermissionSettings;
   env?: Record<string, string>;
   model?: string;
+  availableModels?: string[];
   effortLevel?: string;
 }
 
@@ -187,6 +188,10 @@ export class SettingsManager {
 
       if (settings.model) {
         merged.model = settings.model;
+      }
+
+      if (settings.availableModels !== undefined) {
+        merged.availableModels = settings.availableModels;
       }
 
       if (settings.effortLevel !== undefined) {

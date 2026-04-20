@@ -2023,19 +2023,31 @@ async function getAvailableModels(
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
-  let currentModel = models[0];
+  const configuredAvailableModels = settings.availableModels?.filter(
+    (model): model is string => typeof model === "string" && model.trim().length > 0,
+  );
+  const filteredModels = configuredAvailableModels?.length
+    ? models.filter((model) =>
+        configuredAvailableModels.some(
+          (configuredModel) => resolveModelPreference([model], configuredModel)?.value === model.value,
+        ),
+      )
+    : models;
+  const visibleModels = filteredModels.length > 0 ? filteredModels : models;
+
+  let currentModel = visibleModels[0];
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. models[0] (default first model)
+  // 3. first visible model
   if (process.env.ANTHROPIC_MODEL) {
-    const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
+    const match = resolveModelPreference(visibleModels, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
     }
   } else if (settings.model) {
-    const match = resolveModelPreference(models, settings.model);
+    const match = resolveModelPreference(visibleModels, settings.model);
     if (match) {
       currentModel = match;
     }
@@ -2044,7 +2056,7 @@ async function getAvailableModels(
   await query.setModel(currentModel.value);
 
   return {
-    availableModels: models.map((model) => ({
+    availableModels: visibleModels.map((model) => ({
       modelId: model.value,
       name: model.displayName,
       description: model.description,

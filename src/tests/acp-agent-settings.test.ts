@@ -217,4 +217,115 @@ describe("ClaudeAcpAgent settings", () => {
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
   });
+
+  it("filters visible models using availableModels", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({
+        availableModels: ["claude-opus-4-6-1m"],
+      }),
+    );
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const setModelSpy = vi.fn();
+    querySpy.mockImplementation(() => {
+      return {
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "claude-opus-4-6",
+              displayName: "Claude Opus 4.6",
+              description: "Base",
+            },
+            {
+              value: "claude-opus-4-6-1m",
+              displayName: "Claude Opus 4.6 (1M)",
+              description: "Long context",
+            },
+          ],
+        }),
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      } as any;
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
+    expect(response.models.availableModels).toEqual([
+      {
+        modelId: "claude-opus-4-6-1m",
+        name: "Claude Opus 4.6 (1M)",
+        description: "Long context",
+      },
+    ]);
+    expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+  });
+
+  it("falls back to the SDK model list when availableModels has no matches", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({
+        availableModels: ["gpt-5.4"],
+      }),
+    );
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const setModelSpy = vi.fn();
+    querySpy.mockImplementation(() => {
+      return {
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "claude-sonnet-4-5",
+              displayName: "Claude Sonnet 4.5",
+              description: "Default",
+            },
+            {
+              value: "claude-opus-4-6",
+              displayName: "Claude Opus 4.6",
+              description: "Most capable",
+            },
+          ],
+        }),
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      } as any;
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+    expect(response.models.availableModels).toEqual([
+      {
+        modelId: "claude-sonnet-4-5",
+        name: "Claude Sonnet 4.5",
+        description: "Default",
+      },
+      {
+        modelId: "claude-opus-4-6",
+        name: "Claude Opus 4.6",
+        description: "Most capable",
+      },
+    ]);
+    expect(response.models.currentModelId).toBe("claude-sonnet-4-5");
+  });
 });
