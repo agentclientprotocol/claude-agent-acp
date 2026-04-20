@@ -260,14 +260,34 @@ export type ToolUseCache = {
   };
 };
 
-function isStaticBinary(): boolean {
-  return process.env.CLAUDE_AGENT_ACP_IS_SINGLE_FILE_BUN !== undefined;
-}
-
 export async function claudeCliPath(): Promise<string> {
-  return isStaticBinary()
-    ? (await import("@anthropic-ai/claude-agent-sdk/embed")).default
-    : import.meta.resolve("@anthropic-ai/claude-agent-sdk").replace("sdk.mjs", "cli.js");
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return process.env.CLAUDE_CODE_EXECUTABLE;
+  }
+  // The SDK's CLI is a native binary shipped as a platform-specific optional
+  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
+  // to the SDK so nested installs are found even when npm doesn't hoist.
+  const { createRequire } = await import("node:module");
+  const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const candidates =
+    process.platform === "linux"
+      ? [
+          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+        ]
+      : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
+  for (const candidate of candidates) {
+    try {
+      return req.resolve(candidate);
+    } catch {
+      // try next candidate
+    }
+  }
+  throw new Error(
+    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
+      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+  );
 }
 
 function shouldHideClaudeAuth(): boolean {
@@ -696,6 +716,7 @@ export class ClaudeAcpAgent implements Agent {
               case "memory_recall":
               case "notification":
               case "api_retry":
+              case "mirror_error":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1562,14 +1583,7 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
-      // note: although not documented by the types, passing an absolute path
-      // here works to find zed's managed node version.
-      executable: isStaticBinary() ? undefined : (process.execPath as any),
-      ...(process.env.CLAUDE_CODE_EXECUTABLE
-        ? { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE }
-        : isStaticBinary()
-          ? { pathToClaudeCodeExecutable: await claudeCliPath() }
-          : {}),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",

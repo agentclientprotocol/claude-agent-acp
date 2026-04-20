@@ -1173,7 +1173,7 @@ describe("prompt conversion", () => {
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
   it("finds vendored cli path", async () => {
     const path = await claudeCliPath();
-    expect(path).toContain("@anthropic-ai/claude-agent-sdk/cli.js");
+    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
   });
 
   it("query has a 'default' model", async () => {
