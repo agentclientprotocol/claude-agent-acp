@@ -1544,6 +1544,11 @@ export class ClaudeAcpAgent implements Agent {
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
+      // Opus 4.7 silently changed `thinking.display` to default `"omitted"`,
+      // so thinking blocks stream with an empty `thinking` field. Opt back into
+      // summarized thinking to restore the prior Opus 4.6 behavior. Overridable
+      // via `userProvidedOptions.thinking` below.
+      thinking: { type: "adaptive", display: "summarized" },
       ...(maxThinkingTokens !== undefined && { maxThinkingTokens }),
       ...userProvidedOptions,
       env: {
