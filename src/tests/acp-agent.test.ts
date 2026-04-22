@@ -1529,6 +1529,87 @@ describe("stop reason propagation", () => {
       }),
     ).rejects.toThrow("Internal error");
   });
+
+  it("forwards SDKAssistantMessage.error as structured data on internal errors", async () => {
+    const agent = createMockAgent();
+    const assistantMessage: SDKAssistantMessage = {
+      type: "assistant",
+      parent_tool_use_id: null,
+      error: "rate_limit",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: "msg-1",
+        type: "message",
+        role: "assistant",
+        container: null,
+        model: "claude-sonnet-4-20250514",
+        content: [],
+        stop_reason: "stop_sequence",
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+          service_tier: null,
+          cache_creation: {
+            ephemeral_1h_input_tokens: 0,
+            ephemeral_5m_input_tokens: 0,
+          },
+        } as any,
+      } as any,
+    };
+
+    injectSession(agent, [
+      assistantMessage,
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "You've hit your limit · resets 8pm",
+      }),
+    ]);
+
+    const err = await agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then(
+        () => null,
+        (e) => e,
+      );
+
+    expect(err).not.toBeNull();
+    expect((err as { data: unknown }).data).toEqual({ errorKind: "rate_limit" });
+  });
+
+  it("omits errorKind data when no SDKAssistantMessage.error was observed", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Something went wrong",
+      }),
+    ]);
+
+    const err = await agent
+      .prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      })
+      .then(
+        () => null,
+        (e) => e,
+      );
+
+    expect(err).not.toBeNull();
+    expect((err as { data: unknown }).data).toBeUndefined();
+  });
 });
 
 describe("session/close", () => {

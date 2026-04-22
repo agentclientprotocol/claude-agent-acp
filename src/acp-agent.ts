@@ -54,6 +54,7 @@ import {
   Query,
   query,
   Settings,
+  SDKAssistantMessageError,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -590,6 +591,13 @@ export class ClaudeAcpAgent implements Agent {
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
+    // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
+    // problem, billing), it sets a categorical `error` field on the
+    // `SDKAssistantMessage` that precedes the final `result` message. We
+    // capture it here so the subsequent `RequestError.internalError` can
+    // forward it to clients as structured `data`, sparing them from
+    // pattern-matching on the human-readable message text.
+    let lastAssistantError: SDKAssistantMessageError | undefined;
 
     const userMessage = promptToClaude(params);
 
@@ -775,7 +783,10 @@ export class ClaudeAcpAgent implements Agent {
                   break;
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(undefined, message.result);
+                  throw RequestError.internalError(
+                    errorKindData(lastAssistantError),
+                    message.result,
+                  );
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
@@ -800,7 +811,7 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -812,7 +823,7 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_structured_output_retries":
                 if (message.is_error) {
                   throw RequestError.internalError(
-                    undefined,
+                    errorKindData(lastAssistantError),
                     message.errors.join(", ") || message.subtype,
                   );
                 }
@@ -927,6 +938,9 @@ export class ClaudeAcpAgent implements Agent {
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               if (message.message.model && message.message.model !== "<synthetic>") {
                 lastAssistantModel = message.message.model;
+              }
+              if (message.error) {
+                lastAssistantError = message.error;
               }
             }
 
@@ -1830,6 +1844,22 @@ function totalTokens(usage: UsageSnapshot): number {
     usage.cache_read_input_tokens +
     usage.cache_creation_input_tokens
   );
+}
+
+/**
+ * Build the `data` payload attached to a `RequestError.internalError` when we
+ * have a categorical error from the Claude SDK. Returns `undefined` when no
+ * categorical error is available, matching the previous behavior of passing
+ * `undefined` to `RequestError.internalError`.
+ *
+ * The `errorKind` field is a convention for ACP clients to dispatch on
+ * without having to pattern-match the human-readable message text. Clients
+ * that don't understand it fall back to the existing message-based rendering.
+ */
+function errorKindData(
+  errorKind: SDKAssistantMessageError | undefined,
+): { errorKind: SDKAssistantMessageError } | undefined {
+  return errorKind ? { errorKind } : undefined;
 }
 
 /** Project a nullable API usage object into our non-null snapshot shape.
