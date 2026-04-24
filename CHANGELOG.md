@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.31.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.30.0...v0.31.0) (2026-04-24)
+
+
+### Features
+
+* allow configuring models through env vars ([#586](https://github.com/agentclientprotocol/claude-agent-acp/issues/586)) ([1e15f3d](https://github.com/agentclientprotocol/claude-agent-acp/commit/1e15f3d8b0a06076ee62764ab576ac29fe056a38))
+* Support effort levels ([#464](https://github.com/agentclientprotocol/claude-agent-acp/issues/464)) ([9e1185b](https://github.com/agentclientprotocol/claude-agent-acp/commit/9e1185bfd55cbf83a653a0ff8c194f986cbd1574))
+* Update to acp sdk v0.20 ([#589](https://github.com/agentclientprotocol/claude-agent-acp/issues/589)) ([92adcbd](https://github.com/agentclientprotocol/claude-agent-acp/commit/92adcbd1ace2f2103742ffcf5c589eb1ca41b9b8))
+* Update to claude-agent-sdk 0.2.119 ([#587](https://github.com/agentclientprotocol/claude-agent-acp/issues/587)) ([ef1dbd1](https://github.com/agentclientprotocol/claude-agent-acp/commit/ef1dbd1cb457f0524d221ea07235abf49dc941a0))
+
+
+### Bug Fixes
+
+* Forward full systemPrompt preset options from _meta ([#591](https://github.com/agentclientprotocol/claude-agent-acp/issues/591)) ([b3ddfc3](https://github.com/agentclientprotocol/claude-agent-acp/commit/b3ddfc3b86703c23fe99d93611885c12b1e4812c))
+* Session Replay and Permission rendering ([#593](https://github.com/agentclientprotocol/claude-agent-acp/issues/593)) ([5faefab](https://github.com/agentclientprotocol/claude-agent-acp/commit/5faefab8ab9b725f7a3374808bf5579e411884bc)), closes [#579](https://github.com/agentclientprotocol/claude-agent-acp/issues/579)
+
 ## [0.30.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.29.2...v0.30.0) (2026-04-20)
 
 
