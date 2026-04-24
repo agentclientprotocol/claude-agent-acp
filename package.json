@@ -65,7 +65,7 @@
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.89.0",
+    "@anthropic-ai/sdk": "0.91.0",
     "@eslint/js": "10.0.1",
     "@types/node": "25.6.0",
     "@typescript-eslint/eslint-plugin": "8.59.0",
