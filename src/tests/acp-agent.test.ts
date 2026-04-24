@@ -1110,6 +1110,113 @@ describe("toolUpdateFromEditToolResponse", () => {
   });
 });
 
+describe("stripLocalCommandMetadata", () => {
+  it("returns null for strings that are pure marker metadata", () => {
+    expect(stripLocalCommandMetadata("<command-name>/model</command-name>")).toBeNull();
+    expect(
+      stripLocalCommandMetadata("<local-command-stdout>out</local-command-stdout>"),
+    ).toBeNull();
+    expect(
+      stripLocalCommandMetadata("<local-command-stderr>err</local-command-stderr>"),
+    ).toBeNull();
+    expect(
+      stripLocalCommandMetadata(
+        "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>",
+      ),
+    ).toBeNull();
+  });
+
+  it("returns the string unchanged for real content", () => {
+    expect(stripLocalCommandMetadata("hi")).toBe("hi");
+    expect(stripLocalCommandMetadata("please run /model with args")).toBe(
+      "please run /model with args",
+    );
+  });
+
+  // Regression: in the original bug report the entire /model preamble and
+  // the user's real "hi" prompt were concatenated into a single message.
+  // We want to strip the marker tags and preserve the real prose, not drop
+  // the whole message.
+  it("strips marker tags from mixed-content strings, preserving real prose", () => {
+    const mixed =
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>" +
+      "<local-command-stdout>Set model to opus (claude-opus-4-7)</local-command-stdout>" +
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus[1m]</command-args>" +
+      "<local-command-stdout>Set model to opus[1m] (claude-opus-4-7[1m])</local-command-stdout>" +
+      "hi";
+    const stripped = stripLocalCommandMetadata(mixed);
+    expect(typeof stripped).toBe("string");
+    expect(stripped as string).not.toContain("<command-name>");
+    expect(stripped as string).not.toContain("<command-message>");
+    expect(stripped as string).not.toContain("<command-args>");
+    expect(stripped as string).not.toContain("<local-command-stdout>");
+    expect((stripped as string).trimEnd()).toMatch(/hi$/);
+  });
+
+  it("drops marker-only blocks from mixed arrays, keeping real blocks", () => {
+    const result = stripLocalCommandMetadata([
+      { type: "text", text: "<command-name>/model</command-name>" },
+      { type: "text", text: "<local-command-stdout>ok</local-command-stdout>" },
+      { type: "text", text: "hi" },
+    ]);
+    expect(result).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  it("returns null when every block is a marker", () => {
+    expect(
+      stripLocalCommandMetadata([
+        { type: "text", text: "<command-name>/model</command-name>" },
+        { type: "text", text: "<local-command-stdout>ok</local-command-stdout>" },
+      ]),
+    ).toBeNull();
+  });
+
+  it("strips tags inside a text block while keeping the trailing prose", () => {
+    const result = stripLocalCommandMetadata([
+      {
+        type: "text",
+        text: "<command-name>/model</command-name><local-command-stdout>ok</local-command-stdout>hi",
+      },
+    ]);
+    expect(result).toEqual([{ type: "text", text: "hi" }]);
+  });
+
+  it("leaves non-text blocks alone", () => {
+    const image = { type: "image", source: { type: "base64", data: "", media_type: "image/png" } };
+    const result = stripLocalCommandMetadata([
+      { type: "text", text: "<command-name>/model</command-name>" },
+      image,
+    ]);
+    expect(result).toEqual([image]);
+  });
+
+  it("handles null/undefined/non-container shapes", () => {
+    expect(stripLocalCommandMetadata(null)).toBeNull();
+    expect(stripLocalCommandMetadata(undefined)).toBeUndefined();
+    expect(stripLocalCommandMetadata({ arbitrary: "object" })).toEqual({ arbitrary: "object" });
+  });
+});
+
+describe("isLocalCommandMetadata", () => {
+  it("is true when stripping leaves nothing", () => {
+    expect(isLocalCommandMetadata("<command-name>/model</command-name>")).toBe(true);
+    expect(
+      isLocalCommandMetadata([{ type: "text", text: "<command-name>/model</command-name>" }]),
+    ).toBe(true);
+  });
+
+  it("is false when real content survives stripping", () => {
+    expect(isLocalCommandMetadata("hi")).toBe(false);
+    expect(isLocalCommandMetadata("<command-name>/model</command-name>hi")).toBe(false);
+    expect(
+      isLocalCommandMetadata([
+        { type: "text", text: "<command-name>/model</command-name>" },
+        { type: "text", text: "hi" },
+      ]),
+    ).toBe(false);
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";

@@ -145,4 +145,189 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       await agentB.dispose();
     }
   }, 30000);
+
+  // Regression test for https://github.com/zed-industries/claude-code-acp/issues/579
+  // The client (Zed) renders its own local slash commands — e.g. `/model` —
+  // by injecting user-message prompts whose text is wrapped in
+  // `<command-name>` / `<local-command-stdout>` markers. The Claude SDK
+  // persists those messages verbatim in the session transcript. Without
+  // filtering, `loadSession` replays the markers as user_message_chunks
+  // ahead of the real prompt, leaking CLI internals into the transcript.
+  it("ACP: loadSession does not replay local-command metadata user messages", async () => {
+    const recordedUserChunks: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "user_message_chunk") {
+          const content = notification.update.content;
+          if (content.type === "text") recordedUserChunks.push(content.text);
+        }
+      },
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AgentSideConnection;
+
+    const commandName =
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>";
+    const commandStdout =
+      "<local-command-stdout>Set model to opus (claude-opus-4-7)</local-command-stdout>";
+
+    // Step 1: create a session via the SDK, push the marker user messages
+    // followed by a real "hi" prompt. We bypass the ACP agent's prompt loop
+    // so we're only testing what the loadSession replay path does, not how
+    // prompts get routed.
+    const sessionId = randomUUID();
+    const input = new Pushable<SDKUserMessage>();
+    const q = query({
+      prompt: input,
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        settingSources: ["user", "project", "local"],
+        includePartialMessages: true,
+      },
+    });
+    await q.initializationResult();
+
+    // Zed renders its local slash commands by mixing the marker blocks into
+    // the user's prompt content array alongside the real text. The Claude
+    // SDK persists the message verbatim — including the marker blocks —
+    // which is what loadSession must filter when it replays.
+    input.push({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          { type: "text", text: commandName },
+          { type: "text", text: commandStdout },
+          { type: "text", text: "hi" },
+        ],
+      },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+    });
+
+    for await (const msg of q) {
+      if (msg.type === "result") break;
+    }
+    input.end();
+    q.return(undefined);
+
+    // Sanity check: the SDK transcript contains the metadata we're filtering.
+    const sdkMessages = await getSessionMessages(sessionId);
+    const sdkTexts = sdkMessages
+      .map((m) => {
+        const c = (m as { message?: { content?: unknown } }).message?.content;
+        if (typeof c === "string") return c;
+        if (Array.isArray(c))
+          return c
+            .map((b) =>
+              b && typeof b === "object" && "text" in b
+                ? String((b as { text: unknown }).text)
+                : "",
+            )
+            .join("");
+        return "";
+      })
+      .join("\n");
+    expect(sdkTexts).toContain("<command-name>");
+    expect(sdkTexts).toContain("<local-command-stdout>");
+    expect(sdkTexts).toContain("hi");
+
+    // Step 2: load the session through the ACP agent and confirm the markers
+    // never reach the client as user_message_chunks, while the real "hi"
+    // prompt does.
+    const agent = new ClaudeAcpAgent(client);
+    try {
+      await agent.loadSession({
+        sessionId,
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+    } finally {
+      await agent.dispose();
+    }
+
+    for (const chunk of recordedUserChunks) {
+      expect(chunk).not.toContain("<command-name>");
+      expect(chunk).not.toContain("<command-message>");
+      expect(chunk).not.toContain("<command-args>");
+      expect(chunk).not.toContain("<local-command-stdout>");
+      expect(chunk).not.toContain("<local-command-stderr>");
+    }
+    expect(recordedUserChunks.some((c) => c.includes("hi"))).toBe(true);
+  }, 60000);
+
+  // Second regression: the original issue showed the markers and the real
+  // "hi" prompt all concatenated into a single string ending with "hi".
+  // loadSession must strip the marker tags in-place rather than dropping the
+  // whole message.
+  it("ACP: loadSession strips marker tags from a concatenated single-string prompt", async () => {
+    const recordedUserChunks: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "user_message_chunk") {
+          const content = notification.update.content;
+          if (content.type === "text") recordedUserChunks.push(content.text);
+        }
+      },
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+    } as unknown as AgentSideConnection;
+
+    // Exact shape from https://github.com/zed-industries/claude-code-acp/issues/579.
+    const concatenated =
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>" +
+      "<local-command-stdout>Set model to opus (claude-opus-4-7)</local-command-stdout>\n" +
+      "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus[1m]</command-args>" +
+      "<local-command-stdout>Set model to opus[1m] (claude-opus-4-7[1m])</local-command-stdout>" +
+      "hi";
+
+    const sessionId = randomUUID();
+    const input = new Pushable<SDKUserMessage>();
+    const q = query({
+      prompt: input,
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        settingSources: ["user", "project", "local"],
+        includePartialMessages: true,
+      },
+    });
+    await q.initializationResult();
+
+    input.push({
+      type: "user",
+      message: { role: "user", content: concatenated },
+      session_id: sessionId,
+      parent_tool_use_id: null,
+    });
+    for await (const msg of q) {
+      if (msg.type === "result") break;
+    }
+    input.end();
+    q.return(undefined);
+
+    const agent = new ClaudeAcpAgent(client);
+    try {
+      await agent.loadSession({
+        sessionId,
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+    } finally {
+      await agent.dispose();
+    }
+
+    expect(recordedUserChunks.length).toBeGreaterThan(0);
+    for (const chunk of recordedUserChunks) {
+      expect(chunk).not.toContain("<command-name>");
+      expect(chunk).not.toContain("<command-message>");
+      expect(chunk).not.toContain("<command-args>");
+      expect(chunk).not.toContain("<local-command-stdout>");
+      expect(chunk).not.toContain("<local-command-stderr>");
+    }
+    expect(recordedUserChunks.some((c) => c.includes("hi"))).toBe(true);
+  }, 60000);
 });

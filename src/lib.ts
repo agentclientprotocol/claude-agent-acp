@@ -1,6 +1,8 @@
 // Export the main agent class and utilities for library usage
 export {
   ClaudeAcpAgent,
+  isLocalCommandMetadata,
+  stripLocalCommandMetadata,
   runAcp,
   toAcpNotifications,
   streamEventToAcpNotifications,

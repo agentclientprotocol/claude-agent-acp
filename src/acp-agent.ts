@@ -305,6 +305,56 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// The Claude SDK persists local slash command invocations (e.g. `/model`) and
+// their output as user messages in the session transcript, wrapping the
+// payload in these XML-like markers that the CLI uses for its own display.
+// The live prompt loop drops them; replay must strip them too or they leak
+// into the UI on session/load.
+const LOCAL_COMMAND_TAG_PATTERN =
+  /<(command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g;
+
+function stripMarkerTags(text: string): string {
+  return text.replace(LOCAL_COMMAND_TAG_PATTERN, "");
+}
+
+/**
+ * Return user-message content with local-command marker tags removed, or
+ * `null` if nothing meaningful remains (caller should skip the message).
+ * Preserves real prose that's mixed in alongside the markers — e.g. a
+ * message like `<command-name>…</command-name>hi` becomes `hi`.
+ */
+export function stripLocalCommandMetadata(content: unknown): unknown | null {
+  if (typeof content === "string") {
+    const stripped = stripMarkerTags(content);
+    return stripped.trim() === "" ? null : stripped;
+  }
+  if (!Array.isArray(content)) return content;
+
+  const kept: unknown[] = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      (block as { type: unknown }).type === "text" &&
+      "text" in block &&
+      typeof (block as { text: unknown }).text === "string"
+    ) {
+      const stripped = stripMarkerTags((block as { text: string }).text);
+      if (stripped.trim() === "") continue;
+      kept.push({ ...(block as object), text: stripped });
+    } else {
+      kept.push(block);
+    }
+  }
+  if (kept.length === 0) return null;
+  return kept;
+}
+
+export function isLocalCommandMetadata(content: unknown): boolean {
+  return stripLocalCommandMetadata(content) === null;
+}
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
@@ -1225,9 +1275,17 @@ export class ClaudeAcpAgent implements Agent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      let content: unknown = message.message.content;
+      // @ts-expect-error - untyped in SDK but we handle all of these
+      if (message.message.role === "user") {
+        content = stripLocalCommandMetadata(content);
+        if (content === null) continue;
+      }
+
       for (const notification of toAcpNotifications(
         // @ts-expect-error - untyped in SDK but we handle all of these
-        message.message.content,
+        content,
         // @ts-expect-error - untyped in SDK but we handle all of these
         message.message.role,
         sessionId,
