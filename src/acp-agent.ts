@@ -51,6 +51,7 @@ import {
   ModelUsage,
   Options,
   PermissionMode,
+  PermissionUpdate,
   Query,
   query,
   Settings,
@@ -391,6 +392,50 @@ export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
   }
 
   return mapped;
+}
+
+/**
+ * Builds the label for the "Always Allow" permission option so the user can see
+ * the exact scope they are committing to. Uses the SDK-provided suggestions
+ * when available (e.g. `Bash(npm test:*)`) and falls back to naming the whole
+ * tool so "Always Allow" is never a blank check without disclosure.
+ */
+export function describeAlwaysAllow(
+  suggestions: PermissionUpdate[] | undefined,
+  toolName: string,
+): string {
+  if (!suggestions || suggestions.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  const ruleLabels: string[] = [];
+  const directories: string[] = [];
+
+  for (const update of suggestions) {
+    if (update.type === "addRules" && update.behavior === "allow") {
+      for (const rule of update.rules) {
+        ruleLabels.push(
+          rule.ruleContent ? `${rule.toolName}(${rule.ruleContent})` : `all ${rule.toolName}`,
+        );
+      }
+    } else if (update.type === "addDirectories") {
+      directories.push(...update.directories);
+    }
+  }
+
+  const parts: string[] = [];
+  if (ruleLabels.length > 0) {
+    parts.push(ruleLabels.join(", "));
+  }
+  if (directories.length > 0) {
+    parts.push(`access to ${directories.join(", ")}`);
+  }
+
+  if (parts.length === 0) {
+    return `Always Allow all ${toolName}`;
+  }
+
+  return `Always Allow ${parts.join(" and ")}`;
 }
 
 // Implement the ACP Agent interface
@@ -1315,6 +1360,7 @@ export class ClaudeAcpAgent implements Agent {
 
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+      const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -1405,7 +1451,7 @@ export class ClaudeAcpAgent implements Agent {
         options: [
           {
             kind: "allow_always",
-            name: "Always Allow",
+            name: alwaysAllowLabel,
             optionId: "allow_always",
           },
           { kind: "allow_once", name: "Allow", optionId: "allow" },

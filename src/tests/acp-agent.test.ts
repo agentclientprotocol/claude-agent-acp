@@ -24,7 +24,15 @@ import {
   toolUpdateFromToolResult,
   toolUpdateFromEditToolResponse,
 } from "../tools.js";
-import { toAcpNotifications, promptToClaude, ClaudeAcpAgent, claudeCliPath } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  promptToClaude,
+  isLocalCommandMetadata,
+  stripLocalCommandMetadata,
+  ClaudeAcpAgent,
+  claudeCliPath,
+  describeAlwaysAllow,
+} from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
@@ -1360,6 +1368,81 @@ describe("permission requests", () => {
       expect(requestStructure.toolCall.content).toBeDefined();
       expect(Array.isArray(requestStructure.toolCall.content)).toBe(true);
     }
+  });
+
+  describe("describeAlwaysAllow", () => {
+    it("falls back to naming the whole tool when no suggestions are provided", () => {
+      expect(describeAlwaysAllow(undefined, "Bash")).toBe("Always Allow all Bash");
+      expect(describeAlwaysAllow([], "Read")).toBe("Always Allow all Read");
+    });
+
+    it("includes the scoped rule content from a suggestion", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(npm test:*)");
+    });
+
+    it("indicates a tool-wide rule when the suggestion has no ruleContent", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Read" }],
+            behavior: "allow",
+            destination: "session",
+          },
+        ],
+        "Read",
+      );
+      expect(label).toBe("Always Allow all Read");
+    });
+
+    it("joins multiple rules and directory suggestions", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [
+              { toolName: "Bash", ruleContent: "git status" },
+              { toolName: "Bash", ruleContent: "git diff:*" },
+            ],
+            behavior: "allow",
+            destination: "session",
+          },
+          {
+            type: "addDirectories",
+            directories: ["/tmp/work"],
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow Bash(git status), Bash(git diff:*) and access to /tmp/work");
+    });
+
+    it("ignores non-allow rules and falls back when nothing is left", () => {
+      const label = describeAlwaysAllow(
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "Bash", ruleContent: "rm -rf:*" }],
+            behavior: "deny",
+            destination: "session",
+          },
+        ],
+        "Bash",
+      );
+      expect(label).toBe("Always Allow all Bash");
+    });
   });
 });
 
