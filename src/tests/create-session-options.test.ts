@@ -253,6 +253,95 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.tools).toEqual([]);
   });
 
+  describe("systemPrompt via _meta", () => {
+    it("defaults to the claude_code preset when not provided", async () => {
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+      });
+    });
+
+    it("replaces the preset when a string is provided", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { systemPrompt: "custom prompt" },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("custom prompt");
+    });
+
+    it("forwards append", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { systemPrompt: { append: "extra instructions" } },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "extra instructions",
+      });
+    });
+
+    it("forwards excludeDynamicSections", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: { systemPrompt: { excludeDynamicSections: true } },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        excludeDynamicSections: true,
+      });
+    });
+
+    it("forwards append and excludeDynamicSections together", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: {
+          systemPrompt: {
+            append: "extra instructions",
+            excludeDynamicSections: true,
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "extra instructions",
+        excludeDynamicSections: true,
+      });
+    });
+
+    it("ignores caller-provided type/preset overrides", async () => {
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: {
+          systemPrompt: {
+            type: "something-else",
+            preset: "other-preset",
+            append: "extra",
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "extra",
+      });
+    });
+  });
+
   describe("CLAUDE_MODEL_CONFIG", () => {
     let originalModelConfig: string | undefined;
 

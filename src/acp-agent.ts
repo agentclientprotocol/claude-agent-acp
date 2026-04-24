@@ -1582,10 +1582,16 @@ export class ClaudeAcpAgent implements Agent {
         systemPrompt = customPrompt;
       } else if (
         typeof customPrompt === "object" &&
-        "append" in customPrompt &&
-        typeof customPrompt.append === "string"
+        customPrompt !== null &&
+        !Array.isArray(customPrompt)
       ) {
-        systemPrompt.append = customPrompt.append;
+        // Forward all preset options (append, excludeDynamicSections, and
+        // anything the SDK adds later) while locking type/preset.
+        systemPrompt = {
+          ...(customPrompt as object),
+          type: "preset",
+          preset: "claude_code",
+        } as Options["systemPrompt"];
       }
     }
 
