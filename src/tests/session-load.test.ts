@@ -86,7 +86,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
 
     try {
       await expect(
-        agent.unstable_resumeSession({
+        agent.resumeSession({
           sessionId: bogusSessionId,
           cwd: process.cwd(),
           mcpServers: [],
@@ -135,7 +135,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
 
     try {
       await expect(
-        agentB.unstable_resumeSession({
+        agentB.resumeSession({
           sessionId,
           cwd: process.cwd(),
           mcpServers: [],

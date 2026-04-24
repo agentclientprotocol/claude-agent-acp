@@ -524,7 +524,7 @@ export class ClaudeAcpAgent implements Agent {
     return response;
   }
 
-  async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+  async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
     // Needs to happen after we return the session
@@ -1079,7 +1079,7 @@ export class ClaudeAcpAgent implements Agent {
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
-  async unstable_closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
     }

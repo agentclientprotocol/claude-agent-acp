@@ -1572,7 +1572,7 @@ describe("session/close", () => {
 
     expect(agent.sessions["session-1"]).toBeDefined();
 
-    const result = await agent.unstable_closeSession({ sessionId: "session-1" });
+    const result = await agent.closeSession({ sessionId: "session-1" });
 
     expect(result).toEqual({});
     expect(agent.sessions["session-1"]).toBeUndefined();
@@ -1586,7 +1586,7 @@ describe("session/close", () => {
 
     expect(session.abortController.signal.aborted).toBe(false);
 
-    await agent.unstable_closeSession({ sessionId: "session-2" });
+    await agent.closeSession({ sessionId: "session-2" });
 
     expect(session.abortController.signal.aborted).toBe(true);
   });
@@ -1594,7 +1594,7 @@ describe("session/close", () => {
   it("should throw when closing a non-existent session", async () => {
     const agent = createMockAgent();
 
-    await expect(agent.unstable_closeSession({ sessionId: "non-existent" })).rejects.toThrow(
+    await expect(agent.closeSession({ sessionId: "non-existent" })).rejects.toThrow(
       "Session not found",
     );
   });
@@ -1604,7 +1604,7 @@ describe("session/close", () => {
     injectSession(agent, "session-a");
     injectSession(agent, "session-b");
 
-    await agent.unstable_closeSession({ sessionId: "session-a" });
+    await agent.closeSession({ sessionId: "session-a" });
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
@@ -1666,7 +1666,7 @@ describe("getOrCreateSession param change detection", () => {
     const agent = createMockAgent();
     const session = injectSession(agent, "s1", { cwd: "/project" });
 
-    await agent.unstable_resumeSession({
+    await agent.resumeSession({
       sessionId: "s1",
       cwd: "/project",
       mcpServers: [],
@@ -1689,7 +1689,7 @@ describe("getOrCreateSession param change detection", () => {
       .mockRejectedValue(new Error("mock"));
 
     await expect(
-      agent.unstable_resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
     ).rejects.toThrow("mock");
 
     // Old session should have been fully torn down
@@ -1714,7 +1714,7 @@ describe("getOrCreateSession param change detection", () => {
       .mockRejectedValue(new Error("mock"));
 
     await expect(
-      agent.unstable_resumeSession({
+      agent.resumeSession({
         sessionId: "s1",
         cwd: "/project",
         mcpServers: [{ name: "new-server", command: "node", args: ["server.js"], env: [] }],
@@ -1739,7 +1739,7 @@ describe("getOrCreateSession param change detection", () => {
     });
 
     // Same servers but reversed order — should NOT trigger teardown
-    await agent.unstable_resumeSession({
+    await agent.resumeSession({
       sessionId: "s1",
       cwd: "/project",
       mcpServers: [...servers].reverse() as any,
