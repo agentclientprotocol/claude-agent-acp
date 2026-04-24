@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
@@ -251,6 +251,100 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  describe("CLAUDE_MODEL_CONFIG", () => {
+    let originalModelConfig: string | undefined;
+
+    beforeEach(() => {
+      originalModelConfig = process.env.CLAUDE_MODEL_CONFIG;
+      delete process.env.CLAUDE_MODEL_CONFIG;
+    });
+
+    afterEach(() => {
+      if (originalModelConfig !== undefined) {
+        process.env.CLAUDE_MODEL_CONFIG = originalModelConfig;
+      } else {
+        delete process.env.CLAUDE_MODEL_CONFIG;
+      }
+    });
+
+    it("passes modelOverrides as settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+      });
+
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+      });
+    });
+
+    it("passes availableModels as settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        availableModels: ["opus", "sonnet"],
+      });
+
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions!.settings).toEqual({
+        availableModels: ["opus", "sonnet"],
+      });
+    });
+
+    it("passes both modelOverrides and availableModels", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+    });
+
+    it("does not add settings when env var is not set", async () => {
+      await agent.newSession({ cwd: "/test", mcpServers: [] });
+
+      expect(capturedOptions!.settings).toBeUndefined();
+    });
+
+    it("ignores env var when _meta provides settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+      });
+
+      await agent.newSession({
+        cwd: "/test",
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              settings: {
+                model: "claude-sonnet-4-5",
+                modelOverrides: { "claude-opus-4-6": "meta-value" },
+              },
+            },
+          },
+        },
+      });
+
+      // _meta settings take precedence; env var is ignored entirely
+      expect(capturedOptions!.settings).toEqual({
+        model: "claude-sonnet-4-5",
+        modelOverrides: { "claude-opus-4-6": "meta-value" },
+      });
+    });
+
+    it("throws on invalid JSON", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = "not-json";
+
+      await expect(agent.newSession({ cwd: "/test", mcpServers: [] })).rejects.toThrow();
+    });
   });
 
   it("merges user-provided mcpServers with ACP mcpServers", async () => {
