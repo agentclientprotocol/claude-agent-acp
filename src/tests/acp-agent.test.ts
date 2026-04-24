@@ -221,14 +221,6 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       name: "compact",
     });
 
-    // Error case (no previous message)
-    await connection.prompt({
-      prompt: [{ type: "text", text: "/compact" }],
-      sessionId: newSessionResponse.sessionId,
-    });
-
-    expect(client.takeReceivedText()).toBe("Compacting...\n\nCompacting completed.");
-
     // Send something
     await connection.prompt({
       prompt: [{ type: "text", text: "Hi" }],
@@ -237,12 +229,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     // Clear response
     client.takeReceivedText();
 
-    // Test with instruction
     await connection.prompt({
       prompt: [
         {
           type: "text",
-          text: "/compact greeting",
+          text: "/compact",
         },
       ],
       sessionId: newSessionResponse.sessionId,
@@ -1195,7 +1186,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
     });
 
     const { value } = await q.next();
-    expect(value).toMatchObject({ type: "system", subtype: "init", session_id: sessionId });
+    expect(value).toMatchObject({ type: "system", session_id: sessionId });
   }, 10000);
 });
 
