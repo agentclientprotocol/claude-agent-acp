@@ -6,10 +6,10 @@ When using claude-agent-acp with alternative providers (e.g. AWS Bedrock), model
 
 A JSON string with two optional fields:
 
-| Field | Type | Description |
-|---|---|---|
-| `modelOverrides` | `Record<string, string>` | Maps Anthropic model IDs to provider-specific model IDs (e.g. Bedrock model IDs or ARNs) |
-| `availableModels` | `string[]` | Restricts which models are offered to users. Accepts aliases (`"opus"`), prefixes (`"opus-4-5"`), or full IDs |
+| Field             | Type                     | Description                                                                                                   |
+| ----------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `modelOverrides`  | `Record<string, string>` | Maps Anthropic model IDs to provider-specific model IDs (e.g. Bedrock model IDs or ARNs)                      |
+| `availableModels` | `string[]`               | Restricts which models are offered to users. Accepts aliases (`"opus"`), prefixes (`"opus-4-5"`), or full IDs |
 
 ### Examples
 
@@ -44,10 +44,10 @@ node dist/index.js
 
 When an ACP caller provides `settings` via `_meta.claudeCode.options.settings` in the `sessions/create` request, `CLAUDE_MODEL_CONFIG` is ignored entirely. The env var is a deployment-level fallback for cases where the caller does not configure model settings itself.
 
-| Source | Priority |
-|---|---|
-| `_meta.claudeCode.options.settings` (caller) | Highest — used if present |
-| `CLAUDE_MODEL_CONFIG` (env var) | Fallback — used only when caller provides no settings |
+| Source                                       | Priority                                              |
+| -------------------------------------------- | ----------------------------------------------------- |
+| `_meta.claudeCode.options.settings` (caller) | Highest — used if present                             |
+| `CLAUDE_MODEL_CONFIG` (env var)              | Fallback — used only when caller provides no settings |
 
 ## Format details
 

@@ -1613,12 +1613,13 @@ export class ClaudeAcpAgent implements Agent {
       // configuration (e.g. Bedrock model ID overrides). When the caller
       // provides settings via _meta, we intentionally ignore the env var —
       // the caller is assumed to have full control over model configuration.
-      ...((!userProvidedOptions?.settings && modelConfig) && {
-        settings: {
-          ...modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides },
-          ...modelConfig.availableModels && { availableModels: modelConfig.availableModels },
-        },
-      }),
+      ...(!userProvidedOptions?.settings &&
+        modelConfig && {
+          settings: {
+            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
+            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
+          },
+        }),
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
