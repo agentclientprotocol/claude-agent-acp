@@ -2,12 +2,11 @@
 
 // Load managed settings and apply environment variables
 import { loadManagedSettings, applyEnvironmentSettings } from "./utils.js";
-import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { runAcp, spawnClaudeCli } from "./acp-agent.js";
 
 if (process.argv.includes("--cli")) {
-  const { spawn } = await import("node:child_process");
   const args = process.argv.slice(2).filter((arg) => arg !== "--cli");
-  const child = spawn(await claudeCliPath(), args, { stdio: "inherit" });
+  const child = await spawnClaudeCli(args, { stdio: "inherit" });
 
   const signals =
     process.platform === "win32"

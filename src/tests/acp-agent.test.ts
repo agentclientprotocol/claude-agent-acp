@@ -30,8 +30,8 @@ import {
   isLocalCommandMetadata,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
-  claudeCliPath,
   describeAlwaysAllow,
+  spawnClaudeCli,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -1276,9 +1276,12 @@ describe("prompt conversion", () => {
 });
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
-  it("finds vendored cli path", async () => {
-    const path = await claudeCliPath();
-    expect(path).toMatch(/@anthropic-ai\/claude-agent-sdk-[^/]+\/claude(\.exe)?$/);
+  it("spawns vendored cli", async () => {
+    const child = await spawnClaudeCli(["--version"], { stdio: "ignore" });
+    const code = await new Promise<number | null>((resolve) => {
+      child.once("exit", (code) => resolve(code));
+    });
+    expect(code).toBe(0);
   });
 
   it("query has a 'default' model", async () => {

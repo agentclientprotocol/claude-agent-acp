@@ -62,6 +62,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -264,34 +265,64 @@ export type ToolUseCache = {
   };
 };
 
-export async function claudeCliPath(): Promise<string> {
-  if (process.env.CLAUDE_CODE_EXECUTABLE) {
-    return process.env.CLAUDE_CODE_EXECUTABLE;
-  }
+export async function spawnClaudeCli(
+  args: ReadonlyArray<string>,
+  options: SpawnOptions,
+): Promise<ChildProcess> {
   // The SDK's CLI is a native binary shipped as a platform-specific optional
-  // dependency of @anthropic-ai/claude-agent-sdk. Resolve via a require bound
-  // to the SDK so nested installs are found even when npm doesn't hoist.
+  // dependency of @anthropic-ai/claude-agent-sdk. On linux, both glibc and musl
+  // variants may resolve via require (e.g. bunx pre-installs both) even when
+  // only one is actually present on disk, so we try each candidate and fall
+  // through if spawn fails with ENOENT.
+  const candidates = await claudeCliCandidates();
+  let lastError: unknown;
+  for (const candidate of candidates) {
+    const child = spawn(candidate, args as string[], options);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("spawn", () => resolve());
+        child.once("error", reject);
+      });
+      return child;
+    } catch (err) {
+      lastError = err;
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    }
+  }
+  throw (
+    lastError ??
+    new Error(
+      `Claude native binary not found for ${process.platform}-${process.arch}. ` +
+        `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
+    )
+  );
+}
+
+async function claudeCliCandidates(): Promise<string[]> {
+  if (process.env.CLAUDE_CODE_EXECUTABLE) {
+    return [process.env.CLAUDE_CODE_EXECUTABLE];
+  }
+  // Resolve via a require bound to the SDK so nested installs are found even
+  // when npm doesn't hoist.
   const { createRequire } = await import("node:module");
   const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
   const ext = process.platform === "win32" ? ".exe" : "";
-  const candidates =
+  const names =
     process.platform === "linux"
       ? [
-          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
           `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
         ]
       : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
-  for (const candidate of candidates) {
+  const paths: string[] = [];
+  for (const name of names) {
     try {
-      return req.resolve(candidate);
+      paths.push(req.resolve(name));
     } catch {
-      // try next candidate
+      // package not installed
     }
   }
-  throw new Error(
-    `Claude native binary not found for ${process.platform}-${process.arch}. ` +
-      `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
-  );
+  return paths;
 }
 
 function shouldHideClaudeAuth(): boolean {
