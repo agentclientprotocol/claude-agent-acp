@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.0...v0.31.1) (2026-04-27)
+
+
+### Bug Fixes
+
+* detect glibc and use correct binary ([#599](https://github.com/agentclientprotocol/claude-agent-acp/issues/599)) ([f0801d5](https://github.com/agentclientprotocol/claude-agent-acp/commit/f0801d50b2390a3c48150b9b8507d30a70c18b84))
+
 ## [0.31.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.30.0...v0.31.0) (2026-04-24)
 
 
