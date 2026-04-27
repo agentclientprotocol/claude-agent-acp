@@ -1779,7 +1779,7 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
-      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? await claudeCliPath(),
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
