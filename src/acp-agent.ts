@@ -274,12 +274,22 @@ export async function claudeCliPath(): Promise<string> {
   const { createRequire } = await import("node:module");
   const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
   const ext = process.platform === "win32" ? ".exe" : "";
+  // On linux, both glibc and musl variants may be installed side-by-side
+  // (e.g. bunx hydrates every optional dep), so picking one by trial is
+  // unreliable: the wrong binary segfaults at runtime instead of failing to
+  // spawn. Detect the runtime libc and prefer the matching variant, falling
+  // back to the other only if the preferred one isn't installed.
   const candidates =
     process.platform === "linux"
-      ? [
-          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-          `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-        ]
+      ? isMuslLibc()
+        ? [
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+          ]
+        : [
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
+            `@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
+          ]
       : [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
   for (const candidate of candidates) {
     try {
@@ -292,6 +302,15 @@ export async function claudeCliPath(): Promise<string> {
     `Claude native binary not found for ${process.platform}-${process.arch}. ` +
       `Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
   );
+}
+
+function isMuslLibc(): boolean {
+  // process.report.getReport().header.glibcVersionRuntime is populated when
+  // Node is dynamically linked against glibc, and absent on musl.
+  const report = process.report?.getReport() as
+    | { header?: { glibcVersionRuntime?: string } }
+    | undefined;
+  return !report?.header?.glibcVersionRuntime;
 }
 
 function shouldHideClaudeAuth(): boolean {
@@ -1760,7 +1779,7 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
-      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE,
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? await claudeCliPath(),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
         "replay-user-messages": "",
