@@ -1587,9 +1587,11 @@ export class ClaudeAcpAgent implements Agent {
     configId: string,
     value: string,
   ): Promise<void> {
-    // Sync top-level session state
     if (configId === "mode") {
       session.modes = { ...session.modes, currentModeId: value };
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
     } else if (configId === "model") {
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
@@ -1608,6 +1610,7 @@ export class ClaudeAcpAgent implements Agent {
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
       const previousModeId = session.modes.currentModeId;
+      let modeDowngraded = false;
       if (!newAvailableModes.some((m) => m.id === previousModeId)) {
         session.modes = {
           availableModes: newAvailableModes,
@@ -1621,28 +1624,15 @@ export class ClaudeAcpAgent implements Agent {
           // to change models. The next setPermissionMode from the user will
           // either succeed or surface a fresh error.
           this.logger.error(
-            `Failed to sync permissionMode to "default" after model switch ` +
-              `invalidated "${previousModeId}": ${err instanceof Error ? err.message : String(err)}`,
+            `Failed to sync permissionMode to "default" after model switch invalidated "${previousModeId}":`,
+            err,
           );
         }
-        // Emit current_mode_update BEFORE the caller's config_option_update
-        // (updateConfigOption emits that after this method returns) so a
-        // client applying notifications in order updates currentModeId
-        // before re-rendering the config-option list.
-        await this.client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "current_mode_update",
-            currentModeId: "default",
-          },
-        });
+        modeDowngraded = true;
       } else {
         session.modes = { ...session.modes, availableModes: newAvailableModes };
       }
-    }
 
-    // Update configOptions
-    if (configId === "model") {
       // Rebuild config options since effort levels depend on the selected model
       const effortOpt = session.configOptions.find((o) => o.id === "effort");
       const currentEffort =
@@ -1661,6 +1651,22 @@ export class ClaudeAcpAgent implements Agent {
       if (newEffort !== currentEffort) {
         await session.query.applyFlagSettings({
           effortLevel: newEffort as Settings["effortLevel"],
+        });
+      }
+
+      // Emit current_mode_update only after session.modes AND
+      // session.configOptions have been fully reconciled. This way, a failure
+      // in the configOptions/effort rebuild above can't leave the client with
+      // a clamped currentModeId but stale configOptions, and the notification
+      // still precedes the caller's config_option_update so order-sensitive
+      // clients update currentModeId before re-rendering the option list.
+      if (modeDowngraded) {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "current_mode_update",
+            currentModeId: "default",
+          },
         });
       }
     } else {
@@ -1786,7 +1792,7 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    let permissionMode = resolvePermissionMode(
+    const permissionMode = resolvePermissionMode(
       settingsManager.getSettings().permissions?.defaultMode,
       this.logger,
     );
@@ -1945,35 +1951,34 @@ export class ClaudeAcpAgent implements Agent {
     // common case is `permissions.defaultMode: "auto"` resolving to a model
     // that does not support auto mode (e.g. Haiku); without this clamp the
     // SDK would later throw `"auto mode unavailable for this model"` from
-    // `setPermissionMode`. Use a mode-specific log so reviewers don't see
-    // "not available for model …" reported for the bypass/root case.
-    if (!availableModes.some((m) => m.id === permissionMode)) {
-      if (permissionMode === "auto") {
+    // `setPermissionMode`. Keep `permissionMode` as the resolved user intent
+    // (matches what was passed into `options.permissionMode` above) and use
+    // `effectiveMode` for the post-clamp value the session actually runs in.
+    let effectiveMode: PermissionMode = permissionMode;
+    if (!availableModes.some((m) => m.id === effectiveMode)) {
+      if (effectiveMode === "auto") {
         this.logger.error(
           `permissions.defaultMode "auto" is not available for model ` +
             `"${models.currentModelId}"; falling back to "default".`,
         );
       } else {
         this.logger.error(
-          `permissions.defaultMode "${permissionMode}" is not available in ` +
+          `permissions.defaultMode "${effectiveMode}" is not available in ` +
             `this session; falling back to "default".`,
         );
       }
-      permissionMode = "default";
+      effectiveMode = "default";
       // Sync the SDK so it doesn't keep "auto" cached internally. Wrapped in
       // try/catch since failing here would abort session creation entirely.
       try {
         await q.setPermissionMode("default");
       } catch (err) {
-        this.logger.error(
-          `Failed to sync clamped permissionMode to SDK: ` +
-            `${err instanceof Error ? err.message : String(err)}`,
-        );
+        this.logger.error("Failed to sync clamped permissionMode to SDK:", err);
       }
     }
 
     const modes = {
-      currentModeId: permissionMode,
+      currentModeId: effectiveMode,
       availableModes,
     };
 

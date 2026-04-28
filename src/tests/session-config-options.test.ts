@@ -882,21 +882,35 @@ describe("session config options", () => {
           },
         ],
       };
-      // Reflect the seeded availableModes in configOptions.mode.options so the
-      // pre-state matches what `createSession` would have produced for Opus.
-      session.configOptions = session.configOptions.map((o: any) =>
-        o.id === "mode"
-          ? {
-              ...o,
-              currentValue: currentModeId,
-              options: session.modes.availableModes.map((m: any) => ({
-                value: m.id,
-                name: m.name,
-                description: m.description,
-              })),
-            }
-          : o,
-      );
+      // Reflect the seeded availableModes/availableModels in configOptions so
+      // the pre-state matches what `createSession` would have produced for
+      // Opus, and `setSessionConfigOption` validation can accept the seeded
+      // model ids (notably the new Haiku entry).
+      session.configOptions = session.configOptions.map((o: any) => {
+        if (o.id === "mode") {
+          return {
+            ...o,
+            currentValue: currentModeId,
+            options: session.modes.availableModes.map((m: any) => ({
+              value: m.id,
+              name: m.name,
+              description: m.description,
+            })),
+          };
+        }
+        if (o.id === "model") {
+          return {
+            ...o,
+            currentValue: session.models.currentModelId,
+            options: session.models.availableModels.map((m: any) => ({
+              value: m.modelId,
+              name: m.name,
+              description: m.description,
+            })),
+          };
+        }
+        return o;
+      });
       return session;
     }
 
@@ -1019,6 +1033,41 @@ describe("session config options", () => {
         (o: any) => o.id === "mode",
       );
       expect(modeOption.currentValue).toBe("plan");
+    });
+
+    it("clamps mode and emits current_mode_update via setSessionConfigOption(model)", async () => {
+      // Mirrors the unstable_setSessionModel(auto → Haiku) test, but goes
+      // through the request/response API. The `current_mode_update` side
+      // effect must still fire so clients learn about the clamp regardless of
+      // which entry point triggered the model switch.
+      setupHaikuOpusSession("auto");
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-haiku-4-5",
+      });
+
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
+
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(1);
+      expect((modeUpdates[0].update as any).currentModeId).toBe("default");
+
+      // setSessionConfigOption is a request/response API: it returns the new
+      // configOptions in the response rather than emitting a
+      // config_option_update notification.
+      const configUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdates).toHaveLength(0);
+
+      const modeOption = response.configOptions.find((o: any) => o.id === "mode");
+      expect(modeOption).toBeDefined();
+      expect((modeOption as any).currentValue).toBe("default");
+      expect((modeOption as any).options.map((o: any) => o.value)).not.toContain("auto");
     });
 
     it("rejects direct setSessionMode to `auto` when the active model does not offer it", async () => {
