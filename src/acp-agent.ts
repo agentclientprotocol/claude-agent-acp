@@ -385,29 +385,36 @@ const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   bypass: "bypassPermissions",
 };
 
-export function resolvePermissionMode(defaultMode?: unknown): PermissionMode {
+export function resolvePermissionMode(
+  defaultMode?: unknown,
+  logger: Logger = console,
+): PermissionMode {
   if (defaultMode === undefined) {
     return "default";
   }
 
   if (typeof defaultMode !== "string") {
-    throw new Error("Invalid permissions.defaultMode: expected a string.");
+    logger.error("Ignoring permissions.defaultMode from settings: expected a string.");
+    return "default";
   }
 
   const normalized = defaultMode.trim().toLowerCase();
   if (normalized === "") {
-    throw new Error("Invalid permissions.defaultMode: expected a non-empty string.");
+    logger.error("Ignoring permissions.defaultMode from settings: expected a non-empty string.");
+    return "default";
   }
 
   const mapped = PERMISSION_MODE_ALIASES[normalized];
   if (!mapped) {
-    throw new Error(`Invalid permissions.defaultMode: ${defaultMode}.`);
+    logger.error(`Ignoring permissions.defaultMode from settings: unknown value '${defaultMode}'.`);
+    return "default";
   }
 
   if (mapped === "bypassPermissions" && !ALLOW_BYPASS) {
-    throw new Error(
-      "Invalid permissions.defaultMode: bypassPermissions is not available when running as root.",
+    logger.error(
+      "Ignoring permissions.defaultMode from settings: bypassPermissions is not available when running as root.",
     );
+    return "default";
   }
 
   return mapped;
@@ -1781,6 +1788,7 @@ export class ClaudeAcpAgent implements Agent {
 
     let permissionMode = resolvePermissionMode(
       settingsManager.getSettings().permissions?.defaultMode,
+      this.logger,
     );
 
     // Extract options from _meta if provided
@@ -1919,7 +1927,12 @@ export class ClaudeAcpAgent implements Agent {
       );
     }
 
-    const models = await getAvailableModels(q, initializationResult.models, settingsManager);
+    const models = await getAvailableModels(
+      q,
+      initializationResult.models,
+      settingsManager,
+      this.logger,
+    );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
@@ -2304,10 +2317,27 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
   return bestMatch;
 }
 
+function resolveSettingsModel(
+  models: ModelInfo[],
+  settingsModel: unknown,
+  logger: Logger,
+): ModelInfo | null {
+  if (settingsModel === undefined) {
+    return null;
+  }
+  if (typeof settingsModel !== "string") {
+    const typeLabel = settingsModel === null ? "null" : typeof settingsModel;
+    logger.error(`Ignoring model from settings: expected a string, got ${typeLabel}.`);
+    return null;
+  }
+  return resolveModelPreference(models, settingsModel);
+}
+
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   settingsManager: SettingsManager,
+  logger: Logger,
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
@@ -2322,8 +2352,8 @@ async function getAvailableModels(
     if (match) {
       currentModel = match;
     }
-  } else if (settings.model) {
-    const match = resolveModelPreference(models, settings.model);
+  } else {
+    const match = resolveSettingsModel(models, settings.model, logger);
     if (match) {
       currentModel = match;
     }

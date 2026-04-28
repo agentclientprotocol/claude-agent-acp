@@ -145,12 +145,12 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.modes.currentModeId).toBe("default");
   });
 
-  it("throws when permissions.defaultMode is not a string", async () => {
+  it("falls back to 'default' when permissions.defaultMode is invalid", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
       JSON.stringify({
         permissions: {
-          defaultMode: 123,
+          defaultMode: "not-a-real-mode",
         },
       }),
     );
@@ -158,18 +158,47 @@ describe("ClaudeAcpAgent settings", () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });
 
-    mockQuery();
+    const { getCapturedOptions } = mockQuery();
 
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
     const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
 
-    await expect(
-      (agent as any).createSession({
-        cwd: projectDir,
-        mcpServers: [],
-        _meta: { disableBuiltInTools: true },
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    // Bad mode is ignored at the usage site; session creation must not throw.
+    expect(getCapturedOptions().permissionMode).toBe("default");
+    expect(response.modes.currentModeId).toBe("default");
+  });
+
+  it("ignores model from settings when it is not a string", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({
+        model: 123,
       }),
-    ).rejects.toThrow("Invalid permissions.defaultMode");
+    );
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { setModelSpy } = mockQuery();
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    // Bad model is ignored at the usage site; falls back to the first SDK model.
+    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
+    expect(response.models.currentModelId).toBe("claude-sonnet-4-5");
   });
 
   describe("auto mode availability per model", () => {

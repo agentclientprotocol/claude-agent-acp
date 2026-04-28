@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.1...v0.31.2) (2026-04-28)
+
+
+### Bug Fixes
+
+* tolerate invalid values in settings.json ([#601](https://github.com/agentclientprotocol/claude-agent-acp/issues/601)) ([67af018](https://github.com/agentclientprotocol/claude-agent-acp/commit/67af018d0216238d8f3cd5bad04a55200518239b))
+
 ## [0.31.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.0...v0.31.1) (2026-04-27)
 
 
