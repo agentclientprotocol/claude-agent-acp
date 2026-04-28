@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.4](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.3...v0.31.4) (2026-04-28)
+
+
+### Bug Fixes
+
+* gate auto mode on model support ([#604](https://github.com/agentclientprotocol/claude-agent-acp/issues/604)) ([ec47d34](https://github.com/agentclientprotocol/claude-agent-acp/commit/ec47d3446fa22e5895621f57c0a4497dbe044505))
+
 ## [0.31.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.2...v0.31.3) (2026-04-28)
 
 
