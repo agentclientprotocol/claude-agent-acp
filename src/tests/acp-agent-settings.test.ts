@@ -172,6 +172,167 @@ describe("ClaudeAcpAgent settings", () => {
     ).rejects.toThrow("Invalid permissions.defaultMode");
   });
 
+  describe("auto mode availability per model", () => {
+    function mockQueryWithModels(models: any[]): {
+      getCapturedOptions: () => any;
+      setModelSpy: ReturnType<typeof vi.fn>;
+      setPermissionModeSpy: ReturnType<typeof vi.fn>;
+    } {
+      let capturedOptions: any;
+      const setModelSpy = vi.fn();
+      const setPermissionModeSpy = vi.fn();
+      querySpy.mockImplementation(({ options }: any) => {
+        capturedOptions = options;
+        return {
+          initializationResult: async () => ({ models }),
+          setModel: setModelSpy,
+          setPermissionMode: setPermissionModeSpy,
+          supportedCommands: async () => [],
+        } as any;
+      });
+      return {
+        getCapturedOptions: () => capturedOptions,
+        setModelSpy,
+        setPermissionModeSpy,
+      };
+    }
+
+    it("omits `auto` from availableModes when the resolved model lacks supportsAutoMode", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        {
+          value: "claude-haiku-4-5",
+          displayName: "Claude Haiku",
+          description: "Fast",
+          // supportsAutoMode intentionally omitted
+        },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
+      expect(modeIds).not.toContain("auto");
+      expect(modeIds).toEqual(
+        expect.arrayContaining(["default", "acceptEdits", "plan", "dontAsk"]),
+      );
+    });
+
+    it("includes `auto` when the resolved model has supportsAutoMode: true", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsAutoMode: true,
+        },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
+      expect(modeIds).toContain("auto");
+    });
+
+    it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ permissions: { defaultMode: "auto" } }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { getCapturedOptions, setPermissionModeSpy } = mockQueryWithModels([
+        {
+          value: "claude-haiku-4-5",
+          displayName: "Claude Haiku",
+          description: "Fast",
+          // supportsAutoMode intentionally omitted
+        },
+      ]);
+
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+      try {
+        const { ClaudeAcpAgent } = await import("../acp-agent.js");
+        const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+        const response = await (agent as any).createSession({
+          cwd: projectDir,
+          mcpServers: [],
+          _meta: { disableBuiltInTools: true },
+        });
+
+        // Options.permissionMode is built before init resolves, so it still
+        // carries the user-typed value; the SDK was synced via
+        // setPermissionMode after we discovered the model can't honor it.
+        expect(getCapturedOptions().permissionMode).toBe("auto");
+        expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
+        expect(response.modes.currentModeId).toBe("default");
+        expect(response.modes.availableModes.map((m: any) => m.id)).not.toContain("auto");
+
+        // A descriptive warning was logged so operators see the clamp.
+        const messages = errorSpy.mock.calls.map((c) => c.join(" "));
+        expect(messages.some((m) => m.includes("auto") && m.includes("claude-haiku-4-5"))).toBe(
+          true,
+        );
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("does not clamp permissions.defaultMode='auto' on a model that supports auto", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ permissions: { defaultMode: "auto" } }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { getCapturedOptions, setPermissionModeSpy } = mockQueryWithModels([
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsAutoMode: true,
+        },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(getCapturedOptions().permissionMode).toBe("auto");
+      expect(setPermissionModeSpy).not.toHaveBeenCalled();
+      expect(response.modes.currentModeId).toBe("auto");
+    });
+  });
+
   it("resolves model aliases like opus[1m] to the correct model", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),

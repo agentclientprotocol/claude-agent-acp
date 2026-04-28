@@ -1302,7 +1302,7 @@ export class ClaudeAcpAgent implements Agent {
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(session, params.configId, resolvedValue);
+    await this.applyConfigOptionValue(params.sessionId, session, params.configId, resolvedValue);
 
     return { configOptions: session.configOptions };
   }
@@ -1319,8 +1319,17 @@ export class ClaudeAcpAgent implements Agent {
       default:
         throw new Error("Invalid Mode");
     }
+
+    const session = this.sessions[sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    if (!session.modes.availableModes.some((mode) => mode.id === modeId)) {
+      throw new Error(`Mode ${modeId} is not available in this session`);
+    }
+
     try {
-      await this.sessions[sessionId].query.setPermissionMode(modeId);
+      await session.query.setPermissionMode(modeId);
     } catch (error) {
       if (error instanceof Error) {
         if (!error.message) {
@@ -1390,7 +1399,7 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       if (toolName === "ExitPlanMode") {
-        const options = [
+        const optionsAll = [
           { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
           {
             kind: "allow_always",
@@ -1401,12 +1410,20 @@ export class ClaudeAcpAgent implements Agent {
           { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
         ];
         if (ALLOW_BYPASS) {
-          options.unshift({
+          optionsAll.unshift({
             kind: "allow_always",
             name: "Yes, and bypass permissions",
             optionId: "bypassPermissions",
           });
         }
+        // Filter against the session's currently-advertised modes so we never
+        // present options the active model can't honor (e.g. `auto` on Haiku).
+        // `bypassPermissions` is already covered by `availableModes` via
+        // `buildAvailableModes`/`ALLOW_BYPASS`. The `plan` option is a
+        // "keep planning" reject path; it's always present in `availableModes`.
+        const options = optionsAll.filter((o) =>
+          session.modes.availableModes.some((m) => m.id === o.optionId),
+        );
 
         const response = await this.client.requestPermission({
           options,
@@ -1425,27 +1442,30 @@ export class ClaudeAcpAgent implements Agent {
         if (signal.aborted || response.outcome?.outcome === "cancelled") {
           throw new Error("Tool use aborted");
         }
+        const selectedMode =
+          response.outcome?.outcome === "selected" ? response.outcome.optionId : undefined;
+        const selectedModeWasOffered = options.some((option) => option.optionId === selectedMode);
         if (
-          response.outcome?.outcome === "selected" &&
-          (response.outcome.optionId === "default" ||
-            response.outcome.optionId === "acceptEdits" ||
-            response.outcome.optionId === "auto" ||
-            response.outcome.optionId === "bypassPermissions")
+          selectedModeWasOffered &&
+          (selectedMode === "default" ||
+            selectedMode === "acceptEdits" ||
+            selectedMode === "auto" ||
+            selectedMode === "bypassPermissions")
         ) {
           await this.client.sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: "current_mode_update",
-              currentModeId: response.outcome.optionId,
+              currentModeId: selectedMode,
             },
           });
-          await this.updateConfigOption(sessionId, "mode", response.outcome.optionId);
+          await this.updateConfigOption(sessionId, "mode", selectedMode);
 
           return {
             behavior: "allow",
             updatedInput: toolInput,
             updatedPermissions: suggestions ?? [
-              { type: "setMode", mode: response.outcome.optionId, destination: "session" },
+              { type: "setMode", mode: selectedMode, destination: "session" },
             ],
           };
         } else {
@@ -1543,7 +1563,7 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[sessionId];
     if (!session) return;
 
-    await this.applyConfigOptionValue(session, configId, value);
+    await this.applyConfigOptionValue(sessionId, session, configId, value);
 
     await this.client.sessionUpdate({
       sessionId,
@@ -1555,6 +1575,7 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   private async applyConfigOptionValue(
+    sessionId: string,
     session: Session,
     configId: string,
     value: string,
@@ -1571,6 +1592,46 @@ export class ClaudeAcpAgent implements Agent {
         session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
+
+      // Recompute availableModes for the new model and clamp the current
+      // mode if the SDK no longer offers it (today: "auto" on Haiku).
+      // `ModelInfo.supportsAutoMode` is the canonical SDK signal.
+      const newModelInfo = session.modelInfos.find((m) => m.value === value);
+      const newAvailableModes = buildAvailableModes(newModelInfo);
+      // Capture BEFORE mutating session.modes so the log message reflects
+      // the invalidated mode rather than "default".
+      const previousModeId = session.modes.currentModeId;
+      if (!newAvailableModes.some((m) => m.id === previousModeId)) {
+        session.modes = {
+          availableModes: newAvailableModes,
+          currentModeId: "default",
+        };
+        try {
+          await session.query.setPermissionMode("default");
+        } catch (err) {
+          // Failing the entire model switch over a bookkeeping sync error is
+          // worse UX than logging and continuing; the user explicitly asked
+          // to change models. The next setPermissionMode from the user will
+          // either succeed or surface a fresh error.
+          this.logger.error(
+            `Failed to sync permissionMode to "default" after model switch ` +
+              `invalidated "${previousModeId}": ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        // Emit current_mode_update BEFORE the caller's config_option_update
+        // (updateConfigOption emits that after this method returns) so a
+        // client applying notifications in order updates currentModeId
+        // before re-rendering the config-option list.
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "current_mode_update",
+            currentModeId: "default",
+          },
+        });
+      } else {
+        session.modes = { ...session.modes, availableModes: newAvailableModes };
+      }
     }
 
     // Update configOptions
@@ -1718,7 +1779,7 @@ export class ClaudeAcpAgent implements Agent {
       }
     }
 
-    const permissionMode = resolvePermissionMode(
+    let permissionMode = resolvePermissionMode(
       settingsManager.getSettings().permissions?.defaultMode,
     );
 
@@ -1860,40 +1921,42 @@ export class ClaudeAcpAgent implements Agent {
 
     const models = await getAvailableModels(q, initializationResult.models, settingsManager);
 
-    const availableModes = [
-      {
-        id: "auto",
-        name: "Auto",
-        description: "Use a model classifier to approve/deny permission prompts",
-      },
-      {
-        id: "default",
-        name: "Default",
-        description: "Standard behavior, prompts for dangerous operations",
-      },
-      {
-        id: "acceptEdits",
-        name: "Accept Edits",
-        description: "Auto-accept file edit operations",
-      },
-      {
-        id: "plan",
-        name: "Plan Mode",
-        description: "Planning mode, no actual tool execution",
-      },
-      {
-        id: "dontAsk",
-        name: "Don't Ask",
-        description: "Don't prompt for permissions, deny if not pre-approved",
-      },
-    ];
-    // Only works in non-root mode
-    if (ALLOW_BYPASS) {
-      availableModes.push({
-        id: "bypassPermissions",
-        name: "Bypass Permissions",
-        description: "Bypass all permission checks",
-      });
+    // Gate `auto` (and future model-specific modes) on the resolved model's
+    // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
+    const currentModelInfo = initializationResult.models.find(
+      (m) => m.value === models.currentModelId,
+    );
+    const availableModes = buildAvailableModes(currentModelInfo);
+
+    // Clamp `permissionMode` if the resolved session does not offer it. The
+    // common case is `permissions.defaultMode: "auto"` resolving to a model
+    // that does not support auto mode (e.g. Haiku); without this clamp the
+    // SDK would later throw `"auto mode unavailable for this model"` from
+    // `setPermissionMode`. Use a mode-specific log so reviewers don't see
+    // "not available for model …" reported for the bypass/root case.
+    if (!availableModes.some((m) => m.id === permissionMode)) {
+      if (permissionMode === "auto") {
+        this.logger.error(
+          `permissions.defaultMode "auto" is not available for model ` +
+            `"${models.currentModelId}"; falling back to "default".`,
+        );
+      } else {
+        this.logger.error(
+          `permissions.defaultMode "${permissionMode}" is not available in ` +
+            `this session; falling back to "default".`,
+        );
+      }
+      permissionMode = "default";
+      // Sync the SDK so it doesn't keep "auto" cached internally. Wrapped in
+      // try/catch since failing here would abort session creation entirely.
+      try {
+        await q.setPermissionMode("default");
+      } catch (err) {
+        this.logger.error(
+          `Failed to sync clamped permissionMode to SDK: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     const modes = {
@@ -2038,6 +2101,58 @@ function createEnvForGateway(gatewayMeta?: GatewayAuthMeta) {
       .join("\n"),
     ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
   };
+}
+
+/**
+ * Build the list of permission modes the agent will advertise for the given
+ * model. `auto` is gated by `ModelInfo.supportsAutoMode === true`, which is
+ * the SDK's model-level availability signal. `undefined`/`false` both exclude
+ * `auto`. `bypassPermissions` is still gated by `ALLOW_BYPASS`.
+ */
+function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState["availableModes"] {
+  const modes: SessionModeState["availableModes"] = [];
+
+  // Only advertise "auto" when the SDK reports the model supports it.
+  if (modelInfo?.supportsAutoMode === true) {
+    modes.push({
+      id: "auto",
+      name: "Auto",
+      description: "Use a model classifier to approve/deny permission prompts",
+    });
+  }
+
+  modes.push(
+    {
+      id: "default",
+      name: "Default",
+      description: "Standard behavior, prompts for dangerous operations",
+    },
+    {
+      id: "acceptEdits",
+      name: "Accept Edits",
+      description: "Auto-accept file edit operations",
+    },
+    {
+      id: "plan",
+      name: "Plan Mode",
+      description: "Planning mode, no actual tool execution",
+    },
+    {
+      id: "dontAsk",
+      name: "Don't Ask",
+      description: "Don't prompt for permissions, deny if not pre-approved",
+    },
+  );
+
+  if (ALLOW_BYPASS) {
+    modes.push({
+      id: "bypassPermissions",
+      name: "Bypass Permissions",
+      description: "Bypass all permission checks",
+    });
+  }
+
+  return modes;
 }
 
 function buildConfigOptions(

@@ -811,4 +811,342 @@ describe("session config options", () => {
       );
     });
   });
+
+  describe("auto mode availability per model", () => {
+    /**
+     * Augment the session populated by `populateSession()` with a Haiku entry
+     * (no `supportsAutoMode`), Opus + Sonnet entries with `supportsAutoMode:
+     * true`, and seed `availableModes` so it currently includes `auto`. This
+     * exercises the per-model recomputation done by `applyConfigOptionValue`
+     * on a model switch.
+     */
+    function setupHaikuOpusSession(currentModeId: string = "default") {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modelInfos = [
+        {
+          value: "claude-opus-4-5",
+          displayName: "Claude Opus",
+          description: "Most capable",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-sonnet-4-5",
+          displayName: "Claude Sonnet",
+          description: "Balanced",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-haiku-4-5",
+          displayName: "Claude Haiku",
+          description: "Fast",
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high"],
+          // supportsAutoMode intentionally omitted
+        },
+      ];
+      session.models = {
+        currentModelId: "claude-opus-4-5",
+        availableModels: [
+          { modelId: "claude-opus-4-5", name: "Claude Opus", description: "Most capable" },
+          { modelId: "claude-sonnet-4-5", name: "Claude Sonnet", description: "Balanced" },
+          { modelId: "claude-haiku-4-5", name: "Claude Haiku", description: "Fast" },
+        ],
+      };
+      session.modes = {
+        currentModeId,
+        availableModes: [
+          {
+            id: "auto",
+            name: "Auto",
+            description: "Use a model classifier to approve/deny permission prompts",
+          },
+          {
+            id: "default",
+            name: "Default",
+            description: "Standard behavior, prompts for dangerous operations",
+          },
+          {
+            id: "acceptEdits",
+            name: "Accept Edits",
+            description: "Auto-accept file edit operations",
+          },
+          { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          {
+            id: "dontAsk",
+            name: "Don't Ask",
+            description: "Don't prompt for permissions, deny if not pre-approved",
+          },
+        ],
+      };
+      // Reflect the seeded availableModes in configOptions.mode.options so the
+      // pre-state matches what `createSession` would have produced for Opus.
+      session.configOptions = session.configOptions.map((o: any) =>
+        o.id === "mode"
+          ? {
+              ...o,
+              currentValue: currentModeId,
+              options: session.modes.availableModes.map((m: any) => ({
+                value: m.id,
+                name: m.name,
+                description: m.description,
+              })),
+            }
+          : o,
+      );
+      return session;
+    }
+
+    beforeEach(() => {
+      populateSession();
+    });
+
+    it("drops `auto` from available modes when switching to Haiku", async () => {
+      setupHaikuOpusSession("default");
+
+      await agent.unstable_setSessionModel({
+        sessionId: SESSION_ID,
+        modelId: "claude-haiku-4-5",
+      });
+
+      const configUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdate).toBeDefined();
+      const modeOption = (configUpdate?.update as any).configOptions.find(
+        (o: any) => o.id === "mode",
+      );
+      expect(modeOption).toBeDefined();
+      const modeValues = modeOption.options.map((o: any) => o.value);
+      expect(modeValues).not.toContain("auto");
+      expect(modeValues).toEqual(
+        expect.arrayContaining(["default", "acceptEdits", "plan", "dontAsk"]),
+      );
+    });
+
+    it("clamps to `default` and emits current_mode_update when Opus(auto) → Haiku", async () => {
+      setupHaikuOpusSession("auto");
+
+      await agent.unstable_setSessionModel({
+        sessionId: SESSION_ID,
+        modelId: "claude-haiku-4-5",
+      });
+
+      // SDK was synced to "default".
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
+
+      // current_mode_update was emitted before config_option_update so a
+      // client applying notifications in order observes the mode change
+      // before re-rendering the config-option list.
+      const modeUpdateIdx = sessionUpdates.findIndex(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      const configUpdateIdx = sessionUpdates.findIndex(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(modeUpdateIdx).toBeGreaterThanOrEqual(0);
+      expect(configUpdateIdx).toBeGreaterThanOrEqual(0);
+      expect(modeUpdateIdx).toBeLessThan(configUpdateIdx);
+      expect((sessionUpdates[modeUpdateIdx].update as any).currentModeId).toBe("default");
+
+      // configOptions reflect the clamped mode.
+      const modeOption = (sessionUpdates[configUpdateIdx].update as any).configOptions.find(
+        (o: any) => o.id === "mode",
+      );
+      expect(modeOption.currentValue).toBe("default");
+    });
+
+    it("re-adds `auto` when switching from Haiku back to Opus", async () => {
+      const session = setupHaikuOpusSession("default");
+      // Pretend Haiku is the current model with no `auto`.
+      session.models.currentModelId = "claude-haiku-4-5";
+      session.modes.availableModes = session.modes.availableModes.filter(
+        (m: any) => m.id !== "auto",
+      );
+      const modeOpt = session.configOptions.find((o: any) => o.id === "mode");
+      modeOpt.options = session.modes.availableModes.map((m: any) => ({
+        value: m.id,
+        name: m.name,
+        description: m.description,
+      }));
+
+      await agent.unstable_setSessionModel({
+        sessionId: SESSION_ID,
+        modelId: "claude-opus-4-5",
+      });
+
+      const configUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      expect(configUpdate).toBeDefined();
+      const modeOption = (configUpdate?.update as any).configOptions.find(
+        (o: any) => o.id === "mode",
+      );
+      const modeValues = modeOption.options.map((o: any) => o.value);
+      expect(modeValues).toContain("auto");
+
+      // The current mode ("default") is still valid on Opus, so no
+      // current_mode_update should have been emitted by the model switch.
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(0);
+    });
+
+    it("preserves the current mode when it remains valid after a model switch", async () => {
+      setupHaikuOpusSession("plan");
+
+      await agent.unstable_setSessionModel({
+        sessionId: SESSION_ID,
+        modelId: "claude-haiku-4-5",
+      });
+
+      // `plan` is in availableModes for both Opus and Haiku, so no clamp.
+      expect(setPermissionModeSpy).not.toHaveBeenCalledWith("default");
+
+      const modeUpdates = sessionUpdates.filter(
+        (n) => n.update.sessionUpdate === "current_mode_update",
+      );
+      expect(modeUpdates).toHaveLength(0);
+
+      const configUpdate = sessionUpdates.find(
+        (n) => n.update.sessionUpdate === "config_option_update",
+      );
+      const modeOption = (configUpdate?.update as any).configOptions.find(
+        (o: any) => o.id === "mode",
+      );
+      expect(modeOption.currentValue).toBe("plan");
+    });
+
+    it("rejects direct setSessionMode to `auto` when the active model does not offer it", async () => {
+      const session = setupHaikuOpusSession("default");
+      session.models.currentModelId = "claude-haiku-4-5";
+      session.modes.availableModes = session.modes.availableModes.filter(
+        (mode: any) => mode.id !== "auto",
+      );
+
+      await expect(agent.setSessionMode({ sessionId: SESSION_ID, modeId: "auto" })).rejects.toThrow(
+        "Mode auto is not available in this session",
+      );
+
+      expect(setPermissionModeSpy).not.toHaveBeenCalledWith("auto");
+      expect(sessionUpdates).toHaveLength(0);
+    });
+  });
+
+  describe("ExitPlanMode permission options filtered by availableModes", () => {
+    let capturedPermissionRequest: any;
+    let permissionResponse: any;
+
+    beforeEach(() => {
+      capturedPermissionRequest = null;
+      permissionResponse = { outcome: { outcome: "cancelled" } };
+      // Replace the default mock client with one that captures the
+      // requestPermission call so we can assert on the offered options.
+      (agent as any).client = {
+        sessionUpdate: async (notification: SessionNotification) => {
+          sessionUpdates.push(notification);
+        },
+        requestPermission: async (params: any) => {
+          capturedPermissionRequest = params;
+          return permissionResponse;
+        },
+        readTextFile: async () => ({ content: "" }),
+        writeTextFile: async () => ({}),
+      };
+      populateSession();
+    });
+
+    it("omits the `auto` option on a model without supportsAutoMode", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      // Haiku-shaped session: availableModes does NOT include `auto`.
+      session.modes = {
+        currentModeId: "plan",
+        availableModes: [
+          { id: "default", name: "Default", description: "Standard" },
+          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+          { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
+        ],
+      };
+
+      const canUseTool = (agent as any).canUseTool(SESSION_ID);
+      const signal = new AbortController().signal;
+      try {
+        await canUseTool(
+          "ExitPlanMode",
+          { plan: "do stuff" },
+          { signal, suggestions: undefined, toolUseID: "toolu_1" },
+        );
+      } catch {
+        // The mock client returns `cancelled`, which makes canUseTool throw.
+        // We only care about the captured requestPermission options.
+      }
+
+      expect(capturedPermissionRequest).not.toBeNull();
+      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
+      expect(optionIds).not.toContain("auto");
+      expect(optionIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan"]));
+    });
+
+    it("denies a selected `auto` option if the client did not receive that option", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modes = {
+        currentModeId: "plan",
+        availableModes: [
+          { id: "default", name: "Default", description: "Standard" },
+          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+          { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
+        ],
+      };
+      permissionResponse = { outcome: { outcome: "selected", optionId: "auto" } };
+
+      const canUseTool = (agent as any).canUseTool(SESSION_ID);
+      const result = await canUseTool(
+        "ExitPlanMode",
+        { plan: "do stuff" },
+        { signal: new AbortController().signal, suggestions: undefined, toolUseID: "toolu_2" },
+      );
+
+      expect(capturedPermissionRequest).not.toBeNull();
+      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
+      expect(optionIds).not.toContain("auto");
+      expect(result.behavior).toBe("deny");
+      expect(sessionUpdates).toHaveLength(0);
+    });
+
+    it("includes the `auto` option on a model with supportsAutoMode", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.modes = {
+        currentModeId: "plan",
+        availableModes: [
+          { id: "auto", name: "Auto", description: "Use a model classifier" },
+          { id: "default", name: "Default", description: "Standard" },
+          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
+          { id: "plan", name: "Plan Mode", description: "Planning mode" },
+          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
+        ],
+      };
+
+      const canUseTool = (agent as any).canUseTool(SESSION_ID);
+      const signal = new AbortController().signal;
+      try {
+        await canUseTool(
+          "ExitPlanMode",
+          { plan: "do stuff" },
+          { signal, suggestions: undefined, toolUseID: "toolu_3" },
+        );
+      } catch {
+        // mock returns cancelled
+      }
+
+      expect(capturedPermissionRequest).not.toBeNull();
+      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
+      expect(optionIds).toContain("auto");
+    });
+  });
 });
