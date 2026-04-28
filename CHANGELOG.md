@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.3](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.2...v0.31.3) (2026-04-28)
+
+
+### Bug Fixes
+
+* Rename effort config category to thought_level ([#609](https://github.com/agentclientprotocol/claude-agent-acp/issues/609)) ([76b4e96](https://github.com/agentclientprotocol/claude-agent-acp/commit/76b4e9650832e59a6b4915ad898fc66a065022fa))
+
 ## [0.31.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.1...v0.31.2) (2026-04-28)
 
 
