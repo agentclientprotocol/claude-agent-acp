@@ -2119,7 +2119,7 @@ function buildConfigOptions(
       id: "effort",
       name: "Effort",
       description: "Available effort levels for this model",
-      category: "effort",
+      category: "thought_level",
       type: "select",
       currentValue: validEffort,
       options: effortOptions,
