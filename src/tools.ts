@@ -473,7 +473,9 @@ export function toolUpdateFromToolResult(
       // Extract output and exit code from either format:
       // 1. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
       // 2. Plain string content from a regular tool_result
-      // 3. Array content (e.g. [{ type: "text", text: "..." }])
+      // 3. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
+      //    or [{ type: "image", source: {...} }] when the local Bash tool
+      //    produces an image, e.g. piping a base64 data URI)
       let output = "";
       let exitCode = isError ? 1 : 0;
 
@@ -488,13 +490,20 @@ export function toolUpdateFromToolResult(
         exitCode = bashResult.return_code;
       } else if (typeof result === "string") {
         output = result;
-      } else if (
-        Array.isArray(result) &&
-        result.length > 0 &&
-        "text" in result[0] &&
-        typeof result[0].text === "string"
-      ) {
-        output = result.map((c: any) => c.text).join("\n");
+      } else if (Array.isArray(result) && result.length > 0) {
+        const textOnly = result.every(
+          (c: any) => c && typeof c === "object" && typeof c.text === "string",
+        );
+        if (textOnly) {
+          output = result.map((c: any) => c.text).join("\n");
+        } else {
+          // Image (or mixed non-text) content. Binary payloads can't be
+          // streamed through the terminal-output _meta channel, so bypass
+          // it and surface the blocks as ACP content. This handles the
+          // local Bash tool's image output, which previously failed the
+          // text-only guard and was silently dropped.
+          return toAcpContentUpdate(result, isError);
+        }
       }
 
       if (supportsTerminalOutput) {

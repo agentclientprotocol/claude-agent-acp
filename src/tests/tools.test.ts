@@ -664,6 +664,77 @@ describe("Bash terminal output", () => {
         });
       });
     });
+
+    describe("with image array tool_result (local Bash image output path)", () => {
+      // The local Bash tool emits image content as
+      // `[{ type: "image", source: { type: "base64", ... } }]` when a
+      // command produces an image (e.g. piping a base64 data URI).
+      const makeImageBashResult = (
+        data: string,
+        media_type: "image/png" | "image/jpeg" | "image/gif" | "image/webp" = "image/png",
+      ): ToolResultBlockParam => ({
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content: [
+          {
+            type: "image",
+            source: { type: "base64", media_type, data },
+          } as ImageBlockParam,
+        ],
+      });
+
+      it("should surface image content as ACP image content (terminal disabled)", () => {
+        const toolResult = makeImageBashResult("iVBORw0KGgo=");
+        const update = toolUpdateFromToolResult(toolResult, bashToolUse, false);
+
+        expect(update.content).toEqual([
+          {
+            type: "content",
+            content: { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+          },
+        ]);
+        expect(update._meta).toBeUndefined();
+      });
+
+      it("should bypass terminal _meta even when supportsTerminalOutput is true", () => {
+        // Binary content cannot be streamed through the terminal-output
+        // _meta channel, so the fix returns ACP content directly and skips
+        // the terminal info/output/exit triple.
+        const toolResult = makeImageBashResult("iVBORw0KGgo=", "image/jpeg");
+        const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+        expect(update.content).toEqual([
+          {
+            type: "content",
+            content: { type: "image", data: "iVBORw0KGgo=", mimeType: "image/jpeg" },
+          },
+        ]);
+        expect(update._meta).toBeUndefined();
+      });
+
+      it("should still surface multi-block content with text + image mixed", () => {
+        const toolResult: ToolResultBlockParam = {
+          type: "tool_result",
+          tool_use_id: "toolu_bash",
+          content: [
+            { type: "text", text: "generated:" },
+            {
+              type: "image",
+              source: { type: "base64", media_type: "image/png", data: "AAAA" },
+            } as ImageBlockParam,
+          ],
+        };
+        const update = toolUpdateFromToolResult(toolResult, bashToolUse, false);
+
+        expect(update.content).toEqual([
+          { type: "content", content: { type: "text", text: "generated:" } },
+          {
+            type: "content",
+            content: { type: "image", data: "AAAA", mimeType: "image/png" },
+          },
+        ]);
+      });
+    });
   });
 
   describe("toAcpNotifications with clientCapabilities", () => {
