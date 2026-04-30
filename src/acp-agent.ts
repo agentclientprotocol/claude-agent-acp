@@ -2603,8 +2603,18 @@ export function toAcpNotifications(
               onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
                 const toolUse = toolUseCache[toolUseId];
                 if (toolUse) {
+                  // Both `Edit` and `Write` produce a structuredPatch in their
+                  // PostToolUse tool_response. For Edit the diff replaces the
+                  // optimistic content built at tool_use time. For Write the
+                  // optimistic content (built from `input.content` alone with
+                  // `oldText: null`) shows "creation" semantics regardless of
+                  // whether the file existed; the structuredPatch from the
+                  // hook lets us emit the real diff for `type: "update"`. The
+                  // helper returns `{}` if the response shape isn't usable.
                   const editDiff =
-                    toolUse.name === "Edit" ? toolUpdateFromEditToolResponse(toolResponse) : {};
+                    toolUse.name === "Edit" || toolUse.name === "Write"
+                      ? toolUpdateFromEditToolResponse(toolResponse)
+                      : {};
                   const update: SessionNotification["update"] = {
                     _meta: {
                       claudeCode: {
