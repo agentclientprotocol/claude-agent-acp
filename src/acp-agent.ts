@@ -151,6 +151,16 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Ephemeral side-question Query spawned by /btw. Tracked so cancel() can
+   *  interrupt it alongside the main query. Undefined when no /btw is in flight. */
+  btwQuery?: Query;
+  /** Resolvers for /btw handlers waiting for the main query to become idle.
+   *  Drained by prompt()'s finally block when promptRunning flips to false,
+   *  and by cancel() so queued /btw calls bail out. */
+  idleResolvers: Array<() => void>;
+  /** True once prompt() has started a main turn at least once, meaning the
+   *  session JSONL exists on disk and is safe for /btw to resume from. */
+  hasRunMainPrompt: boolean;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -732,6 +742,14 @@ export class ClaudeAcpAgent implements Agent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
+    // /btw <question>: ephemeral side-question. Routes to a separate query()
+    // that resumes the main session's context but does not persist, so the
+    // main session's transcript stays clean for subsequent turns.
+    if (firstText === "/btw" || firstText.startsWith("/btw ")) {
+      const question = firstText.slice(4).trim();
+      return await this.handleBtwQuestion(session, params, question);
+    }
+
     if (session.promptRunning) {
       session.input.push(userMessage);
       const order = session.nextPendingOrder++;
@@ -752,6 +770,13 @@ export class ClaudeAcpAgent implements Agent {
     try {
       while (true) {
         const { value: message, done } = await session.query.next();
+
+        // The SDK subprocess has emitted a message — the session JSONL exists
+        // on disk by now, so subsequent /btw calls can safely `resume` from it.
+        // Flipping here rather than before the loop ensures we don't mark the
+        // session as run if the subprocess fails to start (errors are caught
+        // below and /btw resume would have failed against a nonexistent file).
+        session.hasRunMainPrompt = true;
 
         if (done || !message) {
           if (session.cancelled) {
@@ -1166,6 +1191,9 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
+        // Release any /btw handlers waiting on main-session idle.
+        const idleWaiters = session.idleResolvers.splice(0);
+        for (const resolve of idleWaiters) resolve();
         // This usually should not happen, but in case the loop finishes
         // without claude sending all message replays, we resolve the
         // next pending prompt call to ensure no prompts get stuck.
@@ -1192,7 +1220,173 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+    // Release any /btw handlers waiting on main-session idle; they observe
+    // session.cancelled and return stopReason: "cancelled".
+    const idleWaiters = session.idleResolvers.splice(0);
+    for (const resolve of idleWaiters) resolve();
+    // Interrupt an in-flight /btw side-question Query, if any.
+    if (session.btwQuery) {
+      try {
+        await session.btwQuery.interrupt();
+      } catch (error) {
+        this.logger.error(
+          `[claude-agent-acp] Error interrupting /btw query: ${(error as Error).message}`,
+        );
+      }
+    }
     await session.query.interrupt();
+  }
+
+  /**
+   * Handle a `/btw <question>` side question. Spawns an ephemeral Query that
+   * resumes the main session's transcript for context but uses
+   * `persistSession: false` so nothing is written to disk. The assistant's
+   * response is forwarded to Zed on the main ACP sessionId. Tools are
+   * disabled via `tools: []` + `disallowedTools: ["*"]` and turns are capped
+   * at 1, so the side query can only produce a single text answer.
+   *
+   * Serialized behind any in-flight main turn via session.idleResolvers so
+   * the two queries don't interleave output on the same ACP sessionId.
+   */
+  private async handleBtwQuestion(
+    session: Session,
+    params: PromptRequest,
+    question: string,
+  ): Promise<PromptResponse> {
+    if (question === "") {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Usage: `/btw <question>`" },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+
+    // Only one /btw in flight per session. ACP clients serialize prompt()
+    // per session so this shouldn't happen from Zed, but guard the invariant
+    // so a stray concurrent call doesn't orphan an in-flight Query.
+    if (session.btwQuery) {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: "A `/btw` question is already in progress — wait for it to finish.",
+          },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+
+    // Wait for main query to idle so output streams don't interleave and
+    // so the side query's `resume` reads a stable on-disk transcript.
+    if (session.promptRunning) {
+      await new Promise<void>((resolve) => {
+        session.idleResolvers.push(resolve);
+      });
+      if (session.cancelled) {
+        return { stopReason: "cancelled" };
+      }
+    }
+
+    const input = new Pushable<SDKUserMessage>();
+    input.push({
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: question }] },
+      session_id: params.sessionId,
+      parent_tool_use_id: null,
+    });
+    // maxTurns: 1 means the SDK won't need more input; close the stream so
+    // the subprocess sees EOF cleanly rather than relying solely on close().
+    input.end();
+
+    const canResume = session.hasRunMainPrompt;
+    const sideOptions: Options = {
+      cwd: session.cwd,
+      persistSession: false,
+      maxTurns: 1,
+      tools: [],
+      disallowedTools: ["*"],
+      systemPrompt: { type: "preset", preset: "claude_code" },
+      settingSources: ["user", "project", "local"],
+      pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
+      ...(canResume ? { resume: params.sessionId } : {}),
+    };
+
+    let sideQuery: Query;
+    try {
+      sideQuery = query({ prompt: input, options: sideOptions });
+      session.btwQuery = sideQuery;
+      await sideQuery.initializationResult();
+      if (session.models.currentModelId) {
+        try {
+          await sideQuery.setModel(session.models.currentModelId);
+        } catch (error) {
+          this.logger.error(`[claude-agent-acp] /btw setModel failed: ${(error as Error).message}`);
+        }
+      }
+    } catch (error) {
+      session.btwQuery = undefined;
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `\`/btw\` failed: ${(error as Error).message}`,
+          },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
+
+    const ephemeralCache: ToolUseCache = {};
+    try {
+      for await (const message of sideQuery) {
+        if (session.cancelled) {
+          return { stopReason: "cancelled" };
+        }
+        if (message.type === "assistant" && message.parent_tool_use_id === null) {
+          const notifications = toAcpNotifications(
+            message.message.content,
+            "assistant",
+            params.sessionId,
+            ephemeralCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              cwd: session.cwd,
+              registerHooks: false,
+            },
+          );
+          for (const notification of notifications) {
+            notification.update._meta = {
+              ...notification.update._meta,
+              claudeCode: {
+                ...(notification.update._meta?.claudeCode || {}),
+                btw: true,
+              },
+            };
+            await this.client.sessionUpdate(notification);
+          }
+        } else if (message.type === "result") {
+          break;
+        }
+      }
+    } finally {
+      session.btwQuery = undefined;
+      try {
+        sideQuery.close();
+      } catch {
+        // ignore close errors; the subprocess may already be gone
+      }
+    }
+
+    return { stopReason: session.cancelled ? "cancelled" : "end_turn" };
   }
 
   /** Cleanly tear down a session: cancel in-flight work, dispose resources,
@@ -2021,6 +2215,8 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
 
     return {
@@ -2376,7 +2572,7 @@ async function getAvailableModels(
   };
 }
 
-function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
+export function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "cost",
     "keybindings-help",
@@ -2387,7 +2583,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "todos",
   ];
 
-  return commands
+  const result = commands
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -2407,6 +2603,17 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  // Append /btw — implemented in this agent layer (not backed by the SDK's
+  // supportedCommands list), for ephemeral side questions that don't persist
+  // to the session transcript. See handleBtwQuestion.
+  result.push({
+    name: "btw",
+    description: "Ask a side question — not saved to this thread's context",
+    input: { hint: "question" },
+  });
+
+  return result;
 }
 
 function formatUriAsLink(uri: string): string {

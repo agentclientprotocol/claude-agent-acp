@@ -32,6 +32,7 @@ import {
   ClaudeAcpAgent,
   claudeCliPath,
   describeAlwaysAllow,
+  getAvailableSlashCommands,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -1532,6 +1533,8 @@ describe("stop reason propagation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
   }
 
@@ -1675,6 +1678,8 @@ describe("stop reason propagation", () => {
       nextPendingOrder: 0,
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
 
     const response = await agent.prompt({
@@ -1833,6 +1838,8 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
     return agent.sessions[sessionId]!;
   }
@@ -1929,6 +1936,8 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
     return agent.sessions[sessionId]!;
   }
@@ -2163,6 +2172,8 @@ describe("usage_update computation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
   }
 
@@ -3062,6 +3073,8 @@ describe("emitRawSDKMessages", () => {
       abortController: new AbortController(),
       emitRawSDKMessages,
       contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: false,
     };
   }
 
@@ -3197,5 +3210,169 @@ describe("emitRawSDKMessages", () => {
     expect(sdkMessages[0].params.message.type).toBe("system");
     expect(sdkMessages[0].params.message.subtype).toBe("compact_boundary");
     expect(sdkMessages[1].params.message.type).toBe("result");
+  });
+});
+
+describe("/btw side-question", () => {
+  function createMockAgentWithCapture() {
+    const updates: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function injectBareSession(
+    agent: ClaudeAcpAgent,
+    overrides: {
+      promptRunning?: boolean;
+      btwQuery?: any;
+      hasRunMainPrompt?: boolean;
+    } = {},
+  ) {
+    agent.sessions["test-session"] = {
+      query: (async function* () {})() as any,
+      input: new Pushable<any>(),
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "claude-sonnet-4-5", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: overrides.promptRunning ?? false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      idleResolvers: [],
+      hasRunMainPrompt: overrides.hasRunMainPrompt ?? true,
+      btwQuery: overrides.btwQuery,
+    };
+    return agent.sessions["test-session"];
+  }
+
+  it("empty argument shows usage notice and returns end_turn without spawning a subprocess", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectBareSession(agent);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/btw" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(updates).toHaveLength(1);
+    const update = updates[0].update;
+    expect(update.sessionUpdate).toBe("agent_message_chunk");
+    if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+      expect(update.content.text).toContain("Usage:");
+      expect(update.content.text).toContain("/btw");
+    }
+    // Subprocess should not have been spawned — btwQuery stays undefined
+    expect(agent.sessions["test-session"].btwQuery).toBeUndefined();
+  });
+
+  it("empty argument with trailing space also shows usage notice", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectBareSession(agent);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/btw " }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    const update = updates[0].update;
+    if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+      expect(update.content.text).toContain("Usage:");
+    }
+  });
+
+  it("concurrent /btw returns an in-progress notice without spawning a second subprocess", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const fakeExistingQuery = { interrupt: vi.fn() };
+    injectBareSession(agent, { btwQuery: fakeExistingQuery });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/btw another question" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(updates).toHaveLength(1);
+    const update = updates[0].update;
+    if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+      expect(update.content.text.toLowerCase()).toContain("already in progress");
+    }
+    // The original in-flight query should not have been overwritten
+    expect(agent.sessions["test-session"].btwQuery).toBe(fakeExistingQuery);
+    expect(fakeExistingQuery.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("cancel while /btw is waiting for main idle returns stopReason cancelled", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const session = injectBareSession(agent, { promptRunning: true });
+
+    // Kick off /btw — it should enter the idle-wait branch.
+    const btwPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/btw what color is the sky" }],
+    });
+
+    // Give /btw a microtask tick to register its resolver.
+    await new Promise((r) => setImmediate(r));
+    expect(session.idleResolvers).toHaveLength(1);
+
+    // Simulate main-session cancel — should drain the waiter and flip cancelled.
+    session.cancelled = true;
+    const waiters = session.idleResolvers.splice(0);
+    for (const resolve of waiters) resolve();
+
+    const response = await btwPromise;
+    expect(response.stopReason).toBe("cancelled");
+    // No agent_message_chunk should have been sent for a cancelled-before-start /btw
+    expect(updates).toHaveLength(0);
+  });
+
+  it("getAvailableSlashCommands appends /btw to the SDK-provided list", () => {
+    const result = getAvailableSlashCommands([]);
+    const btw = result.find((c) => c.name === "btw");
+    expect(btw).toBeDefined();
+    expect(btw?.description.toLowerCase()).toContain("side question");
+    expect(btw?.input).toEqual({ hint: "question" });
+  });
+
+  it("getAvailableSlashCommands preserves SDK commands alongside /btw", () => {
+    const result = getAvailableSlashCommands([
+      {
+        name: "compact",
+        description: "Compact the conversation",
+        argumentHint: null,
+      } as any,
+    ]);
+    const names = result.map((c) => c.name);
+    expect(names).toContain("compact");
+    expect(names).toContain("btw");
+  });
+
+  it("/btw is not listed among unsupported commands", () => {
+    // Regression guard: if someone adds "btw" to UNSUPPORTED_COMMANDS by accident,
+    // the filter would strip it before we append — verify it survives when SDK
+    // happens to report it too.
+    const result = getAvailableSlashCommands([]);
+    const btwEntries = result.filter((c) => c.name === "btw");
+    expect(btwEntries).toHaveLength(1);
   });
 });
