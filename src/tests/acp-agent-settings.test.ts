@@ -39,7 +39,7 @@ describe("ClaudeAcpAgent settings", () => {
         initializationResult: async () => ({
           models: [
             {
-              value: "claude-sonnet-4-5",
+              value: "claude-sonnet-4-6",
               displayName: "Claude Sonnet 4.5",
               description: "Default",
             },
@@ -197,8 +197,8 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     // Bad model is ignored at the usage site; falls back to the first SDK model.
-    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-5");
-    expect(response.models.currentModelId).toBe("claude-sonnet-4-5");
+    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+    expect(response.models.currentModelId).toBe("claude-sonnet-4-6");
   });
 
   describe("auto mode availability per model", () => {
