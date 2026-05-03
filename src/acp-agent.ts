@@ -73,7 +73,7 @@ import {
   planEntries,
   registerHookCallback,
   toolInfoFromToolUse,
-  toolUpdateFromEditToolResponse,
+  toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
@@ -2613,7 +2613,7 @@ export function toAcpNotifications(
                   // helper returns `{}` if the response shape isn't usable.
                   const editDiff =
                     toolUse.name === "Edit" || toolUse.name === "Write"
-                      ? toolUpdateFromEditToolResponse(toolResponse)
+                      ? toolUpdateFromDiffToolResponse(toolResponse)
                       : {};
                   const update: SessionNotification["update"] = {
                     _meta: {

@@ -1058,7 +1058,7 @@ describe("Bash terminal output", () => {
 
   describe("post-tool-use hook sends diff content for Write tool", () => {
     // Regression: previously the dispatch only invoked
-    // toolUpdateFromEditToolResponse for `Edit`, so a Write that
+    // toolUpdateFromDiffToolResponse for `Edit`, so a Write that
     // overwrote an existing file (FileWriteOutput.type === "update")
     // showed a "creation" diff (oldText: null, full new content) at
     // tool_use time and was never corrected after the tool ran.

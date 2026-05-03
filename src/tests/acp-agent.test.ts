@@ -22,7 +22,7 @@ import {
   toolInfoFromToolUse,
   toDisplayPath,
   toolUpdateFromToolResult,
-  toolUpdateFromEditToolResponse,
+  toolUpdateFromDiffToolResponse,
 } from "../tools.js";
 import {
   toAcpNotifications,
@@ -998,17 +998,17 @@ describe("toDisplayPath", () => {
   });
 });
 
-describe("toolUpdateFromEditToolResponse", () => {
+describe("toolUpdateFromDiffToolResponse", () => {
   it("should return empty for non-object input", () => {
-    expect(toolUpdateFromEditToolResponse(null)).toEqual({});
-    expect(toolUpdateFromEditToolResponse(undefined)).toEqual({});
-    expect(toolUpdateFromEditToolResponse("string")).toEqual({});
+    expect(toolUpdateFromDiffToolResponse(null)).toEqual({});
+    expect(toolUpdateFromDiffToolResponse(undefined)).toEqual({});
+    expect(toolUpdateFromDiffToolResponse("string")).toEqual({});
   });
 
   it("should return empty when filePath or structuredPatch is missing", () => {
-    expect(toolUpdateFromEditToolResponse({})).toEqual({});
-    expect(toolUpdateFromEditToolResponse({ filePath: "/foo.ts" })).toEqual({});
-    expect(toolUpdateFromEditToolResponse({ structuredPatch: [] })).toEqual({});
+    expect(toolUpdateFromDiffToolResponse({})).toEqual({});
+    expect(toolUpdateFromDiffToolResponse({ filePath: "/foo.ts" })).toEqual({});
+    expect(toolUpdateFromDiffToolResponse({ structuredPatch: [] })).toEqual({});
   });
 
   it("should build diff content from a single-hunk structuredPatch", () => {
@@ -1025,7 +1025,7 @@ describe("toolUpdateFromEditToolResponse", () => {
       ],
     };
 
-    expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+    expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({
       content: [
         {
           type: "diff",
@@ -1059,7 +1059,7 @@ describe("toolUpdateFromEditToolResponse", () => {
       ],
     };
 
-    expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+    expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({
       content: [
         {
           type: "diff",
@@ -1095,7 +1095,7 @@ describe("toolUpdateFromEditToolResponse", () => {
       ],
     };
 
-    expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({
+    expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({
       content: [
         {
           type: "diff",
@@ -1114,7 +1114,7 @@ describe("toolUpdateFromEditToolResponse", () => {
       structuredPatch: [],
     };
 
-    expect(toolUpdateFromEditToolResponse(toolResponse)).toEqual({});
+    expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({});
   });
 });
 
