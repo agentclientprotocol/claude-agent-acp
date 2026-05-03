@@ -32,6 +32,7 @@ import {
   ClaudeAcpAgent,
   claudeCliPath,
   describeAlwaysAllow,
+  type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -3021,7 +3022,7 @@ describe("emitRawSDKMessages", () => {
   function injectSession(
     agent: ClaudeAcpAgent,
     messages: any[],
-    emitRawSDKMessages: boolean | { type: string; subtype?: string }[],
+    emitRawSDKMessages: boolean | SDKMessageFilter[],
   ) {
     const input = new Pushable<any>();
     async function* messageGenerator() {
@@ -3197,5 +3198,216 @@ describe("emitRawSDKMessages", () => {
     expect(sdkMessages[0].params.message.type).toBe("system");
     expect(sdkMessages[0].params.message.subtype).toBe("compact_boundary");
     expect(sdkMessages[1].params.message.type).toBe("result");
+  });
+
+  it("filter by origin kind only emits matching results", async () => {
+    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    injectSession(
+      agent,
+      [
+        { ...createResultMessage(), origin: { kind: "channel", server: "acp" } },
+        { ...createResultMessage(), origin: { kind: "task-notification" } },
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      [{ type: "result", origin: "task-notification" }],
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
+    expect(sdkMessages).toHaveLength(1);
+    expect(sdkMessages[0].params.message.origin.kind).toBe("task-notification");
+  });
+
+  it("filter without origin matches results regardless of origin", async () => {
+    const { agent, extNotifications } = createMockAgentWithExtNotification();
+    injectSession(
+      agent,
+      [
+        { ...createResultMessage(), origin: { kind: "channel", server: "acp" } },
+        { ...createResultMessage(), origin: { kind: "task-notification" } },
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      [{ type: "result" }],
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
+    expect(sdkMessages).toHaveLength(2);
+  });
+});
+
+describe("result origin handling", () => {
+  function createMockAgentWithCapture() {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+    };
+  }
+
+  function createAssistantMessage() {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "hello" }],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    };
+  }
+
+  function createResult(overrides: Record<string, unknown> = {}) {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...overrides,
+    };
+  }
+
+  it("forwards origin in usage_update _meta", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage(),
+      createResult({ origin: { kind: "channel", server: "acp" } }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update._meta).toEqual({
+      "_claude/origin": { kind: "channel", server: "acp" },
+    });
+  });
+
+  it("omits _meta when origin is absent", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage(),
+      createResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update._meta).toBeUndefined();
+  });
+
+  it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage(),
+      // User-turn result completes normally
+      createResult({ origin: { kind: "channel", server: "acp" } }),
+      // Task-notification followup hits max_tokens — must not bleed into the user's stopReason
+      createResult({
+        stop_reason: "max_tokens",
+        origin: { kind: "task-notification" },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
+  it("user-prompted result with max_tokens still sets stopReason", async () => {
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage(),
+      createResult({
+        stop_reason: "max_tokens",
+        origin: { kind: "channel", server: "acp" },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("max_tokens");
   });
 });

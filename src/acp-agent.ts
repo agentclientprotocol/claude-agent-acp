@@ -56,6 +56,7 @@ import {
   query,
   Settings,
   SDKAssistantMessageError,
+  SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
   SlashCommand,
@@ -179,6 +180,7 @@ type BackgroundTerminal =
 export type SDKMessageFilter = {
   type: string;
   subtype?: string;
+  origin?: SDKMessageOrigin["kind"];
 };
 
 /**
@@ -873,6 +875,12 @@ export class ClaudeAcpAgent implements Agent {
               session.contextWindowSize = matchingModelUsage.contextWindow;
             }
 
+            // Task-notification followups are autonomous work triggered by a
+            // task-notification system message, not by the user's prompt.
+            // They should not influence the user-turn lifecycle (stop reason,
+            // slash-command output forwarding) but their cost is real.
+            const isTaskNotification = message.origin?.kind === "task-notification";
+
             // Send usage_update notification
             if (lastAssistantTotalUsage !== null) {
               await this.client.sessionUpdate({
@@ -885,12 +893,17 @@ export class ClaudeAcpAgent implements Agent {
                     amount: message.total_cost_usd,
                     currency: "USD",
                   },
+                  ...(message.origin && {
+                    _meta: { "_claude/origin": message.origin },
+                  }),
                 },
               });
             }
 
             if (session.cancelled) {
-              stopReason = "cancelled";
+              if (!isTaskNotification) {
+                stopReason = "cancelled";
+              }
               break;
             }
 
@@ -900,7 +913,9 @@ export class ClaudeAcpAgent implements Agent {
                   throw RequestError.authRequired();
                 }
                 if (message.stop_reason === "max_tokens") {
-                  stopReason = "max_tokens";
+                  if (!isTaskNotification) {
+                    stopReason = "max_tokens";
+                  }
                   break;
                 }
                 if (message.is_error) {
@@ -911,7 +926,9 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
-                if (isLocalOnlyCommand) {
+                // Task-notification followups never originate from a user
+                // slash command, so skip the forwarding for them.
+                if (isLocalOnlyCommand && !isTaskNotification) {
                   for (const notification of toAcpNotifications(
                     message.result,
                     "assistant",
@@ -927,7 +944,9 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "error_during_execution": {
                 if (message.stop_reason === "max_tokens") {
-                  stopReason = "max_tokens";
+                  if (!isTaskNotification) {
+                    stopReason = "max_tokens";
+                  }
                   break;
                 }
                 if (message.is_error) {
@@ -936,7 +955,9 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                stopReason = "end_turn";
+                if (!isTaskNotification) {
+                  stopReason = "end_turn";
+                }
                 break;
               }
               case "error_max_budget_usd":
@@ -948,7 +969,9 @@ export class ClaudeAcpAgent implements Agent {
                     message.errors.join(", ") || message.subtype,
                   );
                 }
-                stopReason = "max_turn_requests";
+                if (!isTaskNotification) {
+                  stopReason = "max_turn_requests";
+                }
                 break;
               default:
                 unreachable(message, this.logger);
@@ -2034,12 +2057,15 @@ export class ClaudeAcpAgent implements Agent {
 
 function shouldEmitRawMessage(
   config: boolean | SDKMessageFilter[],
-  message: { type: string; subtype?: string },
+  message: { type: string; subtype?: string; origin?: SDKMessageOrigin },
 ): boolean {
   if (config === true) return true;
   if (config === false) return false;
   return config.some(
-    (f) => f.type === message.type && (f.subtype === undefined || f.subtype === message.subtype),
+    (f) =>
+      f.type === message.type &&
+      (f.subtype === undefined || f.subtype === message.subtype) &&
+      (f.origin === undefined || f.origin === message.origin?.kind),
   );
 }
 
