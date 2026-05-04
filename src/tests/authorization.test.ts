@@ -5,9 +5,12 @@ import { AgentSideConnection } from "@agentclientprotocol/sdk";
 const mockQuery = vi.hoisted(() =>
   vi.fn(() => ({
     initializationResult: vi.fn().mockResolvedValue({
-      models: [{ value: "id", displayName: "name", description: "description" }],
+      models: [
+        { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
+      ],
     }),
     setModel: vi.fn(),
+    setPermissionMode: vi.fn(),
     supportedCommands: vi.fn().mockResolvedValue([]),
   })),
 );

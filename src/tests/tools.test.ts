@@ -1056,6 +1056,162 @@ describe("Bash terminal output", () => {
     });
   });
 
+  describe("post-tool-use hook sends diff content for Write tool", () => {
+    // Regression: previously the dispatch only invoked
+    // toolUpdateFromDiffToolResponse for `Edit`, so a Write that
+    // overwrote an existing file (FileWriteOutput.type === "update")
+    // showed a "creation" diff (oldText: null, full new content) at
+    // tool_use time and was never corrected after the tool ran.
+    it("should emit a real diff for Write of an existing file (type: update)", async () => {
+      const toolUseCache: ToolUseCache = {};
+      const hookUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AgentSideConnection;
+
+      toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_write_update",
+            name: "Write",
+            input: {
+              file_path: "/Users/test/project/file.ts",
+              content: "line1\nNEW line2\nline3",
+            },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+      );
+
+      const hook = createPostToolUseHook(mockLogger);
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "Write",
+          tool_input: {
+            file_path: "/Users/test/project/file.ts",
+            content: "line1\nNEW line2\nline3",
+          },
+          tool_response: {
+            type: "update",
+            filePath: "/Users/test/project/file.ts",
+            content: "line1\nNEW line2\nline3",
+            originalFile: "line1\nold line2\nline3",
+            structuredPatch: [
+              {
+                oldStart: 1,
+                oldLines: 3,
+                newStart: 1,
+                newLines: 3,
+                lines: [" line1", "-old line2", "+NEW line2", " line3"],
+              },
+            ],
+            userModified: false,
+          },
+          tool_use_id: "toolu_write_update",
+          session_id: "test-session",
+          transcript_path: "/tmp/test",
+          cwd: "/tmp",
+        },
+        "toolu_write_update",
+        { signal: AbortSignal.abort() },
+      );
+
+      expect(hookUpdates).toHaveLength(1);
+      const hookUpdate = hookUpdates[0].update;
+      expect(hookUpdate._meta.claudeCode.toolName).toBe("Write");
+      expect(hookUpdate.content).toEqual([
+        {
+          type: "diff",
+          path: "/Users/test/project/file.ts",
+          oldText: "line1\nold line2\nline3",
+          newText: "line1\nNEW line2\nline3",
+        },
+      ]);
+      expect(hookUpdate.locations).toEqual([{ path: "/Users/test/project/file.ts", line: 1 }]);
+    });
+
+    it("should still emit a sensible diff for Write of a brand-new file (type: create)", async () => {
+      const toolUseCache: ToolUseCache = {};
+      const hookUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AgentSideConnection;
+
+      toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_write_create",
+            name: "Write",
+            input: {
+              file_path: "/Users/test/project/new.ts",
+              content: "first\nsecond",
+            },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+      );
+
+      const hook = createPostToolUseHook(mockLogger);
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "Write",
+          tool_input: {
+            file_path: "/Users/test/project/new.ts",
+            content: "first\nsecond",
+          },
+          tool_response: {
+            type: "create",
+            filePath: "/Users/test/project/new.ts",
+            content: "first\nsecond",
+            originalFile: null,
+            structuredPatch: [
+              {
+                oldStart: 0,
+                oldLines: 0,
+                newStart: 1,
+                newLines: 2,
+                lines: ["+first", "+second"],
+              },
+            ],
+          },
+          tool_use_id: "toolu_write_create",
+          session_id: "test-session",
+          transcript_path: "/tmp/test",
+          cwd: "/tmp",
+        },
+        "toolu_write_create",
+        { signal: AbortSignal.abort() },
+      );
+
+      expect(hookUpdates).toHaveLength(1);
+      const hookUpdate = hookUpdates[0].update;
+      expect(hookUpdate.content).toEqual([
+        {
+          type: "diff",
+          path: "/Users/test/project/new.ts",
+          oldText: null,
+          newText: "first\nsecond",
+        },
+      ]);
+    });
+  });
+
   describe("post-tool-use hook preserves terminal _meta", () => {
     it("should send terminal_output and terminal_exit as separate notifications, and hook should only have claudeCode", async () => {
       const clientCapabilities: ClientCapabilities = {

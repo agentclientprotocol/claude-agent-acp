@@ -15,9 +15,17 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
     capturedOptions = options;
     return {
       initializationResult: async () => ({
-        models: [{ value: "claude-sonnet-4-5", displayName: "Claude Sonnet", description: "Fast" }],
+        models: [
+          {
+            value: "claude-sonnet-4-6",
+            displayName: "Claude Sonnet",
+            description: "Fast",
+            supportsAutoMode: true,
+          },
+        ],
       }),
       setModel: async () => {},
+      setPermissionMode: async () => {},
       supportedCommands: async () => [],
       [Symbol.asyncIterator]: async function* () {},
     };

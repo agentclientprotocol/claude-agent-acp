@@ -1,5 +1,12 @@
-import { describe, it, expect } from "vitest";
-import { resolvePermissionMode } from "../acp-agent.js";
+import { describe, it, expect, vi } from "vitest";
+import { resolvePermissionMode, type Logger } from "../acp-agent.js";
+
+function mockLogger() {
+  const error = vi.fn<(...args: any[]) => void>();
+  const log = vi.fn<(...args: any[]) => void>();
+  const logger: Logger = { log, error };
+  return { logger, error, log };
+}
 
 describe("resolvePermissionMode", () => {
   it("returns 'default' when no mode is provided", () => {
@@ -26,18 +33,25 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("  dontAsk  ")).toBe("dontAsk");
   });
 
-  it("throws on non-string values", () => {
-    expect(() => resolvePermissionMode(123)).toThrow("expected a string");
-    expect(() => resolvePermissionMode(true)).toThrow("expected a string");
-    expect(() => resolvePermissionMode({})).toThrow("expected a string");
+  it("falls back to 'default' and logs on non-string values", () => {
+    for (const value of [123, true, {}]) {
+      const { logger, error } = mockLogger();
+      expect(resolvePermissionMode(value, logger)).toBe("default");
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("expected a string"));
+    }
   });
 
-  it("throws on empty string", () => {
-    expect(() => resolvePermissionMode("")).toThrow("expected a non-empty string");
-    expect(() => resolvePermissionMode("  ")).toThrow("expected a non-empty string");
+  it("falls back to 'default' and logs on empty string", () => {
+    for (const value of ["", "  "]) {
+      const { logger, error } = mockLogger();
+      expect(resolvePermissionMode(value, logger)).toBe("default");
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("expected a non-empty string"));
+    }
   });
 
-  it("throws on unknown mode", () => {
-    expect(() => resolvePermissionMode("yolo")).toThrow("Invalid permissions.defaultMode: yolo");
+  it("falls back to 'default' and logs on unknown mode", () => {
+    const { logger, error } = mockLogger();
+    expect(resolvePermissionMode("yolo", logger)).toBe("default");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("yolo"));
   });
 });
