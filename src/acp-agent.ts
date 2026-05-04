@@ -703,6 +703,26 @@ export class ClaudeAcpAgent implements Agent {
     // message. Mark promptReplayed=true so their result isn't consumed as a
     // background task result.
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    if (firstText.trimStart().split(/\s+/, 1)[0].toLowerCase() === "/skills") {
+      const commands = await getAvailableSkillSlashCommands(session.query);
+      const lines = commands.map((command) =>
+        command.description ? `- /${command.name}: ${command.description}` : `- /${command.name}`,
+      );
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text:
+              lines.length > 0
+                ? ["Available skills and plugins:", ...lines].join("\n")
+                : "No skills or plugins configured.",
+          },
+        },
+      });
+      return { stopReason: "end_turn", usage: sessionUsage(session) };
+    }
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -1511,7 +1531,14 @@ export class ClaudeAcpAgent implements Agent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands),
+        availableCommands: [
+          {
+            name: "skills",
+            description: "List available skills and plugins.",
+            input: null,
+          },
+          ...getAvailableSlashCommands(commands),
+        ],
       },
     });
   }
@@ -2208,7 +2235,7 @@ async function getAvailableModels(
 }
 
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
-  const UNSUPPORTED_COMMANDS = [
+  const unsupportedSlashCommands = new Set([
     "cost",
     "keybindings-help",
     "login",
@@ -2216,7 +2243,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "output-style:new",
     "release-notes",
     "todos",
-  ];
+  ]);
 
   return commands
     .map((command) => {
@@ -2237,7 +2264,21 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
         input,
       };
     })
-    .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+    .filter((command: AvailableCommand) => !unsupportedSlashCommands.has(command.name));
+}
+
+async function getAvailableSkillSlashCommands(sessionQuery: Query): Promise<AvailableCommand[]> {
+  const [commands, contextUsage] = await Promise.all([
+    sessionQuery.supportedCommands(),
+    sessionQuery.getContextUsage(),
+  ]);
+  const skillNames = new Set(
+    (contextUsage.skills?.skillFrontmatter ?? [])
+      .filter((skill) => skill.source !== "builtin")
+      .map((skill) => skill.name),
+  );
+
+  return getAvailableSlashCommands(commands).filter((command) => skillNames.has(command.name));
 }
 
 function formatUriAsLink(uri: string): string {
