@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.32.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.4...v0.32.0) (2026-05-03)
+
+
+### Features
+
+* **deps-dev:** Bump nanoid from 3.3.11 to 3.3.12 ([#622](https://github.com/agentclientprotocol/claude-agent-acp/issues/622)) ([c78ac62](https://github.com/agentclientprotocol/claude-agent-acp/commit/c78ac62d05283e5683b87b198923818f9f556a03))
+* **deps:** Bump the minor group with 2 updates ([#619](https://github.com/agentclientprotocol/claude-agent-acp/issues/619)) ([6ccd37c](https://github.com/agentclientprotocol/claude-agent-acp/commit/6ccd37ce947fbd55691f676344b15ef1266191ad))
+* **deps:** update to @anthropic-ai/claude-agent-sdk 0.2.126 ([#621](https://github.com/agentclientprotocol/claude-agent-acp/issues/621)) ([becc3b8](https://github.com/agentclientprotocol/claude-agent-acp/commit/becc3b86e60eb33e7823a0ef27d5aa99758750d7))
+* **deps:** Update to @anthropic-ai/claude-agent-sdk@0.2.123 ([#614](https://github.com/agentclientprotocol/claude-agent-acp/issues/614)) ([5b93119](https://github.com/agentclientprotocol/claude-agent-acp/commit/5b9311938d97f47400debd66f2b4792e50639c6b))
+
+
+### Bug Fixes
+
+* emit a real diff when Write overwrites an existing file ([#618](https://github.com/agentclientprotocol/claude-agent-acp/issues/618)) ([8d7e220](https://github.com/agentclientprotocol/claude-agent-acp/commit/8d7e22026e15d54208414bd9ad128eb86d41b451))
+
 ## [0.31.4](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.3...v0.31.4) (2026-04-28)
 
 
