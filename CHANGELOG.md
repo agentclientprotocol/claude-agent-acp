@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.33.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.32.0...v0.33.0) (2026-05-07)
+
+
+### Features
+
+* **deps:** bump the minor group with 14 updates ([#631](https://github.com/agentclientprotocol/claude-agent-acp/issues/631)) ([8b43ee8](https://github.com/agentclientprotocol/claude-agent-acp/commit/8b43ee813f05f5087a213a7f42154e39d6bc4a5a))
+* **deps:** Update to claude-agent-sdk 0.2.132 ([#636](https://github.com/agentclientprotocol/claude-agent-acp/issues/636)) ([0c8ff27](https://github.com/agentclientprotocol/claude-agent-acp/commit/0c8ff277f2af8d3085cc1b5cf33891630dede0b1))
+
+
+### Bug Fixes
+
+* Handle result origins in ACP agent ([#627](https://github.com/agentclientprotocol/claude-agent-acp/issues/627)) ([dba1998](https://github.com/agentclientprotocol/claude-agent-acp/commit/dba199839a25ba405f04b9d4409e647150fe0290))
+
 ## [0.32.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.31.4...v0.32.0) (2026-05-03)
 
 
