@@ -23,6 +23,7 @@ export interface ClaudeCodeSettings {
   env?: Record<string, string>;
   model?: string;
   effortLevel?: string;
+  availableModels?: string[];
 }
 
 /**
@@ -191,6 +192,15 @@ export class SettingsManager {
 
       if (settings.effortLevel !== undefined) {
         merged.effortLevel = settings.effortLevel;
+      }
+
+      if (settings.availableModels !== undefined) {
+        // Per Claude Code docs: "When `availableModels` is set at multiple
+        // levels, such as user settings and project settings, arrays are
+        // merged and deduplicated."
+        // https://code.claude.com/docs/en/model-config#merge-behavior
+        const combined = [...(merged.availableModels ?? []), ...settings.availableModels];
+        merged.availableModels = Array.from(new Set(combined));
       }
 
       if (settings.permissions?.defaultMode !== undefined) {

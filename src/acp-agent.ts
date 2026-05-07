@@ -1956,18 +1956,21 @@ export class ClaudeAcpAgent implements Agent {
       );
     }
 
-    const models = await getAvailableModels(
-      q,
-      initializationResult.models,
-      settingsManager,
-      this.logger,
-    );
+    // Apply user's `availableModels` allowlist from settings.json before any
+    // downstream model handling. The SDK only enforces this allowlist in its
+    // own UI, not in `initializationResult.models`, so we filter here to keep
+    // configOptions, the current-model resolver, and the stored modelInfos
+    // consistent with what the user configured.
+    const settingsAvailableModels = settingsManager.getSettings().availableModels;
+    const allowedModels = Array.isArray(settingsAvailableModels)
+      ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
+      : initializationResult.models;
+
+    const models = await getAvailableModels(q, allowedModels, settingsManager, this.logger);
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
-    const currentModelInfo = initializationResult.models.find(
-      (m) => m.value === models.currentModelId,
-    );
+    const currentModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
     const availableModes = buildAvailableModes(currentModelInfo);
 
     // Clamp `permissionMode` if the resolved session does not offer it. The
@@ -2008,7 +2011,7 @@ export class ClaudeAcpAgent implements Agent {
     const configOptions = buildConfigOptions(
       modes,
       models,
-      initializationResult.models,
+      allowedModels,
       settingsManager.getSettings().effortLevel,
     );
 
@@ -2035,7 +2038,7 @@ export class ClaudeAcpAgent implements Agent {
       },
       modes,
       models,
-      modelInfos: initializationResult.models,
+      modelInfos: allowedModels,
       configOptions,
       promptRunning: false,
       pendingMessages: new Map(),
@@ -2362,6 +2365,52 @@ function resolveSettingsModel(
     return null;
   }
   return resolveModelPreference(models, settingsModel);
+}
+
+/**
+ * Restrict the SDK's model list to the user's `availableModels` allowlist
+ * (already merged-and-deduped across settings sources by `SettingsManager`).
+ * The user's exact entries become the model IDs surfaced via configOptions
+ * and passed to `setModel`, which prevents Claude Code from silently
+ * substituting a date-pinned variant (e.g. `haiku` →
+ * `claude-haiku-4-5-20251001`) that the user may not have access to.
+ *
+ * Display info and capability flags are copied from the closest SDK match so
+ * the UI still renders sensible names and effort levels.
+ *
+ * Semantics from https://code.claude.com/docs/en/model-config#restrict-model-selection:
+ * - `undefined` is handled by the caller (no allowlist applied).
+ * - The Default option is unaffected by `availableModels` — it always remains
+ *   available, even when the allowlist is `[]`.
+ */
+function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string[]): ModelInfo[] {
+  // Default is always preserved per the docs. Synthesize one if the SDK
+  // didn't surface it so downstream code (e.g. `getAvailableModels` picking
+  // `models[0]` as a fallback) still has something to work with.
+  const defaultModel = sdkModels.find((m) => m.value === "default") ?? {
+    value: "default",
+    displayName: "Default",
+    description: "",
+  };
+  const result: ModelInfo[] = [defaultModel];
+  const seen = new Set<string>([defaultModel.value]);
+
+  const sdkModelsWithoutDefault = sdkModels.filter((m) => m.value !== "default");
+
+  for (const entry of allowlist) {
+    const trimmed = entry.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+
+    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
+    if (sdkMatch) {
+      result.push({ ...sdkMatch, value: trimmed });
+    } else {
+      result.push({ value: trimmed, displayName: trimmed, description: "" });
+    }
+    seen.add(trimmed);
+  }
+
+  return result;
 }
 
 async function getAvailableModels(

@@ -362,6 +362,199 @@ describe("ClaudeAcpAgent settings", () => {
     });
   });
 
+  describe("availableModels allowlist from settings", () => {
+    function mockQueryWithModels(models: any[]): {
+      setModelSpy: ReturnType<typeof vi.fn>;
+    } {
+      const setModelSpy = vi.fn();
+      querySpy.mockImplementation(() => {
+        return {
+          initializationResult: async () => ({ models }),
+          setModel: setModelSpy,
+          supportedCommands: async () => [],
+        } as any;
+      });
+      return { setModelSpy };
+    }
+
+    it("restricts configOptions to the user's allowlist using their exact IDs", async () => {
+      // Reproduces the scenario from
+      // https://github.com/agentclientprotocol/claude-agent-acp/issues/620:
+      // user lists `claude-haiku-4-5` (no date pin) in availableModels, but
+      // the SDK still surfaces its `haiku` alias which resolves to a
+      // date-pinned variant the user doesn't have access to.
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          availableModels: [
+            "claude-sonnet-4-6[1m]",
+            "claude-opus-4-6[1m]",
+            "claude-haiku-4-5",
+            "claude-opus-4-7[1m]",
+          ],
+        }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        {
+          value: "sonnet[1m]",
+          displayName: "Sonnet (1M context)",
+          description: "Sonnet 4.6 long context",
+        },
+        {
+          value: "opus[1m]",
+          displayName: "Opus (1M context)",
+          description: "Opus 1M context",
+        },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "default",
+        "claude-sonnet-4-6[1m]",
+        "claude-opus-4-6[1m]",
+        "claude-haiku-4-5",
+        "claude-opus-4-7[1m]",
+      ]);
+    });
+
+    it("unions availableModels across user and project settings", async () => {
+      // https://code.claude.com/docs/en/model-config#merge-behavior
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ availableModels: ["claude-haiku-4-5"] }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(path.join(projectDir, ".claude"), { recursive: true });
+      await fs.promises.writeFile(
+        path.join(projectDir, ".claude", "settings.json"),
+        JSON.stringify({
+          availableModels: ["claude-haiku-4-5", "claude-opus-4-7[1m]"],
+        }),
+      );
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      // User and project entries are unioned and deduplicated.
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "default",
+        "claude-haiku-4-5",
+        "claude-opus-4-7[1m]",
+      ]);
+    });
+
+    it("returns only the default entry when availableModels is an empty array", async () => {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ availableModels: [] }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default"]);
+    });
+
+    it("does not filter when availableModels is absent from settings", async () => {
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.options.map((o: any) => o.value)).toEqual(["default", "haiku"]);
+    });
+
+    it("passes the user's exact ID to setModel when it matches an SDK alias", async () => {
+      // Without the allowlist, the SDK would resolve `haiku` to a
+      // date-pinned variant. Forcing setModel to receive `claude-haiku-4-5`
+      // is exactly what the issue's workaround
+      // (`ANTHROPIC_DEFAULT_HAIKU_MODEL`) achieves manually.
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          availableModels: ["claude-haiku-4-5"],
+          model: "claude-haiku-4-5",
+        }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { setModelSpy } = mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "haiku", displayName: "Haiku", description: "Fast" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-haiku-4-5");
+      expect(response.models.currentModelId).toBe("claude-haiku-4-5");
+    });
+  });
+
   it("resolves model aliases like opus[1m] to the correct model", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
