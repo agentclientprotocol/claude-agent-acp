@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.33.0...v0.33.1) (2026-05-07)
+
+
+### Bug Fixes
+
+* Honor availableModels settings allowlist ([#637](https://github.com/agentclientprotocol/claude-agent-acp/issues/637)) ([867a3a0](https://github.com/agentclientprotocol/claude-agent-acp/commit/867a3a0de2a050592d79aa76d7dd3dd5b478162d)), closes [#620](https://github.com/agentclientprotocol/claude-agent-acp/issues/620)
+
 ## [0.33.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.32.0...v0.33.0) (2026-05-07)
 
 
