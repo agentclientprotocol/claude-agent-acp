@@ -20,6 +20,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
 describe("ClaudeAcpAgent settings", () => {
   let tempDir: string;
   let originalClaudeConfigDir: string | undefined;
+  let originalAnthropicModel: string | undefined;
+  let originalSkipInitialSetModel: string | undefined;
+  let originalClaudeAcpBakeModel: string | undefined;
 
   function createMockClient(): AgentSideConnection {
     return {
@@ -55,7 +58,13 @@ describe("ClaudeAcpAgent settings", () => {
   beforeEach(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "acp-agent-settings-"));
     originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    originalAnthropicModel = process.env.ANTHROPIC_MODEL;
+    originalSkipInitialSetModel = process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL;
+    originalClaudeAcpBakeModel = process.env.CLAUDE_ACP_BAKE_MODEL;
     process.env.CLAUDE_CONFIG_DIR = tempDir;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL;
+    delete process.env.CLAUDE_ACP_BAKE_MODEL;
     querySpy.mockReset();
     vi.resetModules();
   });
@@ -65,6 +74,21 @@ describe("ClaudeAcpAgent settings", () => {
       process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
     } else {
       delete process.env.CLAUDE_CONFIG_DIR;
+    }
+    if (originalAnthropicModel) {
+      process.env.ANTHROPIC_MODEL = originalAnthropicModel;
+    } else {
+      delete process.env.ANTHROPIC_MODEL;
+    }
+    if (originalSkipInitialSetModel) {
+      process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL = originalSkipInitialSetModel;
+    } else {
+      delete process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL;
+    }
+    if (originalClaudeAcpBakeModel) {
+      process.env.CLAUDE_ACP_BAKE_MODEL = originalClaudeAcpBakeModel;
+    } else {
+      delete process.env.CLAUDE_ACP_BAKE_MODEL;
     }
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
@@ -599,5 +623,47 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+  });
+
+  it("can skip initial setModel when the launcher already baked the model into the environment", async () => {
+    process.env.ANTHROPIC_MODEL = "claude-opus-4-6";
+    process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL = "1";
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const setModelSpy = vi.fn();
+    querySpy.mockImplementation(({ options: _options }: any) => {
+      return {
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "claude-sonnet-4-6",
+              displayName: "Claude Sonnet 4.6",
+              description: "Default",
+            },
+            {
+              value: "claude-opus-4-6",
+              displayName: "Claude Opus 4.6",
+              description: "Reasoning",
+            },
+          ],
+        }),
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      } as any;
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(setModelSpy).not.toHaveBeenCalled();
+    expect(response.models.currentModelId).toBe("claude-opus-4-6");
   });
 });

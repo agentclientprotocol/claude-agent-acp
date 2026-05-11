@@ -2439,7 +2439,12 @@ async function getAvailableModels(
     }
   }
 
-  await query.setModel(currentModel.value);
+  if (
+    process.env.CLAUDE_AGENT_ACP_SKIP_INITIAL_SET_MODEL !== "1" &&
+    process.env.CLAUDE_ACP_BAKE_MODEL !== "1"
+  ) {
+    await query.setModel(currentModel.value);
+  }
 
   return {
     availableModels: models.map((model) => ({
