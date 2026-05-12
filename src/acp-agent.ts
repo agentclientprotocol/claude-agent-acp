@@ -849,6 +849,7 @@ export class ClaudeAcpAgent implements Agent {
               case "memory_recall":
               case "notification":
               case "api_retry":
+              case "permission_denied":
               case "mirror_error":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
