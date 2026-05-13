@@ -54,6 +54,7 @@ import {
   PermissionUpdate,
   Query,
   query,
+  renameSession,
   Settings,
   SDKAssistantMessageError,
   SDKMessageOrigin,
@@ -733,6 +734,50 @@ export class ClaudeAcpAgent implements Agent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+
+    // /rename <new title> — handled entirely inside the ACP server so the user
+    // can retitle a session inline without leaving the chat input. Writes a
+    // custom-title entry to the session JSONL via the SDK; the new title is
+    // surfaced through listSessions() the next time the client refreshes.
+    if (firstText.startsWith("/rename") && /^\/rename(\s|$)/.test(firstText)) {
+      const title = firstText.slice("/rename".length).trim();
+      if (!title) {
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Usage: /rename <new session title>\n" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+      try {
+        await renameSession(params.sessionId, title, { dir: session.cwd });
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `Renamed session to "${title}".\n`,
+            },
+          },
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: `Failed to rename session: ${message}\n`,
+            },
+          },
+        });
+      }
+      return { stopReason: "end_turn" };
+    }
 
     if (session.promptRunning) {
       session.input.push(userMessage);
@@ -2462,7 +2507,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "todos",
   ];
 
-  return commands
+  const sdkCommands = commands
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -2482,6 +2527,19 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  // Custom ACP-server builtins — appended so they appear in the `/` picker
+  // alongside SDK-provided commands. Handled inline in `prompt()` before the
+  // SDK is invoked.
+  const customBuiltins: AvailableCommand[] = [
+    {
+      name: "rename",
+      description: "rename this session",
+      input: { hint: "new session title" },
+    },
+  ];
+
+  return [...sdkCommands, ...customBuiltins];
 }
 
 function formatUriAsLink(uri: string): string {
