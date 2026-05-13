@@ -64,6 +64,7 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -141,6 +142,8 @@ type Session = {
   models: SessionModelState;
   modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
+  agents: DiscoveredAgent[];
+  currentAgent: string;
   promptRunning: boolean;
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
@@ -1327,6 +1330,8 @@ export class ClaudeAcpAgent implements Agent {
       });
     } else if (params.configId === "model") {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
+    } else if (params.configId === "agent") {
+      await this.switchAgent(params.sessionId, resolvedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
@@ -1370,6 +1375,60 @@ export class ClaudeAcpAgent implements Agent {
         // eslint-disable-next-line preserve-caught-error
         throw new Error("Invalid Mode");
       }
+    }
+  }
+
+  private async switchAgent(sessionId: string, agentId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+
+    this.logger.log(`[switchAgent] ${sessionId}: "${session.currentAgent}" → "${agentId}"`);
+
+    // Abort the current subprocess and reset prompt state
+    session.abortController.abort();
+    session.promptRunning = false;
+    for (const [, pending] of session.pendingMessages) {
+      pending.resolve(true);
+    }
+    session.pendingMessages.clear();
+
+    // Close the old session entry so createSession can recreate it
+    delete this.sessions[sessionId];
+
+    // Use the existing createSession with resume + agent via _meta
+    const agentOption = agentId === "default" ? undefined : agentId;
+    const meta = agentOption
+      ? { claudeCode: { options: { agent: agentOption } } }
+      : undefined;
+
+    try {
+      await this.createSession(
+        { cwd: session.cwd, mcpServers: [], _meta: meta },
+        { resume: sessionId },
+      );
+      this.logger.log(`[switchAgent] resumed session with agent "${agentId}"`);
+    } catch {
+      // Resume fails if no conversation yet — start fresh
+      this.logger.log(`[switchAgent] resume failed, starting fresh`);
+      await this.createSession(
+        { cwd: session.cwd, mcpServers: [], _meta: meta },
+        {},
+      );
+      // createSession generates a new ID; remap to the original
+      const newId = Object.keys(this.sessions).find((k) => k !== sessionId);
+      if (newId) {
+        this.sessions[sessionId] = this.sessions[newId];
+        delete this.sessions[newId];
+      }
+    }
+
+    // Update the agent tracking on the recreated session
+    const newSession = this.sessions[sessionId];
+    if (newSession) {
+      newSession.currentAgent = agentId;
+      newSession.agents = session.agents;
     }
   }
 
@@ -1665,9 +1724,9 @@ export class ClaudeAcpAgent implements Agent {
         session.models,
         session.modelInfos,
         currentEffort,
+        session.agents,
+        session.currentAgent,
       );
-
-      // Sync effort with the SDK if it changed after the model switch
       const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
@@ -1700,6 +1759,8 @@ export class ClaudeAcpAgent implements Agent {
         await session.query.applyFlagSettings({
           effortLevel: value as Settings["effortLevel"],
         });
+      } else if (configId === "agent") {
+        session.currentAgent = value;
       }
     }
   }
@@ -2008,11 +2069,27 @@ export class ClaudeAcpAgent implements Agent {
       availableModes,
     };
 
+    const agents: DiscoveredAgent[] = await (async () => {
+      try {
+        const sdkAgents = await q.supportedAgents();
+        return sdkAgents.map((a) => ({
+          id: a.name,
+          name: a.name,
+          description: a.description || undefined,
+        }));
+      } catch {
+        return discoverAgents();
+      }
+    })();
+    const currentAgent = userProvidedOptions?.agent ?? "default";
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       allowedModels,
       settingsManager.getSettings().effortLevel,
+      agents,
+      currentAgent,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -2040,6 +2117,8 @@ export class ClaudeAcpAgent implements Agent {
       models,
       modelInfos: allowedModels,
       configOptions,
+      agents,
+      currentAgent,
       promptRunning: false,
       pendingMessages: new Map(),
       nextPendingOrder: 0,
@@ -2202,11 +2281,43 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
   return modes;
 }
 
+interface DiscoveredAgent {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+function discoverAgents(): DiscoveredAgent[] {
+  const agentsDir = path.join(CLAUDE_CONFIG_DIR, "agents");
+  try {
+    const files = fs.readdirSync(agentsDir).filter((f) => f.endsWith(".md"));
+    return files.map((file) => {
+      const id = file.replace(/\.md$/, "");
+      const content = fs.readFileSync(path.join(agentsDir, file), "utf-8");
+      // Parse YAML frontmatter
+      const match = content.match(/^---\n([\s\S]*?)\n---/);
+      let name = id;
+      let description: string | undefined;
+      if (match) {
+        const nameMatch = match[1].match(/^name:\s*(.+)$/m);
+        const descMatch = match[1].match(/^description:\s*(.+)$/m);
+        if (nameMatch) name = nameMatch[1].trim().replace(/^["']|["']$/g, "");
+        if (descMatch) description = descMatch[1].trim().replace(/^["']|["']$/g, "");
+      }
+      return { id, name, description };
+    });
+  } catch {
+    return [];
+  }
+}
+
 function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
+  agents?: DiscoveredAgent[],
+  currentAgent?: string,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -2272,6 +2383,24 @@ function buildConfigOptions(
       type: "select",
       currentValue: validEffort,
       options: effortOptions,
+    });
+  }
+
+  if (agents && agents.length > 0) {
+    options.push({
+      id: "agent",
+      name: "Agent",
+      description: "Custom agent persona",
+      type: "select",
+      currentValue: currentAgent ?? "default",
+      options: [
+        { value: "default", name: "Default", description: "Standard Claude Code agent" },
+        ...agents.map((a) => ({
+          value: a.name,
+          name: a.name,
+          description: a.description,
+        })),
+      ],
     });
   }
 
