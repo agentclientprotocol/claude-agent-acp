@@ -753,6 +753,17 @@ export class ClaudeAcpAgent implements Agent {
       }
       try {
         await renameSession(params.sessionId, title, { dir: session.cwd });
+        // Notify the client so it can repaint its session list inline; the
+        // protocol's session_info_update carries the new title, plus a fresh
+        // updatedAt timestamp so sort order reflects the latest activity.
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            title,
+            updatedAt: new Date().toISOString(),
+          },
+        });
         await this.client.sessionUpdate({
           sessionId: params.sessionId,
           update: {

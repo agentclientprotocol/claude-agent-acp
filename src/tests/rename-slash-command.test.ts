@@ -107,6 +107,14 @@ describe("/rename slash command", () => {
       .map((u) => u.content?.text ?? "");
     expect(texts.some((t) => t.includes("Renamed session to") && t.includes("Quarterly review notes")))
       .toBe(true);
+
+    // The client must also see a session_info_update so it can repaint the
+    // session list without waiting for the next listSessions() call.
+    const infoUpdates = updates
+      .map((u) => u.update as any)
+      .filter((u) => u.sessionUpdate === "session_info_update");
+    expect(infoUpdates).toHaveLength(1);
+    expect(infoUpdates[0].title).toBe("Quarterly review notes");
   });
 
   it("emits a usage hint when no title is supplied", async () => {
