@@ -721,6 +721,7 @@ export class ClaudeAcpAgent implements Agent {
     // forward it to clients as structured `data`, sparing them from
     // pattern-matching on the human-readable message text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
+    const errors: string[] = [];
 
     const userMessage = promptToClaude(params);
 
@@ -752,14 +753,14 @@ export class ClaudeAcpAgent implements Agent {
     let stopReason: StopReason = "end_turn";
 
     try {
-      while (true) {
+      query: while (true) {
         const { value: message, done } = await session.query.next();
 
         if (done || !message) {
           if (session.cancelled) {
             return { stopReason: "cancelled" };
           }
-          break;
+          throw new TypeError("Session did not end in result");
         }
 
         if (
@@ -831,9 +832,7 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "session_state_changed": {
-                if (message.state === "idle") {
-                  return { stopReason, usage: sessionUsage(session) };
-                }
+                if (message.state === "idle") break query;
                 break;
               }
               case "hook_started":
@@ -910,19 +909,11 @@ export class ClaudeAcpAgent implements Agent {
             switch (message.subtype) {
               case "success": {
                 if (message.result.includes("Please run /login")) {
-                  throw RequestError.authRequired();
-                }
-                if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
-                  break;
+                  lastAssistantError ??= "authentication_failed";
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.result,
-                  );
+                  errors.push(message.result);
+                  lastAssistantError ??= "unknown";
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
@@ -943,20 +934,9 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "error_during_execution": {
-                if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
-                  break;
-                }
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
-                }
-                if (!isTaskNotification) {
-                  stopReason = "end_turn";
+                  errors.push(...message.errors);
+                  lastAssistantError ??= "unknown";
                 }
                 break;
               }
@@ -964,10 +944,8 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_turns":
               case "error_max_structured_output_retries":
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
-                  );
+                  errors.push(...message.errors);
+                  lastAssistantError ??= "max_output_tokens";
                 }
                 if (!isTaskNotification) {
                   stopReason = "max_turn_requests";
@@ -976,6 +954,10 @@ export class ClaudeAcpAgent implements Agent {
               default:
                 unreachable(message, this.logger);
                 break;
+            }
+
+            if (!isTaskNotification && message.stop_reason === "max_tokens") {
+              stopReason = "max_tokens";
             }
             break;
           }
@@ -1065,7 +1047,7 @@ export class ClaudeAcpAgent implements Agent {
                 handedOff = true;
                 // the current loop stops with end_turn,
                 // the loop of the next prompt continues running
-                return { stopReason: "end_turn", usage: sessionUsage(session) };
+                break query;
               }
               if ("isReplay" in message && message.isReplay) {
                 // not pending or unrelated replay message
@@ -1124,7 +1106,7 @@ export class ClaudeAcpAgent implements Agent {
               message.message.content[0].type === "text" &&
               message.message.content[0].text.includes("Please run /login")
             ) {
-              throw RequestError.authRequired();
+              lastAssistantError = "authentication_failed";
             }
 
             const content =
@@ -1163,7 +1145,43 @@ export class ClaudeAcpAgent implements Agent {
             break;
         }
       }
-      throw new Error("Session did not end in result");
+
+      let errorFactory: (
+        data: {
+          errorKind: SDKAssistantMessageError;
+        },
+        message: string,
+      ) => RequestError;
+
+      switch (lastAssistantError) {
+        case undefined:
+          return {
+            stopReason,
+            usage: {
+              cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
+              cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
+              inputTokens: session.accumulatedUsage.inputTokens,
+              outputTokens: session.accumulatedUsage.outputTokens,
+              totalTokens:
+                session.accumulatedUsage.cachedReadTokens +
+                session.accumulatedUsage.cachedWriteTokens +
+                session.accumulatedUsage.inputTokens +
+                session.accumulatedUsage.outputTokens,
+            },
+          };
+        case "authentication_failed":
+          errorFactory = RequestError.authRequired;
+          break;
+        default:
+          errorFactory = RequestError.internalError;
+      }
+
+      throw errorFactory(
+        {
+          errorKind: lastAssistantError,
+        },
+        errors.join(", "),
+      );
     } catch (error) {
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
@@ -2072,20 +2090,6 @@ function shouldEmitRawMessage(
   );
 }
 
-function sessionUsage(session: Session) {
-  return {
-    inputTokens: session.accumulatedUsage.inputTokens,
-    outputTokens: session.accumulatedUsage.outputTokens,
-    cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
-    cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
-    totalTokens:
-      session.accumulatedUsage.inputTokens +
-      session.accumulatedUsage.outputTokens +
-      session.accumulatedUsage.cachedReadTokens +
-      session.accumulatedUsage.cachedWriteTokens,
-  };
-}
-
 /** Sum all four fields as a proxy for post-turn context occupancy: the current
  *  turn's output becomes next turn's input. Per the Anthropic API, input_tokens
  *  excludes cache tokens — cache_read and cache_creation are reported
@@ -2097,22 +2101,6 @@ function totalTokens(usage: UsageSnapshot): number {
     usage.cache_read_input_tokens +
     usage.cache_creation_input_tokens
   );
-}
-
-/**
- * Build the `data` payload attached to a `RequestError.internalError` when we
- * have a categorical error from the Claude SDK. Returns `undefined` when no
- * categorical error is available, matching the previous behavior of passing
- * `undefined` to `RequestError.internalError`.
- *
- * The `errorKind` field is a convention for ACP clients to dispatch on
- * without having to pattern-match the human-readable message text. Clients
- * that don't understand it fall back to the existing message-based rendering.
- */
-function errorKindData(
-  errorKind: SDKAssistantMessageError | undefined,
-): { errorKind: SDKAssistantMessageError } | undefined {
-  return errorKind ? { errorKind } : undefined;
 }
 
 /** Project a nullable API usage object into our non-null snapshot shape.
