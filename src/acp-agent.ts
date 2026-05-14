@@ -1165,6 +1165,27 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw new Error("Session did not end in result");
     } catch (error) {
+      // The failed turn may have left trailing SDK messages in the query
+      // stream (notably a final session_state_changed: idle). Drain them
+      // here so the next prompt starts with a clean stream instead of
+      // short-circuiting to end_turn on the stale idle.
+      try {
+        await session.query.interrupt();
+        while (true) {
+          const { value: message, done } = await session.query.next();
+          if (done || !message) break;
+          if (
+            message.type === "system" &&
+            message.subtype === "session_state_changed" &&
+            message.state === "idle"
+          ) {
+            break;
+          }
+        }
+      } catch (drainErr) {
+        this.logger.error("Failed to drain query after prompt error:", drainErr);
+      }
+
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
       }
@@ -1189,18 +1210,16 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
-        // This usually should not happen, but in case the loop finishes
-        // without claude sending all message replays, we resolve the
-        // next pending prompt call to ensure no prompts get stuck.
-        if (session.pendingMessages.size > 0) {
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
-          }
+        // On error or unexpected loop exit, cancel all pending prompts so
+        // they return stopReason: "cancelled" instead of handing off onto
+        // a potentially broken query stream. Handing off would let the
+        // next prompt consume leftover SDK messages (e.g. a trailing
+        // session_state_changed: idle from the failed turn) and return
+        // end_turn instantly with zero usage.
+        for (const pending of session.pendingMessages.values()) {
+          pending.resolve(true);
         }
+        session.pendingMessages.clear();
       }
     }
   }

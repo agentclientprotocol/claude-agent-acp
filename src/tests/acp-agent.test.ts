@@ -3411,3 +3411,176 @@ describe("result origin handling", () => {
     expect(response.stopReason).toBe("max_tokens");
   });
 });
+
+describe("post-error recovery", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function createResultMessage(overrides: {
+    subtype: "success" | "error_during_execution";
+    stop_reason: string | null;
+    is_error: boolean;
+    result?: string;
+    errors?: string[];
+  }) {
+    return {
+      type: "result" as const,
+      subtype: overrides.subtype,
+      stop_reason: overrides.stop_reason,
+      is_error: overrides.is_error,
+      result: overrides.result ?? "",
+      errors: overrides.errors ?? [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** Build a session whose query stream serves two consecutive turns:
+   *  turn 1 yields `firstTurn` after the user replay; turn 2 yields a
+   *  successful end_turn. The trailing `idle` of turn 1 is included so
+   *  we can verify the agent drains it after throwing. */
+  function injectTwoTurnSession(agent: ClaudeAcpAgent, firstTurn: any[]) {
+    const input = new Pushable<any>();
+    const interrupt = vi.fn();
+    const close = vi.fn();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      // Turn 1: replay user, then yield caller-supplied messages.
+      const first = await iter.next();
+      if (!first.done && first.value) {
+        yield {
+          type: "user",
+          message: first.value.message,
+          parent_tool_use_id: null,
+          uuid: first.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* firstTurn;
+
+      // Turn 2: replay user, return a clean success.
+      const second = await iter.next();
+      if (!second.done && second.value) {
+        yield {
+          type: "user",
+          message: second.value.message,
+          parent_tool_use_id: null,
+          uuid: second.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield createResultMessage({ subtype: "success", stop_reason: null, is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    const gen = Object.assign(messageGenerator(), { interrupt, close });
+    agent.sessions["test-session"] = {
+      query: gen as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+    };
+    return { interrupt };
+  }
+
+  it("drains the failed turn's trailing idle so the next prompt is not short-circuited", async () => {
+    const agent = createMockAgent();
+    const { interrupt } = injectTwoTurnSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "There's an issue with the selected model",
+      }),
+      // Trailing idle that without draining would short-circuit the next prompt.
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      }),
+    ).rejects.toThrow("Internal error");
+
+    // The error path should have interrupted the query and consumed the stale idle.
+    expect(interrupt).toHaveBeenCalled();
+
+    // Second prompt must reach the success result + new idle, not the stale one.
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    expect(second.usage?.inputTokens).toBe(10);
+    expect(second.usage?.outputTokens).toBe(5);
+  });
+
+  it("cancels all pending prompts queued during a failing turn", async () => {
+    const agent = createMockAgent();
+    injectTwoTurnSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "boom",
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const session = agent.sessions["test-session"];
+    // Two prompts queued behind the running one. Their resolvers should be
+    // invoked with `true` (cancelled) when the running prompt errors.
+    const resolves: ((cancelled: boolean) => void)[] = [];
+    const pendingA = new Promise<boolean>((resolve) => resolves.push(resolve));
+    const pendingB = new Promise<boolean>((resolve) => resolves.push(resolve));
+    session.pendingMessages.set("uuid-a", { resolve: resolves[0], order: 0 });
+    session.pendingMessages.set("uuid-b", { resolve: resolves[1], order: 1 });
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      }),
+    ).rejects.toThrow("Internal error");
+
+    await expect(pendingA).resolves.toBe(true);
+    await expect(pendingB).resolves.toBe(true);
+    expect(session.pendingMessages.size).toBe(0);
+  });
+});
