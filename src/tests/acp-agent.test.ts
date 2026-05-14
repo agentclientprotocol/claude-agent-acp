@@ -35,7 +35,7 @@ import {
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
-import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, SDKAssistantMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import type {
   BetaToolResultBlockParam,
@@ -44,6 +44,72 @@ import type {
   BetaWebFetchToolResultBlockParam,
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
+
+function injectSessionWithMessages(
+  agent: ClaudeAcpAgent,
+  messages: unknown[],
+  emitRawSDKMessages: boolean | SDKMessageFilter[] = false,
+) {
+  const input = new Pushable<SDKUserMessage>();
+  async function* messageGenerator() {
+    // Wait for the prompt to push its user message so we can replay it
+    const iter = input[Symbol.asyncIterator]();
+    const { done, value } = await iter.next();
+    if (!done && value) {
+      yield {
+        isReplay: true,
+        message: value.message,
+        parent_tool_use_id: null,
+        session_id: "test-session",
+        type: "user",
+        uuid: value.uuid,
+      };
+    }
+    yield* [
+      ...messages,
+      {
+        state: "idle",
+        subtype: "session_state_changed",
+        type: "system",
+      },
+    ];
+  }
+  agent.sessions["test-session"] = {
+    abortController: new AbortController(),
+    accumulatedUsage: {
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+    },
+    cancelled: false,
+    configOptions: [],
+    contextWindowSize: 200000,
+    cwd: "/test",
+    emitRawSDKMessages,
+    input,
+    modelInfos: [],
+    models: {
+      currentModelId: "default",
+      availableModels: [],
+    },
+    modes: {
+      currentModeId: "default",
+      availableModes: [],
+    },
+    nextPendingOrder: 0,
+    pendingMessages: new Map(),
+    promptRunning: false,
+    query: messageGenerator() as any,
+    sessionFingerprint: JSON.stringify({
+      cwd: "/test",
+      mcpServers: [],
+    }),
+    settingsManager: {
+      dispose: vi.fn(),
+    } as any,
+  };
+}
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
@@ -1486,61 +1552,10 @@ describe("stop reason propagation", () => {
     };
   }
 
-  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      // Wait for the prompt to push its user message so we can replay it
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: {
-        currentModeId: "default",
-        availableModes: [],
-      },
-      models: {
-        currentModelId: "default",
-        availableModels: [],
-      },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-    };
-  }
-
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({ subtype: "success", stop_reason: "max_tokens", is_error: false }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1553,14 +1568,13 @@ describe("stop reason propagation", () => {
 
   it("should return max_tokens when success result has stop_reason max_tokens and is_error true", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({
         subtype: "success",
         stop_reason: "max_tokens",
         is_error: true,
         result: "Token limit reached",
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1573,14 +1587,13 @@ describe("stop reason propagation", () => {
 
   it("should return max_tokens when error_during_execution has stop_reason max_tokens", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({
         subtype: "error_during_execution",
         stop_reason: "max_tokens",
         is_error: true,
         errors: ["some error"],
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1593,9 +1606,8 @@ describe("stop reason propagation", () => {
 
   it("should return end_turn for success with null stop_reason", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -1695,7 +1707,7 @@ describe("stop reason propagation", () => {
 
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({
         subtype: "success",
         stop_reason: "end_turn",
@@ -1744,7 +1756,7 @@ describe("stop reason propagation", () => {
       } as any,
     };
 
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       assistantMessage,
       createResultMessage({
         subtype: "success",
@@ -1770,7 +1782,7 @@ describe("stop reason propagation", () => {
 
   it("omits errorKind data when no SDKAssistantMessage.error was observed", async () => {
     const agent = createMockAgent();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessage({
         subtype: "success",
         stop_reason: "end_turn",
@@ -2117,59 +2129,9 @@ describe("usage_update computation", () => {
     return { agent, updates };
   }
 
-  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      // Wait for the prompt to push its user message so we can replay it
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: {
-        currentModeId: "default",
-        availableModes: [],
-      },
-      models: {
-        currentModelId: "default",
-        availableModels: [],
-      },
-      modelInfos: [],
-      settingsManager: {} as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-    };
-  }
-
   it("used sums all token types as post-turn context occupancy proxy", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({
         model: "claude-opus-4-20250514",
         usage: {
@@ -2193,7 +2155,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2210,7 +2171,7 @@ describe("usage_update computation", () => {
     // snapshot leaks NaN into totalTokens(), and JSON.stringify(NaN) === "null"
     // produces a malformed `used: null` that schema-validating ACP clients reject.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({
         model: "claude-opus-4-20250514",
         usage: {
@@ -2239,7 +2200,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2258,7 +2218,7 @@ describe("usage_update computation", () => {
 
   it("stream_event message_start emits usage_update before result", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-20250514",
         usage: {
@@ -2282,7 +2242,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2301,7 +2260,7 @@ describe("usage_update computation", () => {
 
   it("stream_event message_delta patches previous snapshot", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-20250514",
         usage: {
@@ -2328,7 +2287,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2348,7 +2306,7 @@ describe("usage_update computation", () => {
     // mid-stream update would otherwise fall back to 200k. A "-1m" suffix in
     // the SDK model ID is enough signal to emit 1_000_000 up front.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-6-1m",
         usage: {
@@ -2372,7 +2330,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2387,7 +2344,7 @@ describe("usage_update computation", () => {
     // A message_delta whose cumulative totals match the prior snapshot should
     // not trigger a duplicate usage_update — only the result adds cost on top.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-20250514",
         usage: {
@@ -2414,7 +2371,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2432,7 +2388,7 @@ describe("usage_update computation", () => {
     // mid-stream update in a later prompt reports the real size immediately
     // instead of snapping back to the 200k default before the result arrives.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-20250514",
         usage: {
@@ -2456,7 +2412,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     // Simulate a prior prompt having learned the 1M window for this model.
     agent.sessions["test-session"].contextWindowSize = 1000000;
@@ -2474,7 +2429,7 @@ describe("usage_update computation", () => {
     // next prompt already report 1M — without waiting for message_start or
     // the next `result` to correct us.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-6-1m",
         usage: {
@@ -2498,7 +2453,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
     expect(session.contextWindowSize).toBe(200000);
@@ -2525,7 +2479,7 @@ describe("usage_update computation", () => {
     // not clobber the window learned on a prior turn — otherwise the next
     // prompt's mid-stream updates regress to the 200k default.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createResultMessageWithModel({
         modelUsage: {
           "claude-haiku-4-5-20251001": {
@@ -2540,7 +2494,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
@@ -2562,7 +2515,7 @@ describe("usage_update computation", () => {
     // mid-stream update. applyConfigOptionValue should reset it so the next
     // turn's first update falls back to the heuristic (here: 200k default).
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-sonnet-4-6",
         usage: {
@@ -2586,7 +2539,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
@@ -2613,7 +2565,7 @@ describe("usage_update computation", () => {
     // trigger duplicate emits between the real message_start / message_delta
     // / result updates.
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent("message_start", {
         model: "claude-opus-4-20250514",
         usage: {
@@ -2668,7 +2620,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2684,7 +2635,7 @@ describe("usage_update computation", () => {
 
   it("subagent stream_event does not emit usage_update", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createStreamEvent(
         "message_start",
         {
@@ -2712,7 +2663,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2723,7 +2673,7 @@ describe("usage_update computation", () => {
 
   it("size reflects the current model's context window, not min across all", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-opus-4-20250514" }),
       createResultMessageWithModel({
         modelUsage: {
@@ -2749,7 +2699,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2763,7 +2712,7 @@ describe("usage_update computation", () => {
   it("after model switch, size updates to the new model's window", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Simulate: assistant on Sonnet with both models in modelUsage
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-sonnet-4-20250514" }),
       createResultMessageWithModel({
         modelUsage: {
@@ -2789,7 +2738,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2803,7 +2751,7 @@ describe("usage_update computation", () => {
   it("after switching back to original model, size returns to original window", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Last assistant message is Opus again
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-sonnet-4-20250514" }),
       createAssistantMessage({ model: "claude-opus-4-20250514" }),
       createResultMessageWithModel({
@@ -2830,7 +2778,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2844,7 +2791,7 @@ describe("usage_update computation", () => {
   it("subagent assistant messages do not affect size (top-level model is used)", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Top-level assistant on Opus, then subagent on Haiku (parent_tool_use_id set)
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-opus-4-20250514" }),
       {
         type: "assistant" as const,
@@ -2886,7 +2833,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2901,7 +2847,7 @@ describe("usage_update computation", () => {
     const { agent, updates } = createMockAgentWithCapture();
     // The API response has the full versioned model ID on assistant messages,
     // but the SDK's streaming path may key modelUsage by the shorter alias.
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-opus-4-6-20250514" }),
       createResultMessageWithModel({
         modelUsage: {
@@ -2917,7 +2863,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2930,7 +2875,7 @@ describe("usage_update computation", () => {
 
   it("prefix-matches when modelUsage key has date suffix but assistant model does not", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-opus-4-6" }),
       createResultMessageWithModel({
         modelUsage: {
@@ -2946,7 +2891,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -2959,7 +2903,7 @@ describe("usage_update computation", () => {
   it("synthetic assistant messages do not override lastAssistantModel", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Real assistant on Opus, then a synthetic message (e.g. from /compact)
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage({ model: "claude-opus-4-20250514" }),
       {
         type: "assistant" as const,
@@ -2991,7 +2935,6 @@ describe("usage_update computation", () => {
           },
         },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -3017,53 +2960,6 @@ describe("emitRawSDKMessages", () => {
     } as unknown as AgentSideConnection;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates, extNotifications };
-  }
-
-  function injectSession(
-    agent: ClaudeAcpAgent,
-    messages: any[],
-    emitRawSDKMessages: boolean | SDKMessageFilter[],
-  ) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
-      abortController: new AbortController(),
-      emitRawSDKMessages,
-      contextWindowSize: 200000,
-    };
   }
 
   function createResultMessage() {
@@ -3100,15 +2996,7 @@ describe("emitRawSDKMessages", () => {
       status: "compacting",
       session_id: "test-session",
     };
-    injectSession(
-      agent,
-      [
-        systemMsg,
-        createResultMessage(),
-        { type: "system", subtype: "session_state_changed", state: "idle" },
-      ],
-      true,
-    );
+    injectSessionWithMessages(agent, [systemMsg, createResultMessage()], true);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3119,12 +3007,11 @@ describe("emitRawSDKMessages", () => {
 
   it("does not emit when set to false", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
         createResultMessage(),
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       false,
     );
@@ -3136,13 +3023,12 @@ describe("emitRawSDKMessages", () => {
 
   it("emits only messages matching a filter array", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { type: "system", subtype: "compact_boundary", session_id: "test-session" },
         { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
         createResultMessage(),
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       [{ type: "system", subtype: "compact_boundary" }],
     );
@@ -3159,13 +3045,12 @@ describe("emitRawSDKMessages", () => {
 
   it("filter without subtype matches all messages of that type", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { type: "system", subtype: "compact_boundary", session_id: "test-session" },
         { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
         createResultMessage(),
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       [{ type: "system" }],
     );
@@ -3180,13 +3065,12 @@ describe("emitRawSDKMessages", () => {
 
   it("supports multiple filters", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { type: "system", subtype: "compact_boundary", session_id: "test-session" },
         { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
         createResultMessage(),
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       [{ type: "system", subtype: "compact_boundary" }, { type: "result" }],
     );
@@ -3202,12 +3086,11 @@ describe("emitRawSDKMessages", () => {
 
   it("filter by origin kind only emits matching results", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { ...createResultMessage(), origin: { kind: "channel", server: "acp" } },
         { ...createResultMessage(), origin: { kind: "task-notification" } },
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       [{ type: "result", origin: "task-notification" }],
     );
@@ -3221,12 +3104,11 @@ describe("emitRawSDKMessages", () => {
 
   it("filter without origin matches results regardless of origin", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
-    injectSession(
+    injectSessionWithMessages(
       agent,
       [
         { ...createResultMessage(), origin: { kind: "channel", server: "acp" } },
         { ...createResultMessage(), origin: { kind: "task-notification" } },
-        { type: "system", subtype: "session_state_changed", state: "idle" },
       ],
       [{ type: "result" }],
     );
@@ -3248,49 +3130,6 @@ describe("result origin handling", () => {
     } as unknown as AgentSideConnection;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
-  }
-
-  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage, done } = await iter.next();
-      if (!done && userMessage) {
-        yield {
-          type: "user",
-          message: userMessage.message,
-          parent_tool_use_id: null,
-          uuid: userMessage.uuid,
-          session_id: "test-session",
-          isReplay: true,
-        };
-      }
-      yield* messages;
-    }
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-    };
   }
 
   function createAssistantMessage() {
@@ -3340,10 +3179,9 @@ describe("result origin handling", () => {
 
   it("forwards origin in usage_update _meta", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage(),
       createResult({ origin: { kind: "channel", server: "acp" } }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
@@ -3357,11 +3195,7 @@ describe("result origin handling", () => {
 
   it("omits _meta when origin is absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    injectSession(agent, [
-      createAssistantMessage(),
-      createResult(),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
+    injectSessionWithMessages(agent, [createAssistantMessage(), createResult()]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3372,7 +3206,7 @@ describe("result origin handling", () => {
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
     const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage(),
       // User-turn result completes normally
       createResult({ origin: { kind: "channel", server: "acp" } }),
@@ -3381,7 +3215,6 @@ describe("result origin handling", () => {
         stop_reason: "max_tokens",
         origin: { kind: "task-notification" },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
@@ -3394,13 +3227,12 @@ describe("result origin handling", () => {
 
   it("user-prompted result with max_tokens still sets stopReason", async () => {
     const { agent } = createMockAgentWithCapture();
-    injectSession(agent, [
+    injectSessionWithMessages(agent, [
       createAssistantMessage(),
       createResult({
         stop_reason: "max_tokens",
         origin: { kind: "channel", server: "acp" },
       }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
     const response = await agent.prompt({
