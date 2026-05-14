@@ -753,7 +753,7 @@ export class ClaudeAcpAgent implements Agent {
     let stopReason: StopReason = "end_turn";
 
     try {
-      query: while (true) {
+      loop: while (true) {
         const { value: message, done } = await session.query.next();
 
         if (done || !message) {
@@ -832,7 +832,7 @@ export class ClaudeAcpAgent implements Agent {
                 break;
               }
               case "session_state_changed": {
-                if (message.state === "idle") break query;
+                if (message.state === "idle") break loop;
                 break;
               }
               case "hook_started":
@@ -906,6 +906,11 @@ export class ClaudeAcpAgent implements Agent {
               break;
             }
 
+            if (!isTaskNotification && message.stop_reason === "max_tokens") {
+              stopReason = "max_tokens";
+              break;
+            }
+
             switch (message.subtype) {
               case "success": {
                 if (message.result.includes("Please run /login")) {
@@ -954,10 +959,6 @@ export class ClaudeAcpAgent implements Agent {
               default:
                 unreachable(message, this.logger);
                 break;
-            }
-
-            if (!isTaskNotification && message.stop_reason === "max_tokens") {
-              stopReason = "max_tokens";
             }
             break;
           }
@@ -1047,7 +1048,7 @@ export class ClaudeAcpAgent implements Agent {
                 handedOff = true;
                 // the current loop stops with end_turn,
                 // the loop of the next prompt continues running
-                break query;
+                break loop;
               }
               if ("isReplay" in message && message.isReplay) {
                 // not pending or unrelated replay message
@@ -1146,12 +1147,14 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
 
-      let errorFactory: (
-        data: {
-          errorKind: SDKAssistantMessageError;
-        },
-        message: string,
-      ) => RequestError;
+      let data:
+        | {
+            errorKind?: SDKAssistantMessageError;
+          }
+        | undefined = {
+        errorKind: lastAssistantError,
+      };
+      let errorFactory = RequestError.internalError;
 
       switch (lastAssistantError) {
         case undefined:
@@ -1172,16 +1175,12 @@ export class ClaudeAcpAgent implements Agent {
         case "authentication_failed":
           errorFactory = RequestError.authRequired;
           break;
+        case "unknown":
+          data = undefined;
+          break;
         default:
-          errorFactory = RequestError.internalError;
       }
-
-      throw errorFactory(
-        {
-          errorKind: lastAssistantError,
-        },
-        errors.join(", "),
-      );
+      throw errorFactory(data, errors.join(", ") || lastAssistantError);
     } catch (error) {
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
