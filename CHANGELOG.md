@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.33.1...v0.34.0) (2026-05-15)
+
+
+### Features
+
+* add bedrock gateway authentication ([#665](https://github.com/agentclientprotocol/claude-agent-acp/issues/665)) ([002c63a](https://github.com/agentclientprotocol/claude-agent-acp/commit/002c63a78b844c168d3dfc744cf408362a6adf97))
+
 ## [0.33.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.33.0...v0.33.1) (2026-05-07)
 
 
