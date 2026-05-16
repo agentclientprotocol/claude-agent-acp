@@ -1125,7 +1125,6 @@ export class ClaudeAcpAgent implements Agent {
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
-              this.logger.log(message.message.content);
               const stripped = stripLocalCommandMetadata(message.message.content);
               if (typeof stripped === "string") {
                 for (const notification of toAcpNotifications(
@@ -1144,6 +1143,8 @@ export class ClaudeAcpAgent implements Agent {
                 )) {
                   await this.client.sessionUpdate(notification);
                 }
+              } else {
+                this.logger.log(message.message.content);
               }
               break;
             }
