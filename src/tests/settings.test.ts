@@ -141,4 +141,66 @@ describe("SettingsManager", () => {
       expect(settings.permissions?.defaultMode).toBe("plan");
     });
   });
+
+  describe("escalating defaultMode trust filter", () => {
+    // The SDK's filterEscalatingDefaultMode drops escalating values
+    // (bypassPermissions / auto / acceptEdits) that came from a repo-committed
+    // tier (.claude/settings.json), preventing a checked-in file from
+    // silently escalating permissions. Local (.claude/settings.local.json)
+    // and user-tier sources are not committed by convention, so escalating
+    // values from those tiers are preserved.
+
+    it.each(["bypassPermissions", "auto", "acceptEdits"] as const)(
+      "drops %s when set in project-tier settings",
+      async (mode) => {
+        const claudeDir = path.join(tempDir, ".claude");
+        await fs.promises.mkdir(claudeDir, { recursive: true });
+
+        await fs.promises.writeFile(
+          path.join(claudeDir, "settings.json"),
+          JSON.stringify({ permissions: { defaultMode: mode } }),
+        );
+
+        settingsManager = new SettingsManager(tempDir);
+        await settingsManager.initialize();
+
+        expect(settingsManager.getSettings().permissions?.defaultMode).toBeUndefined();
+      },
+    );
+
+    it.each(["plan", "dontAsk"] as const)(
+      "preserves non-escalating %s from project-tier settings",
+      async (mode) => {
+        const claudeDir = path.join(tempDir, ".claude");
+        await fs.promises.mkdir(claudeDir, { recursive: true });
+
+        await fs.promises.writeFile(
+          path.join(claudeDir, "settings.json"),
+          JSON.stringify({ permissions: { defaultMode: mode } }),
+        );
+
+        settingsManager = new SettingsManager(tempDir);
+        await settingsManager.initialize();
+
+        expect(settingsManager.getSettings().permissions?.defaultMode).toBe(mode);
+      },
+    );
+
+    it("preserves escalating defaultMode when it comes from local-tier settings", async () => {
+      // settings.local.json is git-ignored by convention, so the trust
+      // filter does not apply.
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.promises.mkdir(claudeDir, { recursive: true });
+
+      await fs.promises.writeFile(
+        path.join(claudeDir, "settings.local.json"),
+        JSON.stringify({ permissions: { defaultMode: "acceptEdits" } }),
+      );
+
+      settingsManager = new SettingsManager(tempDir);
+      await settingsManager.initialize();
+
+      expect(settingsManager.getSettings().permissions?.defaultMode).toBe("acceptEdits");
+    });
+  });
 });

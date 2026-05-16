@@ -2,9 +2,7 @@
 
 import { Readable, Writable } from "node:stream";
 import { WritableStream, ReadableStream } from "node:stream/web";
-import { readFileSync } from "node:fs";
 import { Logger } from "./acp-agent.js";
-import { ClaudeCodeSettings, getManagedSettingsPath } from "./settings.js";
 
 // Useful for bridging push-based and async-iterator-based code.
 export class Pushable<T> implements AsyncIterable<T> {
@@ -88,20 +86,4 @@ export function unreachable(value: never, logger: Logger = console) {
 
 export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
-}
-
-export function loadManagedSettings(): ClaudeCodeSettings | null {
-  try {
-    return JSON.parse(readFileSync(getManagedSettingsPath(), "utf8")) as ClaudeCodeSettings;
-  } catch {
-    return null;
-  }
-}
-
-export function applyEnvironmentSettings(settings: ClaudeCodeSettings): void {
-  if (settings.env) {
-    for (const [key, value] of Object.entries(settings.env)) {
-      process.env[key] = value;
-    }
-  }
 }

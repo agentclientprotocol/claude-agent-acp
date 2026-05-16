@@ -1,5 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+// resolveSettings and filterEscalatingDefaultMode are marked @alpha in the
+// SDK; API may shift in a future release.
+import {
+  filterEscalatingDefaultMode,
+  resolveSettings,
+  type Settings,
+} from "@anthropic-ai/claude-agent-sdk";
 import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
 
 /**
@@ -14,52 +21,10 @@ import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
  * Docs: https://code.claude.com/docs/en/iam#tool-specific-permission-rules
  */
 
-export interface PermissionSettings {
-  defaultMode?: string;
-}
-
-export interface ClaudeCodeSettings {
-  permissions?: PermissionSettings;
-  env?: Record<string, string>;
-  model?: string;
-  effortLevel?: string;
-  availableModels?: string[];
-}
-
-/**
- * Reads and parses a JSON settings file, returning an empty object if not found or invalid.
- * Silently ignores missing files (ENOENT) but logs warnings for other errors
- * (malformed JSON, permission errors, etc.) to aid debugging.
- */
-async function loadSettingsFile(
-  filePath: string | null,
-  logger?: { error: (...args: any[]) => void },
-): Promise<ClaudeCodeSettings> {
-  if (!filePath) {
-    return {};
-  }
-
-  try {
-    const content = await fs.promises.readFile(filePath, "utf-8");
-    return JSON.parse(content) as ClaudeCodeSettings;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      return {};
-    }
-    logger?.error(`Failed to load settings from ${filePath}:`, error);
-    return {};
-  }
-}
-
-/**
- * Gets the enterprise settings path based on the current platform
- */
-export function getManagedSettingsPath(): string {
+function getManagedSettingsPath(): string {
   switch (process.platform) {
     case "darwin":
       return "/Library/Application Support/ClaudeCode/managed-settings.json";
-    case "linux":
-      return "/etc/claude-code/managed-settings.json";
     case "win32":
       return "C:\\Program Files\\ClaudeCode\\managed-settings.json";
     default:
@@ -73,23 +38,17 @@ export interface SettingsManagerOptions {
 }
 
 /**
- * Manages Claude Code settings from multiple sources with proper precedence.
+ * Manages Claude Code settings using the SDK's `resolveSettings` merge engine
+ * so the values we see match what `query()` would observe.
  *
- * Settings are loaded from (in order of increasing precedence):
- * 1. User settings (~/.claude/settings.json)
- * 2. Project settings (<cwd>/.claude/settings.json)
- * 3. Local project settings (<cwd>/.claude/settings.local.json)
- * 4. Enterprise managed settings (platform-specific path)
- *
- * The manager watches all settings files for changes and automatically reloads.
+ * Watches the user/project/local/managed settings files for changes and
+ * re-resolves through the SDK on update. Escalating `permissions.defaultMode`
+ * values from repo-committed sources are filtered out via
+ * `filterEscalatingDefaultMode`, matching the CLI's trust policy.
  */
 export class SettingsManager {
   private cwd: string;
-  private userSettings: ClaudeCodeSettings = {};
-  private projectSettings: ClaudeCodeSettings = {};
-  private localSettings: ClaudeCodeSettings = {};
-  private enterpriseSettings: ClaudeCodeSettings = {};
-  private mergedSettings: ClaudeCodeSettings = {};
+  private effective: Settings = {};
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -127,107 +86,37 @@ export class SettingsManager {
   }
 
   /**
-   * Returns the path to the user settings file
+   * Paths the SDK reads when resolving settings for this cwd. Watching the
+   * containing directories means we pick up file creation as well as edits.
    */
-  private getUserSettingsPath(): string {
-    return path.join(CLAUDE_CONFIG_DIR, "settings.json");
+  private getWatchedPaths(): string[] {
+    return [
+      path.join(CLAUDE_CONFIG_DIR, "settings.json"),
+      path.join(this.cwd, ".claude", "settings.json"),
+      path.join(this.cwd, ".claude", "settings.local.json"),
+      getManagedSettingsPath(),
+    ];
   }
 
   /**
-   * Returns the path to the project settings file
-   */
-  private getProjectSettingsPath(): string {
-    return path.join(this.cwd, ".claude", "settings.json");
-  }
-
-  /**
-   * Returns the path to the local project settings file
-   */
-  private getLocalSettingsPath(): string {
-    return path.join(this.cwd, ".claude", "settings.local.json");
-  }
-
-  /**
-   * Loads settings from all sources
+   * Resolves the effective settings via the SDK and applies the CLI's trust
+   * filter for escalating `permissions.defaultMode` values.
    */
   private async loadAllSettings(): Promise<void> {
-    const [userSettings, projectSettings, localSettings, enterpriseSettings] = await Promise.all([
-      loadSettingsFile(this.getUserSettingsPath(), this.logger),
-      loadSettingsFile(this.getProjectSettingsPath(), this.logger),
-      loadSettingsFile(this.getLocalSettingsPath(), this.logger),
-      loadSettingsFile(getManagedSettingsPath(), this.logger),
-    ]);
-
-    this.userSettings = userSettings;
-    this.projectSettings = projectSettings;
-    this.localSettings = localSettings;
-    this.enterpriseSettings = enterpriseSettings;
-
-    this.mergeSettings();
-  }
-
-  /**
-   * Merges all settings sources with proper precedence.
-   * For permissions, rules from all sources are combined.
-   * Deny rules always take precedence during permission checks.
-   */
-  private mergeSettings(): void {
-    const allSettings = [
-      this.userSettings,
-      this.projectSettings,
-      this.localSettings,
-      this.enterpriseSettings,
-    ];
-
-    const merged: ClaudeCodeSettings = {};
-
-    for (const settings of allSettings) {
-      if (settings.env) {
-        merged.env = { ...merged.env, ...settings.env };
-      }
-
-      if (settings.model) {
-        merged.model = settings.model;
-      }
-
-      if (settings.effortLevel !== undefined) {
-        merged.effortLevel = settings.effortLevel;
-      }
-
-      if (settings.availableModels !== undefined) {
-        // Per Claude Code docs: "When `availableModels` is set at multiple
-        // levels, such as user settings and project settings, arrays are
-        // merged and deduplicated."
-        // https://code.claude.com/docs/en/model-config#merge-behavior
-        const combined = [...(merged.availableModels ?? []), ...settings.availableModels];
-        merged.availableModels = Array.from(new Set(combined));
-      }
-
-      if (settings.permissions?.defaultMode !== undefined) {
-        merged.permissions = {
-          ...merged.permissions,
-          defaultMode: settings.permissions.defaultMode,
-        };
-      }
+    try {
+      const resolved = await resolveSettings({ cwd: this.cwd });
+      this.effective = filterEscalatingDefaultMode(resolved);
+    } catch (error) {
+      this.logger.error("Failed to resolve settings:", error);
+      this.effective = {};
     }
-
-    this.mergedSettings = merged;
   }
 
   /**
    * Sets up file watchers for all settings files
    */
   private setupWatchers(): void {
-    const paths = [
-      this.getUserSettingsPath(),
-      this.getProjectSettingsPath(),
-      this.getLocalSettingsPath(),
-      getManagedSettingsPath(),
-    ];
-
-    for (const filePath of paths) {
-      if (!filePath) continue;
-
+    for (const filePath of this.getWatchedPaths()) {
       try {
         const dir = path.dirname(filePath);
         const filename = path.basename(filePath);
@@ -278,8 +167,8 @@ export class SettingsManager {
   /**
    * Returns the current merged settings
    */
-  getSettings(): ClaudeCodeSettings {
-    return this.mergedSettings;
+  getSettings(): Settings {
+    return this.effective;
   }
 
   /**
