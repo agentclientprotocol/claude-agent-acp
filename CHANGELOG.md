@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.34.0...v0.34.1) (2026-05-16)
+
+
+### Bug Fixes
+
+* load credential error for bedrock gateway ([#667](https://github.com/agentclientprotocol/claude-agent-acp/issues/667)) ([8d76be3](https://github.com/agentclientprotocol/claude-agent-acp/commit/8d76be356a3e74c58a7c93c3c201cca6a317d784))
+
 ## [0.34.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.33.1...v0.34.0) (2026-05-15)
 
 
