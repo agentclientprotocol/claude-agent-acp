@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.35.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.34.1...v0.35.0) (2026-05-16)
+
+
+### Features
+
+* **deps:** bump actions/create-github-app-token from 3.1.1 to 3.2.0 ([#669](https://github.com/agentclientprotocol/claude-agent-acp/issues/669)) ([47df1f2](https://github.com/agentclientprotocol/claude-agent-acp/commit/47df1f2a0be57ddb8873ae8e341f748471c7bc53))
+* **deps:** bump hono from 4.12.18 to 4.12.19 in the minor group ([#671](https://github.com/agentclientprotocol/claude-agent-acp/issues/671)) ([5d7165d](https://github.com/agentclientprotocol/claude-agent-acp/commit/5d7165d96158da2ddf3087676cdb0a19d1ff57aa))
+* **deps:** update to claude-agent-sdk 0.3.143 ([#664](https://github.com/agentclientprotocol/claude-agent-acp/issues/664)) ([27ca2e5](https://github.com/agentclientprotocol/claude-agent-acp/commit/27ca2e5d40917887671cc4c39a854fd8f92c01e6))
+* Use SDK settings resolution for defaults ([#677](https://github.com/agentclientprotocol/claude-agent-acp/issues/677)) ([eb1259c](https://github.com/agentclientprotocol/claude-agent-acp/commit/eb1259cf88375ca3c20a219ab99f12f5488fb360))
+
+
+### Bug Fixes
+
+* Add task hooks for plan state updates ([#676](https://github.com/agentclientprotocol/claude-agent-acp/issues/676)) ([5ff7d50](https://github.com/agentclientprotocol/claude-agent-acp/commit/5ff7d50f0ec7f34a7d9d901223aed73e2dbcce68))
+* render local-command-stdout messages instead of dropping them ([#649](https://github.com/agentclientprotocol/claude-agent-acp/issues/649)) ([3b9b7d5](https://github.com/agentclientprotocol/claude-agent-acp/commit/3b9b7d5a56defd925eb2038fa97b6484ad951587))
+
 ## [0.34.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.34.0...v0.34.1) (2026-05-16)
 
 
