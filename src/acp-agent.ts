@@ -74,6 +74,7 @@ import {
   applyTaskUpdate,
   ClaudePlanEntry,
   createPostToolUseHook,
+  createTaskHook,
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
@@ -1874,6 +1875,11 @@ export class ClaudeAcpAgent implements Agent {
 
     const abortController = userProvidedOptions?.abortController || new AbortController();
 
+    // Per-session task state. Created here (rather than in the session record
+    // below) so the TaskCreated/TaskCompleted hook callbacks can close over
+    // the same Map that the streaming message handler will read from.
+    const taskState: TaskState = new Map();
+
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -1929,6 +1935,44 @@ export class ClaudeAcpAgent implements Agent {
                     },
                   });
                   await this.updateConfigOption(sessionId, "mode", "plan");
+                },
+              }),
+            ],
+          },
+        ],
+        TaskCreated: [
+          ...(userProvidedOptions?.hooks?.TaskCreated || []),
+          {
+            hooks: [
+              createTaskHook({
+                taskState,
+                onChange: async () => {
+                  await this.client.sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "plan",
+                      entries: taskStateToPlanEntries(taskState),
+                    },
+                  });
+                },
+              }),
+            ],
+          },
+        ],
+        TaskCompleted: [
+          ...(userProvidedOptions?.hooks?.TaskCompleted || []),
+          {
+            hooks: [
+              createTaskHook({
+                taskState,
+                onChange: async () => {
+                  await this.client.sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "plan",
+                      entries: taskStateToPlanEntries(taskState),
+                    },
+                  });
                 },
               }),
             ],
@@ -2076,7 +2120,7 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
-      taskState: new Map(),
+      taskState,
     };
 
     return {

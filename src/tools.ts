@@ -782,12 +782,16 @@ export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undef
     state.delete(input.taskId);
     return;
   }
-  const existing = state.get(input.taskId) ?? { subject: "", status: "pending" as const };
+  const existing = state.get(input.taskId);
+  // Without a subject from either the existing entry or the update payload,
+  // we'd produce a plan entry with empty `content` — drop the update.
+  const subject = input.subject ?? existing?.subject;
+  if (!subject) return;
   state.set(input.taskId, {
-    subject: input.subject ?? existing.subject,
-    status: input.status ?? existing.status,
-    activeForm: input.activeForm ?? existing.activeForm,
-    description: input.description ?? existing.description,
+    subject,
+    status: input.status ?? existing?.status ?? "pending",
+    activeForm: input.activeForm ?? existing?.activeForm,
+    description: input.description ?? existing?.description,
   });
 }
 
@@ -924,6 +928,43 @@ export const createPostToolUseHook =
           delete toolUseCallbacks[toolUseID];
         }
       }
+    }
+    return { continue: true };
+  };
+
+/**
+ * Hook callback for `TaskCreated` / `TaskCompleted` events. The SDK fires
+ * these for both user-facing TaskCreate tool calls and subagent task
+ * creation, giving us `task_id` + `task_subject` without having to parse
+ * tool_result payloads.
+ *
+ * Populating `taskState` from the hook means a later `TaskUpdate` (which
+ * typically only carries `taskId` + `status`) finds an existing entry with
+ * a real subject, instead of synthesizing a placeholder with empty content.
+ */
+export const createTaskHook =
+  (options: {
+    taskState: TaskState;
+    onChange?: () => Promise<void>;
+  }): HookCallback =>
+  async (input): Promise<{ continue: boolean }> => {
+    const taskId = "task_id" in input && typeof input.task_id === "string" ? input.task_id : undefined;
+    if (!taskId) return { continue: true };
+
+    if (input.hook_event_name === "TaskCreated") {
+      if (!input.task_subject) return { continue: true };
+      if (options.taskState.has(taskId)) return { continue: true };
+      options.taskState.set(taskId, {
+        subject: input.task_subject,
+        status: "pending",
+        description: input.task_description,
+      });
+      if (options.onChange) await options.onChange();
+    } else if (input.hook_event_name === "TaskCompleted") {
+      const existing = options.taskState.get(taskId);
+      if (!existing || existing.status === "completed") return { continue: true };
+      options.taskState.set(taskId, { ...existing, status: "completed" });
+      if (options.onChange) await options.onChange();
     }
     return { continue: true };
   };

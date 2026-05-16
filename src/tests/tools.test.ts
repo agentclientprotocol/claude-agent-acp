@@ -14,6 +14,7 @@ import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
+  createTaskHook,
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
@@ -1610,7 +1611,7 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     expect(state.size).toBe(0);
   });
 
-  it("creates a placeholder entry when TaskUpdate references an unseen task ID", () => {
+  it("creates a placeholder entry when TaskUpdate carries a subject for an unseen task", () => {
     const state: TaskState = new Map();
     applyTaskUpdate(state, { taskId: "5", subject: "Late arrival", status: "in_progress" });
     expect(state.get("5")).toEqual({
@@ -1619,6 +1620,14 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
       activeForm: undefined,
       description: undefined,
     });
+  });
+
+  it("skips TaskUpdate for an unseen task when no subject is available", () => {
+    const state: TaskState = new Map();
+    applyTaskUpdate(state, { taskId: "5", status: "in_progress" });
+    // Without a subject we'd render an empty-content plan entry, so the
+    // update is dropped instead of synthesizing a blank placeholder.
+    expect(state.has("5")).toBe(false);
   });
 });
 
@@ -1836,5 +1845,106 @@ describe("toAcpNotifications - Task* tools", () => {
 
     expect(notifications).toHaveLength(0);
     expect(taskState.size).toBe(0);
+  });
+});
+
+describe("createTaskHook", () => {
+  it("registers a task on TaskCreated and fires onChange", async () => {
+    const taskState: TaskState = new Map();
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCreated",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+        task_description: "Repro and fix",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")).toEqual({
+      subject: "Investigate flaky test",
+      status: "pending",
+      description: "Repro and fix",
+    });
+    expect(changes).toBe(1);
+  });
+
+  it("does not clobber an existing entry on TaskCreated", async () => {
+    const taskState: TaskState = new Map([
+      ["t-1", { subject: "Investigate flaky test", status: "in_progress" as const }],
+    ]);
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCreated",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")?.status).toBe("in_progress");
+    expect(changes).toBe(0);
+  });
+
+  it("marks a task completed on TaskCompleted", async () => {
+    const taskState: TaskState = new Map([
+      ["t-1", { subject: "Investigate flaky test", status: "in_progress" as const }],
+    ]);
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCompleted",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")?.status).toBe("completed");
+    expect(changes).toBe(1);
+  });
+
+  it("is a no-op for unrelated hook events", async () => {
+    const taskState: TaskState = new Map();
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook({ hook_event_name: "PostToolUse", tool_name: "Read" } as any, undefined, {
+      signal: new AbortController().signal,
+    });
+
+    expect(taskState.size).toBe(0);
+    expect(changes).toBe(0);
   });
 });
