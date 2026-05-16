@@ -17,6 +17,7 @@ import {
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
+  PermissionOption,
   PromptRequest,
   PromptResponse,
   ReadTextFileRequest,
@@ -866,6 +867,7 @@ export class ClaudeAcpAgent implements Agent {
               case "notification":
               case "api_retry":
               case "mirror_error":
+              case "permission_denied":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -1445,7 +1447,7 @@ export class ClaudeAcpAgent implements Agent {
       }
 
       if (toolName === "ExitPlanMode") {
-        const optionsAll = [
+        const optionsAll: PermissionOption[] = [
           { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
           {
             kind: "allow_always",

@@ -639,6 +639,8 @@ describe("tool conversions", () => {
         ],
         stop_reason: null,
         stop_sequence: null,
+        stop_details: null,
+        diagnostics: null,
         usage: {
           input_tokens: 6,
           cache_creation_input_tokens: 326,
