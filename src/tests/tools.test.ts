@@ -16,6 +16,11 @@ import {
   createPostToolUseHook,
   toolInfoFromToolUse,
   planEntries,
+  applyTaskCreate,
+  applyTaskUpdate,
+  parseTaskCreateOutput,
+  taskStateToPlanEntries,
+  TaskState,
 } from "../tools.js";
 
 describe("rawOutput in tool call updates", () => {
@@ -1539,5 +1544,297 @@ describe("toAcpNotifications - TodoWrite with undefined input regression", () =>
 
     const planUpdates = notifications.filter((n) => (n.update as any).sessionUpdate === "plan");
     expect(planUpdates).toHaveLength(1);
+  });
+});
+
+describe("parseTaskCreateOutput", () => {
+  it("parses JSON-string content", () => {
+    const parsed = parseTaskCreateOutput(JSON.stringify({ task: { id: "1", subject: "X" } }));
+    expect(parsed).toEqual({ task: { id: "1", subject: "X" } });
+  });
+
+  it("parses array-of-text-block content", () => {
+    const parsed = parseTaskCreateOutput([
+      { type: "text", text: JSON.stringify({ task: { id: "2", subject: "Y" } }) },
+    ]);
+    expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
+  });
+
+  it("returns undefined for non-JSON content", () => {
+    expect(parseTaskCreateOutput("not json")).toBeUndefined();
+    expect(parseTaskCreateOutput([{ type: "text", text: "not json" }])).toBeUndefined();
+  });
+
+  it("returns undefined when task.id is missing", () => {
+    expect(parseTaskCreateOutput(JSON.stringify({ task: { subject: "X" } }))).toBeUndefined();
+  });
+});
+
+describe("applyTaskCreate / applyTaskUpdate", () => {
+  it("creates an entry on TaskCreate when both input and output are present", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(
+      state,
+      { subject: "Write tests", description: "Cover Task* flow", activeForm: "Writing tests" },
+      { task: { id: "1", subject: "Write tests" } },
+    );
+    expect(state.get("1")).toEqual({
+      subject: "Write tests",
+      status: "pending",
+      activeForm: "Writing tests",
+      description: "Cover Task* flow",
+    });
+  });
+
+  it("is a no-op when the output has no task ID", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "X", description: "Y" }, undefined);
+    expect(state.size).toBe(0);
+  });
+
+  it("updates fields by task ID and keeps insertion order in plan entries", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskCreate(state, { subject: "B", description: "" }, { task: { id: "2", subject: "B" } });
+    applyTaskUpdate(state, { taskId: "1", status: "in_progress" });
+    expect(taskStateToPlanEntries(state)).toEqual([
+      { content: "A", status: "in_progress", priority: "medium" },
+      { content: "B", status: "pending", priority: "medium" },
+    ]);
+  });
+
+  it("removes entries when status is 'deleted'", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskUpdate(state, { taskId: "1", status: "deleted" });
+    expect(state.size).toBe(0);
+  });
+
+  it("creates a placeholder entry when TaskUpdate references an unseen task ID", () => {
+    const state: TaskState = new Map();
+    applyTaskUpdate(state, { taskId: "5", subject: "Late arrival", status: "in_progress" });
+    expect(state.get("5")).toEqual({
+      subject: "Late arrival",
+      status: "in_progress",
+      activeForm: undefined,
+      description: undefined,
+    });
+  });
+});
+
+describe("toAcpNotifications - Task* tools", () => {
+  const mockClient = {} as AgentSideConnection;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("suppresses tool_call for TaskCreate/TaskUpdate/TaskList/TaskGet on tool_use", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map();
+
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_use", id: "1", name: "TaskCreate", input: { subject: "A", description: "" } },
+        {
+          type: "tool_use",
+          id: "2",
+          name: "TaskUpdate",
+          input: { taskId: "1", status: "in_progress" },
+        },
+        { type: "tool_use", id: "3", name: "TaskList", input: {} },
+        { type: "tool_use", id: "4", name: "TaskGet", input: { taskId: "1" } },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.size).toBe(0);
+  });
+
+  it("emits a plan snapshot after a TaskCreate tool_result and accumulates state", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map();
+
+    toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "1",
+          name: "TaskCreate",
+          input: { subject: "First", description: "" },
+        },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    const created = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "1",
+          content: JSON.stringify({ task: { id: "1", subject: "First" } }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(created).toHaveLength(1);
+    expect(created[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "First", status: "pending", priority: "medium" }],
+    });
+
+    // A second TaskCreate accumulates rather than replacing.
+    toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "2",
+          name: "TaskCreate",
+          input: { subject: "Second", description: "" },
+        },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    const second = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "2",
+          content: JSON.stringify({ task: { id: "2", subject: "Second" } }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(second[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [
+        { content: "First", status: "pending", priority: "medium" },
+        { content: "Second", status: "pending", priority: "medium" },
+      ],
+    });
+  });
+
+  it("emits a plan snapshot reflecting status changes after a TaskUpdate tool_result", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map([["1", { subject: "First", status: "pending" as const }]]);
+    toolUseCache["update-1"] = {
+      type: "tool_use",
+      id: "update-1",
+      name: "TaskUpdate",
+      input: { taskId: "1", status: "completed" },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: JSON.stringify({
+            success: true,
+            taskId: "1",
+            updatedFields: ["status"],
+          }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "First", status: "completed", priority: "medium" }],
+    });
+  });
+
+  it("suppresses TaskList and TaskGet tool_result without touching task state", () => {
+    const toolUseCache: ToolUseCache = {
+      "list-1": { type: "tool_use", id: "list-1", name: "TaskList", input: {} },
+      "get-1": { type: "tool_use", id: "get-1", name: "TaskGet", input: { taskId: "1" } },
+    };
+    const taskState: TaskState = new Map([
+      ["1", { subject: "Existing", status: "in_progress" as const }],
+    ]);
+
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_result", tool_use_id: "list-1", content: "...", is_error: false },
+        { type: "tool_result", tool_use_id: "get-1", content: "...", is_error: false },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "in_progress" });
+  });
+
+  it("does not apply TaskCreate/TaskUpdate when the tool_result reports an error", () => {
+    const toolUseCache: ToolUseCache = {
+      "create-1": {
+        type: "tool_use",
+        id: "create-1",
+        name: "TaskCreate",
+        input: { subject: "A", description: "" },
+      },
+    };
+    const taskState: TaskState = new Map();
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "create-1",
+          content: "task creation failed",
+          is_error: true,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.size).toBe(0);
   });
 });

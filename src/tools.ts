@@ -14,6 +14,9 @@ import {
   FileWriteInput,
   GlobInput,
   GrepInput,
+  TaskCreateInput,
+  TaskCreateOutput,
+  TaskUpdateInput,
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
@@ -367,6 +370,40 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "TaskCreate": {
+      const input = toolUse.input as TaskCreateInput | undefined;
+      return {
+        title: input?.subject ? `Create task: ${input.subject}` : "Create task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskUpdate": {
+      const input = toolUse.input as TaskUpdateInput | undefined;
+      return {
+        title: input?.subject ? `Update task: ${input.subject}` : "Update task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskList": {
+      return {
+        title: "List tasks",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskGet": {
+      return {
+        title: "Get task",
+        kind: "think",
+        content: [],
+      };
+    }
+
     case "ExitPlanMode": {
       const planInput = toolUse.input as { plan?: string } | undefined;
       return {
@@ -665,6 +702,99 @@ export function planEntries(input: { todos: ClaudePlanEntry[] } | undefined): Pl
   return (input?.todos ?? []).map((todo) => ({
     content: todo.content,
     status: todo.status,
+    priority: "medium",
+  }));
+}
+
+/**
+ * Per-session task list accumulated from Task* tool calls (TaskCreate /
+ * TaskUpdate). The headless/SDK session emits these as incremental tool
+ * calls keyed by task ID, replacing the snapshot-style TodoWrite tool.
+ * Iteration order is insertion order (Map semantics), matching the order
+ * tasks are created.
+ */
+export type TaskEntry = {
+  subject: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+  description?: string;
+};
+export type TaskState = Map<string, TaskEntry>;
+
+/**
+ * Best-effort parse of a TaskCreate tool_result content into the structured
+ * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
+ * an array of TextBlockParam-like blocks containing JSON text; try both.
+ */
+export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
+  const tryParse = (text: string): TaskCreateOutput | undefined => {
+    try {
+      const parsed = JSON.parse(text);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.task &&
+        typeof parsed.task.id === "string"
+      ) {
+        return parsed as TaskCreateOutput;
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  };
+
+  if (typeof content === "string") {
+    return tryParse(content);
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && "type" in block && block.type === "text") {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === "string") {
+          const parsed = tryParse(text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function applyTaskCreate(
+  state: TaskState,
+  input: TaskCreateInput | undefined,
+  output: TaskCreateOutput | undefined,
+): void {
+  const taskId = output?.task?.id;
+  if (!taskId || !input) return;
+  state.set(taskId, {
+    subject: input.subject,
+    status: "pending",
+    activeForm: input.activeForm,
+    description: input.description,
+  });
+}
+
+export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undefined): void {
+  if (!input?.taskId) return;
+  if (input.status === "deleted") {
+    state.delete(input.taskId);
+    return;
+  }
+  const existing = state.get(input.taskId) ?? { subject: "", status: "pending" as const };
+  state.set(input.taskId, {
+    subject: input.subject ?? existing.subject,
+    status: input.status ?? existing.status,
+    activeForm: input.activeForm ?? existing.activeForm,
+    description: input.description ?? existing.description,
+  });
+}
+
+export function taskStateToPlanEntries(state: TaskState): PlanEntry[] {
+  return Array.from(state.values()).map((task) => ({
+    content: task.subject,
+    status: task.status,
     priority: "medium",
   }));
 }

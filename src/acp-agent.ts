@@ -70,10 +70,15 @@ import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { SettingsManager } from "./settings.js";
 import {
+  applyTaskCreate,
+  applyTaskUpdate,
   ClaudePlanEntry,
   createPostToolUseHook,
+  parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
+  TaskState,
+  taskStateToPlanEntries,
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
@@ -153,6 +158,9 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** Accumulated task list for the session, keyed by task ID. Task IDs are
+   *  per-session, so this state must not be shared across sessions. */
+  taskState: TaskState;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -1058,6 +1066,7 @@ export class ClaudeAcpAgent implements Agent {
               {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
+                taskState: session.taskState,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1164,6 +1173,7 @@ export class ClaudeAcpAgent implements Agent {
                 clientCapabilities: this.clientCapabilities,
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
+                taskState: session.taskState,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1417,6 +1427,7 @@ export class ClaudeAcpAgent implements Agent {
           registerHooks: false,
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
+          taskState: this.sessions[sessionId]?.taskState,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -2065,6 +2076,7 @@ export class ClaudeAcpAgent implements Agent {
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      taskState: new Map(),
     };
 
     return {
@@ -2624,8 +2636,10 @@ export function toAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     parentToolUseId?: string | null;
     cwd?: string;
+    taskState?: TaskState;
   },
 ): SessionNotification[] {
+  const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
@@ -2699,6 +2713,15 @@ export function toAcpNotifications(
               entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
             };
           }
+        } else if (
+          chunk.name === "TaskCreate" ||
+          chunk.name === "TaskUpdate" ||
+          chunk.name === "TaskList" ||
+          chunk.name === "TaskGet"
+        ) {
+          // Task* tool_use is suppressed; the plan update is emitted at
+          // tool_result time once we have the task ID (for TaskCreate) and
+          // confirmation that the change took effect.
         } else {
           // Only register hooks on first encounter to avoid double-firing
           if (registerHooks && !alreadyCached) {
@@ -2803,7 +2826,36 @@ export function toAcpNotifications(
           break;
         }
 
-        if (toolUse.name !== "TodoWrite") {
+        if (
+          toolUse.name === "TaskCreate" ||
+          toolUse.name === "TaskUpdate" ||
+          toolUse.name === "TaskList" ||
+          toolUse.name === "TaskGet"
+        ) {
+          // Headless/SDK sessions emit Task* tools instead of TodoWrite.
+          // TaskCreate / TaskUpdate mutate the accumulated task list; TaskList
+          // and TaskGet are read-only so we just suppress their tool_call /
+          // tool_result events. The plan update is emitted as a snapshot of
+          // the accumulated state, mirroring the legacy TodoWrite behavior.
+          const isError = "is_error" in chunk && chunk.is_error;
+          if (!isError) {
+            if (toolUse.name === "TaskCreate") {
+              applyTaskCreate(
+                taskState,
+                toolUse.input as Parameters<typeof applyTaskCreate>[1],
+                parseTaskCreateOutput(chunk.content),
+              );
+            } else if (toolUse.name === "TaskUpdate") {
+              applyTaskUpdate(taskState, toolUse.input as Parameters<typeof applyTaskUpdate>[1]);
+            }
+          }
+          if (!isError && (toolUse.name === "TaskCreate" || toolUse.name === "TaskUpdate")) {
+            update = {
+              sessionUpdate: "plan",
+              entries: taskStateToPlanEntries(taskState),
+            };
+          }
+        } else if (toolUse.name !== "TodoWrite") {
           const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
             chunk,
             toolUseCache[chunk.tool_use_id],
@@ -2890,6 +2942,7 @@ export function streamEventToAcpNotifications(
   options?: {
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
+    taskState?: TaskState;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -2906,6 +2959,7 @@ export function streamEventToAcpNotifications(
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
+          taskState: options?.taskState,
         },
       );
     case "content_block_delta":
@@ -2920,6 +2974,7 @@ export function streamEventToAcpNotifications(
           clientCapabilities: options?.clientCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
+          taskState: options?.taskState,
         },
       );
     // No content
