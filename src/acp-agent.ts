@@ -1116,21 +1116,11 @@ export class ClaudeAcpAgent implements Agent {
               }
             }
 
-            // Slash commands like /compact can generate invalid output... doesn't match
-            // their own docs: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-slash-commands#%2Fcompact-compact-conversation-history
-            //
-            // Strip local-command marker tags from the content and render whatever
-            // real prose remains, so that custom slash commands / user-defined
-            // skills (whose bodies arrive wrapped in <command-*> / <local-command-stdout>
-            // markers) and built-in commands that emit textual output reach the UI.
-            // Previously this branch dropped every message containing a stdout
-            // marker, which silently swallowed every successful skill invocation
-            // and any built-in command that emits output through these tags.
-            // strip-and-render is safe because stripLocalCommandMetadata returns
-            // null when nothing renderable remains (e.g. pure-marker /compact
-            // payloads), so the no-render no-op path is preserved for those cases.
-            //
-            // Refs zed-industries/claude-code-acp#624, #642.
+            // Strip <command-*>/<local-command-stdout> markers and render any
+            // remaining prose. Skill bodies and built-in slash commands (e.g.
+            // /usage, /status, /model) arrive wrapped in these tags; pure-marker
+            // payloads (e.g. /compact's malformed output) strip to null and are
+            // skipped. Mirrors the replay path at replaySessionHistory.
             if (
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
@@ -1145,6 +1135,12 @@ export class ClaudeAcpAgent implements Agent {
                   this.toolUseCache,
                   this.client,
                   this.logger,
+                  {
+                    clientCapabilities: this.clientCapabilities,
+                    parentToolUseId: message.parent_tool_use_id,
+                    cwd: session.cwd,
+                    taskState: session.taskState,
+                  },
                 )) {
                   await this.client.sessionUpdate(notification);
                 }
