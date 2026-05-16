@@ -943,12 +943,10 @@ export const createPostToolUseHook =
  * a real subject, instead of synthesizing a placeholder with empty content.
  */
 export const createTaskHook =
-  (options: {
-    taskState: TaskState;
-    onChange?: () => Promise<void>;
-  }): HookCallback =>
+  (options: { taskState: TaskState; onChange?: () => Promise<void> }): HookCallback =>
   async (input): Promise<{ continue: boolean }> => {
-    const taskId = "task_id" in input && typeof input.task_id === "string" ? input.task_id : undefined;
+    const taskId =
+      "task_id" in input && typeof input.task_id === "string" ? input.task_id : undefined;
     if (!taskId) return { continue: true };
 
     if (input.hook_event_name === "TaskCreated") {
