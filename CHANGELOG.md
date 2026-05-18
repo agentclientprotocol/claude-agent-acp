@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.36.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.35.0...v0.36.0) (2026-05-18)
+
+
+### Features
+
+* Add experimental session delete support ([#682](https://github.com/agentclientprotocol/claude-agent-acp/issues/682)) ([2162d5a](https://github.com/agentclientprotocol/claude-agent-acp/commit/2162d5af62d493a82381bd88bc8fc67d376e358b))
+* Support experimental additionalDirectories field ([#684](https://github.com/agentclientprotocol/claude-agent-acp/issues/684)) ([f37e9a0](https://github.com/agentclientprotocol/claude-agent-acp/commit/f37e9a0d47d8d201d98b2177083664a6781895cc))
+
 ## [0.35.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.34.1...v0.35.0) (2026-05-16)
 
 
