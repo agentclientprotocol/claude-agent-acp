@@ -1834,7 +1834,7 @@ export class ClaudeAcpAgent implements Agent {
               ? Object.fromEntries(server.headers.map((e) => [e.name, e.value]))
               : undefined,
           };
-        } else {
+        } else if (!("type" in server)) {
           // Stdio type MCP server (with or without explicit type field)
           mcpServers[server.name] = {
             type: "stdio",
