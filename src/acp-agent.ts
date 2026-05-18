@@ -2277,7 +2277,7 @@ function createEnvForGateway(request?: GatewayAuthRequest) {
   return {
     ANTHROPIC_BASE_URL: request._meta.gateway.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: "", // Must be specified to bypass claude login requirement
+    ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
   };
 }
 
