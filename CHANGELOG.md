@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.36.0...v0.36.1) (2026-05-18)
+
+
+### Bug Fixes
+
+* flaky authentication bypass for gateway ([#686](https://github.com/agentclientprotocol/claude-agent-acp/issues/686)) ([db852dc](https://github.com/agentclientprotocol/claude-agent-acp/commit/db852dcf7c8e3b461fabb1bdcf0c80a27d1da77d))
+
 ## [0.36.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.35.0...v0.36.0) (2026-05-18)
 
 
