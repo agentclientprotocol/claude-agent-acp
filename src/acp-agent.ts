@@ -628,11 +628,12 @@ export class ClaudeAcpAgent implements Agent {
         },
         loadSession: true,
         sessionCapabilities: {
+          additionalDirectories: {},
+          close: {},
+          delete: {},
           fork: {},
           list: {},
           resume: {},
-          close: {},
-          delete: {},
         },
       },
       agentInfo: {
@@ -664,6 +665,7 @@ export class ClaudeAcpAgent implements Agent {
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
+        additionalDirectories: params.additionalDirectories,
         _meta: params._meta,
       },
       {
@@ -1775,6 +1777,7 @@ export class ClaudeAcpAgent implements Agent {
     sessionId: string;
     cwd: string;
     mcpServers?: NewSessionRequest["mcpServers"];
+    additionalDirectories?: NewSessionRequest["additionalDirectories"];
     _meta?: NewSessionRequest["_meta"];
   }): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
@@ -1799,6 +1802,7 @@ export class ClaudeAcpAgent implements Agent {
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
+        additionalDirectories: params.additionalDirectories,
         _meta: params._meta,
       },
       {
@@ -2020,9 +2024,15 @@ export class ClaudeAcpAgent implements Agent {
       abortController,
     };
 
+    // Prefer the official ACP `additionalDirectories` field. Fall back to the
+    // legacy `_meta.additionalRoots` extension for clients that haven't been
+    // updated yet. Either source is merged with directories supplied via
+    // `_meta.claudeCode.options.additionalDirectories` (SDK pass-through).
+    const acpAdditionalDirectories =
+      params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
     options.additionalDirectories = [
       ...(userProvidedOptions?.additionalDirectories ?? []),
-      ...(sessionMeta?.additionalRoots ?? []),
+      ...acpAdditionalDirectories,
     ];
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
