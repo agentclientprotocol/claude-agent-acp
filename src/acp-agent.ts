@@ -37,6 +37,8 @@ import {
   SetSessionModeResponse,
   CloseSessionRequest,
   CloseSessionResponse,
+  DeleteSessionRequest,
+  DeleteSessionResponse,
   TerminalHandle,
   TerminalOutputResponse,
   WriteTextFileRequest,
@@ -45,6 +47,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import {
   CanUseTool,
+  deleteSession,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -629,6 +632,7 @@ export class ClaudeAcpAgent implements Agent {
           list: {},
           resume: {},
           close: {},
+          delete: {},
         },
       },
       agentInfo: {
@@ -1294,6 +1298,16 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
     await this.teardownSession(params.sessionId);
+    return {};
+  }
+
+  async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    // Tear down any active in-memory state first so the on-disk file isn't
+    // recreated by an outstanding query writing to it.
+    if (this.sessions[params.sessionId]) {
+      await this.teardownSession(params.sessionId);
+    }
+    await deleteSession(params.sessionId);
     return {};
   }
 

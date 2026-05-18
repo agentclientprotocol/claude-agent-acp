@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
   Agent,
@@ -35,8 +35,16 @@ import {
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
-import { query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import { deleteSession, query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+
+vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
+  return {
+    ...actual,
+    deleteSession: vi.fn(),
+  };
+});
 import type {
   BetaToolResultBlockParam,
   BetaToolSearchToolResultBlockParam,
@@ -1882,6 +1890,94 @@ describe("session/close", () => {
     injectSession(agent, "session-b");
 
     await agent.closeSession({ sessionId: "session-a" });
+
+    expect(agent.sessions["session-a"]).toBeUndefined();
+    expect(agent.sessions["session-b"]).toBeDefined();
+  });
+});
+
+describe("session/delete", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    return agent.sessions[sessionId]!;
+  }
+
+  beforeEach(() => {
+    vi.mocked(deleteSession).mockReset();
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+  });
+
+  it("tears down the active session and deletes it from disk", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "session-1");
+
+    const result = await agent.unstable_deleteSession({ sessionId: "session-1" });
+
+    expect(result).toEqual({});
+    expect(agent.sessions["session-1"]).toBeUndefined();
+    expect(session.query.interrupt).toHaveBeenCalled();
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(session.abortController.signal.aborted).toBe(true);
+    expect(deleteSession).toHaveBeenCalledWith("session-1");
+  });
+
+  it("deletes a session from disk that is not currently active", async () => {
+    const agent = createMockAgent();
+
+    const result = await agent.unstable_deleteSession({ sessionId: "not-active" });
+
+    expect(result).toEqual({});
+    expect(deleteSession).toHaveBeenCalledWith("not-active");
+  });
+
+  it("propagates errors from the SDK delete call", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Session not found on disk"));
+
+    await expect(agent.unstable_deleteSession({ sessionId: "missing" })).rejects.toThrow(
+      "Session not found on disk",
+    );
+  });
+
+  it("does not affect other sessions when deleting one", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-a");
+    injectSession(agent, "session-b");
+
+    await agent.unstable_deleteSession({ sessionId: "session-a" });
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
