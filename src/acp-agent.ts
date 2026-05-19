@@ -1742,7 +1742,7 @@ export class ClaudeAcpAgent implements Agent {
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
         await session.query.applyFlagSettings({
-          effortLevel: newEffort as Settings["effortLevel"],
+          effortLevel: newEffort === "default" ? undefined : (newEffort as Settings["effortLevel"]),
         });
       }
 
@@ -1767,7 +1767,7 @@ export class ClaudeAcpAgent implements Agent {
       );
       if (configId === "effort") {
         await session.query.applyFlagSettings({
-          effortLevel: value as Settings["effortLevel"],
+          effortLevel: value === "default" ? undefined : (value as Settings["effortLevel"]),
         });
       }
     }
@@ -2137,7 +2137,7 @@ export class ClaudeAcpAgent implements Agent {
 
     // Apply the initial effort level to the SDK so it matches the UI default
     const initialEffort = configOptions.find((o) => o.id === "effort");
-    if (initialEffort && typeof initialEffort.currentValue === "string") {
+    if (initialEffort && typeof initialEffort.currentValue === "string" && initialEffort.currentValue !== "default") {
       await q.applyFlagSettings({
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
@@ -2375,25 +2375,23 @@ function buildConfigOptions(
     : [];
 
   if (supportedLevels.length > 0) {
-    const effortOptions = supportedLevels.map((level) => ({
-      value: level,
-      name: level
-        .split(/[_-]/)
-        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-        .join(" "),
-    }));
+    const effortOptions = [
+      { value: "default", name: "Default" },
+      ...supportedLevels.map((level) => ({
+        value: level,
+        name: level
+          .split(/[_-]/)
+          .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+          .join(" "),
+      })),
+    ];
 
-    // Keep the current level if valid, otherwise prefer xhigh (Claude Code's
-    // recommended default for capable models), then high (the API default).
-    const includes = (l: string) => (supportedLevels as string[]).includes(l);
+    const includes = (l: string) =>
+      l === "default" || (supportedLevels as string[]).includes(l);
     const validEffort =
       currentEffortLevel && includes(currentEffortLevel)
         ? currentEffortLevel
-        : includes("xhigh")
-          ? "xhigh"
-          : includes("high")
-            ? "high"
-            : supportedLevels[0];
+        : "default";
 
     options.push({
       id: "effort",
