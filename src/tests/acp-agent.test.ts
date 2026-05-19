@@ -1236,6 +1236,91 @@ describe("isLocalCommandMetadata", () => {
   });
 });
 
+describe("skills slash command", () => {
+  function createAgentWithSession(commands: any[], skillFrontmatter: any[] = []) {
+    const updates: any[] = [];
+    const agent = new ClaudeAcpAgent({
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection);
+    const query = {
+      supportedCommands: vi.fn().mockResolvedValue(commands),
+      getContextUsage: vi.fn().mockResolvedValue({
+        skills: {
+          skillFrontmatter,
+        },
+      }),
+    };
+
+    agent.sessions["test-session"] = {
+      query: query as any,
+    } as any;
+
+    return { agent, query, updates };
+  }
+
+  it("advertises /skills", async () => {
+    const { agent, updates } = createAgentWithSession([]);
+
+    await (agent as any).sendAvailableCommandsUpdate("test-session");
+
+    expect(updates[0].update.availableCommands[0]).toEqual({
+      name: "skills",
+      description: "List available skills and plugins.",
+      input: null,
+    });
+  });
+
+  it("handles /skills locally", async () => {
+    const { agent, query, updates } = createAgentWithSession(
+      [
+        { name: "build", description: "Build", argumentHint: "" },
+        { name: "clear", description: "Start a new session", argumentHint: "" },
+        { name: "deploy", description: "", argumentHint: "" },
+        { name: "usage", description: "Show session usage", argumentHint: "" },
+      ],
+      [
+        { name: "build", source: "user", tokens: 1 },
+        { name: "deploy", source: "plugin", tokens: 1 },
+      ],
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/skills" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(query.supportedCommands).toHaveBeenCalledTimes(1);
+    expect(query.getContextUsage).toHaveBeenCalledTimes(1);
+    expect(updates[0].update.content.text).toBe(
+      "Available skills and plugins:\n- /build: Build\n- /deploy",
+    );
+  });
+
+  it("reports no configured skills when only built-ins are available", async () => {
+    const { agent, query, updates } = createAgentWithSession(
+      [
+        { name: "clear", description: "Start a new session", argumentHint: "" },
+        { name: "compact", description: "Summarize context", argumentHint: "" },
+        { name: "review", description: "Review a pull request", argumentHint: "" },
+      ],
+      [{ name: "review", source: "builtin", tokens: 1 }],
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/skills" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(query.supportedCommands).toHaveBeenCalledTimes(1);
+    expect(query.getContextUsage).toHaveBeenCalledTimes(1);
+    expect(updates[0].update.content.text).toBe("No skills or plugins configured.");
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
