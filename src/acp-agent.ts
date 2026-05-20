@@ -864,6 +864,9 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
+                  if (session.cancelled) {
+                    stopReason = "cancelled";
+                  }
                   return { stopReason, usage: sessionUsage(session) };
                 }
                 break;
