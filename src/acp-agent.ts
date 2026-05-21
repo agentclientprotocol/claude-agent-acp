@@ -781,6 +781,7 @@ export class ClaudeAcpAgent implements Agent {
 
     session.promptRunning = true;
     let handedOff = false;
+    let errored = false;
     let stopReason: StopReason = "end_turn";
 
     try {
@@ -1262,6 +1263,34 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw new Error("Session did not end in result");
     } catch (error) {
+      errored = true;
+      // A failed turn typically leaves a trailing `session_state_changed: idle`
+      // (and possibly more) in the query iterator. If we don't drain it here,
+      // the next prompt's first `query.next()` consumes that stale idle and
+      // short-circuits to end_turn with zero usage
+      // Bounded so a misbehaving SDK can't hang the next prompt indefinitely.
+      try {
+        await session.query.interrupt();
+        const MAX_DRAIN = 100;
+        for (let i = 0; i < MAX_DRAIN; i++) {
+          const { value: m, done } = await session.query.next();
+          if (done || !m) break;
+          if (m.type === "system" && m.subtype === "session_state_changed" && m.state === "idle") {
+            break;
+          }
+          if (i === MAX_DRAIN - 1) {
+            this.logger.error(
+              `Session ${params.sessionId}: drained ${MAX_DRAIN} messages after error without observing idle`,
+            );
+          }
+        }
+      } catch (drainErr) {
+        this.logger.error(
+          `Session ${params.sessionId}: failed to drain query after prompt error:`,
+          drainErr,
+        );
+      }
+
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
       }
@@ -1286,10 +1315,19 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
-        // This usually should not happen, but in case the loop finishes
-        // without claude sending all message replays, we resolve the
-        // next pending prompt call to ensure no prompts get stuck.
-        if (session.pendingMessages.size > 0) {
+        if (errored) {
+          // The query stream was just drained — handing pending prompts off
+          // onto it would let them race with the recovery. Cancel them so
+          // each waiting prompt() returns stopReason: "cancelled" and the
+          // client can decide whether to retry.
+          for (const pending of session.pendingMessages.values()) {
+            pending.resolve(true);
+          }
+          session.pendingMessages.clear();
+        } else if (session.pendingMessages.size > 0) {
+          // This usually should not happen, but in case the loop finishes
+          // without claude sending all message replays, we resolve the
+          // next pending prompt call to ensure no prompts get stuck.
           const next = [...session.pendingMessages.entries()].sort(
             (a, b) => a[1].order - b[1].order,
           )[0];

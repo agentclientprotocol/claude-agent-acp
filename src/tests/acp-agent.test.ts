@@ -3697,3 +3697,178 @@ describe("memory_recall handling", () => {
     expect(toolCall.update._meta.claudeCode.toolResponse).toEqual({ mode: "synthesize" });
   });
 });
+
+describe("post-error recovery", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function createResultMessage(overrides: {
+    subtype: "success" | "error_during_execution";
+    stop_reason: string | null;
+    is_error: boolean;
+    result?: string;
+    errors?: string[];
+  }) {
+    return {
+      type: "result" as const,
+      subtype: overrides.subtype,
+      stop_reason: overrides.stop_reason,
+      is_error: overrides.is_error,
+      result: overrides.result ?? "",
+      errors: overrides.errors ?? [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  // Two-turn generator: turn 1 yields the caller-supplied `firstTurn`
+  // messages (including a trailing idle that the drain must consume).
+  // Turn 2 yields a clean success + idle, used to verify the next prompt
+  // sees real messages rather than the stale idle.
+  function injectTwoTurnSession(agent: ClaudeAcpAgent, firstTurn: unknown[]) {
+    const input = new Pushable<any>();
+    const interrupt = vi.fn(async () => {});
+    const close = vi.fn();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+
+      const first = await iter.next();
+      if (!first.done && first.value) {
+        yield {
+          type: "user",
+          message: first.value.message,
+          parent_tool_use_id: null,
+          uuid: first.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* firstTurn;
+
+      const second = await iter.next();
+      if (!second.done && second.value) {
+        yield {
+          type: "user",
+          message: second.value.message,
+          parent_tool_use_id: null,
+          uuid: second.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield createResultMessage({ subtype: "success", stop_reason: null, is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    const gen = Object.assign(messageGenerator(), { interrupt, close });
+    agent.sessions["test-session"] = {
+      query: gen as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    return { interrupt };
+  }
+
+  it("drains a failed turn's trailing idle so the next prompt is not short-circuited", async () => {
+    const agent = createMockAgent();
+    const { interrupt } = injectTwoTurnSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "boom",
+      }),
+      // Trailing idle from the failed turn. Without draining, the next
+      // prompt's first query.next() would consume this and short-circuit
+      // to end_turn with zero usage (issue #654).
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      }),
+    ).rejects.toThrow();
+
+    expect(interrupt).toHaveBeenCalled();
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    expect(second.usage?.inputTokens).toBe(10);
+    expect(second.usage?.outputTokens).toBe(5);
+  });
+
+  it("cancels all queued pending prompts when a turn errors", async () => {
+    const agent = createMockAgent();
+    injectTwoTurnSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "boom",
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    // Simulate two prompts already queued behind the running turn. Both
+    // resolvers should fire with `true` (cancelled) when the running
+    // prompt errors, and the map should be cleared.
+    const session = agent.sessions["test-session"];
+    let resolveA!: (cancelled: boolean) => void;
+    let resolveB!: (cancelled: boolean) => void;
+    const pendingA = new Promise<boolean>((r) => (resolveA = r));
+    const pendingB = new Promise<boolean>((r) => (resolveB = r));
+    session.pendingMessages.set("uuid-a", { resolve: resolveA, order: 0 });
+    session.pendingMessages.set("uuid-b", { resolve: resolveB, order: 1 });
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "first" }],
+      }),
+    ).rejects.toThrow();
+
+    await expect(pendingA).resolves.toBe(true);
+    await expect(pendingB).resolves.toBe(true);
+    expect(session.pendingMessages.size).toBe(0);
+  });
+});
