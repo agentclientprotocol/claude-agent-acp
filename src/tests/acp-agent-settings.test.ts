@@ -222,7 +222,9 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     // Bad model is ignored at the usage site; falls back to the first SDK model.
-    expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
+    // No setModel call is needed because no override was applied — the SDK is
+    // already on its own default.
+    expect(setModelSpy).not.toHaveBeenCalled();
     expect(response.models.currentModelId).toBe("claude-sonnet-4-6");
   });
 
@@ -624,5 +626,95 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
     expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+  });
+
+  it("skips the initial setModel when the resolved value matches the SDK's model list verbatim", async () => {
+    // Covers the launcher case from PR #646: the launcher bakes the model into
+    // ANTHROPIC_MODEL, the SDK already starts on that model, and a second
+    // setModel call would be a redundant round-trip (and on some launcher
+    // setups, more fragile than launch-time selection).
+    const originalEnv = process.env.ANTHROPIC_MODEL;
+    process.env.ANTHROPIC_MODEL = "claude-opus-4-6";
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const setModelSpy = vi.fn();
+    querySpy.mockImplementation(() => {
+      return {
+        initializationResult: async () => ({
+          models: [
+            { value: "default", displayName: "Default", description: "" },
+            { value: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6", description: "" },
+            { value: "claude-opus-4-6", displayName: "Claude Opus 4.6", description: "" },
+          ],
+        }),
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      } as any;
+    });
+
+    try {
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(setModelSpy).not.toHaveBeenCalled();
+      expect(response.models.currentModelId).toBe("claude-opus-4-6");
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.ANTHROPIC_MODEL;
+      } else {
+        process.env.ANTHROPIC_MODEL = originalEnv;
+      }
+    }
+  });
+
+  it("still calls setModel when the allowlist synthesizes a value the SDK has not surfaced", async () => {
+    // The allowlist may rewrite a model's `value` to the user's literal ID
+    // (e.g., `claude-haiku-4-5`) even when the SDK only exposed an alias
+    // (`haiku`). In that case the SDK has not independently arrived at the
+    // user's preferred ID, so we must sync via setModel.
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({
+        availableModels: ["claude-haiku-4-5"],
+        model: "claude-haiku-4-5",
+      }),
+    );
+
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const setModelSpy = vi.fn();
+    querySpy.mockImplementation(() => {
+      return {
+        initializationResult: async () => ({
+          models: [
+            { value: "default", displayName: "Default", description: "" },
+            { value: "haiku", displayName: "Haiku", description: "Fast" },
+          ],
+        }),
+        setModel: setModelSpy,
+        supportedCommands: async () => [],
+      } as any;
+    });
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+
+    expect(setModelSpy).toHaveBeenCalledWith("claude-haiku-4-5");
+    expect(response.models.currentModelId).toBe("claude-haiku-4-5");
   });
 });

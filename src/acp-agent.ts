@@ -2086,7 +2086,13 @@ export class ClaudeAcpAgent implements Agent {
       ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
       : initializationResult.models;
 
-    const models = await getAvailableModels(q, allowedModels, settingsManager, this.logger);
+    const models = await getAvailableModels(
+      q,
+      allowedModels,
+      initializationResult.models,
+      settingsManager,
+      this.logger,
+    );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
@@ -2547,12 +2553,14 @@ function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
+  sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
+  let resolvedFromInput: string | undefined;
 
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
@@ -2562,15 +2570,33 @@ async function getAvailableModels(
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
+      resolvedFromInput = process.env.ANTHROPIC_MODEL;
     }
-  } else {
+  } else if (typeof settings.model === "string") {
     const match = resolveSettingsModel(models, settings.model, logger);
     if (match) {
       currentModel = match;
+      resolvedFromInput = settings.model;
     }
   }
 
-  await query.setModel(currentModel.value);
+  // Skip the setModel round-trip when we can prove the SDK has already landed
+  // on the same model. Two cases qualify:
+  //  (a) No override applied — currentModel stayed at models[0]; the SDK is on
+  //      its own default and we have nothing to sync.
+  //  (b) The resolver returned the user's input verbatim AND that value exists
+  //      in the SDK's original model list — meaning no fuzzy match or
+  //      allowlist rewrite was involved, and the SDK (which reads the same
+  //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
+  // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
+  // setModel call so we don't drift from the user's intended pin.
+  const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
+  const skipSetModel =
+    resolvedFromInput === undefined ||
+    (currentModel.value === resolvedFromInput && sdkSawSameValue);
+  if (!skipSetModel) {
+    await query.setModel(currentModel.value);
+  }
 
   return {
     availableModels: models.map((model) => ({
