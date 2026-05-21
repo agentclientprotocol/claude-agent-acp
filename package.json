@@ -61,13 +61,13 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@agentclientprotocol/sdk": "0.22.1",
-    "@anthropic-ai/claude-agent-sdk": "0.3.143",
+    "@anthropic-ai/claude-agent-sdk": "0.3.146",
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.96.0",
+    "@anthropic-ai/sdk": "0.97.1",
     "@eslint/js": "10.0.1",
-    "@types/node": "25.9.0",
+    "@types/node": "25.9.1",
     "@typescript-eslint/eslint-plugin": "8.59.4",
     "@typescript-eslint/parser": "8.59.4",
     "eslint": "10.4.0",
@@ -76,6 +76,6 @@
     "prettier": "3.8.3",
     "ts-node": "10.9.2",
     "typescript": "6.0.3",
-    "vitest": "4.1.6"
+    "vitest": "4.1.7"
   }
 }
