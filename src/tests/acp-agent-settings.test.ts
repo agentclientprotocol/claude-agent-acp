@@ -578,6 +578,68 @@ describe("ClaudeAcpAgent settings", () => {
       expect(setModelSpy).toHaveBeenCalledWith("claude-haiku-4-5");
       expect(response.models.currentModelId).toBe("claude-haiku-4-5");
     });
+
+    it("does not inherit display info across mismatched model family versions", async () => {
+      // https://github.com/agentclientprotocol/claude-agent-acp/issues/639:
+      // when the SDK's `opus` alias resolves to Opus 4.7, an allowlist entry
+      // of `claude-opus-4-6` (or `claude-opus-4-6[1m]`) used to substring-match
+      // `opus` and inherit the "Opus 4.7" display info. With version-aware
+      // matching, these entries fall back to showing their literal ID rather
+      // than a misleading newer name.
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          availableModels: [
+            "claude-opus-4-6",
+            "claude-opus-4-6[1m]",
+            "claude-opus-4-7",
+            "claude-opus-4-7[1m]",
+          ],
+        }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        {
+          value: "opus",
+          displayName: "Opus 4.7",
+          description: "Claude Opus 4.7 — complex tasks, higher cost",
+        },
+        {
+          value: "opus[1m]",
+          displayName: "Opus 4.7 (1M context)",
+          description: "Opus 4.7 with 1M context",
+        },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      const byValue: Record<string, { name: string; description?: string }> = {};
+      for (const opt of modelOption.options) {
+        byValue[opt.value] = { name: opt.name, description: opt.description };
+      }
+
+      // 4-6 entries must NOT inherit the 4.7 SDK alias display info.
+      expect(byValue["claude-opus-4-6"].name).toBe("claude-opus-4-6");
+      expect(byValue["claude-opus-4-6"].description).toBe("");
+      expect(byValue["claude-opus-4-6[1m]"].name).toBe("claude-opus-4-6[1m]");
+      expect(byValue["claude-opus-4-6[1m]"].description).toBe("");
+
+      // 4-7 entries continue to inherit display info from a 4.7 SDK alias.
+      expect(byValue["claude-opus-4-7"].name).toBe("Opus 4.7");
+      expect(byValue["claude-opus-4-7[1m]"].name).toMatch(/Opus 4\.7/);
+    });
   });
 
   it("resolves model aliases like opus[1m] to the correct model", async () => {

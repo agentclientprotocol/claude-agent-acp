@@ -2413,6 +2413,27 @@ function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
+// Captures a model family version such as `4-6` or `4.7` so we can keep
+// `claude-opus-4-6` from being copied onto the SDK's `opus` alias when that
+// alias currently resolves to a different family version (e.g. Opus 4.7).
+const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)[-.](\d+)\b/;
+
+function extractModelFamilyVersion(s: string): string | null {
+  const match = s.match(MODEL_FAMILY_VERSION_PATTERN);
+  return match ? `${match[1]}.${match[2]}` : null;
+}
+
+function modelVersionsCompatible(preference: string, candidate: ModelInfo): boolean {
+  const preferred = extractModelFamilyVersion(preference);
+  if (!preferred) return true;
+  const candidateVersion =
+    extractModelFamilyVersion(candidate.value) ??
+    extractModelFamilyVersion(candidate.displayName) ??
+    extractModelFamilyVersion(candidate.description);
+  if (!candidateVersion) return true;
+  return preferred === candidateVersion;
+}
+
 function tokenizeModelPreference(model: string): { tokens: string[]; contextHint?: string } {
   const lower = model.trim().toLowerCase();
   const contextHint = lower.match(MODEL_CONTEXT_HINT_PATTERN)?.[1]?.toLowerCase();
@@ -2459,6 +2480,7 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
 
   // Substring match
   const includesMatch = models.find((model) => {
+    if (!modelVersionsCompatible(trimmed, model)) return false;
     const value = model.value.toLowerCase();
     const display = model.displayName.toLowerCase();
     return value.includes(lower) || display.includes(lower) || lower.includes(value);
@@ -2472,6 +2494,7 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
   let bestMatch: ModelInfo | null = null;
   let bestScore = 0;
   for (const model of models) {
+    if (!modelVersionsCompatible(trimmed, model)) continue;
     const score = scoreModelMatch(model, tokens, contextHint);
     if (0 < score && (!bestMatch || bestScore < score)) {
       bestMatch = model;
