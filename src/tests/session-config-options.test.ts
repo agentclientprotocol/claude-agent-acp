@@ -577,7 +577,8 @@ describe("session config options", () => {
       // dropped during JSON.stringify, which would leave the previous effort
       // override in place. Round-trip the call args through JSON to make sure
       // the key actually reaches the SDK.
-      const lastCallArgs = applyFlagSettingsSpy.mock.calls.at(-1)?.[0];
+      const calls = applyFlagSettingsSpy.mock.calls;
+      const lastCallArgs = calls[calls.length - 1]?.[0];
       const serialized = JSON.parse(JSON.stringify(lastCallArgs));
       expect(serialized).toHaveProperty("effortLevel", null);
     });
