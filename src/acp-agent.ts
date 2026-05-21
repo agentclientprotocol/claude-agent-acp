@@ -868,6 +868,46 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 break;
               }
+              case "memory_recall": {
+                const isSynthesis = message.mode === "synthesize";
+                const locations = isSynthesis
+                  ? []
+                  : message.memories.map((m) => ({ path: m.path }));
+                const content = isSynthesis
+                  ? message.memories
+                      .filter(
+                        (m): m is (typeof message.memories)[number] & { content: string } =>
+                          typeof m.content === "string",
+                      )
+                      .map((m) => ({
+                        type: "content" as const,
+                        content: { type: "text" as const, text: m.content },
+                      }))
+                  : [];
+                const count = message.memories.length;
+                const title = isSynthesis
+                  ? "Recalled synthesized memory"
+                  : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: message.uuid,
+                    title,
+                    kind: "read",
+                    status: "completed",
+                    ...(locations.length > 0 && { locations }),
+                    ...(content.length > 0 && { content }),
+                    _meta: {
+                      claudeCode: {
+                        toolName: "memory_recall",
+                        toolResponse: { mode: message.mode },
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -878,7 +918,6 @@ export class ClaudeAcpAgent implements Agent {
               case "task_updated":
               case "elicitation_complete":
               case "plugin_install":
-              case "memory_recall":
               case "notification":
               case "api_retry":
               case "mirror_error":

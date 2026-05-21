@@ -3516,3 +3516,184 @@ describe("result origin handling", () => {
     expect(response.stopReason).toBe("max_tokens");
   });
 });
+
+describe("memory_recall handling", () => {
+  function createMockAgentWithCapture() {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => {
+        updates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, updates };
+  }
+
+  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+  }
+
+  function createResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  it("emits a synthetic tool_call for select mode with one location per memory", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const recallUuid = randomUUID();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "memory_recall",
+        mode: "select",
+        memories: [
+          { path: "/Users/test/.claude/memory/user_role.md", scope: "personal" },
+          { path: "/Users/test/.claude/memory/feedback_testing.md", scope: "personal" },
+          { path: "/Users/test/.claude/team/conventions.md", scope: "team" },
+        ],
+        uuid: recallUuid,
+        session_id: "test-session",
+      },
+      createResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const toolCall = updates.find((u: any) => u.update?.sessionUpdate === "tool_call");
+    expect(toolCall).toBeDefined();
+    expect(toolCall.update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: recallUuid,
+      title: "Recalled 3 memories",
+      kind: "read",
+      status: "completed",
+      locations: [
+        { path: "/Users/test/.claude/memory/user_role.md" },
+        { path: "/Users/test/.claude/memory/feedback_testing.md" },
+        { path: "/Users/test/.claude/team/conventions.md" },
+      ],
+      _meta: {
+        claudeCode: { toolName: "memory_recall", toolResponse: { mode: "select" } },
+      },
+    });
+    expect(toolCall.update.content).toBeUndefined();
+  });
+
+  it("uses singular 'memory' in title when exactly one entry", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "memory_recall",
+        mode: "select",
+        memories: [{ path: "/Users/test/.claude/memory/user_role.md", scope: "personal" }],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const toolCall = updates.find((u: any) => u.update?.sessionUpdate === "tool_call");
+    expect(toolCall.update.title).toBe("Recalled 1 memory");
+  });
+
+  it("emits synthesis content and no locations for synthesize mode", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "memory_recall",
+        mode: "synthesize",
+        memories: [
+          {
+            path: "<synthesis:/Users/test/.claude/memory>",
+            scope: "personal",
+            content: "The user prefers terse responses and writes Go.",
+          },
+        ],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResult(),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const toolCall = updates.find((u: any) => u.update?.sessionUpdate === "tool_call");
+    expect(toolCall).toBeDefined();
+    expect(toolCall.update.title).toBe("Recalled synthesized memory");
+    expect(toolCall.update.locations).toBeUndefined();
+    expect(toolCall.update.content).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: "The user prefers terse responses and writes Go." },
+      },
+    ]);
+    expect(toolCall.update._meta.claudeCode.toolResponse).toEqual({ mode: "synthesize" });
+  });
+});
