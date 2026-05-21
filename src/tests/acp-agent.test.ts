@@ -32,6 +32,7 @@ import {
   ClaudeAcpAgent,
   claudeCliPath,
   describeAlwaysAllow,
+  streamEventToAcpNotifications,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -3870,5 +3871,40 @@ describe("post-error recovery", () => {
     await expect(pendingA).resolves.toBe(true);
     await expect(pendingB).resolves.toBe(true);
     expect(session.pendingMessages.size).toBe(0);
+  });
+});
+
+describe("streamEventToAcpNotifications", () => {
+  it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
+    const errors: unknown[][] = [];
+    const logger = {
+      log: () => {},
+      error: (...args: unknown[]) => {
+        errors.push(args);
+      },
+    };
+    const pingMessage = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      // The SDK's typed `BetaRawMessageStreamEvent` union doesn't include
+      // `ping`, but the API emits it on the wire and the SDK passes it
+      // through. Cast through `unknown` to feed the realistic runtime shape.
+      event: { type: "ping" } as unknown,
+    } as Parameters<typeof streamEventToAcpNotifications>[0];
+
+    const result = streamEventToAcpNotifications(
+      pingMessage,
+      "test-session",
+      {},
+      { sessionUpdate: async () => {} } as unknown as Parameters<
+        typeof streamEventToAcpNotifications
+      >[3],
+      logger,
+    );
+
+    expect(result).toEqual([]);
+    expect(errors).toEqual([]);
   });
 });

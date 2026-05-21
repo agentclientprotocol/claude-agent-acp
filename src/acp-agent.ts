@@ -3207,7 +3207,11 @@ export function streamEventToAcpNotifications(
           taskState: options?.taskState,
         },
       );
-    // No content
+    // No content. `ping` is a Messages-API keep-alive event that the SDK's
+    // `BetaRawMessageStreamEvent` union doesn't include even though the
+    // wire format emits it; the `as never` cast lets us no-op it here
+    // instead of letting it fall through to `unreachable`.
+    case "ping" as never:
     case "message_start":
     case "message_delta":
     case "message_stop":
