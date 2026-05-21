@@ -2672,6 +2672,7 @@ async function getAvailableModels(
 
 function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
+    "clear",
     "cost",
     "keybindings-help",
     "login",
