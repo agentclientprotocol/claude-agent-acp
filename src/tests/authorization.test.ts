@@ -15,7 +15,10 @@ const mockQuery = vi.hoisted(() =>
   })),
 );
 
-vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
+  ...(await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+    "@anthropic-ai/claude-agent-sdk",
+  )),
   query: mockQuery,
 }));
 
