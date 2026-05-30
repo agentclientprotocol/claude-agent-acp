@@ -2600,11 +2600,14 @@ function tokenizeModelPreference(model: string): { tokens: string[]; contextHint
 function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: string): number {
   const haystack = `${model.value} ${model.displayName}`.toLowerCase();
   let score = 0;
+  let nonHintMatched = false;
   for (const token of tokens) {
     if (haystack.includes(token)) {
+      if (token !== contextHint) nonHintMatched = true;
       score += token === contextHint ? 3 : 1;
     }
   }
+  if (contextHint && !nonHintMatched) return 0;
   return score;
 }
 
