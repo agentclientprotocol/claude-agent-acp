@@ -700,7 +700,6 @@ describe("ClaudeAcpAgent settings", () => {
         byValue[opt.value] = { name: opt.name, description: opt.description };
       }
 
-      expect(byValue["claude-opus-4-6[1m]"].name).not.toBe("Sonnet (1M context)");
       expect(byValue["claude-opus-4-6[1m]"].name).toBe("claude-opus-4-6[1m]");
       expect(byValue["claude-opus-4-6"].name).toBe("claude-opus-4-6");
     });
