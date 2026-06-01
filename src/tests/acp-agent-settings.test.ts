@@ -11,15 +11,18 @@ const { querySpy } = vi.hoisted(() => ({
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<any>("@anthropic-ai/claude-agent-sdk");
+  const { isolatedResolveSettings } = await import("./isolated-settings-resolver.js");
   return {
     ...actual,
     query: querySpy,
+    resolveSettings: isolatedResolveSettings,
   };
 });
 
 describe("ClaudeAcpAgent settings", () => {
   let tempDir: string;
   let originalClaudeConfigDir: string | undefined;
+  let originalAnthropicEnv: Record<string, string> = {};
 
   function createMockClient(): AcpClient {
     return {
@@ -55,6 +58,20 @@ describe("ClaudeAcpAgent settings", () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "acp-agent-settings-"));
     originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = tempDir;
+    // Strip every ANTHROPIC_* from the inherited shell. ANTHROPIC_MODEL
+    // outranks settings.model at acp-agent.ts:2832, and other ANTHROPIC_*
+    // vars (ANTHROPIC_BASE_URL, ANTHROPIC_DEFAULT_HAIKU_MODEL, etc.) are
+    // read by the SDK or referenced in fixtures — any of them leaking in
+    // from the developer's shell can preempt what the test wrote to disk.
+    // Tests that intentionally exercise an ANTHROPIC_* var set and restore
+    // it within the test body.
+    originalAnthropicEnv = {};
+    for (const k of Object.keys(process.env)) {
+      if (k.startsWith("ANTHROPIC_")) {
+        originalAnthropicEnv[k] = process.env[k]!;
+        delete process.env[k];
+      }
+    }
     querySpy.mockReset();
     vi.resetModules();
   });
@@ -64,6 +81,15 @@ describe("ClaudeAcpAgent settings", () => {
       process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
     } else {
       delete process.env.CLAUDE_CONFIG_DIR;
+    }
+    // Drop anything a test added, then restore the shell's original set.
+    for (const k of Object.keys(process.env)) {
+      if (k.startsWith("ANTHROPIC_")) {
+        delete process.env[k];
+      }
+    }
+    for (const [k, v] of Object.entries(originalAnthropicEnv)) {
+      process.env[k] = v;
     }
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
