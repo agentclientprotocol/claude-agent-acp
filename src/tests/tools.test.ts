@@ -10,7 +10,12 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import {
+  toAcpNotifications,
+  clearToolCallHeartbeatsForSession,
+  ToolUseCache,
+  Logger,
+} from "../acp-agent.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
@@ -27,10 +32,6 @@ import {
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AgentSideConnection;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
 
   it("should include rawOutput with string content for tool_result", () => {
     const toolUseCache: ToolUseCache = {
@@ -853,82 +854,6 @@ describe("Bash terminal output", () => {
   });
 
   describe("post-tool-use hook sends diff content for Edit tool", () => {
-    it("emits periodic in-progress heartbeats until the tool result arrives", async () => {
-      vi.useFakeTimers();
-      const toolUseCache: ToolUseCache = {};
-      const sessionUpdates: any[] = [];
-      const mockClientWithUpdate = {
-        sessionUpdate: async (notification: any) => {
-          sessionUpdates.push(notification);
-        },
-      } as unknown as AgentSideConnection;
-
-      const toolUseNotifications = toAcpNotifications(
-        [
-          {
-            type: "tool_use" as const,
-            id: "toolu_quiet_read",
-            name: "Read",
-            input: {
-              file_path: "/tmp/timeout_shot.jpg",
-            },
-          },
-        ],
-        "assistant",
-        "test-session",
-        toolUseCache,
-        mockClientWithUpdate,
-        mockLogger,
-      );
-
-      expect(toolUseNotifications).toHaveLength(1);
-      expect(toolUseNotifications[0].update).toMatchObject({
-        sessionUpdate: "tool_call",
-        toolCallId: "toolu_quiet_read",
-        status: "pending",
-      });
-
-      await vi.advanceTimersByTimeAsync(60_000);
-
-      expect(sessionUpdates).toHaveLength(1);
-      expect(sessionUpdates[0].update).toMatchObject({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "toolu_quiet_read",
-        status: "pending",
-        _meta: {
-          claudeCode: {
-            toolName: "Read",
-          },
-        },
-      });
-
-      const resultNotifications = toAcpNotifications(
-        [
-          {
-            type: "tool_result" as const,
-            tool_use_id: "toolu_quiet_read",
-            content: "done",
-            is_error: false,
-          },
-        ],
-        "assistant",
-        "test-session",
-        toolUseCache,
-        mockClientWithUpdate,
-        mockLogger,
-      );
-
-      expect(resultNotifications).toHaveLength(1);
-      expect(resultNotifications[0].update).toMatchObject({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "toolu_quiet_read",
-        status: "completed",
-      });
-
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(sessionUpdates).toHaveLength(1);
-    });
-
     it("should include content and locations from structuredPatch in hook update", async () => {
       const toolUseCache: ToolUseCache = {};
 
@@ -1480,6 +1405,132 @@ describe("Bash terminal output", () => {
       expect(hookMeta.terminal_output).toBeUndefined();
       expect(hookMeta.terminal_exit).toBeUndefined();
     });
+  });
+});
+
+describe("tool call heartbeat", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("emits periodic in-progress heartbeats until the tool result arrives", async () => {
+    vi.useFakeTimers();
+    const toolUseCache: ToolUseCache = {};
+    const sessionUpdates: any[] = [];
+    const mockClientWithUpdate = {
+      sessionUpdate: async (notification: any) => {
+        sessionUpdates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+
+    const toolUseNotifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          id: "toolu_quiet_read",
+          name: "Read",
+          input: {
+            file_path: "/tmp/timeout_shot.jpg",
+          },
+        },
+      ],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClientWithUpdate,
+      mockLogger,
+    );
+
+    expect(toolUseNotifications).toHaveLength(1);
+    expect(toolUseNotifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_quiet_read",
+      status: "pending",
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_quiet_read",
+      status: "pending",
+      _meta: {
+        claudeCode: {
+          toolName: "Read",
+        },
+      },
+    });
+
+    const resultNotifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result" as const,
+          tool_use_id: "toolu_quiet_read",
+          content: "done",
+          is_error: false,
+        },
+      ],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClientWithUpdate,
+      mockLogger,
+    );
+
+    expect(resultNotifications).toHaveLength(1);
+    expect(resultNotifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_quiet_read",
+      status: "completed",
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionUpdates).toHaveLength(1);
+  });
+
+  it("stops heartbeating when the session is cleared without a tool result", async () => {
+    // Leak regression: a tool_use can end without a tool_result (turn
+    // cancelled, stream aborted, session torn down). The prompt/cancel/
+    // teardown paths call clearToolCallHeartbeatsForSession; verify that sweep
+    // actually stops the interval rather than leaving it running forever.
+    vi.useFakeTimers();
+    const toolUseCache: ToolUseCache = {};
+    const sessionUpdates: any[] = [];
+    const mockClientWithUpdate = {
+      sessionUpdate: async (notification: any) => {
+        sessionUpdates.push(notification);
+      },
+    } as unknown as AgentSideConnection;
+
+    toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          id: "toolu_abandoned",
+          name: "Read",
+          input: { file_path: "/tmp/abandoned.txt" },
+        },
+      ],
+      "assistant",
+      "leak-session",
+      toolUseCache,
+      mockClientWithUpdate,
+      mockLogger,
+    );
+
+    // One beat lands while the tool is still pending.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sessionUpdates).toHaveLength(1);
+
+    // No tool_result arrives — the turn ends and the session is swept.
+    clearToolCallHeartbeatsForSession("leak-session");
+
+    // Advancing well past several intervals must produce no further beats.
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(sessionUpdates).toHaveLength(1);
   });
 });
 

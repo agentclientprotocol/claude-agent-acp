@@ -335,6 +335,24 @@ function stopToolCallHeartbeat(sessionId: string, toolCallId: string): void {
   toolCallHeartbeatTimers.delete(key);
 }
 
+/**
+ * Clear every heartbeat belonging to a session. A heartbeat is normally
+ * stopped when its tool_result arrives (see `stopToolCallHeartbeat`), but a
+ * tool_use can end without one — the turn is cancelled, the stream aborts, or
+ * the session is torn down. Without this sweep the `setInterval` and its Map
+ * entry would leak for the lifetime of the process. Exported for the prompt
+ * turn-end, cancel, and teardown paths (and the regression test).
+ */
+export function clearToolCallHeartbeatsForSession(sessionId: string): void {
+  const prefix = `${sessionId}:`;
+  for (const [key, timer] of toolCallHeartbeatTimers) {
+    if (key.startsWith(prefix)) {
+      clearInterval(timer);
+      toolCallHeartbeatTimers.delete(key);
+    }
+  }
+}
+
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
     return process.env.CLAUDE_CODE_EXECUTABLE;
@@ -1404,6 +1422,10 @@ export class ClaudeAcpAgent implements Agent {
     } finally {
       if (!handedOff) {
         session.promptRunning = false;
+        // The turn is over; no further tool_results will arrive for its tools.
+        // Clear any heartbeat still running so a tool_use that never resolved
+        // (errored or partial stream) doesn't leak its interval.
+        clearToolCallHeartbeatsForSession(params.sessionId);
         if (errored) {
           // The query stream was just drained — handing pending prompts off
           // onto it would let them race with the recovery. Cancel them so
@@ -1435,6 +1457,10 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
+    // Cancellation aborts in-flight tools; their tool_results may never land,
+    // so the per-tool heartbeats must be swept here rather than waiting on a
+    // result that won't arrive.
+    clearToolCallHeartbeatsForSession(params.sessionId);
     for (const [, pending] of session.pendingMessages) {
       pending.resolve(true);
     }
