@@ -281,6 +281,60 @@ export type ToolUseCache = {
   };
 };
 
+const TOOL_CALL_HEARTBEAT_INTERVAL_MS = 60_000;
+const toolCallHeartbeatTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+function toolCallHeartbeatKey(sessionId: string, toolCallId: string): string {
+  return `${sessionId}:${toolCallId}`;
+}
+
+function startToolCallHeartbeat(
+  sessionId: string,
+  toolCallId: string,
+  toolName: string,
+  client: AgentSideConnection,
+  logger: Logger,
+  parentToolUseId?: string | null,
+): void {
+  const key = toolCallHeartbeatKey(sessionId, toolCallId);
+  if (toolCallHeartbeatTimers.has(key)) {
+    return;
+  }
+
+  const timer = setInterval(() => {
+    void client
+      .sessionUpdate({
+        sessionId,
+        update: {
+          _meta: {
+            claudeCode: {
+              toolName,
+              ...(parentToolUseId ? { parentToolUseId } : {}),
+            },
+          } satisfies ToolUpdateMeta,
+          toolCallId,
+          sessionUpdate: "tool_call_update",
+          status: "pending",
+        },
+      })
+      .catch((error: unknown) => {
+        logger.error("[claude-agent-acp] Failed to send tool heartbeat", error);
+      });
+  }, TOOL_CALL_HEARTBEAT_INTERVAL_MS);
+  timer.unref?.();
+  toolCallHeartbeatTimers.set(key, timer);
+}
+
+function stopToolCallHeartbeat(sessionId: string, toolCallId: string): void {
+  const key = toolCallHeartbeatKey(sessionId, toolCallId);
+  const timer = toolCallHeartbeatTimers.get(key);
+  if (!timer) {
+    return;
+  }
+  clearInterval(timer);
+  toolCallHeartbeatTimers.delete(key);
+}
+
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
     return process.env.CLAUDE_CODE_EXECUTABLE;
@@ -3067,6 +3121,14 @@ export function toAcpNotifications(
               status: "pending",
               ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
             };
+            startToolCallHeartbeat(
+              sessionId,
+              chunk.id,
+              chunk.name,
+              client,
+              logger,
+              options?.parentToolUseId,
+            );
           }
         }
         break;
@@ -3081,6 +3143,7 @@ export function toAcpNotifications(
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
         const toolUse = toolUseCache[chunk.tool_use_id];
+        stopToolCallHeartbeat(sessionId, chunk.tool_use_id);
         if (!toolUse) {
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,

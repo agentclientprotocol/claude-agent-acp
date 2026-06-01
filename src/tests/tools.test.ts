@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -27,6 +27,10 @@ import {
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AgentSideConnection;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it("should include rawOutput with string content for tool_result", () => {
     const toolUseCache: ToolUseCache = {
@@ -849,6 +853,82 @@ describe("Bash terminal output", () => {
   });
 
   describe("post-tool-use hook sends diff content for Edit tool", () => {
+    it("emits periodic in-progress heartbeats until the tool result arrives", async () => {
+      vi.useFakeTimers();
+      const toolUseCache: ToolUseCache = {};
+      const sessionUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          sessionUpdates.push(notification);
+        },
+      } as unknown as AgentSideConnection;
+
+      const toolUseNotifications = toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_quiet_read",
+            name: "Read",
+            input: {
+              file_path: "/tmp/timeout_shot.jpg",
+            },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+      );
+
+      expect(toolUseNotifications).toHaveLength(1);
+      expect(toolUseNotifications[0].update).toMatchObject({
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_quiet_read",
+        status: "pending",
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(sessionUpdates).toHaveLength(1);
+      expect(sessionUpdates[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_quiet_read",
+        status: "pending",
+        _meta: {
+          claudeCode: {
+            toolName: "Read",
+          },
+        },
+      });
+
+      const resultNotifications = toAcpNotifications(
+        [
+          {
+            type: "tool_result" as const,
+            tool_use_id: "toolu_quiet_read",
+            content: "done",
+            is_error: false,
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+      );
+
+      expect(resultNotifications).toHaveLength(1);
+      expect(resultNotifications[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_quiet_read",
+        status: "completed",
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sessionUpdates).toHaveLength(1);
+    });
+
     it("should include content and locations from structuredPatch in hook update", async () => {
       const toolUseCache: ToolUseCache = {};
 
