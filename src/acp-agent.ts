@@ -353,11 +353,42 @@ const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 // payload in these XML-like markers that the CLI uses for its own display.
 // The live prompt loop drops them; replay must strip them too or they leak
 // into the UI on session/load.
-const LOCAL_COMMAND_TAG_PATTERN =
-  /<(command-name|command-message|command-args|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g;
+const LOCAL_COMMAND_MARKERS = [
+  "command-name",
+  "command-message",
+  "command-args",
+  "local-command-stdout",
+  "local-command-stderr",
+].map((tag) => ({ open: `<${tag}>`, close: `</${tag}>` }));
 
+// Single-pass scanner that removes each `<tag>…</tag>` marker (matching the
+// nearest closing tag of the same name, like a lazy regex would).
 function stripMarkerTags(text: string): string {
-  return text.replace(LOCAL_COMMAND_TAG_PATTERN, "");
+  const dead = new Set<string>();
+  let result = "";
+  let copiedUpTo = 0;
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === "<") {
+      const marker = LOCAL_COMMAND_MARKERS.find(
+        (m) => !dead.has(m.open) && text.startsWith(m.open, i),
+      );
+      if (marker) {
+        const end = text.indexOf(marker.close, i + marker.open.length);
+        if (end !== -1) {
+          result += text.slice(copiedUpTo, i);
+          i = copiedUpTo = end + marker.close.length;
+          continue;
+        }
+        // No closing marker remains anywhere ahead, and `indexOf` only ever
+        // searches forward from here on, so stop treating this tag as an
+        // opener — that avoids rescanning the tail for it on every match.
+        dead.add(marker.open);
+      }
+    }
+    i++;
+  }
+  return result + text.slice(copiedUpTo);
 }
 
 /**
