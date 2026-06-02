@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.40.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.39.0...v0.40.0) (2026-06-02)
+
+
+### Features
+
+* **deps-dev:** bump the minor group with 2 updates ([#726](https://github.com/agentclientprotocol/claude-agent-acp/issues/726)) ([51a370e](https://github.com/agentclientprotocol/claude-agent-acp/commit/51a370e4feb8a74279698b156e35b96631a74d74))
+* **deps:** bump actions/checkout from 6.0.2 to 6.0.3 ([#736](https://github.com/agentclientprotocol/claude-agent-acp/issues/736)) ([9cda07b](https://github.com/agentclientprotocol/claude-agent-acp/commit/9cda07ba9df27b48bd94332e365eed982e3f5613))
+* **deps:** bump the minor group with 50 updates ([#737](https://github.com/agentclientprotocol/claude-agent-acp/issues/737)) ([32175b8](https://github.com/agentclientprotocol/claude-agent-acp/commit/32175b83a0227d0baa1f7d7eedabe743b4b870e8))
+
+
+### Bug Fixes
+
+* Optimize local command marker stripping ([#738](https://github.com/agentclientprotocol/claude-agent-acp/issues/738)) ([895422c](https://github.com/agentclientprotocol/claude-agent-acp/commit/895422c72d5f955903f227dc6887df823d2730e6)), closes [#727](https://github.com/agentclientprotocol/claude-agent-acp/issues/727)
+
 ## [0.39.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.38.0...v0.39.0) (2026-05-29)
 
 
