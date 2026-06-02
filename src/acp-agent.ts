@@ -26,13 +26,10 @@ import {
   ResumeSessionRequest,
   ResumeSessionResponse,
   SessionConfigOption,
-  SessionModelState,
   SessionModeState,
   SessionNotification,
   SetSessionConfigOptionRequest,
   SetSessionConfigOptionResponse,
-  SetSessionModelRequest,
-  SetSessionModelResponse,
   SetSessionModeRequest,
   SetSessionModeResponse,
   CloseSessionRequest,
@@ -136,6 +133,15 @@ const ZERO_USAGE = Object.freeze({
 });
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
+
+/** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
+ *  `SessionModelState` before model selection moved entirely into
+ *  `SessionConfigOption` (category "model"). Retained internally to track the
+ *  current model and build the "model" config option. */
+type SessionModelState = {
+  availableModels: Array<{ modelId: string; name: string; description?: string }>;
+  currentModelId: string;
+};
 
 type Session = {
   query: Query;
@@ -1425,22 +1431,6 @@ export class ClaudeAcpAgent implements Agent {
     return {};
   }
 
-  async unstable_setSessionModel(
-    params: SetSessionModelRequest,
-  ): Promise<SetSessionModelResponse | void> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    // Resolve aliases (e.g. "opus", "opus[1m]") to canonical model IDs so
-    // downstream lookups in modelInfos succeed and the effort option isn't
-    // silently dropped.
-    const resolved = resolveModelPreference(session.modelInfos, params.modelId);
-    const modelId = resolved?.value ?? params.modelId;
-    await session.query.setModel(modelId);
-    await this.updateConfigOption(params.sessionId, "model", modelId);
-  }
-
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
@@ -1899,7 +1889,6 @@ export class ClaudeAcpAgent implements Agent {
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,
-          models: existingSession.models,
           configOptions: existingSession.configOptions,
         };
       }
@@ -1925,7 +1914,6 @@ export class ClaudeAcpAgent implements Agent {
     return {
       sessionId: response.sessionId,
       modes: response.modes,
-      models: response.models,
       configOptions: response.configOptions,
     };
   }
@@ -2294,7 +2282,6 @@ export class ClaudeAcpAgent implements Agent {
 
     return {
       sessionId,
-      models,
       modes,
       configOptions,
     };

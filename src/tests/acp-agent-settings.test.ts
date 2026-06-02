@@ -225,7 +225,9 @@ describe("ClaudeAcpAgent settings", () => {
     // No setModel call is needed because no override was applied — the SDK is
     // already on its own default.
     expect(setModelSpy).not.toHaveBeenCalled();
-    expect(response.models.currentModelId).toBe("claude-sonnet-4-6");
+    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+      "claude-sonnet-4-6",
+    );
   });
 
   describe("auto mode availability per model", () => {
@@ -578,7 +580,9 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       expect(setModelSpy).toHaveBeenCalledWith("claude-haiku-4-5");
-      expect(response.models.currentModelId).toBe("claude-haiku-4-5");
+      expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+        "claude-haiku-4-5",
+      );
     });
 
     it("does not inherit display info across mismatched model family versions", async () => {
@@ -687,7 +691,9 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-6-1m");
-    expect(response.models.currentModelId).toBe("claude-opus-4-6-1m");
+    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+      "claude-opus-4-6-1m",
+    );
   });
 
   it("skips the initial setModel when the resolved value matches the SDK's model list verbatim", async () => {
@@ -727,7 +733,9 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       expect(setModelSpy).not.toHaveBeenCalled();
-      expect(response.models.currentModelId).toBe("claude-opus-4-6");
+      expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+        "claude-opus-4-6",
+      );
     } finally {
       if (originalEnv === undefined) {
         delete process.env.ANTHROPIC_MODEL;
@@ -777,6 +785,8 @@ describe("ClaudeAcpAgent settings", () => {
     });
 
     expect(setModelSpy).toHaveBeenCalledWith("claude-haiku-4-5");
-    expect(response.models.currentModelId).toBe("claude-haiku-4-5");
+    expect(response.configOptions?.find((o: any) => o.id === "model")?.currentValue).toBe(
+      "claude-haiku-4-5",
+    );
   });
 });
