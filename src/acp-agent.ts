@@ -57,6 +57,7 @@ import {
   query,
   Settings,
   SDKAssistantMessageError,
+  SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
@@ -134,6 +135,17 @@ const ZERO_USAGE = Object.freeze({
 
 const DEFAULT_CONTEXT_WINDOW = 200000;
 
+/** Floor after `session/cancel` before the adapter forces the active prompt
+ *  loop to return "cancelled". `query.interrupt()` normally makes the SDK
+ *  yield a trailing idle within milliseconds, and the loop returns through its
+ *  usual path — so this timer is armed and cleared, never fired, on healthy
+ *  cancels. It only trips when the SDK is genuinely wedged (e.g. a
+ *  `TaskOutput { block: true }` poll against a hung background task — issue
+ *  #680) and never yields. The value is deliberately loose: it's an
+ *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
+ *  pre-empt a slow-but-healthy interrupt. */
+const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
  *  `SessionConfigOption` (category "model"). Retained internally to track the
@@ -161,6 +173,17 @@ type Session = {
   pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
   nextPendingOrder: number;
   abortController: AbortController;
+  /** Per-turn signal the active prompt loop races `query.next()` against.
+   *  Aborted by cancel() (after a grace period) to force the loop to return
+   *  "cancelled" when the SDK is wedged and `query.next()` never yields again
+   *  (issue #680). Distinct from `abortController`: this only wakes the loop;
+   *  it does NOT touch the SDK query/subprocess. Undefined when no prompt is
+   *  actively consuming the query. */
+  cancelController?: AbortController;
+  /** Pending grace-period timer that aborts `cancelController`. Cleared when
+   *  the loop returns normally so the backstop never fires after a clean
+   *  cancel. */
+  forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Context window size of the last top-level assistant model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
@@ -529,6 +552,10 @@ export class ClaudeAcpAgent implements Agent {
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
+  /** Grace period before a `session/cancel` forces a wedged prompt loop to
+   *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
+   *  tests can shrink it. */
+  forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
 
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
@@ -834,9 +861,27 @@ export class ClaudeAcpAgent implements Agent {
     let errored = false;
     let stopReason: StopReason = "end_turn";
 
+    // Wake-up channel so cancel() can force this loop to return "cancelled"
+    // even when query.next() is wedged and never yields again (issue #680).
+    const cancelController = new AbortController();
+    session.cancelController = cancelController;
+    const cancelled = new Promise<void>((resolve) => {
+      cancelController.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+
     try {
       while (true) {
-        const { value: message, done } = await session.query.next();
+        const nextMessage = session.query.next();
+        const next = await Promise.race([nextMessage, cancelled]);
+        if (cancelController.signal.aborted) {
+          // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
+          // block). Abandon the in-flight next() — swallowing any later
+          // rejection so it can't surface as an unhandled rejection — and
+          // honor the cancel per the ACP contract.
+          void nextMessage.catch(() => {});
+          return { stopReason: "cancelled" };
+        }
+        const { value: message, done } = next as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
           if (session.cancelled) {
@@ -1430,6 +1475,16 @@ export class ClaudeAcpAgent implements Agent {
       }
       throw error;
     } finally {
+      // The loop is returning — interrupt() succeeded or the prompt finished
+      // — so disarm the force-cancel backstop and release the wake-up channel
+      // (only if we still own it; a handoff installs the next prompt's).
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      if (session.cancelController === cancelController) {
+        session.cancelController = undefined;
+      }
       if (!handedOff) {
         session.promptRunning = false;
         if (errored) {
@@ -1467,6 +1522,33 @@ export class ClaudeAcpAgent implements Agent {
       pending.resolve(true);
     }
     session.pendingMessages.clear();
+
+    // Arm a backstop before interrupting: if a prompt is actively consuming
+    // the query and interrupt() doesn't make the SDK yield (e.g. a wedged
+    // TaskOutput block — issue #680), force the loop to return "cancelled"
+    // after the floor elapses so the pending session/prompt still resolves per
+    // the ACP cancellation contract instead of hanging forever. The loop's
+    // `finally` clears this timer when interrupt() works and it returns through
+    // the normal idle path, so on healthy cancels it is armed but never fires.
+    //
+    // Arm at most once per turn: the floor is an absolute ceiling from the
+    // first cancel, so a client that re-sends cancel (each call still retries
+    // interrupt() below) can't keep pushing the deadline out.
+    if (
+      session.promptRunning &&
+      session.cancelController &&
+      !session.cancelController.signal.aborted &&
+      !session.forceCancelTimer
+    ) {
+      const cancelController = session.cancelController;
+      session.forceCancelTimer = setTimeout(() => {
+        this.logger.error(
+          `Session ${params.sessionId}: cancel floor elapsed without the SDK yielding; forcing "cancelled". The underlying query may still be wedged — a new session may be required.`,
+        );
+        cancelController.abort();
+      }, this.forceCancelGraceMs);
+    }
+
     await session.query.interrupt();
   }
 
@@ -1478,6 +1560,18 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     await this.cancel({ sessionId });
+    // cancel() arms the force-cancel floor and interrupts gracefully, but a
+    // wedged prompt loop only wakes when `cancelController` aborts — closing
+    // the query/abortController below doesn't touch it. Since we're tearing the
+    // session down anyway, wake the loop now so the in-flight prompt() resolves
+    // immediately instead of after the floor, and clear the timer so it can't
+    // outlive the deleted session (it isn't unref'd and would otherwise keep
+    // the event loop alive until it fires).
+    if (session.forceCancelTimer) {
+      clearTimeout(session.forceCancelTimer);
+      session.forceCancelTimer = undefined;
+    }
+    session.cancelController?.abort();
     session.settingsManager.dispose();
     session.abortController.abort();
     session.query.close();

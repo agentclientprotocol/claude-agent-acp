@@ -3877,6 +3877,184 @@ describe("post-error recovery", () => {
   });
 });
 
+describe("session/cancel wedge recovery (issue #680)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AgentSideConnection;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  // Generator that replays the prompt's user message and then blocks forever,
+  // simulating the SDK wedged in a `TaskOutput { block: true }` poll against a
+  // hung background task. `interrupt()` is a no-op — it does NOT unblock the
+  // generator, matching the SDK behavior described in the issue.
+  function injectWedgedSession(agent: ClaudeAcpAgent, opts: { interruptUnblocks?: boolean } = {}) {
+    const input = new Pushable<any>();
+    const interrupt = vi.fn(async () => {});
+    const close = vi.fn();
+    // A promise the wedged poll awaits. When `interruptUnblocks` is set, the
+    // mocked interrupt() resolves it so the generator yields a trailing idle —
+    // the normal, healthy interrupt path.
+    let releaseBlock!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseBlock = resolve;
+    });
+    if (opts.interruptUnblocks) {
+      interrupt.mockImplementation(async () => {
+        releaseBlock();
+      });
+    }
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      if (!first.done && first.value) {
+        yield {
+          type: "user",
+          message: first.value.message,
+          parent_tool_use_id: null,
+          uuid: first.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      // Wedge: never yield again unless interrupt() releases us.
+      await blocked;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    const gen = Object.assign(messageGenerator(), { interrupt, close });
+    agent.sessions["test-session"] = {
+      query: gen as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+    };
+    return { interrupt };
+  }
+
+  it("resolves the pending prompt with cancelled when the SDK never yields after interrupt", async () => {
+    const agent = createMockAgent();
+    // Shrink the grace period so the test doesn't wait the production default.
+    agent.forceCancelGraceMs = 20;
+    const { interrupt } = injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+
+    // Let the loop consume the replay and block on the wedged query.next().
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("cancelled");
+    expect(interrupt).toHaveBeenCalled();
+  });
+
+  it("returns cancelled through the normal idle path without waiting the grace period when interrupt works", async () => {
+    const agent = createMockAgent();
+    // Large grace so that if the test ever falls through to the backstop it
+    // would hang past the test timeout instead of passing by accident.
+    agent.forceCancelGraceMs = 60_000;
+    const { interrupt } = injectWedgedSession(agent, { interruptUnblocks: true });
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const response = await promptPromise;
+    expect(response.stopReason).toBe("cancelled");
+    expect(interrupt).toHaveBeenCalled();
+    // Backstop timer must have been cleared so it can't fire later.
+    expect(agent.sessions["test-session"].forceCancelTimer).toBeUndefined();
+  });
+
+  it("does not arm the backstop when no prompt is running", async () => {
+    const agent = createMockAgent();
+    injectWedgedSession(agent);
+
+    await agent.cancel({ sessionId: "test-session" });
+
+    const session = agent.sessions["test-session"];
+    expect(session.cancelled).toBe(true);
+    expect(session.forceCancelTimer).toBeUndefined();
+  });
+
+  it("does not reset the force-cancel floor on repeated cancels", async () => {
+    const agent = createMockAgent();
+    // Long floor so the timer handle stays observable across both cancels.
+    agent.forceCancelGraceMs = 60_000;
+    injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.cancel({ sessionId: "test-session" });
+    const firstTimer = agent.sessions["test-session"].forceCancelTimer;
+    expect(firstTimer).toBeDefined();
+
+    await agent.cancel({ sessionId: "test-session" });
+    // Same handle: the second cancel did not clear-and-rearm (which would push
+    // the floor out). The deadline stays anchored to the first cancel.
+    expect(agent.sessions["test-session"].forceCancelTimer).toBe(firstTimer);
+
+    // Clean up the wedged prompt + long timer.
+    await agent.closeSession({ sessionId: "test-session" });
+    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("resolves an in-flight wedged prompt immediately when the session is closed", async () => {
+    const agent = createMockAgent();
+    // Large floor: if closeSession relied on the force-cancel timer this would
+    // hang past the test timeout. Teardown must wake the loop via
+    // cancelController instead.
+    agent.forceCancelGraceMs = 60_000;
+    injectWedgedSession(agent);
+
+    const promptPromise = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "run cargo test" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    await agent.closeSession({ sessionId: "test-session" });
+
+    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+    expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+});
+
 describe("streamEventToAcpNotifications", () => {
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
