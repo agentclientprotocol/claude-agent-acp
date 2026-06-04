@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.41.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.40.0...v0.41.0) (2026-06-04)
+
+
+### Features
+
+* **deps:** upgrade to @anthropic-ai/claude-agent-sdk@0.3.162 ([#740](https://github.com/agentclientprotocol/claude-agent-acp/issues/740)) ([add7e31](https://github.com/agentclientprotocol/claude-agent-acp/commit/add7e31704581aa70febb6341ca0e8cee5d93b43))
+
+
+### Bug Fixes
+
+* Force cancellation when SDK query hangs ([#742](https://github.com/agentclientprotocol/claude-agent-acp/issues/742)) ([cffea4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/cffea4be28e6def91027110433a99e80b1be8a0c)), closes [#680](https://github.com/agentclientprotocol/claude-agent-acp/issues/680)
+
 ## [0.40.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.39.0...v0.40.0) (2026-06-02)
 
 
