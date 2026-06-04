@@ -790,6 +790,12 @@ export class ClaudeAcpAgent implements Agent {
     // forward it to clients as structured `data`, sparing them from
     // pattern-matching on the human-readable message text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
+    // When a streaming classifier refuses a turn, the assistant message carries
+    // stop_reason "refusal" and structured stop_details. We capture the
+    // human-readable explanation here so the terminal `result` can surface it
+    // to the user (the refused assistant message itself usually has no content)
+    // and report ACP's dedicated `refusal` stop reason.
+    let lastRefusalExplanation: string | null = null;
     // Tracks whether we're inside a compaction. The SDK emits the terminal
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
@@ -976,6 +982,22 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "commands_changed": {
+                // Push the full slash-command list after a mid-session change
+                // (e.g. skills discovered dynamically as the agent works in a
+                // subdirectory). The client should REPLACE its cached command
+                // list with this payload: supportedCommands() is captured once
+                // at initialize and never reflects mid-session changes, so we
+                // forward message.commands directly rather than re-querying.
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "available_commands_update",
+                    availableCommands: getAvailableSlashCommands(message.commands),
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -1045,6 +1067,26 @@ export class ClaudeAcpAgent implements Agent {
               if (!isTaskNotification) {
                 stopReason = "cancelled";
               }
+              break;
+            }
+
+            // A refusal can arrive on any result subtype (and may even set
+            // is_error), so handle it before the subtype switch — otherwise the
+            // is_error throw below would surface it as an internal error. The
+            // refused assistant message carries no visible content, so surface
+            // the classifier's explanation (when available) and report ACP's
+            // dedicated `refusal` stop reason.
+            if (message.stop_reason === "refusal" && !isTaskNotification) {
+              if (lastRefusalExplanation) {
+                await this.client.sessionUpdate({
+                  sessionId: params.sessionId,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text: lastRefusalExplanation },
+                  },
+                });
+              }
+              stopReason = "refusal";
               break;
             }
 
@@ -1227,6 +1269,9 @@ export class ClaudeAcpAgent implements Agent {
               }
               if (message.error) {
                 lastAssistantError = message.error;
+              }
+              if (message.message.stop_reason === "refusal") {
+                lastRefusalExplanation = message.message.stop_details?.explanation ?? null;
               }
             }
 
