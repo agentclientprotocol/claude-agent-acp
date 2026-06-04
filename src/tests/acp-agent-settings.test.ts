@@ -656,10 +656,7 @@ describe("ClaudeAcpAgent settings", () => {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
         JSON.stringify({
-          availableModels: [
-            "claude-opus-4-6",
-            "claude-opus-4-6[1m]",
-          ],
+          availableModels: ["claude-opus-4-6", "claude-opus-4-6[1m]"],
         }),
       );
 
