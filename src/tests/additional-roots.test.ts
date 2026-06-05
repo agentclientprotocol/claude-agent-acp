@@ -39,7 +39,7 @@ vi.mock("../tools.js", async () => ({
 describe("additionalRoots", () => {
   let agent: ClaudeAcpAgentType;
   const tempDirs: string[] = [];
-  const newSession = (meta: Record<string, unknown>, cwd = "/test") =>
+  const newSession = (meta: Record<string, unknown>, cwd = process.cwd()) =>
     agent.newSession({ cwd, mcpServers: [], _meta: meta });
 
   beforeEach(async () => {
@@ -79,7 +79,7 @@ describe("additionalRoots", () => {
 
   it("prefers the official ACP additionalDirectories field over _meta.additionalRoots", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       additionalDirectories: ["/from/official"],
       _meta: { additionalRoots: ["/from/meta"] },
@@ -89,7 +89,7 @@ describe("additionalRoots", () => {
 
   it("merges official ACP additionalDirectories with claudeCode SDK additionalDirectories", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       additionalDirectories: ["/from/official"],
       _meta: { claudeCode: { options: { additionalDirectories: ["/from/sdk"] } } },
@@ -99,7 +99,7 @@ describe("additionalRoots", () => {
 
   it("falls back to _meta.additionalRoots when the official field is omitted", async () => {
     await agent.newSession({
-      cwd: "/test",
+      cwd: process.cwd(),
       mcpServers: [],
       _meta: { additionalRoots: ["/from/meta"] },
     });

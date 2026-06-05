@@ -65,6 +65,8 @@ import {
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
@@ -2214,10 +2216,46 @@ export class ClaudeAcpAgent implements Agent {
     };
   }
 
+  /**
+   * Ensures the requested `cwd` is an absolute path that points at an existing
+   * directory before we create a session. Throws an `invalidParams` error with
+   * an actionable message so clients (e.g. Zed) can surface it to the user
+   * instead of failing later with an opaque SDK error.
+   */
+  private async validateCwd(cwd: string): Promise<void> {
+    if (!path.isAbsolute(cwd)) {
+      throw RequestError.invalidParams(
+        { cwd },
+        `\`cwd\` must be an absolute path, but received: ${cwd}`,
+      );
+    }
+
+    let stats: Stats;
+    try {
+      stats = await fs.stat(cwd);
+    } catch {
+      throw RequestError.invalidParams(
+        { cwd },
+        `\`cwd\` does not exist on the machine running the agent: ${cwd}`,
+      );
+    }
+
+    if (!stats.isDirectory()) {
+      throw RequestError.invalidParams({ cwd }, `\`cwd\` is not a directory: ${cwd}`);
+    }
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: { resume?: string; forkSession?: boolean } = {},
   ): Promise<NewSessionResponse> {
+    // Validate `cwd` up front. The ACP spec requires an absolute path, and the
+    // directory must actually exist on the machine running the agent. Without
+    // this check a session is created against a missing directory and the
+    // failure only surfaces later as a confusing "native binary failed to
+    // launch" error from the SDK (see issue #749).
+    await this.validateCwd(params.cwd);
+
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
     let sessionId;

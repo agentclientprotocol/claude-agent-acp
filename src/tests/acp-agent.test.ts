@@ -176,7 +176,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   }
 
   it("should connect to the ACP subprocess", async () => {
-    const { client, connection, newSessionResponse } = await setupTestSession("./");
+    const { client, connection, newSessionResponse } = await setupTestSession(process.cwd());
 
     await connection.prompt({
       prompt: [

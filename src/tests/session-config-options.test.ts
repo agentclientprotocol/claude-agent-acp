@@ -148,13 +148,13 @@ describe("session config options", () => {
 
   describe("newSession returns configOptions", () => {
     it("includes configOptions in the response", async () => {
-      const response = await agent.newSession({ cwd: "/test", mcpServers: [] });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       expect(response.configOptions).toBeDefined();
       expect(response.configOptions).toEqual(MOCK_CONFIG_OPTIONS);
     });
 
     it("includes mode and model config options", async () => {
-      const response = await agent.newSession({ cwd: "/test", mcpServers: [] });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       const modeOption = response.configOptions?.find((o) => o.id === "mode");
       const modelOption = response.configOptions?.find((o) => o.id === "model");
       expect(modeOption).toBeDefined();
@@ -173,7 +173,7 @@ describe("session config options", () => {
       (agent as unknown as { loadSession: typeof loadSessionSpy }).loadSession = loadSessionSpy;
 
       const response = await agent.loadSession({
-        cwd: "/test",
+        cwd: process.cwd(),
         sessionId: SESSION_ID,
         mcpServers: [],
       });
