@@ -26,7 +26,6 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: async () => {},
         setPermissionMode: async () => {},
         supportedCommands: async () => [],
-        getContextUsage: async () => ({ totalTokens: 5000, rawMaxTokens: 444000 }),
         [Symbol.asyncIterator]: async function* () {},
       };
     },
@@ -531,12 +530,5 @@ describe("createSession options merging", () => {
       });
       expect(capturedOptions!.thinking).toEqual({ type: "adaptive" });
     });
-  });
-
-  it("seeds contextWindowSize from the SDK's authoritative getContextUsage", async () => {
-    const response = await agent.newSession({ cwd: "/test", mcpServers: [] });
-    // getContextUsage (mocked) reports rawMaxTokens: 444000, which must win over
-    // the model-ID heuristic / DEFAULT_CONTEXT_WINDOW fallback.
-    expect(agent.sessions[response.sessionId].contextWindowSize).toBe(444000);
   });
 });

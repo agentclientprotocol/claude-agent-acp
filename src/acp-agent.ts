@@ -947,7 +947,7 @@ export class ClaudeAcpAgent implements Agent {
                 // right after the user sees "Compacting completed", which is
                 // confusing and wrong.
                 //
-                // Prefer the SDK's authoritative post-compaction occupancy via
+                // Prefer the SDK's authoritative post-compaction `used` via
                 // getContextUsage — it reflects the real retained context
                 // (system prompt + tools + surviving messages), which the
                 // per-message API usage numbers can't give us until the next
@@ -956,15 +956,16 @@ export class ClaudeAcpAgent implements Agent {
                 // dropped dramatically) and replaced within seconds by the next
                 // result message.
                 //
+                // `size` keeps coming from session.contextWindowSize (learned
+                // from modelUsage / the model heuristic) — getContextUsage's
+                // window field under-reports extended 1M windows.
+                //
                 // The "Compacting completed." text is emitted from the `status`
                 // handler (keyed on `compact_result`), not here, so the failure
                 // path gets a message too.
-                const usage = await fetchContextUsage(session.query, this.logger);
+                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usage?.used ?? 0;
-                if (usage) {
-                  session.contextWindowSize = usage.size;
-                }
+                lastAssistantTotalUsage = usedTokens ?? 0;
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -2497,17 +2498,6 @@ export class ClaudeAcpAgent implements Agent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
-
-    // Seed the context window from the SDK's authoritative report rather than
-    // the model-ID heuristic. getContextUsage reflects the real overhead of the
-    // system prompt, tools, and memory files even before the first turn. Falls
-    // back to the heuristic if the control request fails.
-    const initialContextUsage = await fetchContextUsage(q, this.logger);
-    const initialContextWindowSize =
-      initialContextUsage?.size ??
-      inferContextWindowFromModel(models.currentModelId) ??
-      DEFAULT_CONTEXT_WINDOW;
-
     this.sessions[sessionId] = {
       query: q,
       input: input,
@@ -2530,7 +2520,8 @@ export class ClaudeAcpAgent implements Agent {
       nextPendingOrder: 0,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      contextWindowSize: initialContextWindowSize,
+      contextWindowSize:
+        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
     };
 
@@ -3535,18 +3526,18 @@ function inferContextWindowFromModel(model: string): number | null {
 
 /** Fetch the SDK's authoritative context-window occupancy via the
  *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), this includes the system prompt, tool
- *  schemas, MCP tools, and memory-file overhead — the real denominator-and-fill
- *  the user sees. `rawMaxTokens` is the model's full context window, matching
- *  the "size" semantics the adapter uses elsewhere. Returns `null` on any
- *  control-request failure so callers can fall back to the heuristic. */
-async function fetchContextUsage(
-  query: Query,
-  logger: Logger,
-): Promise<{ used: number; size: number } | null> {
+ *  (which only count message tokens), this `totalTokens` includes the system
+ *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
+ *  occupancy the user sees. Returns `null` on any control-request failure.
+ *
+ *  Note: we deliberately do NOT use this response's window fields for `size`.
+ *  They have been observed to under-report extended (1M) context windows, so
+ *  the window keeps coming from `modelUsage` / `inferContextWindowFromModel`,
+ *  which handle the 1M variants correctly. */
+async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
   try {
     const usage = await query.getContextUsage();
-    return { used: usage.totalTokens, size: usage.rawMaxTokens };
+    return usage.totalTokens;
   } catch (error) {
     logger.error("Failed to fetch context usage from SDK:", error);
     return null;
