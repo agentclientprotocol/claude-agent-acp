@@ -3108,6 +3108,48 @@ describe("usage_update computation", () => {
     // size should be 1000000 (Opus), not 200000 (the fallback if <synthetic> overrode the model)
     expect(usageUpdate.update.size).toBe(1000000);
   });
+
+  it("compact_boundary uses authoritative getContextUsage for used and size", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 200000;
+    (session.query as any).getContextUsage = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 1000000 });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(12345);
+    expect(usageUpdate.update.size).toBe(1000000);
+    // The session window is updated so subsequent mid-stream updates use it.
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
+  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"];
+    session.contextWindowSize = 200000;
+    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update.used).toBe(0);
+    // Window left at its prior value on the fallback path.
+    expect(usageUpdate.update.size).toBe(200000);
+    expect(session.contextWindowSize).toBe(200000);
+  });
 });
 
 describe("emitRawSDKMessages", () => {
