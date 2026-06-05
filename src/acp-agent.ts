@@ -36,8 +36,6 @@ import {
   CloseSessionResponse,
   DeleteSessionRequest,
   DeleteSessionResponse,
-  TerminalHandle,
-  TerminalOutputResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
   StopReason,
@@ -195,6 +193,12 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
+   *  the tool name/input when mapping it to a `tool_call_update`. Per-session
+   *  (tool_use ids are only unique within a session) and pruned at
+   *  `tool_result` time so a long-running session doesn't accumulate every
+   *  tool call for its whole lifetime. */
+  toolUseCache: ToolUseCache;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -208,17 +212,6 @@ function computeSessionFingerprint(params: {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
   return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
 }
-
-type BackgroundTerminal =
-  | {
-      handle: TerminalHandle;
-      status: "started";
-      lastOutput: TerminalOutputResponse | null;
-    }
-  | {
-      status: "aborted" | "exited" | "killed" | "timedOut";
-      pendingOutput: TerminalOutputResponse;
-    };
 
 export type SDKMessageFilter = {
   type: string;
@@ -548,8 +541,6 @@ export class ClaudeAcpAgent implements Agent {
     [key: string]: Session;
   };
   client: AgentSideConnection;
-  toolUseCache: ToolUseCache;
-  backgroundTerminals: { [key: string]: BackgroundTerminal } = {};
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
@@ -561,7 +552,6 @@ export class ClaudeAcpAgent implements Agent {
   constructor(client: AgentSideConnection, logger?: Logger) {
     this.sessions = {};
     this.client = client;
-    this.toolUseCache = {};
     this.logger = logger ?? console;
   }
 
@@ -1210,7 +1200,7 @@ export class ClaudeAcpAgent implements Agent {
                     message.result,
                     "assistant",
                     params.sessionId,
-                    this.toolUseCache,
+                    session.toolUseCache,
                     this.client,
                     this.logger,
                   )) {
@@ -1311,7 +1301,7 @@ export class ClaudeAcpAgent implements Agent {
             for (const notification of streamEventToAcpNotifications(
               message,
               params.sessionId,
-              this.toolUseCache,
+              session.toolUseCache,
               this.client,
               this.logger,
               {
@@ -1385,7 +1375,7 @@ export class ClaudeAcpAgent implements Agent {
                   stripped,
                   message.message.role,
                   params.sessionId,
-                  this.toolUseCache,
+                  session.toolUseCache,
                   this.client,
                   this.logger,
                   {
@@ -1447,7 +1437,7 @@ export class ClaudeAcpAgent implements Agent {
               content,
               message.message.role,
               params.sessionId,
-              this.toolUseCache,
+              session.toolUseCache,
               this.client,
               this.logger,
               {
@@ -2523,6 +2513,7 @@ export class ClaudeAcpAgent implements Agent {
       contextWindowSize:
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
+      toolUseCache: {},
     };
 
     return {
@@ -3222,42 +3213,41 @@ export function toAcpNotifications(
         } else {
           // Only register hooks on first encounter to avoid double-firing
           if (registerHooks && !alreadyCached) {
+            // Capture the tool name in the closure rather than re-reading the
+            // cache when the hook fires. The cache entry is pruned at
+            // tool_result time, and a PostToolUse hook can fire after that, so
+            // closing over the name keeps the diff working without depending on
+            // (or pinning) the cache entry's lifetime.
+            const toolName = chunk.name;
             registerHookCallback(chunk.id, {
               onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
-                const toolUse = toolUseCache[toolUseId];
-                if (toolUse) {
-                  // Both `Edit` and `Write` produce a structuredPatch in their
-                  // PostToolUse tool_response. For Edit the diff replaces the
-                  // optimistic content built at tool_use time. For Write the
-                  // optimistic content (built from `input.content` alone with
-                  // `oldText: null`) shows "creation" semantics regardless of
-                  // whether the file existed; the structuredPatch from the
-                  // hook lets us emit the real diff for `type: "update"`. The
-                  // helper returns `{}` if the response shape isn't usable.
-                  const editDiff =
-                    toolUse.name === "Edit" || toolUse.name === "Write"
-                      ? toolUpdateFromDiffToolResponse(toolResponse)
-                      : {};
-                  const update: SessionNotification["update"] = {
-                    _meta: {
-                      claudeCode: {
-                        toolResponse,
-                        toolName: toolUse.name,
-                      },
-                    } satisfies ToolUpdateMeta,
-                    toolCallId: toolUseId,
-                    sessionUpdate: "tool_call_update",
-                    ...editDiff,
-                  };
-                  await client.sessionUpdate({
-                    sessionId,
-                    update,
-                  });
-                } else {
-                  logger.error(
-                    `[claude-agent-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
-                  );
-                }
+                // Both `Edit` and `Write` produce a structuredPatch in their
+                // PostToolUse tool_response. For Edit the diff replaces the
+                // optimistic content built at tool_use time. For Write the
+                // optimistic content (built from `input.content` alone with
+                // `oldText: null`) shows "creation" semantics regardless of
+                // whether the file existed; the structuredPatch from the
+                // hook lets us emit the real diff for `type: "update"`. The
+                // helper returns `{}` if the response shape isn't usable.
+                const editDiff =
+                  toolName === "Edit" || toolName === "Write"
+                    ? toolUpdateFromDiffToolResponse(toolResponse)
+                    : {};
+                const update: SessionNotification["update"] = {
+                  _meta: {
+                    claudeCode: {
+                      toolResponse,
+                      toolName,
+                    },
+                  } satisfies ToolUpdateMeta,
+                  toolCallId: toolUseId,
+                  sessionUpdate: "tool_call_update",
+                  ...editDiff,
+                };
+                await client.sessionUpdate({
+                  sessionId,
+                  update,
+                });
               },
             });
           }
@@ -3394,6 +3384,11 @@ export function toAcpNotifications(
             ...toolUpdate,
           };
         }
+        // The tool_use is fully resolved now — drop it so a long session doesn't
+        // retain every tool call. The PostToolUse hook (Edit/Write diffs) closes
+        // over the tool name and no longer reads the cache, so pruning here is
+        // safe regardless of hook/result ordering.
+        delete toolUseCache[chunk.tool_use_id];
         break;
       }
 

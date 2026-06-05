@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -673,14 +673,19 @@ describe("Bash terminal output", () => {
   });
 
   describe("toAcpNotifications with clientCapabilities", () => {
-    const toolUseCache: ToolUseCache = {
-      toolu_bash: {
-        type: "tool_use",
-        id: "toolu_bash",
-        name: "Bash",
-        input: { command: "ls -la" },
-      },
-    };
+    // Reset before each test: toAcpNotifications prunes the cache entry once it
+    // maps the tool_result, so a shared object would be empty by the 2nd test.
+    let toolUseCache: ToolUseCache;
+    beforeEach(() => {
+      toolUseCache = {
+        toolu_bash: {
+          type: "tool_use",
+          id: "toolu_bash",
+          name: "Bash",
+          input: { command: "ls -la" },
+        },
+      };
+    });
 
     const bashResult: BetaBashCodeExecutionResultBlock = {
       type: "bash_code_execution_result",
@@ -792,11 +797,21 @@ describe("Bash terminal output", () => {
         { clientCapabilities: { _meta: { terminal_output: true } } },
       );
 
+      // Fresh cache: the withSupport call above already consumed the entry,
+      // since toAcpNotifications prunes the tool_use once it maps the result.
+      const toolUseCacheWithoutSupport: ToolUseCache = {
+        toolu_bash: {
+          type: "tool_use",
+          id: "toolu_bash",
+          name: "Bash",
+          input: { command: "ls -la" },
+        },
+      };
       const withoutSupport = toAcpNotifications(
         [toolResult],
         "assistant",
         "test-session",
-        toolUseCache,
+        toolUseCacheWithoutSupport,
         mockClient,
         mockLogger,
       );
@@ -845,6 +860,31 @@ describe("Bash terminal output", () => {
       const exitMeta = (notifications[1].update as any)._meta;
       expect(exitMeta.claudeCode).toEqual({ toolName: "Bash" });
       expect(exitMeta.terminal_exit).toBeDefined();
+    });
+  });
+
+  describe("toolUseCache pruning", () => {
+    it("retains the tool_use entry until its result, then prunes it", () => {
+      const toolUseCache: ToolUseCache = {};
+      const toolUse = {
+        type: "tool_use" as const,
+        id: "toolu_read",
+        name: "Read",
+        input: { file_path: "/tmp/x.txt" },
+      };
+
+      // tool_use is cached and kept (the matching result hasn't arrived yet).
+      toAcpNotifications([toolUse], "assistant", "s", toolUseCache, mockClient, mockLogger);
+      expect(toolUseCache.toolu_read).toBeDefined();
+
+      // tool_result resolves it, so the entry is pruned to bound memory.
+      const toolResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_read",
+        content: [{ type: "text", text: "hello" }],
+      };
+      toAcpNotifications([toolResult], "assistant", "s", toolUseCache, mockClient, mockLogger);
+      expect(toolUseCache.toolu_read).toBeUndefined();
     });
   });
 

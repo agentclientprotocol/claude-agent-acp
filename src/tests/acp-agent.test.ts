@@ -1548,6 +1548,7 @@ describe("stop reason propagation", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
   }
 
@@ -1692,6 +1693,7 @@ describe("stop reason propagation", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
 
     const response = await agent.prompt({
@@ -1851,6 +1853,7 @@ describe("session/close", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
     return agent.sessions[sessionId]!;
   }
@@ -1935,6 +1938,7 @@ describe("session/delete", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
     return agent.sessions[sessionId]!;
   }
@@ -2036,6 +2040,7 @@ describe("getOrCreateSession param change detection", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
     return agent.sessions[sessionId]!;
   }
@@ -2271,6 +2276,7 @@ describe("usage_update computation", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
   }
 
@@ -3214,6 +3220,7 @@ describe("emitRawSDKMessages", () => {
       emitRawSDKMessages,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
   }
 
@@ -3442,6 +3449,7 @@ describe("result origin handling", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
   }
 
@@ -3617,6 +3625,7 @@ describe("memory_recall handling", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
   }
 
@@ -3847,6 +3856,7 @@ describe("post-error recovery", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
     return { interrupt };
   }
@@ -3992,6 +4002,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
+      toolUseCache: {},
     };
     return { interrupt };
   }
