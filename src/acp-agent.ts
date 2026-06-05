@@ -1708,7 +1708,7 @@ export class ClaudeAcpAgent implements Agent {
     return {};
   }
 
-  async unstable_deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     // Tear down any active in-memory state first so the on-disk file isn't
     // recreated by an outstanding query writing to it.
     if (this.sessions[params.sessionId]) {

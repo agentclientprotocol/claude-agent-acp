@@ -2023,7 +2023,7 @@ describe("session/delete", () => {
     const agent = createMockAgent();
     const session = injectSession(agent, "session-1");
 
-    const result = await agent.unstable_deleteSession({ sessionId: "session-1" });
+    const result = await agent.deleteSession({ sessionId: "session-1" });
 
     expect(result).toEqual({});
     expect(agent.sessions["session-1"]).toBeUndefined();
@@ -2036,7 +2036,7 @@ describe("session/delete", () => {
   it("deletes a session from disk that is not currently active", async () => {
     const agent = createMockAgent();
 
-    const result = await agent.unstable_deleteSession({ sessionId: "not-active" });
+    const result = await agent.deleteSession({ sessionId: "not-active" });
 
     expect(result).toEqual({});
     expect(deleteSession).toHaveBeenCalledWith("not-active");
@@ -2046,7 +2046,7 @@ describe("session/delete", () => {
     const agent = createMockAgent();
     vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Session not found on disk"));
 
-    await expect(agent.unstable_deleteSession({ sessionId: "missing" })).rejects.toThrow(
+    await expect(agent.deleteSession({ sessionId: "missing" })).rejects.toThrow(
       "Session not found on disk",
     );
   });
@@ -2056,7 +2056,7 @@ describe("session/delete", () => {
     injectSession(agent, "session-a");
     injectSession(agent, "session-b");
 
-    await agent.unstable_deleteSession({ sessionId: "session-a" });
+    await agent.deleteSession({ sessionId: "session-a" });
 
     expect(agent.sessions["session-a"]).toBeUndefined();
     expect(agent.sessions["session-b"]).toBeDefined();
