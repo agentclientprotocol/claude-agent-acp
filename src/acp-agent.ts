@@ -1043,6 +1043,49 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "mirror_error": {
+                // The SDK failed to persist session history (SessionStore
+                // append rejected/timed out after retry) — potential data loss
+                // the user should know about rather than a silent gap on
+                // resume. Log it and surface a warning in the conversation.
+                this.logger.error(
+                  `Session ${message.session_id}: failed to persist history: ${message.error}`,
+                );
+                break;
+              }
+              case "permission_denied": {
+                // A tool call was auto-denied (by a rule, the classifier,
+                // dontAsk mode, etc.) before running. The tool_use block was
+                // already emitted as a `tool_call`, so mark it failed with the
+                // rejection reason — otherwise the client shows a tool call
+                // that silently never resolves.
+                const reason = message.decision_reason ?? message.message;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: message.tool_use_id,
+                    status: "failed",
+                    content: [
+                      {
+                        type: "content",
+                        content: { type: "text", text: `Permission denied: ${reason}` },
+                      },
+                    ],
+                    _meta: {
+                      claudeCode: {
+                        toolName: message.tool_name,
+                        toolResponse: {
+                          decisionReasonType: message.decision_reason_type,
+                          decisionReason: message.decision_reason,
+                          message: message.message,
+                        },
+                      },
+                    } satisfies ToolUpdateMeta,
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -1055,8 +1098,6 @@ export class ClaudeAcpAgent implements Agent {
               case "plugin_install":
               case "notification":
               case "api_retry":
-              case "mirror_error":
-              case "permission_denied":
               case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
@@ -1412,11 +1453,40 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           }
-          case "tool_progress":
+          case "tool_progress": {
+            await this.client.sessionUpdate({
+              sessionId: message.session_id,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: message.tool_use_id,
+                status: "in_progress",
+                _meta: {
+                  claudeCode: {
+                    toolName: message.tool_name,
+                    toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                  },
+                } satisfies ToolUpdateMeta,
+              },
+            });
+            break;
+          }
+          case "rate_limit_event": {
+            if (lastAssistantTotalUsage !== null) {
+              await this.client.sessionUpdate({
+                sessionId: message.session_id,
+                update: {
+                  sessionUpdate: "usage_update",
+                  used: lastAssistantTotalUsage,
+                  size: session.contextWindowSize,
+                  _meta: { "_claude/rateLimit": message.rate_limit_info },
+                },
+              });
+            }
+            break;
+          }
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
-          case "rate_limit_event":
             break;
           default:
             unreachable(message);
