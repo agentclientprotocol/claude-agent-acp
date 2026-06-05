@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.42.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.41.0...v0.42.0) (2026-06-05)
+
+
+### Features
+
+* **deps-dev:** bump obug from 2.1.1 to 2.1.2 in the minor group ([#743](https://github.com/agentclientprotocol/claude-agent-acp/issues/743)) ([7ffb78c](https://github.com/agentclientprotocol/claude-agent-acp/commit/7ffb78c57280fc32af77862896c0035ce0e690b7))
+* Send message ids for assistant and user messages ([#750](https://github.com/agentclientprotocol/claude-agent-acp/issues/750)) ([18516a3](https://github.com/agentclientprotocol/claude-agent-acp/commit/18516a3088f847a38f5eee0fe81ad5ca3e2a751c))
+* Update Claude Agent SDK to 0.3.165 ([#746](https://github.com/agentclientprotocol/claude-agent-acp/issues/746)) ([23cbe6f](https://github.com/agentclientprotocol/claude-agent-acp/commit/23cbe6f58fa9e10ad736f664c4cf94dbd1c6ad65))
+
+
+### Bug Fixes
+
+* Prevent cross-family model matching in resolveModelPreference ([#731](https://github.com/agentclientprotocol/claude-agent-acp/issues/731)) ([f4704c1](https://github.com/agentclientprotocol/claude-agent-acp/commit/f4704c168f917e6710f2b3cd49e1fef49613a469))
+* Prune tool cache per session after results ([#748](https://github.com/agentclientprotocol/claude-agent-acp/issues/748)) ([ec14211](https://github.com/agentclientprotocol/claude-agent-acp/commit/ec142110561f680330c6976783805685c5c069ec))
+* Update to better utilize existing SDK data ([#747](https://github.com/agentclientprotocol/claude-agent-acp/issues/747)) ([398f763](https://github.com/agentclientprotocol/claude-agent-acp/commit/398f763f71bd2fe2ca9e8269de120d26a744b7a8))
+
 ## [0.41.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.40.0...v0.41.0) (2026-06-04)
 
 
