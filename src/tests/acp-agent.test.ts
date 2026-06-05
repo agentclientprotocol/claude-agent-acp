@@ -33,10 +33,16 @@ import {
   claudeCliPath,
   describeAlwaysAllow,
   streamEventToAcpNotifications,
+  messageIdForGrouping,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
-import { deleteSession, query, SDKAssistantMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  deleteSession,
+  getSessionMessages,
+  query,
+  SDKAssistantMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
@@ -1318,6 +1324,67 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
     const { value } = await q.next();
     expect(value).toMatchObject({ type: "system", session_id: sessionId });
   }, 10000);
+
+  // Pins the SDK invariant our `messageId` plumbing relies on: the Anthropic
+  // API message id is available at `message_start` (before any delta), is the
+  // same on the consolidated assistant message, and is recoverable from the
+  // persisted transcript — so a turn keeps one stable id across streaming and
+  // replay. The per-`stream_event` uuid is NOT used because it is unique per
+  // event and never persisted; this test would fail if a future SDK regressed
+  // any of those properties.
+  it("uses the API message id as a stable anchor across streaming and replay", async () => {
+    const sessionId = randomUUID();
+    const q = query({
+      prompt: "Reply with exactly these words and nothing else: hello there my friend",
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        includePartialMessages: true,
+        maxTurns: 1,
+        allowedTools: [],
+      },
+    });
+
+    let messageStartApiId: string | undefined;
+    let consolidatedApiId: string | undefined;
+    let sawDelta = false;
+    let allPartialsTopLevel = true;
+
+    for await (const message of q) {
+      if (message.type === "assistant") {
+        consolidatedApiId = message.message.id;
+      }
+      if (message.type !== "stream_event") continue;
+      // Every streaming partial must belong to the top-level agent
+      // (parent_tool_use_id === null). Subagent work is folded into tool-result
+      // messages rather than surfaced as partial streams, which is what lets us
+      // track a single anchor without keying by parent_tool_use_id.
+      if (message.parent_tool_use_id !== null) allPartialsTopLevel = false;
+      if (message.event.type === "message_start") {
+        messageStartApiId = message.event.message.id;
+      } else if (message.event.type === "content_block_delta") {
+        sawDelta = true;
+      }
+    }
+
+    // The API message id is present at message_start (before deltas), so we can
+    // tag every streamed chunk with it, and it is identical on the consolidated
+    // assistant message.
+    expect(messageStartApiId).toBeTruthy();
+    expect(sawDelta).toBe(true);
+    expect(allPartialsTopLevel).toBe(true);
+    expect(consolidatedApiId).toBe(messageStartApiId);
+
+    // ...and the SAME id is recoverable from the persisted transcript, so chunks
+    // grouped live keep their id when the session is replayed.
+    const persisted = await getSessionMessages(sessionId);
+    const replayedAssistant = persisted.find((m) => m.type === "assistant");
+    expect(replayedAssistant).toBeDefined();
+    expect((replayedAssistant!.message as { id?: string }).id).toBe(messageStartApiId);
+    // The helper used in production must derive that same id from the replayed
+    // message.
+    expect(messageIdForGrouping(replayedAssistant!)).toBe(messageStartApiId);
+  }, 30000);
 });
 
 describe("permission requests", () => {
@@ -1549,6 +1616,7 @@ describe("stop reason propagation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -1694,6 +1762,7 @@ describe("stop reason propagation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
 
     const response = await agent.prompt({
@@ -1854,6 +1923,7 @@ describe("session/close", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -1939,6 +2009,7 @@ describe("session/delete", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2041,6 +2112,7 @@ describe("getOrCreateSession param change detection", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -2277,6 +2349,7 @@ describe("usage_update computation", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3221,6 +3294,7 @@ describe("emitRawSDKMessages", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3450,6 +3524,7 @@ describe("result origin handling", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3626,6 +3701,7 @@ describe("memory_recall handling", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
   }
 
@@ -3857,6 +3933,7 @@ describe("post-error recovery", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return { interrupt };
   }
@@ -4003,6 +4080,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       contextWindowSize: 200000,
       taskState: new Map(),
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
     return { interrupt };
   }
@@ -4141,5 +4219,167 @@ describe("streamEventToAcpNotifications", () => {
 
     expect(result).toEqual([]);
     expect(errors).toEqual([]);
+  });
+
+  it("attaches the supplied messageId to streamed text chunks", () => {
+    const messageId = randomUUID();
+    const message = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "hello" },
+      },
+    } as Parameters<typeof streamEventToAcpNotifications>[0];
+
+    const result = streamEventToAcpNotifications(
+      message,
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+
+    expect(result).toEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "hello" },
+          messageId,
+        },
+      },
+    ]);
+  });
+});
+
+describe("toAcpNotifications messageId", () => {
+  const messageId = "11111111-2222-3333-4444-555555555555";
+
+  it("sets messageId on agent message chunks from string content", () => {
+    const result = toAcpNotifications(
+      "hello world",
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+
+    expect(result).toEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "hello world" },
+          messageId,
+        },
+      },
+    ]);
+  });
+
+  it("sets messageId on user message chunks and thought chunks", () => {
+    const userResult = toAcpNotifications(
+      [{ type: "text", text: "hi" }],
+      "user",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+    expect(userResult[0].update).toMatchObject({
+      sessionUpdate: "user_message_chunk",
+      messageId,
+    });
+
+    const thoughtResult = toAcpNotifications(
+      [{ type: "thinking", thinking: "hmm", signature: "" }],
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId },
+    );
+    expect(thoughtResult[0].update).toMatchObject({
+      sessionUpdate: "agent_thought_chunk",
+      messageId,
+    });
+  });
+
+  it("omits messageId when none is supplied", () => {
+    const result = toAcpNotifications(
+      "hello",
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+    );
+    expect(result[0].update).not.toHaveProperty("messageId");
+  });
+
+  it("never sets messageId on non-chunk updates (tool_call)", () => {
+    const result = toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "toolu_abc",
+          name: "Read",
+          input: { file_path: "/tmp/x" },
+        },
+      ],
+      "assistant",
+      "test",
+      {},
+      {} as AgentSideConnection,
+      console,
+      { messageId, registerHooks: false },
+    );
+    expect(result[0].update.sessionUpdate).toBe("tool_call");
+    expect(result[0].update).not.toHaveProperty("messageId");
+  });
+});
+
+describe("messageIdForGrouping", () => {
+  it("uses the Anthropic API message id for assistant messages", () => {
+    const message = {
+      type: "assistant",
+      uuid: "de242400-cdb3-4af7-9856-d3b114b20af9",
+      message: { id: "msg_018DQGVuZbGYwVnvDakAP9Do", role: "assistant" },
+    };
+    // The API id is identical at message_start, on the consolidated message,
+    // and in the persisted transcript — so it stays stable across replay,
+    // unlike the per-message uuid.
+    expect(messageIdForGrouping(message)).toBe("msg_018DQGVuZbGYwVnvDakAP9Do");
+  });
+
+  it("falls back to the uuid for assistant messages without an API id", () => {
+    const message = {
+      type: "assistant",
+      uuid: "de242400-cdb3-4af7-9856-d3b114b20af9",
+      message: { role: "assistant" },
+    };
+    expect(messageIdForGrouping(message)).toBe("de242400-cdb3-4af7-9856-d3b114b20af9");
+  });
+
+  it("uses the uuid for user messages (they carry no API id and aren't streamed)", () => {
+    const message = {
+      type: "user",
+      uuid: "11111111-2222-3333-4444-555555555555",
+      message: { id: "msg_should_be_ignored", role: "user" },
+    };
+    expect(messageIdForGrouping(message)).toBe("11111111-2222-3333-4444-555555555555");
+  });
+
+  it("returns undefined when there is no usable id", () => {
+    expect(messageIdForGrouping({ type: "system", message: {} })).toBeUndefined();
+    expect(messageIdForGrouping({ type: "assistant", uuid: "", message: {} })).toBeUndefined();
   });
 });

@@ -199,6 +199,24 @@ type Session = {
    *  `tool_result` time so a long-running session doesn't accumulate every
    *  tool call for its whole lifetime. */
   toolUseCache: ToolUseCache;
+  /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
+   *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
+   *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
+   *  `SDKAssistantMessage.uuid`). For assistant turns the two differ — the ACP
+   *  id is the Anthropic API message id (`msg_…`), available at `message_start`
+   *  so streamed chunks can carry it, while the uuid only arrives on the
+   *  consolidated message — so a client can only ask to rewind/fork by the id it
+   *  was given, and we need this table to translate it back.
+   *
+   *  Populated as a byproduct of the message loop (the consolidated message
+   *  carries both ids) and of `replaySessionHistory` on load, so no extra
+   *  `getSessionMessages` read is needed at rewind time. Last-write-wins
+   *  naturally yields the turn-boundary uuid when one `msg_…` spans several
+   *  content-block messages.
+   *
+   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
+   *  fork/rewind. */
+  messageIdToUuid: Map<string, string>;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -821,6 +839,17 @@ export class ClaudeAcpAgent implements Agent {
     // `compacting` status sets it again, so every distinct compaction (e.g.
     // repeated auto-compactions in a long turn) is still shown.
     let compactionInProgress = false;
+    // Holds the Anthropic API message id of the assistant message currently
+    // being streamed, captured from `message_start` so every streamed chunk can
+    // be tagged with it. We use the API message id rather than the
+    // per-`stream_event` uuid because the same id is also present on the
+    // consolidated assistant message and in the persisted transcript — so a turn
+    // keeps the same ACP `messageId` whether it is streamed live or replayed
+    // from history. The per-event uuid is unique per event and never persisted.
+    // A single value suffices because every streaming partial arrives with
+    // `parent_tool_use_id === null` (subagent work is folded into tool-result
+    // messages, never surfaced as partial streams).
+    let currentStreamMessageId: string | undefined;
 
     const userMessage = promptToClaude(params);
 
@@ -1247,6 +1276,12 @@ export class ClaudeAcpAgent implements Agent {
             break;
           }
           case "stream_event": {
+            // `message_start` carries the Anthropic API message id; capture it
+            // so the streamed chunks that follow (whose delta events don't carry
+            // it) can all be tagged with the same, replay-stable id.
+            if (message.event.type === "message_start") {
+              currentStreamMessageId = message.event.message.id || undefined;
+            }
             if (
               message.parent_tool_use_id === null &&
               (message.event.type === "message_start" || message.event.type === "message_delta")
@@ -1308,6 +1343,7 @@ export class ClaudeAcpAgent implements Agent {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                messageId: currentStreamMessageId,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1318,6 +1354,15 @@ export class ClaudeAcpAgent implements Agent {
           case "assistant": {
             if (session.cancelled) {
               break;
+            }
+
+            // Record the ACP messageId -> SDK uuid mapping for this message. The
+            // consolidated message carries both ids, so this is where we learn
+            // the uuid that the SDK's rewind/resume APIs key on for the id we
+            // hand clients. Not read yet (see Session.messageIdToUuid).
+            const mappedMessageId = messageIdForGrouping(message);
+            if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
+              session.messageIdToUuid.set(mappedMessageId, message.uuid);
             }
 
             // Check for prompt replay
@@ -1383,6 +1428,7 @@ export class ClaudeAcpAgent implements Agent {
                     parentToolUseId: message.parent_tool_use_id,
                     cwd: session.cwd,
                     taskState: session.taskState,
+                    messageId: messageIdForGrouping(message),
                   },
                 )) {
                   await this.client.sessionUpdate(notification);
@@ -1445,6 +1491,7 @@ export class ClaudeAcpAgent implements Agent {
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                messageId: messageIdForGrouping(message),
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -1786,6 +1833,16 @@ export class ClaudeAcpAgent implements Agent {
     const messages = await getSessionMessages(sessionId);
 
     for (const message of messages) {
+      // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
+      // observe live (resumed/loaded sessions), so rewind/resume can translate
+      // a client-supplied id without an extra getSessionMessages read. Not read
+      // yet (see Session.messageIdToUuid).
+      const replayMessageId = messageIdForGrouping(message);
+      const replaySession = this.sessions[sessionId];
+      if (replaySession && replayMessageId && message.uuid) {
+        replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
+      }
+
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       // @ts-expect-error - untyped in SDK but we handle all of these
@@ -1808,6 +1865,7 @@ export class ClaudeAcpAgent implements Agent {
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
+          messageId: replayMessageId,
         },
       )) {
         await this.client.sessionUpdate(notification);
@@ -2514,6 +2572,7 @@ export class ClaudeAcpAgent implements Agent {
         inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
+      messageIdToUuid: new Map(),
     };
 
     return {
@@ -3109,6 +3168,54 @@ export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
 }
 
 /**
+ * Resolves the ACP `messageId` for a Claude SDK message (live) or a persisted
+ * transcript message (replay) so chunk grouping is identical in both views.
+ *
+ * Assistant turns are keyed by the Anthropic API message id (`message.id`),
+ * which is identical at `message_start`, on the consolidated assistant message,
+ * and in the persisted transcript — unlike the per-`stream_event` uuid, which is
+ * unique per event and never persisted. User messages have no API id, but they
+ * are never streamed, so their (stable) SDK uuid is used instead. ACP message
+ * ids are opaque strings, so no particular format is required.
+ */
+export function messageIdForGrouping(message: {
+  type?: string;
+  uuid?: string | null;
+  message?: unknown;
+}): string | undefined {
+  if (message.type === "assistant") {
+    const inner = message.message;
+    const apiId =
+      inner && typeof inner === "object" && "id" in inner
+        ? (inner as { id?: unknown }).id
+        : undefined;
+    if (typeof apiId === "string" && apiId.length > 0) {
+      return apiId;
+    }
+  }
+  return typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
+}
+
+/**
+ * Stamps an ACP `messageId` onto a session update, but only on the message/
+ * thought chunk variants that carry one — tool_call/plan/etc. updates never do.
+ * No-op when `messageId` is falsy, so callers can pass it through unconditionally.
+ */
+function applyMessageId(
+  update: SessionNotification["update"],
+  messageId: string | undefined,
+): void {
+  if (
+    messageId &&
+    (update.sessionUpdate === "agent_message_chunk" ||
+      update.sessionUpdate === "user_message_chunk" ||
+      update.sessionUpdate === "agent_thought_chunk")
+  ) {
+    update.messageId = messageId;
+  }
+}
+
+/**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
  */
@@ -3125,6 +3232,12 @@ export function toAcpNotifications(
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
+    // Opaque id identifying the message these chunks belong to (ACP message ids
+    // are opaque strings — no particular format is required). Attached to
+    // user/agent message and thought chunks so clients can group streamed chunks
+    // into a single message. Omit it (leave undefined) when unknown — never send
+    // an explicit `null`.
+    messageId?: string;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -3138,6 +3251,7 @@ export function toAcpNotifications(
         text: content,
       },
     };
+    applyMessageId(update, options?.messageId);
 
     if (options?.parentToolUseId) {
       update._meta = {
@@ -3419,6 +3533,7 @@ export function toAcpNotifications(
           },
         };
       }
+      applyMessageId(update, options?.messageId);
       output.push({ sessionId, update });
     }
   }
@@ -3436,6 +3551,7 @@ export function streamEventToAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
     taskState?: TaskState;
+    messageId?: string;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -3453,6 +3569,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          messageId: options?.messageId,
         },
       );
     case "content_block_delta":
@@ -3468,6 +3585,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          messageId: options?.messageId,
         },
       );
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
