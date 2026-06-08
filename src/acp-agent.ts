@@ -43,11 +43,15 @@ import {
 import {
   CanUseTool,
   deleteSession,
+  ElicitationRequest as SdkElicitationRequest,
+  ElicitationResult as SdkElicitationResult,
   getSessionMessages,
   listSessions,
   McpServerConfig,
   ModelInfo,
   ModelUsage,
+  OnElicitation,
+  OnUserDialog,
   Options,
   PermissionMode,
   PermissionUpdate,
@@ -61,6 +65,8 @@ import {
   SDKUserMessage,
   SlashCommand,
   ThinkingConfig,
+  UserDialogRequest,
+  UserDialogResult,
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
@@ -86,6 +92,7 @@ import {
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
 } from "./tools.js";
+import { bridgeSdkElicitation, bridgeUserDialog } from "./elicitationBridge.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
 export const CLAUDE_CONFIG_DIR =
@@ -2335,8 +2342,22 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    // Bridge SDK elicitation + the AskUserQuestion built-in dialog through
+    // ACP's `unstable_createElicitation` when the client advertises form-mode
+    // elicitation. Without that capability the built-in AskUserQuestion
+    // implementation expects an interactive terminal, so we keep it disabled.
+    const clientSupportsFormElicitation = Boolean(
+      this.clientCapabilities?.elicitation?.form,
+    );
+    const disallowedTools = clientSupportsFormElicitation
+      ? []
+      : ["AskUserQuestion"];
+    const onElicitation: OnElicitation | undefined = clientSupportsFormElicitation
+      ? (request) => bridgeSdkElicitation(this.client, sessionId, request)
+      : undefined;
+    const onUserDialog: OnUserDialog | undefined = clientSupportsFormElicitation
+      ? (request) => bridgeUserDialog(this.client, sessionId, request, this.logger)
+      : undefined;
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -2391,6 +2412,8 @@ export class ClaudeAcpAgent implements Agent {
         "replay-user-messages": "",
       },
       disallowedTools: [...(userProvidedOptions?.disallowedTools || []), ...disallowedTools],
+      ...(onElicitation && { onElicitation }),
+      ...(onUserDialog && { onUserDialog }),
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
