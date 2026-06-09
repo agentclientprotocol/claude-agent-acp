@@ -862,6 +862,21 @@ export class ClaudeAcpAgent implements Agent {
     // `parent_tool_use_id === null` (subagent work is folded into tool-result
     // messages, never surfaced as partial streams).
     let currentStreamMessageId: string | undefined;
+    // Per-message-id record of which assistant content actually streamed live via
+    // `stream_event` deltas, split by block type. The `assistant` case below
+    // normally drops `text`/`thinking` blocks on the assumption they already
+    // reached the client as `agent_message_chunk`/`agent_thought_chunk`. That
+    // breaks behind Anthropic-protocol gateways that return a turn as a single
+    // non-streamed block (common with OpenAI-compatible proxies): no
+    // `content_block_delta` fires, so the assembled block is the only copy the
+    // client will ever see. We keep the filter per (id, block type) for content
+    // that did stream, and fall back to forwarding what did not. Split by type so
+    // a gateway that streams text but not thinking (or vice versa) doesn't lose
+    // the un-streamed block. Only top-level (`parent_tool_use_id === null`)
+    // streams are recorded — subagent text is never streamed and must stay
+    // filtered, as it is internal to the tool call.
+    const streamedTextIds = new Set<string>();
+    const streamedThinkingIds = new Set<string>();
 
     const userMessage = promptToClaude(params);
 
@@ -1309,6 +1324,22 @@ export class ClaudeAcpAgent implements Agent {
             if (message.event.type === "message_start") {
               currentStreamMessageId = message.event.message.id || undefined;
             }
+            // Record that this top-level message id actually streamed text/
+            // thinking, so the `assistant` case below knows its assembled blocks
+            // are duplicates (filter them) rather than the only copy (forward
+            // them). Gated on `parent_tool_use_id === null` so a subagent stream
+            // can't attribute its content to the top-level message id.
+            if (
+              currentStreamMessageId &&
+              message.parent_tool_use_id === null &&
+              message.event.type === "content_block_delta"
+            ) {
+              if (message.event.delta.type === "text_delta") {
+                streamedTextIds.add(currentStreamMessageId);
+              } else if (message.event.delta.type === "thinking_delta") {
+                streamedThinkingIds.add(currentStreamMessageId);
+              }
+            }
             if (
               message.parent_tool_use_id === null &&
               (message.event.type === "message_start" || message.event.type === "message_delta")
@@ -1498,13 +1529,47 @@ export class ClaudeAcpAgent implements Agent {
               throw RequestError.authRequired();
             }
 
-            const content =
-              message.type === "assistant"
-                ? // Handled by stream events above
-                  message.message.content.filter(
-                    (item) => !["text", "thinking"].includes(item.type),
-                  )
-                : message.message.content;
+            let content: typeof message.message.content;
+            if (message.type === "assistant" && message.parent_tool_use_id === null) {
+              // Top-level assistant message: drop text/thinking blocks already
+              // streamed live as chunks, and forward (as a fallback) any that were
+              // not, so non-streaming gateways still deliver the final answer.
+              const id = messageIdForGrouping(message);
+              content = message.message.content.filter((item) => {
+                // Non-text blocks (tool_use, etc.) always pass through; their own
+                // dedupe (`toolUseCache`) collapses the streamed/assembled pair.
+                if (item.type !== "text" && item.type !== "thinking") {
+                  return true;
+                }
+                // Already delivered live as a chunk of this exact type — drop the
+                // duplicate. Checked per type so streaming one (e.g. text) doesn't
+                // suppress an un-streamed block of the other (e.g. thinking).
+                const streamedLive =
+                  id !== undefined &&
+                  (item.type === "text" ? streamedTextIds : streamedThinkingIds).has(id);
+                if (streamedLive) {
+                  return false;
+                }
+                // Empty assembled blocks carry nothing (some gateways emit an empty
+                // `thinking` block before the real text) — don't forward stray
+                // empty chunks.
+                const text = item.type === "text" ? item.text : item.thinking;
+                if (text.length === 0) {
+                  return false;
+                }
+                return true;
+              });
+            } else if (message.type === "assistant") {
+              // Subagent assistant message (`parent_tool_use_id !== null`). It is
+              // never streamed live and its text/thinking is internal to the tool
+              // call — keep dropping it so subagent prose doesn't leak into the
+              // top-level feed.
+              content = message.message.content.filter(
+                (item) => item.type !== "text" && item.type !== "thinking",
+              );
+            } else {
+              content = message.message.content;
+            }
 
             for (const notification of toAcpNotifications(
               content,
