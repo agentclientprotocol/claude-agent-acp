@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.44.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.43.0...v0.44.0) (2026-06-09)
+
+
+### Features
+
+* **deps:** bump the minor group with 14 updates ([#758](https://github.com/agentclientprotocol/claude-agent-acp/issues/758)) ([7a70162](https://github.com/agentclientprotocol/claude-agent-acp/commit/7a701623df2e05aec8e552bdfd1cf573413c3471))
+* **deps:** update to @anthropic-ai/claude-agent-sdk 0.3.170 ([#761](https://github.com/agentclientprotocol/claude-agent-acp/issues/761)) ([d8af943](https://github.com/agentclientprotocol/claude-agent-acp/commit/d8af943a1efef9be27d771cec089d2f1cb56c523))
+
 ## [0.43.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.42.0...v0.43.0) (2026-06-09)
 
 
