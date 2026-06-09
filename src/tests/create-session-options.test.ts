@@ -565,4 +565,51 @@ describe("createSession options merging", () => {
       await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).resolves.toBeDefined();
     });
   });
+
+  describe("elicitation", () => {
+    it("keeps AskUserQuestion disabled and omits callbacks without elicitation capability", async () => {
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+      expect(capturedOptions!.onElicitation).toBeUndefined();
+    });
+
+    it("enables AskUserQuestion and wires the elicitation callback when form is supported", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+      expect(typeof capturedOptions!.onElicitation).toBe("function");
+    });
+
+    it("wires callbacks for url-only elicitation but keeps AskUserQuestion disabled", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+      expect(typeof capturedOptions!.onElicitation).toBe("function");
+    });
+
+    it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { disallowedTools: ["WebSearch"] } } },
+      });
+
+      expect(capturedOptions!.disallowedTools).toContain("WebSearch");
+      expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+    });
+  });
 });

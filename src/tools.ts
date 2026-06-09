@@ -8,6 +8,7 @@ import {
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
+  AskUserQuestionInput,
   BashInput,
   FileEditInput,
   FileReadInput,
@@ -412,6 +413,24 @@ export function toolInfoFromToolUse(
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
           : [],
+      };
+    }
+
+    case "AskUserQuestion": {
+      const input = toolUse.input as Partial<AskUserQuestionInput> | undefined;
+      const questions = Array.isArray(input?.questions) ? input.questions : [];
+      return {
+        title:
+          questions.length === 1 && questions[0]?.question
+            ? questions[0].question
+            : "Asking for your input",
+        kind: "other",
+        content: questions
+          .filter((q) => typeof q?.question === "string")
+          .map((q) => ({
+            type: "content" as const,
+            content: { type: "text" as const, text: q.question },
+          })),
       };
     }
 

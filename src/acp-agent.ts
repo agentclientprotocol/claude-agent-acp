@@ -48,8 +48,10 @@ import {
   McpServerConfig,
   ModelInfo,
   ModelUsage,
+  OnElicitation,
   Options,
   PermissionMode,
+  PermissionResult,
   PermissionUpdate,
   Query,
   query,
@@ -70,6 +72,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
+import {
+  applyAskElicitationResponse,
+  askUserQuestionsToCreateRequest,
+  createElicitationResponseToElicitResult,
+  ElicitationSupport,
+  extractAskUserQuestions,
+  mcpElicitationToCreateRequest,
+} from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import {
   applyTaskCreate,
@@ -1123,7 +1133,22 @@ export class ClaudeAcpAgent implements Agent {
               case "task_notification":
               case "task_progress":
               case "task_updated":
-              case "elicitation_complete":
+                break;
+              case "elicitation_complete": {
+                // A url-mode MCP elicitation finished server-side. Let the client
+                // dismiss any UI it opened for it. Only meaningful when the
+                // client supports url elicitation; ignore failures otherwise.
+                if (this.clientCapabilities?.elicitation?.url) {
+                  try {
+                    await this.client.unstable_completeElicitation({
+                      elicitationId: message.elicitation_id,
+                    });
+                  } catch (error) {
+                    this.logger.error(`Failed to complete elicitation: ${error}`);
+                  }
+                }
+                break;
+              }
               case "plugin_install":
               case "notification":
               case "api_retry":
@@ -1897,6 +1922,14 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
 
+      // AskUserQuestion is surfaced to us as a normal permission check (the SDK
+      // routes it through canUseTool whenever a callback is registered, rather
+      // than the interactive dialog). Present it as an ACP form elicitation and
+      // feed the answers back as updatedInput for the tool's own call() to read.
+      if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
+        return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
+      }
+
       if (toolName === "ExitPlanMode") {
         const optionsAll: PermissionOption[] = [
           { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
@@ -2039,6 +2072,71 @@ export class ClaudeAcpAgent implements Agent {
         };
       }
     };
+  }
+
+  /**
+   * Handle elicitation requests that originate from MCP servers by forwarding
+   * them to the client over ACP. Modes the client did not advertise (or
+   * requests we can't represent) are declined.
+   */
+  private handleMcpElicitation(sessionId: string, support: ElicitationSupport): OnElicitation {
+    return async (request, { signal }) => {
+      const isUrl = request.mode === "url";
+      if ((isUrl && !support.url) || (!isUrl && !support.form)) {
+        return { action: "decline" };
+      }
+
+      const createRequest = mcpElicitationToCreateRequest(request, sessionId);
+      if (!createRequest) {
+        return { action: "decline" };
+      }
+
+      try {
+        const response = await this.client.unstable_createElicitation(createRequest);
+        if (signal.aborted) {
+          return { action: "cancel" };
+        }
+        return createElicitationResponseToElicitResult(response);
+      } catch (error) {
+        this.logger.error(`Failed to forward MCP elicitation: ${error}`);
+        return { action: "decline" };
+      }
+    };
+  }
+
+  /**
+   * Present the built-in AskUserQuestion tool's questions as an ACP form
+   * elicitation and return the answers as the tool's `updatedInput`. Called from
+   * `canUseTool` since that is where the SDK routes the tool's permission check.
+   */
+  private async handleAskUserQuestion(
+    sessionId: string,
+    toolInput: Record<string, unknown>,
+    toolUseID: string,
+    signal: AbortSignal,
+  ): Promise<PermissionResult> {
+    const questions = extractAskUserQuestions(toolInput);
+    if (!questions) {
+      return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
+    }
+
+    const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);
+    let response;
+    try {
+      response = await this.client.unstable_createElicitation(createRequest);
+    } catch (error) {
+      this.logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
+      return { behavior: "deny", message: "Could not present the question to the user." };
+    }
+    if (signal.aborted) {
+      throw new Error("Tool use aborted");
+    }
+
+    const outcome = applyAskElicitationResponse(response, toolInput, questions);
+    if (outcome.action === "cancel") {
+      throw new Error("Tool use aborted");
+    }
+    return { behavior: "allow", updatedInput: outcome.updatedInput };
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
@@ -2335,8 +2433,18 @@ export class ClaudeAcpAgent implements Agent {
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
 
-    // Disable this for now, not a great way to expose this over ACP at the moment (in progress work so we can revisit)
-    const disallowedTools = ["AskUserQuestion"];
+    // Elicitation modes the connected client advertised. We only forward
+    // elicitations (and only re-enable AskUserQuestion) for modes the client
+    // can actually render.
+    const elicitationSupport: ElicitationSupport = {
+      form: !!this.clientCapabilities?.elicitation?.form,
+      url: !!this.clientCapabilities?.elicitation?.url,
+    };
+
+    // AskUserQuestion surfaces as a `permission_ask_user_question` dialog that
+    // we render as a form elicitation. Without form-elicitation support there
+    // is no way to present it over ACP, so keep it disabled in that case.
+    const disallowedTools = elicitationSupport.form ? [] : ["AskUserQuestion"];
 
     // Resolve which built-in tools to expose.
     // Explicit tools array from _meta.claudeCode.options takes precedence.
@@ -2385,6 +2493,13 @@ export class ClaudeAcpAgent implements Agent {
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
       permissionMode,
       canUseTool: this.canUseTool(sessionId),
+      // Forward MCP elicitation requests onto ACP elicitation. Only attached
+      // when the client advertised support, so non-supporting clients keep the
+      // SDK's default (auto-decline) behavior. (AskUserQuestion is handled in
+      // canUseTool, not here.)
+      ...(elicitationSupport.form || elicitationSupport.url
+        ? { onElicitation: this.handleMcpElicitation(sessionId, elicitationSupport) }
+        : {}),
       pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       extraArgs: {
         ...userProvidedOptions?.extraArgs,
