@@ -6,6 +6,8 @@ import {
   AvailableCommand,
   Client,
   ClientSideConnection,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   ndJsonStream,
   NewSessionResponse,
   ReadTextFileRequest,
@@ -89,6 +91,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     agent: Agent;
     files: Map<string, string> = new Map();
     receivedText: string = "";
+    // Records for the AskUserQuestion elicitation test.
+    elicitations: CreateElicitationRequest[] = [];
+    permissionToolInputs: unknown[] = [];
+    chosenAnswers: Record<string, string | string[]> = {};
     resolveAvailableCommands: (commands: AvailableCommand[]) => void;
     availableCommandsPromise: Promise<AvailableCommand[]>;
 
@@ -107,9 +113,37 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     }
 
     async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+      // Record what asked for permission so a test can assert that
+      // AskUserQuestion did NOT fall back to a generic permission prompt.
+      this.permissionToolInputs.push(params.toolCall?.rawInput);
       const optionId = params.options.find((p) => p.kind === "allow_once")!.optionId;
 
       return { outcome: { outcome: "selected", optionId } };
+    }
+
+    async unstable_createElicitation(
+      params: CreateElicitationRequest,
+    ): Promise<CreateElicitationResponse> {
+      this.elicitations.push(params);
+      if (params.mode !== "form") {
+        return { action: "decline" };
+      }
+      // Accept the first option of every choice field (skip the free-text one).
+      const content: Record<string, string | string[]> = {};
+      for (const [key, prop] of Object.entries(params.requestedSchema.properties ?? {})) {
+        if (key === "customAnswer") continue;
+        const p = prop as {
+          oneOf?: Array<{ const: string }>;
+          items?: { anyOf?: Array<{ const: string }> };
+        };
+        if (p.oneOf?.length) {
+          content[key] = p.oneOf[0].const;
+        } else if (p.items?.anyOf?.length) {
+          content[key] = [p.items.anyOf[0].const];
+        }
+      }
+      this.chosenAnswers = content;
+      return { action: "accept", content };
     }
 
     async sessionUpdate(params: SessionNotification): Promise<void> {
@@ -163,6 +197,9 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         fs: {
           readTextFile: true,
           writeTextFile: true,
+        },
+        elicitation: {
+          form: {},
         },
       },
     });
@@ -266,6 +303,60 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     });
 
     expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
+  }, 60000);
+
+  // Regression guard for the SDK's AskUserQuestion routing. The built-in
+  // AskUserQuestion tool is delivered to us through `canUseTool` (not the
+  // interactive `onUserDialog` path), where we intercept it and render an ACP
+  // form elicitation, returning the answer via `updatedInput`. If a future SDK
+  // changes that routing — e.g. stops calling `canUseTool` for it, or no longer
+  // reads answers back from `updatedInput` — this test fails: either no
+  // elicitation arrives, the tool falls back to a permission prompt, or the
+  // answer never reaches the model's reply.
+  it("routes AskUserQuestion through ACP form elicitation and round-trips the answer", async () => {
+    const { client, connection, newSessionResponse } = await setupTestSession(process.cwd());
+
+    await connection.prompt({
+      prompt: [
+        {
+          type: "text",
+          text:
+            "Use the AskUserQuestion tool right now to ask me to choose a favorite color. " +
+            "Offer exactly two options: 'Red' and 'Blue'. Do not use any other tool and do " +
+            "not ask in plain text. After I answer, reply with one short sentence naming the " +
+            "color I picked.",
+        },
+      ],
+      sessionId: newSessionResponse.sessionId,
+    });
+
+    // The tool surfaced as an ACP form elicitation...
+    expect(client.elicitations.length).toBeGreaterThan(0);
+    const elicitation = client.elicitations[0];
+    expect(elicitation.mode).toBe("form");
+
+    // ...built by our converter (indexed field key + free-text "Other" field),
+    // which confirms our interception path produced it rather than some other
+    // mechanism.
+    const properties =
+      elicitation.mode === "form" ? Object.keys(elicitation.requestedSchema.properties ?? {}) : [];
+    expect(properties).toContain("question_0");
+    expect(properties).toContain("customAnswer");
+
+    // AskUserQuestion must NOT fall back to a generic permission prompt: no
+    // permission request should have carried AskUserQuestion's `questions`.
+    const fellBackToPermission = client.permissionToolInputs.some(
+      (input) =>
+        !!input &&
+        typeof input === "object" &&
+        Array.isArray((input as { questions?: unknown }).questions),
+    );
+    expect(fellBackToPermission).toBe(false);
+
+    // The chosen answer round-trips: the model's reply names the picked option.
+    const picked = String(Object.values(client.chosenAnswers)[0] ?? "");
+    expect(picked).not.toEqual("");
+    expect(client.takeReceivedText().toLowerCase()).toContain(picked.toLowerCase());
   }, 60000);
 });
 
