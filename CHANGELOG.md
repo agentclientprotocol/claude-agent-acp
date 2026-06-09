@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.43.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.42.0...v0.43.0) (2026-06-09)
+
+
+### Features
+
+* Add experimental elicitation support ([#756](https://github.com/agentclientprotocol/claude-agent-acp/issues/756)) ([12bd276](https://github.com/agentclientprotocol/claude-agent-acp/commit/12bd2762d9ba0ccb7497a3848a5928b8bb2ce820))
+* **deps:** update to @anthropic-ai/claude-agent-sdk 0.3.169 ([#754](https://github.com/agentclientprotocol/claude-agent-acp/issues/754)) ([bd0ae4d](https://github.com/agentclientprotocol/claude-agent-acp/commit/bd0ae4dde160f59559ab4ac1bf703fcf151eff17))
+* Update ACP SDK to 0.25.0 ([#753](https://github.com/agentclientprotocol/claude-agent-acp/issues/753)) ([0dbccf5](https://github.com/agentclientprotocol/claude-agent-acp/commit/0dbccf588ff702015494dd29969d47f0b7402feb))
+
+
+### Bug Fixes
+
+* Forward unstreamed assistant text blocks ([#757](https://github.com/agentclientprotocol/claude-agent-acp/issues/757)) ([7ff6b7f](https://github.com/agentclientprotocol/claude-agent-acp/commit/7ff6b7fd6b157aedbce0c636087f51ae7d1df3a7))
+* Validate cwd before creating sessions ([#751](https://github.com/agentclientprotocol/claude-agent-acp/issues/751)) ([9854b0c](https://github.com/agentclientprotocol/claude-agent-acp/commit/9854b0c6790ebafff514e3c4c8e03a131f065a4a)), closes [#749](https://github.com/agentclientprotocol/claude-agent-acp/issues/749)
+
 ## [0.42.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.41.0...v0.42.0) (2026-06-05)
 
 
