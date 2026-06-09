@@ -1168,6 +1168,7 @@ export class ClaudeAcpAgent implements Agent {
               case "notification":
               case "api_retry":
               case "thinking_tokens":
+              case "model_refusal_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
@@ -3735,6 +3736,7 @@ export function toAcpNotifications(
       case "compaction_delta":
       case "advisor_tool_result":
       case "mid_conv_system":
+      case "fallback":
         break;
 
       default:
