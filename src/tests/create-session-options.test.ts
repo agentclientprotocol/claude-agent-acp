@@ -493,9 +493,12 @@ describe("createSession options merging", () => {
       }
     });
 
-    it("leaves thinking unset (SDK default) when env var is absent", async () => {
+    it("defaults to adaptive thinking with summarized display when env var is absent", async () => {
+      // Recent models default `display` to "omitted", which streams thinking
+      // blocks with empty text — request "summarized" so agent_thought_chunk
+      // notifications carry visible content.
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-      expect(capturedOptions!.thinking).toBeUndefined();
+      expect(capturedOptions!.thinking).toEqual({ type: "adaptive", display: "summarized" });
       // The deprecated option must not be set either.
       expect(capturedOptions!.maxThinkingTokens).toBeUndefined();
     });
@@ -506,16 +509,20 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.thinking).toEqual({ type: "disabled" });
     });
 
-    it("maps a positive value to a fixed thinking budget", async () => {
+    it("maps a positive value to a fixed thinking budget with summarized display", async () => {
       process.env.MAX_THINKING_TOKENS = "12000";
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-      expect(capturedOptions!.thinking).toEqual({ type: "enabled", budgetTokens: 12000 });
+      expect(capturedOptions!.thinking).toEqual({
+        type: "enabled",
+        budgetTokens: 12000,
+        display: "summarized",
+      });
     });
 
-    it("ignores a non-numeric value", async () => {
+    it("falls back to the adaptive default on a non-numeric value", async () => {
       process.env.MAX_THINKING_TOKENS = "lots";
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-      expect(capturedOptions!.thinking).toBeUndefined();
+      expect(capturedOptions!.thinking).toEqual({ type: "adaptive", display: "summarized" });
     });
 
     it("lets a user-provided thinking option override the env default", async () => {

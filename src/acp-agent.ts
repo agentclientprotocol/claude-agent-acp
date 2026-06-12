@@ -3880,20 +3880,27 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
 /** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
  *  option. The `maxThinkingTokens` option it used to feed is deprecated and
  *  reduced to on/off on current models, so map the value to explicit thinking
- *  config instead: unset → `undefined` (SDK default, adaptive on models that
+ *  config instead: unset → adaptive (matching the SDK default on models that
  *  support it); `0` → disabled; a positive integer → a fixed token budget.
- *  Anything else is ignored with a warning. */
+ *  Anything else is ignored with a warning.
+ *
+ *  Recent models default `display` to "omitted", which streams thinking blocks
+ *  whose text is empty (signature-only) — clients receive agent_thought_chunk
+ *  notifications with no content. Request "summarized" explicitly so thought
+ *  chunks carry visible text. */
 function resolveThinkingConfig(
   raw: string | undefined,
   logger: Logger,
 ): ThinkingConfig | undefined {
-  if (raw === undefined) return undefined;
+  if (raw === undefined) return { type: "adaptive", display: "summarized" };
   const parsed = Number.parseInt(raw, 10);
   if (Number.isNaN(parsed) || parsed < 0) {
     logger.error(`Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${raw}'.`);
-    return undefined;
+    return { type: "adaptive", display: "summarized" };
   }
-  return parsed === 0 ? { type: "disabled" } : { type: "enabled", budgetTokens: parsed };
+  return parsed === 0
+    ? { type: "disabled" }
+    : { type: "enabled", budgetTokens: parsed, display: "summarized" };
 }
 
 function parseModelConfig(
