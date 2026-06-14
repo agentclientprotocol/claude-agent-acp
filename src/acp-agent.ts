@@ -3195,6 +3195,21 @@ function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string
     seen.add(trimmed);
   }
 
+  // The custom model option (ANTHROPIC_CUSTOM_MODEL_OPTION) is exempt from the
+  // allowlist, the same way Default is. Per the model-config docs it adds an
+  // entry "without replacing the built-in aliases" and "appears at the bottom of
+  // the /model picker", so we append it last and skip the allowlist filter; this
+  // keeps a slim alias allowlist from hiding the custom model row.
+  // https://code.claude.com/docs/en/model-config#add-a-custom-model-option
+  const customModelOption = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION?.trim();
+  if (customModelOption && !seen.has(customModelOption)) {
+    const customModel = sdkModels.find((m) => m.value === customModelOption);
+    if (customModel) {
+      result.push(customModel);
+      seen.add(customModel.value);
+    }
+  }
+
   return result;
 }
 
