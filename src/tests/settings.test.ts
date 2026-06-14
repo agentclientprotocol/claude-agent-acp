@@ -7,13 +7,26 @@ import * as os from "node:os";
 describe("SettingsManager", () => {
   let tempDir: string;
   let settingsManager: SettingsManager;
+  let originalConfigDir: string | undefined;
 
   beforeEach(async () => {
     tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "settings-test-"));
+    // Isolate the user tier. resolveSettings reads the user settings.json from
+    // CLAUDE_CONFIG_DIR at call time; without this it falls back to the real
+    // ~/.claude and the developer's own settings (e.g. availableModels) leak
+    // into the merge, making union-based assertions fail on their machine.
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = path.join(tempDir, "user-config");
+    await fs.promises.mkdir(process.env.CLAUDE_CONFIG_DIR, { recursive: true });
   });
 
   afterEach(async () => {
     settingsManager?.dispose();
+    if (originalConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    }
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   });
 
