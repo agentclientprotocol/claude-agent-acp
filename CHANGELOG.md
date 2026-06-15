@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.45.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.44.0...v0.45.0) (2026-06-15)
+
+
+### Features
+
+* **deps-dev:** bump the minor group with 3 updates ([#763](https://github.com/agentclientprotocol/claude-agent-acp/issues/763)) ([7de5e4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/7de5e4bcca9bfea70593092060f82bc8abe33e0e))
+* **deps:** bump @anthropic-ai/claude-agent-sdk to 0.3.177 ([#771](https://github.com/agentclientprotocol/claude-agent-acp/issues/771)) ([1be5ca5](https://github.com/agentclientprotocol/claude-agent-acp/commit/1be5ca57ee772fe90e41126365dc4186a18ad257))
+
+
+### Bug Fixes
+
+* preserve ANTHROPIC_CUSTOM_MODEL_OPTION when availableModels is set ([#768](https://github.com/agentclientprotocol/claude-agent-acp/issues/768)) ([cc2885f](https://github.com/agentclientprotocol/claude-agent-acp/commit/cc2885f6a9993cf61e759c3c770015f94c218627))
+
 ## [0.44.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.43.0...v0.44.0) (2026-06-09)
 
 
