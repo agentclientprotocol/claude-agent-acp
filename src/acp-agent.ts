@@ -1140,6 +1140,25 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "informational": {
+                // Free-form notice from the SDK (e.g. why a UserPromptSubmit/Stop
+                // hook blocked continuation). Surface the text so the user sees it
+                // instead of a silent stop. ACP's agent_message_chunk has no
+                // severity field, so fold the level into the text for the more
+                // prominent levels ('info' is transcript-only noise — leave plain).
+                const text =
+                  message.level === "info"
+                    ? message.content
+                    : `**${message.level[0].toUpperCase()}${message.level.slice(1)}:** ${message.content}`;
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: { type: "text", text },
+                  },
+                });
+                break;
+              }
               case "hook_started":
               case "hook_progress":
               case "hook_response":
@@ -1148,6 +1167,11 @@ export class ClaudeAcpAgent implements Agent {
               case "task_notification":
               case "task_progress":
               case "task_updated":
+                break;
+              case "worker_shutting_down":
+                // A Remote Control worker announced a graceful teardown. This is a
+                // live-tail signal for remote clients to explain why a session went
+                // away; it's not meaningful for a local stdio ACP session.
                 break;
               case "elicitation_complete": {
                 // A url-mode MCP elicitation finished server-side. Let the client
