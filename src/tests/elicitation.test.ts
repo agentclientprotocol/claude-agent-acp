@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import type { CreateElicitationRequest, CreateElicitationResponse } from "@agentclientprotocol/sdk";
+import type {
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  EnumOption,
+} from "@agentclientprotocol/sdk";
 import type { ElicitationRequest } from "@anthropic-ai/claude-agent-sdk";
 import {
   applyAskElicitationResponse,
@@ -19,14 +23,18 @@ const SESSION_ID = "session-1";
  */
 function mkQuestion(
   question: string,
-  options: Array<{ label: string; description?: string }>,
+  options: Array<{ label: string; description?: string; preview?: string }>,
   opts: { header?: string; multiSelect?: boolean } = {},
 ): AskUserQuestion {
   return {
     question,
     header: opts.header ?? "",
     multiSelect: opts.multiSelect ?? false,
-    options: options.map((o) => ({ label: o.label, description: o.description ?? "" })),
+    options: options.map((o) => ({
+      label: o.label,
+      description: o.description ?? "",
+      ...(o.preview ? { preview: o.preview } : {}),
+    })),
   } as AskUserQuestion;
 }
 
@@ -179,12 +187,60 @@ describe("askUserQuestionsToCreateRequest", () => {
       title: "Library",
       description: undefined,
       oneOf: [
-        { const: "date-fns", title: "date-fns — Lightweight" },
+        {
+          const: "date-fns",
+          title: "date-fns — Lightweight",
+          // Structured description forwarded under `_meta` so clients can render
+          // it as secondary text instead of parsing it out of the title.
+          _meta: { "_claude/askUserQuestionOption": { description: "Lightweight" } },
+        },
+        // No description → no `_meta` emitted.
         { const: "luxon", title: "luxon" },
       ],
     });
     // The full question text is not used as a property key.
     expect(schema.properties?.["Which library?"]).toBeUndefined();
+  });
+
+  it("forwards option description and preview under _meta for rich clients", () => {
+    const questions = [
+      mkQuestion("Which layout?", [
+        {
+          label: "Grid",
+          description: "Cards in a responsive grid",
+          preview: "```\n[ ] [ ] [ ]\n[ ] [ ] [ ]\n```",
+        },
+        { label: "List", description: "Stacked rows" },
+        { label: "Plain" },
+      ]),
+    ];
+
+    const schema = (
+      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
+        CreateElicitationRequest,
+        { mode: "form" }
+      >
+    ).requestedSchema;
+    const oneOf = (schema.properties?.["question_0"] as { oneOf: EnumOption[] }).oneOf;
+
+    // Both description and preview travel structurally; the title still flattens
+    // the description for clients that only read const/title.
+    expect(oneOf[0]).toEqual({
+      const: "Grid",
+      title: "Grid — Cards in a responsive grid",
+      _meta: {
+        "_claude/askUserQuestionOption": {
+          description: "Cards in a responsive grid",
+          preview: "```\n[ ] [ ] [ ]\n[ ] [ ] [ ]\n```",
+        },
+      },
+    });
+    // Description only → preview omitted from _meta.
+    expect(oneOf[1]._meta).toEqual({
+      "_claude/askUserQuestionOption": { description: "Stacked rows" },
+    });
+    // Neither → no _meta at all.
+    expect(oneOf[2]._meta).toBeUndefined();
   });
 
   it("includes a per-question optional free-text custom-answer field", () => {
