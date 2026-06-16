@@ -341,7 +341,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     const properties =
       elicitation.mode === "form" ? Object.keys(elicitation.requestedSchema.properties ?? {}) : [];
     expect(properties).toContain("question_0");
-    expect(properties).toContain("customAnswer");
+    expect(properties).toContain("question_0_custom");
 
     // AskUserQuestion must NOT fall back to a generic permission prompt: no
     // permission request should have carried AskUserQuestion's `questions`.

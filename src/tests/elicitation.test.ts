@@ -208,7 +208,6 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
     });
-    expect(schema.properties?.["customAnswer"]).toBeUndefined();
   });
 
   it("builds an array property for multi-select questions and includes per-field question text", () => {
