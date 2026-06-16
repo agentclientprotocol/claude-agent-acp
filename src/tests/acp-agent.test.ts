@@ -4941,6 +4941,9 @@ describe("post-error recovery", () => {
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
     expect(compactResult.stopReason).toBe("end_turn");
+    // /compact settled with its OWN result (10 tokens), proving the orphan was
+    // skipped — not promoted onto the /compact turn (which would leak its 999).
+    expect(compactResult.usage?.inputTokens).toBe(10);
     await agent.sessions["test-session"]?.consumer;
   });
 });
