@@ -1415,6 +1415,7 @@ export class ClaudeAcpAgent implements Agent {
                 });
               }
               stopReason = "refusal";
+              settleActive({ stopReason: "refusal", usage: sessionUsage(session) });
               break;
             }
 
@@ -1494,6 +1495,16 @@ export class ClaudeAcpAgent implements Agent {
               default:
                 unreachable(message, this.logger);
                 break;
+            }
+            // Settle the user turn at its terminal result so the client unlocks
+            // as soon as the answer is done, rather than waiting for the SDK's
+            // trailing `idle` (which can lag while background work runs — issue
+            // #773). The consumer keeps draining afterward (absorbing idle and
+            // forwarding any background output). is_error/auth already settled
+            // via failActive; cancellation is left to the idle/abort path.
+            // settleActive is idempotent, so a duplicate idle is a no-op.
+            if (!isTaskNotification && !session.cancelled) {
+              settleActive({ stopReason, usage: sessionUsage(session) });
             }
             break;
           }

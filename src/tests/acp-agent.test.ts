@@ -1787,9 +1787,12 @@ describe("stop reason propagation", () => {
       stop_reason: null,
       is_error: false,
     });
-    // Background task used some tokens
+    // Background task used some tokens. Real autonomous followups carry a
+    // task-notification origin, which keeps them out of the user turn's result
+    // and usage.
     backgroundTaskResult.usage.input_tokens = 100;
     backgroundTaskResult.usage.output_tokens = 50;
+    (backgroundTaskResult as { origin?: unknown }).origin = { kind: "task-notification" };
 
     const promptResult = createResultMessage({
       subtype: "success",
@@ -1856,13 +1859,165 @@ describe("stop reason propagation", () => {
     });
 
     expect(response.stopReason).toBe("end_turn");
-    // Usage should include both background task and prompt result tokens
-    expect(response.usage?.inputTokens).toBe(
-      backgroundTaskResult.usage.input_tokens + promptResult.usage.input_tokens,
-    );
-    expect(response.usage?.outputTokens).toBe(
-      backgroundTaskResult.usage.output_tokens + promptResult.usage.output_tokens,
-    );
+    // The prompt resolves with its OWN result's usage; the background
+    // task-notification result's tokens are reported separately (via
+    // usage_update), not folded into the user turn's response.
+    expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
+    expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
+  });
+
+  it("resolves at the terminal result without waiting for a lagging idle (issue #773)", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    // The SDK's trailing `idle` can lag far behind the result while it flushes
+    // held-back results / drains background agents. prompt() must resolve from
+    // the result so the composer unlocks immediately, not block until idle.
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let idleYielded = false;
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      await idleGate;
+      idleYielded = true;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    // Resolved from the result while idle is still gated.
+    expect(response.stopReason).toBe("end_turn");
+    expect(idleYielded).toBe(false);
+
+    // Releasing the idle lets the consumer drain cleanly without double-settling.
+    releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("forwards background output that arrives after the turn resolves (issue #679)", async () => {
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AgentSideConnection;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // The user turn completes here — prompt() resolves — and the turn goes
+      // idle. The old per-prompt loop returned at this idle, so anything after
+      // it was not consumed until the next prompt (issue #679).
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      // Between-turn background output: a top-level assistant message arriving
+      // with no prompt awaiting. The persistent consumer must still forward it.
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "assistant",
+          model: "claude-sonnet-4-5",
+          stop_reason: "end_turn",
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          content: [{ type: "text", text: "between-turn background note" }],
+        },
+      };
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    // Drain the consumer so the post-resolution message is processed.
+    await agent.sessions["test-session"]?.consumer;
+
+    const chunkTexts = sessionUpdates
+      .filter((u) => u.update?.sessionUpdate === "agent_message_chunk")
+      .map((u) => u.update.content?.text);
+    expect(chunkTexts).toContain("between-turn background note");
   });
 
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
@@ -3730,6 +3885,9 @@ describe("emitRawSDKMessages", () => {
     );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    // prompt() resolves at the turn's result; the trailing idle is forwarded by
+    // the consumer afterward, so wait for it to drain before asserting.
+    await agent.sessions["test-session"]?.consumer;
 
     const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
     // All system messages should match (compact_boundary + status + session_state_changed)
@@ -3772,6 +3930,9 @@ describe("emitRawSDKMessages", () => {
     );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    // The task-notification result arrives after the user-turn result that
+    // resolves prompt(); wait for the consumer to drain it before asserting.
+    await agent.sessions["test-session"]?.consumer;
 
     const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
     expect(sdkMessages).toHaveLength(1);
@@ -3791,6 +3952,9 @@ describe("emitRawSDKMessages", () => {
     );
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    // The second (task-notification) result arrives after the one that resolves
+    // prompt(); wait for the consumer to drain it before asserting.
+    await agent.sessions["test-session"]?.consumer;
 
     const sdkMessages = extNotifications.filter((n) => n.method === "_claude/sdkMessage");
     expect(sdkMessages).toHaveLength(2);
