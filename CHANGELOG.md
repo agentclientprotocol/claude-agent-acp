@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.46.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.45.1...v0.46.0) (2026-06-16)
+
+
+### Features
+
+* Update to claude-agent-sdk 0.3.178 ([#777](https://github.com/agentclientprotocol/claude-agent-acp/issues/777)) ([58549ff](https://github.com/agentclientprotocol/claude-agent-acp/commit/58549ffe6a8b02ce59894e567407bd4299c11428))
+
+
+### Bug Fixes
+
+* Better handle out of turn events ([#780](https://github.com/agentclientprotocol/claude-agent-acp/issues/780)) ([4f273a2](https://github.com/agentclientprotocol/claude-agent-acp/commit/4f273a20d870c9c69f71556b8e0519f1de30f285))
+* Forward option details in elicitation meta ([#779](https://github.com/agentclientprotocol/claude-agent-acp/issues/779)) ([b364059](https://github.com/agentclientprotocol/claude-agent-acp/commit/b3640599ae685beecacd93e012d5bbc9dac716f7)), closes [#764](https://github.com/agentclientprotocol/claude-agent-acp/issues/764)
+
 ## [0.45.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.45.0...v0.45.1) (2026-06-16)
 
 
