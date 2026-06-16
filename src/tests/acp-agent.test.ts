@@ -1476,6 +1476,73 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
     // message.
     expect(messageIdForGrouping(replayedAssistant!)).toBe(messageStartApiId);
   }, 30000);
+
+  // Pins the two SDK invariants the persistent consumer's lifecycle relies on
+  // (see runConsumer's `done` handling and Session.queryClosed):
+  //   1. A streaming-input query does NOT yield `done` between turns — it stays
+  //      open for the session's life, so a second pushed message starts a
+  //      second turn rather than ending the stream. If this regressed, the
+  //      consumer would tear the session down after the first turn's idle.
+  //   2. Ending the input stream drives the iterator to `done`, and once `done`
+  //      it stays `done` (the iterator is not revivable) — which is what lets us
+  //      treat a `done` as a permanent stream close and reject later prompts
+  //      instead of restarting a consumer over an exhausted query.
+  it("keeps the streaming query open across turns and stays done after input ends", async () => {
+    const sessionId = randomUUID();
+    const input = new Pushable<any>();
+    const q = query({
+      prompt: input,
+      options: {
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        sessionId,
+        includePartialMessages: false,
+        allowedTools: [],
+      },
+    });
+
+    const pushPrompt = (text: string) => {
+      const msg = promptToClaude({ sessionId, prompt: [{ type: "text", text }] });
+      msg.uuid = randomUUID();
+      input.push(msg);
+    };
+
+    // Drain one turn, asserting the stream never ends mid-session, and return
+    // whether the turn produced a `result` before its terminal `idle`.
+    const drainTurn = async () => {
+      let sawResult = false;
+      while (true) {
+        const { value, done } = await q.next();
+        // Invariant 1: the streaming query must not end while a turn is live.
+        expect(done).toBe(false);
+        const message = value as { type: string; subtype?: string; state?: string };
+        if (message.type === "result") sawResult = true;
+        if (
+          message.type === "system" &&
+          message.subtype === "session_state_changed" &&
+          message.state === "idle"
+        ) {
+          return sawResult;
+        }
+      }
+    };
+
+    pushPrompt("Reply with exactly this word and nothing else: one");
+    expect(await drainTurn()).toBe(true);
+
+    // The first turn ended (idle), but the query stays open: pushing a second
+    // user message yields a second turn rather than `done`.
+    pushPrompt("Reply with exactly this word and nothing else: two");
+    expect(await drainTurn()).toBe(true);
+
+    // Invariant 2: ending the input is what terminates the iterator.
+    input.end();
+    const tail = await q.next();
+    expect(tail.done).toBe(true);
+
+    // ...and it stays terminated — a later next() does not revive the stream.
+    const again = await q.next();
+    expect(again.done).toBe(true);
+  }, 60000);
 });
 
 describe("permission requests", () => {
@@ -1862,6 +1929,83 @@ describe("stop reason propagation", () => {
     // The prompt resolves with its OWN result's usage; the background
     // task-notification result's tokens are reported separately (via
     // usage_update), not folded into the user turn's response.
+    expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
+    expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
+  });
+
+  it("does not fold a task-notification result's tokens into an already-active turn's usage", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+
+    // A task-notification followup that interleaves AFTER the user turn is
+    // active (its echo seen) but BEFORE the turn's own result. Its tokens must
+    // not leak into the user turn's usage even though the accumulator is only
+    // reset on activation.
+    const backgroundTaskResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    backgroundTaskResult.usage.input_tokens = 100;
+    backgroundTaskResult.usage.output_tokens = 50;
+    (backgroundTaskResult as { origin?: unknown }).origin = { kind: "task-notification" };
+
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      // User echo first → the turn is now active and its accumulator reset.
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // Task-notification result lands mid-turn...
+      yield backgroundTaskResult;
+      // ...then the user turn's own result settles it.
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = {
+      query: messageGenerator() as any,
+      input,
+      cwd: "/tmp/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
+      cancelled: false,
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      abortController: new AbortController(),
+      configOptions: [],
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    };
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
     expect(response.usage?.inputTokens).toBe(promptResult.usage.input_tokens);
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
@@ -4499,6 +4643,123 @@ describe("post-error recovery", () => {
 
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  function userEcho(u: any) {
+    return {
+      type: "user",
+      message: u.message,
+      parent_tool_use_id: null,
+      uuid: u.uuid,
+      session_id: "test-session",
+      isReplay: true,
+    };
+  }
+
+  function injectGeneratorSession(
+    agent: ClaudeAcpAgent,
+    makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
+  ) {
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = {
+      query: makeGenerator(input) as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    } as any;
+    return input;
+  }
+
+  it("does not let a settled turn's lagging idle resolve the next turn early (issue #773 race)", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        // Turn 1's terminal result settles its prompt() immediately (#773).
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        // Turn 2 is echoed and activated BEFORE turn 1's trailing idle arrives.
+        const u2 = await iter.next();
+        yield userEcho(u2.value);
+        // This lagging idle belongs to turn 1, not turn 2. It must be absorbed,
+        // not used to settle the freshly-activated turn 2 (which would resolve
+        // turn 2 with end_turn and the reset, zero usage before its result).
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        // Turn 2's own result is what should settle it, carrying real usage.
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    // If turn 1's lagging idle had settled turn 2, it would have resolved with
+    // the reset (zero) usage before turn 2's result accumulated; turn 2's real
+    // result carries 10 input tokens.
+    expect(second.usage?.inputTokens).toBe(10);
+  });
+
+  it("rejects later prompts after the query stream errors instead of hanging on a dead consumer", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        // The next prompt drives the stream, which then errors with a
+        // transport failure that is NOT a process death.
+        await iter.next();
+        throw new Error("stream decode error");
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+
+    // The in-flight prompt rejects when the stream errors rather than hanging.
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] }),
+    ).rejects.toThrow();
+
+    // A subsequent prompt rejects up front (the dead consumer is not restarted
+    // on the exhausted stream, which would otherwise hang or fake an end_turn).
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "third" }] }),
+    ).rejects.toThrow(/start a new session/);
   });
 });
 

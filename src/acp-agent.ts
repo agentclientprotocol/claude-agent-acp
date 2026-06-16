@@ -200,6 +200,12 @@ type Session = {
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
   consumer?: Promise<void>;
+  /** Set once the SDK query stream has terminated (it ran to `done` or threw a
+   *  non-process error). The query iterator is not reusable afterward, so a
+   *  later `prompt()` rejects instead of enqueueing onto a dead stream and
+   *  hanging (or silently restarting a consumer that resolves `end_turn`
+   *  without ever reaching the model). */
+  queryClosed?: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
@@ -846,6 +852,15 @@ export class ClaudeAcpAgent implements Agent {
     if (!session) {
       throw new Error("Session not found");
     }
+    // The SDK query stream already terminated (see `queryClosed`); its iterator
+    // can't be revived, so enqueueing here would hang on a deferred that never
+    // settles. Fail clearly and let the client start a fresh session.
+    if (session.queryClosed) {
+      throw RequestError.internalError(
+        undefined,
+        "The Claude Agent session has ended. Please start a new session.",
+      );
+    }
 
     const userMessage = promptToClaude(params);
     const promptUuid = randomUUID();
@@ -969,13 +984,20 @@ export class ClaudeAcpAgent implements Agent {
     };
 
     /** Ensure there is an active turn before a result that carries no echo
-     *  (local-only commands) by promoting the queue head. */
+     *  (local-only commands) by promoting the queue head. Only local-only
+     *  commands legitimately return a result without a user-message echo to
+     *  activate them; a normal turn is always activated by its echo before its
+     *  result. So if the head is NOT a local-only command, leave activeTurn
+     *  unset: such a result is an orphan (e.g. the SDK still ran a queued turn
+     *  that cancel() already resolved, since its user message was pushed before
+     *  the cancel) and promoting the head would misattribute the orphan's stop
+     *  reason and usage to an unrelated queued prompt. */
     const ensureActiveTurn = () => {
       if (session.activeTurn) {
         return;
       }
       const head = (session.turnQueue ?? []).find((t) => !t.settled);
-      if (head) {
+      if (head?.isLocalOnlyCommand) {
         activateTurn(head);
       }
     };
@@ -1072,26 +1094,41 @@ export class ClaudeAcpAgent implements Agent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
-          // The stream ended. Settle any in-flight turns so no prompt() hangs:
+          // The stream ended. The query iterator can't be revived, so mark the
+          // session closed; a later prompt() rejects up front rather than
+          // restarting a consumer on the exhausted stream (which would resolve
+          // end_turn without ever reaching the model).
+          session.queryClosed = true;
+          // Settle the turn that was in flight so its prompt() doesn't hang:
           // cancelled if a cancel is pending, otherwise the accumulated outcome.
           settleActive(
             session.cancelled
               ? { stopReason: "cancelled" }
               : { stopReason, usage: sessionUsage(session) },
           );
+          // Queued turns the SDK never started: a cancel turns them into
+          // "cancelled", but otherwise the stream died before they ran, so
+          // reject them rather than reporting a success (end_turn) for a prompt
+          // that produced no output.
           for (const queued of [...(session.turnQueue ?? [])]) {
             if (!queued.settled) {
               queued.settled = true;
-              queued.resolve(
-                session.cancelled ? { stopReason: "cancelled" } : { stopReason: "end_turn" },
-              );
+              if (session.cancelled) {
+                queued.resolve({ stopReason: "cancelled" });
+              } else {
+                queued.reject(
+                  RequestError.internalError(
+                    undefined,
+                    "The Claude Agent session ended before this prompt ran. Please start a new session.",
+                  ),
+                );
+              }
             }
           }
           session.turnQueue = [];
-          // The query is exhausted. If the session is still around (the SDK
-          // closed the stream without us tearing it down), drop the finished
-          // consumer handle so a later prompt restarts one rather than awaiting
-          // a deferred that will never settle.
+          // Drop the finished consumer handle. With queryClosed set, prompt()
+          // won't restart it, but clearing keeps the dead promise from being
+          // mistaken for a live consumer.
           session.consumer = undefined;
           return;
         }
@@ -1193,14 +1230,20 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  // `idle` is the authoritative turn-over signal. Settle the
-                  // active turn here; the consumer keeps running for subsequent
-                  // turns and background work rather than returning.
-                  settleActive(
-                    session.cancelled
-                      ? { stopReason: "cancelled" }
-                      : { stopReason, usage: sessionUsage(session) },
-                  );
+                  // A non-cancelled turn already settled at its terminal
+                  // `result` (issue #773), so this trailing `idle` is just
+                  // absorbed. We must NOT settle `activeTurn` here in that case:
+                  // `idle` carries no turn identity, and it can lag (the SDK
+                  // flushes held-back results / drains background agents first),
+                  // so by the time it arrives the SDK may have echoed the NEXT
+                  // turn and activated it — settling now would resolve that new
+                  // turn prematurely with end_turn and ~zero usage, dropping its
+                  // real result. Only a cancelled turn relies on `idle`: its
+                  // `result` is dropped at the `session.cancelled` guard, so it
+                  // never settles at a result and must settle here.
+                  if (session.cancelled) {
+                    settleActive({ stopReason: "cancelled" });
+                  }
                 }
                 break;
               }
@@ -1355,11 +1398,19 @@ export class ClaudeAcpAgent implements Agent {
               ensureActiveTurn();
             }
 
-            // Accumulate usage from this result
-            session.accumulatedUsage.inputTokens += message.usage.input_tokens;
-            session.accumulatedUsage.outputTokens += message.usage.output_tokens;
-            session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
-            session.accumulatedUsage.cachedWriteTokens += message.usage.cache_creation_input_tokens;
+            // Accumulate usage into the user turn's tally. Skip task-notification
+            // followups: their cost is real but is reported separately via the
+            // usage_update below, and `session.accumulatedUsage` is only reset on
+            // turn activation — so folding a task-notification result that lands
+            // after the next turn is active (but before it settles) would leak
+            // those tokens into that turn's PromptResponse.usage.
+            if (!isTaskNotification) {
+              session.accumulatedUsage.inputTokens += message.usage.input_tokens;
+              session.accumulatedUsage.outputTokens += message.usage.output_tokens;
+              session.accumulatedUsage.cachedReadTokens += message.usage.cache_read_input_tokens;
+              session.accumulatedUsage.cachedWriteTokens +=
+                message.usage.cache_creation_input_tokens;
+            }
 
             const matchingModelUsage = lastAssistantModel
               ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
@@ -1858,6 +1909,13 @@ export class ClaudeAcpAgent implements Agent {
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
         failAllTurns(error);
+        // query.next() threw, so the iterator is finished and the consumer is
+        // exiting. Mark the stream closed and drop the consumer handle so a
+        // later prompt() rejects up front instead of awaiting a deferred that
+        // no running consumer will ever settle (the early-return in
+        // ensureConsumer would otherwise see a truthy-but-dead consumer).
+        session.queryClosed = true;
+        session.consumer = undefined;
       }
     }
   }
