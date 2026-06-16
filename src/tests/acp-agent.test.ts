@@ -75,32 +75,29 @@ function userEcho(u: any) {
   };
 }
 
-/** Install a mock session whose query is a caller-supplied async generator
- *  driven by the session's streaming input. Returns the input Pushable so the
- *  test can push additional turns. Centralizes the Session literal so tests that
- *  need bespoke message ordering don't each re-declare it. */
-function injectGeneratorSession(
-  agent: ClaudeAcpAgent,
-  makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
-) {
-  const input = new Pushable<any>();
-  // Wrap the generator with the Query methods cancel()/teardown call, so tests
-  // that exercise cancellation don't hit "interrupt is not a function".
-  const query = Object.assign(makeGenerator(input), {
+/** Wrap a mock async generator with the `Query` methods the agent calls outside
+ *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
+ *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
+function wrapQuery(generator: AsyncGenerator<any>) {
+  return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
-  });
-  agent.sessions["test-session"] = {
-    query: query as any,
-    input,
+  }) as any;
+}
+
+/** The common `Session` mock fields, with per-test overrides spread on top.
+ *  Centralizes the boilerplate (usage accumulator, caches, controllers) so a new
+ *  Session field is added in one place rather than every inline literal. */
+function mockSessionState(overrides: Record<string, any> = {}) {
+  return {
     cancelled: false,
     cwd: "/test",
     sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
     modes: { currentModeId: "default", availableModes: [] },
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
-    settingsManager: { dispose: vi.fn() } as any,
+    settingsManager: { dispose: vi.fn() },
     accumulatedUsage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -114,7 +111,23 @@ function injectGeneratorSession(
     taskState: new Map(),
     toolUseCache: {},
     messageIdToUuid: new Map(),
+    ...overrides,
   } as any;
+}
+
+/** Install a mock session whose query is a caller-supplied async generator
+ *  driven by the session's streaming input. Returns the input Pushable so the
+ *  test can push additional turns. Centralizes the Session literal so tests that
+ *  need bespoke message ordering don't each re-declare it. */
+function injectGeneratorSession(
+  agent: ClaudeAcpAgent,
+  makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
+) {
+  const input = new Pushable<any>();
+  agent.sessions["test-session"] = mockSessionState({
+    query: wrapQuery(makeGenerator(input)),
+    input,
+  });
   return input;
 }
 
@@ -1807,7 +1820,7 @@ describe("stop reason propagation", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -1953,7 +1966,7 @@ describe("stop reason propagation", () => {
     }
 
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cwd: "/tmp/test",
       sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
@@ -2071,7 +2084,7 @@ describe("stop reason propagation", () => {
     }
 
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -2158,7 +2171,7 @@ describe("stop reason propagation", () => {
     }
 
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -2727,7 +2740,7 @@ describe("usage_update computation", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -3739,7 +3752,7 @@ describe("assembled assistant text fallback", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -3932,7 +3945,7 @@ describe("emitRawSDKMessages", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -4168,7 +4181,7 @@ describe("result origin handling", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -4342,7 +4355,7 @@ describe("memory_recall handling", () => {
       yield* messages;
     }
     agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
+      query: wrapQuery(messageGenerator()),
       input,
       cancelled: false,
       cwd: "/test",
@@ -4750,6 +4763,14 @@ describe("post-error recovery", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "third" }] }),
     ).rejects.toThrow(/start a new session/);
+
+    // The broken stream's resources are released even though the session husk
+    // stays in the map for the clear error above: the subprocess/query is
+    // closed, its abort signal fired, and the settings watchers disposed.
+    const session = agent.sessions["test-session"];
+    expect(session.query.close).toHaveBeenCalled();
+    expect(session.abortController.signal.aborted).toBe(true);
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
   });
 
   // Poll a condition across microtask/timer turns, so a test can wait for the

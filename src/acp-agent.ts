@@ -1976,15 +1976,19 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
-  /** Mark a session's SDK query stream as permanently ended and release the
-   *  resources tied to it: drop the consumer handle, dispose the settings
-   *  watchers, and end the input stream. The query iterator is not revivable, so
+  /** Mark a session's SDK query stream as permanently ended and release every
+   *  resource tied to it: drop the consumer handle, dispose the settings
+   *  watchers, end the input stream, abort the SDK abort signal, and close the
+   *  query (terminating the subprocess). The query iterator is not revivable, so
    *  `prompt()`/`cancel()` consult `queryClosed` and fail/short-circuit instead
    *  of acting on a dead stream. Idempotent (guarded by `queryClosed`), so the
    *  consumer's done/error paths and a later `teardownSession` can all call it
-   *  without double-disposing. Does NOT remove the session from the map — that
-   *  is `teardownSession`'s job — so prompt() can still answer with a clear
-   *  "session ended" error after an unexpected stream close. */
+   *  without double-releasing. Does NOT remove the session from the map — that is
+   *  `teardownSession`'s job — so prompt() can still answer with a clear "session
+   *  ended" error after an unexpected stream close. The leftover session object
+   *  is a lightweight husk (its heavy resources are released here) and is evicted
+   *  on the next closeSession/deleteSession or when the connection's `dispose()`
+   *  runs. */
   private closeQueryStream(session: Session): void {
     if (session.queryClosed) {
       return;
@@ -1993,6 +1997,8 @@ export class ClaudeAcpAgent implements Agent {
     session.consumer = undefined;
     session.settingsManager.dispose();
     session.input.end();
+    session.abortController.abort();
+    session.query.close();
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -2004,20 +2010,18 @@ export class ClaudeAcpAgent implements Agent {
     }
     await this.cancel({ sessionId });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
-    // wedged consumer only wakes when `cancelController` aborts — closing the
-    // query/abortController below doesn't touch it. Since we're tearing the
-    // session down anyway, wake the consumer now so the in-flight prompt()
-    // resolves immediately instead of after the floor, and clear the timer so it
-    // can't outlive the deleted session (it isn't unref'd and would otherwise
-    // keep the event loop alive until it fires).
+    // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
+    // below doesn't touch it. Since we're tearing the session down anyway, wake
+    // the consumer now so the in-flight prompt() resolves immediately instead of
+    // after the floor, and clear the timer so it can't outlive the deleted
+    // session (it isn't unref'd and would otherwise keep the event loop alive
+    // until it fires).
     if (session.forceCancelTimer) {
       clearTimeout(session.forceCancelTimer);
       session.forceCancelTimer = undefined;
     }
     session.cancelController?.abort();
     this.closeQueryStream(session);
-    session.abortController.abort();
-    session.query.close();
     delete this.sessions[sessionId];
   }
 
