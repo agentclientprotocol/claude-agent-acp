@@ -1577,39 +1577,37 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
       input.push(msg);
     };
 
-    // Drain one turn, asserting the stream never ends mid-session, and return
-    // whether the turn produced a `result` before its terminal `idle`.
-    const drainTurn = async () => {
-      let sawResult = false;
+    // Drain one turn up to its terminal `result`, asserting the stream stays
+    // open (never `done`) meanwhile. We delimit by `result` — NOT by the
+    // trailing `session_state_changed: idle` — because some CLI binaries don't
+    // emit session-state events (issue #497); waiting on idle would hang there.
+    // This also matches how the consumer itself settles a turn (at the result).
+    const drainToResult = async () => {
       while (true) {
         const { value, done } = await q.next();
         // Invariant 1: the streaming query must not end while a turn is live.
         expect(done).toBe(false);
-        const message = value as { type: string; subtype?: string; state?: string };
-        if (message.type === "result") sawResult = true;
-        if (
-          message.type === "system" &&
-          message.subtype === "session_state_changed" &&
-          message.state === "idle"
-        ) {
-          return sawResult;
-        }
+        if ((value as { type?: string }).type === "result") return;
       }
     };
 
     try {
       pushPrompt("Reply with exactly this word and nothing else: one");
-      expect(await drainTurn()).toBe(true);
+      await drainToResult();
 
-      // The first turn ended (idle), but the query stays open: pushing a second
-      // user message yields a second turn rather than `done`.
+      // The query stays open across turns: a second pushed message yields a
+      // second turn (its own `result`) rather than ending the stream.
       pushPrompt("Reply with exactly this word and nothing else: two");
-      expect(await drainTurn()).toBe(true);
+      await drainToResult();
 
-      // Invariant 2: ending the input is what terminates the iterator.
+      // Invariant 2: ending the input terminates the iterator. Drain any trailing
+      // messages (e.g. a final idle) until it reports `done`.
       input.end();
-      const tail = await q.next();
-      expect(tail.done).toBe(true);
+      let done = false;
+      for (let i = 0; i < 20 && !done; i++) {
+        done = (await q.next()).done ?? false;
+      }
+      expect(done).toBe(true);
 
       // ...and it stays terminated — a later next() does not revive the stream.
       const again = await q.next();
