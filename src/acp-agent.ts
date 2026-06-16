@@ -420,6 +420,11 @@ function shouldHideClaudeAuth(): boolean {
   return process.argv.includes("--hide-claude-auth");
 }
 
+/** Returned to clients when a prompt or cancel targets a session whose SDK
+ *  query stream has already ended (ran to `done` or died). The stream is not
+ *  revivable, so the only recovery is a fresh session. */
+const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start a new session.";
+
 // Bypass Permissions doesn't work if we are a root/sudo user
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
@@ -856,10 +861,7 @@ export class ClaudeAcpAgent implements Agent {
     // can't be revived, so enqueueing here would hang on a deferred that never
     // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
-      throw RequestError.internalError(
-        undefined,
-        "The Claude Agent session has ended. Please start a new session.",
-      );
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
     const userMessage = promptToClaude(params);
@@ -1094,11 +1096,12 @@ export class ClaudeAcpAgent implements Agent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
-          // The stream ended. The query iterator can't be revived, so mark the
-          // session closed; a later prompt() rejects up front rather than
-          // restarting a consumer on the exhausted stream (which would resolve
-          // end_turn without ever reaching the model).
-          session.queryClosed = true;
+          // The stream ended. The query iterator can't be revived, so close the
+          // session's stream (marks queryClosed, drops the consumer handle, and
+          // releases the dead subprocess/settings resources) — a later prompt()
+          // then rejects up front rather than restarting a consumer on the
+          // exhausted stream.
+          this.closeQueryStream(session);
           // Settle the turn that was in flight so its prompt() doesn't hang:
           // cancelled if a cancel is pending, otherwise the accumulated outcome.
           settleActive(
@@ -1106,30 +1109,18 @@ export class ClaudeAcpAgent implements Agent {
               ? { stopReason: "cancelled" }
               : { stopReason, usage: sessionUsage(session) },
           );
-          // Queued turns the SDK never started: a cancel turns them into
-          // "cancelled", but otherwise the stream died before they ran, so
-          // reject them rather than reporting a success (end_turn) for a prompt
-          // that produced no output.
+          // Queued turns the SDK never started never ran, so reject them rather
+          // than reporting a success (end_turn) — or a misleading "cancelled" —
+          // for a prompt that produced no output. (A cancel already settled the
+          // turns that were queued at cancel time and removed them, so anything
+          // still here was enqueued afterward and was not part of the cancel.)
           for (const queued of [...(session.turnQueue ?? [])]) {
             if (!queued.settled) {
               queued.settled = true;
-              if (session.cancelled) {
-                queued.resolve({ stopReason: "cancelled" });
-              } else {
-                queued.reject(
-                  RequestError.internalError(
-                    undefined,
-                    "The Claude Agent session ended before this prompt ran. Please start a new session.",
-                  ),
-                );
-              }
+              queued.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
             }
           }
           session.turnQueue = [];
-          // Drop the finished consumer handle. With queryClosed set, prompt()
-          // won't restart it, but clearing keeps the dead promise from being
-          // mistaken for a live consumer.
-          session.consumer = undefined;
           return;
         }
 
@@ -1677,7 +1668,16 @@ export class ClaudeAcpAgent implements Agent {
                 // must not have its accumulated usage reset by its own echo.
                 if (session.activeTurn !== queued) {
                   if (session.activeTurn) {
-                    settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
+                    // Hand off the previous turn. If a cancel is pending for it
+                    // (its trailing idle hasn't arrived yet), settle it
+                    // "cancelled" per the ACP contract rather than "end_turn" —
+                    // otherwise a cancel followed quickly by the next prompt
+                    // would report the cancelled turn as a normal completion.
+                    settleActive(
+                      session.cancelled
+                        ? { stopReason: "cancelled" }
+                        : { stopReason: "end_turn", usage: sessionUsage(session) },
+                    );
                   }
                   activateTurn(queued);
                 }
@@ -1895,6 +1895,11 @@ export class ClaudeAcpAgent implements Agent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
+      // Either way the query iterator is finished and the consumer is exiting,
+      // so release its resources via closeQueryStream (idempotent). A process
+      // death is unrecoverable, so additionally evict the session so the client
+      // starts fresh; other stream errors keep the session so prompt()/cancel()
+      // can answer with a clear "session ended" error.
       if (processDied) {
         this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
         failAllTurns(
@@ -1903,19 +1908,12 @@ export class ClaudeAcpAgent implements Agent {
             "The Claude Agent process exited unexpectedly. Please start a new session.",
           ),
         );
-        session.settingsManager.dispose();
-        session.input.end();
+        this.closeQueryStream(session);
         delete this.sessions[params.sessionId];
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
         failAllTurns(error);
-        // query.next() threw, so the iterator is finished and the consumer is
-        // exiting. Mark the stream closed and drop the consumer handle so a
-        // later prompt() rejects up front instead of awaiting a deferred that
-        // no running consumer will ever settle (the early-return in
-        // ensureConsumer would otherwise see a truthy-but-dead consumer).
-        session.queryClosed = true;
-        session.consumer = undefined;
+        this.closeQueryStream(session);
       }
     }
   }
@@ -1923,6 +1921,13 @@ export class ClaudeAcpAgent implements Agent {
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions[params.sessionId];
     if (!session) {
+      return;
+    }
+    // The stream already ended (see closeQueryStream): every in-flight turn was
+    // settled when it closed, and there is no live query to interrupt. Calling
+    // query.interrupt() on a finished iterator could reject and surface from
+    // this fire-and-forget notification, so there is nothing to do here.
+    if (session.queryClosed) {
       return;
     }
     session.cancelled = true;
@@ -1971,8 +1976,27 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
-  /** Cleanly tear down a session: cancel in-flight work, dispose resources,
-   *  and remove it from the session map. */
+  /** Mark a session's SDK query stream as permanently ended and release the
+   *  resources tied to it: drop the consumer handle, dispose the settings
+   *  watchers, and end the input stream. The query iterator is not revivable, so
+   *  `prompt()`/`cancel()` consult `queryClosed` and fail/short-circuit instead
+   *  of acting on a dead stream. Idempotent (guarded by `queryClosed`), so the
+   *  consumer's done/error paths and a later `teardownSession` can all call it
+   *  without double-disposing. Does NOT remove the session from the map — that
+   *  is `teardownSession`'s job — so prompt() can still answer with a clear
+   *  "session ended" error after an unexpected stream close. */
+  private closeQueryStream(session: Session): void {
+    if (session.queryClosed) {
+      return;
+    }
+    session.queryClosed = true;
+    session.consumer = undefined;
+    session.settingsManager.dispose();
+    session.input.end();
+  }
+
+  /** Cleanly tear down a session: cancel in-flight work, release stream
+   *  resources, and remove it from the session map. */
   private async teardownSession(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
@@ -1991,7 +2015,7 @@ export class ClaudeAcpAgent implements Agent {
       session.forceCancelTimer = undefined;
     }
     session.cancelController?.abort();
-    session.settingsManager.dispose();
+    this.closeQueryStream(session);
     session.abortController.abort();
     session.query.close();
     delete this.sessions[sessionId];

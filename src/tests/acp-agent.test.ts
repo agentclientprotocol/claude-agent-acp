@@ -62,6 +62,62 @@ import type {
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 
+/** Build the replayed `user` message the SDK echoes back for a pushed prompt,
+ *  used by mock generators to promote a turn to active. */
+function userEcho(u: any) {
+  return {
+    type: "user",
+    message: u.message,
+    parent_tool_use_id: null,
+    uuid: u.uuid,
+    session_id: "test-session",
+    isReplay: true,
+  };
+}
+
+/** Install a mock session whose query is a caller-supplied async generator
+ *  driven by the session's streaming input. Returns the input Pushable so the
+ *  test can push additional turns. Centralizes the Session literal so tests that
+ *  need bespoke message ordering don't each re-declare it. */
+function injectGeneratorSession(
+  agent: ClaudeAcpAgent,
+  makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
+) {
+  const input = new Pushable<any>();
+  // Wrap the generator with the Query methods cancel()/teardown call, so tests
+  // that exercise cancellation don't hit "interrupt is not a function".
+  const query = Object.assign(makeGenerator(input), {
+    interrupt: vi.fn(async () => {}),
+    close: vi.fn(),
+    setModel: vi.fn(async () => {}),
+  });
+  agent.sessions["test-session"] = {
+    query: query as any,
+    input,
+    cancelled: false,
+    cwd: "/test",
+    sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+    modes: { currentModeId: "default", availableModes: [] },
+    models: { currentModelId: "default", availableModels: [] },
+    modelInfos: [],
+    settingsManager: { dispose: vi.fn() } as any,
+    accumulatedUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+    },
+    configOptions: [],
+    abortController: new AbortController(),
+    emitRawSDKMessages: false,
+    contextWindowSize: 200000,
+    taskState: new Map(),
+    toolUseCache: {},
+    messageIdToUuid: new Map(),
+  } as any;
+  return input;
+}
+
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
 
@@ -1526,22 +1582,29 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("SDK behavior", () => {
       }
     };
 
-    pushPrompt("Reply with exactly this word and nothing else: one");
-    expect(await drainTurn()).toBe(true);
+    try {
+      pushPrompt("Reply with exactly this word and nothing else: one");
+      expect(await drainTurn()).toBe(true);
 
-    // The first turn ended (idle), but the query stays open: pushing a second
-    // user message yields a second turn rather than `done`.
-    pushPrompt("Reply with exactly this word and nothing else: two");
-    expect(await drainTurn()).toBe(true);
+      // The first turn ended (idle), but the query stays open: pushing a second
+      // user message yields a second turn rather than `done`.
+      pushPrompt("Reply with exactly this word and nothing else: two");
+      expect(await drainTurn()).toBe(true);
 
-    // Invariant 2: ending the input is what terminates the iterator.
-    input.end();
-    const tail = await q.next();
-    expect(tail.done).toBe(true);
+      // Invariant 2: ending the input is what terminates the iterator.
+      input.end();
+      const tail = await q.next();
+      expect(tail.done).toBe(true);
 
-    // ...and it stays terminated — a later next() does not revive the stream.
-    const again = await q.next();
-    expect(again.done).toBe(true);
+      // ...and it stays terminated — a later next() does not revive the stream.
+      const again = await q.next();
+      expect(again.done).toBe(true);
+    } finally {
+      // Ensure the live CLI subprocess is torn down even if an assertion above
+      // throws before input.end() — otherwise it would outlive the test run.
+      input.end();
+      await q.close?.();
+    }
   }, 60000);
 });
 
@@ -1935,7 +1998,6 @@ describe("stop reason propagation", () => {
 
   it("does not fold a task-notification result's tokens into an already-active turn's usage", async () => {
     const agent = createMockAgent();
-    const input = new Pushable<any>();
 
     // A task-notification followup that interleaves AFTER the user turn is
     // active (its echo seen) but BEFORE the turn's own result. Its tokens must
@@ -1956,49 +2018,20 @@ describe("stop reason propagation", () => {
       is_error: false,
     });
 
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage } = await iter.next();
-      // User echo first → the turn is now active and its accumulator reset.
-      yield {
-        type: "user",
-        message: userMessage.message,
-        parent_tool_use_id: null,
-        uuid: userMessage.uuid,
-        session_id: "test-session",
-        isReplay: true,
-      };
-      // Task-notification result lands mid-turn...
-      yield backgroundTaskResult;
-      // ...then the user turn's own result settles it.
-      yield promptResult;
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
-    }
-
-    agent.sessions["test-session"] = {
-      query: messageGenerator() as any,
-      input,
-      cwd: "/tmp/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
-      cancelled: false,
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      abortController: new AbortController(),
-      configOptions: [],
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        // User echo first → the turn is now active and its accumulator reset.
+        yield userEcho(userMessage);
+        // Task-notification result lands mid-turn...
+        yield backgroundTaskResult;
+        // ...then the user turn's own result settles it.
+        yield promptResult;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -2708,7 +2741,7 @@ describe("usage_update computation", () => {
         availableModels: [],
       },
       modelInfos: [],
-      settingsManager: {} as any,
+      settingsManager: { dispose: vi.fn() } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -4645,49 +4678,6 @@ describe("post-error recovery", () => {
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
-  function userEcho(u: any) {
-    return {
-      type: "user",
-      message: u.message,
-      parent_tool_use_id: null,
-      uuid: u.uuid,
-      session_id: "test-session",
-      isReplay: true,
-    };
-  }
-
-  function injectGeneratorSession(
-    agent: ClaudeAcpAgent,
-    makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
-  ) {
-    const input = new Pushable<any>();
-    agent.sessions["test-session"] = {
-      query: makeGenerator(input) as any,
-      input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    } as any;
-    return input;
-  }
-
   it("does not let a settled turn's lagging idle resolve the next turn early (issue #773 race)", async () => {
     const agent = createMockAgent();
     injectGeneratorSession(agent, (input) => {
@@ -4760,6 +4750,115 @@ describe("post-error recovery", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "third" }] }),
     ).rejects.toThrow(/start a new session/);
+  });
+
+  // Poll a condition across microtask/timer turns, so a test can wait for the
+  // persistent consumer to reach a particular state (e.g. a turn became active,
+  // or the stream closed) without coupling to its internal scheduling.
+  const waitFor = async (cond: () => boolean) => {
+    for (let i = 0; i < 200; i++) {
+      if (cond()) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error("waitFor timed out");
+  };
+
+  it("settles a cancelled turn as 'cancelled' even when the next prompt's echo arrives first", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        // Turn 1's trailing idle never arrives (the cancel's interrupt is a
+        // no-op here); instead the SDK echoes turn 2 first, forcing the hand-off
+        // path to settle turn 1.
+        const u2 = await iter.next();
+        yield userEcho(u2.value); // turn 2's echo hands off turn 1
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    // Cancel turn 1 while it is the active turn, then send turn 2. Turn 2's echo
+    // hands off turn 1 — which must settle "cancelled", not "end_turn".
+    await agent.cancel({ sessionId: "test-session" });
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
+  it("ignores cancel() after the query stream has closed (no interrupt on a dead query)", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        // generator returns → done → closeQueryStream marks queryClosed.
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+
+    await waitFor(() => agent.sessions["test-session"]?.queryClosed === true);
+
+    // cancel() must be a no-op and must NOT interrupt the finished query.
+    await expect(agent.cancel({ sessionId: "test-session" })).resolves.toBeUndefined();
+    expect(agent.sessions["test-session"].query.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("rejects (not 'cancelled') a prompt enqueued after a cancel when the stream then ends", async () => {
+    const agent = createMockAgent();
+    let releaseEnd!: () => void;
+    const endGate = new Promise<void>((resolve) => (releaseEnd = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        // Hold the stream open until the test has cancelled turn 1 and enqueued
+        // turn 2, then end it WITHOUT ever echoing turn 2.
+        await endGate;
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    await agent.cancel({ sessionId: "test-session" });
+    // Turn 2 is enqueued AFTER the cancel — it was not part of the cancellation.
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+
+    releaseEnd(); // stream ends -> done branch settles turn 1 + rejects turn 2
+
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).rejects.toThrow(/start a new session/);
   });
 });
 
