@@ -166,10 +166,40 @@ type SessionModelState = {
   currentModelId: string;
 };
 
+/** One in-flight `prompt()` call. A persistent per-session consumer (see
+ *  `runConsumer`) drains the SDK query stream for the whole session and settles
+ *  each Turn's deferred when that turn's outcome is known, so `prompt()` itself
+ *  holds no loop. Turns are processed FIFO: the SDK echoes queued user messages
+ *  back in submission order, so `turnQueue[0]` is the turn currently running. */
+type Turn = {
+  /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
+   *  consumer can match the replayed user message to this turn. */
+  promptUuid: string;
+  /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
+   *  so the consumer can't promote them via the replay; it falls back to
+   *  promoting the queue head when the result arrives. */
+  isLocalOnlyCommand: boolean;
+  /** Set once the deferred has been resolved/rejected, so the consumer never
+   *  settles a turn twice (idle + handoff + stream-end can all race). */
+  settled: boolean;
+  resolve: (response: PromptResponse) => void;
+  reject: (error: unknown) => void;
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
+  /** FIFO of in-flight prompts. The head is the turn the SDK is currently
+   *  processing; later entries are queued and will be echoed in order. */
+  turnQueue?: Turn[];
+  /** The turn whose messages the consumer is currently attributing output to
+   *  (the head of `turnQueue` once its user message has been echoed). */
+  activeTurn?: Turn | null;
+  /** The long-lived consumer task. Lazily started on the first `prompt()` and
+   *  kept alive for the session so between-turn/background messages are still
+   *  drained and forwarded. */
+  consumer?: Promise<void>;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
@@ -180,19 +210,16 @@ type Session = {
   models: SessionModelState;
   modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
-  promptRunning: boolean;
-  pendingMessages: Map<string, { resolve: (cancelled: boolean) => void; order: number }>;
-  nextPendingOrder: number;
   abortController: AbortController;
-  /** Per-turn signal the active prompt loop races `query.next()` against.
-   *  Aborted by cancel() (after a grace period) to force the loop to return
-   *  "cancelled" when the SDK is wedged and `query.next()` never yields again
-   *  (issue #680). Distinct from `abortController`: this only wakes the loop;
-   *  it does NOT touch the SDK query/subprocess. Undefined when no prompt is
-   *  actively consuming the query. */
+  /** Signal the consumer races `query.next()` against. Aborted by cancel()
+   *  (after a grace period) to force the active turn to settle "cancelled" when
+   *  the SDK is wedged and `query.next()` never yields again (issue #680).
+   *  Distinct from `abortController`: this only wakes the consumer; it does NOT
+   *  touch the SDK query/subprocess. The consumer re-arms it after each fire.
+   *  Undefined until the consumer is started by the first prompt. */
   cancelController?: AbortController;
-  /** Pending grace-period timer that aborts `cancelController`. Cleared when
-   *  the loop returns normally so the backstop never fires after a clean
+  /** Pending grace-period timer that aborts `cancelController`. Cleared when the
+   *  active turn settles normally so the backstop never fires after a clean
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
@@ -820,121 +847,253 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session not found");
     }
 
-    session.cancelled = false;
-    session.accumulatedUsage = {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    };
+    const userMessage = promptToClaude(params);
+    const promptUuid = randomUUID();
+    userMessage.uuid = promptUuid;
 
+    // Local-only commands (e.g. `/clear`) return a result without replaying the
+    // user message, so the consumer can't promote the turn from the echo.
+    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const isLocalOnlyCommand =
+      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+
+    // Each prompt is a Turn whose deferred the persistent consumer settles once
+    // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
+    // turn, pushes the user message onto the streaming input, makes sure the
+    // consumer is running, and awaits the deferred.
+    const turn: Turn = {
+      promptUuid,
+      isLocalOnlyCommand,
+      settled: false,
+      resolve: () => {},
+      reject: () => {},
+    };
+    const response = new Promise<PromptResponse>((resolve, reject) => {
+      turn.resolve = resolve;
+      turn.reject = reject;
+    });
+
+    session.turnQueue ??= [];
+    session.turnQueue.push(turn);
+    session.input.push(userMessage);
+    this.ensureConsumer(session, params.sessionId);
+    return response;
+  }
+
+  /** Lazily start the per-session consumer that drains the SDK query stream for
+   *  the session's whole life. Idempotent: only the first `prompt()` starts it. */
+  private ensureConsumer(session: Session, sessionId: string): void {
+    if (session.consumer) {
+      return;
+    }
+    // Wake-up channel so cancel() can force the consumer to settle the active
+    // turn "cancelled" even when query.next() is wedged and never yields again
+    // (issue #680). The consumer re-arms it after each fire.
+    session.cancelController = new AbortController();
+    session.consumer = this.runConsumer(session, { sessionId });
+    session.consumer.catch((error) => {
+      this.logger.error(`Session ${sessionId}: consumer terminated unexpectedly: ${error}`);
+    });
+  }
+
+  /** The single, long-lived consumer of the SDK query stream for a session. It
+   *  forwards every message as ACP `sessionUpdate`s (so background/between-turn
+   *  output streams live, not just while a prompt is awaiting) and settles each
+   *  Turn's deferred when that turn ends. Replaces the per-prompt message loop;
+   *  `params` only carries the (session-invariant) `sessionId`. */
+  private async runConsumer(session: Session, params: { sessionId: string }): Promise<void> {
+    // Per-turn scratch, reset whenever a turn becomes active. Kept as consumer
+    // locals (rather than per-Turn fields) because they describe the message
+    // currently being processed, which is sequential — exactly one turn is
+    // active at a time. Mirrors the locals the old per-prompt loop held.
     let lastAssistantTotalUsage: number | null = null;
     let lastAssistantUsage: UsageSnapshot | null = null;
     let lastAssistantModel: string | null = null;
     // When the Claude SDK classifies a turn as failed (e.g. rate limit, auth
     // problem, billing), it sets a categorical `error` field on the
-    // `SDKAssistantMessage` that precedes the final `result` message. We
-    // capture it here so the subsequent `RequestError.internalError` can
-    // forward it to clients as structured `data`, sparing them from
-    // pattern-matching on the human-readable message text.
+    // `SDKAssistantMessage` that precedes the final `result` message. We capture
+    // it here so the subsequent `RequestError.internalError` can forward it to
+    // clients as structured `data`, sparing them from pattern-matching on text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
     // When a streaming classifier refuses a turn, the assistant message carries
     // stop_reason "refusal" and structured stop_details. We capture the
-    // human-readable explanation here so the terminal `result` can surface it
-    // to the user (the refused assistant message itself usually has no content)
-    // and report ACP's dedicated `refusal` stop reason.
+    // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
     // Tracks whether we're inside a compaction. The SDK emits the terminal
     // `status` (compact_result success/failed) twice for a single failed
     // compaction, and the two messages are indistinguishable — so we report the
-    // outcome only while a compaction is in progress, then clear this. A fresh
-    // `compacting` status sets it again, so every distinct compaction (e.g.
-    // repeated auto-compactions in a long turn) is still shown.
+    // outcome only while a compaction is in progress, then clear this.
     let compactionInProgress = false;
-    // Holds the Anthropic API message id of the assistant message currently
-    // being streamed, captured from `message_start` so every streamed chunk can
-    // be tagged with it. We use the API message id rather than the
-    // per-`stream_event` uuid because the same id is also present on the
-    // consolidated assistant message and in the persisted transcript — so a turn
-    // keeps the same ACP `messageId` whether it is streamed live or replayed
-    // from history. The per-event uuid is unique per event and never persisted.
-    // A single value suffices because every streaming partial arrives with
-    // `parent_tool_use_id === null` (subagent work is folded into tool-result
-    // messages, never surfaced as partial streams).
+    // Anthropic API message id of the assistant message currently being
+    // streamed, captured from `message_start` so the streamed chunks that follow
+    // (whose delta events don't carry it) can all be tagged with the same,
+    // replay-stable id.
     let currentStreamMessageId: string | undefined;
-    // Per-message-id record of which assistant content actually streamed live via
-    // `stream_event` deltas, split by block type. The `assistant` case below
-    // normally drops `text`/`thinking` blocks on the assumption they already
-    // reached the client as `agent_message_chunk`/`agent_thought_chunk`. That
-    // breaks behind Anthropic-protocol gateways that return a turn as a single
-    // non-streamed block (common with OpenAI-compatible proxies): no
-    // `content_block_delta` fires, so the assembled block is the only copy the
-    // client will ever see. We keep the filter per (id, block type) for content
-    // that did stream, and fall back to forwarding what did not. Split by type so
-    // a gateway that streams text but not thinking (or vice versa) doesn't lose
-    // the un-streamed block. Only top-level (`parent_tool_use_id === null`)
-    // streams are recorded — subagent text is never streamed and must stay
-    // filtered, as it is internal to the tool call.
-    const streamedTextIds = new Set<string>();
-    const streamedThinkingIds = new Set<string>();
-
-    const userMessage = promptToClaude(params);
-
-    const promptUuid = randomUUID();
-    userMessage.uuid = promptUuid;
-
-    // These local-only commands return a result without replaying the user
-    // message. Mark promptReplayed=true so their result isn't consumed as a
-    // background task result.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    const isLocalOnlyCommand =
-      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
-
-    if (session.promptRunning) {
-      session.input.push(userMessage);
-      const order = session.nextPendingOrder++;
-      const cancelled = await new Promise<boolean>((resolve) => {
-        session.pendingMessages.set(promptUuid, { resolve, order });
-      });
-      if (cancelled) {
-        return { stopReason: "cancelled" };
-      }
-    } else {
-      session.input.push(userMessage);
-    }
-
-    session.promptRunning = true;
-    let handedOff = false;
-    let errored = false;
+    // Per-message-id record of which assistant content actually streamed live
+    // via `stream_event` deltas, split by block type, so the consolidated
+    // `assistant` message can drop the duplicate blocks that already reached the
+    // client as chunks while still forwarding any that a non-streaming gateway
+    // delivered only as an assembled block.
+    let streamedTextIds = new Set<string>();
+    let streamedThinkingIds = new Set<string>();
+    // Stop reason accumulated for the active turn (result subtype, refusal,
+    // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
 
-    // Wake-up channel so cancel() can force this loop to return "cancelled"
-    // even when query.next() is wedged and never yields again (issue #680).
-    const cancelController = new AbortController();
-    session.cancelController = cancelController;
-    const cancelled = new Promise<void>((resolve) => {
-      cancelController.signal.addEventListener("abort", () => resolve(), { once: true });
-    });
+    const resetTurnScratch = () => {
+      lastAssistantTotalUsage = null;
+      lastAssistantUsage = null;
+      lastAssistantModel = null;
+      lastAssistantError = undefined;
+      lastRefusalExplanation = null;
+      compactionInProgress = false;
+      currentStreamMessageId = undefined;
+      streamedTextIds = new Set<string>();
+      streamedThinkingIds = new Set<string>();
+      stopReason = "end_turn";
+      session.accumulatedUsage = {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      };
+    };
+
+    /** Promote a queued turn to active: it becomes the one output is attributed
+     *  to, and its scratch starts fresh. Clears the cancelled flag so a turn
+     *  enqueued after a prior cancel isn't treated as cancelled. */
+    const activateTurn = (turn: Turn) => {
+      session.activeTurn = turn;
+      session.cancelled = false;
+      resetTurnScratch();
+    };
+
+    /** Ensure there is an active turn before a result that carries no echo
+     *  (local-only commands) by promoting the queue head. */
+    const ensureActiveTurn = () => {
+      if (session.activeTurn) {
+        return;
+      }
+      const head = (session.turnQueue ?? []).find((t) => !t.settled);
+      if (head) {
+        activateTurn(head);
+      }
+    };
+
+    /** Settle the active turn's deferred exactly once, disarm the force-cancel
+     *  backstop (the turn is over), and drop it from the queue. */
+    const settleActive = (result: PromptResponse) => {
+      const turn = session.activeTurn;
+      if (!turn || turn.settled) {
+        return;
+      }
+      turn.settled = true;
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
+      session.activeTurn = null;
+      turn.resolve(result);
+    };
+
+    /** Reject the active turn (auth required, error result, …) without tearing
+     *  down the consumer: the stream continues to idle and later turns proceed. */
+    const failActive = (error: unknown) => {
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      const turn = session.activeTurn;
+      if (!turn || turn.settled) {
+        return;
+      }
+      turn.settled = true;
+      session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
+      session.activeTurn = null;
+      turn.reject(error);
+    };
+
+    /** Reject every in-flight turn — used when the stream dies. */
+    const failAllTurns = (error: unknown) => {
+      if (session.forceCancelTimer) {
+        clearTimeout(session.forceCancelTimer);
+        session.forceCancelTimer = undefined;
+      }
+      const turns = session.activeTurn
+        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
+        : [...(session.turnQueue ?? [])];
+      session.activeTurn = null;
+      session.turnQueue = [];
+      for (const turn of turns) {
+        if (!turn.settled) {
+          turn.settled = true;
+          turn.reject(error);
+        }
+      }
+    };
+
+    // The wake-up channel cancel()/teardown aborts to force the active turn to
+    // settle "cancelled" even when query.next() is wedged (issue #680). Re-armed
+    // after each fire so the consumer keeps serving later turns.
+    let cancelController = session.cancelController!;
 
     try {
       while (true) {
         const nextMessage = session.query.next();
-        const next = await Promise.race([nextMessage, cancelled]);
-        if (cancelController.signal.aborted) {
-          // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
-          // block). Abandon the in-flight next() — swallowing any later
-          // rejection so it can't surface as an unhandled rejection — and
-          // honor the cancel per the ACP contract.
+        // Fresh abort listener per iteration, removed when next() wins, so a
+        // long-lived session doesn't accumulate listeners on one signal.
+        let onAbort!: () => void;
+        const abortRace = new Promise<"abort">((resolve) => {
+          onAbort = () => resolve("abort");
+          cancelController.signal.addEventListener("abort", onAbort, { once: true });
+        });
+        const raced = await Promise.race([
+          nextMessage.then((result) => ({ kind: "message" as const, result })),
+          abortRace,
+        ]);
+        cancelController.signal.removeEventListener("abort", onAbort);
+
+        if (raced === "abort") {
+          // cancel()/teardown woke us. Abandon the in-flight next() (swallowing
+          // any later rejection so it can't surface as unhandled) and settle the
+          // active turn "cancelled" per the ACP contract. If the session is
+          // being torn down, stop; otherwise re-arm and keep consuming.
           void nextMessage.catch(() => {});
-          return { stopReason: "cancelled" };
+          settleActive({ stopReason: "cancelled" });
+          if (!this.sessions[params.sessionId]) {
+            return;
+          }
+          cancelController = new AbortController();
+          session.cancelController = cancelController;
+          continue;
         }
-        const { value: message, done } = next as IteratorResult<SDKMessage, void>;
+
+        const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
-          if (session.cancelled) {
-            return { stopReason: "cancelled" };
+          // The stream ended. Settle any in-flight turns so no prompt() hangs:
+          // cancelled if a cancel is pending, otherwise the accumulated outcome.
+          settleActive(
+            session.cancelled
+              ? { stopReason: "cancelled" }
+              : { stopReason, usage: sessionUsage(session) },
+          );
+          for (const queued of [...(session.turnQueue ?? [])]) {
+            if (!queued.settled) {
+              queued.settled = true;
+              queued.resolve(
+                session.cancelled ? { stopReason: "cancelled" } : { stopReason: "end_turn" },
+              );
+            }
           }
-          break;
+          session.turnQueue = [];
+          // The query is exhausted. If the session is still around (the SDK
+          // closed the stream without us tearing it down), drop the finished
+          // consumer handle so a later prompt restarts one rather than awaiting
+          // a deferred that will never settle.
+          session.consumer = undefined;
+          return;
         }
 
         if (
@@ -1034,10 +1193,14 @@ export class ClaudeAcpAgent implements Agent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  if (session.cancelled) {
-                    stopReason = "cancelled";
-                  }
-                  return { stopReason, usage: sessionUsage(session) };
+                  // `idle` is the authoritative turn-over signal. Settle the
+                  // active turn here; the consumer keeps running for subsequent
+                  // turns and background work rather than returning.
+                  settleActive(
+                    session.cancelled
+                      ? { stopReason: "cancelled" }
+                      : { stopReason, usage: sessionUsage(session) },
+                  );
                 }
                 break;
               }
@@ -1177,6 +1340,21 @@ export class ClaudeAcpAgent implements Agent {
             }
             break;
           case "result": {
+            // Task-notification followups are autonomous work triggered by a
+            // task-notification system message, not by the user's prompt.
+            // They should not influence the user-turn lifecycle (stop reason,
+            // slash-command output forwarding) but their cost is real.
+            const isTaskNotification = message.origin?.kind === "task-notification";
+
+            // A user-turn result needs an active turn so its stop reason is
+            // attributed and the turn settles at idle. Local-only commands carry
+            // no user-message echo to promote them, so do it here from the head.
+            // Promote BEFORE accumulating usage, since activation resets the
+            // accumulator — promoting after would discard this result's tokens.
+            if (!isTaskNotification) {
+              ensureActiveTurn();
+            }
+
             // Accumulate usage from this result
             session.accumulatedUsage.inputTokens += message.usage.input_tokens;
             session.accumulatedUsage.outputTokens += message.usage.output_tokens;
@@ -1193,12 +1371,6 @@ export class ClaudeAcpAgent implements Agent {
             if (matchingModelUsage) {
               session.contextWindowSize = matchingModelUsage.contextWindow;
             }
-
-            // Task-notification followups are autonomous work triggered by a
-            // task-notification system message, not by the user's prompt.
-            // They should not influence the user-turn lifecycle (stop reason,
-            // slash-command output forwarding) but their cost is real.
-            const isTaskNotification = message.origin?.kind === "task-notification";
 
             // Send usage_update notification
             if (lastAssistantTotalUsage !== null) {
@@ -1249,7 +1421,8 @@ export class ClaudeAcpAgent implements Agent {
             switch (message.subtype) {
               case "success": {
                 if (message.result.includes("Please run /login")) {
-                  throw RequestError.authRequired();
+                  failActive(RequestError.authRequired());
+                  break;
                 }
                 if (message.stop_reason === "max_tokens") {
                   if (!isTaskNotification) {
@@ -1258,16 +1431,16 @@ export class ClaudeAcpAgent implements Agent {
                   break;
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.result,
+                  failActive(
+                    RequestError.internalError(errorKindData(lastAssistantError), message.result),
                   );
+                  break;
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
                 // Task-notification followups never originate from a user
                 // slash command, so skip the forwarding for them.
-                if (isLocalOnlyCommand && !isTaskNotification) {
+                if (session.activeTurn?.isLocalOnlyCommand && !isTaskNotification) {
                   for (const notification of toAcpNotifications(
                     message.result,
                     "assistant",
@@ -1289,10 +1462,13 @@ export class ClaudeAcpAgent implements Agent {
                   break;
                 }
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
+                  failActive(
+                    RequestError.internalError(
+                      errorKindData(lastAssistantError),
+                      message.errors.join(", ") || message.subtype,
+                    ),
                   );
+                  break;
                 }
                 if (!isTaskNotification) {
                   stopReason = "end_turn";
@@ -1303,10 +1479,13 @@ export class ClaudeAcpAgent implements Agent {
               case "error_max_turns":
               case "error_max_structured_output_retries":
                 if (message.is_error) {
-                  throw RequestError.internalError(
-                    errorKindData(lastAssistantError),
-                    message.errors.join(", ") || message.subtype,
+                  failActive(
+                    RequestError.internalError(
+                      errorKindData(lastAssistantError),
+                      message.errors.join(", ") || message.subtype,
+                    ),
                   );
+                  break;
                 }
                 if (!isTaskNotification) {
                   stopReason = "max_turn_requests";
@@ -1411,38 +1590,45 @@ export class ClaudeAcpAgent implements Agent {
           }
           case "user":
           case "assistant": {
-            if (session.cancelled) {
-              break;
-            }
-
-            // Record the ACP messageId -> SDK uuid mapping for this message. The
-            // consolidated message carries both ids, so this is where we learn
-            // the uuid that the SDK's rewind/resume APIs key on for the id we
-            // hand clients. Not read yet (see Session.messageIdToUuid).
+            // Record the ACP messageId -> SDK uuid mapping for this message
+            // (including replays). The consolidated message carries both ids, so
+            // this is where we learn the uuid the SDK's rewind/resume APIs key on
+            // for the id we hand clients. Not read yet (see messageIdToUuid).
             const mappedMessageId = messageIdForGrouping(message);
             if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
               session.messageIdToUuid.set(mappedMessageId, message.uuid);
             }
 
-            // Check for prompt replay
+            // A replayed user message echoes a queued turn back in submission
+            // order. The first echo promotes that turn to active; if a different
+            // turn is still active, it is handed off (settled end_turn) first.
+            // Done before the `cancelled` guard so a turn enqueued after a cancel
+            // is still promoted — activateTurn() clears the flag. The turn's own
+            // echo is then dropped from the feed (the client already shows it).
             if (message.type === "user" && "uuid" in message && message.uuid) {
-              if (message.uuid === promptUuid) {
+              const queued = (session.turnQueue ?? []).find(
+                (t) => t.promptUuid === message.uuid && !t.settled,
+              );
+              if (queued) {
+                // Only (re)activate if this isn't already the active turn — a
+                // turn promoted early (e.g. by a result that preceded its echo)
+                // must not have its accumulated usage reset by its own echo.
+                if (session.activeTurn !== queued) {
+                  if (session.activeTurn) {
+                    settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
+                  }
+                  activateTurn(queued);
+                }
                 break;
-              }
-
-              const pending = session.pendingMessages.get(message.uuid as string);
-              if (pending) {
-                pending.resolve(false);
-                session.pendingMessages.delete(message.uuid as string);
-                handedOff = true;
-                // the current loop stops with end_turn,
-                // the loop of the next prompt continues running
-                return { stopReason: "end_turn", usage: sessionUsage(session) };
               }
               if ("isReplay" in message && message.isReplay) {
-                // not pending or unrelated replay message
+                // Unrelated replay (e.g. the echo of an already-settled turn).
                 break;
               }
+            }
+
+            if (session.cancelled) {
+              break;
             }
 
             // Snapshot the latest top-level assistant usage and model so the
@@ -1527,7 +1713,8 @@ export class ClaudeAcpAgent implements Agent {
               message.message.content[0].type === "text" &&
               message.message.content[0].text.includes("Please run /login")
             ) {
-              throw RequestError.authRequired();
+              failActive(RequestError.authRequired());
+              break;
             }
 
             let content: typeof message.message.content;
@@ -1631,91 +1818,35 @@ export class ClaudeAcpAgent implements Agent {
             break;
         }
       }
-      throw new Error("Session did not end in result");
+      // `while (true)` only exits via the `done` return above or the catch
+      // below, so there is no normal fall-through here.
     } catch (error) {
-      errored = true;
-      // A failed turn typically leaves a trailing `session_state_changed: idle`
-      // (and possibly more) in the query iterator. If we don't drain it here,
-      // the next prompt's first `query.next()` consumes that stale idle and
-      // short-circuits to end_turn with zero usage
-      // Bounded so a misbehaving SDK can't hang the next prompt indefinitely.
-      try {
-        await session.query.interrupt();
-        const MAX_DRAIN = 100;
-        for (let i = 0; i < MAX_DRAIN; i++) {
-          const { value: m, done } = await session.query.next();
-          if (done || !m) break;
-          if (m.type === "system" && m.subtype === "session_state_changed" && m.state === "idle") {
-            break;
-          }
-          if (i === MAX_DRAIN - 1) {
-            this.logger.error(
-              `Session ${params.sessionId}: drained ${MAX_DRAIN} messages after error without observing idle`,
-            );
-          }
-        }
-      } catch (drainErr) {
-        this.logger.error(
-          `Session ${params.sessionId}: failed to drain query after prompt error:`,
-          drainErr,
-        );
-      }
-
-      if (error instanceof RequestError || !(error instanceof Error)) {
-        throw error;
-      }
-      const message = error.message;
-      if (
-        message.includes("ProcessTransport") ||
-        message.includes("terminated process") ||
-        message.includes("process exited with") ||
-        message.includes("process terminated by signal") ||
-        message.includes("Failed to write to process stdin")
-      ) {
+      // The query stream itself died (a transport/process error surfaced from
+      // query.next()). Turn-level failures (auth, error results) are handled
+      // inline via failActive and never reach here. Reject every in-flight turn;
+      // if the process is gone, tear the session down so the client starts fresh.
+      const message = error instanceof Error ? error.message : String(error);
+      const processDied =
+        error instanceof Error &&
+        (message.includes("ProcessTransport") ||
+          message.includes("terminated process") ||
+          message.includes("process exited with") ||
+          message.includes("process terminated by signal") ||
+          message.includes("Failed to write to process stdin"));
+      if (processDied) {
         this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
+        failAllTurns(
+          RequestError.internalError(
+            undefined,
+            "The Claude Agent process exited unexpectedly. Please start a new session.",
+          ),
+        );
         session.settingsManager.dispose();
         session.input.end();
         delete this.sessions[params.sessionId];
-        throw RequestError.internalError(
-          undefined,
-          "The Claude Agent process exited unexpectedly. Please start a new session.",
-        );
-      }
-      throw error;
-    } finally {
-      // The loop is returning — interrupt() succeeded or the prompt finished
-      // — so disarm the force-cancel backstop and release the wake-up channel
-      // (only if we still own it; a handoff installs the next prompt's).
-      if (session.forceCancelTimer) {
-        clearTimeout(session.forceCancelTimer);
-        session.forceCancelTimer = undefined;
-      }
-      if (session.cancelController === cancelController) {
-        session.cancelController = undefined;
-      }
-      if (!handedOff) {
-        session.promptRunning = false;
-        if (errored) {
-          // The query stream was just drained — handing pending prompts off
-          // onto it would let them race with the recovery. Cancel them so
-          // each waiting prompt() returns stopReason: "cancelled" and the
-          // client can decide whether to retry.
-          for (const pending of session.pendingMessages.values()) {
-            pending.resolve(true);
-          }
-          session.pendingMessages.clear();
-        } else if (session.pendingMessages.size > 0) {
-          // This usually should not happen, but in case the loop finishes
-          // without claude sending all message replays, we resolve the
-          // next pending prompt call to ensure no prompts get stuck.
-          const next = [...session.pendingMessages.entries()].sort(
-            (a, b) => a[1].order - b[1].order,
-          )[0];
-          if (next) {
-            next[1].resolve(false);
-            session.pendingMessages.delete(next[0]);
-          }
-        }
+      } else {
+        this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
+        failAllTurns(error);
       }
     }
   }
@@ -1726,24 +1857,35 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
-    for (const [, pending] of session.pendingMessages) {
-      pending.resolve(true);
+    // Settle queued turns that haven't started yet (no echo seen) right away —
+    // they have no in-flight SDK work to interrupt. The active turn is settled
+    // by the consumer when it observes the interrupt's trailing idle (or via the
+    // backstop below). Mirrors the old pendingMessages cancellation.
+    if (session.turnQueue) {
+      for (const turn of session.turnQueue) {
+        if (turn !== session.activeTurn && !turn.settled) {
+          turn.settled = true;
+          turn.resolve({ stopReason: "cancelled" });
+        }
+      }
+      session.turnQueue = session.turnQueue.filter(
+        (turn) => turn === session.activeTurn && !turn.settled,
+      );
     }
-    session.pendingMessages.clear();
 
-    // Arm a backstop before interrupting: if a prompt is actively consuming
-    // the query and interrupt() doesn't make the SDK yield (e.g. a wedged
-    // TaskOutput block — issue #680), force the loop to return "cancelled"
-    // after the floor elapses so the pending session/prompt still resolves per
-    // the ACP cancellation contract instead of hanging forever. The loop's
-    // `finally` clears this timer when interrupt() works and it returns through
+    // Arm a backstop before interrupting: if a turn is actively consuming the
+    // query and interrupt() doesn't make the SDK yield (e.g. a wedged TaskOutput
+    // block — issue #680), force the consumer to settle the active turn
+    // "cancelled" after the floor elapses so the pending session/prompt still
+    // resolves per the ACP cancellation contract instead of hanging forever. The
+    // consumer clears this timer when interrupt() works and it settles through
     // the normal idle path, so on healthy cancels it is armed but never fires.
     //
-    // Arm at most once per turn: the floor is an absolute ceiling from the
-    // first cancel, so a client that re-sends cancel (each call still retries
+    // Arm at most once per turn: the floor is an absolute ceiling from the first
+    // cancel, so a client that re-sends cancel (each call still retries
     // interrupt() below) can't keep pushing the deadline out.
     if (
-      session.promptRunning &&
+      session.activeTurn &&
       session.cancelController &&
       !session.cancelController.signal.aborted &&
       !session.forceCancelTimer
@@ -1769,12 +1911,12 @@ export class ClaudeAcpAgent implements Agent {
     }
     await this.cancel({ sessionId });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
-    // wedged prompt loop only wakes when `cancelController` aborts — closing
-    // the query/abortController below doesn't touch it. Since we're tearing the
-    // session down anyway, wake the loop now so the in-flight prompt() resolves
-    // immediately instead of after the floor, and clear the timer so it can't
-    // outlive the deleted session (it isn't unref'd and would otherwise keep
-    // the event loop alive until it fires).
+    // wedged consumer only wakes when `cancelController` aborts — closing the
+    // query/abortController below doesn't touch it. Since we're tearing the
+    // session down anyway, wake the consumer now so the in-flight prompt()
+    // resolves immediately instead of after the floor, and clear the timer so it
+    // can't outlive the deleted session (it isn't unref'd and would otherwise
+    // keep the event loop alive until it fires).
     if (session.forceCancelTimer) {
       clearTimeout(session.forceCancelTimer);
       session.forceCancelTimer = undefined;
@@ -2782,9 +2924,6 @@ export class ClaudeAcpAgent implements Agent {
       models,
       modelInfos: allowedModels,
       configOptions,
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:

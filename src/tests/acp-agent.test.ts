@@ -1699,9 +1699,6 @@ describe("stop reason propagation", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -1846,9 +1843,6 @@ describe("stop reason propagation", () => {
       },
       abortController: new AbortController(),
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
       taskState: new Map(),
@@ -2006,9 +2000,6 @@ describe("session/close", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2092,9 +2083,6 @@ describe("session/delete", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2195,9 +2183,6 @@ describe("getOrCreateSession param change detection", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2432,9 +2417,6 @@ describe("usage_update computation", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -3441,9 +3423,6 @@ describe("assembled assistant text fallback", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -3637,9 +3616,6 @@ describe("emitRawSDKMessages", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages,
       contextWindowSize: 200000,
@@ -3867,9 +3843,6 @@ describe("result origin handling", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -4044,9 +4017,6 @@ describe("memory_recall handling", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -4276,9 +4246,6 @@ describe("post-error recovery", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -4291,16 +4258,16 @@ describe("post-error recovery", () => {
 
   it("drains a failed turn's trailing idle so the next prompt is not short-circuited", async () => {
     const agent = createMockAgent();
-    const { interrupt } = injectTwoTurnSession(agent, [
+    injectTwoTurnSession(agent, [
       createResultMessage({
         subtype: "success",
         stop_reason: "end_turn",
         is_error: true,
         result: "boom",
       }),
-      // Trailing idle from the failed turn. Without draining, the next
-      // prompt's first query.next() would consume this and short-circuit
-      // to end_turn with zero usage (issue #654).
+      // Trailing idle from the failed turn. The persistent consumer keeps
+      // reading and absorbs this idle (no active turn to settle), so the next
+      // prompt starts clean rather than consuming a stale idle (issue #654).
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
@@ -4311,8 +4278,6 @@ describe("post-error recovery", () => {
       }),
     ).rejects.toThrow();
 
-    expect(interrupt).toHaveBeenCalled();
-
     const second = await agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "second" }],
@@ -4322,7 +4287,7 @@ describe("post-error recovery", () => {
     expect(second.usage?.outputTokens).toBe(5);
   });
 
-  it("cancels all queued pending prompts when a turn errors", async () => {
+  it("rejects only the failed turn; a queued prompt still runs", async () => {
     const agent = createMockAgent();
     injectTwoTurnSession(agent, [
       createResultMessage({
@@ -4334,27 +4299,42 @@ describe("post-error recovery", () => {
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
 
-    // Simulate two prompts already queued behind the running turn. Both
-    // resolvers should fire with `true` (cancelled) when the running
-    // prompt errors, and the map should be cleared.
-    const session = agent.sessions["test-session"];
-    let resolveA!: (cancelled: boolean) => void;
-    let resolveB!: (cancelled: boolean) => void;
-    const pendingA = new Promise<boolean>((r) => (resolveA = r));
-    const pendingB = new Promise<boolean>((r) => (resolveB = r));
-    session.pendingMessages.set("uuid-a", { resolve: resolveA, order: 0 });
-    session.pendingMessages.set("uuid-b", { resolve: resolveB, order: 1 });
+    // With a persistent consumer a turn-level error no longer poisons the
+    // stream, so a prompt queued behind the failing one runs to completion
+    // instead of being cancelled.
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
 
-    await expect(
-      agent.prompt({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "first" }],
-      }),
-    ).rejects.toThrow();
+    await expect(first).rejects.toThrow();
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
 
-    await expect(pendingA).resolves.toBe(true);
-    await expect(pendingB).resolves.toBe(true);
-    expect(session.pendingMessages.size).toBe(0);
+  it("hands off to a queued prompt when the next turn starts without a trailing idle", async () => {
+    const agent = createMockAgent();
+    // turn 1 produces a result but NO trailing idle — the SDK goes straight to
+    // echoing turn 2. The consumer must settle turn 1 (end_turn) on that echo
+    // (the hand-off path) rather than letting it hang until turn 2's idle.
+    injectTwoTurnSession(agent, [
+      createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
+    ]);
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 });
 
@@ -4423,9 +4403,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      promptRunning: false,
-      pendingMessages: new Map(),
-      nextPendingOrder: 0,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
