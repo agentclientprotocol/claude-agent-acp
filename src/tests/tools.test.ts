@@ -502,6 +502,23 @@ describe("Bash terminal output", () => {
       });
     });
 
+    it("should route failed commands through the terminal when supportsTerminalOutput is true", () => {
+      const toolResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content: "some error output",
+        is_error: true,
+      };
+      const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "some error output" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+      });
+    });
+
     it("should fall back to stderr when stdout is empty", () => {
       const toolResult = makeBashResult("", "some error output", 1);
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, false);
@@ -610,9 +627,24 @@ describe("Bash terminal output", () => {
         });
       });
 
-      it("should use error handler when is_error is true (early return before Bash case)", () => {
+      it("should route is_error through the terminal when supportsTerminalOutput is true", () => {
         const toolResult = makeStringBashResult("command not found: bad_cmd", true);
         const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+        // Failed Bash commands skip the early error return and reach the Bash
+        // case so the client receives terminal output with a non-zero exit code
+        // instead of plain markdown details.
+        expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+        expect(update._meta).toEqual({
+          terminal_info: { terminal_id: "toolu_bash" },
+          terminal_output: { terminal_id: "toolu_bash", data: "command not found: bad_cmd" },
+          terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+        });
+      });
+
+      it("should use error handler when is_error is true and terminal output is unsupported", () => {
+        const toolResult = makeStringBashResult("command not found: bad_cmd", true);
+        const update = toolUpdateFromToolResult(toolResult, bashToolUse, false);
 
         // is_error with content hits the early error return at the top of
         // toolUpdateFromToolResult, before reaching the Bash switch case.

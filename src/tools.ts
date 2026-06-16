@@ -485,7 +485,8 @@ export function toolUpdateFromToolResult(
     "is_error" in toolResult &&
     toolResult.is_error &&
     toolResult.content &&
-    toolResult.content.length > 0
+    toolResult.content.length > 0 &&
+    !(toolUse?.name === "Bash" && supportsTerminalOutput)
   ) {
     // Only return errors
     return toAcpContentUpdate(toolResult.content, true);
