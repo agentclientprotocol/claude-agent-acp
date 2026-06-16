@@ -2097,8 +2097,15 @@ export class ClaudeAcpAgent implements Agent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    if (!this.sessions[params.sessionId]) {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
       throw new Error("Session not found");
+    }
+    // The SDK query stream already ended (see closeQueryStream); the session is
+    // a husk and `query.setPermissionMode` below would act on a closed query.
+    // Fail with the same clear message prompt()/cancel() give for a dead stream.
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
     await this.applySessionMode(params.sessionId, params.modeId);
@@ -2112,6 +2119,13 @@ export class ClaudeAcpAgent implements Agent {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
+    }
+    // The SDK query stream already ended (see closeQueryStream); the session is
+    // a husk and the `query.setModel`/`setPermissionMode`/`applyFlagSettings`
+    // calls this triggers would act on a closed query. Fail with the same clear
+    // message prompt()/cancel() give for a dead stream.
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
     if (typeof params.value !== "string") {
       throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
