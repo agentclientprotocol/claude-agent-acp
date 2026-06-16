@@ -4877,6 +4877,72 @@ describe("post-error recovery", () => {
     expect(thirdResult.usage?.inputTokens).toBe(10);
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("drains the orphan count, then promotes a no-echo /compact while still cancelled", async () => {
+    // The case that ONLY the orphan-count gate handles (the old `!cancelled`
+    // gate would hang it): cancel removes a queued turn (count=1), its orphan
+    // result drains the count to 0, and THEN a no-echo /compact result arrives
+    // while session.cancelled is still true. The count is 0, so /compact is
+    // promoted (and activating it clears `cancelled`) rather than skipped.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    const orphanResult = createResultMessage({
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+    });
+    orphanResult.usage.input_tokens = 999;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await iter.next(); // turn 2's pushed message (cancelled + removed)
+        await gate; // wait until the test cancels (count=1) and sends /compact
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield orphanResult; // turn 2's orphan — drains the count to 0
+        await iter.next(); // /compact's pushed message — never echoes its uuid
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        // session.cancelled is STILL true here; the drained count (0) lets this
+        // promote rather than the `!cancelled` gate blocking it.
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    await agent.cancel({ sessionId: "test-session" }); // removes turn 2 -> pendingOrphanResults = 1
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("session/cancel wedge recovery (issue #680)", () => {
