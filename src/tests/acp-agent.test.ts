@@ -122,11 +122,13 @@ function mockSessionState(overrides: Record<string, any> = {}) {
 function injectGeneratorSession(
   agent: ClaudeAcpAgent,
   makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>,
+  overrides: Record<string, any> = {},
 ) {
   const input = new Pushable<any>();
   agent.sessions["test-session"] = mockSessionState({
     query: wrapQuery(makeGenerator(input)),
     input,
+    ...overrides,
   });
   return input;
 }
@@ -1819,36 +1821,10 @@ describe("stop reason propagation", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: {
-        currentModeId: "default",
-        availableModes: [],
-      },
-      models: {
-        currentModelId: "default",
-        availableModels: [],
-      },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
@@ -1965,36 +1941,12 @@ describe("stop reason propagation", () => {
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
     }
 
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
       cwd: "/tmp/test",
       sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
-      cancelled: false,
-      modes: {
-        currentModeId: "default",
-        availableModes: [],
-      },
-      models: {
-        currentModelId: "default",
-        availableModels: [],
-      },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      abortController: new AbortController(),
-      configOptions: [],
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -2056,6 +2008,44 @@ describe("stop reason propagation", () => {
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
 
+  it("settles a no-echo command result (e.g. /compact) by promoting the head turn", async () => {
+    // Regression: /compact never echoes a user message carrying the prompt's
+    // uuid (its only user messages are the generated summary and a
+    // <local-command-stdout> replay), so the turn is never activated by an echo.
+    // Its result must still settle the turn — otherwise prompt() hangs forever.
+    const agent = createMockAgent();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        await iter.next(); // consume the pushed message but do NOT echo its uuid
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        // Hold the stream open past the result so the turn must settle at the
+        // result itself, not via the stream-end (done) fallback or a real idle.
+        await idleGate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("resolves at the terminal result without waiting for a lagging idle (issue #773)", async () => {
     const agent = createMockAgent();
     const input = new Pushable<any>();
@@ -2083,30 +2073,10 @@ describe("stop reason propagation", () => {
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
     }
 
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -2170,30 +2140,10 @@ describe("stop reason propagation", () => {
       };
     }
 
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -2739,36 +2689,10 @@ describe("usage_update computation", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: {
-        currentModeId: "default",
-        availableModes: [],
-      },
-      models: {
-        currentModelId: "default",
-        availableModels: [],
-      },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
@@ -3751,30 +3675,10 @@ describe("assembled assistant text fallback", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   function messageChunkTexts(updates: any[]): string[] {
@@ -3944,30 +3848,11 @@ describe("emitRawSDKMessages", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
       emitRawSDKMessages,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   function createResultMessage() {
@@ -4180,30 +4065,10 @@ describe("result origin handling", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   function createAssistantMessage() {
@@ -4354,30 +4219,10 @@ describe("memory_recall handling", () => {
       }
       yield* messages;
     }
-    agent.sessions["test-session"] = {
+    agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
       input,
-      cancelled: false,
-      cwd: "/test",
-      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-      modes: { currentModeId: "default", availableModes: [] },
-      models: { currentModelId: "default", availableModels: [] },
-      modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      configOptions: [],
-      abortController: new AbortController(),
-      emitRawSDKMessages: false,
-      contextWindowSize: 200000,
-      taskState: new Map(),
-      toolUseCache: {},
-      messageIdToUuid: new Map(),
-    };
+    });
   }
 
   function createResult() {
@@ -4765,12 +4610,14 @@ describe("post-error recovery", () => {
     ).rejects.toThrow(/start a new session/);
 
     // The broken stream's resources are released even though the session husk
-    // stays in the map for the clear error above: the subprocess/query is
-    // closed, its abort signal fired, and the settings watchers disposed.
+    // stays in the map for the clear error above: the subprocess/query is closed
+    // and the settings watchers disposed. The abortController is left alone — it
+    // may be client-owned, so we don't abort it on a spontaneous stream end (only
+    // teardownSession does, on explicit close).
     const session = agent.sessions["test-session"];
     expect(session.query.close).toHaveBeenCalled();
-    expect(session.abortController.signal.aborted).toBe(true);
     expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(session.abortController.signal.aborted).toBe(false);
   });
 
   // Poll a condition across microtask/timer turns, so a test can wait for the
@@ -4845,6 +4692,46 @@ describe("post-error recovery", () => {
     // cancel() must be a no-op and must NOT interrupt the finished query.
     await expect(agent.cancel({ sessionId: "test-session" })).resolves.toBeUndefined();
     expect(agent.sessions["test-session"].query.interrupt).not.toHaveBeenCalled();
+    // A normal stream end closes the query but does NOT abort the (possibly
+    // client-owned) abort controller — only explicit teardown does.
+    expect(agent.sessions["test-session"].query.close).toHaveBeenCalled();
+    expect(agent.sessions["test-session"].abortController.signal.aborted).toBe(false);
+  });
+
+  it("settles a turn that ends via the stream-done path even if releasing resources throws", async () => {
+    const agent = createMockAgent();
+    // The turn is activated by its echo but the stream then ends with NO terminal
+    // result — so it settles in the consumer's `done` branch, not at a result.
+    // settingsManager.dispose() throws during closeQueryStream; because the done
+    // branch settles the turn BEFORE releasing resources, the prompt still
+    // resolves end_turn rather than being rejected when the cleanup failure lands
+    // in the consumer's catch (release-before-settle would reject it).
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          // generator returns → done (no result/idle) → done branch settles the
+          // active turn, then closeQueryStream → dispose() throws.
+        }
+        return messageGenerator();
+      },
+      {
+        settingsManager: {
+          dispose: vi.fn(() => {
+            throw new Error("dispose boom");
+          }),
+        },
+      },
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
   });
 
   it("rejects (not 'cancelled') a prompt enqueued after a cancel when the stream then ends", async () => {

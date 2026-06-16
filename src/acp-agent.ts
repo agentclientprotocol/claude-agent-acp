@@ -985,21 +985,26 @@ export class ClaudeAcpAgent implements Agent {
       resetTurnScratch();
     };
 
-    /** Ensure there is an active turn before a result that carries no echo
-     *  (local-only commands) by promoting the queue head. Only local-only
-     *  commands legitimately return a result without a user-message echo to
-     *  activate them; a normal turn is always activated by its echo before its
-     *  result. So if the head is NOT a local-only command, leave activeTurn
-     *  unset: such a result is an orphan (e.g. the SDK still ran a queued turn
-     *  that cancel() already resolved, since its user message was pushed before
-     *  the cancel) and promoting the head would misattribute the orphan's stop
-     *  reason and usage to an unrelated queued prompt. */
+    /** Ensure there is an active turn before a user-turn result that carries no
+     *  echo to activate it, by promoting the queue head. Most turns are
+     *  activated by their replayed user message before their result, but some
+     *  legitimately produce a result with no matching echo: local-only commands
+     *  (e.g. `/context`) and compaction (`/compact`, whose only user messages
+     *  are the generated summary and a `<local-command-stdout>` replay — neither
+     *  carries the prompt's uuid). Promoting the head settles those.
+     *
+     *  Gated on `!session.cancelled`: a result that arrives while a cancel is
+     *  pending is an orphan — e.g. the SDK still ran a turn that cancel() already
+     *  resolved and removed (its user message was pushed before the cancel), so
+     *  the head is now an unrelated later prompt. Promoting it would misattribute
+     *  the orphan's stop reason/usage. In normal (non-cancelled) operation the
+     *  head IS the turn the SDK is running, so promoting it is correct. */
     const ensureActiveTurn = () => {
-      if (session.activeTurn) {
+      if (session.activeTurn || session.cancelled) {
         return;
       }
       const head = (session.turnQueue ?? []).find((t) => !t.settled);
-      if (head?.isLocalOnlyCommand) {
+      if (head) {
         activateTurn(head);
       }
     };
@@ -1096,12 +1101,12 @@ export class ClaudeAcpAgent implements Agent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
-          // The stream ended. The query iterator can't be revived, so close the
-          // session's stream (marks queryClosed, drops the consumer handle, and
-          // releases the dead subprocess/settings resources) — a later prompt()
-          // then rejects up front rather than restarting a consumer on the
-          // exhausted stream.
-          this.closeQueryStream(session);
+          // The stream ended. Settle the in-flight turns FIRST, then release the
+          // stream resources — same order as the error paths (failAllTurns before
+          // closeQueryStream). Settling is the user-facing contract; resource
+          // release is best-effort cleanup, so a throw there must not pre-empt a
+          // turn's real outcome.
+          //
           // Settle the turn that was in flight so its prompt() doesn't hang:
           // cancelled if a cancel is pending, otherwise the accumulated outcome.
           settleActive(
@@ -1121,6 +1126,11 @@ export class ClaudeAcpAgent implements Agent {
             }
           }
           session.turnQueue = [];
+          // The query iterator can't be revived, so close the session's stream
+          // (marks queryClosed, drops the consumer handle, releases the dead
+          // subprocess/settings resources) — a later prompt() then rejects up
+          // front rather than restarting a consumer on the exhausted stream.
+          this.closeQueryStream(session);
           return;
         }
 
@@ -1976,14 +1986,20 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
-  /** Mark a session's SDK query stream as permanently ended and release every
-   *  resource tied to it: drop the consumer handle, dispose the settings
-   *  watchers, end the input stream, abort the SDK abort signal, and close the
-   *  query (terminating the subprocess). The query iterator is not revivable, so
-   *  `prompt()`/`cancel()` consult `queryClosed` and fail/short-circuit instead
-   *  of acting on a dead stream. Idempotent (guarded by `queryClosed`), so the
-   *  consumer's done/error paths and a later `teardownSession` can all call it
-   *  without double-releasing. Does NOT remove the session from the map — that is
+  /** Mark a session's SDK query stream as permanently ended and release the
+   *  resources tied to it: drop the consumer handle, dispose the settings
+   *  watchers, end the input stream, and close the query (which terminates the
+   *  subprocess). The query iterator is not revivable, so `prompt()`/`cancel()`
+   *  consult `queryClosed` and fail/short-circuit instead of acting on a dead
+   *  stream. Idempotent (guarded by `queryClosed`), so the consumer's done/error
+   *  paths and a later `teardownSession` can all call it without double-releasing.
+   *
+   *  Deliberately does NOT abort `session.abortController`: that controller may be
+   *  CLIENT-supplied (`_meta.claudeCode.options.abortController`) and reused, so
+   *  aborting it on a spontaneous stream end would cancel the client's own work
+   *  or make a sibling session born aborted. `query.close()` already terminates
+   *  the subprocess; aborting the signal belongs in `teardownSession` (explicit
+   *  destroy), not here. Also does NOT remove the session from the map — that is
    *  `teardownSession`'s job — so prompt() can still answer with a clear "session
    *  ended" error after an unexpected stream close. The leftover session object
    *  is a lightweight husk (its heavy resources are released here) and is evicted
@@ -1997,7 +2013,6 @@ export class ClaudeAcpAgent implements Agent {
     session.consumer = undefined;
     session.settingsManager.dispose();
     session.input.end();
-    session.abortController.abort();
     session.query.close();
   }
 
@@ -2022,6 +2037,11 @@ export class ClaudeAcpAgent implements Agent {
     }
     session.cancelController?.abort();
     this.closeQueryStream(session);
+    // Abort the SDK abort signal only on explicit destroy. closeQueryStream
+    // leaves it alone (it may be a client-owned controller — see its doc), but
+    // here the client has asked us to close the session, so signalling abort is
+    // appropriate; query.close() above has already torn the subprocess down.
+    session.abortController.abort();
     delete this.sessions[sessionId];
   }
 
