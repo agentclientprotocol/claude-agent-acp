@@ -116,8 +116,14 @@ function questionFieldKey(index: number): string {
   return `question_${index}`;
 }
 
-/** Form-field key for the optional free-text "custom answer" field. */
-const CUSTOM_ANSWER_FIELD = "customAnswer";
+/**
+ * Form-field key for the per-question free-text "custom answer" field that sits
+ * alongside `question_<n>`. Mirrors the first-party clients, where every
+ * question carries its own "Other" box rather than one form-level field.
+ */
+function questionCustomFieldKey(index: number): string {
+  return `question_${index}_custom`;
+}
 
 /**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
@@ -128,10 +134,11 @@ const CUSTOM_ANSWER_FIELD = "customAnswer";
  * an array with a titled `anyOf` item enum. The enum `const` is always the
  * option label, since that is what the tool records as the answer.
  *
- * A trailing optional free-text field mirrors the CLI's custom-answer box: the
- * user can type their own answer instead of (or as well as) picking an option.
- * Nothing is marked required, so the user can also just skip — matching the
- * built-in tool, which always offers Skip + a free-text box.
+ * Each question is followed by its own optional free-text "custom answer" field
+ * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
+ * user can type their own answer instead of picking an option, scoped to that
+ * specific question. Nothing is marked required, so the user can also just skip
+ * — matching the built-in tool, which always offers Skip + a free-text box.
  */
 export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
@@ -156,13 +163,13 @@ export function askUserQuestionsToCreateRequest(
     properties[questionFieldKey(index)] = question.multiSelect
       ? { type: "array", title, description, items: { anyOf: options } }
       : { type: "string", title, description, oneOf: options };
-  });
 
-  properties[CUSTOM_ANSWER_FIELD] = {
-    type: "string",
-    title: "Other",
-    description: "Type your own answer instead of choosing an option above (optional).",
-  };
+    properties[questionCustomFieldKey(index)] = {
+      type: "string",
+      title: "Other",
+      description: "Type your own answer instead of choosing an option above (optional).",
+    };
+  });
 
   const requestedSchema: ElicitationSchema = {
     type: "object",
@@ -190,10 +197,11 @@ export type AskUserQuestionOutcome =
  *
  * Selected labels are read back from the indexed form fields and written into
  * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
- * — the key shape the tool's own `call()` reads. Free text from the custom-
- * answer field becomes the tool's top-level `response`. Decline yields empty
- * answers (the model is told the user skipped rather than the turn aborting);
- * cancel aborts the tool call.
+ * — the key shape the tool's own `call()` reads. A non-empty per-question
+ * custom-answer field (`question_<n>_custom`) takes precedence over that
+ * question's selection, since the user typed their own answer instead of
+ * picking one. Decline yields empty answers (the model is told the user skipped
+ * rather than the turn aborting); cancel aborts the tool call.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
@@ -213,6 +221,14 @@ export function applyAskElicitationResponse(
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
   questions.forEach((question, index) => {
+    // A typed custom answer wins over the selection: the user chose to write
+    // their own answer for this question instead of picking an option.
+    const custom = content[questionCustomFieldKey(index)];
+    if (typeof custom === "string" && custom.trim() !== "") {
+      answers[question.question] = custom.trim();
+      return;
+    }
+
     const value = content[questionFieldKey(index)];
     if (value === undefined || value === null) {
       return;
@@ -224,14 +240,7 @@ export function applyAskElicitationResponse(
     answers[question.question] = text;
   });
 
-  const updatedInput: Record<string, unknown> = { ...toolInput, answers };
-  const custom = content[CUSTOM_ANSWER_FIELD];
-  if (typeof custom === "string" && custom.trim() !== "") {
-    const response: AskUserQuestionOutput["response"] = custom;
-    updatedInput.response = response;
-  }
-
-  return { action: "answered", updatedInput };
+  return { action: "answered", updatedInput: { ...toolInput, answers } };
 }
 
 /**

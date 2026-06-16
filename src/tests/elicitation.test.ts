@@ -187,8 +187,11 @@ describe("askUserQuestionsToCreateRequest", () => {
     expect(schema.properties?.["Which library?"]).toBeUndefined();
   });
 
-  it("includes an optional free-text custom-answer field", () => {
-    const questions = [mkQuestion("Which?", [{ label: "A" }, { label: "B" }])];
+  it("includes a per-question optional free-text custom-answer field", () => {
+    const questions = [
+      mkQuestion("Which?", [{ label: "A" }, { label: "B" }]),
+      mkQuestion("What else?", [{ label: "C" }, { label: "D" }]),
+    ];
     const schema = (
       askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
         CreateElicitationRequest,
@@ -196,7 +199,16 @@ describe("askUserQuestionsToCreateRequest", () => {
       >
     ).requestedSchema;
 
-    expect(schema.properties?.["customAnswer"]).toMatchObject({ type: "string", title: "Other" });
+    // Each question gets its own "Other" box, not one shared form-level field.
+    expect(schema.properties?.["question_0_custom"]).toMatchObject({
+      type: "string",
+      title: "Other",
+    });
+    expect(schema.properties?.["question_1_custom"]).toMatchObject({
+      type: "string",
+      title: "Other",
+    });
+    expect(schema.properties?.["customAnswer"]).toBeUndefined();
   });
 
   it("builds an array property for multi-select questions and includes per-field question text", () => {
@@ -250,10 +262,10 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("maps the free-text custom-answer field to the tool's response", () => {
+  it("folds a per-question custom answer into that question's answer", () => {
     const response = {
       action: "accept",
-      content: { question_0: "A", customAnswer: "something else entirely" },
+      content: { question_0: "A", question_1_custom: "something else entirely" },
     } as CreateElicitationResponse;
 
     expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
@@ -261,8 +273,23 @@ describe("applyAskElicitationResponse", () => {
       updatedInput: {
         questions,
         metadata: { source: "test" },
-        answers: { "Single?": "A" },
-        response: "something else entirely",
+        answers: { "Single?": "A", "Multi?": "something else entirely" },
+      },
+    });
+  });
+
+  it("prefers a question's custom answer over its selection", () => {
+    const response = {
+      action: "accept",
+      content: { question_0: "A", question_0_custom: "  my own take  " },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "my own take" },
       },
     });
   });
@@ -270,7 +297,7 @@ describe("applyAskElicitationResponse", () => {
   it("ignores empty selections and blank custom answers", () => {
     const response = {
       action: "accept",
-      content: { question_1: [], customAnswer: "   " },
+      content: { question_1: [], question_0_custom: "   " },
     } as CreateElicitationResponse;
 
     expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
