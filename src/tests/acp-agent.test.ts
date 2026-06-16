@@ -4768,6 +4768,115 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({ stopReason: "cancelled" });
     await expect(second).rejects.toThrow(/start a new session/);
   });
+
+  it("settles a no-echo command (/compact) submitted right after a cancel", async () => {
+    // Regression: after cancelling turn 1, session.cancelled lingers until the
+    // next activation. A /compact submitted next never echoes its uuid, so it
+    // can only be settled by head-promotion — which the old `!session.cancelled`
+    // gate blocked, hanging the prompt. The orphan-count gate promotes it (no
+    // orphans are expected since the cancel removed no queued turns).
+    const agent = createMockAgent();
+    let releaseAfterCancel!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await afterCancel; // wait until the test has cancelled turn 1
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // settles turn 1 cancelled
+        await iter.next(); // /compact's pushed message — never echoed
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    await agent.cancel({ sessionId: "test-session" });
+    releaseAfterCancel();
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+
+    // session.cancelled is still true here (turn 1 settled, nothing re-activated).
+    // The /compact result must still settle via head-promotion.
+    const compact = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    expect(compact.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("skips the orphan result of a cancelled queued turn instead of misattributing it", async () => {
+    // Turn 1 active, turn 2 queued. cancel() settles+removes turn 2 but its
+    // message was already pushed, so the SDK still emits turn 2's result (an
+    // orphan). That orphan must be SKIPPED — not promoted onto the next prompt —
+    // so a later turn 3 resolves with its OWN usage, not the orphan's.
+    const agent = createMockAgent();
+    let afterCancelAndQueue!: () => void;
+    const gate = new Promise<void>((resolve) => (afterCancelAndQueue = resolve));
+
+    const orphanResult = createResultMessage({
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+    });
+    orphanResult.usage.input_tokens = 999; // distinct so misattribution is visible
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await iter.next(); // turn 2's pushed message (will be cancelled+removed)
+        await gate; // wait until the test cancels (removing turn 2) and queues turn 3
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield orphanResult; // turn 2's orphan result — must be skipped, not promote turn 3
+        const u3 = await iter.next();
+        yield userEcho(u3.value); // turn 3 echo activates it
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }); // usage 10
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    await agent.cancel({ sessionId: "test-session" }); // removes turn 2 -> pendingOrphanResults = 1
+    const third = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "third" }],
+    });
+    afterCancelAndQueue();
+
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const thirdResult = await third;
+    expect(thirdResult.stopReason).toBe("end_turn");
+    // Turn 3's own result carries 10 input tokens; the orphan's 999 must not leak.
+    expect(thirdResult.usage?.inputTokens).toBe(10);
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("session/cancel wedge recovery (issue #680)", () => {

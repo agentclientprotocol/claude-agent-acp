@@ -196,6 +196,15 @@ type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
+  /** Count of result messages the consumer should treat as orphans and skip
+   *  (not promote/attribute to the current head). When cancel() settles+removes
+   *  a queued turn, that turn's user message was already pushed to the SDK, so
+   *  the SDK still runs it and emits a result with no uuid we can match. Because
+   *  the SDK processes input FIFO, those orphan results arrive (in submission
+   *  order) before the next live turn's, so skipping exactly this many leaves
+   *  the genuine head untouched. Reset to 0 on every activation as a backstop
+   *  against an SDK that drops queued input on interrupt (no orphan emitted). */
+  pendingOrphanResults?: number;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -978,10 +987,16 @@ export class ClaudeAcpAgent implements Agent {
 
     /** Promote a queued turn to active: it becomes the one output is attributed
      *  to, and its scratch starts fresh. Clears the cancelled flag so a turn
-     *  enqueued after a prior cancel isn't treated as cancelled. */
+     *  enqueued after a prior cancel isn't treated as cancelled. Also clears any
+     *  leftover orphan-skip count: since the SDK echoes/runs input FIFO, every
+     *  orphan from a prior cancel has already arrived by the time a live turn
+     *  activates, so a non-zero remainder means the SDK dropped a queued turn on
+     *  interrupt (no orphan emitted) — drop the stale count so a later echo-less
+     *  result isn't wrongly skipped. */
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      session.pendingOrphanResults = 0;
       resetTurnScratch();
     };
 
@@ -993,20 +1008,26 @@ export class ClaudeAcpAgent implements Agent {
      *  are the generated summary and a `<local-command-stdout>` replay — neither
      *  carries the prompt's uuid). Promoting the head settles those.
      *
-     *  Gated on `!session.cancelled`: a result that arrives while a cancel is
-     *  pending is an orphan — e.g. the SDK still ran a turn that cancel() already
-     *  resolved and removed (its user message was pushed before the cancel), so
-     *  the head is now an unrelated later prompt. Promoting it would misattribute
-     *  the orphan's stop reason/usage. In normal (non-cancelled) operation the
-     *  head IS the turn the SDK is running, so promoting it is correct. */
+     *  But an echo-less result can also be an ORPHAN: cancel() settles+removes a
+     *  queued turn whose user message was already pushed, so the SDK still runs
+     *  it and emits a result with no uuid to match. Promoting the head for an
+     *  orphan would misattribute its stop reason/usage to an unrelated later
+     *  prompt. `session.pendingOrphanResults` counts exactly how many such
+     *  orphans are still expected (FIFO, they arrive before any live turn's
+     *  result), so we skip those and only promote once the count is drained. */
     const ensureActiveTurn = () => {
-      if (session.activeTurn || session.cancelled) {
+      if (session.activeTurn) {
         return;
       }
       const head = (session.turnQueue ?? []).find((t) => !t.settled);
-      if (head) {
-        activateTurn(head);
+      if (!head) {
+        return;
       }
+      if ((session.pendingOrphanResults ?? 0) > 0) {
+        session.pendingOrphanResults!--;
+        return;
+      }
+      activateTurn(head);
     };
 
     /** Settle the active turn's deferred exactly once, disarm the force-cancel
@@ -1946,12 +1967,19 @@ export class ClaudeAcpAgent implements Agent {
     // by the consumer when it observes the interrupt's trailing idle (or via the
     // backstop below). Mirrors the old pendingMessages cancellation.
     if (session.turnQueue) {
+      let orphaned = 0;
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
           turn.resolve({ stopReason: "cancelled" });
+          orphaned++;
         }
       }
+      // Each removed queued turn's user message was already pushed to the SDK,
+      // which processes input FIFO and will still emit a result for it with no
+      // uuid to match. Count those so the consumer skips them (see
+      // ensureActiveTurn) rather than misattributing them to the head.
+      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphaned;
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
       );
