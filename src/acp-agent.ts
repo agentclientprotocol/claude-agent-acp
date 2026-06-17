@@ -959,9 +959,8 @@ export class ClaudeAcpAgent implements Agent {
     // via `stream_event` deltas, split by block type, so the consolidated
     // `assistant` message can drop the duplicate blocks that already reached the
     // client as chunks while still forwarding any that a non-streaming gateway
-    // delivered only as an assembled block.
-    let streamedTextIds = new Set<string>();
-    let streamedThinkingIds = new Set<string>();
+    const streamedTextIds = new Set<string>();
+    const streamedThinkingIds = new Set<string>();
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
@@ -974,8 +973,6 @@ export class ClaudeAcpAgent implements Agent {
       lastRefusalExplanation = null;
       compactionInProgress = false;
       currentStreamMessageId = undefined;
-      streamedTextIds = new Set<string>();
-      streamedThinkingIds = new Set<string>();
       stopReason = "end_turn";
       session.accumulatedUsage = {
         inputTokens: 0,
@@ -1864,6 +1861,13 @@ export class ClaudeAcpAgent implements Agent {
                 }
                 return true;
               });
+              // The consolidated message is the last place this id is needed for
+              // dedupe — drop it so the streamed-id sets stay bounded to in-flight
+              // streams rather than growing for the session's whole life.
+              if (id !== undefined) {
+                streamedTextIds.delete(id);
+                streamedThinkingIds.delete(id);
+              }
             } else if (message.type === "assistant") {
               // Subagent assistant message (`parent_tool_use_id !== null`). It is
               // never streamed live and its text/thinking is internal to the tool

@@ -3679,6 +3679,36 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
+  // Like injectSession, but the user-message echo is yielded at the position of
+  // the "ECHO" sentinel in `messages` rather than always first — so a test can
+  // reproduce the production ordering where the assistant stream arrives before
+  // the SDK replays the user message.
+  function injectSessionEchoAt(agent: ClaudeAcpAgent, messages: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      for (const m of messages) {
+        if (m === "ECHO") {
+          yield {
+            type: "user",
+            message: userMessage.message,
+            parent_tool_use_id: null,
+            uuid: userMessage.uuid,
+            session_id: "test-session",
+            isReplay: true,
+          };
+        } else {
+          yield m;
+        }
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
   function messageChunkTexts(updates: any[]): string[] {
     return updates
       .filter((u) => u.update?.sessionUpdate === "agent_message_chunk")
@@ -3720,6 +3750,28 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
     // Only the two streamed deltas — the assembled block is filtered out.
+    expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
+  });
+
+  it("dedupes streamed text even when the stream arrives before the user echo", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Production ordering: the SDK emits the assistant's stream events before it
+    // replays the user message that activates the turn. The streamed-id tracking
+    // must survive activation, or the consolidated block is re-emitted as a
+    // duplicate (regression from the persistent-consumer rework).
+    injectSessionEchoAt(agent, [
+      messageStart("msg-streamed"),
+      textDelta("hello "),
+      textDelta("world"),
+      "ECHO",
+      assistantMessage("msg-streamed", [{ type: "text", text: "hello world" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    // Still just the two streamed deltas — no duplicated assembled block.
     expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
   });
 
