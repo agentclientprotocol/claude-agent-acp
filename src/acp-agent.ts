@@ -972,7 +972,12 @@ export class ClaudeAcpAgent implements Agent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
-      currentStreamMessageId = undefined;
+      // Do NOT reset currentStreamMessageId here. `message_start` sets it per
+      // message; clearing it on turn activation drops the id for any block that
+      // streams after a mid-message activation (the replayed user echo with
+      // --replay-user-messages), so those ids never enter streamedTextIds and the
+      // consolidated assistant message re-emits already-streamed text as a
+      // duplicate. #785 stopped resetting streamedTextIds here but left this line.
       stopReason = "end_turn";
       session.accumulatedUsage = {
         inputTokens: 0,

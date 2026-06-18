@@ -3618,6 +3618,20 @@ describe("assembled assistant text fallback", () => {
     };
   }
 
+  function thinkingDelta(thinking: string) {
+    return {
+      type: "stream_event" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "thinking_delta" as const, thinking },
+      },
+    };
+  }
+
   function assistantMessage(apiId: string, content: any[], parentToolUseId: string | null = null) {
     return {
       type: "assistant" as const,
@@ -3773,6 +3787,37 @@ describe("assembled assistant text fallback", () => {
 
     // Still just the two streamed deltas — no duplicated assembled block.
     expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
+  });
+
+  it("dedupes streamed text when the user echo activates the turn mid-message, between a thinking and a text block", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Production ordering captured with: inside a single message id, the
+    // thinking block streams, THEN the SDK replays the user message that
+    // activates the turn, THEN the text block streams. Turn activation runs
+    // `resetTurnScratch()`; if that nulls `currentStreamMessageId`, every text
+    // delta after the echo streams untracked, so the consolidated `assistant`
+    // text fails dedupe and is re-emitted as a duplicate. #785 fixed the
+    // stream-before-echo case but left this residual mid-message path.
+    injectSessionEchoAt(agent, [
+      messageStart("msg-mixed"),
+      thinkingDelta("private reasoning"),
+      "ECHO",
+      textDelta("Starting now."),
+      assistantMessage("msg-mixed", [
+        { type: "thinking", thinking: "private reasoning" },
+        { type: "text", text: "Starting now." },
+      ]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    // The text streamed once; the consolidated copy must be deduped, not doubled.
+    expect(messageChunkTexts(updates)).toEqual(["Starting now."]);
+    // The thinking streamed before the echo (still tracked) so it is deduped —
+    // mirrors the production signature where only the text block doubled.
+    expect(thoughtChunkTexts(updates)).toEqual(["private reasoning"]);
   });
 
   it("dedupes per block type: streamed text is dropped but an un-streamed thinking block in the same message is forwarded", async () => {
