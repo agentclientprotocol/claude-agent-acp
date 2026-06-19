@@ -2730,6 +2730,19 @@ export class ClaudeAcpAgent {
           },
         });
       }
+    } else if (configId === "agent") {
+      // Live agent switch — no subprocess restart needed. Apply the SDK flag
+      // first so a rejected control request leaves both `currentAgent` and the
+      // config option untouched (no UI/SDK desync). Passing `null` clears the
+      // flag layer back to the standard Claude Code agent; the change takes
+      // effect on the next turn (SDK >= 0.3.161).
+      await session.query.applyFlagSettings({
+        agent: value === "default" ? null : value,
+      });
+      session.currentAgent = value;
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
+      );
     } else {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
@@ -2737,14 +2750,6 @@ export class ClaudeAcpAgent {
       if (configId === "effort") {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(value),
-        });
-      } else if (configId === "agent") {
-        session.currentAgent = value;
-        // Live agent switch — no subprocess restart needed. Passing `null`
-        // clears the flag layer back to the standard Claude Code agent; the
-        // change takes effect on the next turn (SDK >= 0.3.161).
-        await session.query.applyFlagSettings({
-          agent: value === "default" ? null : value,
         });
       }
     }
@@ -3161,7 +3166,14 @@ export class ClaudeAcpAgent {
     };
 
     const agents = await discoverCustomAgents(q);
-    const currentAgent = userProvidedOptions?.agent ?? "default";
+    // Only adopt the requested agent as the selected value if it's one we
+    // actually surface in the picker. A built-in (filtered out above) or
+    // otherwise-unknown name would leave the config option's `currentValue`
+    // pointing at an entry not in its own `options` list, which clients render
+    // as a blank/invalid selection.
+    const requestedAgent = userProvidedOptions?.agent;
+    const currentAgent =
+      requestedAgent && agents.some((a) => a.name === requestedAgent) ? requestedAgent : "default";
 
     const configOptions = buildConfigOptions(
       modes,
@@ -3389,7 +3401,7 @@ function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | 
 // personas, so we filter them out and only surface the Agent picker when the
 // user (or a plugin/project) has configured custom agents. Update this set if
 // the SDK's built-in roster changes.
-const BUILTIN_AGENT_NAMES = new Set([
+export const BUILTIN_AGENT_NAMES = new Set([
   "claude",
   "general-purpose",
   "Explore",

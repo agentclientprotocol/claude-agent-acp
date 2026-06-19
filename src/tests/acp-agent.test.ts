@@ -5625,5 +5625,25 @@ describe("agent selection config option", () => {
       expect(applyFlagSettings).toHaveBeenCalledWith({ agent: null });
       expect(session.currentAgent).toBe("default");
     });
+
+    it("leaves tracked state untouched when the live switch is rejected", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s3");
+      applyFlagSettings.mockRejectedValueOnce(new Error("control channel closed"));
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "s3",
+          configId: "agent",
+          value: "my-reviewer",
+        }),
+      ).rejects.toThrow("control channel closed");
+
+      // The flag never applied, so neither currentAgent nor the config option
+      // moves — no desync with the agent the SDK is actually running.
+      expect(session.currentAgent).toBe("default");
+      const agentOption = session.configOptions.find((o) => o.id === "agent");
+      expect(agentOption?.currentValue).toBe("default");
+    });
   });
 });
