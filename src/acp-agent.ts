@@ -259,6 +259,10 @@ type Session = {
    *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
    *  invalidated when the user switches the session's model. */
   contextWindowSize: number;
+  /** True while contextWindowSize is still the generic fallback placeholder
+   *  rather than a model-name heuristic or the authoritative window reported by
+   *  modelUsage. Mid-stream usage_update events are suppressed while this holds. */
+  contextWindowSizeIsDefault: boolean;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -1538,6 +1542,7 @@ export class ClaudeAcpAgent {
             // leave the next prompt's mid-stream updates reporting 200k.
             if (matchingModelUsage) {
               session.contextWindowSize = matchingModelUsage.contextWindow;
+              session.contextWindowSizeIsDefault = false;
             }
 
             // Send usage_update notification
@@ -1713,10 +1718,11 @@ export class ClaudeAcpAgent {
                   // Model switches invalidate the cached window via
                   // `syncSessionConfigState`, which resets us back to the
                   // default so this branch runs again for the new model.
-                  if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
+                  if (session.contextWindowSizeIsDefault) {
                     const inferred = inferContextWindowFromModel(model);
                     if (inferred !== null) {
                       session.contextWindowSize = inferred;
+                      session.contextWindowSizeIsDefault = false;
                     }
                   }
                 }
@@ -1740,14 +1746,16 @@ export class ClaudeAcpAgent {
               const nextUsage = totalTokens(lastAssistantUsage);
               if (nextUsage !== lastAssistantTotalUsage) {
                 lastAssistantTotalUsage = nextUsage;
-                await this.client.sessionUpdate({
-                  sessionId: params.sessionId,
-                  update: {
-                    sessionUpdate: "usage_update",
-                    used: nextUsage,
-                    size: session.contextWindowSize,
-                  },
-                });
+                if (!session.contextWindowSizeIsDefault) {
+                  await this.client.sessionUpdate({
+                    sessionId: params.sessionId,
+                    update: {
+                      sessionUpdate: "usage_update",
+                      used: nextUsage,
+                      size: session.contextWindowSize,
+                    },
+                  });
+                }
               }
             }
             for (const notification of streamEventToAcpNotifications(
@@ -2657,7 +2665,9 @@ export class ClaudeAcpAgent {
         // to the new model's heuristic so mid-stream updates between now and
         // the next `result` reflect the user's selection instead of the old
         // model's window.
-        session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
+        const inferredContextWindowSize = inferContextWindowFromModel(value);
+        session.contextWindowSize = inferredContextWindowSize ?? DEFAULT_CONTEXT_WINDOW;
+        session.contextWindowSizeIsDefault = inferredContextWindowSize === null;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -3197,6 +3207,7 @@ export class ClaudeAcpAgent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
+    const inferredContextWindowSize = inferContextWindowFromModel(models.currentModelId);
     this.sessions[sessionId] = {
       query: q,
       input: input,
@@ -3218,8 +3229,8 @@ export class ClaudeAcpAgent {
       currentAgent,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindowSize: inferredContextWindowSize ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindowSizeIsDefault: inferredContextWindowSize === null,
       taskState,
       toolUseCache: {},
       messageIdToUuid: new Map(),

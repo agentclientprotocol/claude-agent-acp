@@ -124,6 +124,7 @@ describe("session config options", () => {
       ),
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
     };
   }
 

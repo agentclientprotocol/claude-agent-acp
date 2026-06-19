@@ -113,6 +113,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     contextWindowSize: 200000,
+    contextWindowSizeIsDefault: true,
     taskState: new Map(),
     toolUseCache: {},
     messageIdToUuid: new Map(),
@@ -2319,6 +2320,7 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -2404,6 +2406,7 @@ describe("session/delete", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -2506,6 +2509,7 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -2809,7 +2813,7 @@ describe("usage_update computation", () => {
     }
   });
 
-  it("stream_event message_start emits usage_update before result", async () => {
+  it("stream_event message_start suppresses default-window usage_update before result", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
       createStreamEvent("message_start", {
@@ -2841,15 +2845,10 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates).toHaveLength(1);
     expect(usageUpdates[0].update.used).toBe(1800);
-    // First prompt of a session has no prior result to learn the window from,
-    // so the mid-stream update falls back to the default context window.
-    expect(usageUpdates[0].update.size).toBe(200000);
-    expect(usageUpdates[0].update.cost).toBeUndefined();
-    expect(usageUpdates[1].update.used).toBe(1800);
-    expect(usageUpdates[1].update.size).toBe(1000000);
-    expect(usageUpdates[1].update.cost).toBeDefined();
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[0].update.cost).toBeDefined();
   });
 
   it("stream_event message_delta patches previous snapshot", async () => {
@@ -2887,13 +2886,10 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(3);
-    expect(usageUpdates[0].update.used).toBe(1300);
-    expect(usageUpdates[0].update.cost).toBeUndefined();
-    expect(usageUpdates[1].update.used).toBe(1800);
-    expect(usageUpdates[1].update.cost).toBeUndefined();
-    expect(usageUpdates[2].update.used).toBe(1800);
-    expect(usageUpdates[2].update.cost).toBeDefined();
+    expect(usageUpdates).toHaveLength(1);
+    expect(usageUpdates[0].update.used).toBe(1800);
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[0].update.cost).toBeDefined();
   });
 
   it("mid-stream size is inferred from a 1M model name before the first result", async () => {
@@ -2973,11 +2969,9 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates).toHaveLength(1);
     expect(usageUpdates[0].update.used).toBe(1800);
-    expect(usageUpdates[0].update.cost).toBeUndefined();
-    expect(usageUpdates[1].update.used).toBe(1800);
-    expect(usageUpdates[1].update.cost).toBeDefined();
+    expect(usageUpdates[0].update.cost).toBeDefined();
   });
 
   it("mid-stream size uses the session's learned context window", async () => {
@@ -3013,6 +3007,7 @@ describe("usage_update computation", () => {
     ]);
     // Simulate a prior prompt having learned the 1M window for this model.
     agent.sessions["test-session"].contextWindowSize = 1000000;
+    agent.sessions["test-session"].contextWindowSizeIsDefault = false;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3063,6 +3058,7 @@ describe("usage_update computation", () => {
       "claude-opus-4-6-1m",
     );
     expect(session.contextWindowSize).toBe(1000000);
+    expect(session.contextWindowSizeIsDefault).toBe(false);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3097,6 +3093,7 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
+    session.contextWindowSizeIsDefault = false;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -3143,6 +3140,7 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 1000000;
+    session.contextWindowSizeIsDefault = false;
     session.models = { ...session.models, currentModelId: "claude-opus-4-6-1m" };
 
     // User flips the selector to a 200k model.
@@ -3152,13 +3150,14 @@ describe("usage_update computation", () => {
       "model",
       "claude-sonnet-4-6",
     );
+    expect(session.contextWindowSizeIsDefault).toBe(true);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates).toHaveLength(1);
     expect(usageUpdates[0].update.size).toBe(200000);
-    expect(usageUpdates[1].update.size).toBe(200000);
+    expect(usageUpdates[0].update.cost).toBeDefined();
   });
 
   it("non-usage stream events do not re-emit usage_update", async () => {
@@ -3227,12 +3226,12 @@ describe("usage_update computation", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
-    // Exactly three: message_start (1000), message_delta (1200), result (1200 + cost).
-    expect(usageUpdates).toHaveLength(3);
-    expect(usageUpdates[0].update.used).toBe(1000);
-    expect(usageUpdates[1].update.used).toBe(1200);
-    expect(usageUpdates[2].update.used).toBe(1200);
-    expect(usageUpdates[2].update.cost).toBeDefined();
+    // Stream events update the accumulator, but the default placeholder window
+    // is not emitted; only the final result carries the authoritative size.
+    expect(usageUpdates).toHaveLength(1);
+    expect(usageUpdates[0].update.used).toBe(1200);
+    expect(usageUpdates[0].update.size).toBe(1000000);
+    expect(usageUpdates[0].update.cost).toBeDefined();
   });
 
   it("subagent stream_event does not emit usage_update", async () => {
@@ -3565,6 +3564,7 @@ describe("usage_update computation", () => {
     // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
     // — getContextUsage's window field under-reports it, so we don't use it.
     session.contextWindowSize = 1000000;
+    session.contextWindowSizeIsDefault = false;
     (session.query as any).getContextUsage = vi
       .fn()
       .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
@@ -4572,6 +4572,7 @@ describe("post-error recovery", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -5142,6 +5143,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowSizeIsDefault: true,
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -5595,6 +5597,7 @@ describe("agent selection config option", () => {
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         contextWindowSize: 200000,
+        contextWindowSizeIsDefault: true,
         taskState: new Map(),
         toolUseCache: {},
         messageIdToUuid: new Map(),
