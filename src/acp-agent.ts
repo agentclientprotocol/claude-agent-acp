@@ -1,11 +1,14 @@
 import {
-  Agent,
-  AgentSideConnection,
+  agent as acpAgent,
+  AgentContext,
   AuthenticateRequest,
   AuthMethod,
   AvailableCommand,
   CancelNotification,
   ClientCapabilities,
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
   ForkSessionRequest,
   ForkSessionResponse,
   InitializeRequest,
@@ -14,6 +17,7 @@ import {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  methods,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -23,6 +27,8 @@ import {
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestError,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
   ResumeSessionRequest,
   ResumeSessionResponse,
   SessionConfigOption,
@@ -612,12 +618,66 @@ export function describeAlwaysAllow(
   return `Always Allow ${parts.join(" and ")}`;
 }
 
-// Implement the ACP Agent interface
-export class ClaudeAcpAgent implements Agent {
+/**
+ * Client-facing surface the agent calls back into. This is the subset of ACP
+ * client methods the agent actually uses, expressed as a narrow interface so
+ * tests can supply lightweight mocks. In production it is backed by
+ * {@link ClientConnection} over the SDK's typed `AgentContext`.
+ */
+export interface AcpClient {
+  sessionUpdate(params: SessionNotification): Promise<void>;
+  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
+  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
+  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
+  unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void>;
+  /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
+  extNotification(method: string, params: Record<string, unknown>): Promise<void>;
+}
+
+/**
+ * Bridges {@link AcpClient} to the connection-scoped {@link AgentContext}
+ * exposed by `AgentApp.connect(...)` as `connection.client`. The peer handle is
+ * valid for the entire connection lifetime, so it is captured once at
+ * construction.
+ */
+class ClientConnection implements AcpClient {
+  constructor(private readonly ctx: AgentContext) {}
+
+  sessionUpdate(params: SessionNotification): Promise<void> {
+    return this.ctx.notify(methods.client.session.update, params);
+  }
+
+  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+    return this.ctx.request(methods.client.session.requestPermission, params);
+  }
+
+  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+    return this.ctx.request(methods.client.fs.readTextFile, params);
+  }
+
+  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+    return this.ctx.request(methods.client.fs.writeTextFile, params);
+  }
+
+  unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    return this.ctx.request(methods.client.elicitation.create, params);
+  }
+
+  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+    return this.ctx.notify(methods.client.elicitation.complete, params);
+  }
+
+  extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+    return this.ctx.notify(method, params);
+  }
+}
+
+export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
   };
-  client: AgentSideConnection;
+  client: AcpClient;
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
@@ -626,7 +686,7 @@ export class ClaudeAcpAgent implements Agent {
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
 
-  constructor(client: AgentSideConnection, logger?: Logger) {
+  constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
@@ -3789,7 +3849,7 @@ export function toAcpNotifications(
   role: "assistant" | "user",
   sessionId: string,
   toolUseCache: ToolUseCache,
-  client: AgentSideConnection,
+  client: AcpClient,
   logger: Logger,
   options?: {
     registerHooks?: boolean;
@@ -4111,7 +4171,7 @@ export function streamEventToAcpNotifications(
   message: SDKPartialAssistantMessage,
   sessionId: string,
   toolUseCache: ToolUseCache,
-  client: AgentSideConnection,
+  client: AcpClient,
   logger: Logger,
   options?: {
     clientCapabilities?: ClientCapabilities;
@@ -4176,11 +4236,34 @@ export function runAcp() {
   const output = nodeToWebReadable(process.stdin);
 
   const stream = ndJsonStream(input, output);
-  let agent!: ClaudeAcpAgent;
-  const connection = new AgentSideConnection((client) => {
-    agent = new ClaudeAcpAgent(client);
-    return agent;
-  }, stream);
+
+  // `connect(...)` returns a connection-scoped peer handle (`connection.client`)
+  // that stays valid for the whole connection, so the agent captures it once.
+  // Handlers close over `agent`, which is assigned synchronously right after
+  // `connect()` returns — before the connection processes any inbound message.
+  // It cannot be `const`: its value depends on `connection.client`, which does
+  // not exist until `connect()` has been called.
+  // eslint-disable-next-line prefer-const
+  let agent: ClaudeAcpAgent;
+  const connection = acpAgent({ name: "claude-code-acp" })
+    .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
+    .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
+    .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
+    .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
+    .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
+    .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
+    .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))
+    .onRequest(methods.agent.session.close, (ctx) => agent.closeSession(ctx.params))
+    .onRequest(methods.agent.session.setMode, (ctx) => agent.setSessionMode(ctx.params))
+    .onRequest(methods.agent.session.setConfigOption, (ctx) =>
+      agent.setSessionConfigOption(ctx.params),
+    )
+    .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.session.prompt, (ctx) => agent.prompt(ctx.params))
+    .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
+    .connect(stream);
+
+  agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
   return { connection, agent };
 }
 

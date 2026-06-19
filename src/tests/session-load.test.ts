@@ -1,18 +1,18 @@
 import { describe, it, expect } from "vitest";
 import { randomUUID } from "crypto";
-import { AgentSideConnection, RequestError, SessionNotification } from "@agentclientprotocol/sdk";
+import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
-function createMockClient(): AgentSideConnection {
+function createMockClient(): AcpClient {
   return {
     sessionUpdate: async (_notification: SessionNotification) => {},
     requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
     readTextFile: async () => ({ content: "" }),
     writeTextFile: async () => ({}),
-  } as unknown as AgentSideConnection;
+  } as unknown as AcpClient;
 }
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecycle", () => {
@@ -165,7 +165,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
 
     const commandName =
       "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>";
@@ -274,7 +274,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("session load/resume lifecyc
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
 
     // Exact shape from https://github.com/zed-industries/claude-code-acp/issues/579.
     const concatenated =

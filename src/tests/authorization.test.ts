@@ -1,6 +1,5 @@
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
-import { ClaudeAcpAgent } from "../acp-agent.js";
-import { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 
 const mockQuery = vi.hoisted(() =>
   vi.fn(() => ({
@@ -39,7 +38,7 @@ describe("authorization", () => {
   async function createAgentMock(): Promise<[ClaudeAcpAgent, Mock]> {
     const connectionMock = {
       sessionUpdate: async (_: any) => {},
-    } as AgentSideConnection;
+    } as AcpClient;
 
     const agent = new ClaudeAcpAgent(connectionMock);
 

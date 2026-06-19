@@ -1,15 +1,15 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
-  Agent,
-  AgentSideConnection,
   AvailableCommand,
-  Client,
-  ClientSideConnection,
+  client as acpClient,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  methods,
   ndJsonStream,
   NewSessionResponse,
+  PromptRequest,
+  PromptResponse,
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestPermissionRequest,
@@ -36,6 +36,7 @@ import {
   describeAlwaysAllow,
   streamEventToAcpNotifications,
   messageIdForGrouping,
+  type AcpClient,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -158,8 +159,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     child.kill();
   });
 
-  class TestClient implements Client {
-    agent: Agent;
+  class TestClient {
     files: Map<string, string> = new Map();
     receivedText: string = "";
     // Records for the AskUserQuestion elicitation test.
@@ -169,8 +169,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     resolveAvailableCommands: (commands: AvailableCommand[]) => void;
     availableCommandsPromise: Promise<AvailableCommand[]>;
 
-    constructor(agent: Agent) {
-      this.agent = agent;
+    constructor() {
       this.resolveAvailableCommands = () => {};
       this.availableCommandsPromise = new Promise((resolve) => {
         this.resolveAvailableCommands = resolve;
@@ -248,21 +247,35 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     }
   }
 
+  type TestConnection = {
+    prompt(params: PromptRequest): Promise<PromptResponse>;
+  };
+
   async function setupTestSession(cwd: string): Promise<{
     client: TestClient;
-    connection: ClientSideConnection;
+    connection: TestConnection;
     newSessionResponse: NewSessionResponse;
   }> {
-    let client;
     const input = nodeToWebWritable(child.stdin!);
     const output = nodeToWebReadable(child.stdout!);
     const stream = ndJsonStream(input, output);
-    const connection = new ClientSideConnection((agent) => {
-      client = new TestClient(agent);
-      return client;
-    }, stream);
 
-    await connection.initialize({
+    const client = new TestClient();
+    // `connect(...)` keeps the connection open and exposes the agent-side peer
+    // handle as `connection.agent`, valid for the lifetime of the connection.
+    const { agent: ctx } = acpClient({ name: "test-client" })
+      .onNotification(methods.client.session.update, (c) => client.sessionUpdate(c.params))
+      .onRequest(methods.client.session.requestPermission, (c) =>
+        client.requestPermission(c.params),
+      )
+      .onRequest(methods.client.fs.readTextFile, (c) => client.readTextFile(c.params))
+      .onRequest(methods.client.fs.writeTextFile, (c) => client.writeTextFile(c.params))
+      .onRequest(methods.client.elicitation.create, (c) =>
+        client.unstable_createElicitation(c.params),
+      )
+      .connect(stream);
+
+    await ctx.request(methods.agent.initialize, {
       protocolVersion: 1,
       clientCapabilities: {
         fs: {
@@ -275,12 +288,16 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       },
     });
 
-    const newSessionResponse = await connection.newSession({
+    const newSessionResponse = await ctx.request(methods.agent.session.new, {
       cwd,
       mcpServers: [],
     });
 
-    return { client: client!, connection, newSessionResponse };
+    const connection: TestConnection = {
+      prompt: (params) => ctx.request(methods.agent.session.prompt, params),
+    };
+
+    return { client, connection, newSessionResponse };
   }
 
   it("should connect to the ACP subprocess", async () => {
@@ -848,7 +865,7 @@ describe("tool conversions", () => {
         received.message.role,
         "test",
         {},
-        {} as AgentSideConnection,
+        {} as AcpClient,
         console,
       ),
     ).toStrictEqual([
@@ -1766,7 +1783,7 @@ describe("stop reason propagation", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -2096,7 +2113,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (u: any) => {
         sessionUpdates.push(u);
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
 
     const input = new Pushable<any>();
@@ -2263,7 +2280,7 @@ describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -2352,7 +2369,7 @@ describe("session/delete", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -2439,7 +2456,7 @@ describe("getOrCreateSession param change detection", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -2664,7 +2681,7 @@ describe("usage_update computation", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
   }
@@ -3586,7 +3603,7 @@ describe("assembled assistant text fallback", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
   }
@@ -3917,7 +3934,7 @@ describe("emitRawSDKMessages", () => {
       extNotification: async (method: string, params: any) => {
         extNotifications.push({ method, params });
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates, extNotifications };
   }
@@ -4138,7 +4155,7 @@ describe("result origin handling", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
   }
@@ -4292,7 +4309,7 @@ describe("memory_recall handling", () => {
       sessionUpdate: async (notification: any) => {
         updates.push(notification);
       },
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
     return { agent, updates };
   }
@@ -4449,7 +4466,7 @@ describe("post-error recovery", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -5047,7 +5064,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
-    } as unknown as AgentSideConnection;
+    } as unknown as AcpClient;
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
@@ -5268,14 +5285,9 @@ describe("streamEventToAcpNotifications", () => {
       },
     } as Parameters<typeof streamEventToAcpNotifications>[0];
 
-    const result = streamEventToAcpNotifications(
-      message,
-      "test",
-      {},
-      {} as AgentSideConnection,
-      console,
-      { messageId },
-    );
+    const result = streamEventToAcpNotifications(message, "test", {}, {} as AcpClient, console, {
+      messageId,
+    });
 
     expect(result).toEqual([
       {
@@ -5299,7 +5311,7 @@ describe("toAcpNotifications messageId", () => {
       "assistant",
       "test",
       {},
-      {} as AgentSideConnection,
+      {} as AcpClient,
       console,
       { messageId },
     );
@@ -5322,7 +5334,7 @@ describe("toAcpNotifications messageId", () => {
       "user",
       "test",
       {},
-      {} as AgentSideConnection,
+      {} as AcpClient,
       console,
       { messageId },
     );
@@ -5336,7 +5348,7 @@ describe("toAcpNotifications messageId", () => {
       "assistant",
       "test",
       {},
-      {} as AgentSideConnection,
+      {} as AcpClient,
       console,
       { messageId },
     );
@@ -5347,14 +5359,7 @@ describe("toAcpNotifications messageId", () => {
   });
 
   it("omits messageId when none is supplied", () => {
-    const result = toAcpNotifications(
-      "hello",
-      "assistant",
-      "test",
-      {},
-      {} as AgentSideConnection,
-      console,
-    );
+    const result = toAcpNotifications("hello", "assistant", "test", {}, {} as AcpClient, console);
     expect(result[0].update).not.toHaveProperty("messageId");
   });
 
@@ -5371,7 +5376,7 @@ describe("toAcpNotifications messageId", () => {
       "assistant",
       "test",
       {},
-      {} as AgentSideConnection,
+      {} as AcpClient,
       console,
       { messageId, registerHooks: false },
     );

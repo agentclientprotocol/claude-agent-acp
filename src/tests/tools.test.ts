@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
+import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
   BetaMCPToolResultBlock,
@@ -10,7 +10,7 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
@@ -25,7 +25,7 @@ import {
 } from "../tools.js";
 
 describe("rawOutput in tool call updates", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   it("should include rawOutput with string content for tool_result", () => {
@@ -425,7 +425,7 @@ describe("rawOutput in tool call updates", () => {
 });
 
 describe("Bash terminal output", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   const bashToolUse = {
@@ -929,7 +929,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Register hook callback by processing tool_use
       toAcpNotifications(
@@ -1008,7 +1008,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1093,7 +1093,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1147,7 +1147,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1223,7 +1223,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1304,7 +1304,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Step 1: Process tool_use chunk — registers the PostToolUse hook callback
       const toolUseChunk = {
@@ -1404,7 +1404,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Process tool_use (registers hook)
       toAcpNotifications(
@@ -1569,7 +1569,7 @@ describe("planEntries - undefined input regression", () => {
 });
 
 describe("toAcpNotifications - TodoWrite with undefined input regression", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   it("should not throw when TodoWrite tool_use has undefined input", () => {
@@ -1704,7 +1704,7 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
 });
 
 describe("toAcpNotifications - Task* tools", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   it("suppresses tool_call for TaskCreate/TaskUpdate/TaskList/TaskGet on tool_use", () => {
