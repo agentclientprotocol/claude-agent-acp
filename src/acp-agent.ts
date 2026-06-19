@@ -2737,7 +2737,7 @@ export class ClaudeAcpAgent {
       // flag layer back to the standard Claude Code agent; the change takes
       // effect on the next turn (SDK >= 0.3.161).
       await session.query.applyFlagSettings({
-        agent: value === "default" ? null : value,
+        agent: value === DEFAULT_AGENT_ID ? null : value,
       });
       session.currentAgent = value;
       session.configOptions = session.configOptions.map((o) =>
@@ -3173,7 +3173,9 @@ export class ClaudeAcpAgent {
     // as a blank/invalid selection.
     const requestedAgent = userProvidedOptions?.agent;
     const currentAgent =
-      requestedAgent && agents.some((a) => a.name === requestedAgent) ? requestedAgent : "default";
+      requestedAgent && agents.some((a) => a.name === requestedAgent)
+        ? requestedAgent
+        : DEFAULT_AGENT_ID;
 
     const configOptions = buildConfigOptions(
       modes,
@@ -3409,13 +3411,21 @@ export const BUILTIN_AGENT_NAMES = new Set([
   "statusline-setup",
 ]);
 
+// Value of the synthetic "Default" entry in the agent picker, which maps to the
+// standard Claude Code agent (`applyFlagSettings({ agent: null })`). It is a
+// reserved sentinel: a custom agent named exactly this would collide with it
+// (two options sharing the value, selection silently routing to `null`), so we
+// exclude that name from discovery.
+export const DEFAULT_AGENT_ID = "default";
+
 /** Discover user/plugin/project-configured main-thread agents, excluding the
- *  built-in subagents. Returns an empty list if discovery fails so a flaky
- *  control request never blocks session creation. */
+ *  built-in subagents and the reserved "default" sentinel. Returns an empty
+ *  list if discovery fails so a flaky control request never blocks session
+ *  creation. */
 export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
   try {
     const agents = await q.supportedAgents();
-    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name));
+    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID);
   } catch {
     return [];
   }
@@ -3427,7 +3437,7 @@ export function buildConfigOptions(
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
   agents: AgentInfo[] = [],
-  currentAgent: string = "default",
+  currentAgent: string = DEFAULT_AGENT_ID,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -3503,7 +3513,7 @@ export function buildConfigOptions(
       type: "select",
       currentValue: currentAgent,
       options: [
-        { value: "default", name: "Default", description: "Standard Claude Code agent" },
+        { value: DEFAULT_AGENT_ID, name: "Default", description: "Standard Claude Code agent" },
         ...agents.map((a) => ({
           value: a.name,
           name: a.name,

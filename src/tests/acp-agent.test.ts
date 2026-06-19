@@ -5506,6 +5506,17 @@ describe("agent selection config option", () => {
       expect(agents.map((a) => a.name)).toEqual(["my-reviewer", "my-writer"]);
     });
 
+    it("excludes a custom agent named 'default' (reserved sentinel)", async () => {
+      const q = {
+        supportedAgents: async () => [
+          { name: "default", description: "collides with the synthetic Default entry" },
+          { name: "my-reviewer", description: "Reviews code" },
+        ],
+      } as any;
+      const agents = await discoverCustomAgents(q);
+      expect(agents.map((a) => a.name)).toEqual(["my-reviewer"]);
+    });
+
     it("returns an empty list when discovery throws", async () => {
       const q = {
         supportedAgents: async () => {
