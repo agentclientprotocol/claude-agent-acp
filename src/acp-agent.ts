@@ -47,6 +47,7 @@ import {
   StopReason,
 } from "@agentclientprotocol/sdk";
 import {
+  AgentInfo,
   CanUseTool,
   deleteSession,
   getSessionMessages,
@@ -231,6 +232,14 @@ type Session = {
   models: SessionModelState;
   modelInfos: ModelInfo[];
   configOptions: SessionConfigOption[];
+  /** Custom main-thread agent personas the user (or a plugin/project) has
+   *  configured, discovered via `supportedAgents()` with Claude Code's built-in
+   *  subagents filtered out. Empty when none are configured, in which case the
+   *  "agent" config option is omitted entirely. */
+  agents: AgentInfo[];
+  /** The currently selected main-thread agent name, or "default" for the
+   *  standard Claude Code agent (no `agent` flag applied). */
+  currentAgent: string;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -2692,6 +2701,8 @@ export class ClaudeAcpAgent {
         session.models,
         session.modelInfos,
         currentEffort,
+        session.agents,
+        session.currentAgent,
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -2726,6 +2737,14 @@ export class ClaudeAcpAgent {
       if (configId === "effort") {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(value),
+        });
+      } else if (configId === "agent") {
+        session.currentAgent = value;
+        // Live agent switch — no subprocess restart needed. Passing `null`
+        // clears the flag layer back to the standard Claude Code agent; the
+        // change takes effect on the next turn (SDK >= 0.3.161).
+        await session.query.applyFlagSettings({
+          agent: value === "default" ? null : value,
         });
       }
     }
@@ -3141,11 +3160,16 @@ export class ClaudeAcpAgent {
       availableModes,
     };
 
+    const agents = await discoverCustomAgents(q);
+    const currentAgent = userProvidedOptions?.agent ?? "default";
+
     const configOptions = buildConfigOptions(
       modes,
       models,
       allowedModels,
       settingsManager.getSettings().effortLevel,
+      agents,
+      currentAgent,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -3176,6 +3200,8 @@ export class ClaudeAcpAgent {
       models,
       modelInfos: allowedModels,
       configOptions,
+      agents,
+      currentAgent,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
@@ -3357,11 +3383,39 @@ function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | 
   return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
 }
 
-function buildConfigOptions(
+// `supportedAgents()` always returns Claude Code's built-in subagents — the
+// ones used for Task-tool delegation (Explore, Plan, etc.) — even when the user
+// has configured none of their own. Those aren't meaningful *main-thread*
+// personas, so we filter them out and only surface the Agent picker when the
+// user (or a plugin/project) has configured custom agents. Update this set if
+// the SDK's built-in roster changes.
+const BUILTIN_AGENT_NAMES = new Set([
+  "claude",
+  "general-purpose",
+  "Explore",
+  "Plan",
+  "statusline-setup",
+]);
+
+/** Discover user/plugin/project-configured main-thread agents, excluding the
+ *  built-in subagents. Returns an empty list if discovery fails so a flaky
+ *  control request never blocks session creation. */
+export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
+  try {
+    const agents = await q.supportedAgents();
+    return agents.filter((a) => !BUILTIN_AGENT_NAMES.has(a.name));
+  } catch {
+    return [];
+  }
+}
+
+export function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
   modelInfos: ModelInfo[],
   currentEffortLevel?: string,
+  agents: AgentInfo[] = [],
+  currentAgent: string = "default",
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -3422,6 +3476,28 @@ function buildConfigOptions(
       type: "select",
       currentValue: validEffort,
       options: effortOptions,
+    });
+  }
+
+  // Only surface the Agent picker when there's a real choice — i.e. the user
+  // has configured at least one custom agent (built-ins are filtered out in
+  // discoverCustomAgents). With none configured, "Default" would be the only
+  // entry, so we omit the option entirely.
+  if (agents.length > 0) {
+    options.push({
+      id: "agent",
+      name: "Agent",
+      description: "Main-thread agent persona",
+      type: "select",
+      currentValue: currentAgent,
+      options: [
+        { value: "default", name: "Default", description: "Standard Claude Code agent" },
+        ...agents.map((a) => ({
+          value: a.name,
+          name: a.name,
+          description: a.description || undefined,
+        })),
+      ],
     });
   }
 
