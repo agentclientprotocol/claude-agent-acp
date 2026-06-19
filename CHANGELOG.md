@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.48.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.47.0...v0.48.0) (2026-06-19)
+
+
+### Features
+
+* Agent selection dropdown in config options ([#794](https://github.com/agentclientprotocol/claude-agent-acp/issues/794)) ([5729c47](https://github.com/agentclientprotocol/claude-agent-acp/commit/5729c471f92e1d2a191eb2a6d18c2be47821e9ec))
+* **deps:** bump the minor group with 11 updates ([#787](https://github.com/agentclientprotocol/claude-agent-acp/issues/787)) ([ad3b5fe](https://github.com/agentclientprotocol/claude-agent-acp/commit/ad3b5fe74527f83964695a1e8056d010b981fc79))
+* Update to claude-agent-sdk 0.3.183 ([#791](https://github.com/agentclientprotocol/claude-agent-acp/issues/791)) ([744b2d4](https://github.com/agentclientprotocol/claude-agent-acp/commit/744b2d41128f67091d4136283594c0db11ea4db5))
+* Update to new ACP SDK patterns ([#790](https://github.com/agentclientprotocol/claude-agent-acp/issues/790)) ([2554c7b](https://github.com/agentclientprotocol/claude-agent-acp/commit/2554c7bf980472760a6e7810b826f030d2c3af25))
+
+
+### Bug Fixes
+
+* duplicate assistant text when turn activates mid-message ([#789](https://github.com/agentclientprotocol/claude-agent-acp/issues/789)) ([1c80bf8](https://github.com/agentclientprotocol/claude-agent-acp/commit/1c80bf8e56a9279dc799e7bbdcae87241e99c18b))
+* Skip empty thinking chunks ([#793](https://github.com/agentclientprotocol/claude-agent-acp/issues/793)) ([15fdf26](https://github.com/agentclientprotocol/claude-agent-acp/commit/15fdf26fc7d3a6c51e89d3e56fc91dd00cb3d7ae))
+* surface Bash tool image output instead of dropping it ([#617](https://github.com/agentclientprotocol/claude-agent-acp/issues/617)) ([a759e64](https://github.com/agentclientprotocol/claude-agent-acp/commit/a759e64ef6d9b7c5bfe9a6e6b182db835f8ed3b6))
+
 ## [0.47.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.46.0...v0.47.0) (2026-06-17)
 
 
