@@ -5385,6 +5385,55 @@ describe("toAcpNotifications messageId", () => {
   });
 });
 
+describe("toAcpNotifications thinking chunks", () => {
+  it("emits an agent_thought_chunk for non-empty thinking text", () => {
+    const result = toAcpNotifications(
+      [{ type: "thinking", thinking: "let me reason", signature: "" }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([
+      {
+        sessionId: "test",
+        update: {
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "let me reason" },
+        },
+      },
+    ]);
+  });
+
+  it("skips empty thinking blocks (display: 'omitted' signature-only blocks)", () => {
+    const result = toAcpNotifications(
+      [{ type: "thinking", thinking: "", signature: "abc" }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("skips empty thinking deltas", () => {
+    const result = toAcpNotifications(
+      [{ type: "thinking_delta", thinking: "", estimated_tokens: 0 }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+});
+
 describe("messageIdForGrouping", () => {
   it("uses the Anthropic API message id for assistant messages", () => {
     const message = {

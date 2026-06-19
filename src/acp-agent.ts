@@ -3919,13 +3919,17 @@ export function toAcpNotifications(
         break;
       case "thinking":
       case "thinking_delta":
-        update = {
-          sessionUpdate: "agent_thought_chunk",
-          content: {
-            type: "text",
-            text: chunk.thinking,
-          },
-        };
+        // Recent models default `thinking.display` to "omitted", which streams
+        // signature-only thinking blocks whose text is empty.
+        if (chunk.thinking.length > 0) {
+          update = {
+            sessionUpdate: "agent_thought_chunk",
+            content: {
+              type: "text",
+              text: chunk.thinking,
+            },
+          };
+        }
         break;
       case "tool_use":
       case "server_tool_use":
