@@ -8,12 +8,16 @@ import {
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
+  AskUserQuestionInput,
   BashInput,
   FileEditInput,
   FileReadInput,
   FileWriteInput,
   GlobInput,
   GrepInput,
+  TaskCreateInput,
+  TaskCreateOutput,
+  TaskUpdateInput,
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
@@ -367,6 +371,40 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "TaskCreate": {
+      const input = toolUse.input as TaskCreateInput | undefined;
+      return {
+        title: input?.subject ? `Create task: ${input.subject}` : "Create task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskUpdate": {
+      const input = toolUse.input as TaskUpdateInput | undefined;
+      return {
+        title: input?.subject ? `Update task: ${input.subject}` : "Update task",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskList": {
+      return {
+        title: "List tasks",
+        kind: "think",
+        content: [],
+      };
+    }
+
+    case "TaskGet": {
+      return {
+        title: "Get task",
+        kind: "think",
+        content: [],
+      };
+    }
+
     case "ExitPlanMode": {
       const planInput = toolUse.input as { plan?: string } | undefined;
       return {
@@ -375,6 +413,24 @@ export function toolInfoFromToolUse(
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
           : [],
+      };
+    }
+
+    case "AskUserQuestion": {
+      const input = toolUse.input as Partial<AskUserQuestionInput> | undefined;
+      const questions = Array.isArray(input?.questions) ? input.questions : [];
+      return {
+        title:
+          questions.length === 1 && questions[0]?.question
+            ? questions[0].question
+            : "Asking for your input",
+        kind: "other",
+        content: questions
+          .filter((q) => typeof q?.question === "string")
+          .map((q) => ({
+            type: "content" as const,
+            content: { type: "text" as const, text: q.question },
+          })),
       };
     }
 
@@ -429,7 +485,8 @@ export function toolUpdateFromToolResult(
     "is_error" in toolResult &&
     toolResult.is_error &&
     toolResult.content &&
-    toolResult.content.length > 0
+    toolResult.content.length > 0 &&
+    !(toolUse?.name === "Bash" && supportsTerminalOutput)
   ) {
     // Only return errors
     return toAcpContentUpdate(toolResult.content, true);
@@ -678,6 +735,103 @@ export function planEntries(input: { todos: ClaudePlanEntry[] } | undefined): Pl
   }));
 }
 
+/**
+ * Per-session task list accumulated from Task* tool calls (TaskCreate /
+ * TaskUpdate). The headless/SDK session emits these as incremental tool
+ * calls keyed by task ID, replacing the snapshot-style TodoWrite tool.
+ * Iteration order is insertion order (Map semantics), matching the order
+ * tasks are created.
+ */
+export type TaskEntry = {
+  subject: string;
+  status: "pending" | "in_progress" | "completed";
+  activeForm?: string;
+  description?: string;
+};
+export type TaskState = Map<string, TaskEntry>;
+
+/**
+ * Best-effort parse of a TaskCreate tool_result content into the structured
+ * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
+ * an array of TextBlockParam-like blocks containing JSON text; try both.
+ */
+export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
+  const tryParse = (text: string): TaskCreateOutput | undefined => {
+    try {
+      const parsed = JSON.parse(text);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        parsed.task &&
+        typeof parsed.task.id === "string"
+      ) {
+        return parsed as TaskCreateOutput;
+      }
+    } catch {
+      // ignore
+    }
+    return undefined;
+  };
+
+  if (typeof content === "string") {
+    return tryParse(content);
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === "object" && "type" in block && block.type === "text") {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === "string") {
+          const parsed = tryParse(text);
+          if (parsed) return parsed;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function applyTaskCreate(
+  state: TaskState,
+  input: TaskCreateInput | undefined,
+  output: TaskCreateOutput | undefined,
+): void {
+  const taskId = output?.task?.id;
+  if (!taskId || !input) return;
+  state.set(taskId, {
+    subject: input.subject,
+    status: "pending",
+    activeForm: input.activeForm,
+    description: input.description,
+  });
+}
+
+export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undefined): void {
+  if (!input?.taskId) return;
+  if (input.status === "deleted") {
+    state.delete(input.taskId);
+    return;
+  }
+  const existing = state.get(input.taskId);
+  // Without a subject from either the existing entry or the update payload,
+  // we'd produce a plan entry with empty `content` — drop the update.
+  const subject = input.subject ?? existing?.subject;
+  if (!subject) return;
+  state.set(input.taskId, {
+    subject,
+    status: input.status ?? existing?.status ?? "pending",
+    activeForm: input.activeForm ?? existing?.activeForm,
+    description: input.description ?? existing?.description,
+  });
+}
+
+export function taskStateToPlanEntries(state: TaskState): PlanEntry[] {
+  return Array.from(state.values()).map((task) => ({
+    content: task.subject,
+    status: task.status,
+    priority: "medium",
+  }));
+}
+
 export function markdownEscape(text: string): string {
   let escape = "```";
   for (const [m] of text.matchAll(/^```+/gm)) {
@@ -803,6 +957,41 @@ export const createPostToolUseHook =
           delete toolUseCallbacks[toolUseID];
         }
       }
+    }
+    return { continue: true };
+  };
+
+/**
+ * Hook callback for `TaskCreated` / `TaskCompleted` events. The SDK fires
+ * these for both user-facing TaskCreate tool calls and subagent task
+ * creation, giving us `task_id` + `task_subject` without having to parse
+ * tool_result payloads.
+ *
+ * Populating `taskState` from the hook means a later `TaskUpdate` (which
+ * typically only carries `taskId` + `status`) finds an existing entry with
+ * a real subject, instead of synthesizing a placeholder with empty content.
+ */
+export const createTaskHook =
+  (options: { taskState: TaskState; onChange?: () => Promise<void> }): HookCallback =>
+  async (input): Promise<{ continue: boolean }> => {
+    const taskId =
+      "task_id" in input && typeof input.task_id === "string" ? input.task_id : undefined;
+    if (!taskId) return { continue: true };
+
+    if (input.hook_event_name === "TaskCreated") {
+      if (!input.task_subject) return { continue: true };
+      if (options.taskState.has(taskId)) return { continue: true };
+      options.taskState.set(taskId, {
+        subject: input.task_subject,
+        status: "pending",
+        description: input.task_description,
+      });
+      if (options.onChange) await options.onChange();
+    } else if (input.hook_event_name === "TaskCompleted") {
+      const existing = options.taskState.get(taskId);
+      if (!existing || existing.status === "completed") return { continue: true };
+      options.taskState.set(taskId, { ...existing, status: "completed" });
+      if (options.onChange) await options.onChange();
     }
     return { continue: true };
   };

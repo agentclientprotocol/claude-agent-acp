@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-// Load managed settings and apply environment variables
-import { loadManagedSettings, applyEnvironmentSettings } from "./utils.js";
+import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliPath, runAcp } from "./acp-agent.js";
 
 if (process.argv.includes("--cli")) {
@@ -35,9 +34,13 @@ if (process.argv.includes("--cli")) {
     process.exit(1);
   });
 } else {
-  const managedSettings = loadManagedSettings();
-  if (managedSettings) {
-    applyEnvironmentSettings(managedSettings);
+  // Apply env vars from the managed-policy tier before any SDK call so the
+  // SDK subprocess inherits them. Going through resolveSettings (vs. a raw
+  // read of managed-settings.json) also picks up MDM sources on macOS and
+  // HKLM/HKCU on Windows.
+  const policy = await resolveSettings({ settingSources: [] });
+  for (const [key, value] of Object.entries(policy.effective.env ?? {})) {
+    process.env[key] = value;
   }
 
   // stdout is used to send messages to the client

@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
+import { describe, it, expect, beforeEach } from "vitest";
+import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
   BetaMCPToolResultBlock,
@@ -10,16 +10,22 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
+  createTaskHook,
   toolInfoFromToolUse,
   planEntries,
+  applyTaskCreate,
+  applyTaskUpdate,
+  parseTaskCreateOutput,
+  taskStateToPlanEntries,
+  TaskState,
 } from "../tools.js";
 
 describe("rawOutput in tool call updates", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   it("should include rawOutput with string content for tool_result", () => {
@@ -419,7 +425,7 @@ describe("rawOutput in tool call updates", () => {
 });
 
 describe("Bash terminal output", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   const bashToolUse = {
@@ -493,6 +499,23 @@ describe("Bash terminal output", () => {
         terminal_id: "toolu_bash",
         exit_code: 127,
         signal: null,
+      });
+    });
+
+    it("should route failed commands through the terminal when supportsTerminalOutput is true", () => {
+      const toolResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content: "some error output",
+        is_error: true,
+      };
+      const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "some error output" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
       });
     });
 
@@ -604,9 +627,24 @@ describe("Bash terminal output", () => {
         });
       });
 
-      it("should use error handler when is_error is true (early return before Bash case)", () => {
+      it("should route is_error through the terminal when supportsTerminalOutput is true", () => {
         const toolResult = makeStringBashResult("command not found: bad_cmd", true);
         const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+        // Failed Bash commands skip the early error return and reach the Bash
+        // case so the client receives terminal output with a non-zero exit code
+        // instead of plain markdown details.
+        expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+        expect(update._meta).toEqual({
+          terminal_info: { terminal_id: "toolu_bash" },
+          terminal_output: { terminal_id: "toolu_bash", data: "command not found: bad_cmd" },
+          terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+        });
+      });
+
+      it("should use error handler when is_error is true and terminal output is unsupported", () => {
+        const toolResult = makeStringBashResult("command not found: bad_cmd", true);
+        const update = toolUpdateFromToolResult(toolResult, bashToolUse, false);
 
         // is_error with content hits the early error return at the top of
         // toolUpdateFromToolResult, before reaching the Bash switch case.
@@ -738,14 +776,19 @@ describe("Bash terminal output", () => {
   });
 
   describe("toAcpNotifications with clientCapabilities", () => {
-    const toolUseCache: ToolUseCache = {
-      toolu_bash: {
-        type: "tool_use",
-        id: "toolu_bash",
-        name: "Bash",
-        input: { command: "ls -la" },
-      },
-    };
+    // Reset before each test: toAcpNotifications prunes the cache entry once it
+    // maps the tool_result, so a shared object would be empty by the 2nd test.
+    let toolUseCache: ToolUseCache;
+    beforeEach(() => {
+      toolUseCache = {
+        toolu_bash: {
+          type: "tool_use",
+          id: "toolu_bash",
+          name: "Bash",
+          input: { command: "ls -la" },
+        },
+      };
+    });
 
     const bashResult: BetaBashCodeExecutionResultBlock = {
       type: "bash_code_execution_result",
@@ -857,11 +900,21 @@ describe("Bash terminal output", () => {
         { clientCapabilities: { _meta: { terminal_output: true } } },
       );
 
+      // Fresh cache: the withSupport call above already consumed the entry,
+      // since toAcpNotifications prunes the tool_use once it maps the result.
+      const toolUseCacheWithoutSupport: ToolUseCache = {
+        toolu_bash: {
+          type: "tool_use",
+          id: "toolu_bash",
+          name: "Bash",
+          input: { command: "ls -la" },
+        },
+      };
       const withoutSupport = toAcpNotifications(
         [toolResult],
         "assistant",
         "test-session",
-        toolUseCache,
+        toolUseCacheWithoutSupport,
         mockClient,
         mockLogger,
       );
@@ -913,6 +966,31 @@ describe("Bash terminal output", () => {
     });
   });
 
+  describe("toolUseCache pruning", () => {
+    it("retains the tool_use entry until its result, then prunes it", () => {
+      const toolUseCache: ToolUseCache = {};
+      const toolUse = {
+        type: "tool_use" as const,
+        id: "toolu_read",
+        name: "Read",
+        input: { file_path: "/tmp/x.txt" },
+      };
+
+      // tool_use is cached and kept (the matching result hasn't arrived yet).
+      toAcpNotifications([toolUse], "assistant", "s", toolUseCache, mockClient, mockLogger);
+      expect(toolUseCache.toolu_read).toBeDefined();
+
+      // tool_result resolves it, so the entry is pruned to bound memory.
+      const toolResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_read",
+        content: [{ type: "text", text: "hello" }],
+      };
+      toAcpNotifications([toolResult], "assistant", "s", toolUseCache, mockClient, mockLogger);
+      expect(toolUseCache.toolu_read).toBeUndefined();
+    });
+  });
+
   describe("post-tool-use hook sends diff content for Edit tool", () => {
     it("should include content and locations from structuredPatch in hook update", async () => {
       const toolUseCache: ToolUseCache = {};
@@ -922,7 +1000,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Register hook callback by processing tool_use
       toAcpNotifications(
@@ -1001,7 +1079,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1086,7 +1164,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1140,7 +1218,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1216,7 +1294,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       toAcpNotifications(
         [
@@ -1297,7 +1375,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Step 1: Process tool_use chunk — registers the PostToolUse hook callback
       const toolUseChunk = {
@@ -1397,7 +1475,7 @@ describe("Bash terminal output", () => {
         sessionUpdate: async (notification: any) => {
           hookUpdates.push(notification);
         },
-      } as unknown as AgentSideConnection;
+      } as unknown as AcpClient;
 
       // Process tool_use (registers hook)
       toAcpNotifications(
@@ -1562,7 +1640,7 @@ describe("planEntries - undefined input regression", () => {
 });
 
 describe("toAcpNotifications - TodoWrite with undefined input regression", () => {
-  const mockClient = {} as AgentSideConnection;
+  const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
   it("should not throw when TodoWrite tool_use has undefined input", () => {
@@ -1610,5 +1688,406 @@ describe("toAcpNotifications - TodoWrite with undefined input regression", () =>
 
     const planUpdates = notifications.filter((n) => (n.update as any).sessionUpdate === "plan");
     expect(planUpdates).toHaveLength(1);
+  });
+});
+
+describe("parseTaskCreateOutput", () => {
+  it("parses JSON-string content", () => {
+    const parsed = parseTaskCreateOutput(JSON.stringify({ task: { id: "1", subject: "X" } }));
+    expect(parsed).toEqual({ task: { id: "1", subject: "X" } });
+  });
+
+  it("parses array-of-text-block content", () => {
+    const parsed = parseTaskCreateOutput([
+      { type: "text", text: JSON.stringify({ task: { id: "2", subject: "Y" } }) },
+    ]);
+    expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
+  });
+
+  it("returns undefined for non-JSON content", () => {
+    expect(parseTaskCreateOutput("not json")).toBeUndefined();
+    expect(parseTaskCreateOutput([{ type: "text", text: "not json" }])).toBeUndefined();
+  });
+
+  it("returns undefined when task.id is missing", () => {
+    expect(parseTaskCreateOutput(JSON.stringify({ task: { subject: "X" } }))).toBeUndefined();
+  });
+});
+
+describe("applyTaskCreate / applyTaskUpdate", () => {
+  it("creates an entry on TaskCreate when both input and output are present", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(
+      state,
+      { subject: "Write tests", description: "Cover Task* flow", activeForm: "Writing tests" },
+      { task: { id: "1", subject: "Write tests" } },
+    );
+    expect(state.get("1")).toEqual({
+      subject: "Write tests",
+      status: "pending",
+      activeForm: "Writing tests",
+      description: "Cover Task* flow",
+    });
+  });
+
+  it("is a no-op when the output has no task ID", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "X", description: "Y" }, undefined);
+    expect(state.size).toBe(0);
+  });
+
+  it("updates fields by task ID and keeps insertion order in plan entries", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskCreate(state, { subject: "B", description: "" }, { task: { id: "2", subject: "B" } });
+    applyTaskUpdate(state, { taskId: "1", status: "in_progress" });
+    expect(taskStateToPlanEntries(state)).toEqual([
+      { content: "A", status: "in_progress", priority: "medium" },
+      { content: "B", status: "pending", priority: "medium" },
+    ]);
+  });
+
+  it("removes entries when status is 'deleted'", () => {
+    const state: TaskState = new Map();
+    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskUpdate(state, { taskId: "1", status: "deleted" });
+    expect(state.size).toBe(0);
+  });
+
+  it("creates a placeholder entry when TaskUpdate carries a subject for an unseen task", () => {
+    const state: TaskState = new Map();
+    applyTaskUpdate(state, { taskId: "5", subject: "Late arrival", status: "in_progress" });
+    expect(state.get("5")).toEqual({
+      subject: "Late arrival",
+      status: "in_progress",
+      activeForm: undefined,
+      description: undefined,
+    });
+  });
+
+  it("skips TaskUpdate for an unseen task when no subject is available", () => {
+    const state: TaskState = new Map();
+    applyTaskUpdate(state, { taskId: "5", status: "in_progress" });
+    // Without a subject we'd render an empty-content plan entry, so the
+    // update is dropped instead of synthesizing a blank placeholder.
+    expect(state.has("5")).toBe(false);
+  });
+});
+
+describe("toAcpNotifications - Task* tools", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("suppresses tool_call for TaskCreate/TaskUpdate/TaskList/TaskGet on tool_use", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map();
+
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_use", id: "1", name: "TaskCreate", input: { subject: "A", description: "" } },
+        {
+          type: "tool_use",
+          id: "2",
+          name: "TaskUpdate",
+          input: { taskId: "1", status: "in_progress" },
+        },
+        { type: "tool_use", id: "3", name: "TaskList", input: {} },
+        { type: "tool_use", id: "4", name: "TaskGet", input: { taskId: "1" } },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.size).toBe(0);
+  });
+
+  it("emits a plan snapshot after a TaskCreate tool_result and accumulates state", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map();
+
+    toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "1",
+          name: "TaskCreate",
+          input: { subject: "First", description: "" },
+        },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    const created = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "1",
+          content: JSON.stringify({ task: { id: "1", subject: "First" } }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(created).toHaveLength(1);
+    expect(created[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "First", status: "pending", priority: "medium" }],
+    });
+
+    // A second TaskCreate accumulates rather than replacing.
+    toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "2",
+          name: "TaskCreate",
+          input: { subject: "Second", description: "" },
+        },
+      ] as any,
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    const second = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "2",
+          content: JSON.stringify({ task: { id: "2", subject: "Second" } }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(second[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [
+        { content: "First", status: "pending", priority: "medium" },
+        { content: "Second", status: "pending", priority: "medium" },
+      ],
+    });
+  });
+
+  it("emits a plan snapshot reflecting status changes after a TaskUpdate tool_result", () => {
+    const toolUseCache: ToolUseCache = {};
+    const taskState: TaskState = new Map([["1", { subject: "First", status: "pending" as const }]]);
+    toolUseCache["update-1"] = {
+      type: "tool_use",
+      id: "update-1",
+      name: "TaskUpdate",
+      input: { taskId: "1", status: "completed" },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: JSON.stringify({
+            success: true,
+            taskId: "1",
+            updatedFields: ["status"],
+          }),
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "First", status: "completed", priority: "medium" }],
+    });
+  });
+
+  it("suppresses TaskList and TaskGet tool_result without touching task state", () => {
+    const toolUseCache: ToolUseCache = {
+      "list-1": { type: "tool_use", id: "list-1", name: "TaskList", input: {} },
+      "get-1": { type: "tool_use", id: "get-1", name: "TaskGet", input: { taskId: "1" } },
+    };
+    const taskState: TaskState = new Map([
+      ["1", { subject: "Existing", status: "in_progress" as const }],
+    ]);
+
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_result", tool_use_id: "list-1", content: "...", is_error: false },
+        { type: "tool_result", tool_use_id: "get-1", content: "...", is_error: false },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "in_progress" });
+  });
+
+  it("does not apply TaskCreate/TaskUpdate when the tool_result reports an error", () => {
+    const toolUseCache: ToolUseCache = {
+      "create-1": {
+        type: "tool_use",
+        id: "create-1",
+        name: "TaskCreate",
+        input: { subject: "A", description: "" },
+      },
+    };
+    const taskState: TaskState = new Map();
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "create-1",
+          content: "task creation failed",
+          is_error: true,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { taskState },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.size).toBe(0);
+  });
+});
+
+describe("createTaskHook", () => {
+  it("registers a task on TaskCreated and fires onChange", async () => {
+    const taskState: TaskState = new Map();
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCreated",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+        task_description: "Repro and fix",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")).toEqual({
+      subject: "Investigate flaky test",
+      status: "pending",
+      description: "Repro and fix",
+    });
+    expect(changes).toBe(1);
+  });
+
+  it("does not clobber an existing entry on TaskCreated", async () => {
+    const taskState: TaskState = new Map([
+      ["t-1", { subject: "Investigate flaky test", status: "in_progress" as const }],
+    ]);
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCreated",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")?.status).toBe("in_progress");
+    expect(changes).toBe(0);
+  });
+
+  it("marks a task completed on TaskCompleted", async () => {
+    const taskState: TaskState = new Map([
+      ["t-1", { subject: "Investigate flaky test", status: "in_progress" as const }],
+    ]);
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook(
+      {
+        hook_event_name: "TaskCompleted",
+        task_id: "t-1",
+        task_subject: "Investigate flaky test",
+      } as any,
+      undefined,
+      { signal: new AbortController().signal },
+    );
+
+    expect(taskState.get("t-1")?.status).toBe("completed");
+    expect(changes).toBe(1);
+  });
+
+  it("is a no-op for unrelated hook events", async () => {
+    const taskState: TaskState = new Map();
+    let changes = 0;
+    const hook = createTaskHook({
+      taskState,
+      onChange: async () => {
+        changes++;
+      },
+    });
+
+    await hook({ hook_event_name: "PostToolUse", tool_name: "Read" } as any, undefined, {
+      signal: new AbortController().signal,
+    });
+
+    expect(taskState.size).toBe(0);
+    expect(changes).toBe(0);
   });
 });

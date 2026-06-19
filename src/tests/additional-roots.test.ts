@@ -1,9 +1,9 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
+import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-import type { ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let capturedOptions: Options | undefined;
@@ -39,7 +39,7 @@ vi.mock("../tools.js", async () => ({
 describe("additionalRoots", () => {
   let agent: ClaudeAcpAgentType;
   const tempDirs: string[] = [];
-  const newSession = (meta: Record<string, unknown>, cwd = "/test") =>
+  const newSession = (meta: Record<string, unknown>, cwd = process.cwd()) =>
     agent.newSession({ cwd, mcpServers: [], _meta: meta });
 
   beforeEach(async () => {
@@ -52,7 +52,7 @@ describe("additionalRoots", () => {
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
       readTextFile: async () => ({ content: "" }),
       writeTextFile: async () => ({}),
-    } as unknown as AgentSideConnection);
+    } as unknown as AcpClient);
   });
 
   afterEach(
@@ -75,5 +75,34 @@ describe("additionalRoots", () => {
       claudeCode: { options: { additionalDirectories: ["/workspace/shared"] } },
     });
     expect(capturedOptions!.additionalDirectories).toEqual(["/workspace/shared", "", root]);
+  });
+
+  it("prefers the official ACP additionalDirectories field over _meta.additionalRoots", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      additionalDirectories: ["/from/official"],
+      _meta: { additionalRoots: ["/from/meta"] },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/official"]);
+  });
+
+  it("merges official ACP additionalDirectories with claudeCode SDK additionalDirectories", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      additionalDirectories: ["/from/official"],
+      _meta: { claudeCode: { options: { additionalDirectories: ["/from/sdk"] } } },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/sdk", "/from/official"]);
+  });
+
+  it("falls back to _meta.additionalRoots when the official field is omitted", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { additionalRoots: ["/from/meta"] },
+    });
+    expect(capturedOptions!.additionalDirectories).toEqual(["/from/meta"]);
   });
 });
