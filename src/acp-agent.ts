@@ -2652,19 +2652,27 @@ export class ClaudeAcpAgent {
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
     } else if (configId === "model") {
+      // `ModelInfo.supportsAutoMode` is the canonical SDK signal for clamping
+      // modes below; its `displayName`/`description` also let us infer the
+      // context window for semantic aliases (e.g. `default`) whose ID alone
+      // carries no "1m" token.
+      const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
         // The cached context window was learned for the previous model; reset
         // to the new model's heuristic so mid-stream updates between now and
         // the next `result` reflect the user's selection instead of the old
         // model's window.
-        session.contextWindowSize = inferContextWindowFromModel(value) ?? DEFAULT_CONTEXT_WINDOW;
+        session.contextWindowSize =
+          inferContextWindowFromModel(
+            value,
+            newModelInfo?.displayName,
+            newModelInfo?.description,
+          ) ?? DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
 
       // Recompute availableModes for the new model and clamp the current
       // mode if the SDK no longer offers it (today: "auto" on Haiku).
-      // `ModelInfo.supportsAutoMode` is the canonical SDK signal.
-      const newModelInfo = session.modelInfos.find((m) => m.value === value);
       const newAvailableModes = buildAvailableModes(newModelInfo);
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
@@ -3219,7 +3227,11 @@ export class ClaudeAcpAgent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
-        inferContextWindowFromModel(models.currentModelId) ?? DEFAULT_CONTEXT_WINDOW,
+        inferContextWindowFromModel(
+          models.currentModelId,
+          currentModelInfo?.displayName,
+          currentModelInfo?.description,
+        ) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
       messageIdToUuid: new Map(),
@@ -4377,14 +4389,21 @@ function commonPrefixLength(a: string, b: string) {
   return i;
 }
 
-/** Best-effort first guess of a model's context window from its ID, used only
- *  as a fallback when the SDK's authoritative `getContextUsage` is unavailable
- *  (and until a `result` message arrives with the `modelUsage` value).
+/** Best-effort first guess of a model's context window, used only as a
+ *  fallback when the SDK's authoritative `getContextUsage` is unavailable (and
+ *  until a `result` message arrives with the `modelUsage` value).
+ *
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
- *  matching things like "10m" or embedded substrings. */
-function inferContextWindowFromModel(model: string): number | null {
-  if (/\b1m\b/i.test(model)) return 1_000_000;
+ *  matching things like "10m" or embedded substrings. Semantic aliases like
+ *  `default` carry no such token in the ID, but the SDK's human-facing
+ *  `displayName`/`description` do (e.g. "Opus 4.7 (1M context)"), so callers
+ *  pass those too — the same `\b1m\b` token appears in "1M context". The SDK's
+ *  `ModelInfo` exposes no structured context-window field, so this text scan is
+ *  the only pre-`result` signal available. A miss falls back to the default
+ *  window and is corrected by `result.modelUsage` within one turn. */
+function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
+  if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
 }
 

@@ -3072,6 +3072,26 @@ describe("usage_update computation", () => {
     expect(usageUpdates[1].update.size).toBe(1000000);
   });
 
+  it("infers the 1M window from a model's description when the ID lacks a 1m token (issue #596)", async () => {
+    // Semantic aliases like `default` resolve to a 1M-context model but carry
+    // no "1m" token in the modelId — the SDK signals 1M only via the
+    // human-facing displayName/description (e.g. "Opus 4.7 with 1M context").
+    // Inference must read those so the session reports the correct window from
+    // the first mid-stream update instead of the 200k placeholder.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [{ type: "system", subtype: "session_state_changed", state: "idle" }]);
+    const session = agent.sessions["test-session"];
+    session.models = { currentModelId: "claude-sonnet-4-6", availableModels: [] };
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "Opus 4.7 with 1M context" },
+    ] as any;
+    expect(session.contextWindowSize).toBe(200000);
+
+    await (agent as any).applyConfigOptionValue("test-session", session, "model", "default");
+
+    expect(session.contextWindowSize).toBe(1000000);
+  });
+
   it("result with no matching modelUsage preserves the learned window", async () => {
     // A turn whose `result.modelUsage` doesn't contain the current top-level
     // model (e.g. no top-level assistant message, or only a subagent ran) must
