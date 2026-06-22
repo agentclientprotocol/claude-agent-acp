@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.49.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.48.0...v0.49.0) (2026-06-22)
+
+
+### Features
+
+* Update to claude-agent-sdk 0.3.185 ([#798](https://github.com/agentclientprotocol/claude-agent-acp/issues/798)) ([8dc8c86](https://github.com/agentclientprotocol/claude-agent-acp/commit/8dc8c864263fa50d03bec7ebff7aee776604cb3d))
+
+
+### Bug Fixes
+
+* Deduplicate streamed assistant blocks by content ([#800](https://github.com/agentclientprotocol/claude-agent-acp/issues/800)) ([960f62d](https://github.com/agentclientprotocol/claude-agent-acp/commit/960f62d76582ae5c9c5575ab66974809049ce1d0))
+* Infer 1M context from model descriptions ([#799](https://github.com/agentclientprotocol/claude-agent-acp/issues/799)) ([508453c](https://github.com/agentclientprotocol/claude-agent-acp/commit/508453c288b4a12701abd507199e7fa0ab172171))
+
 ## [0.48.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.47.0...v0.48.0) (2026-06-19)
 
 
