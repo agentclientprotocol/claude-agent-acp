@@ -1024,12 +1024,17 @@ export class ClaudeAcpAgent {
     // (whose delta events don't carry it) can all be tagged with the same,
     // replay-stable id.
     let currentStreamMessageId: string | undefined;
-    // Per-message-id record of which assistant content actually streamed live
-    // via `stream_event` deltas, split by block type, so the consolidated
-    // `assistant` message can drop the duplicate blocks that already reached the
-    // client as chunks while still forwarding any that a non-streaming gateway
-    const streamedTextIds = new Set<string>();
-    const streamedThinkingIds = new Set<string>();
+    // The text/thinking blocks that have actually streamed live as
+    // `stream_event` deltas for the message the next consolidated `assistant`
+    // will repeat, in stream order, each accumulated to its full streamed text.
+    // The consolidated handler diffs each assembled block against these and
+    // forwards only the un-streamed remainder — nothing if it streamed in full
+    // (the common case), the whole block if it never streamed (a non-streaming
+    // gateway), or just the tail if the stream was cut short mid-block. Matching
+    // on content rather than the Anthropic message id makes dedupe robust to
+    // gateways that don't carry a stable/matching id across the stream and the
+    // consolidated message. Reset after each consolidated message consumes it.
+    const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
@@ -1041,12 +1046,14 @@ export class ClaudeAcpAgent {
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
-      // Do NOT reset currentStreamMessageId here. `message_start` sets it per
-      // message; clearing it on turn activation drops the id for any block that
-      // streams after a mid-message activation (the replayed user echo with
-      // --replay-user-messages), so those ids never enter streamedTextIds and the
-      // consolidated assistant message re-emits already-streamed text as a
-      // duplicate. #785 stopped resetting streamedTextIds here but left this line.
+      // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
+      // activation can fire mid-message (the replayed user echo with
+      // --replay-user-messages lands between a message's blocks); clearing the
+      // streamed-content record on activation would drop the blocks that
+      // streamed before the echo, so the consolidated assistant message would
+      // re-emit them as duplicates. streamedBlocks is bounded instead by being
+      // cleared when each consolidated message consumes it. #785 stopped
+      // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
       session.accumulatedUsage = {
         inputTokens: 0,
@@ -1682,21 +1689,52 @@ export class ClaudeAcpAgent {
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
               currentStreamMessageId = message.event.message.id || undefined;
+              // A new top-level message starts: clear any streamed-content
+              // residue from a prior message that never reached its
+              // consolidated reset — a cancelled turn breaks out before the
+              // reset, and the synthetic-auth/system/local-command paths
+              // `break` early too. Block indices restart at 0 each message, so
+              // leftover entries would otherwise collide with this message's
+              // blocks and re-emit (or truncate) already-streamed text. Gated on
+              // `parent_tool_use_id === null` so a subagent stream can't clear
+              // the top-level record. Fires once, before any of this message's
+              // blocks, so it doesn't disturb the mid-message turn-activation
+              // path the way resetting on turn activation would.
+              if (message.parent_tool_use_id === null) {
+                streamedBlocks.length = 0;
+              }
             }
-            // Record that this top-level message id actually streamed text/
-            // thinking, so the `assistant` case below knows its assembled blocks
-            // are duplicates (filter them) rather than the only copy (forward
-            // them). Gated on `parent_tool_use_id === null` so a subagent stream
-            // can't attribute its content to the top-level message id.
+            // Accumulate the text/thinking actually streamed live, so the
+            // `assistant` case below can diff its assembled blocks against what
+            // already reached the client as chunks and forward only the
+            // remainder. Gated on `parent_tool_use_id === null` so a subagent
+            // stream can't attribute its content to the top-level message.
+            // Contiguous deltas of the same block (same index and type) extend
+            // the current entry; anything else opens a new one.
             if (
-              currentStreamMessageId &&
               message.parent_tool_use_id === null &&
               message.event.type === "content_block_delta"
             ) {
-              if (message.event.delta.type === "text_delta") {
-                streamedTextIds.add(currentStreamMessageId);
-              } else if (message.event.delta.type === "thinking_delta") {
-                streamedThinkingIds.add(currentStreamMessageId);
+              const delta = message.event.delta;
+              const chunk =
+                delta.type === "text_delta"
+                  ? { type: "text" as const, text: delta.text }
+                  : delta.type === "thinking_delta"
+                    ? { type: "thinking" as const, text: delta.thinking }
+                    : undefined;
+              // Skip empty deltas (some gateways emit empty thinking chunks —
+              // #793): appending "" is a no-op, but pushing a "" entry would
+              // create a block the consolidated handler's `text.length > 0`
+              // guard can never consume, stalling the diff cursor and
+              // re-emitting the next block as a duplicate.
+              if (chunk && chunk.text.length > 0) {
+                const index = message.event.index;
+                const last = streamedBlocks[streamedBlocks.length - 1];
+                if (last && last.index === index && last.type === chunk.type) {
+                  last.text += chunk.text;
+                } else {
+                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
+                }
               }
             }
             if (
@@ -1907,41 +1945,66 @@ export class ClaudeAcpAgent {
 
             let content: typeof message.message.content;
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              // Top-level assistant message: drop text/thinking blocks already
-              // streamed live as chunks, and forward (as a fallback) any that were
-              // not, so non-streaming gateways still deliver the final answer.
-              const id = messageIdForGrouping(message);
-              content = message.message.content.filter((item) => {
-                // Non-text blocks (tool_use, etc.) always pass through; their own
-                // dedupe (`toolUseCache`) collapses the streamed/assembled pair.
+              // Top-level assistant message: each text/thinking block may have
+              // already been streamed live as deltas. Diff each against what
+              // streamed (`streamedBlocks`, in document order) and forward only
+              // the un-streamed remainder — nothing if it streamed in full (the
+              // common case), the whole block if it never streamed (a
+              // non-streaming gateway), or just the tail if the stream was cut
+              // short mid-block. `streamPos` walks the streamed blocks in step
+              // with the assembled text/thinking blocks; tool_use and other
+              // blocks pass through untouched (their own `toolUseCache` collapses
+              // the streamed/assembled pair) without advancing it.
+              const blocks = message.message.content;
+              const kept: typeof blocks = [];
+              let streamPos = 0;
+              for (const item of blocks) {
                 if (item.type !== "text" && item.type !== "thinking") {
-                  return true;
+                  kept.push(item);
+                  continue;
                 }
-                // Already delivered live as a chunk of this exact type — drop the
-                // duplicate. Checked per type so streaming one (e.g. text) doesn't
-                // suppress an un-streamed block of the other (e.g. thinking).
-                const streamedLive =
-                  id !== undefined &&
-                  (item.type === "text" ? streamedTextIds : streamedThinkingIds).has(id);
-                if (streamedLive) {
-                  return false;
+                const full = item.type === "text" ? item.text : item.thinking;
+                // Empty assembled blocks carry nothing (some gateways emit an
+                // empty `thinking` block before the real text) — drop them.
+                if (full.length === 0) {
+                  continue;
                 }
-                // Empty assembled blocks carry nothing (some gateways emit an empty
-                // `thinking` block before the real text) — don't forward stray
-                // empty chunks.
-                const text = item.type === "text" ? item.text : item.thinking;
-                if (text.length === 0) {
-                  return false;
+                // A streamed block of the same type whose accumulated text is a
+                // prefix of this one was already (at least partly) delivered as
+                // chunks; consume it and forward only what's left. A non-empty
+                // streamed text is required so an empty/aborted streamed block
+                // doesn't swallow the assembled copy.
+                const streamed = streamedBlocks[streamPos];
+                if (
+                  streamed &&
+                  streamed.type === item.type &&
+                  streamed.text.length > 0 &&
+                  full.startsWith(streamed.text)
+                ) {
+                  streamPos++;
+                  const remainder = full.slice(streamed.text.length);
+                  if (remainder.length === 0) {
+                    continue;
+                  }
+                  // Overwrite in place with just the un-streamed tail (the
+                  // assembled message isn't read again after this) so the block
+                  // keeps its exact SDK type.
+                  if (item.type === "text") {
+                    item.text = remainder;
+                  } else {
+                    item.thinking = remainder;
+                  }
+                  kept.push(item);
+                  continue;
                 }
-                return true;
-              });
-              // The consolidated message is the last place this id is needed for
-              // dedupe — drop it so the streamed-id sets stay bounded to in-flight
-              // streams rather than growing for the session's whole life.
-              if (id !== undefined) {
-                streamedTextIds.delete(id);
-                streamedThinkingIds.delete(id);
+                // Not matched: never streamed (or the stream diverged from the
+                // assembled text) — forward the block in full.
+                kept.push(item);
               }
+              content = kept;
+              // Consumed: reset so the next message's blocks accumulate fresh and
+              // the record stays bounded to the in-flight message.
+              streamedBlocks.length = 0;
             } else if (message.type === "assistant") {
               // Subagent assistant message (`parent_tool_use_id !== null`). It is
               // never streamed live and its text/thinking is internal to the tool

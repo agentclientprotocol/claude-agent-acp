@@ -3892,6 +3892,134 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual(["private reasoning"]);
   });
 
+  it("forwards only the un-streamed remainder when the stream is cut short mid-block", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // The stream stops partway ("hello ") but the consolidated message carries
+    // the whole block ("hello world"). The streamed prefix must not be re-sent,
+    // and the un-streamed tail must still reach the client — dropping the whole
+    // assembled block would truncate the answer to "hello ".
+    injectSession(agent, [
+      messageStart("msg-partial"),
+      textDelta("hello "),
+      assistantMessage("msg-partial", [{ type: "text", text: "hello world" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    // The streamed prefix, then just the tail from the consolidated message.
+    expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
+  });
+
+  it("dedupes streamed text even when the consolidated message carries a different id", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Some gateways assign one id during the stream and a different one (or only
+    // a uuid) on the assembled message. Dedupe must key on content, not the id,
+    // or the consolidated block re-emits already-streamed text as a duplicate.
+    injectSession(agent, [
+      messageStart("msg-stream-id"),
+      textDelta("hello "),
+      textDelta("world"),
+      assistantMessage("msg-DIFFERENT-id", [{ type: "text", text: "hello world" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    // Only the streamed deltas — the assembled copy is deduped despite the id
+    // mismatch.
+    expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
+  });
+
+  it("dedupes a streamed text block even when an empty thinking delta precedes it", async () => {
+    // An empty thinking delta (some gateways emit them — #793) must not create
+    // a zero-length streamedBlocks entry: that entry can never satisfy the
+    // consolidated handler's `text.length > 0` guard, so it would stall the
+    // diff cursor and re-emit the real, already-streamed text as a duplicate.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-empty-thinking"),
+      thinkingDelta(""),
+      textDelta("real answer"),
+      assistantMessage("msg-empty-thinking", [{ type: "text", text: "real answer" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    // The streamed text appears once; the consolidated copy is deduped.
+    expect(messageChunkTexts(updates)).toEqual(["real answer"]);
+  });
+
+  it("does not re-emit the next turn's text after a turn is cancelled mid-stream", async () => {
+    // Regression: streamedBlocks is reset inside the consolidated-assistant
+    // branch, but a cancelled turn `break`s out before reaching it (the
+    // `if (session.cancelled) break;` guard), and streamedBlocks is
+    // session-scoped — so a cancelled turn's streamed text used to leak into
+    // the next turn. Block indices restart at 0 per message, so the leftover
+    // "Hello there" would fuse with turn 2's first block and make its
+    // consolidated copy fail the prefix dedupe, re-emitting "Second answer" as
+    // a duplicate. The fix resets streamedBlocks on each top-level
+    // `message_start`, bounding the record to one in-flight message.
+    const { agent, updates } = createMockAgentWithCapture();
+
+    let releaseCancel!: () => void;
+    const cancelled = new Promise<void>((resolve) => {
+      releaseCancel = resolve;
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // activate turn 1
+        yield messageStart("msg-1");
+        yield textDelta("Hello ");
+        yield textDelta("there"); // streamedBlocks = [{ index: 0, text: "Hello there" }]
+        await cancelled; // hold until the test has cancelled turn 1
+        // Turn 1's consolidated message arrives while cancelled → hits the
+        // `if (session.cancelled) break;` guard, skipping the streamedBlocks
+        // reset. The leftover entry must not survive into turn 2.
+        yield assistantMessage("msg-1", [{ type: "text", text: "Hello there" }]);
+        yield idle; // settles turn 1 as cancelled
+        const u2 = await iter.next();
+        yield userEcho(u2.value); // activate turn 2
+        yield messageStart("msg-2"); // resets streamedBlocks (the fix)
+        yield textDelta("Second answer");
+        yield assistantMessage("msg-2", [{ type: "text", text: "Second answer" }]);
+        yield result();
+        yield idle;
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    // Wait until turn 1's deltas have streamed before cancelling.
+    const deadline = Date.now() + 1000;
+    while (!messageChunkTexts(updates).includes("there")) {
+      if (Date.now() > deadline) throw new Error("turn 1 stream never arrived");
+      await new Promise((r) => setTimeout(r, 1));
+    }
+
+    await agent.cancel({ sessionId: "test-session" });
+    releaseCancel();
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
+
+    // Turn 2's text appears exactly once (the live delta); the consolidated copy
+    // is deduped despite the cancelled turn's leftover streamed text.
+    expect(messageChunkTexts(updates).filter((t) => t === "Second answer")).toEqual([
+      "Second answer",
+    ]);
+  });
+
   it("does not leak subagent assistant text into the top-level feed", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Subagent assistant messages (parent_tool_use_id !== null) are never
