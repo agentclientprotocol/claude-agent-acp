@@ -1,13 +1,7 @@
 {
+  "extends": "@tsconfig/node22/tsconfig.json",
   "compilerOptions": {
-    "target": "ES2021",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "lib": ["ES2021"],
-    "strict": true,
-    "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
     "outDir": "dist",
     "rootDir": "src",
     "declaration": true,

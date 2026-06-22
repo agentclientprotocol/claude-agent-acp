@@ -38,6 +38,7 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   discoverCustomAgents,
+  runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
 } from "../acp-agent.js";
@@ -1780,6 +1781,148 @@ describe("permission requests", () => {
       );
       expect(label).toBe("Always Allow all Bash");
     });
+  });
+});
+
+describe("permission request cancellation", () => {
+  function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), { interrupt: vi.fn(), close: vi.fn() });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      agents: [],
+      currentAgent: "default",
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+    } as any;
+    return agent.sessions[sessionId]!;
+  }
+
+  it("forwards the tool-call signal so a pending permission request is cancelled on abort", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      // A `$/cancel_request`-aware client settles the request once the agent
+      // aborts it; model that by rejecting when the forwarded signal fires.
+      requestPermission: (_params: RequestPermissionRequest, signal?: AbortSignal) => {
+        receivedSignal = signal;
+        return new Promise<RequestPermissionResponse>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("Request cancelled")), {
+            once: true,
+          });
+        });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const controller = new AbortController();
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: controller.signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    // Let canUseTool reach the awaited requestPermission before cancelling.
+    await Promise.resolve();
+
+    // The tool-call signal is threaded through as the cancellation signal.
+    expect(receivedSignal).toBe(controller.signal);
+
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+  });
+
+  it("treats a cancelled permission outcome as an aborted tool use", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).rejects.toThrow("Tool use aborted");
+  });
+});
+
+describe("runPromptWithCancellation", () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it("cancels the in-flight prompt when the request signal aborts ($/cancel_request)", async () => {
+    const promptResult = deferred<PromptResponse>();
+    const cancel = vi.fn(async () => {});
+    const agent = {
+      prompt: vi.fn(() => promptResult.promise),
+      cancel,
+      logger: { log: () => {}, error: () => {} },
+    } as any;
+
+    const controller = new AbortController();
+    const params = { sessionId: "session-1", prompt: [] } as any;
+    const pending = runPromptWithCancellation(agent, params, controller.signal);
+
+    // No cancel yet — the turn is running.
+    expect(cancel).not.toHaveBeenCalled();
+
+    // Client sends $/cancel_request -> the SDK aborts this request's signal.
+    controller.abort();
+    expect(cancel).toHaveBeenCalledWith({ sessionId: "session-1" });
+
+    // The prompt settles "cancelled" through the normal cancel path.
+    promptResult.resolve({ stopReason: "cancelled" });
+    await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("does not cancel after the prompt settles normally", async () => {
+    const promptResult = deferred<PromptResponse>();
+    const cancel = vi.fn(async () => {});
+    const agent = {
+      prompt: vi.fn(() => promptResult.promise),
+      cancel,
+      logger: { log: () => {}, error: () => {} },
+    } as any;
+
+    const controller = new AbortController();
+    const params = { sessionId: "session-1", prompt: [] } as any;
+    const pending = runPromptWithCancellation(agent, params, controller.signal);
+
+    promptResult.resolve({ stopReason: "end_turn" });
+    await expect(pending).resolves.toEqual({ stopReason: "end_turn" });
+
+    // A late abort (e.g. per-request signal cleanup) must not cancel a later turn.
+    controller.abort();
+    expect(cancel).not.toHaveBeenCalled();
   });
 });
 

@@ -635,10 +635,21 @@ export function describeAlwaysAllow(
  */
 export interface AcpClient {
   sessionUpdate(params: SessionNotification): Promise<void>;
-  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
+  /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
+   *  permission request so the client can dismiss its prompt (and settle our
+   *  await) instead of leaving the dialog open after the turn was cancelled. */
+  requestPermission(
+    params: RequestPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse>;
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
-  unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse>;
+  /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
+   *  elicitation so the client can dismiss its prompt and settle our await. */
+  unstable_createElicitation(
+    params: CreateElicitationRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateElicitationResponse>;
   unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
@@ -657,8 +668,13 @@ class ClientConnection implements AcpClient {
     return this.ctx.notify(methods.client.session.update, params);
   }
 
-  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    return this.ctx.request(methods.client.session.requestPermission, params);
+  requestPermission(
+    params: RequestPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    return this.ctx.request(methods.client.session.requestPermission, params, {
+      cancellationSignal: signal,
+    });
   }
 
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
@@ -669,8 +685,13 @@ class ClientConnection implements AcpClient {
     return this.ctx.request(methods.client.fs.writeTextFile, params);
   }
 
-  unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
-    return this.ctx.request(methods.client.elicitation.create, params);
+  unstable_createElicitation(
+    params: CreateElicitationRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    return this.ctx.request(methods.client.elicitation.create, params, {
+      cancellationSignal: signal,
+    });
   }
 
   unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
@@ -2442,6 +2463,27 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /** Forward a permission request to the client, wiring the tool call's
+   *  `signal` through as a `cancellationSignal`. When the turn is cancelled
+   *  while the client's prompt is still open the signal aborts, the SDK sends
+   *  `$/cancel_request`, and the client settles the request (a `cancelled`
+   *  outcome or a `requestCancelled` rejection). Either way we surface the same
+   *  "Tool use aborted" the callers already expect, so a cancelled dialog no
+   *  longer leaves the `await` hanging. */
+  private async requestPermissionFromClient(
+    params: RequestPermissionRequest,
+    signal: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    try {
+      return await this.client.requestPermission(params, signal);
+    } catch (error) {
+      if (signal.aborted) {
+        throw new Error("Tool use aborted", { cause: error });
+      }
+      throw error;
+    }
+  }
+
   canUseTool(sessionId: string): CanUseTool {
     return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
@@ -2489,19 +2531,22 @@ export class ClaudeAcpAgent {
           session.modes.availableModes.some((m) => m.id === o.optionId),
         );
 
-        const response = await this.client.requestPermission({
-          options,
-          sessionId,
-          toolCall: {
-            toolCallId: toolUseID,
-            rawInput: toolInput,
-            ...toolInfoFromToolUse(
-              { name: toolName, input: toolInput, id: toolUseID },
-              supportsTerminalOutput,
-              session?.cwd,
-            ),
+        const response = await this.requestPermissionFromClient(
+          {
+            options,
+            sessionId,
+            toolCall: {
+              toolCallId: toolUseID,
+              rawInput: toolInput,
+              ...toolInfoFromToolUse(
+                { name: toolName, input: toolInput, id: toolUseID },
+                supportsTerminalOutput,
+                session?.cwd,
+              ),
+            },
           },
-        });
+          signal,
+        );
 
         if (signal.aborted || response.outcome?.outcome === "cancelled") {
           throw new Error("Tool use aborted");
@@ -2550,27 +2595,30 @@ export class ClaudeAcpAgent {
         };
       }
 
-      const response = await this.client.requestPermission({
-        options: [
-          {
-            kind: "allow_always",
-            name: alwaysAllowLabel,
-            optionId: "allow_always",
+      const response = await this.requestPermissionFromClient(
+        {
+          options: [
+            {
+              kind: "allow_always",
+              name: alwaysAllowLabel,
+              optionId: "allow_always",
+            },
+            { kind: "allow_once", name: "Allow", optionId: "allow" },
+            { kind: "reject_once", name: "Reject", optionId: "reject" },
+          ],
+          sessionId,
+          toolCall: {
+            toolCallId: toolUseID,
+            rawInput: toolInput,
+            ...toolInfoFromToolUse(
+              { name: toolName, input: toolInput, id: toolUseID },
+              supportsTerminalOutput,
+              session?.cwd,
+            ),
           },
-          { kind: "allow_once", name: "Allow", optionId: "allow" },
-          { kind: "reject_once", name: "Reject", optionId: "reject" },
-        ],
-        sessionId,
-        toolCall: {
-          toolCallId: toolUseID,
-          rawInput: toolInput,
-          ...toolInfoFromToolUse(
-            { name: toolName, input: toolInput, id: toolUseID },
-            supportsTerminalOutput,
-            session?.cwd,
-          ),
         },
-      });
+        signal,
+      );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
         throw new Error("Tool use aborted");
       }
@@ -2624,12 +2672,17 @@ export class ClaudeAcpAgent {
       }
 
       try {
-        const response = await this.client.unstable_createElicitation(createRequest);
+        const response = await this.client.unstable_createElicitation(createRequest, signal);
         if (signal.aborted) {
           return { action: "cancel" };
         }
         return createElicitationResponseToElicitResult(response);
       } catch (error) {
+        // A cancellation we requested (signal aborted) settles as a cancel, not
+        // a hard decline — the elicitation was abandoned, not refused.
+        if (signal.aborted) {
+          return { action: "cancel" };
+        }
         this.logger.error(`Failed to forward MCP elicitation: ${error}`);
         return { action: "decline" };
       }
@@ -2655,8 +2708,13 @@ export class ClaudeAcpAgent {
     const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);
     let response;
     try {
-      response = await this.client.unstable_createElicitation(createRequest);
+      response = await this.client.unstable_createElicitation(createRequest, signal);
     } catch (error) {
+      // A cancellation we requested (signal aborted) settles as an aborted tool
+      // use, matching the post-response check below.
+      if (signal.aborted) {
+        throw new Error("Tool use aborted", { cause: error });
+      }
       this.logger.error(`Failed to present AskUserQuestion elicitation: ${error}`);
       return { behavior: "deny", message: "Could not present the question to the user." };
     }
@@ -4408,6 +4466,38 @@ export function streamEventToAcpNotifications(
   }
 }
 
+/** Run a `session/prompt` while honoring `$/cancel_request` for it. ACP clients
+ *  normally stop a turn with the `session/cancel` notification, but `signal`
+ *  (the prompt request's abort signal) also fires when the client sends the
+ *  generic `$/cancel_request` for this prompt — the protocol's complementary
+ *  cancellation fallback. Route that to the same `agent.cancel` path so a client
+ *  using only the generic mechanism still stops the turn (and the prompt
+ *  resolves "cancelled" instead of running to completion).
+ *
+ *  The listener is scoped to this call: once the prompt settles it is removed,
+ *  so a later teardown-time abort of the (per-request) signal can't cancel a
+ *  subsequent turn. `signal` also aborts on connection close, in which case
+ *  cancelling the in-flight turn is the desired behavior anyway. */
+export async function runPromptWithCancellation(
+  agent: Pick<ClaudeAcpAgent, "prompt" | "cancel" | "logger">,
+  params: PromptRequest,
+  signal: AbortSignal,
+): Promise<PromptResponse> {
+  const onAbort = () => {
+    // Fire-and-forget: nothing awaits this listener, so swallow (and log) any
+    // rejection rather than surfacing it as an unhandled rejection.
+    agent.cancel({ sessionId: params.sessionId }).catch((error) => {
+      agent.logger.error(`Failed to cancel prompt via $/cancel_request: ${error}`);
+    });
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await agent.prompt(params);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export function runAcp() {
   const input = nodeToWebWritable(process.stdout);
   const output = nodeToWebReadable(process.stdin);
@@ -4436,7 +4526,9 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
-    .onRequest(methods.agent.session.prompt, (ctx) => agent.prompt(ctx.params))
+    .onRequest(methods.agent.session.prompt, (ctx) =>
+      runPromptWithCancellation(agent, ctx.params, ctx.signal),
+    )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .connect(stream);
 
