@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.50.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.49.0...v0.50.0) (2026-06-23)
+
+
+### Features
+
+* **acp:** Handle ACP request cancellation signals ([#801](https://github.com/agentclientprotocol/claude-agent-acp/issues/801)) ([9013d1d](https://github.com/agentclientprotocol/claude-agent-acp/commit/9013d1d46883a7f3774a63a9dca16c4a0f634a97))
+* **deps:** bump actions/checkout from 6.0.3 to 7.0.0 ([#803](https://github.com/agentclientprotocol/claude-agent-acp/issues/803)) ([044c43e](https://github.com/agentclientprotocol/claude-agent-acp/commit/044c43e0c894082b9e747c01e9dbde6e21036823))
+* **deps:** upgrade to @anthropic-ai/claude-agent-sdk@0.3.186 ([#806](https://github.com/agentclientprotocol/claude-agent-acp/issues/806)) ([a7e6137](https://github.com/agentclientprotocol/claude-agent-acp/commit/a7e6137f6877b72b8daa39e74971c3559db8d28f))
+
 ## [0.49.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.48.0...v0.49.0) (2026-06-22)
 
 
