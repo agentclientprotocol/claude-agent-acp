@@ -2,8 +2,12 @@
 
 import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliPath, runAcp } from "./acp-agent.js";
+import packageJson from "../package.json" with { type: "json" };
 
-if (process.argv.includes("--cli")) {
+if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(packageJson.version);
+  process.exit(0);
+} else if (process.argv.includes("--cli")) {
   const { spawn } = await import("node:child_process");
   const args = process.argv.slice(2).filter((arg) => arg !== "--cli");
   const child = spawn(await claudeCliPath(), args, { stdio: "inherit" });
