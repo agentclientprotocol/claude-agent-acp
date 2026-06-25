@@ -75,11 +75,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
   applyAskElicitationResponse,
@@ -109,6 +111,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+
+const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -1006,30 +1010,18 @@ export class ClaudeAcpAgent {
     // CLI's store (keychain or config dir), which only the binary can clear.
     // `claude auth logout` is non-interactive and idempotent.
     const cliPath = await claudeCliPath();
-    const { spawn } = await import("node:child_process");
-    await new Promise<void>((resolve, reject) => {
-      const child = spawn(cliPath, ["auth", "logout"], {
-        stdio: ["ignore", "ignore", "pipe"],
-        env: process.env,
-      });
-      let stderr = "";
-      child.stderr?.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-      child.on("error", reject);
-      child.on("exit", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(
-            RequestError.internalError(
-              { stderr: stderr.trim() || undefined },
-              `claude auth logout exited with code ${code}`,
-            ),
-          );
-        }
-      });
-    });
+    try {
+      await execFileAsync(cliPath, ["auth", "logout"]);
+    } catch (error) {
+      const stderr =
+        typeof error === "object" && error && "stderr" in error
+          ? String((error as { stderr: unknown }).stderr).trim()
+          : undefined;
+      throw RequestError.internalError(
+        { stderr: stderr || undefined },
+        `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {

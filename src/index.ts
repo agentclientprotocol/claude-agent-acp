@@ -4,10 +4,10 @@ import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliPath, runAcp } from "./acp-agent.js";
 import packageJson from "../package.json" with { type: "json" };
 
-if (process.argv.includes("--version") || process.argv.includes("-v")) {
-  console.log(packageJson.version);
-  process.exit(0);
-} else if (process.argv.includes("--cli")) {
+// `--cli` is checked first so that `--version`/`-v` (and any other flags) are
+// forwarded to the wrapped native CLI rather than swallowed by our own version
+// handler below. Our version flag only applies when not delegating.
+if (process.argv.includes("--cli")) {
   const { spawn } = await import("node:child_process");
   const args = process.argv.slice(2).filter((arg) => arg !== "--cli");
   const child = spawn(await claudeCliPath(), args, { stdio: "inherit" });
@@ -37,6 +37,9 @@ if (process.argv.includes("--version") || process.argv.includes("-v")) {
     console.error(err);
     process.exit(1);
   });
+} else if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  console.log(packageJson.version);
+  process.exit(0);
 } else {
   // Apply env vars from the managed-policy tier before any SDK call so the
   // SDK subprocess inherits them. Going through resolveSettings (vs. a raw
