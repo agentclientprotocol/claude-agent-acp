@@ -2523,6 +2523,24 @@ describe("stop reason propagation", () => {
   });
 });
 
+describe("logout", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  it("advertises the logout capability during initialize", async () => {
+    const agent = createMockAgent();
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    expect(response.agentCapabilities?.auth?.logout).toEqual({});
+  });
+});
+
 describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {

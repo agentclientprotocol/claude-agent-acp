@@ -17,6 +17,7 @@ import {
   ListSessionsResponse,
   LoadSessionRequest,
   LoadSessionResponse,
+  LogoutRequest,
   methods,
   ndJsonStream,
   NewSessionRequest,
@@ -855,6 +856,9 @@ export class ClaudeAcpAgent {
           http: true,
           sse: true,
         },
+        auth: {
+          logout: {},
+        },
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -990,6 +994,42 @@ export class ClaudeAcpAgent {
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  async logout(_params: LogoutRequest): Promise<void> {
+    // Clear in-memory gateway credentials supplied via `authenticate`. The
+    // gateway method never touches the on-disk credential store, so dropping
+    // this reference is the whole logout for that path.
+    this.gatewayAuthRequest = undefined;
+
+    // For the Claude/Console login methods the credentials live in the native
+    // CLI's store (keychain or config dir), which only the binary can clear.
+    // `claude auth logout` is non-interactive and idempotent.
+    const cliPath = await claudeCliPath();
+    const { spawn } = await import("node:child_process");
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(cliPath, ["auth", "logout"], {
+        stdio: ["ignore", "ignore", "pipe"],
+        env: process.env,
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            RequestError.internalError(
+              { stderr: stderr.trim() || undefined },
+              `claude auth logout exited with code ${code}`,
+            ),
+          );
+        }
+      });
+    });
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -4572,6 +4612,7 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
