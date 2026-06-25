@@ -50,6 +50,7 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  getSessionInfo,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -262,6 +263,12 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Last session title we pushed to the client via `session_info_update`.
+   *  The SDK auto-generates a title in a background task and persists it to the
+   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
+   *  and only notify the client when it actually changes. Undefined until the
+   *  first title is observed. */
+  lastTitle?: string;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -943,6 +950,40 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** Read the SDK-maintained title for a session and, if it changed since the
+   *  last time we looked, notify the client with a `session_info_update`. The
+   *  SDK has no push event for the title it auto-generates in the background, so
+   *  we pull it at turn-end. A missing session file or read error is non-fatal:
+   *  the title is best-effort and another turn will retry. */
+  private async maybeUpdateSessionTitle(sessionId: string, session: Session): Promise<void> {
+    let info;
+    try {
+      info = await getSessionInfo(sessionId, { dir: session.cwd });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
+      return;
+    }
+    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
+    // title (or first prompt). Prefer the explicit title when present.
+    const rawTitle = info?.customTitle ?? info?.summary;
+    if (!rawTitle) {
+      return;
+    }
+    const title = sanitizeTitle(rawTitle);
+    if (title === session.lastTitle) {
+      return;
+    }
+    session.lastTitle = title;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        title,
+        updatedAt: new Date(info!.lastModified).toISOString(),
+      },
+    });
+  }
+
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
@@ -1365,6 +1406,11 @@ export class ClaudeAcpAgent {
                   if (session.cancelled) {
                     settleActive({ stopReason: "cancelled" });
                   }
+                  // The SDK generates the session title in a background task and
+                  // persists it to the session file; `idle` is the turn-over
+                  // signal, so it's the point at which a new title may have
+                  // landed. Push it to the client if it changed.
+                  await this.maybeUpdateSessionTitle(params.sessionId, session);
                 }
                 break;
               }

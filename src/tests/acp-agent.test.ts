@@ -45,6 +45,7 @@ import {
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
+  getSessionInfo,
   getSessionMessages,
   query,
   SDKAssistantMessage,
@@ -56,6 +57,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   return {
     ...actual,
     deleteSession: vi.fn(),
+    getSessionInfo: vi.fn(),
   };
 });
 import type {
@@ -1927,6 +1929,12 @@ describe("runPromptWithCancellation", () => {
 });
 
 describe("stop reason propagation", () => {
+  // The title-update tests set `getSessionInfo` to resolve a title; reset it so
+  // that value can't leak into other turn-end (idle) assertions in this block.
+  beforeEach(() => {
+    vi.mocked(getSessionInfo).mockReset();
+  });
+
   function createMockAgent() {
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2320,6 +2328,98 @@ describe("stop reason propagation", () => {
       .filter((u) => u.update?.sessionUpdate === "agent_message_chunk")
       .map((u) => u.update.content?.text);
     expect(chunkTexts).toContain("between-turn background note");
+  });
+
+  it("pushes a session_info_update when the SDK generates a title at turn-end", async () => {
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Fix the flaky title test",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield userEcho(userMessage);
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+
+    const titleUpdate = sessionUpdates.find(
+      (u) => u.update?.sessionUpdate === "session_info_update",
+    );
+    expect(titleUpdate?.update).toEqual({
+      sessionUpdate: "session_info_update",
+      title: "Fix the flaky title test",
+      updatedAt: new Date(1_700_000_000_000).toISOString(),
+    });
+    expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
+  });
+
+  it("does not re-push session_info_update when the title is unchanged", async () => {
+    const sessionUpdates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "Stable title",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      // Two turns, each ending in idle, but the title never changes.
+      for (let i = 0; i < 2; i++) {
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "one" }] });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "two" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    const titleUpdates = sessionUpdates.filter(
+      (u) => u.update?.sessionUpdate === "session_info_update",
+    );
+    expect(titleUpdates).toHaveLength(1);
   });
 
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
