@@ -447,8 +447,7 @@ function isMuslLibc(): boolean {
   // process.report.getReport().header.glibcVersionRuntime is populated when
   // Node is dynamically linked against glibc, and absent on musl.
   const report = process.report?.getReport() as
-    | { header?: { glibcVersionRuntime?: string } }
-    | undefined;
+    { header?: { glibcVersionRuntime?: string } } | undefined;
   return !report?.header?.glibcVersionRuntime;
 }
 

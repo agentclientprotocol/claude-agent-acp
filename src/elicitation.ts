@@ -232,8 +232,7 @@ export function askUserQuestionsToCreateRequest(
 
 /** Outcome of an AskUserQuestion elicitation, decoupled from any transport. */
 export type AskUserQuestionOutcome =
-  | { action: "answered"; updatedInput: Record<string, unknown> }
-  | { action: "cancel" };
+  { action: "answered"; updatedInput: Record<string, unknown> } | { action: "cancel" };
 
 /**
  * Fold an ACP elicitation response into the AskUserQuestion tool's input.

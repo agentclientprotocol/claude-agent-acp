@@ -113,15 +113,13 @@ describe("session config options", () => {
       settingsManager: {},
       modes: structuredClone(MOCK_MODES),
       models: structuredClone(MOCK_MODELS),
-      modelInfos: MOCK_MODELS.availableModels.map(
-        (m): ModelInfo => ({
-          value: m.modelId,
-          displayName: m.name,
-          description: m.description,
-          supportsEffort: true,
-          supportedEffortLevels: ["low", "medium", "high"],
-        }),
-      ),
+      modelInfos: MOCK_MODELS.availableModels.map((m): ModelInfo => ({
+        value: m.modelId,
+        displayName: m.name,
+        description: m.description,
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "medium", "high"],
+      })),
       configOptions: structuredClone(MOCK_CONFIG_OPTIONS),
       contextWindowSize: 200000,
     };
