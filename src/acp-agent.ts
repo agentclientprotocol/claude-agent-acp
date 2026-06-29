@@ -1597,6 +1597,7 @@ export class ClaudeAcpAgent {
               case "api_retry":
               case "thinking_tokens":
               case "model_refusal_fallback":
+              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               default:
