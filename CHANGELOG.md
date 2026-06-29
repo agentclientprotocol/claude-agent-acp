@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.53.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.52.0...v0.53.0) (2026-06-29)
+
+
+### Features
+
+* Add ACP logout support ([#816](https://github.com/agentclientprotocol/claude-agent-acp/issues/816)) ([0a0468c](https://github.com/agentclientprotocol/claude-agent-acp/commit/0a0468c72092b7ceccc551b4353dd92f9c22cbb8))
+* **deps:** bump @anthropic-ai/claude-agent-sdk to 0.3.195 ([#818](https://github.com/agentclientprotocol/claude-agent-acp/issues/818)) ([5dd8746](https://github.com/agentclientprotocol/claude-agent-acp/commit/5dd87462376597eb7b695200f4c716af46e764d6))
+
+
+### Bug Fixes
+
+* Emit tool_call before permission request ([#820](https://github.com/agentclientprotocol/claude-agent-acp/issues/820)) ([c95fc88](https://github.com/agentclientprotocol/claude-agent-acp/commit/c95fc884e82e5a297d1b17b8965690260867835b))
+
 ## [0.52.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.51.0...v0.52.0) (2026-06-25)
 
 
