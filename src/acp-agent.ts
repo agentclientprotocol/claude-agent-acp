@@ -280,6 +280,14 @@ type Session = {
    *  `tool_result` time so a long-running session doesn't accumulate every
    *  tool call for its whole lifetime. */
   toolUseCache: ToolUseCache;
+  /** Tracks which tool_use ids we've already emitted a `tool_call` for, so the
+   *  second source to encounter a tool call sends a `tool_call_update` instead
+   *  of a duplicate `tool_call`. The SDK can invoke `canUseTool` (→ a permission
+   *  request, which emits the tool_call eagerly so the client has it before
+   *  being asked to approve it) either before or after the assistant message's
+   *  tool_use block streams; this set makes the two paths converge regardless of
+   *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
+  emittedToolCalls: Set<string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -1897,6 +1905,7 @@ export class ClaudeAcpAgent {
                 clientCapabilities: this.clientCapabilities,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
               },
             )) {
@@ -2128,6 +2137,7 @@ export class ClaudeAcpAgent {
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
                 taskState: session.taskState,
+                emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
               },
             )) {
@@ -2550,8 +2560,21 @@ export class ClaudeAcpAgent {
    *  longer leaves the `await` hanging. */
   private async requestPermissionFromClient(
     params: RequestPermissionRequest,
+    toolName: string,
     signal: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The SDK may invoke `canUseTool` (and therefore this permission request)
+    // before the assistant message's tool_use block streams to us. Some ACP clients
+    // expect the `tool_call` a permission request references to already exist,
+    // so emit it now if it hasn't been sent yet. The streamed tool_use chunk
+    // later refines it with a `tool_call_update` rather than emitting a
+    // duplicate (see `emittedToolCalls` in `toAcpNotifications`).
+    await this.ensureToolCallEmitted(
+      params.sessionId,
+      toolName,
+      params.toolCall.toolCallId,
+      params.toolCall.rawInput,
+    );
     try {
       return await this.client.requestPermission(params, signal);
     } catch (error) {
@@ -2560,6 +2583,39 @@ export class ClaudeAcpAgent {
       }
       throw error;
     }
+  }
+
+  /** Emit the `tool_call` a permission request references if it hasn't been sent
+   *  yet, so the client has the tool call before being asked to approve it. The
+   *  matching streamed tool_use chunk later refines it with a `tool_call_update`
+   *  instead of emitting a duplicate (see `emittedToolCalls`). Built via the same
+   *  `toolCallNotification` helper as the streamed path so the two are identical.
+   *  Tools the stream renders as a plan (TodoWrite) or suppresses (Task*) are
+   *  skipped so a permission prompt for them never surfaces a stray tool_call. */
+  private async ensureToolCallEmitted(
+    sessionId: string,
+    toolName: string,
+    toolCallId: string,
+    toolInput: unknown,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || !shouldEmitToolCall(toolName)) {
+      return;
+    }
+    if (session.emittedToolCalls.has(toolCallId)) {
+      return;
+    }
+    session.emittedToolCalls.add(toolCallId);
+    const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: toolCallNotification(
+        { id: toolCallId, name: toolName, input: toolInput },
+        toolInput,
+        supportsTerminalOutput,
+        session.cwd,
+      ),
+    });
   }
 
   canUseTool(sessionId: string): CanUseTool {
@@ -2579,6 +2635,9 @@ export class ClaudeAcpAgent {
       // than the interactive dialog). Present it as an ACP form elicitation and
       // feed the answers back as updatedInput for the tool's own call() to read.
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
+        // Like permission requests, the elicitation references this toolUseID, so
+        // make sure the tool_call has surfaced to the client before we send it.
+        await this.ensureToolCallEmitted(sessionId, toolName, toolUseID, toolInput);
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
@@ -2623,6 +2682,7 @@ export class ClaudeAcpAgent {
               ),
             },
           },
+          toolName,
           signal,
         );
 
@@ -2695,6 +2755,7 @@ export class ClaudeAcpAgent {
             ),
           },
         },
+        toolName,
         signal,
       );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -3433,6 +3494,7 @@ export class ClaudeAcpAgent {
         ) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
+      emittedToolCalls: new Set(),
       messageIdToUuid: new Map(),
     };
 
@@ -4149,6 +4211,64 @@ function applyMessageId(
   }
 }
 
+/** Built-in tools that drive the task list (headless/SDK sessions use these
+ *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
+ *  snapshots rather than as tool_calls. */
+function isTaskTool(toolName: string): boolean {
+  return (
+    toolName === "TaskCreate" ||
+    toolName === "TaskUpdate" ||
+    toolName === "TaskList" ||
+    toolName === "TaskGet"
+  );
+}
+
+/** Whether a tool's tool_use surfaces to the client as a standalone
+ *  `tool_call`. TodoWrite is rendered as a `plan` and Task* tools are
+ *  suppressed (their plan snapshot is emitted at tool_result time), so neither
+ *  produces a tool_call. */
+function shouldEmitToolCall(toolName: string): boolean {
+  return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+/** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
+ *  notification for a tool_use. Shared by every site that surfaces a tool call:
+ *  the streamed tool_use path (first encounter → tool_call, later encounter →
+ *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
+ *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
+ *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
+ *  updates key off of; a refining `tool_call_update` carries neither. */
+function toolCallNotification(
+  toolUse: { id: string; name: string; input: unknown },
+  rawInput: unknown,
+  supportsTerminalOutput: boolean,
+  cwd?: string,
+  refine = false,
+): SessionNotification["update"] {
+  if (refine) {
+    return {
+      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      toolCallId: toolUse.id,
+      sessionUpdate: "tool_call_update",
+      rawInput,
+      ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
+    };
+  }
+  return {
+    _meta: {
+      claudeCode: { toolName: toolUse.name },
+      ...(toolUse.name === "Bash" && supportsTerminalOutput
+        ? { terminal_info: { terminal_id: toolUse.id } }
+        : {}),
+    } satisfies ToolUpdateMeta,
+    toolCallId: toolUse.id,
+    sessionUpdate: "tool_call",
+    rawInput,
+    status: "pending",
+    ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
+  };
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -4166,6 +4286,13 @@ export function toAcpNotifications(
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
+    // Tracks tool_use ids already emitted as a `tool_call` so a permission
+    // request (which emits the tool_call eagerly) and the streamed tool_use
+    // chunk don't both emit one — whichever arrives second emits a
+    // `tool_call_update` instead. Mutated in place. When omitted, the
+    // tool_call/update decision falls back to `toolUseCache` presence (the
+    // historical single-source behavior).
+    emittedToolCalls?: Set<string>;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -4253,12 +4380,7 @@ export function toAcpNotifications(
               entries: planEntries(chunk.input as { todos: ClaudePlanEntry[] }),
             };
           }
-        } else if (
-          chunk.name === "TaskCreate" ||
-          chunk.name === "TaskUpdate" ||
-          chunk.name === "TaskList" ||
-          chunk.name === "TaskGet"
-        ) {
+        } else if (isTaskTool(chunk.name)) {
           // Task* tool_use is suppressed; the plan update is emitted at
           // tool_result time once we have the task ID (for TaskCreate) and
           // confirmation that the change took effect.
@@ -4311,39 +4433,31 @@ export function toAcpNotifications(
             // ignore if we can't turn it to JSON
           }
 
-          if (alreadyCached) {
-            // Second encounter (full assistant message after streaming) —
-            // send as tool_call_update to refine the existing tool_call
-            // rather than emitting a duplicate tool_call.
-            update = {
-              _meta: {
-                claudeCode: {
-                  toolName: chunk.name,
-                },
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.id,
-              sessionUpdate: "tool_call_update",
+          // Emit a `tool_call` only the first time this id surfaces to the
+          // client; afterwards refine it with a `tool_call_update`. The first
+          // surface may be this stream chunk OR an earlier permission request
+          // (see `ensureToolCallEmitted`), so emission is tracked separately
+          // from `toolUseCache`. Without an `emittedToolCalls` set we fall back
+          // to cache presence — the historical streaming-only behavior.
+          const emittedToolCalls = options?.emittedToolCalls;
+          const alreadyEmitted = emittedToolCalls ? emittedToolCalls.has(chunk.id) : alreadyCached;
+          emittedToolCalls?.add(chunk.id);
+
+          if (alreadyEmitted) {
+            // Already surfaced (full assistant message after streaming, or a
+            // permission request emitted it first) — refine with a
+            // tool_call_update rather than emitting a duplicate tool_call.
+            update = toolCallNotification(
+              chunk,
               rawInput,
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
-            };
+              supportsTerminalOutput,
+              options?.cwd,
+              true,
+            );
           } else {
-            // First encounter (streaming content_block_start or replay) —
-            // send as tool_call with terminal_info for Bash tools.
-            update = {
-              _meta: {
-                claudeCode: {
-                  toolName: chunk.name,
-                },
-                ...(chunk.name === "Bash" && supportsTerminalOutput
-                  ? { terminal_info: { terminal_id: chunk.id } }
-                  : {}),
-              } satisfies ToolUpdateMeta,
-              toolCallId: chunk.id,
-              sessionUpdate: "tool_call",
-              rawInput,
-              status: "pending",
-              ...toolInfoFromToolUse(chunk, supportsTerminalOutput, options?.cwd),
-            };
+            // First surface (streaming content_block_start or replay) — send as
+            // tool_call (with terminal_info for Bash).
+            update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
           }
         }
         break;
@@ -4357,6 +4471,7 @@ export function toAcpNotifications(
       case "bash_code_execution_tool_result":
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
+        options?.emittedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           logger.error(
@@ -4365,12 +4480,7 @@ export function toAcpNotifications(
           break;
         }
 
-        if (
-          toolUse.name === "TaskCreate" ||
-          toolUse.name === "TaskUpdate" ||
-          toolUse.name === "TaskList" ||
-          toolUse.name === "TaskGet"
-        ) {
+        if (isTaskTool(toolUse.name)) {
           // Headless/SDK sessions emit Task* tools instead of TodoWrite.
           // TaskCreate / TaskUpdate mutate the accumulated task list; TaskList
           // and TaskGet are read-only so we just suppress their tool_call /
@@ -4490,6 +4600,7 @@ export function streamEventToAcpNotifications(
     clientCapabilities?: ClientCapabilities;
     cwd?: string;
     taskState?: TaskState;
+    emittedToolCalls?: Set<string>;
     messageId?: string;
   },
 ): SessionNotification[] {
@@ -4508,6 +4619,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
         },
       );
@@ -4524,6 +4636,7 @@ export function streamEventToAcpNotifications(
           parentToolUseId: message.parent_tool_use_id,
           cwd: options?.cwd,
           taskState: options?.taskState,
+          emittedToolCalls: options?.emittedToolCalls,
           messageId: options?.messageId,
         },
       );
