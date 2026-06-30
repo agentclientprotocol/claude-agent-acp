@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.54.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.53.0...v0.54.0) (2026-06-30)
+
+
+### Features
+
+* Add Fast mode session config support ([#828](https://github.com/agentclientprotocol/claude-agent-acp/issues/828)) ([fa949a2](https://github.com/agentclientprotocol/claude-agent-acp/commit/fa949a20db0e33f2d63aebeb37e9fea212d8ee95))
+* **deps-dev:** bump prettier from 3.9.1 to 3.9.3 in the minor group ([#821](https://github.com/agentclientprotocol/claude-agent-acp/issues/821)) ([b8df8e0](https://github.com/agentclientprotocol/claude-agent-acp/commit/b8df8e0e5460fd782214f4dde488f7476c80c454))
+* **deps:** bump @anthropic-ai/claude-agent-sdk to 0.3.197 for Sonnet 5 ([#826](https://github.com/agentclientprotocol/claude-agent-acp/issues/826)) ([ef42c46](https://github.com/agentclientprotocol/claude-agent-acp/commit/ef42c46e5aea3bb53f433b9f9dd36a62a9f2df6a))
+* **deps:** bump fast-uri from 3.1.2 to 3.1.3 ([#822](https://github.com/agentclientprotocol/claude-agent-acp/issues/822)) ([64aa130](https://github.com/agentclientprotocol/claude-agent-acp/commit/64aa130c66c299f9835193796ba372b3ed40e7c1))
+
 ## [0.53.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.52.0...v0.53.0) (2026-06-29)
 
 
