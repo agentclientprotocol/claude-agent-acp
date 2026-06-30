@@ -811,6 +811,55 @@ describe("ClaudeAcpAgent settings", () => {
         }
       }
     });
+
+    it("maps allowlist aliases through modelOverrides to provider IDs", async () => {
+      // Bedrock/Vertex deployments enforce short aliases in availableModels
+      // but require provider-specific IDs at the API. Without applying
+      // modelOverrides during allowlist resolution, the alias is surfaced as
+      // the model value and passed verbatim to setModel, which the provider
+      // API rejects with a 400 "invalid model identifier".
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({
+          availableModels: ["claude-opus-4-6", "claude-sonnet-4-6"],
+          model: "claude-opus-4-6",
+          modelOverrides: {
+            "claude-opus-4-6": "global.anthropic.claude-opus-4-6-v1[1m]",
+            "claude-sonnet-4-6": "global.anthropic.claude-sonnet-4-6[1m]",
+          },
+        }),
+      );
+
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+
+      const { setModelSpy } = mockQueryWithModels([
+        { value: "default", displayName: "Default", description: "Default model" },
+        { value: "opus", displayName: "Opus", description: "Claude Opus 4.6" },
+        { value: "sonnet", displayName: "Sonnet", description: "Claude Sonnet 4.6" },
+      ]);
+
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+
+      const response = await (agent as any).createSession({
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      const modelOption = response.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption.options.map((o: any) => o.value)).toEqual([
+        "default",
+        "global.anthropic.claude-opus-4-6-v1[1m]",
+        "global.anthropic.claude-sonnet-4-6[1m]",
+      ]);
+      // The allowlist synthesized the overridden ID (the SDK only surfaced the
+      // `opus` alias), so the adapter syncs the provider ID via setModel — never
+      // the raw alias that Bedrock would reject.
+      expect(setModelSpy).toHaveBeenCalledWith("global.anthropic.claude-opus-4-6-v1[1m]");
+      expect(modelOption.currentValue).toBe("global.anthropic.claude-opus-4-6-v1[1m]");
+    });
   });
 
   it("resolves model aliases like opus[1m] to the correct model", async () => {

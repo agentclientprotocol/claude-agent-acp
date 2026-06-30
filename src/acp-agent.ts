@@ -3486,8 +3486,14 @@ export class ClaudeAcpAgent {
     // configOptions, the current-model resolver, and the stored modelInfos
     // consistent with what the user configured.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
+    const settingsModelOverrides = (settingsManager.getSettings() as Record<string, unknown>)
+      .modelOverrides as Record<string, string> | undefined;
     const allowedModels = Array.isArray(settingsAvailableModels)
-      ? applyAvailableModelsAllowlist(initializationResult.models, settingsAvailableModels)
+      ? applyAvailableModelsAllowlist(
+          initializationResult.models,
+          settingsAvailableModels,
+          settingsModelOverrides,
+        )
       : initializationResult.models;
 
     const models = await getAvailableModels(
@@ -4166,6 +4172,7 @@ function resolveSettingsModel(
 export function applyAvailableModelsAllowlist(
   sdkModels: ModelInfo[],
   allowlist: string[],
+  settingsModelOverrides?: Record<string, string>,
 ): ModelInfo[] {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
@@ -4180,17 +4187,25 @@ export function applyAvailableModelsAllowlist(
 
   const sdkModelsWithoutDefault = sdkModels.filter((m) => m.value !== "default");
 
+  // Bedrock/Vertex deployments enforce short aliases (e.g. "claude-opus-4-6")
+  // in availableModels but require provider-specific IDs at the API. Consult
+  // modelOverrides so the allowlist entry's surfaced value is the provider ID
+  // that setModel can actually pass, not the raw alias the API would reject.
   for (const entry of allowlist) {
     const trimmed = entry.trim();
     if (!trimmed || seen.has(trimmed)) continue;
 
-    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
+    const overridden = settingsModelOverrides?.[trimmed];
+    const effective = overridden ?? trimmed;
+    if (seen.has(effective)) continue;
+
+    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, effective);
     if (sdkMatch) {
-      result.push({ ...sdkMatch, value: trimmed });
+      result.push({ ...sdkMatch, value: effective });
     } else {
-      result.push({ value: trimmed, displayName: trimmed, description: "" });
+      result.push({ value: effective, displayName: trimmed, description: "" });
     }
-    seen.add(trimmed);
+    seen.add(effective);
   }
 
   // The custom model option (ANTHROPIC_CUSTOM_MODEL_OPTION) is exempt from the
