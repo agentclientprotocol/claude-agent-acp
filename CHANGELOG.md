@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.54.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.54.0...v0.54.1) (2026-06-30)
+
+
+### Bug Fixes
+
+* apply modelOverrides when resolving availableModels allowlist ([#827](https://github.com/agentclientprotocol/claude-agent-acp/issues/827)) ([98c284b](https://github.com/agentclientprotocol/claude-agent-acp/commit/98c284bb871a96710596dfdc2b9ea25d2400f6b2))
+
 ## [0.54.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.53.0...v0.54.0) (2026-06-30)
 
 
