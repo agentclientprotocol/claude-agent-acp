@@ -37,6 +37,7 @@ import {
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
+  createFastModeConfigOption,
   discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
@@ -1810,6 +1811,7 @@ describe("permission request cancellation", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2267,6 +2269,77 @@ describe("stop reason propagation", () => {
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
 
+  it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: any) => {
+        updates.push(n);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    (agent as any).clientCapabilities = { session: { configOptions: { boolean: {} } } };
+
+    const input = new Pushable<any>();
+
+    // A background followup reports fast_mode_state="on". It must NOT flip the
+    // user's toggle or emit a config_option_update (every other side effect in
+    // the result handler is likewise gated behind !isTaskNotification).
+    const backgroundTaskResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+      fast_mode_state: "on",
+    };
+
+    // The user prompt's own result reports the same state — this one IS a user
+    // turn, so it reconciles and notifies.
+    const promptResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      fast_mode_state: "on",
+    };
+
+    async function* messageGenerator() {
+      yield { type: "system", subtype: "init", session_id: "test-session" };
+      yield backgroundTaskResult;
+
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      fastModeEnabled: false,
+      configOptions: [createFastModeConfigOption(false, true)],
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    // The user-turn result flipped the toggle and emitted exactly one
+    // config_option_update; the background result contributed none.
+    expect((agent.sessions["test-session"] as any).fastModeEnabled).toBe(true);
+    const configUpdates = updates.filter(
+      (n: any) => n.update?.sessionUpdate === "config_option_update",
+    );
+    expect(configUpdates).toHaveLength(1);
+    expect(configUpdates[0].update.configOptions).toContainEqual(
+      createFastModeConfigOption(true, true),
+    );
+  });
+
   it("does not fold a task-notification result's tokens into an already-active turn's usage", async () => {
     const agent = createMockAgent();
 
@@ -2713,6 +2786,7 @@ describe("session/close", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2799,6 +2873,7 @@ describe("session/delete", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -2902,6 +2977,7 @@ describe("getOrCreateSession param change detection", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -5117,6 +5193,7 @@ describe("post-error recovery", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -5688,6 +5765,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       configOptions: [],
       agents: [],
       currentAgent: "default",
+      fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
@@ -6142,6 +6220,7 @@ describe("agent selection config option", () => {
         configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
         agents,
         currentAgent: "default",
+        fastModeEnabled: false,
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         contextWindowSize: 200000,

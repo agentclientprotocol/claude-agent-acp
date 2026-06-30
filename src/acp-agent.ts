@@ -51,6 +51,7 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  FastModeState,
   getSessionInfo,
   getSessionMessages,
   listSessions,
@@ -246,6 +247,10 @@ type Session = {
   /** The currently selected main-thread agent name, or "default" for the
    *  standard Claude Code agent (no `agent` flag applied). */
   currentAgent: string;
+  /** Whether Fast mode is currently enabled for this session. Tracked as the
+   *  user's intent so it persists across model switches; the Fast mode config
+   *  option is only surfaced while the selected model supports it. */
+  fastModeEnabled: boolean;
   abortController: AbortController;
   /** Signal the consumer races `query.next()` against. Aborted by cancel()
    *  (after a grace period) to force the active turn to settle "cancelled" when
@@ -1348,6 +1353,10 @@ export class ClaudeAcpAgent {
           case "system":
             switch (message.subtype) {
               case "init":
+                // A fresh `system`/init (e.g. after reinitialize) can carry an
+                // updated Fast mode state; reconcile it with what we seeded at
+                // session creation.
+                await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
                 break;
               case "status": {
                 if (message.status === "compacting") {
@@ -1619,6 +1628,14 @@ export class ClaudeAcpAgent {
             // They should not influence the user-turn lifecycle (stop reason,
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
+
+            // Reconcile the Fast mode toggle with the SDK's reported state.
+            // Gated to user-driven turns like every other side effect below; a
+            // background followup's state lands on the next user turn's result.
+            // Runs even when the turn errors or was cancelled.
+            if (!isTaskNotification) {
+              await this.syncFastModeState(params.sessionId, session, message.fast_mode_state);
+            }
 
             // A user-turn result needs an active turn so its stop reason is
             // attributed and the turn settles at idle. Local-only commands carry
@@ -2383,7 +2400,7 @@ export class ClaudeAcpAgent {
     }
 
     await this.applySessionMode(params.sessionId, params.modeId);
-    await this.updateConfigOption(params.sessionId, "mode", params.modeId);
+    await this.updateConfigOption(params.sessionId, MODE_CONFIG_ID, params.modeId);
     return {};
   }
 
@@ -2401,13 +2418,22 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
-    if (typeof params.value !== "string") {
-      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
-    }
 
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
       throw new Error(`Unknown config option: ${params.configId}`);
+    }
+
+    // Fast mode carries a boolean value (for Clients that opted into boolean
+    // config options) or the "on"/"off" select fallback, so it bypasses the
+    // string-only validation the select-style options below rely on.
+    if (params.configId === FAST_MODE_CONFIG_ID) {
+      await this.applyFastMode(session, resolveFastModeEnabled(params));
+      return { configOptions: session.configOptions };
+    }
+
+    if (typeof params.value !== "string") {
+      throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
 
     const allValues =
@@ -2419,7 +2445,7 @@ export class ClaudeAcpAgent {
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
-    if (!validValue && params.configId === "model") {
+    if (!validValue && params.configId === MODEL_CONFIG_ID) {
       const modelInfos: ModelInfo[] = allValues.map((o) => ({
         value: o.value,
         displayName: o.name,
@@ -2439,7 +2465,7 @@ export class ClaudeAcpAgent {
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
 
-    if (params.configId === "mode") {
+    if (params.configId === MODE_CONFIG_ID) {
       await this.applySessionMode(params.sessionId, resolvedValue);
       await this.client.sessionUpdate({
         sessionId: params.sessionId,
@@ -2448,7 +2474,7 @@ export class ClaudeAcpAgent {
           currentModeId: resolvedValue,
         },
       });
-    } else if (params.configId === "model") {
+    } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
@@ -2706,7 +2732,7 @@ export class ClaudeAcpAgent {
               currentModeId: selectedMode,
             },
           });
-          await this.updateConfigOption(sessionId, "mode", selectedMode);
+          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, selectedMode);
 
           return {
             behavior: "allow",
@@ -2906,12 +2932,12 @@ export class ClaudeAcpAgent {
     configId: string,
     value: string,
   ): Promise<void> {
-    if (configId === "mode") {
+    if (configId === MODE_CONFIG_ID) {
       session.modes = { ...session.modes, currentModeId: value };
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-    } else if (configId === "model") {
+    } else if (configId === MODEL_CONFIG_ID) {
       // `ModelInfo.supportsAutoMode` is the canonical SDK signal for clamping
       // modes below; its `displayName`/`description` also let us infer the
       // context window for semantic aliases (e.g. `default`) whose ID alone
@@ -2961,7 +2987,7 @@ export class ClaudeAcpAgent {
       }
 
       // Rebuild config options since effort levels depend on the selected model
-      const effortOpt = session.configOptions.find((o) => o.id === "effort");
+      const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
       session.configOptions = buildConfigOptions(
@@ -2971,10 +2997,18 @@ export class ClaudeAcpAgent {
         currentEffort,
         session.agents,
         session.currentAgent,
+        {
+          // The toggle follows the newly selected model: it disappears when the
+          // model lacks fast support and reappears (with the retained user
+          // intent) when a supporting model is selected again.
+          supported: newModelInfo?.supportsFastMode ?? false,
+          enabled: session.fastModeEnabled,
+          useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+        },
       );
 
       // Sync effort with the SDK if it changed after the model switch
-      const newEffortOpt = session.configOptions.find((o) => o.id === "effort");
+      const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const newEffort =
         typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
       if (newEffort !== currentEffort) {
@@ -2998,7 +3032,7 @@ export class ClaudeAcpAgent {
           },
         });
       }
-    } else if (configId === "agent") {
+    } else if (configId === AGENT_CONFIG_ID) {
       // Live agent switch — no subprocess restart needed. Apply the SDK flag
       // first so a rejected control request leaves both `currentAgent` and the
       // config option untouched (no UI/SDK desync). Passing `null` clears the
@@ -3015,12 +3049,83 @@ export class ClaudeAcpAgent {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
-      if (configId === "effort") {
+      if (configId === EFFORT_CONFIG_ID) {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(value),
         });
       }
     }
+  }
+
+  /** Replace the Fast mode option in `session.configOptions` so it reflects
+   *  `enabled` (and the client's current boolean-capability). A no-op when the
+   *  option isn't present, so callers must confirm the current model surfaces
+   *  it first. */
+  private refreshFastModeOption(session: Session, enabled: boolean): void {
+    const refreshed = createFastModeConfigOption(
+      enabled,
+      clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    );
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === FAST_MODE_CONFIG_ID ? refreshed : o,
+    );
+  }
+
+  /** Toggle Fast mode for a session: push the SDK flag, record the user's
+   *  intent, and refresh the Fast mode config option in place. Only reached
+   *  once the option exists (i.e. the current model supports fast mode), so the
+   *  option is guaranteed to be present in `configOptions`. */
+  private async applyFastMode(session: Session, enabled: boolean): Promise<void> {
+    // Apply the SDK flag first so a rejected control request leaves both the
+    // session state and the config option untouched (no UI/SDK desync).
+    await session.query.applyFlagSettings({ fastMode: enabled });
+    session.fastModeEnabled = enabled;
+    this.refreshFastModeOption(session, enabled);
+  }
+
+  /** Reconcile the session's Fast mode toggle with an SDK-reported
+   *  `fast_mode_state` (delivered on `system`/init and on user-turn `result`s).
+   *  The SDK can flip fast mode independently of the user — e.g. back to `on`
+   *  once a rate-limit `cooldown` clears — so we mirror definitive on/off
+   *  changes into the config option and notify the client.
+   *
+   *  Guards, in order:
+   *   - absent state: nothing to reconcile.
+   *   - no Fast mode option: the current model doesn't support fast mode, so the
+   *     reported state reflects capability, not the user's intent. Leave the
+   *     retained setting untouched so it's correct when a supporting model is
+   *     reselected (the source of the earlier intent-clobber bug was mutating it
+   *     here).
+   *   - `cooldown`: a transient suspension of an already-enabled fast mode.
+   *     Leave the toggle as-is rather than flapping it — and never let a stray
+   *     cooldown spuriously enable a toggle the user has off. */
+  private async syncFastModeState(
+    sessionId: string,
+    session: Session,
+    state: FastModeState | undefined,
+  ): Promise<void> {
+    if (state === undefined) {
+      return;
+    }
+    if (!session.configOptions.some((o) => o.id === FAST_MODE_CONFIG_ID)) {
+      return;
+    }
+    if (state === "cooldown") {
+      return;
+    }
+    const enabled = state === "on";
+    if (enabled === session.fastModeEnabled) {
+      return;
+    }
+    session.fastModeEnabled = enabled;
+    this.refreshFastModeOption(session, enabled);
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
   }
 
   private async getOrCreateSession(params: {
@@ -3274,7 +3379,7 @@ export class ClaudeAcpAgent {
                       currentModeId: "plan",
                     },
                   });
-                  await this.updateConfigOption(sessionId, "mode", "plan");
+                  await this.updateConfigOption(sessionId, MODE_CONFIG_ID, "plan");
                 },
               }),
             ],
@@ -3445,6 +3550,19 @@ export class ClaudeAcpAgent {
         ? requestedAgent
         : DEFAULT_AGENT_ID;
 
+    // Seed Fast mode from the SDK's reported state so the UI reflects reality
+    // (the CLI may start a session with fast mode already on, or force it off
+    // when `fastModePerSessionOptIn` is set). The toggle is only surfaced while
+    // the resolved model advertises `supportsFastMode`.
+    const fastModeEnabled =
+      initializationResult.fast_mode_state !== undefined &&
+      fastModeStateEnabled(initializationResult.fast_mode_state);
+    const fastMode: FastModeOptionState = {
+      supported: currentModelInfo?.supportsFastMode ?? false,
+      enabled: fastModeEnabled,
+      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    };
+
     const configOptions = buildConfigOptions(
       modes,
       models,
@@ -3452,10 +3570,11 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().effortLevel,
       agents,
       currentAgent,
+      fastMode,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
-    const initialEffort = configOptions.find((o) => o.id === "effort");
+    const initialEffort = configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
     if (
       initialEffort &&
       typeof initialEffort.currentValue === "string" &&
@@ -3484,6 +3603,7 @@ export class ClaudeAcpAgent {
       configOptions,
       agents,
       currentAgent,
+      fastModeEnabled,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
@@ -3704,6 +3824,96 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
   }
 }
 
+/** Stable ids for the session config options surfaced via `configOptions`.
+ *  Centralized so the option declarations in `buildConfigOptions` and the
+ *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
+ *  same identifiers and can't drift apart. */
+export const MODE_CONFIG_ID = "mode";
+export const MODEL_CONFIG_ID = "model";
+export const EFFORT_CONFIG_ID = "effort";
+export const AGENT_CONFIG_ID = "agent";
+export const FAST_MODE_CONFIG_ID = "fast";
+
+/** Select-fallback values used when the client has not opted into boolean
+ *  config options (see {@link createFastModeConfigOption}). */
+export const FAST_MODE_ON = "on";
+export const FAST_MODE_OFF = "off";
+const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
+
+/** Map the SDK's tri-state `fast_mode_state` onto the boolean config toggle.
+ *  `cooldown` (fast mode temporarily suspended after a rate limit, per the SDK
+ *  docs) keeps the toggle on so it reflects the user's intent — only an
+ *  explicit `off` clears it. */
+export function fastModeStateEnabled(state: FastModeState): boolean {
+  return state !== "off";
+}
+
+/** Whether the Client advertised support for boolean session config options
+ *  (`session.configOptions.boolean`). Agents MUST only send `type: "boolean"`
+ *  config options to Clients that opt in; otherwise we fall back to a `select`.
+ *  See https://agentclientprotocol.com/rfds/boolean-config-option. */
+export function clientSupportsBooleanConfigOptions(
+  clientCapabilities?: ClientCapabilities | null,
+): boolean {
+  return clientCapabilities?.session?.configOptions?.boolean != null;
+}
+
+/** Build the Fast mode config option. When the Client supports boolean config
+ *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
+ *  a two-value `select` ("on"/"off") so older Clients still get a usable
+ *  control. */
+export function createFastModeConfigOption(
+  enabled: boolean,
+  useBooleanOption: boolean,
+): SessionConfigOption {
+  const base = {
+    id: FAST_MODE_CONFIG_ID,
+    name: "Fast mode",
+    description: FAST_MODE_DESCRIPTION,
+    category: "model_config",
+  } as const;
+
+  if (useBooleanOption) {
+    return { ...base, type: "boolean", currentValue: enabled };
+  }
+
+  return {
+    ...base,
+    type: "select",
+    currentValue: enabled ? FAST_MODE_ON : FAST_MODE_OFF,
+    options: [
+      { value: FAST_MODE_ON, name: "On" },
+      { value: FAST_MODE_OFF, name: "Off" },
+    ],
+  };
+}
+
+/** Resolve the requested Fast mode value from a `session/set_config_option`
+ *  request. Accepts a native boolean (boolean-capable Clients) or the
+ *  "on"/"off" select-fallback strings. */
+export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): boolean {
+  const value = params.value;
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (value === FAST_MODE_ON) {
+    return true;
+  }
+  if (value === FAST_MODE_OFF) {
+    return false;
+  }
+  throw new Error(`Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`);
+}
+
+/** Per-model Fast mode state threaded into {@link buildConfigOptions}. The
+ *  option is only surfaced when the current model `supported`s fast mode. */
+export type FastModeOptionState = {
+  supported: boolean;
+  enabled: boolean;
+  /** Whether the Client opted into boolean config options. */
+  useBooleanOption: boolean;
+};
+
 export function buildConfigOptions(
   modes: SessionModeState,
   models: SessionModelState,
@@ -3711,10 +3921,11 @@ export function buildConfigOptions(
   currentEffortLevel?: string,
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
+  fastMode?: FastModeOptionState,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
-      id: "mode",
+      id: MODE_CONFIG_ID,
       name: "Mode",
       description: "Session permission mode",
       category: "mode",
@@ -3727,7 +3938,7 @@ export function buildConfigOptions(
       })),
     },
     {
-      id: "model",
+      id: MODEL_CONFIG_ID,
       name: "Model",
       description: "AI model to use",
       category: "model",
@@ -3764,7 +3975,7 @@ export function buildConfigOptions(
       currentEffortLevel && includes(currentEffortLevel) ? currentEffortLevel : "default";
 
     options.push({
-      id: "effort",
+      id: EFFORT_CONFIG_ID,
       name: "Effort",
       description: "Available effort levels for this model",
       category: "thought_level",
@@ -3774,13 +3985,20 @@ export function buildConfigOptions(
     });
   }
 
+  // Surface the Fast mode toggle only when the current model supports it. The
+  // option renders as a native boolean toggle for Clients that opted in, and a
+  // two-value select otherwise.
+  if (fastMode?.supported) {
+    options.push(createFastModeConfigOption(fastMode.enabled, fastMode.useBooleanOption));
+  }
+
   // Only surface the Agent picker when there's a real choice — i.e. the user
   // has configured at least one custom agent (built-ins are filtered out in
   // discoverCustomAgents). With none configured, "Default" would be the only
   // entry, so we omit the option entirely.
   if (agents.length > 0) {
     options.push({
-      id: "agent",
+      id: AGENT_CONFIG_ID,
       name: "Agent",
       description: "Main-thread agent persona",
       type: "select",
