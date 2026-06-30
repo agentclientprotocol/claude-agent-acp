@@ -4021,14 +4021,17 @@ export function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
-// Captures a model family version such as `4-6` or `4.7` so we can keep
-// `claude-opus-4-6` from being copied onto the SDK's `opus` alias when that
-// alias currently resolves to a different family version (e.g. Opus 4.7).
-const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)[-.](\d+)\b/;
+// Captures a model family version: `4-6`/`4.7` for dated generations, or a
+// bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
+// `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
+const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
 
 function extractModelFamilyVersion(s: string): string | null {
-  const match = s.match(MODEL_FAMILY_VERSION_PATTERN);
-  return match ? `${match[1]}.${match[2]}` : null;
+  // Strip "[1m]"-style context hints first — that digit is context window
+  // size, not a model generation version.
+  const match = s.replace(/\[\d+m\]/gi, "").match(MODEL_FAMILY_VERSION_PATTERN);
+  if (!match) return null;
+  return match[2] ? `${match[1]}.${match[2]}` : match[1];
 }
 
 function modelVersionsCompatible(preference: string, candidate: ModelInfo): boolean {
@@ -4074,7 +4077,7 @@ function scoreModelMatch(model: ModelInfo, tokens: string[], contextHint?: strin
   return score;
 }
 
-function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
+export function resolveModelPreference(models: ModelInfo[], preference: string): ModelInfo | null {
   const trimmed = preference.trim();
   if (!trimmed) return null;
 
@@ -4088,6 +4091,18 @@ function resolveModelPreference(models: ModelInfo[], preference: string): ModelI
       model.displayName.toLowerCase() === lower,
   );
   if (directMatch) return directMatch;
+
+  // Exact match on the alias's canonical resolved id (e.g. a pinned
+  // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
+  // reported and unambiguous, so it's tried before the fuzzier tiers below.
+  // "default" is skipped first since it shares a resolvedModel with
+  // whichever alias the CLI currently recommends — a specific pin should
+  // land on that named alias, not "default".
+  const resolvedMatch =
+    models.find(
+      (model) => model.value !== "default" && model.resolvedModel?.toLowerCase() === lower,
+    ) ?? models.find((model) => model.resolvedModel?.toLowerCase() === lower);
+  if (resolvedMatch) return resolvedMatch;
 
   // Substring match
   const includesMatch = models.find((model) => {
@@ -4148,7 +4163,10 @@ function resolveSettingsModel(
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
  */
-function applyAvailableModelsAllowlist(sdkModels: ModelInfo[], allowlist: string[]): ModelInfo[] {
+export function applyAvailableModelsAllowlist(
+  sdkModels: ModelInfo[],
+  allowlist: string[],
+): ModelInfo[] {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
   // `models[0]` as a fallback) still has something to work with.
