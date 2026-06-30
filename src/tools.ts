@@ -15,6 +15,7 @@ import {
   FileWriteInput,
   GlobInput,
   GrepInput,
+  ReportFindingsInput,
   TaskCreateInput,
   TaskCreateOutput,
   TaskUpdateInput,
@@ -368,6 +369,25 @@ export function toolInfoFromToolUse(
           : "Update TODOs",
         kind: "think",
         content: [],
+      };
+    }
+
+    case "ReportFindings": {
+      const input = toolUse.input as ReportFindingsInput | undefined;
+      const findings = input?.findings ?? [];
+      return {
+        title:
+          findings.length === 0
+            ? "Report findings: none found"
+            : `Report ${findings.length} finding${findings.length === 1 ? "" : "s"}`,
+        kind: "think",
+        content: findings.map((finding) => ({
+          type: "content" as const,
+          content: {
+            type: "text" as const,
+            text: `**${finding.file}${finding.line ? `:${finding.line}` : ""}** — ${finding.summary}`,
+          },
+        })),
       };
     }
 

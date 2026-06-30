@@ -1614,6 +1614,68 @@ describe("toolInfoFromToolUse - undefined input regression", () => {
     const info = toolInfoFromToolUse(toolUse, false);
     expect(info.title).toBe("Update TODOs");
   });
+
+  it("ReportFindings with undefined input should not throw", () => {
+    const toolUse = { name: "ReportFindings", id: "toolu_findings_undef", input: undefined };
+    const info = toolInfoFromToolUse(toolUse, false);
+    expect(info.title).toBe("Report findings: none found");
+    expect(info.content).toEqual([]);
+  });
+});
+
+describe("toolInfoFromToolUse - ReportFindings", () => {
+  it("should summarize findings count and list each in content", () => {
+    const toolUse = {
+      name: "ReportFindings",
+      id: "toolu_findings_1",
+      input: {
+        findings: [
+          {
+            file: "src/foo.ts",
+            line: 42,
+            summary: "Off-by-one in loop bound",
+            failure_scenario: "Empty array → index out of bounds crash",
+          },
+          {
+            file: "src/bar.ts",
+            summary: "Unhandled promise rejection",
+            failure_scenario: "Network failure → unhandled rejection",
+          },
+        ],
+      },
+    };
+
+    const info = toolInfoFromToolUse(toolUse, false);
+
+    expect(info.kind).toBe("think");
+    expect(info.title).toBe("Report 2 findings");
+    expect(info.content).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: "**src/foo.ts:42** — Off-by-one in loop bound" },
+      },
+      {
+        type: "content",
+        content: { type: "text", text: "**src/bar.ts** — Unhandled promise rejection" },
+      },
+    ]);
+  });
+
+  it("should report a singular title and empty findings array", () => {
+    const oneFinding = {
+      name: "ReportFindings",
+      id: "toolu_findings_2",
+      input: { findings: [{ file: "src/baz.ts", summary: "Leak", failure_scenario: "..." }] },
+    };
+    expect(toolInfoFromToolUse(oneFinding, false).title).toBe("Report 1 finding");
+
+    const noFindings = {
+      name: "ReportFindings",
+      id: "toolu_findings_3",
+      input: { findings: [] },
+    };
+    expect(toolInfoFromToolUse(noFindings, false).title).toBe("Report findings: none found");
+  });
 });
 
 describe("planEntries - undefined input regression", () => {
