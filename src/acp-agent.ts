@@ -3486,8 +3486,7 @@ export class ClaudeAcpAgent {
     // configOptions, the current-model resolver, and the stored modelInfos
     // consistent with what the user configured.
     const settingsAvailableModels = settingsManager.getSettings().availableModels;
-    const settingsModelOverrides = (settingsManager.getSettings() as Record<string, unknown>)
-      .modelOverrides as Record<string, string> | undefined;
+    const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
     const allowedModels = Array.isArray(settingsAvailableModels)
       ? applyAvailableModelsAllowlist(
           initializationResult.models,
@@ -4188,9 +4187,12 @@ export function applyAvailableModelsAllowlist(
   const sdkModelsWithoutDefault = sdkModels.filter((m) => m.value !== "default");
 
   // Bedrock/Vertex deployments enforce short aliases (e.g. "claude-opus-4-6")
-  // in availableModels but require provider-specific IDs at the API. Consult
-  // modelOverrides so the allowlist entry's surfaced value is the provider ID
-  // that setModel can actually pass, not the raw alias the API would reject.
+  // in availableModels but require provider-specific IDs at the API. We still
+  // resolve `sdkMatch` against the alias (`trimmed`) — that's what the
+  // matching heuristics above are built for, and override targets (ARNs,
+  // opaque provider IDs) often won't textually resemble anything in
+  // `sdkModelsWithoutDefault`. Only the entry's surfaced `value` becomes the
+  // override target, so it's what `setModel` ends up passing to the API.
   for (const entry of allowlist) {
     const trimmed = entry.trim();
     if (!trimmed || seen.has(trimmed)) continue;
@@ -4199,7 +4201,7 @@ export function applyAvailableModelsAllowlist(
     const effective = overridden ?? trimmed;
     if (seen.has(effective)) continue;
 
-    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, effective);
+    const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
     if (sdkMatch) {
       result.push({ ...sdkMatch, value: effective });
     } else {

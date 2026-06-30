@@ -79,6 +79,38 @@ describe("applyAvailableModelsAllowlist - resolvedModel matching", () => {
   });
 });
 
+describe("applyAvailableModelsAllowlist - modelOverrides", () => {
+  const SDK_MODELS: ModelInfo[] = [
+    { value: "default", displayName: "Default", description: "Default model" },
+    {
+      value: "opus",
+      displayName: "Opus",
+      description: "Claude Opus 4.6",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "high"],
+    },
+  ];
+
+  it("surfaces the override target as the value while keeping the alias's display metadata", () => {
+    // The override target is an opaque Bedrock ARN with no "opus" substring,
+    // so matching against it (instead of the "claude-opus-4-6" alias) would
+    // find nothing and silently drop displayName/description/supportsEffort.
+    const overrides = {
+      "claude-opus-4-6": "arn:aws:bedrock:us-west-2:111122223333:inference-profile/custom-7f3a",
+    };
+    const result = applyAvailableModelsAllowlist(SDK_MODELS, ["claude-opus-4-6"], overrides);
+
+    const entry = result.find((m) => m.value === overrides["claude-opus-4-6"]);
+    expect(entry).toEqual({
+      value: overrides["claude-opus-4-6"],
+      displayName: "Opus",
+      description: "Claude Opus 4.6",
+      supportsEffort: true,
+      supportedEffortLevels: ["low", "high"],
+    });
+  });
+});
+
 // Runs against the real SDK (no mocks) so the fixture above is flagged the
 // moment the SDK's actual model list shape drifts from it. Requires a usable
 // ANTHROPIC_API_KEY, hence opt-in via RUN_INTEGRATION_TESTS.
