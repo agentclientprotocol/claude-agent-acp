@@ -68,10 +68,10 @@
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.108.0",
+    "@anthropic-ai/sdk": "0.109.0",
     "@eslint/js": "10.0.1",
     "@tsconfig/node22": "22.0.5",
-    "@types/node": "26.0.1",
+    "@types/node": "26.1.0",
     "@typescript-eslint/eslint-plugin": "8.62.1",
     "@typescript-eslint/parser": "8.62.1",
     "eslint": "10.6.0",
