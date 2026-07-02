@@ -176,6 +176,14 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** Error surfaced when the SDK declares a turn over (`session_state_changed:
+ *  idle`, its authoritative turn-over signal) without ever emitting the turn's
+ *  `result` — a model stream that dropped mid-turn, or an async agent that
+ *  completed/stalled without the host turn resolving (issue #825). */
+const TURN_NO_RESULT_MESSAGE =
+  "The turn ended without a result: the agent went idle while this prompt was still in flight " +
+  "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
+
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
  *  `SessionConfigOption` (category "model"). Retained internally to track the
@@ -1149,6 +1157,20 @@ export class ClaudeAcpAgent {
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
+    // How many trailing `session_state_changed: idle` messages are already
+    // accounted for: every user-turn result that terminates a turn (settle,
+    // reject, or orphan skip) is followed by one, as is a cancelled turn
+    // settled by the next turn's echo hand-off. The idle handler absorbs owed
+    // idles; an idle that arrives when NONE is owed while the active turn is
+    // still unsettled means the SDK ended the turn without ever emitting its
+    // result, so the turn will never settle on its own (issue #825).
+    // Stream-level debt, deliberately NOT reset per turn: a lagged idle can
+    // arrive after the next turn has already activated (issue #773), and the
+    // debt is what attributes it to the turn that owed it. Over-counting (an
+    // idle the SDK never emits, e.g. CLI binaries without session-state
+    // events — issue #497) is benign: the counter just absorbs one future
+    // idle, and detection degrades to the status quo rather than misfiring.
+    let owedTrailingIdles = 0;
 
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
@@ -1277,9 +1299,21 @@ export class ClaudeAcpAgent {
     // after each fire so the consumer keeps serving later turns.
     let cancelController = session.cancelController!;
 
+    // The in-flight query.next(), kept across abort wake-ups that don't
+    // consume a message, so no yielded message is ever dropped — async
+    // generators serialize next() calls, so racing a SECOND next() while one
+    // is pending would make the abandoned one swallow a message (e.g. a
+    // force-cancelled turn's late result, whose orphan accounting below
+    // depends on actually seeing it).
+    let pendingNext: Promise<{ kind: "message"; result: IteratorResult<SDKMessage, void> }> | null =
+      null;
+
     try {
       while (true) {
-        const nextMessage = session.query.next();
+        pendingNext ??= session.query
+          .next()
+          .then((result) => ({ kind: "message" as const, result }));
+        const nextMessage = pendingNext;
         // Fresh abort listener per iteration, removed when next() wins, so a
         // long-lived session doesn't accumulate listeners on one signal.
         let onAbort!: () => void;
@@ -1287,26 +1321,38 @@ export class ClaudeAcpAgent {
           onAbort = () => resolve("abort");
           cancelController.signal.addEventListener("abort", onAbort, { once: true });
         });
-        const raced = await Promise.race([
-          nextMessage.then((result) => ({ kind: "message" as const, result })),
-          abortRace,
-        ]);
+        const raced = await Promise.race([nextMessage, abortRace]);
         cancelController.signal.removeEventListener("abort", onAbort);
 
         if (raced === "abort") {
-          // cancel()/teardown woke us. Abandon the in-flight next() (swallowing
-          // any later rejection so it can't surface as unhandled) and settle the
-          // active turn "cancelled" per the ACP contract. If the session is
-          // being torn down, stop; otherwise re-arm and keep consuming.
-          void nextMessage.catch(() => {});
+          // cancel()/teardown woke us: settle the active turn "cancelled" per
+          // the ACP contract. The SDK never acknowledged this turn (that's why
+          // the force-cancel backstop fired), so if it later recovers from the
+          // wedge it will still emit the turn's result — with no live turn to
+          // match — followed by its trailing idle. Pre-count it as an orphan
+          // so that late result is skipped (not promoted onto the next queued
+          // prompt) and its trailer is recorded as owed, not read as the next
+          // turn being abandoned. Stale counts self-heal: activation resets
+          // them (see activateTurn).
+          if (session.activeTurn && !session.activeTurn.settled) {
+            session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
+          }
           settleActive({ stopReason: "cancelled" });
+          // If the session is being torn down, abandon the in-flight next()
+          // (swallowing any later rejection so it can't surface as unhandled)
+          // and stop; otherwise re-arm and keep consuming — `pendingNext`
+          // stays in flight so its eventual message is processed, not dropped.
           if (!this.sessions[params.sessionId]) {
+            void nextMessage.catch(() => {});
             return;
           }
           cancelController = new AbortController();
           session.cancelController = cancelController;
           continue;
         }
+
+        // A message arrived: this next() is consumed; arm a fresh one next pass.
+        pendingNext = null;
 
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
@@ -1445,19 +1491,61 @@ export class ClaudeAcpAgent {
               }
               case "session_state_changed": {
                 if (message.state === "idle") {
-                  // A non-cancelled turn already settled at its terminal
-                  // `result` (issue #773), so this trailing `idle` is just
-                  // absorbed. We must NOT settle `activeTurn` here in that case:
-                  // `idle` carries no turn identity, and it can lag (the SDK
-                  // flushes held-back results / drains background agents first),
-                  // so by the time it arrives the SDK may have echoed the NEXT
-                  // turn and activated it — settling now would resolve that new
-                  // turn prematurely with end_turn and ~zero usage, dropping its
-                  // real result. Only a cancelled turn relies on `idle`: its
-                  // `result` is dropped at the `session.cancelled` guard, so it
-                  // never settles at a result and must settle here.
-                  if (session.cancelled) {
+                  // A non-cancelled turn normally settled at its terminal
+                  // `result` already (issue #773), and that result recorded an
+                  // owed trailing idle — absorbed here via the decrement. We
+                  // must NOT settle `activeTurn` on an owed idle: `idle`
+                  // carries no turn identity, and it can lag (the SDK flushes
+                  // held-back results / drains background agents first), so by
+                  // the time it arrives the SDK may have echoed the NEXT turn
+                  // and activated it — settling now would resolve that new
+                  // turn prematurely with end_turn and ~zero usage, dropping
+                  // its real result. A cancelled turn relies on `idle`: its
+                  // `result` is dropped at the `session.cancelled` guard, so
+                  // it never settles at a result and must settle here.
+                  //
+                  // An idle that is NOT owed while the active turn is still
+                  // unsettled is the issue #825 signature: `idle` is the SDK's
+                  // authoritative turn-over signal (it fires after held-back
+                  // results flush and background agents drain), so a turn that
+                  // reaches it without a result will never get one — the model
+                  // stream dropped mid-turn, or an async agent
+                  // completed/stalled without the host turn resolving. Fail
+                  // the turn NOW so its session/prompt gets a terminal
+                  // response, instead of leaving it hanging until the next
+                  // prompt drains the wreckage.
+                  if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
                     settleActive({ stopReason: "cancelled" });
+                  } else if (owedTrailingIdles > 0) {
+                    // Absorb a settled turn's trailing idle. Also covers a
+                    // cancel that landed between a turn's counted result and
+                    // this lagged idle (no active turn to settle): the idle
+                    // still belongs to that settled turn, and skipping the
+                    // decrement would leak the debt permanently.
+                    owedTrailingIdles--;
+                  } else if (
+                    !session.cancelled &&
+                    session.activeTurn &&
+                    !session.activeTurn.settled
+                  ) {
+                    // Deliberately only the ACTIVE turn: a queued turn that
+                    // was never echoed is NOT failed here, because an idle
+                    // can legitimately precede the SDK picking up freshly
+                    // pushed input (the idle was emitted before the SDK read
+                    // it) — failing the queue head on that race would reject
+                    // a prompt the SDK is about to run. A turn abandoned
+                    // before its echo therefore still hangs until cancel or
+                    // the next prompt; only a timer could tell those apart.
+                    this.logger.error(
+                      `Session ${params.sessionId}: SDK went idle without emitting a result ` +
+                        `for the active turn; failing the in-flight prompt (issue #825)`,
+                    );
+                    failActive(
+                      RequestError.internalError(
+                        errorKindData("no_result"),
+                        TURN_NO_RESULT_MESSAGE,
+                      ),
+                    );
                   }
                   // The SDK generates the session title in a background task and
                   // persists it to the session file; `idle` is the turn-over
@@ -1708,6 +1796,24 @@ export class ClaudeAcpAgent {
             // accumulator — promoting after would discard this result's tokens.
             if (!isTaskNotification) {
               ensureActiveTurn();
+            }
+
+            // Every user-turn result terminates a turn (settle, reject, or
+            // orphan skip) and the SDK follows it with a trailing
+            // `session_state_changed: idle` — record the debt so the idle
+            // handler absorbs that idle rather than reading it as a turn the
+            // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
+            // turn's own result. It is dropped at the `session.cancelled`
+            // guard, and either the idle itself settles the turn (consuming
+            // the trailer) or the next echo's hand-off does (which records
+            // the debt there instead) — counting here too would double it.
+            // Results skipped while cancelled with NO active turn — orphaned
+            // queued turns the SDK still ran, or a force-cancelled turn's
+            // late result after the backstop settled it — get no such settle,
+            // so their trailers must be counted here or they'd later be read
+            // as the next healthy turn being abandoned and false-fail it.
+            if (!isTaskNotification && (!session.cancelled || !session.activeTurn)) {
+              owedTrailingIdles++;
             }
 
             // Accumulate usage into the user turn's tally. Skip task-notification
@@ -2026,11 +2132,17 @@ export class ClaudeAcpAgent {
                     // "cancelled" per the ACP contract rather than "end_turn" —
                     // otherwise a cancel followed quickly by the next prompt
                     // would report the cancelled turn as a normal completion.
-                    settleActive(
-                      session.cancelled
-                        ? { stopReason: "cancelled" }
-                        : { stopReason: "end_turn", usage: sessionUsage(session) },
-                    );
+                    if (session.cancelled) {
+                      // The cancelled turn settles here, but the trailing idle
+                      // its interrupt produces is still in flight — record the
+                      // debt so that lagged idle is absorbed rather than read
+                      // as the freshly-activated turn ending without a result
+                      // (which would false-fail a healthy turn — issue #825).
+                      owedTrailingIdles++;
+                      settleActive({ stopReason: "cancelled" });
+                    } else {
+                      settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
+                    }
                   }
                   activateTurn(queued);
                 }
@@ -3842,19 +3954,24 @@ function totalTokens(usage: UsageSnapshot): number {
   );
 }
 
+/** Error kinds this adapter invents itself, alongside the SDK's categorical
+ *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
+ *  over without ever emitting its result (issue #825). */
+type AgentErrorKind = SDKAssistantMessageError | "no_result";
+
 /**
  * Build the `data` payload attached to a `RequestError.internalError` when we
- * have a categorical error from the Claude SDK. Returns `undefined` when no
- * categorical error is available, matching the previous behavior of passing
- * `undefined` to `RequestError.internalError`.
+ * have a categorical error — from the Claude SDK, or one of the adapter's own
+ * kinds. Returns `undefined` when no categorical error is available, matching
+ * the previous behavior of passing `undefined` to `RequestError.internalError`.
  *
  * The `errorKind` field is a convention for ACP clients to dispatch on
  * without having to pattern-match the human-readable message text. Clients
  * that don't understand it fall back to the existing message-based rendering.
  */
 function errorKindData(
-  errorKind: SDKAssistantMessageError | undefined,
-): { errorKind: SDKAssistantMessageError } | undefined {
+  errorKind: AgentErrorKind | undefined,
+): { errorKind: AgentErrorKind } | undefined {
   return errorKind ? { errorKind } : undefined;
 }
 
