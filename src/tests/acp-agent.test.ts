@@ -2732,6 +2732,227 @@ describe("stop reason propagation", () => {
   });
 });
 
+describe("model refusal fallback handling", () => {
+  /** Session overrides with a populated model picker: Fable selected,
+   *  Opus available as the refusal-fallback target. */
+  const modelStateOverrides = {
+    models: {
+      currentModelId: "claude-fable-5",
+      availableModels: [
+        { modelId: "claude-fable-5", name: "Claude Fable 5" },
+        { modelId: "claude-opus-4-8", name: "Claude Opus 4.8" },
+      ],
+    },
+    modelInfos: [
+      { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
+      { value: "claude-opus-4-8", displayName: "Claude Opus 4.8", description: "" },
+    ],
+  };
+
+  function refusalFallbackMessage(overrides: Record<string, unknown> = {}) {
+    return {
+      type: "system",
+      subtype: "model_refusal_fallback",
+      trigger: "refusal",
+      direction: "retry",
+      original_model: "claude-fable-5",
+      fallback_model: "claude-opus-4-8",
+      request_id: "req_1",
+      api_refusal_category: "cyber",
+      content: "banner",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...overrides,
+    };
+  }
+
+  function successResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** Replays the prompt's user echo (so the turn activates), then the given
+   *  messages, then settles the turn. */
+  function makeGenerator(messages: unknown[]) {
+    return async function* (input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages as any;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    };
+  }
+
+  function createCapturingAgent() {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    return { agent, sessionUpdate };
+  }
+
+  it("notifies the user and reconciles model state on model_refusal_fallback", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([refusalFallbackMessage(), successResult()]),
+      modelStateOverrides,
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    const session = agent.sessions["test-session"];
+    // The swap is persistent — our bookkeeping must follow it.
+    expect(session.models.currentModelId).toBe("claude-opus-4-8");
+    // The SDK made the switch itself; a setModel round-trip would be wrong.
+    expect(session.query.setModel).not.toHaveBeenCalled();
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find(
+      (u) => u.sessionUpdate === "agent_message_chunk" && u.content.text.includes("Model fallback"),
+    );
+    expect(notice).toBeDefined();
+    expect(notice.content.text).toContain("claude-fable-5");
+    expect(notice.content.text).toContain("claude-opus-4-8");
+    expect(notice.content.text).toContain("(cyber)");
+
+    const configUpdate = updates.find((u) => u.sessionUpdate === "config_option_update");
+    expect(configUpdate).toBeDefined();
+    const modelOption = configUpdate.configOptions.find((o: { id: string }) => o.id === "model");
+    expect(modelOption.currentValue).toBe("claude-opus-4-8");
+  });
+
+  it("includes the refusal explanation in the fallback notice when present", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({
+          api_refusal_explanation: "This request tripped a safety classifier.",
+        }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find(
+      (u) => u.sessionUpdate === "agent_message_chunk" && u.content.text.includes("Model fallback"),
+    );
+    expect(notice.content.text).toContain("This request tripped a safety classifier.");
+  });
+
+  it("tracks the raw model id when the fallback model is not among the options", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ fallback_model: "claude-mystery-9" }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const session = agent.sessions["test-session"];
+    // Not resolvable to an option — keep the truthful raw id anyway so
+    // model-dependent bookkeeping doesn't keep advertising the refused model.
+    expect(session.models.currentModelId).toBe("claude-mystery-9");
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(true);
+  });
+
+  it("skips the config update when the fallback equals the tracked model", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ fallback_model: "claude-fable-5" }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    // Notice still shown, but no state churn.
+    expect(updates.some((u) => u.sessionUpdate === "agent_message_chunk")).toBe(true);
+    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
+  });
+
+  it("surfaces the structured explanation when a refusal has no fallback", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          original_model: "claude-fable-5",
+          request_id: "req_1",
+          api_refusal_category: "cyber",
+          api_refusal_explanation: "Declined by safety classifiers.",
+          content: "banner",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        { ...successResult(), stop_reason: "refusal" },
+      ]),
+      modelStateOverrides,
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("refusal");
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const chunk = updates.find((u) => u.sessionUpdate === "agent_message_chunk");
+    expect(chunk.content.text).toBe("Declined by safety classifiers.");
+    // No model reconciliation on the no-fallback path.
+    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
+  });
+});
+
 describe("logout", () => {
   function createMockAgent() {
     const mockClient = {

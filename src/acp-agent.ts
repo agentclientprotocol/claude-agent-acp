@@ -1613,9 +1613,48 @@ export class ClaudeAcpAgent {
               case "notification":
               case "api_retry":
               case "thinking_tokens":
-              case "model_refusal_fallback":
-              case "model_refusal_no_fallback":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                break;
+              case "model_refusal_fallback": {
+                // The SDK retried a refused turn on the fallback model and made
+                // the swap persistent for the session. Without a notice the
+                // user just sees regenerated output; without the state sync the
+                // client's model picker (and the model-dependent options
+                // rebuilt from it) keeps advertising a model the session is no
+                // longer running.
+                const category = message.api_refusal_category
+                  ? ` (${message.api_refusal_category})`
+                  : "";
+                const explanation = message.api_refusal_explanation
+                  ? `\n\n${message.api_refusal_explanation}`
+                  : "";
+                await this.client.sessionUpdate({
+                  sessionId: message.session_id,
+                  update: {
+                    sessionUpdate: "agent_message_chunk",
+                    content: {
+                      type: "text",
+                      text: `**Model fallback:** ${message.original_model} declined this request${category}; retried with ${message.fallback_model}. The session will continue on ${message.fallback_model}.${explanation}`,
+                    },
+                  },
+                });
+                await this.syncModelAfterRefusalFallback(
+                  params.sessionId,
+                  session,
+                  message.fallback_model,
+                );
+                break;
+              }
+              case "model_refusal_no_fallback":
+                // The refusal ends the turn as an error; the terminal `result`
+                // handler settles it with ACP's `refusal` stop reason and
+                // streams `lastRefusalExplanation`. The assistant frame's
+                // stop_details is the primary source for that explanation —
+                // this structured banner is the backup source when the frame
+                // carried none (older CLIs, gateways that drop stop_details).
+                if (!lastRefusalExplanation) {
+                  lastRefusalExplanation = message.api_refusal_explanation ?? message.content;
+                }
                 break;
               default:
                 unreachable(message, this.logger);
@@ -3055,6 +3094,37 @@ export class ClaudeAcpAgent {
         });
       }
     }
+  }
+
+  /** Reconcile adapter model state after the SDK persistently swapped the
+   *  session's model out from under us (refusal fallback). The SDK already
+   *  made the switch, so this must NOT call `query.setModel` — it only
+   *  updates our bookkeeping (currentModelId, context window, mode clamping,
+   *  effort/Fast-mode options) via the same `applyConfigOptionValue` path a
+   *  user-driven model change takes, then notifies the client. */
+  private async syncModelAfterRefusalFallback(
+    sessionId: string,
+    session: Session,
+    fallbackModel: string,
+  ): Promise<void> {
+    // Map the SDK-reported model onto one of the session's model options
+    // (handles display names and `resolvedModel` ids). The fallback model may
+    // not be among the options — e.g. excluded by the user's
+    // `availableModels` allowlist — in which case we track the raw id: the
+    // picker shows no selection, but the model-dependent bookkeeping and any
+    // later `setModel` round-trip stay truthful to what the SDK is running.
+    const resolved = resolveModelPreference(session.modelInfos, fallbackModel);
+    const value = resolved?.value ?? fallbackModel;
+    if (session.models.currentModelId === value) return;
+
+    await this.applyConfigOptionValue(sessionId, session, MODEL_CONFIG_ID, value);
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: session.configOptions,
+      },
+    });
   }
 
   /** Replace the Fast mode option in `session.configOptions` so it reflects
