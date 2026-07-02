@@ -613,4 +613,127 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
     });
   });
+
+  describe("refusal fallback dialog", () => {
+    it("declares the dialog kind and callback when the client supports form elicitation", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.supportedDialogKinds).toEqual(["refusal_fallback_prompt"]);
+      expect(typeof capturedOptions!.onUserDialog).toBe("function");
+    });
+
+    it("omits the dialog wiring without form elicitation support (url-only included)", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      // The CLI fails closed on the undeclared kind, so the flow degrades to
+      // the classic refusal error instead of parking a dialog we can't render.
+      expect(capturedOptions!.supportedDialogKinds).toBeUndefined();
+      expect(capturedOptions!.onUserDialog).toBeUndefined();
+    });
+
+    /** Wire the session up with form support and return the captured dialog
+     *  callback plus a mock the test can point the elicitation response at. */
+    async function setupDialog() {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { form: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const createElicitation = vi.fn();
+      (
+        agent as unknown as { client: { unstable_createElicitation: unknown } }
+      ).client.unstable_createElicitation = createElicitation;
+      return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
+    }
+
+    const signal = () => ({ signal: new AbortController().signal });
+
+    it("renders the prompt as a form elicitation and maps the retry choice", async () => {
+      const { onUserDialog, createElicitation } = await setupDialog();
+      createElicitation.mockResolvedValue({
+        action: "accept",
+        content: { choice: "retry_fallback" },
+      });
+
+      const result = await onUserDialog(
+        {
+          dialogKind: "refusal_fallback_prompt",
+          payload: {
+            originalModel: "claude-fable-5",
+            fallbackModel: "claude-opus-4-8",
+            apiRefusalCategory: "cyber",
+          },
+        },
+        signal(),
+      );
+
+      expect(result).toEqual({ behavior: "completed", result: "retry_fallback" });
+      const request = createElicitation.mock.calls[0][0];
+      expect(request.mode).toBe("form");
+      expect(request.message).toContain("claude-fable-5");
+      expect(request.message).toContain("claude-opus-4-8");
+    });
+
+    it("completes with cancelled when the user keeps the refusal", async () => {
+      const { onUserDialog, createElicitation } = await setupDialog();
+      createElicitation.mockResolvedValue({ action: "cancel" });
+
+      const result = await onUserDialog(
+        {
+          dialogKind: "refusal_fallback_prompt",
+          payload: { originalModel: "a", fallbackModel: "b" },
+        },
+        signal(),
+      );
+
+      expect(result).toEqual({ behavior: "completed", result: "cancelled" });
+    });
+
+    it("cancels unrecognized dialog kinds without presenting anything", async () => {
+      const { onUserDialog, createElicitation } = await setupDialog();
+
+      const result = await onUserDialog(
+        { dialogKind: "some_future_dialog", payload: {} },
+        signal(),
+      );
+
+      expect(result).toEqual({ behavior: "cancelled" });
+      expect(createElicitation).not.toHaveBeenCalled();
+    });
+
+    it("cancels on a malformed payload without presenting anything", async () => {
+      const { onUserDialog, createElicitation } = await setupDialog();
+
+      const result = await onUserDialog(
+        { dialogKind: "refusal_fallback_prompt", payload: { fallbackModel: 42 } },
+        signal(),
+      );
+
+      expect(result).toEqual({ behavior: "cancelled" });
+      expect(createElicitation).not.toHaveBeenCalled();
+    });
+
+    it("cancels when the elicitation request fails", async () => {
+      const { onUserDialog, createElicitation } = await setupDialog();
+      createElicitation.mockRejectedValue(new Error("client exploded"));
+
+      const result = await onUserDialog(
+        {
+          dialogKind: "refusal_fallback_prompt",
+          payload: { originalModel: "a", fallbackModel: "b" },
+        },
+        signal(),
+      );
+
+      expect(result).toEqual({ behavior: "cancelled" });
+    });
+  });
 });

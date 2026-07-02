@@ -59,6 +59,7 @@ import {
   ModelInfo,
   ModelUsage,
   OnElicitation,
+  OnUserDialog,
   Options,
   PermissionMode,
   PermissionResult,
@@ -90,7 +91,11 @@ import {
   createElicitationResponseToElicitResult,
   ElicitationSupport,
   extractAskUserQuestions,
+  extractRefusalFallbackPrompt,
   mcpElicitationToCreateRequest,
+  REFUSAL_FALLBACK_DIALOG_KIND,
+  refusalFallbackResultFromResponse,
+  refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { SettingsManager } from "./settings.js";
 import {
@@ -1622,27 +1627,39 @@ export class ClaudeAcpAgent {
                 // client's model picker (and the model-dependent options
                 // rebuilt from it) keeps advertising a model the session is no
                 // longer running.
+                //
+                // Current CLIs only emit direction "retry" (persistent swap).
+                // "revert"/"sticky" are retained in the SDK enum for older
+                // CLIs, where "revert" marked a turn-only fallback — for that
+                // direction the session stays on the original model, so skip
+                // the persistent-swap claim and the state sync.
+                const persistent = message.direction !== "revert";
                 const category = message.api_refusal_category
                   ? ` (${message.api_refusal_category})`
                   : "";
                 const explanation = message.api_refusal_explanation
                   ? `\n\n${message.api_refusal_explanation}`
                   : "";
+                const outcome = persistent
+                  ? `The session will continue on ${message.fallback_model}.`
+                  : `The session stays on ${message.original_model}.`;
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: {
                       type: "text",
-                      text: `**Model fallback:** ${message.original_model} declined this request${category}; retried with ${message.fallback_model}. The session will continue on ${message.fallback_model}.${explanation}`,
+                      text: `**Model fallback:** ${message.original_model} declined this request${category}; retried with ${message.fallback_model}. ${outcome}${explanation}`,
                     },
                   },
                 });
-                await this.syncModelAfterRefusalFallback(
-                  params.sessionId,
-                  session,
-                  message.fallback_model,
-                );
+                if (persistent) {
+                  await this.syncModelAfterRefusalFallback(
+                    params.sessionId,
+                    session,
+                    message.fallback_model,
+                  );
+                }
                 break;
               }
               case "model_refusal_no_fallback":
@@ -1652,7 +1669,15 @@ export class ClaudeAcpAgent {
                 // stop_details is the primary source for that explanation —
                 // this structured banner is the backup source when the frame
                 // carried none (older CLIs, gateways that drop stop_details).
-                if (!lastRefusalExplanation) {
+                //
+                // `refused_user_message_uuid` is explicitly null when the
+                // refused turn was not human-authored (a background
+                // task-notification followup or auto-continuation) — don't
+                // let those pollute the user turn's explanation. `undefined`
+                // (older CLIs that omit the field) can't be attributed either
+                // way, so keep seeding — the same exposure the assistant-frame
+                // capture already has.
+                if (!lastRefusalExplanation && message.refused_user_message_uuid !== null) {
                   lastRefusalExplanation = message.api_refusal_explanation ?? message.content;
                 }
                 break;
@@ -2035,7 +2060,13 @@ export class ClaudeAcpAgent {
                 lastAssistantError = message.error;
               }
               if (message.message.stop_reason === "refusal") {
-                lastRefusalExplanation = message.message.stop_details?.explanation ?? null;
+                // Keep any explanation already seeded by a
+                // `model_refusal_no_fallback` banner — the banner/frame
+                // ordering is CLI-dependent, and a frame whose stop_details
+                // was dropped (the case the banner backup exists for) must
+                // not clobber the seed back to null.
+                lastRefusalExplanation =
+                  message.message.stop_details?.explanation ?? lastRefusalExplanation;
               }
             }
 
@@ -2933,6 +2964,49 @@ export class ClaudeAcpAgent {
     return { behavior: "allow", updatedInput: outcome.updatedInput };
   }
 
+  /**
+   * Handle `request_user_dialog` control requests — blocking dialogs the CLI
+   * asks the host to render. Only kinds declared in `supportedDialogKinds`
+   * are ever emitted; everything unexpected is answered `cancelled` (the
+   * required answer for unrecognized kinds), which applies the dialog's
+   * default behavior CLI-side. Today the only declared kind is the
+   * refusal-fallback consent prompt, rendered as an ACP form elicitation.
+   */
+  private handleUserDialog(sessionId: string): OnUserDialog {
+    return async (request, { signal }) => {
+      if (request.dialogKind !== REFUSAL_FALLBACK_DIALOG_KIND) {
+        return { behavior: "cancelled" };
+      }
+      const prompt = extractRefusalFallbackPrompt(request.payload);
+      if (!prompt) {
+        this.logger.error(
+          `refusal_fallback_prompt payload had an unexpected shape; cancelling the dialog: ${JSON.stringify(request.payload)}`,
+        );
+        return { behavior: "cancelled" };
+      }
+      let response: CreateElicitationResponse;
+      try {
+        response = await this.client.unstable_createElicitation(
+          refusalFallbackToCreateRequest(prompt, sessionId),
+          signal,
+        );
+      } catch (error) {
+        // A cancellation we requested (signal aborted) is expected teardown;
+        // anything else is a client failure. Either way the safe answer is
+        // `cancelled` — the CLI applies the dialog's default (keep the
+        // refusal) rather than switching models without consent.
+        if (!signal.aborted) {
+          this.logger.error(`Failed to present refusal fallback elicitation: ${error}`);
+        }
+        return { behavior: "cancelled" };
+      }
+      if (signal.aborted) {
+        return { behavior: "cancelled" };
+      }
+      return { behavior: "completed", result: refusalFallbackResultFromResponse(response) };
+    };
+  }
+
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
@@ -2997,8 +3071,16 @@ export class ClaudeAcpAgent {
       session.models = { ...session.models, currentModelId: value };
 
       // Recompute availableModes for the new model and clamp the current
-      // mode if the SDK no longer offers it (today: "auto" on Haiku).
-      const newAvailableModes = buildAvailableModes(newModelInfo);
+      // mode if the SDK no longer offers it (today: "auto" on Haiku). An
+      // unknown model (an SDK-initiated refusal fallback to a model outside
+      // the user's `availableModels` allowlist — user-driven switches are
+      // validated against the options first) tells us nothing about its
+      // capabilities, so keep the current modes rather than spuriously
+      // downgrading (e.g. kicking the user out of "auto" for a model that
+      // does support it).
+      const newAvailableModes = newModelInfo
+        ? buildAvailableModes(newModelInfo)
+        : session.modes.availableModes;
       // Capture BEFORE mutating session.modes so the log message reflects
       // the invalidated mode rather than "default".
       const previousModeId = session.modes.currentModeId;
@@ -3117,14 +3199,20 @@ export class ClaudeAcpAgent {
     const value = resolved?.value ?? fallbackModel;
     if (session.models.currentModelId === value) return;
 
-    await this.applyConfigOptionValue(sessionId, session, MODEL_CONFIG_ID, value);
-    await this.client.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "config_option_update",
-        configOptions: session.configOptions,
-      },
-    });
+    try {
+      await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, value);
+    } catch (err) {
+      // This runs on the consumer loop: a throw here tears down the query
+      // stream (failAllTurns + closeQueryStream) and bricks the session —
+      // far worse than stale bookkeeping. The user-driven RPC path lets the
+      // same errors propagate to fail just that request; here we log and
+      // move on, matching the setPermissionMode containment inside
+      // applyConfigOptionValue.
+      this.logger.error(
+        `Failed to reconcile model state after refusal fallback to "${fallbackModel}":`,
+        err,
+      );
+    }
   }
 
   /** Replace the Fast mode option in `session.configOptions` so it reflects
@@ -3426,6 +3514,18 @@ export class ClaudeAcpAgent {
       // canUseTool, not here.)
       ...(elicitationSupport.form || elicitationSupport.url
         ? { onElicitation: this.handleMcpElicitation(sessionId, elicitationSupport) }
+        : {}),
+      // Render the CLI's refusal-fallback consent prompt ("<model> declined —
+      // retry with <fallback>?") as an ACP form elicitation. Declaring the
+      // kind is the opt-in: the CLI never emits an undeclared dialog, and the
+      // flow instead degrades to the classic refusal error ending the turn.
+      // Gated on form elicitation since that's the only ACP surface that can
+      // present a choice outside a tool call.
+      ...(elicitationSupport.form
+        ? {
+            onUserDialog: this.handleUserDialog(sessionId),
+            supportedDialogKinds: [REFUSAL_FALLBACK_DIALOG_KIND],
+          }
         : {}),
       pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()),
       extraArgs: {

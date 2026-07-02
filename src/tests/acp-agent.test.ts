@@ -2734,7 +2734,9 @@ describe("stop reason propagation", () => {
 
 describe("model refusal fallback handling", () => {
   /** Session overrides with a populated model picker: Fable selected,
-   *  Opus available as the refusal-fallback target. */
+   *  Opus available as the refusal-fallback target. `modes` mirrors a real
+   *  session (never empty), so the mode-clamp logic in applyConfigOptionValue
+   *  sees realistic state. */
   const modelStateOverrides = {
     models: {
       currentModelId: "claude-fable-5",
@@ -2747,6 +2749,13 @@ describe("model refusal fallback handling", () => {
       { value: "claude-fable-5", displayName: "Claude Fable 5", description: "" },
       { value: "claude-opus-4-8", displayName: "Claude Opus 4.8", description: "" },
     ],
+    modes: {
+      currentModeId: "default",
+      availableModes: [
+        { id: "auto", name: "Auto", description: "" },
+        { id: "default", name: "Default", description: "" },
+      ],
+    },
   };
 
   function refusalFallbackMessage(overrides: Record<string, unknown> = {}) {
@@ -2950,6 +2959,148 @@ describe("model refusal fallback handling", () => {
     expect(chunk.content.text).toBe("Declined by safety classifiers.");
     // No model reconciliation on the no-fallback path.
     expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
+  });
+
+  it("does not persist the swap for a turn-only fallback (direction revert)", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([refusalFallbackMessage({ direction: "revert" }), successResult()]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const session = agent.sessions["test-session"];
+    // Older-CLI "revert" means the session stays on the original model.
+    expect(session.models.currentModelId).toBe("claude-fable-5");
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find(
+      (u) => u.sessionUpdate === "agent_message_chunk" && u.content.text.includes("Model fallback"),
+    );
+    expect(notice.content.text).toContain("stays on claude-fable-5");
+    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
+  });
+
+  it("keeps the current permission modes when the fallback model is unknown", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ fallback_model: "claude-mystery-9" }),
+        successResult(),
+      ]),
+      {
+        ...modelStateOverrides,
+        // Session is running in auto mode; the unknown fallback model's
+        // capabilities are unknowable, so the mode must NOT be clamped.
+        modes: {
+          currentModeId: "auto",
+          availableModes: [
+            { id: "auto", name: "Auto", description: "" },
+            { id: "default", name: "Default", description: "" },
+          ],
+        },
+      },
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const session = agent.sessions["test-session"];
+    expect(session.models.currentModelId).toBe("claude-mystery-9");
+    expect(session.modes.currentModeId).toBe("auto");
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    expect(updates.some((u) => u.sessionUpdate === "current_mode_update")).toBe(false);
+  });
+
+  it("keeps the banner explanation when the refusal frame arrives after it without stop_details", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          original_model: "claude-fable-5",
+          request_id: "req_1",
+          api_refusal_explanation: "Declined by safety classifiers.",
+          content: "banner",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // The consolidated refusal frame from a gateway that dropped
+        // stop_details — it must not clobber the banner's explanation.
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            model: "claude-fable-5",
+            stop_reason: "refusal",
+            content: [],
+            usage: {
+              input_tokens: 10,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        },
+        { ...successResult(), stop_reason: "refusal" },
+      ]),
+      modelStateOverrides,
+    );
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("refusal");
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const chunk = updates.find(
+      (u) =>
+        u.sessionUpdate === "agent_message_chunk" &&
+        u.content.text === "Declined by safety classifiers.",
+    );
+    expect(chunk).toBeDefined();
+  });
+
+  it("ignores a non-human-authored refusal banner (refused_user_message_uuid null)", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          original_model: "claude-fable-5",
+          request_id: "req_1",
+          api_refusal_explanation: "Background task declined.",
+          refused_user_message_uuid: null,
+          content: "banner",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        { ...successResult(), stop_reason: "refusal" },
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    // The background followup's explanation must not be attributed to the
+    // user's turn.
+    expect(
+      updates.some(
+        (u) =>
+          u.sessionUpdate === "agent_message_chunk" &&
+          u.content.text.includes("Background task declined."),
+      ),
+    ).toBe(false);
   });
 });
 

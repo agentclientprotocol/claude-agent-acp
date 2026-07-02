@@ -298,3 +298,108 @@ function normalizeElicitationSchema(
   }
   return { ...(schema as ElicitationSchema), type: "object" };
 }
+
+/**
+ * The `request_user_dialog` kind the CLI emits when a model refusal has a
+ * fallback available but needs user consent before retrying (e.g. Claude Fable
+ * declining a request with Opus available as the fallback). Declaring this
+ * kind in `supportedDialogKinds` is the opt-in: the CLI fails closed and never
+ * emits an undeclared kind — the flow degrades to the classic refusal error
+ * ending the turn.
+ */
+export const REFUSAL_FALLBACK_DIALOG_KIND = "refusal_fallback_prompt";
+
+/**
+ * Payload of the `refusal_fallback_prompt` dialog. The dialog protocol
+ * transports payloads opaquely, so this shape is recovered from the CLI's own
+ * schema (v2.1.177): `originalModel`/`fallbackModel` are required strings;
+ * `apiRefusalCategory` (nullable), `guidanceText`, and
+ * `retractedMessageUuids` are optional. We ignore `retractedMessageUuids` —
+ * ACP has no way to retract already-streamed chunks.
+ */
+export type RefusalFallbackPrompt = {
+  originalModel: string;
+  fallbackModel: string;
+  apiRefusalCategory: string | null;
+  guidanceText?: string;
+};
+
+/**
+ * Validate the opaque dialog payload into a {@link RefusalFallbackPrompt}.
+ * Returns `null` when the required fields are missing or mistyped (a newer CLI
+ * may reshape the payload), so the caller can cancel the dialog and let the
+ * CLI apply its default behavior instead of rendering something misleading.
+ */
+export function extractRefusalFallbackPrompt(
+  payload: Record<string, unknown>,
+): RefusalFallbackPrompt | null {
+  const { originalModel, fallbackModel, apiRefusalCategory, guidanceText } = payload;
+  if (typeof originalModel !== "string" || typeof fallbackModel !== "string") {
+    return null;
+  }
+  return {
+    originalModel,
+    fallbackModel,
+    apiRefusalCategory: typeof apiRefusalCategory === "string" ? apiRefusalCategory : null,
+    ...(typeof guidanceText === "string" && guidanceText ? { guidanceText } : {}),
+  };
+}
+
+/** Form-field key carrying the user's choice in the refusal-fallback form. */
+const REFUSAL_FALLBACK_CHOICE_KEY = "choice";
+
+/** Wire values of the dialog's result enum (CLI schema). `edit_prompt` is
+ *  deliberately not offered: in the CLI it prefills the composer with the
+ *  refused prompt for edit-and-retry, and ACP has no composer-prefill surface
+ *  — the user can simply edit and resend on their own. */
+const RETRY_FALLBACK_RESULT = "retry_fallback";
+const KEEP_REFUSAL_RESULT = "cancelled";
+
+/**
+ * Render the refusal-fallback consent prompt as an ACP form elicitation: a
+ * single-select between retrying on the fallback model and keeping the
+ * refusal. The enum `const`s are the dialog's wire result values, so the
+ * response maps back without a translation table.
+ */
+export function refusalFallbackToCreateRequest(
+  prompt: RefusalFallbackPrompt,
+  sessionId: string,
+): CreateElicitationRequest {
+  const category = prompt.apiRefusalCategory ? ` (${prompt.apiRefusalCategory})` : "";
+  const guidance = prompt.guidanceText ? `\n\n${prompt.guidanceText}` : "";
+  return {
+    mode: "form",
+    sessionId,
+    message:
+      `${prompt.originalModel} declined this request${category}. ` +
+      `Retry with ${prompt.fallbackModel}? The session would continue on ${prompt.fallbackModel}.` +
+      guidance,
+    requestedSchema: {
+      type: "object",
+      properties: {
+        [REFUSAL_FALLBACK_CHOICE_KEY]: {
+          type: "string",
+          oneOf: [
+            { const: RETRY_FALLBACK_RESULT, title: `Retry with ${prompt.fallbackModel}` },
+            { const: KEEP_REFUSAL_RESULT, title: "Keep the refusal" },
+          ],
+        },
+      },
+    },
+  };
+}
+
+/**
+ * Map the elicitation response back to the dialog's result enum. Only an
+ * explicit accept-with-retry resolves to `retry_fallback`; decline, cancel, a
+ * skipped field, or an unrecognized value all keep the refusal — the dialog's
+ * own default — so a dismissed or half-filled form can never trigger a model
+ * switch the user didn't ask for.
+ */
+export function refusalFallbackResultFromResponse(response: CreateElicitationResponse): string {
+  if (response.action !== "accept") {
+    return KEEP_REFUSAL_RESULT;
+  }
+  const choice = response.content?.[REFUSAL_FALLBACK_CHOICE_KEY];
+  return choice === RETRY_FALLBACK_RESULT ? RETRY_FALLBACK_RESULT : KEEP_REFUSAL_RESULT;
+}
