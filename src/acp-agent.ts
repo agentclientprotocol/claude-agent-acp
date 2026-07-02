@@ -2375,9 +2375,16 @@ export class ClaudeAcpAgent {
             }
             break;
           }
+          // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
+          // flows) is safe to drop: turn lifecycle here is driven by
+          // results/idle, and the client owns its own transcript view.
+          // `control_request_progress` only reports on side_question control
+          // requests, which this adapter never issues.
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
+          case "conversation_reset":
+          case "control_request_progress":
             break;
           default:
             unreachable(message);
