@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.55.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.54.1...v0.55.0) (2026-07-02)
+
+
+### Features
+
+* Add refusal fallback consent dialog support ([#834](https://github.com/agentclientprotocol/claude-agent-acp/issues/834)) ([15dfd83](https://github.com/agentclientprotocol/claude-agent-acp/commit/15dfd83daa84ced98ecbaa7c83fd5a53124030c1))
+* **deps-dev:** bump the minor group with 3 updates ([#831](https://github.com/agentclientprotocol/claude-agent-acp/issues/831)) ([8d5febf](https://github.com/agentclientprotocol/claude-agent-acp/commit/8d5febf85485c1ad19b81501fb5c6d4275448a7c))
+* Update to claude-agent-sdk 0.3.198 ([#836](https://github.com/agentclientprotocol/claude-agent-acp/issues/836)) ([307ab82](https://github.com/agentclientprotocol/claude-agent-acp/commit/307ab82712213413446466d808e161073e94fc7f))
+
+
+### Bug Fixes
+
+* Handle model refusal fallback updates ([#833](https://github.com/agentclientprotocol/claude-agent-acp/issues/833)) ([648e3f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/648e3f60bd7e6eadb5f86b0dc475104ab12e7b02))
+* Handle SDK idle turns without results ([#835](https://github.com/agentclientprotocol/claude-agent-acp/issues/835)) ([57b00cc](https://github.com/agentclientprotocol/claude-agent-acp/commit/57b00ccac610e2eeaf0a753934a0c3b78d27ccb0))
+
 ## [0.54.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.54.0...v0.54.1) (2026-06-30)
 
 
