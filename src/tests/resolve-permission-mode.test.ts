@@ -29,6 +29,13 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("bypass")).toBe("bypassPermissions");
   });
 
+  it("resolves 'manual' as an alias for 'default'", () => {
+    const { logger, error } = mockLogger();
+    expect(resolvePermissionMode("manual", logger)).toBe("default");
+    expect(resolvePermissionMode("Manual", logger)).toBe("default");
+    expect(error).not.toHaveBeenCalled();
+  });
+
   it("trims whitespace", () => {
     expect(resolvePermissionMode("  dontAsk  ")).toBe("dontAsk");
   });

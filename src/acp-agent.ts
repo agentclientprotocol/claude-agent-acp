@@ -578,6 +578,9 @@ export function isLocalCommandMetadata(content: unknown): boolean {
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
+  // Claude Code 2.1.200 renamed the "default" mode to "Manual" and accepts
+  // `"defaultMode": "manual"` in settings.json; honor the same alias here.
+  manual: "default",
   acceptedits: "acceptEdits",
   dontask: "dontAsk",
   plan: "plan",
@@ -4047,8 +4050,10 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
 
   modes.push(
     {
+      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
+      // the wire id stays "default" ("manual" is only an accepted input alias).
       id: "default",
-      name: "Default",
+      name: "Manual",
       description: "Standard behavior, prompts for dangerous operations",
     },
     {
