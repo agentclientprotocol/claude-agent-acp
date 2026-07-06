@@ -2153,3 +2153,55 @@ describe("createTaskHook", () => {
     expect(changes).toBe(0);
   });
 });
+
+describe("empty message content is not emitted", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("drops an empty string content instead of emitting an empty agent_message_chunk", () => {
+    const notifications = toAcpNotifications(
+      "",
+      "assistant",
+      "test-session",
+      {},
+      mockClient,
+      mockLogger,
+    );
+    expect(notifications).toHaveLength(0);
+  });
+
+  it("still emits non-empty string content", () => {
+    const notifications = toAcpNotifications(
+      "hello",
+      "assistant",
+      "test-session",
+      {},
+      mockClient,
+      mockLogger,
+    );
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "hello" },
+    });
+  });
+
+  it("drops an empty streamed text block but keeps a non-empty one", () => {
+    const notifications = toAcpNotifications(
+      [
+        { type: "text", text: "" },
+        { type: "text", text: "real" },
+      ] as any,
+      "assistant",
+      "test-session",
+      {},
+      mockClient,
+      mockLogger,
+    );
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "real" },
+    });
+  });
+});
