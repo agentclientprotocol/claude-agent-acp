@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.57.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.56.0...v0.57.0) (2026-07-07)
+
+
+### Features
+
+* Update @anthropic-ai/claude-agent-sdk to 0.3.202 ([#843](https://github.com/agentclientprotocol/claude-agent-acp/issues/843)) ([1612c07](https://github.com/agentclientprotocol/claude-agent-acp/commit/1612c078953c134e12368a2d968a9bcf14d31b55))
+
+
+### Bug Fixes
+
+* don't emit empty agent_message_chunk ([#841](https://github.com/agentclientprotocol/claude-agent-acp/issues/841)) ([d74dd1d](https://github.com/agentclientprotocol/claude-agent-acp/commit/d74dd1d9d356050fc87f9fdab8599f1546b12a2c))
+
 ## [0.56.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.55.0...v0.56.0) (2026-07-06)
 
 
