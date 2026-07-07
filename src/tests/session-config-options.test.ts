@@ -819,6 +819,29 @@ describe("session config options", () => {
       expect(setModelSpy).toHaveBeenCalledWith("claude-sonnet-4-6");
     });
 
+    // A session can be running a model with no picker entry (resumed onto a
+    // model excluded by the availableModels allowlist, or a refusal
+    // fallback); its verbatim id is then the option's currentValue. A client
+    // round-tripping that reported value must not get "Invalid value".
+    it("accepts the reported currentValue even when it has no options entry", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.models = { ...session.models, currentModelId: "claude-offlist-9" };
+      session.configOptions = session.configOptions.map((o: { id: string }) =>
+        o.id === "model" ? { ...o, currentValue: "claude-offlist-9" } : o,
+      );
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-offlist-9",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-offlist-9");
+      expect(response.configOptions?.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-offlist-9",
+      );
+    });
+
     it("setSessionMode also syncs configOptions", async () => {
       await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" });
 

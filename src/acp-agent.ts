@@ -2634,6 +2634,17 @@ export class ClaudeAcpAgent {
         : [];
     let validValue = allValues.find((o) => o.value === params.value);
 
+    // The option's reported currentValue is always a valid target, even when
+    // it has no options entry: a session running an out-of-picker model
+    // (resumed onto an allowlist-excluded model, or a refusal fallback)
+    // reports a currentValue that isn't selectable, and a client
+    // round-tripping it must not get "Invalid value". It flows through the
+    // normal apply path below — re-asserting an already-current value is
+    // harmless and can repair SDK drift.
+    if (!validValue && option.currentValue === params.value) {
+      validValue = { value: params.value, name: params.value };
+    }
+
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
@@ -3793,11 +3804,30 @@ export class ClaudeAcpAgent {
       initializationResult.models,
       settingsManager,
       this.logger,
+      creationOpts.resume !== undefined,
     );
 
     // Gate `auto` (and future model-specific modes) on the resolved model's
     // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
-    const currentModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
+    // A resumed session can be running a model outside the `availableModels`
+    // allowlist (currentModelId is then the verbatim live id, see
+    // `matchResumedModel`); its capabilities are still known to the SDK's
+    // unfiltered list, so fall back to that before treating the model as
+    // unknown — otherwise auto mode would be spuriously clamped and the
+    // Fast-mode/Effort options hidden for a model that supports them.
+    const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
+    const fallbackModelInfo = allowlistedModelInfo
+      ? undefined
+      : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+    const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
+    // Register the fallback-resolved capabilities under the verbatim live id
+    // so every modelInfos consumer (buildConfigOptions' effort lookup, later
+    // rebuilds via session.modelInfos) agrees with the gating below. The
+    // picker options themselves come from `models.availableModels`, so this
+    // adds no selectable entry.
+    const modelInfos = fallbackModelInfo
+      ? [...allowedModels, { ...fallbackModelInfo, value: models.currentModelId }]
+      : allowedModels;
     const availableModes = buildAvailableModes(currentModelInfo);
 
     // Clamp `permissionMode` if the resolved session does not offer it. The
@@ -3863,7 +3893,7 @@ export class ClaudeAcpAgent {
     const configOptions = buildConfigOptions(
       modes,
       models,
-      allowedModels,
+      modelInfos,
       settingsManager.getSettings().effortLevel,
       agents,
       currentAgent,
@@ -3896,7 +3926,7 @@ export class ClaudeAcpAgent {
       },
       modes,
       models,
-      modelInfos: allowedModels,
+      modelInfos,
       configOptions,
       agents,
       currentAgent,
@@ -3904,10 +3934,15 @@ export class ClaudeAcpAgent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
+        // A fallback-resolved sibling's displayName/description can describe
+        // a different context lane than the verbatim live id (e.g. an
+        // "opus[1m]" row matched for a bare 200k id), so on that path only
+        // the id itself is a trustworthy window signal.
         inferContextWindowFromModel(
           models.currentModelId,
-          currentModelInfo?.displayName,
-          currentModelInfo?.description,
+          ...(fallbackModelInfo
+            ? []
+            : [currentModelInfo?.displayName, currentModelInfo?.description]),
         ) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
@@ -4325,15 +4360,20 @@ export function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
+/** Remove context-window hints — the display form "[1m]" and the SDK id
+ *  suffix form "-1m" — from a model string. Those digits describe context
+ *  size, not model identity or generation version. */
+function stripContextHints(s: string): string {
+  return s.replace(/\[\d+m\]/gi, "").replace(/-\d+m$/i, "");
+}
+
 // Captures a model family version: `4-6`/`4.7` for dated generations, or a
 // bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
 // `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
 const MODEL_FAMILY_VERSION_PATTERN = /\b(\d+)(?:[-.](\d+))?\b/;
 
 function extractModelFamilyVersion(s: string): string | null {
-  // Strip "[1m]"-style context hints first — that digit is context window
-  // size, not a model generation version.
-  const match = s.replace(/\[\d+m\]/gi, "").match(MODEL_FAMILY_VERSION_PATTERN);
+  const match = stripContextHints(s).match(MODEL_FAMILY_VERSION_PATTERN);
   if (!match) return null;
   return match[2] ? `${match[1]}.${match[2]}` : match[1];
 }
@@ -4435,6 +4475,67 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   return bestMatch;
 }
 
+/** Map the live model reported by a resumed session onto the picker's model
+ *  list. The CLI restores a resumed session's model from the transcript's
+ *  last assistant message, which records the concrete API id (e.g.
+ *  "claude-opus-4-6") with any "[1m]" context hint dropped. Tiers, in order:
+ *  1. Exact match with the Default entry's resolution — when a named alias
+ *     shares Default's resolvedModel verbatim, the live id can't tell the
+ *     two apart, and a never-customized session should stay on Default.
+ *  2. Exact resolvedModel match on a named row. Checked before the
+ *     hint-stripped Default comparison so a live "claude-sonnet-5[1m]" lands
+ *     on the "sonnet[1m]" row rather than a Default that resolves to the
+ *     bare "claude-sonnet-5" — the two rows differ in context window, which
+ *     drives `contextWindowSize` and capability gating downstream.
+ *  3. Hint-stripped match with Default's resolution — a session that never
+ *     left the default resumes as the bare transcript id, and shouldn't show
+ *     a concrete picker entry.
+ *  4. `resolveModelPreference` over the picker entries.
+ *  5. A model with no picker counterpart (e.g. excluded by an
+ *     `availableModels` allowlist) is tracked verbatim, mirroring
+ *     `syncModelAfterRefusalFallback`: the picker shows no selection, but the
+ *     model-dependent bookkeeping stays truthful to what the SDK is running. */
+export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
+  // The SDK spells context hints two ways — the display form "[1m]" and the
+  // id suffix form "-1m" — so the exact tiers compare on one canonical
+  // spelling. The hint itself is kept: bare and 1M ids must stay distinct.
+  const canonical = (s: string) =>
+    s
+      .trim()
+      .toLowerCase()
+      .replace(/-(\d+m)$/i, "[$1]");
+  const live = canonical(liveModel);
+  const defaultEntry = models.find((m) => m.value === "default");
+  const defaultResolved = defaultEntry?.resolvedModel
+    ? canonical(defaultEntry.resolvedModel)
+    : undefined;
+
+  if (defaultEntry && defaultResolved === live) {
+    return defaultEntry;
+  }
+
+  // No default-row exclusion needed: a default row matching `live` exactly
+  // already returned at the tier above.
+  const exactMatch = models.find((m) => m.resolvedModel && canonical(m.resolvedModel) === live);
+  if (exactMatch) return exactMatch;
+
+  if (
+    defaultEntry &&
+    defaultResolved &&
+    stripContextHints(defaultResolved) === stripContextHints(live)
+  ) {
+    return defaultEntry;
+  }
+
+  return (
+    resolveModelPreference(models, liveModel) ?? {
+      value: liveModel,
+      displayName: liveModel,
+      description: "",
+    }
+  );
+}
+
 function resolveSettingsModel(
   models: ModelInfo[],
   settingsModel: unknown,
@@ -4527,12 +4628,32 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
+/** Read the model a resumed session is actually running (via the
+ *  `getContextUsage` control request — the same source `/context` prints) and
+ *  map it onto the picker. Best-effort: a control-request failure is logged
+ *  and returns null so callers keep their current choice; failing the whole
+ *  session/load over an unreadable report would be worse. */
+async function readResumedLiveModel(
+  query: Query,
+  models: ModelInfo[],
+  logger: Logger,
+): Promise<ModelInfo | null> {
+  try {
+    const liveModel = (await query.getContextUsage()).model;
+    return liveModel ? matchResumedModel(models, liveModel) : null;
+  } catch (error) {
+    logger.error("Failed to read the resumed session's live model:", error);
+    return null;
+  }
+}
+
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
   sdkModels: ModelInfo[],
   settingsManager: SettingsManager,
   logger: Logger,
+  isResumedSession: boolean,
 ): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
@@ -4542,7 +4663,8 @@ async function getAvailableModels(
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. models[0] (default first model)
+  // 3. the resumed session's live model (resumed sessions only)
+  // 4. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
@@ -4557,22 +4679,49 @@ async function getAvailableModels(
     }
   }
 
+  // A resumed session restores the model it was previously running (the CLI
+  // re-reads it from the transcript), so without an env/settings override the
+  // freshly-computed default above can disagree with what the session actually
+  // runs — session/load then reports a model the session isn't using (issue
+  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
+  // the SDK is already running this model, and pushing a picker alias back
+  // (e.g. "opus[1m]") could change the live model rather than describe it.
+  if (resolvedFromInput === undefined && isResumedSession) {
+    currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
+  }
+
   // Skip the setModel round-trip when we can prove the SDK has already landed
   // on the same model. Two cases qualify:
-  //  (a) No override applied — currentModel stayed at models[0]; the SDK is on
-  //      its own default and we have nothing to sync.
+  //  (a) No override applied — currentModel is the SDK's own default (or, on
+  //      resume, the live model read back from the SDK above); nothing to sync.
   //  (b) The resolver returned the user's input verbatim AND that value exists
   //      in the SDK's original model list — meaning no fuzzy match or
   //      allowlist rewrite was involved, and the SDK (which reads the same
   //      ANTHROPIC_MODEL / settings.json) will have arrived at the same entry.
+  //      This only holds for fresh sessions: a resumed session lands on the
+  //      transcript's model regardless of env/settings, so the override must
+  //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
   const skipSetModel =
     resolvedFromInput === undefined ||
-    (currentModel.value === resolvedFromInput && sdkSawSameValue);
+    (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
-    await query.setModel(currentModel.value);
+    try {
+      await query.setModel(currentModel.value);
+    } catch (error) {
+      // On a fresh session the pin is a defining option — fail loudly. A
+      // resumed session already runs fine on the transcript's model, so
+      // failing the whole session/load over the re-assert would be worse
+      // than loading with the pin unapplied (mirrors the setPermissionMode
+      // containment in createSession). The SDK then stayed on the
+      // transcript's model, so read that back rather than reporting the
+      // pin the session isn't running.
+      if (!isResumedSession) throw error;
+      logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
+      currentModel = (await readResumedLiveModel(query, models, logger)) ?? currentModel;
+    }
   }
 
   return {

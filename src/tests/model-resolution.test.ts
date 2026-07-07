@@ -2,7 +2,11 @@ import { describe, it, expect } from "vitest";
 import { randomUUID } from "crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
-import { resolveModelPreference, applyAvailableModelsAllowlist } from "../acp-agent.js";
+import {
+  resolveModelPreference,
+  applyAvailableModelsAllowlist,
+  matchResumedModel,
+} from "../acp-agent.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
 // `resolvedModel`, and "Sonnet 5" has no `major.minor` dot unlike older
@@ -67,6 +71,85 @@ describe("resolveModelPreference - resolvedModel matching", () => {
 
   it("returns null for a preference that matches nothing", () => {
     expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
+  });
+});
+
+describe("matchResumedModel", () => {
+  // Environment shape from issue #845: the default resolves to Sonnet, the
+  // session was explicitly switched to Opus before the process restart.
+  const SONNET_DEFAULT_MODELS: ModelInfo[] = [
+    {
+      value: "default",
+      resolvedModel: "claude-sonnet-5",
+      displayName: "Default (recommended)",
+      description: "Use the default model (currently Sonnet 5)",
+    },
+    {
+      value: "opus",
+      resolvedModel: "claude-opus-4-6[1m]",
+      displayName: "Opus",
+      description: "Opus 4.6 · Most capable for complex work",
+    },
+    {
+      value: "sonnet",
+      resolvedModel: "claude-sonnet-5",
+      displayName: "Sonnet",
+      description: "Sonnet 5 · Efficient for routine tasks",
+    },
+    {
+      value: "sonnet[1m]",
+      resolvedModel: "claude-sonnet-5[1m]",
+      displayName: "Sonnet",
+      description: "Sonnet 5 with 1M context",
+    },
+  ];
+
+  it("maps an explicitly-switched session's live model to its picker alias", () => {
+    expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-opus-4-6").value).toBe("opus");
+    expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-opus-4-6[1m]").value).toBe("opus");
+  });
+
+  it("keeps Default selected when the live model is what Default resolves to", () => {
+    expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-sonnet-5").value).toBe("default");
+  });
+
+  it("prefers an exact named-row resolvedModel match over the hint-stripped Default tier", () => {
+    // "claude-sonnet-5[1m]" differs from Default's "claude-sonnet-5" only by
+    // the context hint; stripping both would misreport the explicit 1M row as
+    // Default (and infer the wrong context window downstream). Both hint
+    // spellings must land on the row regardless of which one it uses.
+    expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-sonnet-5[1m]").value).toBe(
+      "sonnet[1m]",
+    );
+    expect(matchResumedModel(SONNET_DEFAULT_MODELS, "claude-sonnet-5-1m").value).toBe("sonnet[1m]");
+  });
+
+  it("normalizes the '-1m' id-suffix hint form and casing against Default's resolution", () => {
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-opus-4-8-1m").value).toBe("default");
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "Claude-Opus-4-8[1M]").value).toBe("default");
+  });
+
+  it("prefers Default over a named row sharing the identical resolvedModel", () => {
+    // "opus[1m]" carries the same resolvedModel as Default; the live id can't
+    // tell the two apart, so a never-customized session stays on Default.
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-opus-4-8[1m]").value).toBe("default");
+  });
+
+  it("ignores '[1m]' context hints when comparing against Default's resolution", () => {
+    // The transcript-restored model drops the "[1m]" context hint, so a
+    // session that never left the 1M-context default resumes as the bare id.
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-opus-4-8").value).toBe("default");
+  });
+
+  it("still resolves non-default live models against the picker entries", () => {
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-sonnet-5").value).toBe("sonnet");
+    expect(matchResumedModel(LIVE_SHAPED_MODELS, "claude-haiku-4-5-20251001").value).toBe("haiku");
+  });
+
+  it("tracks a live model with no picker counterpart verbatim", () => {
+    const result = matchResumedModel(LIVE_SHAPED_MODELS, "claude-gpt-99");
+    expect(result.value).toBe("claude-gpt-99");
+    expect(result.displayName).toBe("claude-gpt-99");
   });
 });
 
