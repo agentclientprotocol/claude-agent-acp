@@ -72,6 +72,26 @@ describe("resolveModelPreference - resolvedModel matching", () => {
   it("returns null for a preference that matches nothing", () => {
     expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
   });
+
+  it("matches a '-1m' id-suffix preference against a '[1m]'-spelled resolvedModel", () => {
+    // Without hint canonicalization the exact tier misses and the substring
+    // tier lands on the bare 200k sibling, silently downgrading a 1M pin.
+    const models: ModelInfo[] = [
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Sonnet",
+        description: "Sonnet 5 · Efficient for routine tasks",
+      },
+      {
+        value: "sonnet[1m]",
+        resolvedModel: "claude-sonnet-5[1m]",
+        displayName: "Sonnet",
+        description: "Sonnet 5 with 1M context",
+      },
+    ];
+    expect(resolveModelPreference(models, "claude-sonnet-5-1m")?.value).toBe("sonnet[1m]");
+  });
 });
 
 describe("matchResumedModel", () => {

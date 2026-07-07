@@ -3824,9 +3824,24 @@ export class ClaudeAcpAgent {
     // so every modelInfos consumer (buildConfigOptions' effort lookup, later
     // rebuilds via session.modelInfos) agrees with the gating below. The
     // picker options themselves come from `models.availableModels`, so this
-    // adds no selectable entry.
+    // adds no selectable entry. Capability flags only: the fuzzy-matched
+    // sibling's resolvedModel/displayName/description can describe a
+    // different context lane and would poison later resolvedModel matching
+    // (syncModelAfterRefusalFallback) and context-window inference
+    // (applyConfigOptionValue) if they traveled under this id.
     const modelInfos = fallbackModelInfo
-      ? [...allowedModels, { ...fallbackModelInfo, value: models.currentModelId }]
+      ? [
+          ...allowedModels,
+          {
+            value: models.currentModelId,
+            displayName: models.currentModelId,
+            description: "",
+            supportsAutoMode: fallbackModelInfo.supportsAutoMode,
+            supportsFastMode: fallbackModelInfo.supportsFastMode,
+            supportsEffort: fallbackModelInfo.supportsEffort,
+            supportedEffortLevels: fallbackModelInfo.supportedEffortLevels,
+          },
+        ]
       : allowedModels;
     const availableModes = buildAvailableModes(currentModelInfo);
 
@@ -3934,15 +3949,15 @@ export class ClaudeAcpAgent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize:
-        // A fallback-resolved sibling's displayName/description can describe
-        // a different context lane than the verbatim live id (e.g. an
-        // "opus[1m]" row matched for a bare 200k id), so on that path only
-        // the id itself is a trustworthy window signal.
+        // Deliberately keyed to the allowlisted entry: a fallback-resolved
+        // sibling's displayName/description can describe a different context
+        // lane than the verbatim live id (e.g. an "opus[1m]" row matched for
+        // a bare 200k id), so on the fallback path only the id itself is a
+        // trustworthy window signal.
         inferContextWindowFromModel(
           models.currentModelId,
-          ...(fallbackModelInfo
-            ? []
-            : [currentModelInfo?.displayName, currentModelInfo?.description]),
+          allowlistedModelInfo?.displayName,
+          allowlistedModelInfo?.description,
         ) ?? DEFAULT_CONTEXT_WINDOW,
       taskState,
       toolUseCache: {},
@@ -4360,11 +4375,22 @@ export function buildConfigOptions(
 // but the SDK model list uses IDs like "claude-opus-4-6-1m".
 const MODEL_CONTEXT_HINT_PATTERN = /\[(\d+m)\]$/i;
 
+// The id-suffix spelling of a context hint ("-1m" in "claude-opus-4-6-1m");
+// shared by the strip and canonicalize helpers below so the two can't drift.
+const CONTEXT_HINT_SUFFIX_PATTERN = /-(\d+m)$/i;
+
 /** Remove context-window hints — the display form "[1m]" and the SDK id
  *  suffix form "-1m" — from a model string. Those digits describe context
  *  size, not model identity or generation version. */
 function stripContextHints(s: string): string {
-  return s.replace(/\[\d+m\]/gi, "").replace(/-\d+m$/i, "");
+  return s.replace(/\[\d+m\]/gi, "").replace(CONTEXT_HINT_SUFFIX_PATTERN, "");
+}
+
+/** Canonicalize a model id for exact comparison: trimmed, lowercased, with
+ *  the id-suffix hint spelling unified to the bracket form ("-1m" → "[1m]").
+ *  The hint itself is kept — bare and 1M ids must stay distinct. */
+function canonicalizeModelId(s: string): string {
+  return s.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
 }
 
 // Captures a model family version: `4-6`/`4.7` for dated generations, or a
@@ -4439,13 +4465,18 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   // Exact match on the alias's canonical resolved id (e.g. a pinned
   // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
   // reported and unambiguous, so it's tried before the fuzzier tiers below.
-  // "default" is skipped first since it shares a resolvedModel with
-  // whichever alias the CLI currently recommends — a specific pin should
-  // land on that named alias, not "default".
+  // Compared on the canonical hint spelling so a "-1m"-suffix pin matches a
+  // "[1m]"-spelled resolvedModel instead of falling into the substring tier
+  // (which would land on the bare 200k sibling). "default" is skipped first
+  // since it shares a resolvedModel with whichever alias the CLI currently
+  // recommends — a specific pin should land on that named alias, not
+  // "default".
+  const canonicalPreference = canonicalizeModelId(trimmed);
+  const matchesResolved = (model: ModelInfo) =>
+    model.resolvedModel != null && canonicalizeModelId(model.resolvedModel) === canonicalPreference;
   const resolvedMatch =
-    models.find(
-      (model) => model.value !== "default" && model.resolvedModel?.toLowerCase() === lower,
-    ) ?? models.find((model) => model.resolvedModel?.toLowerCase() === lower);
+    models.find((model) => model.value !== "default" && matchesResolved(model)) ??
+    models.find(matchesResolved);
   if (resolvedMatch) return resolvedMatch;
 
   // Substring match
@@ -4496,18 +4527,10 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
  *     `syncModelAfterRefusalFallback`: the picker shows no selection, but the
  *     model-dependent bookkeeping stays truthful to what the SDK is running. */
 export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
-  // The SDK spells context hints two ways — the display form "[1m]" and the
-  // id suffix form "-1m" — so the exact tiers compare on one canonical
-  // spelling. The hint itself is kept: bare and 1M ids must stay distinct.
-  const canonical = (s: string) =>
-    s
-      .trim()
-      .toLowerCase()
-      .replace(/-(\d+m)$/i, "[$1]");
-  const live = canonical(liveModel);
+  const live = canonicalizeModelId(liveModel);
   const defaultEntry = models.find((m) => m.value === "default");
   const defaultResolved = defaultEntry?.resolvedModel
-    ? canonical(defaultEntry.resolvedModel)
+    ? canonicalizeModelId(defaultEntry.resolvedModel)
     : undefined;
 
   if (defaultEntry && defaultResolved === live) {
@@ -4516,7 +4539,9 @@ export function matchResumedModel(models: ModelInfo[], liveModel: string): Model
 
   // No default-row exclusion needed: a default row matching `live` exactly
   // already returned at the tier above.
-  const exactMatch = models.find((m) => m.resolvedModel && canonical(m.resolvedModel) === live);
+  const exactMatch = models.find(
+    (m) => m.resolvedModel && canonicalizeModelId(m.resolvedModel) === live,
+  );
   if (exactMatch) return exactMatch;
 
   if (
