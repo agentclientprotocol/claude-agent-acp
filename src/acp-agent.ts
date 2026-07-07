@@ -1340,7 +1340,7 @@ export class ClaudeAcpAgent {
           if (session.activeTurn && !session.activeTurn.settled) {
             session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
           }
-          settleActive({ stopReason: "cancelled" });
+          settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
           // If the session is being torn down, abandon the in-flight next()
           // (swallowing any later rejection so it can't surface as unhandled)
           // and stop; otherwise re-arm and keep consuming — `pendingNext`
@@ -1368,11 +1368,10 @@ export class ClaudeAcpAgent {
           //
           // Settle the turn that was in flight so its prompt() doesn't hang:
           // cancelled if a cancel is pending, otherwise the accumulated outcome.
-          settleActive(
-            session.cancelled
-              ? { stopReason: "cancelled" }
-              : { stopReason, usage: sessionUsage(session) },
-          );
+          settleActive({
+            stopReason: session.cancelled ? "cancelled" : stopReason,
+            usage: sessionUsage(session),
+          });
           // Queued turns the SDK never started never ran, so reject them rather
           // than reporting a success (end_turn) — or a misleading "cancelled" —
           // for a prompt that produced no output. (A cancel already settled the
@@ -1517,8 +1516,14 @@ export class ClaudeAcpAgent {
                   // the turn NOW so its session/prompt gets a terminal
                   // response, instead of leaving it hanging until the next
                   // prompt drains the wreckage.
+                  // A cancelled turn still consumed tokens: its dropped result
+                  // already fed the accumulator (the usage tally at the result
+                  // handler runs before the `session.cancelled` guard), so
+                  // report it — clients metering spend would otherwise lose
+                  // the interrupted turn's tokens entirely (issue #844). Zero
+                  // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    settleActive({ stopReason: "cancelled" });
+                    settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
                   } else if (owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -2142,7 +2147,9 @@ export class ClaudeAcpAgent {
                       // as the freshly-activated turn ending without a result
                       // (which would false-fail a healthy turn — issue #825).
                       owedTrailingIdles++;
-                      settleActive({ stopReason: "cancelled" });
+                      // Before activateTurn resets the accumulator, so the
+                      // usage still belongs to the cancelled turn.
+                      settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
                     } else {
                       settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
                     }
@@ -2454,6 +2461,8 @@ export class ClaudeAcpAgent {
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
+          // Deliberately no `usage`: a queued turn never ran, so the session
+          // accumulator (the active turn's tally) is not its spend.
           turn.resolve({ stopReason: "cancelled" });
           orphaned++;
         }
