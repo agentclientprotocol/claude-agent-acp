@@ -92,6 +92,25 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     ];
     expect(resolveModelPreference(models, "claude-sonnet-5-1m")?.value).toBe("sonnet[1m]");
   });
+
+  it("matches a '-1m'-suffix alias directly against a '[1m]'-spelled value", () => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "opus-1m")?.value).toBe("opus[1m]");
+  });
+
+  // Rows without resolvedModel (older SDKs, allowlist-synthesized entries,
+  // option-derived lists) can't use the exact resolved tier, so the hinted
+  // preference must not be absorbed by the bare sibling in the substring
+  // tier — the tokenized tier scores the hinted row correctly instead.
+  it("does not let a bare sibling absorb a hinted preference when resolvedModel is absent", () => {
+    const models: ModelInfo[] = [
+      { value: "sonnet", displayName: "Sonnet", description: "" },
+      { value: "sonnet[1m]", displayName: "Sonnet", description: "" },
+    ];
+    expect(resolveModelPreference(models, "claude-sonnet-5[1m]")?.value).toBe("sonnet[1m]");
+    expect(resolveModelPreference(models, "claude-sonnet-5-1m")?.value).toBe("sonnet[1m]");
+    // Bare preferences still land on the bare row via the substring tier.
+    expect(resolveModelPreference(models, "claude-sonnet-5")?.value).toBe("sonnet");
+  });
 });
 
 describe("matchResumedModel", () => {

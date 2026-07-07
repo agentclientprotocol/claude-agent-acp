@@ -2657,15 +2657,24 @@ export class ClaudeAcpAgent {
     // For model options, fall back to resolveModelPreference when the exact
     // value doesn't match.  This lets callers use human-friendly aliases like
     // "opus" or "sonnet" instead of full model IDs like "claude-opus-4-6".
+    // Resolve against session.modelInfos first: those entries carry
+    // `resolvedModel`, so a full model id (in either hint spelling) lands on
+    // the right row via the exact tier instead of a fuzzier one picking a
+    // same-family sibling from a different context lane. The options-derived
+    // list (which never carries `resolvedModel`) remains as a fallback for
+    // resolutions that don't map back onto a selectable option (e.g. a fuzzy
+    // hit on an out-of-picker verbatim entry).
     if (!validValue && params.configId === MODEL_CONFIG_ID) {
-      const modelInfos: ModelInfo[] = allValues.map((o) => ({
-        value: o.value,
-        displayName: o.name,
-        description: o.description ?? "",
-      }));
-      const resolved = resolveModelPreference(modelInfos, params.value);
-      if (resolved) {
-        validValue = allValues.find((o) => o.value === resolved.value);
+      const toOptionValue = (resolved: ModelInfo | null) =>
+        resolved ? allValues.find((o) => o.value === resolved.value) : undefined;
+      validValue = toOptionValue(resolveModelPreference(session.modelInfos, params.value));
+      if (!validValue) {
+        const optionInfos: ModelInfo[] = allValues.map((o) => ({
+          value: o.value,
+          displayName: o.name,
+          description: o.description ?? "",
+        }));
+        validValue = toOptionValue(resolveModelPreference(optionInfos, params.value));
       }
     }
 
@@ -3833,22 +3842,21 @@ export class ClaudeAcpAgent {
     // so every modelInfos consumer (buildConfigOptions' effort lookup, later
     // rebuilds via session.modelInfos) agrees with the gating below. The
     // picker options themselves come from `models.availableModels`, so this
-    // adds no selectable entry. Capability flags only: the fuzzy-matched
-    // sibling's resolvedModel/displayName/description can describe a
-    // different context lane and would poison later resolvedModel matching
-    // (syncModelAfterRefusalFallback) and context-window inference
+    // adds no selectable entry. The spread keeps every capability flag
+    // (current and future); the identity fields are overridden because the
+    // fuzzy-matched sibling's resolvedModel/displayName/description can
+    // describe a different context lane and would poison later resolvedModel
+    // matching (syncModelAfterRefusalFallback) and context-window inference
     // (applyConfigOptionValue) if they traveled under this id.
     const modelInfos = fallbackModelInfo
       ? [
           ...allowedModels,
           {
+            ...fallbackModelInfo,
             value: models.currentModelId,
             displayName: models.currentModelId,
             description: "",
-            supportsAutoMode: fallbackModelInfo.supportsAutoMode,
-            supportsFastMode: fallbackModelInfo.supportsFastMode,
-            supportsEffort: fallbackModelInfo.supportsEffort,
-            supportedEffortLevels: fallbackModelInfo.supportedEffortLevels,
+            resolvedModel: undefined,
           },
         ]
       : allowedModels;
@@ -4402,6 +4410,12 @@ function canonicalizeModelId(s: string): string {
   return s.trim().toLowerCase().replace(CONTEXT_HINT_SUFFIX_PATTERN, "[$1]");
 }
 
+/** The context hint a model string carries ("1m" for either spelling), or
+ *  null for a bare id. */
+function contextHintOf(s: string): string | null {
+  return canonicalizeModelId(s).match(MODEL_CONTEXT_HINT_PATTERN)?.[1] ?? null;
+}
+
 // Captures a model family version: `4-6`/`4.7` for dated generations, or a
 // bare `5` for single-number ones like "Sonnet 5". Used to keep a pinned
 // `claude-opus-4-6` from matching the `opus` alias once it points at 4.7.
@@ -4462,11 +4476,13 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
 
   const lower = trimmed.toLowerCase();
 
-  // Exact match on value or display name
+  // Exact match on value or display name. Values compare on the canonical
+  // hint spelling so "opus-1m" hits an "opus[1m]" row (and vice versa).
+  const canonicalPreference = canonicalizeModelId(trimmed);
   const directMatch = models.find(
     (model) =>
       model.value === trimmed ||
-      model.value.toLowerCase() === lower ||
+      canonicalizeModelId(model.value) === canonicalPreference ||
       model.displayName.toLowerCase() === lower,
   );
   if (directMatch) return directMatch;
@@ -4480,7 +4496,6 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
   // since it shares a resolvedModel with whichever alias the CLI currently
   // recommends — a specific pin should land on that named alias, not
   // "default".
-  const canonicalPreference = canonicalizeModelId(trimmed);
   const matchesResolved = (model: ModelInfo) =>
     model.resolvedModel != null && canonicalizeModelId(model.resolvedModel) === canonicalPreference;
   const resolvedMatch =
@@ -4488,9 +4503,14 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
     models.find(matchesResolved);
   if (resolvedMatch) return resolvedMatch;
 
-  // Substring match
+  // Substring match. Skips candidates whose context hint disagrees with the
+  // preference's — a bare row must not absorb a 1M-hinted preference (nor
+  // vice versa); such pairs fall through to the tokenized tier, which
+  // weighs hints in its scoring and still finds the best same-family row.
+  const preferenceHint = contextHintOf(trimmed);
   const includesMatch = models.find((model) => {
     if (!modelVersionsCompatible(trimmed, model)) return false;
+    if (contextHintOf(model.value) !== preferenceHint) return false;
     const value = model.value.toLowerCase();
     const display = model.displayName.toLowerCase();
     return value.includes(lower) || display.includes(lower) || lower.includes(value);
