@@ -2020,16 +2020,16 @@ export class ClaudeAcpAgent {
               const delta = message.event.delta;
               const chunk =
                 delta.type === "text_delta"
-                  ? { type: "text" as const, text: delta.text }
+                  ? { type: "text" as const, text: nonEmptyString(delta.text) }
                   : delta.type === "thinking_delta"
-                    ? { type: "thinking" as const, text: delta.thinking }
+                    ? { type: "thinking" as const, text: nonEmptyString(delta.thinking) }
                     : undefined;
               // Skip empty deltas (some gateways emit empty thinking chunks —
               // #793): appending "" is a no-op, but pushing a "" entry would
               // create a block the consolidated handler's `text.length > 0`
               // guard can never consume, stalling the diff cursor and
               // re-emitting the next block as a duplicate.
-              if (chunk && chunk.text.length > 0) {
+              if (chunk?.text) {
                 const index = message.event.index;
                 const last = streamedBlocks[streamedBlocks.length - 1];
                 if (last && last.index === index && last.type === chunk.type) {
@@ -4966,6 +4966,10 @@ function applyMessageId(
   }
 }
 
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 /** Built-in tools that drive the task list (headless/SDK sessions use these
  *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
  *  snapshots rather than as tool_calls. */
@@ -5091,17 +5095,19 @@ export function toAcpNotifications(
     let update: SessionNotification["update"] | null = null;
     switch (chunk.type) {
       case "text":
-      case "text_delta":
-        if (chunk.text.length > 0) {
+      case "text_delta": {
+        const text = nonEmptyString(chunk.text);
+        if (text) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
               type: "text",
-              text: chunk.text,
+              text,
             },
           };
         }
         break;
+      }
       case "image":
         update = {
           sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
@@ -5114,19 +5120,21 @@ export function toAcpNotifications(
         };
         break;
       case "thinking":
-      case "thinking_delta":
+      case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking.length > 0) {
+        const thinking = nonEmptyString(chunk.thinking);
+        if (thinking) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
               type: "text",
-              text: chunk.thinking,
+              text: thinking,
             },
           };
         }
         break;
+      }
       case "tool_use":
       case "server_tool_use":
       case "mcp_tool_use": {

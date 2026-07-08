@@ -4816,6 +4816,22 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["real answer"]);
   });
 
+  it("dedupes a streamed text block even when a thinking delta omits text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-missing-thinking"),
+      thinkingDelta(undefined as any),
+      textDelta("real answer"),
+      assistantMessage("msg-missing-thinking", [{ type: "text", text: "real answer" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["real answer"]);
+  });
+
   it("does not re-emit the next turn's text after a turn is cancelled mid-stream", async () => {
     // Regression: streamedBlocks is reset inside the consolidated-assistant
     // branch, but a cancelled turn `break`s out before reaching it (the
@@ -6786,6 +6802,36 @@ describe("toAcpNotifications thinking chunks", () => {
   it("skips empty thinking deltas", () => {
     const result = toAcpNotifications(
       [{ type: "thinking_delta", thinking: "", estimated_tokens: 0 }],
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("skips thinking chunks without string content", () => {
+    const result = toAcpNotifications(
+      [
+        { type: "thinking", signature: "abc" },
+        { type: "thinking_delta", estimated_tokens: 0 },
+        { type: "thinking_delta", thinking: null, estimated_tokens: 0 },
+      ] as any,
+      "assistant",
+      "test",
+      {},
+      {} as AcpClient,
+      console,
+    );
+
+    expect(result).toEqual([]);
+  });
+
+  it("skips text deltas without string content", () => {
+    const result = toAcpNotifications(
+      [{ type: "text_delta" }, { type: "text_delta", text: null }] as any,
       "assistant",
       "test",
       {},
