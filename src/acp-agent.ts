@@ -2190,7 +2190,7 @@ export class ClaudeAcpAgent {
               // create a block the consolidated handler's `text.length > 0`
               // guard can never consume, stalling the diff cursor and
               // re-emitting the next block as a duplicate.
-              if (chunk && chunk.text.length > 0) {
+              if (chunk?.text) {
                 const index = message.event.index;
                 const last = streamedBlocks[streamedBlocks.length - 1];
                 if (last && last.index === index && last.type === chunk.type) {
@@ -5307,8 +5307,8 @@ export function toAcpNotifications(
     let update: SessionNotification["update"] | null = null;
     switch (chunk.type) {
       case "text":
-      case "text_delta":
-        if (chunk.text.length > 0) {
+      case "text_delta": {
+        if (chunk.text) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
@@ -5318,6 +5318,7 @@ export function toAcpNotifications(
           };
         }
         break;
+      }
       case "image":
         update = {
           sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
@@ -5330,10 +5331,10 @@ export function toAcpNotifications(
         };
         break;
       case "thinking":
-      case "thinking_delta":
+      case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking.length > 0) {
+        if (chunk.thinking) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
@@ -5343,6 +5344,7 @@ export function toAcpNotifications(
           };
         }
         break;
+      }
       case "tool_use":
       case "server_tool_use":
       case "mcp_tool_use": {
