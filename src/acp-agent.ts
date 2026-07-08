@@ -2020,9 +2020,9 @@ export class ClaudeAcpAgent {
               const delta = message.event.delta;
               const chunk =
                 delta.type === "text_delta"
-                  ? { type: "text" as const, text: nonEmptyString(delta.text) }
+                  ? { type: "text" as const, text: delta.text }
                   : delta.type === "thinking_delta"
-                    ? { type: "thinking" as const, text: nonEmptyString(delta.thinking) }
+                    ? { type: "thinking" as const, text: delta.thinking }
                     : undefined;
               // Skip empty deltas (some gateways emit empty thinking chunks —
               // #793): appending "" is a no-op, but pushing a "" entry would
@@ -4966,10 +4966,6 @@ function applyMessageId(
   }
 }
 
-function nonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
-}
-
 /** Built-in tools that drive the task list (headless/SDK sessions use these
  *  instead of TodoWrite). Their tool_use/tool_result are surfaced as `plan`
  *  snapshots rather than as tool_calls. */
@@ -5096,13 +5092,12 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta": {
-        const text = nonEmptyString(chunk.text);
-        if (text) {
+        if (chunk.text) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
               type: "text",
-              text,
+              text: chunk.text,
             },
           };
         }
@@ -5123,13 +5118,12 @@ export function toAcpNotifications(
       case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        const thinking = nonEmptyString(chunk.thinking);
-        if (thinking) {
+        if (chunk.thinking) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
               type: "text",
-              text: thinking,
+              text: chunk.thinking,
             },
           };
         }
