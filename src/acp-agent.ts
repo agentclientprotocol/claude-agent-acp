@@ -9,10 +9,15 @@ import {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  DisableProviderRequest,
+  DisableProviderResponse,
   ForkSessionRequest,
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
+  ListProvidersRequest,
+  ListProvidersResponse,
+  LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
   LoadSessionRequest,
@@ -25,9 +30,12 @@ import {
   PermissionOption,
   PromptRequest,
   PromptResponse,
+  ProviderInfo,
   ReadTextFileRequest,
   ReadTextFileResponse,
   RequestError,
+  SetProviderRequest,
+  SetProviderResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   ResumeSessionRequest,
@@ -396,6 +404,50 @@ type GatewayAuthMeta = {
 type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
 
 /**
+ * The single provider ID this agent exposes via `providers/*`. Claude Code has
+ * one LLM backend selected by protocol (anthropic / bedrock / vertex), so there
+ * is exactly one configurable provider.
+ */
+const PROVIDER_ID = "main";
+
+/**
+ * Protocols the `main` provider can be configured with. These mirror the
+ * env-var mappings understood by {@link createEnvForProvider}.
+ */
+const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
+
+/**
+ * Vertex needs project + region that the standard `providers/set` payload
+ * (`apiType`/`baseUrl`/`headers`) does not model, so clients pass them through
+ * `_meta.claudeCode.vertex`. Required only when `apiType === "vertex"`.
+ */
+type SetProviderMeta = {
+  claudeCode?: {
+    vertex?: {
+      projectId: string;
+      region: string;
+    };
+  };
+};
+
+/**
+ * Resolved, non-secret + secret routing config for the `main` provider. This is
+ * the shared shape produced by both `providers/set` and the legacy gateway auth
+ * path, and consumed by {@link createEnvForProvider}. `null` means the provider
+ * is unconfigured (no client-managed routing in effect).
+ */
+type ProviderConfig = {
+  apiType: LlmProtocol;
+  baseUrl: string;
+  headers: Record<string, string>;
+  /** Present only for `apiType === "vertex"`. */
+  vertex?: {
+    projectId: string;
+    region: string;
+  };
+};
+
+/**
  * Extra metadata that the agent provides for each tool_call / tool_update update.
  */
 export type ToolUpdateMeta = {
@@ -751,6 +803,10 @@ export class ClaudeAcpAgent {
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
+  /** Client-managed LLM routing set via `providers/set`. Process-scoped and
+   *  never persisted to disk (see the Configurable LLM Providers RFD). When
+   *  set, it takes precedence over {@link gatewayAuthRequest}. */
+  providerConfig?: ProviderConfig;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -891,6 +947,10 @@ export class ClaudeAcpAgent {
         auth: {
           logout: {},
         },
+        // Client-managed LLM routing via `providers/list`, `providers/set`, and
+        // `providers/disable`. Advertised unconditionally; there is no client
+        // capability prerequisite for the provider methods.
+        providers: {},
         loadSession: true,
         sessionCapabilities: {
           additionalDirectories: {},
@@ -1028,11 +1088,112 @@ export class ClaudeAcpAgent {
     throw new Error("Method not implemented.");
   }
 
+  /**
+   * `providers/list` — report the single configurable `main` provider and its
+   * current non-secret routing. Headers are never echoed (they may hold
+   * secrets); only `apiType`/`baseUrl` are surfaced for UI display.
+   */
+  async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
+    const config = this.resolveProviderConfig();
+    const provider: ProviderInfo = {
+      providerId: PROVIDER_ID,
+      supported: SUPPORTED_PROTOCOLS,
+      required: true,
+      current: config ? { apiType: config.apiType, baseUrl: config.baseUrl } : null,
+    };
+    return { providers: [provider] };
+  }
+
+  /**
+   * `providers/set` — replace the full configuration for the `main` provider.
+   * Rejects unknown IDs, unsupported protocols, and empty/invalid base URLs with
+   * `invalid_params`. Config is process-scoped and applies to sessions created or
+   * loaded after this call.
+   */
+  async unstable_setProvider(params: SetProviderRequest): Promise<SetProviderResponse> {
+    if (params.providerId !== PROVIDER_ID) {
+      throw RequestError.invalidParams(
+        { providerId: params.providerId },
+        `Unknown provider ID "${params.providerId}"; expected "${PROVIDER_ID}".`,
+      );
+    }
+    if (!SUPPORTED_PROTOCOLS.includes(params.apiType)) {
+      throw RequestError.invalidParams(
+        { apiType: params.apiType, supported: SUPPORTED_PROTOCOLS },
+        `Unsupported apiType "${params.apiType}" for provider "${PROVIDER_ID}".`,
+      );
+    }
+    if (!isValidBaseUrl(params.baseUrl)) {
+      throw RequestError.invalidParams(
+        { baseUrl: params.baseUrl },
+        "baseUrl must be a non-empty absolute http(s) URL.",
+      );
+    }
+
+    const config: ProviderConfig = {
+      apiType: params.apiType,
+      baseUrl: params.baseUrl,
+      headers: params.headers ?? {},
+    };
+
+    // Vertex requires project + region, which the standard payload cannot
+    // carry, so they arrive via `_meta.claudeCode.vertex`.
+    if (params.apiType === "vertex") {
+      const vertex = (params._meta as SetProviderMeta | undefined)?.claudeCode?.vertex;
+      if (
+        !vertex ||
+        typeof vertex.projectId !== "string" ||
+        vertex.projectId.trim() === "" ||
+        typeof vertex.region !== "string" ||
+        vertex.region.trim() === ""
+      ) {
+        throw RequestError.invalidParams(
+          undefined,
+          "vertex apiType requires non-empty `_meta.claudeCode.vertex.projectId` and `_meta.claudeCode.vertex.region`.",
+        );
+      }
+      config.vertex = { projectId: vertex.projectId, region: vertex.region };
+    }
+
+    this.providerConfig = config;
+    return {};
+  }
+
+  /**
+   * `providers/disable` — the `main` provider is `required`, so disabling it is
+   * rejected with `invalid_params`. Disabling any other (unknown) ID is treated
+   * as a successful no-op per the RFD's idempotency rule.
+   */
+  async unstable_disableProvider(params: DisableProviderRequest): Promise<DisableProviderResponse> {
+    if (params.providerId === PROVIDER_ID) {
+      throw RequestError.invalidParams(
+        { providerId: params.providerId },
+        `Provider "${PROVIDER_ID}" is required and cannot be disabled.`,
+      );
+    }
+    // Unknown provider: idempotent success.
+    return {};
+  }
+
+  /**
+   * Resolve the effective client-managed routing config. `providers/set` takes
+   * precedence; otherwise fall back to the legacy gateway auth request. Returns
+   * `null` when neither is configured.
+   */
+  resolveProviderConfig(): ProviderConfig | null {
+    if (this.providerConfig) {
+      return this.providerConfig;
+    }
+    return gatewayRequestToProviderConfig(this.gatewayAuthRequest);
+  }
+
   async logout(_params: LogoutRequest): Promise<void> {
-    // Clear in-memory gateway credentials supplied via `authenticate`. The
-    // gateway method never touches the on-disk credential store, so dropping
-    // this reference is the whole logout for that path.
+    // Clear in-memory gateway credentials supplied via `authenticate` and any
+    // provider routing set via `providers/set`. Neither touches the on-disk
+    // credential store, so dropping these references is the whole logout for
+    // those paths.
     this.gatewayAuthRequest = undefined;
+    this.providerConfig = undefined;
 
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
@@ -3646,7 +3807,10 @@ export class ClaudeAcpAgent {
       env: {
         ...process.env,
         ...userProvidedOptions?.env,
-        ...createEnvForGateway(this.gatewayAuthRequest),
+        // Client-managed LLM routing: `providers/set` config wins, else the
+        // legacy gateway auth request. Baked into the query at creation, so it
+        // only affects sessions started after the change (matching the RFD).
+        ...createEnvForProvider(this.resolveProviderConfig()),
         // Opt-in to session state events like when the agent is idle
         CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
       },
@@ -4074,27 +4238,79 @@ function snapshotFromUsage(usage: {
   };
 }
 
-function createEnvForGateway(request?: GatewayAuthRequest) {
+/**
+ * Adapt a legacy gateway `authenticate` request into the shared
+ * {@link ProviderConfig} shape. Returns `null` when no gateway request is
+ * present. `methodId` selects the protocol: `gateway-bedrock` → bedrock,
+ * otherwise anthropic.
+ */
+function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderConfig | null {
   if (!request?._meta) {
+    return null;
+  }
+  return {
+    apiType: request.methodId === "gateway-bedrock" ? "bedrock" : "anthropic",
+    baseUrl: request._meta.gateway.baseUrl,
+    headers: request._meta.gateway.headers,
+  };
+}
+
+/**
+ * Map a resolved provider config into the Claude Code env vars that redirect API
+ * traffic and inject headers. Returns an empty object when routing is
+ * unconfigured. The token/bypass placeholders (`" "`) are required so the CLI
+ * skips its normal login/credential checks when a gateway is in use.
+ */
+function createEnvForProvider(config: ProviderConfig | null): Record<string, string> {
+  if (!config) {
     return {};
   }
-  const customHeaders = Object.entries(request._meta.gateway.headers)
+  const customHeaders = Object.entries(config.headers)
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");
 
-  if (request.methodId === "gateway-bedrock") {
+  if (config.apiType === "bedrock") {
     return {
       CLAUDE_CODE_USE_BEDROCK: "1",
       AWS_BEARER_TOKEN_BEDROCK: " ", // Must be non-empty to bypass pass configuration check
-      ANTHROPIC_BEDROCK_BASE_URL: request._meta.gateway.baseUrl,
+      ANTHROPIC_BEDROCK_BASE_URL: config.baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     };
   }
+
+  if (config.apiType === "vertex") {
+    // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
+    // validation; fall back to empty strings defensively.
+    return {
+      CLAUDE_CODE_USE_VERTEX: "1",
+      ANTHROPIC_VERTEX_BASE_URL: config.baseUrl,
+      ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
+      CLOUD_ML_REGION: config.vertex?.region ?? "",
+      ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+    };
+  }
+
   return {
-    ANTHROPIC_BASE_URL: request._meta.gateway.baseUrl,
+    ANTHROPIC_BASE_URL: config.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
   };
+}
+
+/**
+ * Validate a provider base URL: must be a non-empty absolute http(s) URL.
+ */
+function isValidBaseUrl(baseUrl: string): boolean {
+  if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
 /**
@@ -5477,6 +5693,9 @@ export function runAcp() {
       agent.setSessionConfigOption(ctx.params),
     )
     .onRequest(methods.agent.authenticate, (ctx) => agent.authenticate(ctx.params))
+    .onRequest(methods.agent.providers.list, (ctx) => agent.unstable_listProviders(ctx.params))
+    .onRequest(methods.agent.providers.set, (ctx) => agent.unstable_setProvider(ctx.params))
+    .onRequest(methods.agent.providers.disable, (ctx) => agent.unstable_disableProvider(ctx.params))
     .onRequest(methods.agent.logout, (ctx) => agent.logout(ctx.params))
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
