@@ -1163,15 +1163,21 @@ export class ClaudeAcpAgent {
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
-    // Whether any assistant text reached the client since the last result, from
-    // either the live `stream_event` deltas or the consolidated `assistant`
-    // message. Read at the terminal `result` to tell a turn whose answer was
-    // already delivered from one that only ever carried it on `result`
-    // (issue #453). Delimited by results, and deliberately NOT reset in
+    // Whether any top-level assistant text reached the client since the last
+    // user-turn result, through the live `stream_event` deltas, the consolidated
+    // `assistant` message, or a direct emission (see the `status` handler). Read
+    // at the terminal `result` to tell a turn whose answer was already delivered
+    // from one that only ever carried it on `result` (issue #453). Cleared by
+    // every non-task-notification result, and deliberately NOT reset in
     // resetTurnScratch: turn activation can fire mid-message (see there), so a
     // flag cleared on activation would forget text that already streamed — the
     // consolidated message then dedupes to nothing, nothing sets the flag
-    // again, and the result text would be emitted a second time.
+    // again, and the result text would be emitted a second time. Neither the
+    // consolidated `assistant` message nor a `stream_event` carries `origin`,
+    // so a background followup's prose is indistinguishable from a user turn's
+    // here and sets the flag too: a replayed turn right behind one stays silent
+    // rather than risk a duplicate, which is the pre-#453 behavior for that
+    // turn and never a double emission.
     let emittedAssistantText = false;
     // How many trailing `session_state_changed: idle` messages are already
     // accounted for: every user-turn result that terminates a turn (settle,
