@@ -22,6 +22,8 @@ import {
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
+  WorkflowInput,
+  WorkflowOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
   ImageBlockParam,
@@ -94,6 +96,10 @@ interface ToolUpdate {
   content?: ToolCallContent[];
   locations?: ToolCallLocation[];
   _meta?: {
+    claudeCode?: {
+      toolResponse?: unknown;
+      workflow?: WorkflowRunState;
+    };
     terminal_info?: {
       terminal_id: string;
     };
@@ -108,6 +114,56 @@ interface ToolUpdate {
     };
   };
 }
+
+export type WorkflowRunStatus =
+  "pending" | "running" | "completed" | "failed" | "stopped" | "paused" | "unknown";
+
+export type WorkflowAgentState = {
+  id: string;
+  label?: string;
+  status?: WorkflowRunStatus;
+  currentAction?: string;
+  lastToolName?: string;
+  usage?: {
+    totalTokens?: number;
+    toolUses?: number;
+    durationMs?: number;
+  };
+  updatedAt?: string;
+  rawSdkEvent?: unknown;
+};
+
+export type WorkflowRunState = {
+  id: string;
+  aliases?: string[];
+  toolUseId?: string;
+  taskId?: string;
+  runId?: string;
+  workflowName?: string;
+  status: WorkflowRunStatus;
+  taskType?: string;
+  description?: string;
+  phases?: Array<{ title: string; detail?: string }>;
+  workflowAgents?: WorkflowAgentState[];
+  summary?: string;
+  progress?: string;
+  usage?: {
+    totalTokens?: number;
+    toolUses?: number;
+    durationMs?: number;
+  };
+  scriptPath?: string;
+  transcriptDir?: string;
+  sessionUrl?: string;
+  lastToolName?: string;
+  rawInput?: unknown;
+  rawSdkEvent?: unknown;
+  warning?: string;
+  error?: string;
+  startedAt?: string;
+  updatedAt?: string;
+  completedAt?: string;
+};
 
 /**
  * Convert an absolute file path to a project-relative path for display.
@@ -425,6 +481,31 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "Workflow": {
+      const input = toolUse.input as WorkflowInput | undefined;
+      const workflowName = input?.name ?? extractWorkflowNameFromScript(input?.script);
+      const title = workflowName
+        ? `Workflow ${workflowName}`
+        : input?.scriptPath
+          ? `Workflow ${toDisplayPath(input.scriptPath, cwd)}`
+          : "Workflow";
+      const details = workflowInputDetails(input, cwd);
+      return {
+        title,
+        kind: "execute",
+        content:
+          details.length > 0
+            ? [
+                {
+                  type: "content",
+                  content: { type: "text", text: details.join("\n") },
+                },
+              ]
+            : [],
+        locations: input?.scriptPath ? [{ path: input.scriptPath }] : [],
+      };
+    }
+
     case "ExitPlanMode": {
       const planInput = toolUse.input as { plan?: string } | undefined;
       return {
@@ -628,6 +709,37 @@ export function toolUpdateFromToolResult(
       return { title: "Exited Plan Mode" };
     }
 
+    case "Workflow": {
+      const workflow = workflowRunStateFromWorkflowOutput(toolResult.content);
+      if (!workflow) {
+        return toAcpContentUpdate(
+          toolResult.content,
+          "is_error" in toolResult ? toolResult.is_error : false,
+        );
+      }
+      const content = formatWorkflowLaunchContent(workflow);
+      return {
+        title: workflow.error
+          ? `Workflow failed: ${workflow.workflowName ?? workflow.id}`
+          : `Workflow launched: ${workflow.workflowName ?? workflow.id}`,
+        content:
+          content.length > 0
+            ? [
+                {
+                  type: "content",
+                  content: { type: "text", text: content.join("\n") },
+                },
+              ]
+            : undefined,
+        _meta: {
+          claudeCode: {
+            toolResponse: workflow,
+            workflow,
+          },
+        },
+      };
+    }
+
     default: {
       return toAcpContentUpdate(
         toolResult.content,
@@ -635,6 +747,110 @@ export function toolUpdateFromToolResult(
       );
     }
   }
+}
+
+function workflowInputDetails(input: WorkflowInput | undefined, cwd?: string): string[] {
+  if (!input) return [];
+  const details: string[] = [];
+  if (input.name) details.push(`Name: ${input.name}`);
+  if (input.scriptPath) details.push(`Script: ${toDisplayPath(input.scriptPath, cwd)}`);
+  if (input.resumeFromRunId) details.push(`Resume from run: ${input.resumeFromRunId}`);
+  if (input.args !== undefined) {
+    details.push(`Args: ${safeJson(input.args)}`);
+  }
+  if (input.script && !input.scriptPath) {
+    const workflowName = extractWorkflowNameFromScript(input.script);
+    if (workflowName && !input.name) details.push(`Name: ${workflowName}`);
+    details.push(`Script: ${input.script.split(/\r?\n/).length} lines`);
+  }
+  return details;
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractWorkflowNameFromScript(script: string | undefined): string | undefined {
+  if (!script) return undefined;
+  const match = script.match(/\bname\s*:\s*["']([^"']+)["']/);
+  return match?.[1];
+}
+
+function workflowRunStateFromWorkflowOutput(content: unknown): WorkflowRunState | undefined {
+  const output = parseWorkflowOutput(content);
+  if (!output?.taskId) return undefined;
+  const id = output.runId ?? output.taskId;
+  const now = new Date().toISOString();
+  return {
+    id,
+    taskId: output.taskId,
+    runId: output.runId,
+    workflowName: output.workflowName,
+    status: output.error ? "failed" : "running",
+    taskType: output.taskType,
+    summary: output.summary,
+    scriptPath: output.scriptPath,
+    transcriptDir: output.transcriptDir,
+    sessionUrl: output.sessionUrl,
+    warning: output.warning,
+    error: output.error,
+    startedAt: now,
+    updatedAt: now,
+    ...(output.error ? { completedAt: now } : {}),
+  };
+}
+
+export function parseWorkflowOutput(content: unknown): WorkflowOutput | undefined {
+  const parse = (value: unknown): WorkflowOutput | undefined => {
+    if (!value || typeof value !== "object") return undefined;
+    if ("taskId" in value && typeof value.taskId === "string") {
+      return value as WorkflowOutput;
+    }
+    return undefined;
+  };
+
+  if (typeof content === "string") {
+    try {
+      return parse(JSON.parse(content));
+    } catch {
+      return undefined;
+    }
+  }
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (
+        block &&
+        typeof block === "object" &&
+        "type" in block &&
+        block.type === "text" &&
+        "text" in block &&
+        typeof block.text === "string"
+      ) {
+        const parsed = parseWorkflowOutput(block.text);
+        if (parsed) return parsed;
+      }
+    }
+    return undefined;
+  }
+  return parse(content);
+}
+
+function formatWorkflowLaunchContent(workflow: WorkflowRunState): string[] {
+  const lines: string[] = [];
+  if (workflow.workflowName) lines.push(`Workflow: ${workflow.workflowName}`);
+  if (workflow.runId) lines.push(`Run ID: ${workflow.runId}`);
+  if (workflow.taskId) lines.push(`Task ID: ${workflow.taskId}`);
+  if (workflow.summary) lines.push(`Summary: ${workflow.summary}`);
+  if (workflow.scriptPath) lines.push(`Script: ${workflow.scriptPath}`);
+  if (workflow.transcriptDir) lines.push(`Transcript: ${workflow.transcriptDir}`);
+  if (workflow.sessionUrl) lines.push(`Session: ${workflow.sessionUrl}`);
+  if (workflow.warning) lines.push(`Warning: ${workflow.warning}`);
+  if (workflow.error) lines.push(`Error: ${workflow.error}`);
+  return lines;
 }
 
 function toAcpContentUpdate(

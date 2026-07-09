@@ -75,6 +75,7 @@ import {
   SlashCommand,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
+import type { WorkflowInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -104,6 +105,7 @@ import {
   ClaudePlanEntry,
   createPostToolUseHook,
   createTaskHook,
+  parseWorkflowOutput,
   parseTaskCreateOutput,
   planEntries,
   registerHookCallback,
@@ -112,6 +114,9 @@ import {
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
+  WorkflowAgentState,
+  WorkflowRunState,
+  WorkflowRunStatus,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 
@@ -309,6 +314,12 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** Workflow runs launched or observed in this session, keyed by canonical id. */
+  workflowRuns: Map<string, WorkflowRunState>;
+  /** Single-turn grants created when a workflow slash command was approved. */
+  workflowApprovalGrants?: Map<string, WorkflowApprovalGrant>;
+  /** In-flight workflow slash-command approval request, aborted by cancel(). */
+  workflowApprovalController?: AbortController;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -327,6 +338,12 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+};
+
+type WorkflowApprovalGrant = {
+  key: string;
+  input: WorkflowInput;
+  workflow: WorkflowRunState;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -495,7 +512,7 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
-const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+const LOCAL_ONLY_COMMANDS = new Set(["/compact", "/context", "/heapdump", "/extra-usage"]);
 
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
@@ -763,6 +780,412 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+  }
+
+  async extMethod(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    switch (method) {
+      case "_claude/workflows/list": {
+        const session = this.sessionFromExtParams(params);
+        return { workflows: workflowRunSnapshots(session.workflowRuns) };
+      }
+      case "_claude/workflows/get": {
+        const session = this.sessionFromExtParams(params);
+        const workflow = findWorkflowRun(session.workflowRuns, params);
+        if (!workflow) {
+          return { error: "not_found" };
+        }
+        return { workflow };
+      }
+      case "_claude/workflows/stop": {
+        const session = this.sessionFromExtParams(params);
+        const workflow = findWorkflowRun(session.workflowRuns, params);
+        if (!workflow?.taskId) {
+          return { error: workflow ? "missing_task_id" : "not_found" };
+        }
+        await session.query.stopTask(workflow.taskId);
+        return { ok: true, taskId: workflow.taskId };
+      }
+      default:
+        return { error: "unsupported", method };
+    }
+  }
+
+  private sessionFromExtParams(params: Record<string, unknown>): Session {
+    const sessionId = typeof params.sessionId === "string" ? params.sessionId : undefined;
+    if (!sessionId || !this.sessions[sessionId]) {
+      throw new Error("Session not found");
+    }
+    return this.sessions[sessionId];
+  }
+
+  private async sendSessionNotification(notification: SessionNotification): Promise<void> {
+    const workflow = getWorkflowFromNotification(notification);
+    if (workflow) {
+      const session = this.sessions[notification.sessionId];
+      if (session) {
+        await this.recordWorkflowRun(notification.sessionId, session, workflow, "tool_result");
+      }
+    }
+    await this.client.sessionUpdate(notification);
+  }
+
+  private async recordWorkflowRun(
+    sessionId: string,
+    session: Session,
+    workflow: WorkflowRunState,
+    sourceMessageSubtype: string,
+  ): Promise<WorkflowRunState> {
+    const existingEntry = findWorkflowRunEntry(session.workflowRuns, workflow);
+    const existing = existingEntry?.run;
+    const id = canonicalWorkflowRunId(workflow, existing);
+    if (!id) return workflow;
+
+    const now = new Date().toISOString();
+    const merged: WorkflowRunState = {
+      ...existing,
+      ...dropUndefined(workflow),
+      id,
+      aliases: workflowRunAliases(existing, workflow, id),
+      status: workflow.status ?? existing?.status ?? "unknown",
+      updatedAt: now,
+      startedAt: existing?.startedAt ?? workflow.startedAt ?? now,
+    };
+    if (isTerminalWorkflowStatus(merged.status)) {
+      merged.completedAt = merged.completedAt ?? now;
+    }
+    if (existingEntry?.key && existingEntry.key !== id) {
+      session.workflowRuns.delete(existingEntry.key);
+    }
+    session.workflowRuns.set(id, merged);
+
+    await this.client.extNotification("_claude/workflowUpdate", {
+      sessionId,
+      workflow: merged,
+      runs: workflowRunSnapshots(session.workflowRuns),
+      sourceMessageSubtype,
+    });
+    return merged;
+  }
+
+  private async approveWorkflowToolUse(
+    sessionId: string,
+    session: Session,
+    toolInput: Record<string, unknown>,
+    toolUseID: string,
+    supportsTerminalOutput: boolean,
+    signal: AbortSignal,
+  ): Promise<PermissionResult> {
+    const input = toolInput as WorkflowInput;
+    const workflow = await workflowRunStateFromWorkflowInput(session.cwd, input, toolUseID);
+
+    const grant = consumeWorkflowApprovalGrant(session, session.cwd, input);
+    if (grant) {
+      await this.recordWorkflowRun(
+        sessionId,
+        session,
+        {
+          ...grant.workflow,
+          id: toolUseID,
+          toolUseId: toolUseID,
+          rawInput: toolInput,
+          status: "pending",
+          progress: "Workflow approved; launching Claude Workflow tool",
+          summary: `Workflow ${grant.workflow.workflowName ?? grant.workflow.id} approved`,
+        },
+        "workflow_approval_grant",
+      );
+      return { behavior: "allow", updatedInput: toolInput };
+    }
+
+    return this.requestWorkflowApproval(
+      sessionId,
+      session,
+      input,
+      workflow,
+      toolUseID,
+      supportsTerminalOutput,
+      signal,
+    );
+  }
+
+  private async requestWorkflowApproval(
+    sessionId: string,
+    session: Session,
+    input: WorkflowInput,
+    workflow: WorkflowRunState,
+    toolUseID: string,
+    supportsTerminalOutput: boolean,
+    signal: AbortSignal,
+  ): Promise<PermissionResult> {
+    await this.recordWorkflowRun(
+      sessionId,
+      session,
+      {
+        ...workflow,
+        status: "pending",
+        progress: "Awaiting workflow approval",
+        summary: `Workflow ${workflow.workflowName ?? workflow.id} is awaiting approval`,
+      },
+      "workflow_approval",
+    );
+
+    for (;;) {
+      let response: RequestPermissionResponse;
+      try {
+        response = await this.requestPermissionFromClient(
+          {
+            sessionId,
+            options: [
+              { kind: "allow_once", name: "Yes, run it", optionId: "run_once" },
+              { kind: "reject_once", name: "View raw script", optionId: "view_script" },
+              { kind: "reject_once", name: "No", optionId: "deny" },
+            ],
+            toolCall: workflowApprovalToolCallFromInput(
+              input,
+              workflow,
+              toolUseID,
+              supportsTerminalOutput,
+              session.cwd,
+            ),
+          },
+          "Workflow",
+          signal,
+        );
+      } catch (error) {
+        if (!signal.aborted) {
+          throw error;
+        }
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...workflow,
+            status: "stopped",
+            progress: "Workflow approval aborted",
+            summary: "Workflow launch cancelled before launch",
+          },
+          "workflow_approval",
+        );
+        return { behavior: "deny", message: "Workflow approval aborted" };
+      }
+
+      if (
+        signal.aborted ||
+        response.outcome?.outcome !== "selected" ||
+        response.outcome.optionId === "deny"
+      ) {
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...workflow,
+            status: "stopped",
+            progress: "Workflow launch denied",
+            summary: "Workflow launch denied before launch",
+          },
+          "workflow_approval",
+        );
+        return {
+          behavior: "deny",
+          message: signal.aborted ? "Workflow approval aborted" : "Workflow launch denied",
+        };
+      }
+
+      if (response.outcome.optionId === "view_script") {
+        await this.client.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text: await renderWorkflowScriptForApproval(input, workflow, session.cwd),
+            },
+          },
+        });
+        continue;
+      }
+
+      if (response.outcome.optionId === "run_once") {
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...workflow,
+            status: "pending",
+            progress: "Workflow approved; waiting for Claude Workflow tool launch",
+            summary: `Workflow ${workflow.workflowName ?? workflow.id} approved`,
+          },
+          "workflow_approval",
+        );
+        return { behavior: "allow", updatedInput: input as Record<string, unknown> };
+      }
+    }
+  }
+
+  private async handleWorkflowTaskMessage(sessionId: string, message: SDKMessage): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || message.type !== "system") return;
+
+    switch (message.subtype) {
+      case "task_started": {
+        if (message.task_type !== "local_workflow" && !message.workflow_name) return;
+        const pending = findPendingWorkflowRun(session.workflowRuns, message.workflow_name);
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...pending,
+            id: pending?.id ?? message.task_id,
+            taskId: message.task_id,
+            workflowName: message.workflow_name,
+            taskType: message.task_type,
+            description: message.description ?? pending?.description,
+            toolUseId: message.tool_use_id,
+            workflowAgents: upsertWorkflowAgent(pending, {
+              id: message.tool_use_id ?? message.task_id,
+              label: message.workflow_name ?? "workflow task",
+              status: "running",
+              currentAction: message.description,
+              updatedAt: new Date().toISOString(),
+              rawSdkEvent: message,
+            }),
+            rawSdkEvent: message,
+            status: "running",
+          },
+          message.subtype,
+        );
+        break;
+      }
+      case "task_progress": {
+        const existing = findWorkflowRun(session.workflowRuns, { taskId: message.task_id });
+        if (!existing) return;
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...existing,
+            id: existing.id,
+            taskId: message.task_id,
+            description: message.description,
+            progress: message.summary ?? message.description,
+            summary: message.summary,
+            status: "running",
+            toolUseId: message.tool_use_id ?? existing.toolUseId,
+            lastToolName: message.last_tool_name,
+            workflowAgents: upsertWorkflowAgent(existing, {
+              id:
+                message.tool_use_id ??
+                currentWorkflowAgentId(existing) ??
+                message.last_tool_name ??
+                message.task_id,
+              label: message.last_tool_name ?? existing.lastToolName ?? "workflow task",
+              status: "running",
+              currentAction: message.summary ?? message.description,
+              lastToolName: message.last_tool_name,
+              usage: {
+                totalTokens: message.usage.total_tokens,
+                toolUses: message.usage.tool_uses,
+                durationMs: message.usage.duration_ms,
+              },
+              updatedAt: new Date().toISOString(),
+              rawSdkEvent: message,
+            }),
+            rawSdkEvent: message,
+            usage: {
+              totalTokens: message.usage.total_tokens,
+              toolUses: message.usage.tool_uses,
+              durationMs: message.usage.duration_ms,
+            },
+          },
+          message.subtype,
+        );
+        break;
+      }
+      case "task_updated": {
+        const existing = findWorkflowRun(session.workflowRuns, { taskId: message.task_id });
+        if (!existing) return;
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...existing,
+            id: existing.id,
+            taskId: message.task_id,
+            status: workflowStatusFromTaskPatch(message.patch.status, existing.status),
+            description: message.patch.description,
+            error: message.patch.error,
+            workflowAgents: upsertWorkflowAgent(existing, {
+              id:
+                currentWorkflowAgentId(existing) ??
+                existing.toolUseId ??
+                existing.lastToolName ??
+                message.task_id,
+              label: existing.lastToolName ?? existing.workflowName ?? "workflow task",
+              status: workflowStatusFromTaskPatch(message.patch.status, existing.status),
+              currentAction: message.patch.error ?? message.patch.description,
+              lastToolName: existing.lastToolName,
+              updatedAt: new Date().toISOString(),
+              rawSdkEvent: message,
+            }),
+            rawSdkEvent: message,
+          },
+          message.subtype,
+        );
+        break;
+      }
+      case "task_notification": {
+        const existing = findWorkflowRun(session.workflowRuns, { taskId: message.task_id });
+        if (!existing) return;
+        await this.recordWorkflowRun(
+          sessionId,
+          session,
+          {
+            ...existing,
+            id: existing.id,
+            taskId: message.task_id,
+            status: workflowStatusFromTaskNotification(message.status),
+            summary: message.summary,
+            toolUseId: message.tool_use_id ?? existing.toolUseId,
+            workflowAgents: upsertWorkflowAgent(existing, {
+              id:
+                message.tool_use_id ??
+                currentWorkflowAgentId(existing) ??
+                existing.toolUseId ??
+                existing.lastToolName ??
+                message.task_id,
+              label: existing.lastToolName ?? existing.workflowName ?? "workflow task",
+              status: workflowStatusFromTaskNotification(message.status),
+              currentAction: message.summary,
+              lastToolName: existing.lastToolName,
+              usage: message.usage
+                ? {
+                    totalTokens: message.usage.total_tokens,
+                    toolUses: message.usage.tool_uses,
+                    durationMs: message.usage.duration_ms,
+                  }
+                : existing.usage,
+              updatedAt: new Date().toISOString(),
+              rawSdkEvent: message,
+            }),
+            rawSdkEvent: message,
+            usage: message.usage
+              ? {
+                  totalTokens: message.usage.total_tokens,
+                  toolUses: message.usage.tool_uses,
+                  durationMs: message.usage.duration_ms,
+                }
+              : existing.usage,
+          },
+          message.subtype,
+        );
+        break;
+      }
+      default:
+        break;
+    }
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -1067,13 +1490,73 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
-    const userMessage = promptToClaude(params);
+    const rawCommandText = firstPromptText(params);
+    const commandText = extractUserSlashCommandText(rawCommandText);
+
+    if (isWorkflowListCommand(commandText)) {
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: renderWorkflowRuns(session.workflowRuns),
+          },
+        },
+      });
+      return { stopReason: "end_turn", usage: sessionUsage(session) };
+    }
+
+    const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+    const workflowSlashCommand = await resolveWorkflowSlashCommand(session.cwd, commandText);
+    let userMessage: SDKUserMessage;
+    if (workflowSlashCommand) {
+      const workflowInput = workflowInputFromSlashCommand(workflowSlashCommand);
+      if (session.modes.currentModeId !== "bypassPermissions") {
+        const workflow = await workflowRunStateFromWorkflowInput(
+          session.cwd,
+          workflowInput,
+          workflowSlashCommand.pendingId,
+        );
+        const approvalController = new AbortController();
+        session.workflowApprovalController = approvalController;
+        let approval: PermissionResult;
+        try {
+          approval = await this.requestWorkflowApproval(
+            params.sessionId,
+            session,
+            workflowInput,
+            workflow,
+            workflowSlashCommand.pendingId,
+            supportsTerminalOutput,
+            approvalController.signal,
+          );
+        } catch (error) {
+          if (!approvalController.signal.aborted) {
+            throw error;
+          }
+          approval = { behavior: "deny", message: "Workflow approval aborted" };
+        } finally {
+          if (session.workflowApprovalController === approvalController) {
+            session.workflowApprovalController = undefined;
+          }
+        }
+        if (approval.behavior !== "allow") {
+          return { stopReason: "end_turn", usage: sessionUsage(session) };
+        }
+        registerWorkflowApprovalGrant(session, session.cwd, workflowInput, workflow);
+      }
+      userMessage = workflowSlashCommandToClaude(params, workflowSlashCommand);
+    } else {
+      userMessage = promptToClaude(params);
+    }
+
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
     // Local-only commands (e.g. `/clear`) return a result without replaying the
     // user message, so the consumer can't promote the turn from the echo.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const firstText = commandText || rawCommandText;
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
@@ -1097,6 +1580,7 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
+    void response.finally(() => session.workflowApprovalGrants?.clear()).catch(() => {});
     return response;
   }
 
@@ -1617,7 +2101,9 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "available_commands_update",
-                    availableCommands: getAvailableSlashCommands(message.commands),
+                    availableCommands: withWorkflowSlashCommands(
+                      getAvailableSlashCommands(message.commands),
+                    ),
                   },
                 });
                 break;
@@ -1692,6 +2178,7 @@ export class ClaudeAcpAgent {
               case "task_notification":
               case "task_progress":
               case "task_updated":
+                await this.handleWorkflowTaskMessage(params.sessionId, message);
                 break;
               case "worker_shutting_down":
                 // A Remote Control worker announced a graceful teardown. This is a
@@ -1939,7 +2426,7 @@ export class ClaudeAcpAgent {
                     this.client,
                     this.logger,
                   )) {
-                    await this.client.sessionUpdate(notification);
+                    await this.sendSessionNotification(notification);
                   }
                 }
                 break;
@@ -2116,7 +2603,7 @@ export class ClaudeAcpAgent {
                 messageId: currentStreamMessageId,
               },
             )) {
-              await this.client.sessionUpdate(notification);
+              await this.sendSessionNotification(notification);
             }
             break;
           }
@@ -2231,7 +2718,7 @@ export class ClaudeAcpAgent {
                     messageId: messageIdForGrouping(message),
                   },
                 )) {
-                  await this.client.sessionUpdate(notification);
+                  await this.sendSessionNotification(notification);
                 }
               } else {
                 this.logger.log(message.message.content);
@@ -2362,7 +2849,7 @@ export class ClaudeAcpAgent {
                 messageId: messageIdForGrouping(message),
               },
             )) {
-              await this.client.sessionUpdate(notification);
+              await this.sendSessionNotification(notification);
             }
             break;
           }
@@ -2461,6 +2948,8 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    session.workflowApprovalController?.abort();
+    session.workflowApprovalController = undefined;
     // Settle queued turns that haven't started yet (no echo seen) right away —
     // they have no in-flight SDK work to interrupt. The active turn is settled
     // by the consumer when it observes the interrupt's trailing idle (or via the
@@ -2650,7 +3139,6 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
-
     const option = session.configOptions.find((o) => o.id === params.configId);
     if (!option) {
       throw new Error(`Unknown config option: ${params.configId}`);
@@ -2661,6 +3149,35 @@ export class ClaudeAcpAgent {
     // string-only validation the select-style options below rely on.
     if (params.configId === FAST_MODE_CONFIG_ID) {
       await this.applyFastMode(session, resolveFastModeEnabled(params));
+      return { configOptions: session.configOptions };
+    }
+
+    if (option.type === "boolean") {
+      const booleanValue =
+        typeof params.value === "boolean"
+          ? params.value
+          : params.value === "true"
+            ? true
+            : params.value === "false"
+              ? false
+              : undefined;
+      if (booleanValue === undefined) {
+        throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
+      }
+      await this.applyConfigOptionValue(
+        params.sessionId,
+        session,
+        params.configId,
+        String(booleanValue),
+      );
+
+      await this.client.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: session.configOptions,
+        },
+      });
       return { configOptions: session.configOptions };
     }
 
@@ -2814,7 +3331,7 @@ export class ClaudeAcpAgent {
           messageId: replayMessageId,
         },
       )) {
-        await this.client.sessionUpdate(notification);
+        await this.sendSessionNotification(notification);
       }
     }
   }
@@ -3011,6 +3528,17 @@ export class ClaudeAcpAgent {
         };
       }
 
+      if (toolName === "Workflow") {
+        return this.approveWorkflowToolUse(
+          sessionId,
+          session,
+          toolInput,
+          toolUseID,
+          supportsTerminalOutput,
+          signal,
+        );
+      }
+
       const response = await this.requestPermissionFromClient(
         {
           options: [
@@ -3197,7 +3725,7 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands),
+        availableCommands: withWorkflowSlashCommands(getAvailableSlashCommands(commands)),
       },
     });
   }
@@ -3293,6 +3821,7 @@ export class ClaudeAcpAgent {
       const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      const currentUltracode = currentBooleanConfigValue(session.configOptions, "ultracode");
       session.configOptions = buildConfigOptions(
         session.modes,
         session.models,
@@ -3308,6 +3837,7 @@ export class ClaudeAcpAgent {
           enabled: session.fastModeEnabled,
           useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
         },
+        currentUltracode,
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -3348,6 +3878,16 @@ export class ClaudeAcpAgent {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
+    } else if (configId === "ultracode") {
+      const booleanValue = value === "true";
+      session.configOptions = session.configOptions.map((o) =>
+        o.id === configId && typeof o.currentValue === "boolean"
+          ? { ...o, currentValue: booleanValue }
+          : o,
+      );
+      await session.query.applyFlagSettings({
+        ultracode: booleanValue,
+      });
     } else {
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
@@ -3961,6 +4501,7 @@ export class ClaudeAcpAgent {
       agents,
       currentAgent,
       fastMode,
+      settingsManager.getSettings().ultracode,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -3972,6 +4513,12 @@ export class ClaudeAcpAgent {
     ) {
       await q.applyFlagSettings({
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+      });
+    }
+    const initialUltracode = settingsManager.getSettings().ultracode;
+    if (typeof initialUltracode === "boolean") {
+      await q.applyFlagSettings({
+        ultracode: initialUltracode,
       });
     }
     this.sessions[sessionId] = {
@@ -4010,6 +4557,8 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
 
@@ -4324,6 +4873,7 @@ export function buildConfigOptions(
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
   fastMode?: FastModeOptionState,
+  currentUltracode?: boolean,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     {
@@ -4393,6 +4943,15 @@ export function buildConfigOptions(
   if (fastMode?.supported) {
     options.push(createFastModeConfigOption(fastMode.enabled, fastMode.useBooleanOption));
   }
+
+  options.push({
+    id: "ultracode",
+    name: "Ultracode",
+    description: "Enable Claude Code's dynamic workflow orchestration for supported models",
+    category: "thought_level",
+    type: "boolean",
+    currentValue: currentUltracode === true,
+  });
 
   // Only surface the Agent picker when there's a real choice — i.e. the user
   // has configured at least one custom agent (built-ins are filtered out in
@@ -4851,6 +5410,788 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+}
+
+function withWorkflowSlashCommands(commands: AvailableCommand[]): AvailableCommand[] {
+  const byName = new Map(commands.map((command) => [command.name, command]));
+  if (!byName.has("workflows")) {
+    byName.set("workflows", {
+      name: "workflows",
+      description: "Show Claude workflow runs and live progress",
+      input: null,
+    });
+  }
+  return [...byName.values()];
+}
+
+function isWorkflowListCommand(text: string): boolean {
+  const command = text.trim().split(/\s+/, 1)[0];
+  return command === "/workflows";
+}
+
+function firstPromptText(prompt: PromptRequest): string {
+  const block = prompt.prompt.find(
+    (item): item is { type: "text"; text: string } =>
+      item.type === "text" && typeof item.text === "string",
+  );
+  return block?.text ?? "";
+}
+
+export function extractUserSlashCommandText(text: string): string {
+  let candidate = text.trimStart();
+
+  for (;;) {
+    const before = candidate;
+    candidate = stripLeadingTaggedBlock(candidate, "system-reminder", "xml");
+    candidate = stripLeadingTaggedBlock(candidate, "Assistant Rules", "bracket");
+    candidate = candidate.trimStart();
+    if (candidate === before) {
+      break;
+    }
+  }
+
+  return candidate.startsWith("/") ? candidate : "";
+}
+
+function stripLeadingTaggedBlock(text: string, tag: string, syntax: "xml" | "bracket"): string {
+  const trimmed = text.trimStart();
+  const open = syntax === "xml" ? `<${tag}>` : `[${tag}]`;
+  const close = syntax === "xml" ? `</${tag}>` : `[/${tag}]`;
+  if (!trimmed.startsWith(open)) {
+    return text;
+  }
+
+  const closeIndex = trimmed.indexOf(close, open.length);
+  if (closeIndex < 0) {
+    return text;
+  }
+  return trimmed.slice(closeIndex + close.length);
+}
+
+type WorkflowSlashCommand = {
+  commandText: string;
+  commandName: string;
+  argsText: string;
+  workflowArgs?: unknown;
+  pendingId: string;
+  workflowName: string;
+  description?: string;
+  phases?: Array<{ title: string; detail?: string }>;
+  scriptPath: string;
+};
+
+export function parseWorkflowSlashCommandText(text: string): {
+  commandText: string;
+  commandName: string;
+  argsText: string;
+  workflowArgs?: unknown;
+} | null {
+  const commandText = text.trim();
+  if (!commandText.startsWith("/")) return null;
+
+  const [token = "", ...rest] = commandText.split(/\s+/);
+  const commandName = token.slice(1);
+  if (
+    commandName === "" ||
+    commandName.startsWith("mcp:") ||
+    commandName.includes("/") ||
+    commandName.includes("\\") ||
+    commandName.includes("..")
+  ) {
+    return null;
+  }
+
+  return {
+    commandText,
+    commandName,
+    ...parseWorkflowCommandArgs(rest.join(" ")),
+  };
+}
+
+function parseWorkflowCommandArgs(argsText: string): { argsText: string; workflowArgs?: unknown } {
+  const trimmed = argsText.trim();
+  if (!trimmed) {
+    return { argsText: "" };
+  }
+
+  try {
+    return { argsText: trimmed, workflowArgs: JSON.parse(trimmed) };
+  } catch {
+    return {
+      argsText: trimmed,
+      workflowArgs: {
+        value: trimmed,
+        raw: trimmed,
+        argv: shellWords(trimmed),
+      },
+    };
+  }
+}
+
+function shellWords(text: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaping = false;
+
+  for (const char of text) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if ((char === "'" || char === '"') && (!quote || quote === char)) {
+      quote = quote ? null : char;
+      continue;
+    }
+    if (!quote && /\s/.test(char)) {
+      if (current) {
+        words.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaping) current += "\\";
+  if (current) words.push(current);
+  return words;
+}
+
+function workflowApprovalToolCallFromInput(
+  input: WorkflowInput,
+  workflow: WorkflowRunState,
+  toolUseID: string,
+  supportsTerminalOutput: boolean,
+  cwd: string,
+) {
+  const base = toolInfoFromToolUse(
+    { name: "Workflow", input, id: toolUseID },
+    supportsTerminalOutput,
+    cwd,
+  );
+  return {
+    toolCallId: toolUseID,
+    rawInput: input,
+    ...base,
+    title: `Workflow ${workflow.workflowName ?? workflow.id}`,
+    content: [
+      {
+        type: "content" as const,
+        content: {
+          type: "text" as const,
+          text: workflowApprovalText(input, workflow),
+        },
+      },
+    ],
+  };
+}
+
+function workflowApprovalText(input: WorkflowInput, workflow: WorkflowRunState): string {
+  const lines = [
+    workflow.description ? `Description: ${workflow.description}` : undefined,
+    input.name ? `Name: ${input.name}` : undefined,
+    input.scriptPath ? `Script path: ${input.scriptPath}` : undefined,
+    input.resumeFromRunId ? `Resume from run ID: ${input.resumeFromRunId}` : undefined,
+    input.args !== undefined ? `Args: ${safeStringify(input.args)}` : undefined,
+  ].filter((line): line is string => Boolean(line));
+
+  if (workflow.phases?.length) {
+    lines.push(
+      "",
+      "Planned phases:",
+      ...workflow.phases.map(
+        (phase, index) => `${index + 1}. ${phase.title}${phase.detail ? ` - ${phase.detail}` : ""}`,
+      ),
+    );
+  }
+
+  return lines.join("\n");
+}
+
+async function renderWorkflowScriptForApproval(
+  input: WorkflowInput,
+  workflow: WorkflowRunState,
+  cwd: string,
+): Promise<string> {
+  if (typeof input.script === "string") {
+    return [
+      `Workflow script for ${workflow.workflowName ?? workflow.id}:`,
+      "",
+      "```js",
+      input.script,
+      "```",
+    ].join("\n");
+  }
+
+  const scriptPath = resolveWorkflowInputScriptPath(cwd, input.scriptPath);
+  if (!scriptPath) {
+    return [
+      `Workflow script for ${workflow.workflowName ?? workflow.id} is unavailable from the SDK input.`,
+      "",
+      "This workflow was provided by name only; the adapter can approve or deny the launch, but cannot show a raw script unless the SDK supplies script or scriptPath.",
+    ].join("\n");
+  }
+
+  try {
+    const source = await fs.readFile(scriptPath, "utf8");
+    return [
+      `Workflow script for ${workflow.workflowName ?? workflow.id}:`,
+      "",
+      "```js",
+      source,
+      "```",
+    ].join("\n");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return `Unable to read workflow script ${scriptPath}: ${message}`;
+  }
+}
+
+async function workflowRunStateFromWorkflowInput(
+  cwd: string,
+  input: WorkflowInput,
+  toolUseID: string,
+): Promise<WorkflowRunState> {
+  const scriptPath = resolveWorkflowInputScriptPath(cwd, input.scriptPath);
+  const meta = input.script
+    ? workflowScriptMetaFromSource(input.script)
+    : scriptPath
+      ? await readWorkflowScriptMeta(scriptPath)
+      : { phases: [] };
+  const workflowName =
+    input.name ??
+    meta.name ??
+    (scriptPath ? path.basename(scriptPath, path.extname(scriptPath)) : undefined);
+
+  return dropUndefined({
+    id: toolUseID,
+    toolUseId: toolUseID,
+    workflowName: workflowName ?? "Workflow",
+    description: meta.description ?? input.description,
+    phases: meta.phases.length > 0 ? meta.phases : undefined,
+    scriptPath: scriptPath ?? input.scriptPath,
+    rawInput: input,
+    status: "pending",
+  }) as WorkflowRunState;
+}
+
+function workflowInputFromSlashCommand(command: WorkflowSlashCommand): WorkflowInput {
+  return dropUndefined({
+    scriptPath: command.scriptPath,
+    args: command.workflowArgs,
+  }) as WorkflowInput;
+}
+
+function registerWorkflowApprovalGrant(
+  session: Session,
+  cwd: string,
+  input: WorkflowInput,
+  workflow: WorkflowRunState,
+): void {
+  const key = workflowApprovalGrantKey(cwd, input);
+  if (!key) return;
+  const grants = (session.workflowApprovalGrants ??= new Map());
+  grants.set(key, { key, input, workflow });
+}
+
+function consumeWorkflowApprovalGrant(
+  session: Session,
+  cwd: string,
+  input: WorkflowInput,
+): WorkflowApprovalGrant | undefined {
+  const key = workflowApprovalGrantKey(cwd, input);
+  if (!key) return undefined;
+  const grant = session.workflowApprovalGrants?.get(key);
+  if (grant) {
+    session.workflowApprovalGrants?.delete(key);
+  }
+  return grant;
+}
+
+function workflowApprovalGrantKey(cwd: string, input: WorkflowInput): string | undefined {
+  const scriptPath = resolveWorkflowInputScriptPath(cwd, input.scriptPath);
+  const identity = scriptPath
+    ? { scriptPath }
+    : typeof input.script === "string"
+      ? { script: input.script }
+      : typeof input.name === "string"
+        ? { name: input.name }
+        : undefined;
+  if (!identity) return undefined;
+
+  return stableJsonStringify(
+    dropUndefined({
+      ...identity,
+      args: input.args,
+      resumeFromRunId: input.resumeFromRunId,
+    }),
+  );
+}
+
+function stableJsonStringify(value: unknown): string {
+  return JSON.stringify(stableJsonValue(value));
+}
+
+function stableJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stableJsonValue);
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.keys(record)
+        .filter((key) => record[key] !== undefined)
+        .sort()
+        .map((key) => [key, stableJsonValue(record[key])]),
+    );
+  }
+  return value;
+}
+
+function workflowScriptMetaFromSource(source: string): {
+  name?: string;
+  description?: string;
+  phases: Array<{ title: string; detail?: string }>;
+} {
+  return {
+    name: matchStringProperty(source, "name"),
+    description: matchStringProperty(source, "description"),
+    phases: matchWorkflowPhases(source),
+  };
+}
+
+function resolveWorkflowInputScriptPath(
+  cwd: string,
+  scriptPath: string | undefined,
+): string | undefined {
+  if (!scriptPath) return undefined;
+  return path.isAbsolute(scriptPath) ? scriptPath : path.join(cwd, scriptPath);
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+async function resolveWorkflowSlashCommand(
+  cwd: string,
+  text: string,
+): Promise<WorkflowSlashCommand | null> {
+  const parsed = parseWorkflowSlashCommandText(text);
+  if (!parsed) return null;
+  if (LOCAL_ONLY_COMMANDS.has(`/${parsed.commandName}`)) return null;
+
+  const scriptPath = await findWorkflowScriptPath(cwd, parsed.commandName);
+  if (!scriptPath) return null;
+
+  const meta = await readWorkflowScriptMeta(scriptPath);
+  return {
+    ...parsed,
+    pendingId: `workflow:${parsed.commandName}:${randomUUID()}`,
+    workflowName: meta.name ?? parsed.commandName,
+    description: meta.description,
+    phases: meta.phases.length > 0 ? meta.phases : undefined,
+    scriptPath,
+  };
+}
+
+async function findWorkflowScriptPath(cwd: string, commandName: string): Promise<string | null> {
+  const roots = workflowSearchRoots(cwd);
+  const extensions = [".js", ".mjs"];
+
+  for (const root of roots) {
+    for (const extension of extensions) {
+      const candidate = path.join(root, `${commandName}${extension}`);
+      try {
+        const stats = await fs.stat(candidate);
+        if (stats.isFile()) return candidate;
+      } catch {
+        // Try the next standard workflow location.
+      }
+    }
+  }
+  return null;
+}
+
+function workflowSearchRoots(cwd: string): string[] {
+  const roots: string[] = [];
+  let current = path.resolve(cwd);
+
+  for (;;) {
+    roots.push(path.join(current, ".claude", "workflows"));
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  roots.push(path.join(CLAUDE_CONFIG_DIR, "workflows"));
+  return roots;
+}
+
+async function readWorkflowScriptMeta(scriptPath: string): Promise<{
+  name?: string;
+  description?: string;
+  phases: Array<{ title: string; detail?: string }>;
+}> {
+  try {
+    const source = await fs.readFile(scriptPath, "utf8");
+    return {
+      name: matchStringProperty(source, "name"),
+      description: matchStringProperty(source, "description"),
+      phases: matchWorkflowPhases(source),
+    };
+  } catch {
+    return { phases: [] };
+  }
+}
+
+function matchStringProperty(source: string, property: string): string | undefined {
+  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = source.match(new RegExp(`${escaped}\\s*:\\s*(['"\`])([\\s\\S]*?)\\1`));
+  return match?.[2] ? unescapeWorkflowString(match[2]) : undefined;
+}
+
+function matchWorkflowPhases(source: string): Array<{ title: string; detail?: string }> {
+  const phasesBlock = source.match(/phases\s*:\s*\[([\s\S]*?)\]\s*[,}]/)?.[1];
+  if (!phasesBlock) return [];
+
+  const phases: Array<{ title: string; detail?: string }> = [];
+  const phasePattern =
+    /{[^{}]*title\s*:\s*(['"`])([\s\S]*?)\1(?:\s*,\s*detail\s*:\s*(['"`])([\s\S]*?)\3)?[^{}]*}/g;
+  for (const match of phasesBlock.matchAll(phasePattern)) {
+    const title = unescapeWorkflowString(match[2] ?? "").trim();
+    const detail = unescapeWorkflowString(match[4] ?? "").trim();
+    if (title) {
+      phases.push({ title, ...(detail ? { detail } : {}) });
+    }
+  }
+  return phases;
+}
+
+function unescapeWorkflowString(value: string): string {
+  return value
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t")
+    .replace(/\\(['"`\\])/g, "$1");
+}
+
+function workflowSlashCommandToClaude(
+  prompt: PromptRequest,
+  command: WorkflowSlashCommand,
+): SDKUserMessage {
+  const message = promptToClaude(prompt);
+  const content = message.message.content;
+  if (Array.isArray(content)) {
+    const firstText = content.find(
+      (block): block is { type: "text"; text: string } =>
+        block.type === "text" && typeof block.text === "string",
+    );
+    if (firstText) {
+      firstText.text = buildWorkflowInvocationPrompt(command);
+    }
+  }
+  return message;
+}
+
+export function buildWorkflowInvocationPrompt(command: {
+  commandText: string;
+  workflowName: string;
+  description?: string;
+  scriptPath: string;
+  workflowArgs?: unknown;
+}): string {
+  const workflowInput = dropUndefined({
+    scriptPath: command.scriptPath,
+    args: command.workflowArgs,
+  });
+  const description = command.description ? `\nWorkflow description: ${command.description}` : "";
+  return [
+    `The user invoked the Claude Code workflow slash command \`${command.commandText}\`.`,
+    `Workflow name: ${command.workflowName}${description}`,
+    "",
+    "This is a direct workflow command dispatch. Do not inspect project files, run tests, or solve the task manually before launching the workflow.",
+    "Invoke the official Claude Workflow tool now with exactly this input:",
+    "```json",
+    JSON.stringify(workflowInput, null, 2),
+    "```",
+    "",
+    "If the Workflow tool is unavailable or rejects this workflow, report that error directly.",
+  ].join("\n");
+}
+
+function currentBooleanConfigValue(
+  options: SessionConfigOption[],
+  configId: string,
+): boolean | undefined {
+  const option = options.find((o) => o.id === configId);
+  return typeof option?.currentValue === "boolean" ? option.currentValue : undefined;
+}
+
+function getWorkflowFromNotification(notification: SessionNotification): WorkflowRunState | null {
+  const update = notification.update as {
+    rawOutput?: unknown;
+    _meta?: { claudeCode?: { workflow?: WorkflowRunState } };
+  };
+  if (update._meta?.claudeCode?.workflow) {
+    return update._meta.claudeCode.workflow;
+  }
+
+  const parsed = parseWorkflowOutput(update.rawOutput);
+  if (!parsed?.taskId) return null;
+  const now = new Date().toISOString();
+  return {
+    id: parsed.runId ?? parsed.taskId,
+    taskId: parsed.taskId,
+    runId: parsed.runId,
+    workflowName: parsed.workflowName,
+    status: parsed.error ? "failed" : "running",
+    taskType: parsed.taskType,
+    summary: parsed.summary,
+    scriptPath: parsed.scriptPath,
+    transcriptDir: parsed.transcriptDir,
+    sessionUrl: parsed.sessionUrl,
+    warning: parsed.warning,
+    error: parsed.error,
+    startedAt: now,
+    updatedAt: now,
+    ...(parsed.error ? { completedAt: now } : {}),
+  };
+}
+
+function findWorkflowRun(
+  workflowRuns: Map<string, WorkflowRunState>,
+  params: Record<string, unknown>,
+): WorkflowRunState | undefined {
+  return findWorkflowRunEntry(workflowRuns, params)?.run;
+}
+
+function findWorkflowRunEntry(
+  workflowRuns: Map<string, WorkflowRunState>,
+  params: Record<string, unknown>,
+): { key: string; run: WorkflowRunState } | undefined {
+  const ids = [params.id, params.runId, params.taskId, params.toolUseId].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  for (const id of ids) {
+    const direct = workflowRuns.get(id);
+    if (direct) return { key: id, run: direct };
+  }
+
+  for (const [key, run] of workflowRuns) {
+    if (
+      ids.some(
+        (id) =>
+          run.id === id ||
+          run.runId === id ||
+          run.taskId === id ||
+          run.toolUseId === id ||
+          run.aliases?.includes(id),
+      ) ||
+      (typeof params.workflowName === "string" &&
+        run.status === "pending" &&
+        !run.taskId &&
+        run.workflowName === params.workflowName)
+    ) {
+      return { key, run };
+    }
+  }
+  return undefined;
+}
+
+function canonicalWorkflowRunId(
+  incoming: Pick<WorkflowRunState, "id" | "runId" | "taskId" | "toolUseId">,
+  existing?: Pick<WorkflowRunState, "id" | "runId" | "taskId" | "toolUseId">,
+): string | undefined {
+  return (
+    incoming.runId ??
+    existing?.runId ??
+    incoming.taskId ??
+    existing?.taskId ??
+    existing?.id ??
+    incoming.id ??
+    incoming.toolUseId ??
+    existing?.toolUseId
+  );
+}
+
+function workflowRunAliases(
+  existing: WorkflowRunState | undefined,
+  incoming: WorkflowRunState,
+  canonicalId: string,
+): string[] | undefined {
+  const aliases = new Set<string>(existing?.aliases ?? []);
+  for (const value of [
+    existing?.id,
+    existing?.runId,
+    existing?.taskId,
+    existing?.toolUseId,
+    incoming.id,
+    incoming.runId,
+    incoming.taskId,
+    incoming.toolUseId,
+  ]) {
+    if (value && value !== canonicalId) aliases.add(value);
+  }
+  return aliases.size > 0 ? [...aliases] : undefined;
+}
+
+function findPendingWorkflowRun(
+  workflowRuns: Map<string, WorkflowRunState>,
+  workflowName: string | undefined,
+): WorkflowRunState | undefined {
+  if (!workflowName) return undefined;
+  return workflowRunSnapshots(workflowRuns).find(
+    (run) =>
+      run.status === "pending" &&
+      !run.taskId &&
+      (run.workflowName === workflowName || run.workflowName === undefined),
+  );
+}
+
+function workflowRunSnapshots(workflowRuns: Map<string, WorkflowRunState>): WorkflowRunState[] {
+  const deduped = new Map<string, WorkflowRunState>();
+  for (const run of workflowRuns.values()) {
+    const id = canonicalWorkflowRunId(run) ?? run.id;
+    deduped.set(id, { ...run, id });
+  }
+  return [...deduped.values()].sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+}
+
+function renderWorkflowRuns(workflowRuns: Map<string, WorkflowRunState>): string {
+  const runs = workflowRunSnapshots(workflowRuns);
+  if (runs.length === 0) {
+    return "No Claude workflows are currently tracked in this session.";
+  }
+
+  const groups: WorkflowRunStatus[] = [
+    "running",
+    "pending",
+    "paused",
+    "completed",
+    "failed",
+    "stopped",
+  ];
+  const sections: string[] = [];
+  for (const status of groups) {
+    const matching = runs.filter((run) => run.status === status);
+    if (matching.length === 0) continue;
+    sections.push(`## ${workflowStatusLabel(status)}`);
+    for (const run of matching) {
+      sections.push(formatWorkflowRun(run));
+    }
+  }
+  const unknown = runs.filter((run) => !groups.includes(run.status));
+  if (unknown.length > 0) {
+    sections.push("## Other");
+    sections.push(...unknown.map(formatWorkflowRun));
+  }
+  return sections.join("\n\n");
+}
+
+function formatWorkflowRun(run: WorkflowRunState): string {
+  const lines = [`- ${run.workflowName ?? run.description ?? run.id}`];
+  lines.push(`  Status: ${run.status}`);
+  if (run.runId) lines.push(`  Run ID: ${run.runId}`);
+  if (run.taskId) lines.push(`  Task ID: ${run.taskId}`);
+  if (run.progress) lines.push(`  Progress: ${run.progress}`);
+  if (run.summary) lines.push(`  Summary: ${run.summary}`);
+  if (run.scriptPath) lines.push(`  Script: ${run.scriptPath}`);
+  if (run.transcriptDir) lines.push(`  Transcript: ${run.transcriptDir}`);
+  if (run.sessionUrl) lines.push(`  Session: ${run.sessionUrl}`);
+  if (run.warning) lines.push(`  Warning: ${run.warning}`);
+  if (run.error) lines.push(`  Error: ${run.error}`);
+  return lines.join("\n");
+}
+
+function workflowStatusLabel(status: WorkflowRunStatus): string {
+  switch (status) {
+    case "running":
+      return "Running Workflows";
+    case "pending":
+      return "Pending Workflows";
+    case "paused":
+      return "Paused Workflows";
+    case "completed":
+      return "Completed Workflows";
+    case "failed":
+      return "Failed Workflows";
+    case "stopped":
+      return "Stopped Workflows";
+    default:
+      return "Workflows";
+  }
+}
+
+function workflowStatusFromTaskNotification(
+  status: "completed" | "failed" | "stopped",
+): WorkflowRunStatus {
+  return status;
+}
+
+function workflowStatusFromTaskPatch(
+  status: "pending" | "running" | "completed" | "failed" | "killed" | "paused" | undefined,
+  fallback: WorkflowRunStatus,
+): WorkflowRunStatus {
+  switch (status) {
+    case "pending":
+    case "running":
+    case "completed":
+    case "failed":
+    case "paused":
+      return status;
+    case "killed":
+      return "stopped";
+    default:
+      return fallback;
+  }
+}
+
+function isTerminalWorkflowStatus(status: WorkflowRunStatus): boolean {
+  return status === "completed" || status === "failed" || status === "stopped";
+}
+
+function upsertWorkflowAgent(
+  existing: WorkflowRunState | undefined,
+  agent: WorkflowAgentState,
+): WorkflowAgentState[] {
+  const agents = new Map<string, WorkflowAgentState>();
+  for (const current of existing?.workflowAgents ?? []) {
+    agents.set(current.id, current);
+  }
+  const previous = agents.get(agent.id);
+  agents.set(agent.id, {
+    ...previous,
+    ...dropUndefined(agent),
+    id: agent.id,
+    status: agent.status ?? previous?.status ?? "unknown",
+  });
+  return [...agents.values()];
+}
+
+function currentWorkflowAgentId(existing: WorkflowRunState | undefined): string | undefined {
+  return (
+    existing?.workflowAgents?.find(
+      (agent) => agent.status === "running" || agent.status === "pending",
+    )?.id ?? existing?.workflowAgents?.[0]?.id
+  );
+}
+
+function dropUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entryValue]) => entryValue !== undefined),
+  ) as Partial<T>;
 }
 
 function formatUriAsLink(uri: string): string {
@@ -5514,11 +6855,27 @@ export function runAcp() {
     .onRequest(methods.agent.session.prompt, (ctx) =>
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
+    .onRequest("_claude/workflows/list", parseExtParams, (ctx) =>
+      agent.extMethod("_claude/workflows/list", ctx.params),
+    )
+    .onRequest("_claude/workflows/get", parseExtParams, (ctx) =>
+      agent.extMethod("_claude/workflows/get", ctx.params),
+    )
+    .onRequest("_claude/workflows/stop", parseExtParams, (ctx) =>
+      agent.extMethod("_claude/workflows/stop", ctx.params),
+    )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .connect(stream);
 
   agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
   return { connection, agent };
+}
+
+function parseExtParams(params: unknown): Record<string, unknown> {
+  if (params && typeof params === "object" && !Array.isArray(params)) {
+    return params as Record<string, unknown>;
+  }
+  return {};
 }
 
 function commonPrefixLength(a: string, b: string) {

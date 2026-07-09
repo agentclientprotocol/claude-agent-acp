@@ -20,4 +20,4 @@ export {
 export { SettingsManager, type SettingsManagerOptions } from "./settings.js";
 
 // Export types
-export type { ClaudePlanEntry } from "./tools.js";
+export type { ClaudePlanEntry, WorkflowRunState, WorkflowRunStatus } from "./tools.js";

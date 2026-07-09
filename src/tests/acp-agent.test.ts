@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   AvailableCommand,
   client as acpClient,
@@ -38,7 +41,9 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
+  buildWorkflowInvocationPrompt,
   discoverCustomAgents,
+  parseWorkflowSlashCommandText,
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
@@ -131,6 +136,8 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     taskState: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
+    workflowRuns: new Map(),
+    workflowApprovalGrants: new Map(),
     messageIdToUuid: new Map(),
     ...overrides,
   } as any;
@@ -1446,6 +1453,40 @@ describe("isLocalCommandMetadata", () => {
   });
 });
 
+describe("workflow slash command helpers", () => {
+  it("parses workflow slash commands without accepting path traversal", () => {
+    expect(parseWorkflowSlashCommandText("/execute-order-test-cases client-config")).toEqual({
+      commandText: "/execute-order-test-cases client-config",
+      commandName: "execute-order-test-cases",
+      argsText: "client-config",
+      workflowArgs: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    });
+    expect(parseWorkflowSlashCommandText('/triage {"issues":[1024,1025]}')).toEqual({
+      commandText: '/triage {"issues":[1024,1025]}',
+      commandName: "triage",
+      argsText: '{"issues":[1024,1025]}',
+      workflowArgs: { issues: [1024, 1025] },
+    });
+    expect(parseWorkflowSlashCommandText("/mcp:server:name args")).toBeNull();
+    expect(parseWorkflowSlashCommandText("/../workflow args")).toBeNull();
+  });
+
+  it("builds a Workflow tool dispatch prompt for workflow slash commands", () => {
+    const prompt = buildWorkflowInvocationPrompt({
+      commandText: "/execute-order-test-cases client-config",
+      workflowName: "execute-order-test-cases",
+      description: "Execute order tests",
+      scriptPath: "/repo/.claude/workflows/execute-order-test-cases.js",
+      workflowArgs: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    });
+
+    expect(prompt).toContain("official Claude Workflow tool");
+    expect(prompt).toContain('"scriptPath": "/repo/.claude/workflows/execute-order-test-cases.js"');
+    expect(prompt).toContain('"args": {');
+    expect(prompt).toContain("Do not inspect project files");
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
@@ -1830,6 +1871,8 @@ describe("permission request cancellation", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
@@ -3177,6 +3220,8 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -3264,6 +3309,8 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -3368,6 +3415,8 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -5605,6 +5654,8 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -6375,6 +6426,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      workflowRuns: new Map(),
+      workflowApprovalGrants: new Map(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -7019,6 +7072,352 @@ describe("messageIdForGrouping", () => {
   });
 });
 
+describe("Claude workflow support", () => {
+  function createWorkflowAgent(
+    messages: any[] = [],
+    options: { permissionSelections?: string[] } = {},
+  ) {
+    const updates: any[] = [];
+    const extNotifications: { method: string; params: any }[] = [];
+    const permissionRequests: RequestPermissionRequest[] = [];
+    const stopTask = vi.fn(async () => {});
+    const permissionSelections = [...(options.permissionSelections ?? ["run_once"])];
+    const input = new Pushable<any>();
+    const sdkInputs: any[] = [];
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        sdkInputs.push(userMessage);
+        yield {
+          type: "user",
+          message: userMessage.message,
+          parent_tool_use_id: null,
+          uuid: userMessage.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+    }
+
+    const mockClient = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        extNotifications.push({ method, params });
+      },
+      requestPermission: async (params: RequestPermissionRequest) => {
+        permissionRequests.push(params);
+        const optionId = permissionSelections.shift() ?? "run_once";
+        return { outcome: { outcome: "selected", optionId } };
+      },
+      readTextFile: async () => ({ content: "" }),
+      writeTextFile: async () => ({}),
+      unstable_createElicitation: async () => ({ action: "decline" }),
+      unstable_completeElicitation: async () => {},
+    } as unknown as AcpClient;
+
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["test-session"] = mockSessionState({
+      query: Object.assign(messageGenerator()[Symbol.asyncIterator](), {
+        interrupt: vi.fn(async () => {}),
+        close: vi.fn(),
+        stopTask,
+      }),
+      input,
+    });
+    return { agent, updates, extNotifications, stopTask, permissionRequests, sdkInputs };
+  }
+
+  function successResult() {
+    return {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "",
+      stop_reason: "end_turn",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      total_cost_usd: 0,
+      session_id: "test-session",
+    };
+  }
+
+  function idleState() {
+    return {
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      session_id: "test-session",
+      uuid: randomUUID(),
+    };
+  }
+
+  async function createWorkflowCwd(): Promise<{ cwd: string; scriptPath: string }> {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "claude-acp-workflow-"));
+    const workflowDir = path.join(cwd, ".claude", "workflows");
+    await fs.mkdir(workflowDir, { recursive: true });
+    const scriptPath = path.join(workflowDir, "execute-order-test-cases.js");
+    await fs.writeFile(
+      scriptPath,
+      [
+        "export const meta = {",
+        "  name: 'execute-order-test-cases',",
+        "  description: 'Execute order tests',",
+        "  phases: [",
+        "    { title: 'Prepare', detail: 'Find test cases' },",
+        "    { title: 'Run', detail: 'Execute cases' },",
+        "  ],",
+        "};",
+        "phase('Prepare');",
+      ].join("\n"),
+    );
+    return { cwd, scriptPath };
+  }
+
+  it("requests workflow approval before allowing Workflow tool use", async () => {
+    const { cwd, scriptPath } = await createWorkflowCwd();
+    const { agent, permissionRequests, extNotifications } = createWorkflowAgent();
+    agent.sessions["test-session"].cwd = cwd;
+    const workflowInput = {
+      scriptPath,
+      args: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    };
+
+    const result = await (agent as any).canUseTool("test-session")("Workflow", workflowInput, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_workflow",
+    });
+
+    expect(result).toMatchObject({ behavior: "allow", updatedInput: workflowInput });
+    expect(permissionRequests).toHaveLength(1);
+    expect(permissionRequests[0].options.map((option) => option.optionId)).toEqual([
+      "run_once",
+      "view_script",
+      "deny",
+    ]);
+    expect(permissionRequests[0].toolCall?.title).toBe("Workflow execute-order-test-cases");
+    expect(permissionRequests[0].toolCall?.rawInput).toMatchObject(workflowInput);
+    expect(extNotifications[0].params.workflow).toMatchObject({
+      id: "toolu_workflow",
+      toolUseId: "toolu_workflow",
+      workflowName: "execute-order-test-cases",
+      scriptPath,
+      rawInput: workflowInput,
+      progress: "Awaiting workflow approval",
+    });
+    expect(extNotifications[extNotifications.length - 1]?.params.workflow.progress).toBe(
+      "Workflow approved; waiting for Claude Workflow tool launch",
+    );
+  });
+
+  it("requests workflow approval before dispatching workflow slash commands", async () => {
+    const { cwd, scriptPath } = await createWorkflowCwd();
+    const { agent, permissionRequests, sdkInputs } = createWorkflowAgent([
+      successResult(),
+      idleState(),
+    ]);
+    agent.sessions["test-session"].cwd = cwd;
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/execute-order-test-cases client-config" }],
+    });
+
+    expect(permissionRequests).toHaveLength(1);
+    expect(permissionRequests[0].toolCall?.rawInput).toMatchObject({
+      scriptPath,
+      args: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    });
+    expect(sdkInputs).toHaveLength(1);
+    expect(sdkInputs[0].message.content[0].text).toContain('"args": {');
+  });
+
+  it("does not dispatch denied workflow slash commands", async () => {
+    const { cwd } = await createWorkflowCwd();
+    const { agent, permissionRequests, sdkInputs } = createWorkflowAgent(
+      [successResult(), idleState()],
+      { permissionSelections: ["deny"] },
+    );
+    agent.sessions["test-session"].cwd = cwd;
+
+    const result = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/execute-order-test-cases client-config" }],
+    });
+    const list = await agent.extMethod("_claude/workflows/list", { sessionId: "test-session" });
+
+    expect(result.stopReason).toBe("end_turn");
+    expect(permissionRequests).toHaveLength(1);
+    expect(sdkInputs).toHaveLength(0);
+    expect(list.workflows).toMatchObject([
+      {
+        workflowName: "execute-order-test-cases",
+        status: "stopped",
+        summary: "Workflow launch denied before launch",
+      },
+    ]);
+  });
+
+  it("shows raw script and then continues the same workflow approval flow", async () => {
+    const { cwd } = await createWorkflowCwd();
+    const { agent, permissionRequests, sdkInputs, updates } = createWorkflowAgent(
+      [successResult(), idleState()],
+      { permissionSelections: ["view_script", "run_once"] },
+    );
+    agent.sessions["test-session"].cwd = cwd;
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/execute-order-test-cases client-config" }],
+    });
+
+    expect(permissionRequests).toHaveLength(2);
+    expect(
+      updates.some((update) => update.update?.content?.text?.includes("phase('Prepare')")),
+    ).toBe(true);
+    expect(sdkInputs).toHaveLength(1);
+  });
+
+  it("does not ask twice when Workflow tool input matches a slash approval grant", async () => {
+    const { cwd, scriptPath } = await createWorkflowCwd();
+    const { agent, permissionRequests } = createWorkflowAgent();
+    const session = agent.sessions["test-session"] as any;
+    session.cwd = cwd;
+    const workflowInput = {
+      scriptPath,
+      args: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    };
+    const workflow = {
+      id: "workflow:execute-order-test-cases:pending",
+      workflowName: "execute-order-test-cases",
+      scriptPath,
+      rawInput: workflowInput,
+      status: "pending",
+    };
+    const grantKey = JSON.stringify({
+      args: { argv: ["client-config"], raw: "client-config", value: "client-config" },
+      scriptPath,
+    });
+    session.workflowRuns.set(workflow.id, workflow);
+    session.workflowApprovalGrants.set(grantKey, {
+      key: grantKey,
+      input: workflowInput,
+      workflow,
+    });
+
+    const result = await (agent as any).canUseTool("test-session")("Workflow", workflowInput, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_from_slash",
+    });
+    const list = await agent.extMethod("_claude/workflows/list", { sessionId: "test-session" });
+
+    expect(result).toMatchObject({ behavior: "allow", updatedInput: workflowInput });
+    expect(permissionRequests).toHaveLength(0);
+    expect(session.workflowApprovalGrants.size).toBe(0);
+    expect(list.workflows).toMatchObject([
+      {
+        id: "workflow:execute-order-test-cases:pending",
+        toolUseId: "toolu_from_slash",
+        workflowName: "execute-order-test-cases",
+      },
+    ]);
+  });
+
+  it("asks again when Workflow tool input does not match a slash approval grant", async () => {
+    const { cwd, scriptPath } = await createWorkflowCwd();
+    const { agent, permissionRequests } = createWorkflowAgent();
+    const session = agent.sessions["test-session"] as any;
+    session.cwd = cwd;
+    const approvedInput = {
+      scriptPath,
+      args: { value: "client-config", raw: "client-config", argv: ["client-config"] },
+    };
+    const changedInput = {
+      scriptPath,
+      args: { value: "supplier-config", raw: "supplier-config", argv: ["supplier-config"] },
+    };
+    const grantKey = JSON.stringify({
+      args: { argv: ["client-config"], raw: "client-config", value: "client-config" },
+      scriptPath,
+    });
+    session.workflowApprovalGrants.set(grantKey, {
+      key: grantKey,
+      input: approvedInput,
+      workflow: {
+        id: "workflow:execute-order-test-cases:pending",
+        workflowName: "execute-order-test-cases",
+        scriptPath,
+        rawInput: approvedInput,
+        status: "pending",
+      },
+    });
+
+    const result = await (agent as any).canUseTool("test-session")("Workflow", changedInput, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_changed",
+    });
+
+    expect(result).toMatchObject({ behavior: "allow", updatedInput: changedInput });
+    expect(permissionRequests).toHaveLength(1);
+    expect(session.workflowApprovalGrants.size).toBe(1);
+  });
+
+  it("renders /workflows from the local registry without invoking the SDK", async () => {
+    const { agent, updates, sdkInputs } = createWorkflowAgent();
+    agent.sessions["test-session"].workflowRuns.set("wf_123", {
+      id: "wf_123",
+      runId: "wf_123",
+      taskId: "task_123",
+      workflowName: "spec",
+      status: "running",
+      scriptPath: "/repo/.claude/workflows/spec.js",
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/workflows" }],
+    });
+
+    expect(updates[0].update.content.text).toContain("Running Workflows");
+    expect(updates[0].update.content.text).toContain("spec");
+    expect(sdkInputs).toHaveLength(0);
+  });
+
+  it("supports workflow ext list/get/stop methods", async () => {
+    const { agent, stopTask } = createWorkflowAgent();
+    agent.sessions["test-session"].workflowRuns.set("wf_123", {
+      id: "wf_123",
+      runId: "wf_123",
+      taskId: "task_123",
+      workflowName: "spec",
+      status: "running",
+    });
+
+    await expect(
+      agent.extMethod("_claude/workflows/list", { sessionId: "test-session" }),
+    ).resolves.toMatchObject({ workflows: [{ id: "wf_123", workflowName: "spec" }] });
+    await expect(
+      agent.extMethod("_claude/workflows/get", { sessionId: "test-session", runId: "wf_123" }),
+    ).resolves.toMatchObject({ workflow: { id: "wf_123", taskId: "task_123" } });
+    await expect(
+      agent.extMethod("_claude/workflows/stop", { sessionId: "test-session", runId: "wf_123" }),
+    ).resolves.toMatchObject({ ok: true, taskId: "task_123" });
+    expect(stopTask).toHaveBeenCalledWith("task_123");
+  });
+});
+
 describe("agent selection config option", () => {
   const baseModes = { currentModeId: "default", availableModes: [] };
   const baseModels = { currentModelId: "default", availableModels: [] };
@@ -7133,6 +7532,8 @@ describe("agent selection config option", () => {
         taskState: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        workflowRuns: new Map(),
+        workflowApprovalGrants: new Map(),
         messageIdToUuid: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
