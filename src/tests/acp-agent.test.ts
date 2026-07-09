@@ -4960,6 +4960,96 @@ describe("assembled assistant text fallback", () => {
 
     expect(messageChunkTexts(updates)).toEqual(["answer", "answer"]);
   });
+
+  // A cache-replayed turn reports output_tokens: 0 and, on some CLIs, carries
+  // the answer only on the result — no deltas, no consolidated message.
+  function replayedResult(text: string) {
+    return { ...result(), result: text };
+  }
+
+  it("forwards the result text when nothing else carried it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [replayedResult("**3**"), idle]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("does not re-emit the result text after the consolidated message delivered it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      assistantMessage("msg-1", [{ type: "text", text: "**3**" }]),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("does not re-emit the result text when the echo lands mid-message", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // The echo activates the turn after the text has already streamed, and the
+    // consolidated message then dedupes to nothing. The delivery flag survives
+    // that activation, so the result must not re-emit the answer.
+    injectSessionEchoAt(agent, [
+      messageStart("msg-streamed"),
+      textDelta("**3**"),
+      "ECHO",
+      assistantMessage("msg-streamed", [{ type: "text", text: "**3**" }]),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("leaves the result text alone when the turn generated output tokens", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // output_tokens > 0 means the model produced this turn's text through the
+    // stream/assistant paths; the result is their trailing copy, not the only one.
+    injectSession(agent, [
+      { ...replayedResult("**3**"), usage: { ...ZERO_USAGE, output_tokens: 5 } },
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("does not forward the result text of a task-notification followup", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { ...replayedResult("background output"), origin: { kind: "task-notification" } },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("does not forward the result text of a turn that only emitted status text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // `/compact` carries no echo, so it is promoted at its own result, and its
+    // status text is emitted directly rather than through the forwarding loops.
+    // That text still counts as delivered, so the result must not follow it.
+    injectSession(agent, [
+      { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+  });
 });
 
 describe("emitRawSDKMessages", () => {

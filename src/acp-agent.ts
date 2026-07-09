@@ -1163,6 +1163,16 @@ export class ClaudeAcpAgent {
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
+    // Whether any assistant text reached the client since the last result, from
+    // either the live `stream_event` deltas or the consolidated `assistant`
+    // message. Read at the terminal `result` to tell a turn whose answer was
+    // already delivered from one that only ever carried it on `result`
+    // (issue #453). Delimited by results, and deliberately NOT reset in
+    // resetTurnScratch: turn activation can fire mid-message (see there), so a
+    // flag cleared on activation would forget text that already streamed — the
+    // consolidated message then dedupes to nothing, nothing sets the flag
+    // again, and the result text would be emitted a second time.
+    let emittedAssistantText = false;
     // How many trailing `session_state_changed: idle` messages are already
     // accounted for: every user-turn result that terminates a turn (settle,
     // reject, or orphan skip) is followed by one, as is a cancelled turn
@@ -1415,8 +1425,15 @@ export class ClaudeAcpAgent {
                 await this.syncFastModeState(message.session_id, session, message.fast_mode_state);
                 break;
               case "status": {
+                // These chunks go straight to the client rather than through
+                // the forwarding loops, so they set the delivery flag here.
+                // Otherwise an echo-less turn that only ever emits them (e.g.
+                // `/compact`, promoted at its own result) reaches the result
+                // with the flag clear and the result-text fallback misreads it
+                // as a turn whose answer never arrived.
                 if (message.status === "compacting") {
                   compactionInProgress = true;
+                  emittedAssistantText = true;
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
@@ -1429,6 +1446,7 @@ export class ClaudeAcpAgent {
                   // message carrying `compact_result`, not the `compact_boundary`
                   // message (which only fires when there's content to compact).
                   compactionInProgress = false;
+                  emittedAssistantText = true;
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
                     update: {
@@ -1438,6 +1456,7 @@ export class ClaudeAcpAgent {
                   });
                 } else if (message.compact_result === "failed" && compactionInProgress) {
                   compactionInProgress = false;
+                  emittedAssistantText = true;
                   const reason = message.compact_error ? `: ${message.compact_error}` : ".";
                   await this.client.sessionUpdate({
                     sessionId: message.session_id,
@@ -1485,6 +1504,8 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                // Direct emission, as in the `status` handler above.
+                emittedAssistantText = true;
                 await this.client.sessionUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -1801,6 +1822,14 @@ export class ClaudeAcpAgent {
             // slash-command output forwarding) but their cost is real.
             const isTaskNotification = message.origin?.kind === "task-notification";
 
+            // A result closes the stretch of output it terminates, so read the
+            // delivery flag here and clear it for the next one. Task-notification
+            // followups run alongside a user turn and must not clear its flag.
+            const deliveredAssistantText = emittedAssistantText;
+            if (!isTaskNotification) {
+              emittedAssistantText = false;
+            }
+
             // Reconcile the Fast mode toggle with the SDK's reported state.
             // Gated to user-driven turns like every other side effect below; a
             // background followup's state lands on the next user turn's result.
@@ -1931,6 +1960,31 @@ export class ClaudeAcpAgent {
                 // Task-notification followups never originate from a user
                 // slash command, so skip the forwarding for them.
                 if (session.activeTurn?.isLocalOnlyCommand && !isTaskNotification) {
+                  for (const notification of toAcpNotifications(
+                    message.result,
+                    "assistant",
+                    params.sessionId,
+                    session.toolUseCache,
+                    this.client,
+                    this.logger,
+                  )) {
+                    await this.client.sessionUpdate(notification);
+                  }
+                } else if (
+                  !isTaskNotification &&
+                  !deliveredAssistantText &&
+                  message.usage.output_tokens === 0 &&
+                  message.result.length > 0
+                ) {
+                  // A cache-replayed turn generates no tokens, so some CLIs
+                  // skip streaming entirely and answer on the `result` alone:
+                  // no `stream_event` deltas and no consolidated `assistant`
+                  // message to carry the text. Forward it here rather than end
+                  // the turn silently (issue #453). `deliveredAssistantText`
+                  // covers whatever already reached the client, and the
+                  // output_tokens check keeps the fallback to the replayed
+                  // turns it was reported for, so a turn that already showed
+                  // its answer cannot emit it twice.
                   for (const notification of toAcpNotifications(
                     message.result,
                     "assistant",
@@ -2116,6 +2170,15 @@ export class ClaudeAcpAgent {
                 messageId: currentStreamMessageId,
               },
             )) {
+              // Subagent prose never reaches the top-level feed (see the
+              // consolidated handler), so only a top-level chunk counts as the
+              // turn's answer having been delivered.
+              if (
+                notification.update.sessionUpdate === "agent_message_chunk" &&
+                message.parent_tool_use_id === null
+              ) {
+                emittedAssistantText = true;
+              }
               await this.client.sessionUpdate(notification);
             }
             break;
@@ -2362,6 +2425,12 @@ export class ClaudeAcpAgent {
                 messageId: messageIdForGrouping(message),
               },
             )) {
+              // No `parent_tool_use_id` gate needed here: subagent text and
+              // thinking are filtered out of `content` above, so a subagent
+              // message cannot produce an agent_message_chunk.
+              if (notification.update.sessionUpdate === "agent_message_chunk") {
+                emittedAssistantText = true;
+              }
               await this.client.sessionUpdate(notification);
             }
             break;
