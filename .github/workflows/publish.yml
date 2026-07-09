@@ -50,8 +50,6 @@ jobs:
         with:
           node-version: "lts/*"
           registry-url: "https://registry.npmjs.org"
-      - name: Update npm
-        run: npm install -g npm@latest
       - run: npm ci
       - run: npm run build
       - run: npm publish
