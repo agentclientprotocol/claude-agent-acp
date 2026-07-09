@@ -229,8 +229,11 @@ type Session = {
    *  the SDK still runs it and emits a result with no uuid we can match. Because
    *  the SDK processes input FIFO, those orphan results arrive (in submission
    *  order) before the next live turn's, so skipping exactly this many leaves
-   *  the genuine head untouched. Reset to 0 on every activation as a backstop
-   *  against an SDK that drops queued input on interrupt (no orphan emitted). */
+   *  the genuine head untouched. On CLIs with the interrupt receipt, orphans
+   *  the interrupt dropped (absent from `still_queued`) are uncounted as soon
+   *  as the receipt arrives (see cancel()). Reset to 0 on every activation as
+   *  a backstop against a dropped queued input this can't see (older CLIs, a
+   *  receipt lost to a failed control round-trip). */
   pendingOrphanResults?: number;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
@@ -1777,6 +1780,15 @@ export class ClaudeAcpAgent {
                   lastRefusalExplanation = message.api_refusal_explanation ?? message.content;
                 }
                 break;
+              // `control_request_progress` only reports on side_question
+              // control requests, which this adapter never issues.
+              // `background_tasks_changed` is a level signal (the full live
+              // background-task set on every membership change) for surfaces
+              // that render a background-activity indicator; turn lifecycle
+              // here is driven by results/idle, so there is nothing to track.
+              case "control_request_progress":
+              case "background_tasks_changed":
+                break;
               default:
                 unreachable(message, this.logger);
                 break;
@@ -2388,13 +2400,10 @@ export class ClaudeAcpAgent {
           // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
           // flows) is safe to drop: turn lifecycle here is driven by
           // results/idle, and the client owns its own transcript view.
-          // `control_request_progress` only reports on side_question control
-          // requests, which this adapter never issues.
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
           case "conversation_reset":
-          case "control_request_progress":
             break;
           default:
             unreachable(message);
@@ -2456,22 +2465,22 @@ export class ClaudeAcpAgent {
     // they have no in-flight SDK work to interrupt. The active turn is settled
     // by the consumer when it observes the interrupt's trailing idle (or via the
     // backstop below). Mirrors the old pendingMessages cancellation.
+    const orphanedUuids: string[] = [];
     if (session.turnQueue) {
-      let orphaned = 0;
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
           // Deliberately no `usage`: a queued turn never ran, so the session
           // accumulator (the active turn's tally) is not its spend.
           turn.resolve({ stopReason: "cancelled" });
-          orphaned++;
+          orphanedUuids.push(turn.promptUuid);
         }
       }
       // Each removed queued turn's user message was already pushed to the SDK,
       // which processes input FIFO and will still emit a result for it with no
       // uuid to match. Count those so the consumer skips them (see
       // ensureActiveTurn) rather than misattributing them to the head.
-      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphaned;
+      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphanedUuids.length;
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
       );
@@ -2503,7 +2512,29 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
-    await session.query.interrupt();
+    const receipt = await session.query.interrupt();
+    // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
+    // lists exactly which queued messages survive the interrupt and will still
+    // run. An orphaned turn whose uuid is absent was dropped by the interrupt
+    // and will never emit a result — uncount it now instead of leaving a stale
+    // skip that activateTurn's reset only clears once a later live ECHO
+    // arrives: an echo-less result in between (a local-only command like
+    // `/context`) would be wrongly swallowed by the leftover count. Subtracting
+    // a count (rather than tracking uuids) stays race-safe against the
+    // consumer draining concurrently: dropped uuids produce no results, so the
+    // consumer's decrements only ever consume the still-queued share. Unknown
+    // uuids in the receipt (internally-enqueued messages) are ignored, per its
+    // contract. Older CLIs resolve `undefined` (guard the FIELD, not just the
+    // receipt, so a bare `{}` success from a gateway can't read as "everything
+    // was dropped") — keep the count-everything behavior and its
+    // activation-time self-heal.
+    if (Array.isArray(receipt?.still_queued) && orphanedUuids.length > 0) {
+      const stillQueued = new Set(receipt.still_queued);
+      const dropped = orphanedUuids.filter((uuid) => !stillQueued.has(uuid)).length;
+      if (dropped > 0) {
+        session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - dropped);
+      }
+    }
   }
 
   /** Mark a session's SDK query stream as permanently ended and release the

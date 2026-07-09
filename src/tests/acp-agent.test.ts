@@ -6160,6 +6160,145 @@ describe("post-error recovery", () => {
     expect(compactResult.usage?.inputTokens).toBe(10);
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("uncounts an orphan the interrupt receipt reports dropped, so a no-echo result isn't swallowed", async () => {
+    // interrupt_receipt_v1 CLIs: interrupt() resolves with `still_queued` —
+    // the queued messages that will still run. Here the interrupt DROPS turn
+    // 2's queued message (still_queued: []), so its orphan result never
+    // arrives. Without the receipt reconciliation the stale count (1) would
+    // swallow the next echo-less result — the /compact below — and hang its
+    // prompt; activation's reset can't help because /compact never echoes.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await iter.next(); // turn 2's pushed message (cancelled; interrupt drops it)
+        await gate; // wait until the test cancels and sends /compact
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        // NO orphan result for turn 2 — the interrupt dropped its queued message.
+        await iter.next(); // /compact's pushed message — never echoes its uuid
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+    // New-CLI interrupt: nothing queued survives the interrupt.
+    agent.sessions["test-session"]!.query.interrupt = vi.fn(async () => ({ still_queued: [] }));
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    await agent.cancel({ sessionId: "test-session" }); // counts turn 2, then the receipt uncounts it
+    expect(agent.sessions["test-session"]?.pendingOrphanResults).toBe(0);
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("keeps counting an orphan the interrupt receipt reports still queued", async () => {
+    // The receipt lists turn 2's uuid in still_queued — its message survives
+    // the interrupt, runs, and emits an orphan result that must still be
+    // skipped (not promoted onto the later /compact).
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    const orphanResult = createResultMessage({
+      subtype: "success",
+      stop_reason: "end_turn",
+      is_error: false,
+    });
+    orphanResult.usage.input_tokens = 999;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn 1 active
+        await iter.next(); // turn 2's pushed message (cancelled, but survives the interrupt)
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield orphanResult; // turn 2's orphan — the kept count skips it
+        await iter.next(); // /compact's pushed message — never echoes its uuid
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    // Report turn 2's queued message as surviving the interrupt. Captured
+    // before cancel() filters the queue (interrupt runs after the filter).
+    const session = agent.sessions["test-session"]!;
+    const survivingUuid = session.turnQueue![1].promptUuid;
+    session.query.interrupt = vi.fn(async () => ({ still_queued: [survivingUuid] }));
+
+    await agent.cancel({ sessionId: "test-session" });
+    expect(agent.sessions["test-session"]?.pendingOrphanResults).toBe(1);
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    // /compact settled with its OWN result, proving the surviving orphan was
+    // skipped rather than promoted onto it (which would leak the 999).
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("session/cancel wedge recovery (issue #680)", () => {
