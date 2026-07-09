@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.58.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.58.0...v0.58.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* Use valid npm version for publish ([#855](https://github.com/agentclientprotocol/claude-agent-acp/issues/855)) ([8b366d8](https://github.com/agentclientprotocol/claude-agent-acp/commit/8b366d8e9ad55e9237bf2d618cfc99b57fac570d))
+
 ## [0.58.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.57.0...v0.58.0) (2026-07-09)
 
 
