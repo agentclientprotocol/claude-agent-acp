@@ -6146,6 +6146,204 @@ describe("post-error recovery", () => {
   });
 });
 
+describe("turn steering (_session/steering)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function createResultMessage() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  const waitFor = async (cond: () => boolean) => {
+    for (let i = 0; i < 200; i++) {
+      if (cond()) return;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    throw new Error("waitFor timed out");
+  };
+
+  it("rejects when the session is unknown", async () => {
+    const agent = createMockAgent();
+    await expect(
+      agent.steer({ sessionId: "missing", prompt: [{ type: "text", text: "hi" }] }),
+    ).rejects.toThrow("Session not found");
+  });
+
+  it("rejects when the query stream has already closed", async () => {
+    const agent = createMockAgent();
+    agent.sessions["test-session"] = mockSessionState({
+      input: new Pushable<any>(),
+      queryClosed: true,
+      turnQueue: [
+        {
+          promptUuid: "x",
+          isLocalOnlyCommand: false,
+          settled: false,
+          resolve: () => {},
+          reject: () => {},
+        },
+      ],
+    });
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] }),
+    ).rejects.toThrow();
+  });
+
+  it("advertises steering support at _meta.steering.supported", async () => {
+    const agent = createMockAgent();
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    // Top-level _meta (sibling of agentCapabilities), per the wire protocol.
+    expect((response._meta as any)?.steering).toEqual({ supported: true });
+  });
+
+  it("starts a new turn (outcome 'startedNewTurn') when no turn is in flight (race)", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    // Idle session: turnQueue starts empty, so the turn we meant to steer has
+    // (from the agent's view) already finished. Steering must not error — it
+    // starts a fresh turn with the message.
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          captured.push(u1.value);
+          yield userEcho(u1.value); // activates the new turn
+          yield createResultMessage();
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        }
+        return messageGenerator();
+      },
+      { turnQueue: [] },
+    );
+
+    const res = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late follow-up" }],
+    });
+    expect(res.outcome).toBe("startedNewTurn");
+
+    // A real turn was enqueued and drains like any normal prompt.
+    await waitFor(() => (agent.sessions["test-session"].turnQueue ?? []).length === 0);
+    expect(captured).toHaveLength(1);
+    // It went through the normal prompt() path — no steering delivery priority.
+    expect(captured[0].priority).toBeUndefined();
+    expect(JSON.stringify(captured[0].message.content)).toContain("late follow-up");
+  });
+
+  it("injects (outcome 'injected') a priority:'now' message into the running turn without spawning a new turn", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn becomes active
+        // The steered message is pushed next; capture it, replay its echo
+        // (which matches no queued turn and must be dropped), then finish.
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield userEcho(steered.value); // unrelated replay — must NOT settle a turn
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerRes = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    // Steering into a live turn reports the 'injected' outcome.
+    expect(steerRes.outcome).toBe("injected");
+
+    // The original turn resolves as a single, normal end_turn — the injected
+    // message steered it rather than producing a second PromptResponse.
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+
+    // The pushed message carried priority:'now' and a fresh uuid (matching no
+    // queued turn, so its echo is dropped rather than settling anything).
+    expect(captured).toHaveLength(1);
+    const injected = captured[0];
+    expect(injected.priority).toBe("now");
+    expect(typeof injected.uuid).toBe("string");
+    expect(JSON.stringify(injected.message.content)).toContain("also handle X");
+  });
+
+  it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    // Delivery priority is an internal detail, not part of the wire contract.
+    // Even if a client sneaks a `priority` field into the params, it's ignored
+    // and the message is always delivered at 'now'.
+    const res = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "queue this after" }],
+      priority: "next",
+    } as any);
+    await turn;
+
+    expect(res.outcome).toBe("injected");
+    expect(captured[0]?.priority).toBe("now");
+  });
+});
+
 describe("session/cancel wedge recovery (issue #680)", () => {
   function createMockAgent() {
     const mockClient = {

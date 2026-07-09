@@ -184,6 +184,66 @@ const TURN_NO_RESULT_MESSAGE =
   "The turn ended without a result: the agent went idle while this prompt was still in flight " +
   "(e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.";
 
+/** Custom (extension) request method a client uses to steer the turn that is
+ *  currently running: the message is injected into the in-flight turn rather
+ *  than queued as a separate `session/prompt`. Named `_session/steering` per the
+ *  agreed ACP steering wire protocol; advertised to clients via the top-level
+ *  `InitializeResponse._meta.steering.supported`. */
+const STEER_METHOD = "_session/steering";
+
+/** How urgently the SDK delivers a steered message relative to the running
+ *  turn — an internal Claude implementation detail, not part of the wire
+ *  contract. `now` pre-empts the current generation and handles the message
+ *  immediately (interrupting a single-shot response, or slotting in between a
+ *  multi-step turn's tool calls). Maps to `SDKUserMessage.priority`; injected
+ *  steering always uses `now` so the running turn adapts as soon as possible. */
+const STEER_PRIORITY = "now" as const;
+
+/** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
+ *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
+ *  priority is deliberately NOT exposed here — it's an internal detail the agent
+ *  chooses (see {@link STEER_PRIORITY}). */
+export type SteerRequest = {
+  sessionId: string;
+  prompt: PromptRequest["prompt"];
+};
+
+/** Where a steering message was accepted, per the wire protocol's two
+ *  successful outcomes:
+ *   - `injected`: a turn was still running and the message was applied to it;
+ *   - `startedNewTurn`: the turn we meant to steer had already finished (an
+ *     unavoidable race), so the message began a fresh turn instead of being
+ *     dropped.
+ *  Both are success results — never a JSON-RPC error — and tell the client
+ *  where the message landed. */
+type SteerOutcome = "injected" | "startedNewTurn";
+
+/** Result of a {@link STEER_METHOD} request: the single required `outcome`
+ *  field the client reads to learn where its steering message was accepted. */
+export type SteerResponse = {
+  outcome: SteerOutcome;
+};
+
+/** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
+ *  content blocks are handed to `promptToClaude`, which tolerates unknown block
+ *  types — but `sessionId` and a non-empty `prompt` array are required. */
+function parseSteerRequest(params: unknown): SteerRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "steer params must be an object");
+  }
+  const { sessionId, prompt } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
+  }
+  if (!Array.isArray(prompt) || prompt.length === 0) {
+    throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
+  }
+  return {
+    sessionId,
+    prompt: prompt as PromptRequest["prompt"],
+  };
+}
+
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
  *  `SessionConfigOption` (category "model"). Retained internally to track the
@@ -910,6 +970,15 @@ export class ClaudeAcpAgent {
         ...terminalAuthMethods,
         ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
       ],
+      // Top-level `_meta` (sibling of `agentCapabilities`), per the ACP steering
+      // wire protocol: advertises the `_session/steering` extension request so
+      // clients know they may inject a follow-up into the running turn (see
+      // STEER_METHOD) instead of queuing it as a separate `session/prompt`.
+      _meta: {
+        steering: {
+          supported: true,
+        },
+      },
     };
   }
 
@@ -1095,6 +1164,63 @@ export class ClaudeAcpAgent {
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     return response;
+  }
+
+  /** Steer the session per the ACP steering wire protocol: apply a follow-up
+   *  message to the turn that is currently running, or — if that turn already
+   *  finished — start a fresh turn with it. Never drops the message and never
+   *  returns a JSON-RPC error for the "arrived too late" race; both paths are
+   *  success outcomes (see {@link SteerOutcome}).
+   *
+   *  When a turn is in flight this injects (returns `injected`): unlike
+   *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
+   *  an `SDKUserMessage` onto the same streaming input, which the SDK routes
+   *  into the in-flight turn. The injected message's echo carries a uuid that
+   *  matches no queued turn, so the consumer drops it as an unrelated replay
+   *  without promoting/settling anything. It is delivered at {@link
+   *  STEER_PRIORITY} (`now`) so it pre-empts the current generation (interrupting
+   *  a single-shot response, or slotting in between a multi-step turn's tool
+   *  calls). The steered message's own output streams via `session/update`, not
+   *  this response.
+   *
+   *  When the session is idle (no unsettled turn — the turn we meant to steer
+   *  raced ahead and finished), this starts a normal new turn with the message
+   *  and returns `startedNewTurn`. That turn is fire-and-forget from the steer
+   *  request's view: its `PromptResponse` and output flow through the usual
+   *  `prompt()`/`session/update` path, so we return the outcome immediately
+   *  rather than awaiting turn completion. */
+  async steer(params: SteerRequest): Promise<SteerResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    // "A turn is running" = the queue holds an unsettled turn. This covers both
+    // the activated turn and one just submitted but not yet echoed/activated,
+    // which is exactly the window in which steering is meaningful.
+    const turnInFlight = (session.turnQueue ?? []).some((t) => !t.settled);
+    if (!turnInFlight) {
+      // Race: the turn we meant to steer already finished. Per the protocol the
+      // message must not be dropped nor surfaced as an error — start a fresh
+      // turn with it. Don't await: the new turn streams via session/update and
+      // its PromptResponse is consumed by the normal prompt() path; we only owe
+      // the client the outcome. `.catch` keeps the detached promise from
+      // becoming an unhandled rejection.
+      this.prompt(params as PromptRequest).catch((error) => {
+        this.logger.error(`Session ${params.sessionId}: steered new turn failed: ${error}`);
+      });
+      return { outcome: "startedNewTurn" };
+    }
+
+    const userMessage = promptToClaude(params as PromptRequest);
+    userMessage.uuid = randomUUID();
+    // Deliver into the running turn rather than queuing behind it as a fresh
+    // prompt would.
+    userMessage.priority = STEER_PRIORITY;
+    session.input.push(userMessage);
+    return { outcome: "injected" };
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
@@ -5482,6 +5608,9 @@ export function runAcp() {
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
+    .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
+      agent.steer(ctx.params),
+    )
     .connect(stream);
 
   agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
