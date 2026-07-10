@@ -59,14 +59,14 @@ describe("providers", () => {
     expect(response.agentCapabilities?.providers).toEqual({});
   });
 
-  it("lists a single required 'main' provider, unconfigured by default", async () => {
+  it("lists a single optional 'main' provider, unconfigured by default", async () => {
     const [agent] = await createAgentMock();
     const response = await agent.unstable_listProviders({});
     expect(response.providers).toEqual([
       {
         providerId: "main",
         supported: ["anthropic", "bedrock", "vertex"],
-        required: true,
+        required: false,
         current: null,
       },
     ]);
@@ -126,11 +126,18 @@ describe("providers", () => {
     ).rejects.toMatchObject({ code: -32602 });
   });
 
-  it("rejects disabling the required 'main' provider", async () => {
+  it("disables the 'main' provider by clearing config and reporting current: null", async () => {
     const [agent] = await createAgentMock();
-    await expect(agent.unstable_disableProvider({ providerId: "main" })).rejects.toMatchObject({
-      code: -32602,
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example/v1",
     });
+    expect((await agent.unstable_listProviders({})).providers[0].current).not.toBeNull();
+
+    await expect(agent.unstable_disableProvider({ providerId: "main" })).resolves.toEqual({});
+
+    expect((await agent.unstable_listProviders({})).providers[0].current).toBeNull();
   });
 
   it("treats disabling an unknown provider as an idempotent no-op", async () => {

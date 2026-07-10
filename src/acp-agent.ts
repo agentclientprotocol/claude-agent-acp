@@ -1089,16 +1089,19 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * `providers/list` — report the single configurable `main` provider and its
-   * current non-secret routing. Headers are never echoed (they may hold
-   * secrets); only `apiType`/`baseUrl` are surfaced for UI display.
+   * `providers/list` — returns the single client-configurable custom gateway
+   * provider (`main`). `current` carries only non-secret routing (never headers,
+   * which may hold secrets); only `apiType`/`baseUrl` are surfaced for UI
+   * display, and is `null` when the provider is not configured/disabled. The
+   * provider is optional (`required: false`): while disabled/unconfigured the
+   * agent falls back to its own default routing (normal Claude login).
    */
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
     const config = this.resolveProviderConfig();
     const provider: ProviderInfo = {
       providerId: PROVIDER_ID,
       supported: SUPPORTED_PROTOCOLS,
-      required: true,
+      required: false,
       current: config ? { apiType: config.apiType, baseUrl: config.baseUrl } : null,
     };
     return { providers: [provider] };
@@ -1160,16 +1163,16 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * `providers/disable` — the `main` provider is `required`, so disabling it is
-   * rejected with `invalid_params`. Disabling any other (unknown) ID is treated
-   * as a successful no-op per the RFD's idempotency rule.
+   * `providers/disable` — disabling the `main` provider clears any client-managed
+   * routing (both a `providers/set` config and the legacy gateway auth request),
+   * so the agent reverts to its own default routing and `providers/list` reports
+   * `current: null`. Disabling any other (unknown) ID is treated as a successful
+   * no-op per the RFD's idempotency rule.
    */
   async unstable_disableProvider(params: DisableProviderRequest): Promise<DisableProviderResponse> {
     if (params.providerId === PROVIDER_ID) {
-      throw RequestError.invalidParams(
-        { providerId: params.providerId },
-        `Provider "${PROVIDER_ID}" is required and cannot be disabled.`,
-      );
+      this.providerConfig = undefined;
+      this.gatewayAuthRequest = undefined;
     }
     // Unknown provider: idempotent success.
     return {};
