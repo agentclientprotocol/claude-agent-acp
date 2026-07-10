@@ -2795,6 +2795,49 @@ describe("stop reason propagation", () => {
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
 
+  it("ignores command_lifecycle frames without logging an unexpected-case error", async () => {
+    // CLIs 2.1.206+ report the fate of every uuid-stamped queued command as
+    // `command_lifecycle` frames (queued/started/completed/...) on the SDK
+    // stream, 2-3 per prompt. They are absent from the SDKMessage union, so
+    // without the pre-switch guard they fall through to `unreachable`'s
+    // error log on every prompt.
+    const errors: string[] = [];
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, {
+      log: () => {},
+      error: (msg: unknown) => errors.push(String(msg)),
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        const lifecycle = (state: string) => ({
+          type: "command_lifecycle",
+          command_uuid: userMessage.uuid,
+          state,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        });
+        yield lifecycle("queued");
+        yield lifecycle("started");
+        yield userEcho(userMessage);
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield lifecycle("completed");
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
+  });
+
   it("settles a no-echo command result (e.g. /compact) by promoting the head turn", async () => {
     // Regression: /compact never echoes a user message carrying the prompt's
     // uuid (its only user messages are the generated summary and a

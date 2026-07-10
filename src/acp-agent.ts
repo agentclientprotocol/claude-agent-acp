@@ -1426,6 +1426,19 @@ export class ClaudeAcpAgent {
           });
         }
 
+        // CLIs 2.1.206+ report the fate of every uuid-stamped queued command
+        // (queued/started/completed/cancelled/discarded) as `command_lifecycle`
+        // frames — 2-3 per prompt, since prompt() stamps a uuid on every
+        // message. The frame is @internal and absent from the SDKMessage
+        // union, so skip it BEFORE the exhaustive switch: it must not reach
+        // `unreachable`'s error log, and a `case` for it wouldn't typecheck.
+        // Turn lifecycle here is driven by echoes/results/idle and cancel
+        // accounting by the interrupt receipt, so there is nothing to track.
+        // (Raw-mode emission above still forwards these frames.)
+        if ((message as { type: string }).type === "command_lifecycle") {
+          continue;
+        }
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -2455,7 +2468,7 @@ export class ClaudeAcpAgent {
           case "conversation_reset":
             break;
           default:
-            unreachable(message);
+            unreachable(message, this.logger);
             break;
         }
       }
