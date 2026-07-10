@@ -214,6 +214,14 @@ type Turn = {
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
    *  still emit a result, an undispatched one may be dropped without one. */
   commandStarted?: boolean;
+  /** Set when a terminal `command_lifecycle` frame arrives for this turn's
+   *  uuid while the turn is still queued (msg_lifecycle_v1 CLIs). The command
+   *  is already finished SDK-side, so a later cancel() must not seed an
+   *  orphan entry for it — no terminal frame will ever come to drain it.
+   *  "completed"/"discarded" leave nothing outstanding; "cancelled" after a
+   *  dispatch means the dead turn's result may still arrive (seeded as a
+   *  zombie), and without a dispatch means dropped (nothing coming). */
+  commandFinished?: "completed" | "discarded" | "cancelled";
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -251,14 +259,21 @@ type Session = {
    *  "started" = dispatched into a turn; exactly one terminal lifecycle frame
    *  will follow ("completed" arrives only after any result its turn emits —
    *  and a FOLDED command's result belongs to the absorbing turn, so removal
-   *  on "completed" never strands an unskipped result). "zombie" = its turn
-   *  was aborted/failed after dispatch (`cancelled` after "started"); no more
-   *  lifecycle frames come, but the dead turn's error result may still arrive
-   *  — consumed by the next echo-less-result skip. An echo-less result is an
-   *  orphan's iff this map is non-empty (FIFO: orphan turns run before any
-   *  live turn's). Cleared on every activation, same self-heal as the count
-   *  (covers a turn that dies by throwing, which can leak "started"). */
-  orphanCommands?: Map<string, "pending" | "started" | "zombie">;
+   *  on "completed" never strands an unskipped result). "resultSeen" = started
+   *  AND its turn's result already arrived and was skipped; only its terminal
+   *  frame is still outstanding, so it no longer blocks head promotion and a
+   *  late `cancelled` deletes it rather than zombifying (the observed abort
+   *  ordering is started → error result → `cancelled` — treating that
+   *  `cancelled` as "result still coming" would make the entry swallow an
+   *  unrelated later result). "zombie" = its turn was aborted/failed after
+   *  dispatch with no result seen since (`cancelled` after "started"); no
+   *  more lifecycle frames come, but the dead turn's error result may still
+   *  arrive — consumed by the next echo-less-result skip. An echo-less result
+   *  is an orphan's iff this map holds a pending/started/zombie entry (FIFO:
+   *  orphan turns run before any live turn's). Cleared on every activation,
+   *  same self-heal as the count (covers a lost frame, which can leak an
+   *  entry — see ensureActiveTurn for how each state bounds the damage). */
+  orphanCommands?: Map<string, "pending" | "started" | "resultSeen" | "zombie">;
   /** True once a `system`/init advertised the msg_lifecycle_v1 capability, so
    *  cancel() routes orphan accounting to `orphanCommands` (exact, per-uuid)
    *  instead of `pendingOrphanResults` (count, coalescing-blind). */
@@ -1294,21 +1309,62 @@ export class ClaudeAcpAgent {
         session.pendingOrphanResults!--;
         return;
       }
-      // msg_lifecycle_v1 lane: any entry means at least one orphan command is
-      // not known-finished, and FIFO puts its result before any live turn's —
-      // skip. Removal is by lifecycle frame, not by result (N coalesced
-      // commands share ONE result but each gets its own terminal frame), with
-      // one exception: a zombie's turn already died, so no more frames come —
-      // this echo-less result is the only signal it ever finished. Consume the
-      // oldest zombie so it can't skip forever.
+      // msg_lifecycle_v1 lane. Attribute this echo-less result using the
+      // entries' states — turns run sequentially and frames arrive in stream
+      // order, so at any result: every "zombie" is from an already-dead turn
+      // whose own result (if any) preceded this one, every "started" entry
+      // belongs to THE turn that emitted this result (an older turn's entries
+      // got their terminal frames before a newer turn's "started" frames),
+      // and a "pending" entry was not dispatched before it. Removal is still
+      // by terminal lifecycle frame where one is coming (N coalesced commands
+      // share ONE result but each gets its own frame): "started" entries are
+      // only MARKED resultSeen here, so a late `cancelled` deletes instead of
+      // zombifying (observed abort ordering: started → result → cancelled),
+      // and a leaked entry stops blocking after one skip instead of
+      // swallowing every later echo-less result (the count lane's bounded
+      // damage, restored).
       if (session.orphanCommands?.size) {
+        // Zombies are covered by this result: the newest dead turn's late
+        // result is at most this one, and any older zombie's result already
+        // passed (or never existed) before the frame that created the newer.
+        let hadZombie = false;
+        let sawStarted = false;
+        let oldestPending: string | undefined;
         for (const [uuid, state] of session.orphanCommands) {
           if (state === "zombie") {
+            hadZombie = true;
             session.orphanCommands.delete(uuid);
-            break;
+          } else if (state === "started") {
+            sawStarted = true;
+          } else if (state === "pending") {
+            oldestPending ??= uuid;
           }
         }
-        return;
+        if (sawStarted) {
+          // The emitting turn's commands: keep them for their terminal
+          // frames, but remember their shared result has passed.
+          for (const [uuid, state] of session.orphanCommands) {
+            if (state === "started") {
+              session.orphanCommands.set(uuid, "resultSeen");
+            }
+          }
+          return;
+        }
+        if (hadZombie) {
+          return;
+        }
+        if (oldestPending !== undefined) {
+          // No dispatch was seen before this result, so it is very likely a
+          // live turn's — but a lost "started" frame would mean it IS the
+          // orphan's (dup-over-loss: prefer one wrong skip over
+          // misattributing a dead turn's outcome to a live prompt). Grant
+          // each pending entry exactly one skip, like the count lane did.
+          session.orphanCommands.delete(oldestPending);
+          return;
+        }
+        // Only resultSeen entries remain: their turns' results already
+        // passed, so this result is a live turn's — promote the head. The
+        // entries drain by their terminal frames or activation's clear.
       }
       activateTurn(head);
     };
@@ -1407,17 +1463,12 @@ export class ClaudeAcpAgent {
           // turn being abandoned. Stale counts self-heal: activation resets
           // them (see activateTurn).
           if (session.activeTurn && !session.activeTurn.settled) {
-            if (session.msgLifecycleV1) {
-              // The wedged turn WAS dispatched, so track it "started": its
-              // late result (if the SDK recovers) is skipped echo-less, and
-              // its own terminal frame — "completed" after that result, or
-              // "cancelled" (→ zombie) if the interrupt finally lands — is
-              // what drains it.
-              session.orphanCommands ??= new Map();
-              session.orphanCommands.set(session.activeTurn.promptUuid, "started");
-            } else {
-              session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
-            }
+            // The wedged turn WAS dispatched, so track it "started": its late
+            // result (if the SDK recovers) is skipped echo-less (marking it
+            // resultSeen), and its terminal frame — or that skip plus
+            // activation's clear when the frame is lost to the wedge — is
+            // what drains it.
+            this.trackOrphanCommand(session, session.activeTurn.promptUuid, "started");
           }
           settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
           // If the session is being torn down, abandon the in-flight next()
@@ -1512,25 +1563,40 @@ export class ClaudeAcpAgent {
             }
             case "completed":
             case "discarded":
+            case "cancelled": {
+              // Terminal frames. Latch the fate on a still-queued turn so a
+              // later cancel() doesn't seed an orphan entry for a command
+              // whose one-and-only terminal frame has already been consumed
+              // (nothing would ever drain that entry).
+              const queued = (session.turnQueue ?? []).find(
+                (t) => t.promptUuid === frame.command_uuid && !t.settled,
+              );
+              if (queued) {
+                queued.commandFinished = frame.state as "completed" | "discarded" | "cancelled";
+              }
+              if (frame.state === "cancelled") {
+                // Ambiguous by design (dup-over-loss): dropped before
+                // dispatch (no result will ever come — safe to forget) vs
+                // consumed into a turn that was aborted/failed. For the
+                // latter, the observed ordering is started → error result →
+                // `cancelled`: an entry already marked resultSeen got its
+                // result, so nothing more is coming — delete. Only a
+                // still-"started" entry (no result seen since dispatch)
+                // becomes a zombie for the next echo-less-result skip.
+                const state = session.orphanCommands?.get(frame.command_uuid);
+                if (state === "pending" || state === "resultSeen") {
+                  session.orphanCommands?.delete(frame.command_uuid);
+                } else if (state === "started") {
+                  session.orphanCommands?.set(frame.command_uuid, "zombie");
+                }
+                break;
+              }
               // Exactly-one-terminal: the command is finished. "completed" is
               // emitted after any result its turn produced (fresh turn) or the
               // command folded into another turn whose result is attributed
               // elsewhere — either way no echo-less result remains to skip.
               // "discarded" = session ended with it still queued; no result.
               session.orphanCommands?.delete(frame.command_uuid);
-              break;
-            case "cancelled": {
-              // Ambiguous by design (dup-over-loss): dropped before dispatch
-              // (no result will ever come — safe to forget) vs consumed into
-              // a turn that was aborted/failed (that dead turn's result may
-              // still arrive, and no further frames will come — mark zombie
-              // so the next echo-less-result skip consumes it).
-              const state = session.orphanCommands?.get(frame.command_uuid);
-              if (state === "pending") {
-                session.orphanCommands?.delete(frame.command_uuid);
-              } else if (state === "started") {
-                session.orphanCommands?.set(frame.command_uuid, "zombie");
-              }
               break;
             }
             default:
@@ -2618,6 +2684,26 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Route one orphaned command into the session's orphan-accounting lane:
+   *  the per-uuid map on msg_lifecycle_v1 CLIs (drained by the command's own
+   *  terminal lifecycle frame and the echo-less-result skip), the plain count
+   *  elsewhere (the count lane can't express per-command states, so `state`
+   *  only matters on the map lane). Both orphan-producing paths — cancel()'s
+   *  queued-turn sweep and the consumer's force-cancel wedge path — must seed
+   *  through here so the lane split stays a single mechanism. */
+  private trackOrphanCommand(
+    session: Session,
+    uuid: string,
+    state: "pending" | "started" | "zombie",
+  ): void {
+    if (session.msgLifecycleV1) {
+      session.orphanCommands ??= new Map();
+      session.orphanCommands.set(uuid, state);
+    } else {
+      session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + 1;
+    }
+  }
+
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -2631,13 +2717,19 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // Capture the orphan-accounting lane before anything can await: the
+    // consumer latches msgLifecycleV1 when it drains the first system/init,
+    // which can happen DURING the awaited interrupt() below — the receipt
+    // reconciliation must act on the same lane the seeding used, or a
+    // count-lane orphan would be left for the map-lane receipt path (which
+    // never decrements the count) to miss.
+    const lifecycleLane = session.msgLifecycleV1 === true;
     // Settle queued turns that haven't started yet (no echo seen) right away —
     // they have no in-flight SDK work to interrupt. The active turn is settled
     // by the consumer when it observes the interrupt's trailing idle (or via the
     // backstop below). Mirrors the old pendingMessages cancellation.
-    const orphanedUuids: string[] = [];
+    const orphanedTurns: Turn[] = [];
     if (session.turnQueue) {
-      const orphanedTurns: Turn[] = [];
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
           turn.settled = true;
@@ -2645,7 +2737,6 @@ export class ClaudeAcpAgent {
           // accumulator (the active turn's tally) is not its spend.
           turn.resolve({ stopReason: "cancelled" });
           orphanedTurns.push(turn);
-          orphanedUuids.push(turn.promptUuid);
         }
       }
       // Each removed queued turn's user message was already pushed to the SDK,
@@ -2656,14 +2747,31 @@ export class ClaudeAcpAgent {
       // own terminal lifecycle frame — exact under command coalescing, where
       // N queued commands fold into ONE turn emitting one result and a plain
       // count would go stale by N-1 and swallow a later echo-less result.
-      // Older CLIs keep the count and its activation-time self-heal.
-      if (session.msgLifecycleV1) {
-        session.orphanCommands ??= new Map();
-        for (const turn of orphanedTurns) {
-          session.orphanCommands.set(turn.promptUuid, turn.commandStarted ? "started" : "pending");
+      // Older CLIs keep the count and its activation-time self-heal (they
+      // never see lifecycle frames, so commandStarted/commandFinished stay
+      // unset and every turn takes the plain-seed path below).
+      for (const turn of orphanedTurns) {
+        if (turn.commandFinished === "completed" || turn.commandFinished === "discarded") {
+          // The command already finished SDK-side and its terminal frame was
+          // consumed while the turn sat queued — nothing is left to skip, and
+          // a seeded entry would never drain.
+          continue;
         }
-      } else {
-        session.pendingOrphanResults = (session.pendingOrphanResults ?? 0) + orphanedUuids.length;
+        if (turn.commandFinished === "cancelled") {
+          // Terminal frame already consumed. Dispatched-then-aborted: the
+          // dead turn's late result may still come — seed the zombie the
+          // frame handler would have made. Never dispatched: dropped, no
+          // result coming, nothing to track.
+          if (turn.commandStarted) {
+            this.trackOrphanCommand(session, turn.promptUuid, "zombie");
+          }
+          continue;
+        }
+        this.trackOrphanCommand(
+          session,
+          turn.promptUuid,
+          turn.commandStarted ? "started" : "pending",
+        );
       }
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
@@ -2712,9 +2820,9 @@ export class ClaudeAcpAgent {
     // receipt, so a bare `{}` success from a gateway can't read as "everything
     // was dropped") — keep the count-everything behavior and its
     // activation-time self-heal.
-    if (Array.isArray(receipt?.still_queued) && orphanedUuids.length > 0) {
+    if (Array.isArray(receipt?.still_queued) && orphanedTurns.length > 0) {
       const stillQueued = new Set(receipt.still_queued);
-      if (session.msgLifecycleV1) {
+      if (lifecycleLane) {
         // Lifecycle lane: forget dropped orphans by uuid. Only entries still
         // "pending" — an orphan absent from `still_queued` because it was
         // DISPATCHED before the interrupt (not dropped) has usually been
@@ -2724,13 +2832,16 @@ export class ClaudeAcpAgent {
         // the count lane has always had for a dropped-then-run command.)
         // Mostly redundant with the "cancelled"-frame removal, but a receipt
         // survives paths where that frame was never emitted.
-        for (const uuid of orphanedUuids) {
-          if (!stillQueued.has(uuid) && session.orphanCommands?.get(uuid) === "pending") {
-            session.orphanCommands.delete(uuid);
+        for (const turn of orphanedTurns) {
+          if (
+            !stillQueued.has(turn.promptUuid) &&
+            session.orphanCommands?.get(turn.promptUuid) === "pending"
+          ) {
+            session.orphanCommands.delete(turn.promptUuid);
           }
         }
       } else {
-        const dropped = orphanedUuids.filter((uuid) => !stillQueued.has(uuid)).length;
+        const dropped = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid)).length;
         if (dropped > 0) {
           session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - dropped);
         }

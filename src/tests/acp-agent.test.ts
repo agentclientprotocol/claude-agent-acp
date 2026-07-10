@@ -82,6 +82,29 @@ function userEcho(u: any) {
   };
 }
 
+/** A `system`/init frame advertising the msg_lifecycle_v1 capability, so the
+ *  consumer latches `session.msgLifecycleV1` and cancel() routes orphan
+ *  accounting through `orphanCommands` (CLIs 2.1.206+). */
+const lifecycleInit = {
+  type: "system",
+  subtype: "init",
+  session_id: "test-session",
+  capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1"],
+};
+
+/** Build a `command_lifecycle` frame (CLIs 2.1.206+) reporting `state` for the
+ *  uuid-stamped command `commandUuid`. One builder for every test so the
+ *  @internal wire shape can't drift between suites. */
+function lifecycleFrame(commandUuid: string, state: string) {
+  return {
+    type: "command_lifecycle",
+    command_uuid: commandUuid,
+    state,
+    uuid: randomUUID(),
+    session_id: "test-session",
+  };
+}
+
 /** The `usage` a cancelled active turn settles with when the cancel pre-empted
  *  its result: all zeros, since only a turn's terminal result feeds the
  *  accumulator (issue #844). */
@@ -2812,18 +2835,11 @@ describe("stop reason propagation", () => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
         const { value: userMessage } = await iter.next();
-        const lifecycle = (state: string) => ({
-          type: "command_lifecycle",
-          command_uuid: userMessage.uuid,
-          state,
-          uuid: randomUUID(),
-          session_id: "test-session",
-        });
-        yield lifecycle("queued");
-        yield lifecycle("started");
+        yield lifecycleFrame(userMessage.uuid, "queued");
+        yield lifecycleFrame(userMessage.uuid, "started");
         yield userEcho(userMessage);
         yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-        yield lifecycle("completed");
+        yield lifecycleFrame(userMessage.uuid, "completed");
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
       return messageGenerator();
@@ -6745,22 +6761,8 @@ describe("post-error recovery", () => {
 
   // msg_lifecycle_v1 CLIs (2.1.206+): cancel() tracks orphans per-uuid in
   // `orphanCommands`, drained by each command's own terminal lifecycle frame
-  // instead of by counting results.
-  const lifecycleInit = {
-    type: "system",
-    subtype: "init",
-    session_id: "test-session",
-    capabilities: ["interrupt_receipt_v1", "msg_lifecycle_v1"],
-  };
-  function lifecycleFrame(commandUuid: string, state: string) {
-    return {
-      type: "command_lifecycle",
-      command_uuid: commandUuid,
-      state,
-      uuid: randomUUID(),
-      session_id: "test-session",
-    };
-  }
+  // instead of by counting results. (lifecycleInit / lifecycleFrame are the
+  // module-scope helpers next to userEcho.)
 
   it("drains coalesced orphans by lifecycle frame, not by result (one result for two commands)", async () => {
     // Two cancelled queued turns can be FOLDED into one SDK turn that emits a
@@ -7040,6 +7042,305 @@ describe("post-error recovery", () => {
     const compactResult = await compact;
     expect(compactResult.stopReason).toBe("end_turn");
     expect(compactResult.usage?.inputTokens).toBe(10);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("deletes (not zombifies) an orphan whose `cancelled` frame arrives AFTER its error result", async () => {
+    // The live-observed abort ordering is started → error result → cancelled.
+    // The result is skipped while the entry is "started" (marking it
+    // resultSeen); the late `cancelled` must then DELETE the entry — a zombie
+    // here would be a phantom (its result already came) that swallows the
+    // next echo-less result and hangs /compact.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    const abortedResult = createResultMessage({
+      subtype: "error_during_execution",
+      stop_reason: null,
+      is_error: true,
+    });
+    abortedResult.usage.input_tokens = 999;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield lifecycleInit;
+        yield userEcho(u1.value); // turn 1 active
+        const u2 = await iter.next(); // turn 2 queued (cancelled below)
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield lifecycleFrame(u2.value.uuid, "started"); // dispatched...
+        yield abortedResult; // ...its turn dies: error result FIRST (observed ordering)
+        yield lifecycleFrame(u2.value.uuid, "cancelled"); // ...terminal frame after — must delete, not zombify
+        await iter.next(); // /compact's pushed message
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    await agent.cancel({ sessionId: "test-session" });
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(0);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("drains ALL coalesced orphans of an aborted turn on its single error result", async () => {
+    // Two cancelled queued commands folded into ONE turn that the interrupt
+    // then aborts: one shared error result, then a `cancelled` frame per
+    // command. The result must cover BOTH entries (marking them resultSeen so
+    // the cancelled frames delete them) — leaving one as a zombie would
+    // swallow /compact's result and hang it.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    const abortedResult = createResultMessage({
+      subtype: "error_during_execution",
+      stop_reason: null,
+      is_error: true,
+    });
+    abortedResult.usage.input_tokens = 999;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield lifecycleInit;
+        yield userEcho(u1.value); // turn 1 active
+        const u2 = await iter.next(); // turn 2 queued (cancelled below)
+        const u3 = await iter.next(); // turn 3 queued (cancelled below)
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield lifecycleFrame(u2.value.uuid, "started"); // both dispatched into
+        yield lifecycleFrame(u3.value.uuid, "started"); // ONE coalesced turn...
+        yield abortedResult; // ...which aborts: ONE shared error result
+        yield lifecycleFrame(u2.value.uuid, "cancelled"); // per-command terminals
+        yield lifecycleFrame(u3.value.uuid, "cancelled");
+        await iter.next(); // /compact's pushed message
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const third = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "third" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 3);
+
+    await agent.cancel({ sessionId: "test-session" });
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(2);
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(third).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(0);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not seed an orphan for a queued command whose terminal frame already passed", async () => {
+    // A queued command can fold into the ACTIVE turn and finish (started +
+    // completed frames consumed) while its Turn still sits queued. A later
+    // cancel() must not seed an entry for it: its one-and-only terminal frame
+    // is spent, so nothing would ever drain the entry and it would swallow
+    // /compact's echo-less result.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield lifecycleInit;
+        yield userEcho(u1.value); // turn 1 active
+        const u2 = await iter.next(); // turn 2 queued...
+        yield lifecycleFrame(u2.value.uuid, "started"); // ...folded into turn 1
+        yield lifecycleFrame(u2.value.uuid, "completed"); // ...and finished pre-cancel
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        // NO further frames and NO orphan result for u2 — it is spent.
+        await iter.next(); // /compact's pushed message
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    // Wait for the consumer to record u2's terminal frame on the queued Turn
+    // before cancelling, so cancel() sees commandFinished.
+    await waitFor(
+      () =>
+        agent.sessions["test-session"]?.turnQueue?.some(
+          (t: any) => t.commandFinished === "completed",
+        ) === true,
+    );
+
+    await agent.cancel({ sessionId: "test-session" });
+    expect(agent.sessions["test-session"]?.orphanCommands?.size ?? 0).toBe(0);
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("stops blocking on a resultSeen orphan whose terminal frame never arrives", async () => {
+    // Crash caveat: a turn that dies by throwing can leak an entry with no
+    // terminal frame. After the orphan's result marks it resultSeen, later
+    // echo-less results must FALL THROUGH to head promotion (the entry's turn
+    // already produced its result) instead of being swallowed one after
+    // another — /compact here must settle normally, and its activation clears
+    // the leaked entry.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    const orphanResult = createResultMessage({
+      subtype: "error_during_execution",
+      stop_reason: null,
+      is_error: true,
+    });
+    orphanResult.usage.input_tokens = 999;
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield lifecycleInit;
+        yield userEcho(u1.value); // turn 1 active
+        const u2 = await iter.next(); // turn 2 queued (cancelled below)
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        yield lifecycleFrame(u2.value.uuid, "started"); // dispatched...
+        yield orphanResult; // ...its result arrives (entry -> resultSeen)...
+        // ...and its terminal frame is LOST (turn died by throwing).
+        await iter.next(); // /compact's pushed message
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 2);
+
+    await agent.cancel({ sessionId: "test-session" });
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    // /compact's activation cleared the leaked resultSeen entry.
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(0);
     await agent.sessions["test-session"]?.consumer;
   });
 });
