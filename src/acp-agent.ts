@@ -306,6 +306,23 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** Maps a live subagent's agent id → the tool_use id of the Agent/Task call
+   *  that spawned it. For subagent tasks the SDK keys its task registry by
+   *  agent id, so `task_started.task_id` IS the `agentID` that `canUseTool`
+   *  later receives, and `task_started.tool_use_id` is the spawning tool call.
+   *  Populated from `task_started` and pruned when the task settles (a
+   *  `task_notification` or a terminal `task_updated` patch). Lets the
+   *  permission flow attribute a subagent's eagerly-emitted `tool_call` (and
+   *  the permission request itself) to its parent tool call via
+   *  `_meta.claudeCode.parentToolUseId`, matching the streamed subagent path.
+   *  Best-effort: a `canUseTool` that races ahead of the consumer processing
+   *  `task_started` omits the attribution from the eager tool_call, and the
+   *  streamed tool_use chunk's refining `tool_call_update` — which carries the
+   *  message-level `parent_tool_use_id` — restores it for merging clients;
+   *  that recovery is what makes best-effort acceptable here. Non-subagent
+   *  tasks (background Bash etc.) also pass through the map; see the
+   *  `task_started` handler. */
+  subagentParentToolUseIds: Map<string, string>;
   /** Maps the ACP `messageId` we expose to clients (see `messageIdForGrouping`)
    *  to the SDK message uuid that the Agent SDK's rewind/resume APIs key on
    *  (`Query.rewindFiles` takes a user-message uuid; `resumeSessionAt` takes an
@@ -404,6 +421,10 @@ export type ToolUpdateMeta = {
     toolName: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
+    /* For a tool call made inside a subagent: the tool_use id of the
+       Agent/Task call that spawned the subagent. Mirrors the SDK's
+       `parent_tool_use_id` on streamed subagent messages. */
+    parentToolUseId?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -1685,10 +1706,38 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
+                break;
+              case "task_started":
+                // For subagent tasks `task_id` is the subagent's agent id (the
+                // SDK keys its task registry by agent id) and `tool_use_id` is
+                // the Agent/Task tool_use that spawned it. Record the mapping so
+                // the subagent's permission requests — which reach canUseTool
+                // with only `agentID` — can attribute their eagerly-emitted
+                // tool_call to the parent tool call. Non-subagent tasks (e.g.
+                // background Bash) land here too; their task_ids never match an
+                // agentID, so the stray entries are inert until pruned below.
+                if (message.tool_use_id) {
+                  session.subagentParentToolUseIds.set(message.task_id, message.tool_use_id);
+                }
+                break;
+              case "task_notification":
+                // The task settled — no further tool calls can originate from
+                // it, so the attribution mapping can be dropped.
+                session.subagentParentToolUseIds.delete(message.task_id);
+                break;
               case "task_updated":
+                // terminal-status task_updated patch and a (deduplicated)
+                // task_notification when a task settles, but only the patch is
+                // guaranteed per transition — prune on it too so the map can't
+                // grow for the session's lifetime if a notification is skipped.
+                if (
+                  message.patch.status === "completed" ||
+                  message.patch.status === "failed" ||
+                  message.patch.status === "killed"
+                ) {
+                  session.subagentParentToolUseIds.delete(message.task_id);
+                }
                 break;
               case "worker_shutting_down":
                 // A Remote Control worker announced a graceful teardown. This is a
@@ -2809,6 +2858,7 @@ export class ClaudeAcpAgent {
     params: RequestPermissionRequest,
     toolName: string,
     signal: AbortSignal,
+    parentToolUseId?: string,
   ): Promise<RequestPermissionResponse> {
     // The SDK may invoke `canUseTool` (and therefore this permission request)
     // before the assistant message's tool_use block streams to us. Some ACP clients
@@ -2821,6 +2871,7 @@ export class ClaudeAcpAgent {
       toolName,
       params.toolCall.toolCallId,
       params.toolCall.rawInput,
+      parentToolUseId,
     );
     try {
       return await this.client.requestPermission(params, signal);
@@ -2838,15 +2889,21 @@ export class ClaudeAcpAgent {
    *  instead of emitting a duplicate (see `emittedToolCalls`). Built via the same
    *  `toolCallNotification` helper as the streamed path so the two are identical.
    *  Tools the stream renders as a plan (TodoWrite) or suppresses (Task*) are
-   *  skipped so a permission prompt for them never surfaces a stray tool_call. */
+   *  emitted too: a permission request referencing a tool call the client has
+   *  never seen can trip strict clients (issue #851), so the reference must
+   *  always resolve. Since the streamed path never completes those calls, they
+   *  are resolved at tool_result time instead (see `toAcpNotifications`).
+   *  `parentToolUseId` attributes a subagent's tool call to the Agent/Task call
+   *  that spawned it, matching the streamed path's `_meta`. */
   private async ensureToolCallEmitted(
     sessionId: string,
     toolName: string,
     toolCallId: string,
     toolInput: unknown,
+    parentToolUseId?: string,
   ): Promise<void> {
     const session = this.sessions[sessionId];
-    if (!session || !shouldEmitToolCall(toolName)) {
+    if (!session) {
       return;
     }
     if (session.emittedToolCalls.has(toolCallId)) {
@@ -2854,19 +2911,26 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
-    await this.client.sessionUpdate({
-      sessionId,
-      update: toolCallNotification(
-        { id: toolCallId, name: toolName, input: toolInput },
-        toolInput,
-        supportsTerminalOutput,
-        session.cwd,
-      ),
-    });
+    const update = toolCallNotification(
+      { id: toolCallId, name: toolName, input: toolInput },
+      toolInput,
+      supportsTerminalOutput,
+      session.cwd,
+    );
+    if (parentToolUseId) {
+      update._meta = {
+        ...update._meta,
+        claudeCode: {
+          ...(update._meta?.claudeCode || {}),
+          parentToolUseId,
+        },
+      };
+    }
+    await this.client.sessionUpdate({ sessionId, update });
   }
 
   canUseTool(sessionId: string): CanUseTool {
-    return async (toolName, toolInput, { signal, suggestions, toolUseID }) => {
+    return async (toolName, toolInput, { signal, suggestions, toolUseID, agentID }) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -2877,6 +2941,24 @@ export class ClaudeAcpAgent {
         };
       }
 
+      // When the tool call originates inside a subagent, attribute the eagerly
+      // emitted tool_call (and the permission request itself) to the Agent/Task
+      // tool call that spawned the subagent, mirroring the streamed subagent
+      // path's `_meta.claudeCode.parentToolUseId` (see `subagentParentToolUseIds`).
+      const parentToolUseId = agentID ? session.subagentParentToolUseIds.get(agentID) : undefined;
+      if (agentID && !parentToolUseId) {
+        // The attribution rests on an undocumented SDK invariant
+        // (task_started.task_id === canUseTool's agentID for subagent tasks;
+        // verified against the bundled CLI). Should an SDK bump break it — or
+        // the consumer lose the race with task_started — the lookup misses and
+        // the request goes out unattributed; log it so the regression is
+        // observable rather than silent.
+        this.logger.log(
+          `[claude-agent-acp] No parent tool_use recorded for subagent ${agentID}; ` +
+            `sending the ${toolName} permission request unattributed`,
+        );
+      }
+
       // AskUserQuestion is surfaced to us as a normal permission check (the SDK
       // routes it through canUseTool whenever a callback is registered, rather
       // than the interactive dialog). Present it as an ACP form elicitation and
@@ -2884,7 +2966,13 @@ export class ClaudeAcpAgent {
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
         // Like permission requests, the elicitation references this toolUseID, so
         // make sure the tool_call has surfaced to the client before we send it.
-        await this.ensureToolCallEmitted(sessionId, toolName, toolUseID, toolInput);
+        await this.ensureToolCallEmitted(
+          sessionId,
+          toolName,
+          toolUseID,
+          toolInput,
+          parentToolUseId,
+        );
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
@@ -2927,10 +3015,16 @@ export class ClaudeAcpAgent {
                 supportsTerminalOutput,
                 session?.cwd,
               ),
+              // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
+              // so clients can rely on one shape everywhere.
+              ...(parentToolUseId
+                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
+                : {}),
             },
           },
           toolName,
           signal,
+          parentToolUseId,
         );
 
         if (signal.aborted || response.outcome?.outcome === "cancelled") {
@@ -3000,10 +3094,16 @@ export class ClaudeAcpAgent {
               supportsTerminalOutput,
               session?.cwd,
             ),
+            // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
+            // so clients can rely on one shape everywhere.
+            ...(parentToolUseId
+              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
+              : {}),
           },
         },
         toolName,
         signal,
+        parentToolUseId,
       );
       if (signal.aborted || response.outcome?.outcome === "cancelled") {
         throw new Error("Tool use aborted");
@@ -3979,6 +4079,7 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
 
@@ -4978,10 +5079,12 @@ function isTaskTool(toolName: string): boolean {
   );
 }
 
-/** Whether a tool's tool_use surfaces to the client as a standalone
+/** Whether the streamed tool_use path surfaces this tool as a standalone
  *  `tool_call`. TodoWrite is rendered as a `plan` and Task* tools are
  *  suppressed (their plan snapshot is emitted at tool_result time), so neither
- *  produces a tool_call. */
+ *  produces a streamed tool_call/tool_call_update — which means a
+ *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
+ *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
@@ -5233,13 +5336,63 @@ export function toAcpNotifications(
       case "bash_code_execution_tool_result":
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
+        const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
+          // The permission flow may have surfaced this tool_call even though
+          // its tool_use never reached the cache (e.g. the assistant message
+          // carrying it was dropped by the cancelled-turn guard and a straggler
+          // result landed later). Resolve the surfaced call anyway so it can't
+          // stay pending in the client forever; without the cache entry the
+          // tool name is unknown, so no claudeCode meta is attached.
+          if (wasEmitted) {
+            output.push({
+              sessionId,
+              update: {
+                toolCallId: chunk.tool_use_id,
+                sessionUpdate: "tool_call_update" as const,
+                status:
+                  "is_error" in chunk && chunk.is_error
+                    ? ("failed" as const)
+                    : ("completed" as const),
+                rawOutput: chunk.content,
+              },
+            });
+          }
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
           break;
+        }
+
+        // A permission request may have surfaced a plan-rendered (TodoWrite) or
+        // suppressed (Task*) tool as a real tool_call so the request referenced
+        // a tool call the client knows about (see `ensureToolCallEmitted`,
+        // issue #851). The branches below never emit a tool_call_update for
+        // those tools, which would leave the surfaced call pending in the
+        // client forever — resolve it here. `wasEmitted` is only ever true for
+        // these tools via the permission flow: the streamed plan/suppressed
+        // branches don't record emissions.
+        if (wasEmitted && !shouldEmitToolCall(toolUse.name)) {
+          output.push({
+            sessionId,
+            update: {
+              _meta: {
+                claudeCode: {
+                  toolName: toolUse.name,
+                  ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
+                },
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.tool_use_id,
+              sessionUpdate: "tool_call_update" as const,
+              status:
+                "is_error" in chunk && chunk.is_error
+                  ? ("failed" as const)
+                  : ("completed" as const),
+              rawOutput: chunk.content,
+            },
+          });
         }
 
         if (isTaskTool(toolUse.name)) {

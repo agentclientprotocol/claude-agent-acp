@@ -131,6 +131,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     taskState: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
+    subagentParentToolUseIds: new Map(),
     messageIdToUuid: new Map(),
     ...overrides,
   } as any;
@@ -1830,6 +1831,7 @@ describe("permission request cancellation", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     } as any;
     return agent.sessions[sessionId]!;
@@ -1968,7 +1970,11 @@ describe("tool_call emitted before permission request", () => {
     expect(notifications[0].update.sessionUpdate).toBe("tool_call_update");
   });
 
-  it("does not emit a tool_call for suppressed tools (TodoWrite) on a permission request", async () => {
+  it("emits a tool_call for plan-rendered tools (TodoWrite) so the permission request references a known id (issue #851)", async () => {
+    // Strict clients reject (or worse, drop without responding to) a
+    // permission request whose toolCallId they have never seen as a
+    // tool_call, so even tools the stream renders as a plan must surface one
+    // before the request goes out.
     const { agent, events, session } = setup();
 
     await agent.canUseTool("session-1")(
@@ -1977,8 +1983,132 @@ describe("tool_call emitted before permission request", () => {
       { signal: new AbortController().signal, suggestions: [], toolUseID: "todo-1" } as any,
     );
 
-    expect(events).toEqual(["permission"]);
+    expect(events).toEqual(["update:tool_call", "permission"]);
+    expect(session.emittedToolCalls.has("todo-1")).toBe(true);
+  });
+
+  it("resolves a permission-surfaced TodoWrite tool_call at tool_result time", () => {
+    // The streamed path renders TodoWrite as `plan` updates and never sends a
+    // tool_call_update for it, so the permission-surfaced tool_call must be
+    // completed when its tool_result arrives or it would stay pending forever.
+    const { session } = setup();
+    session.emittedToolCalls.add("todo-1");
+    session.toolUseCache["todo-1"] = {
+      type: "tool_use",
+      id: "todo-1",
+      name: "TodoWrite",
+      input: { todos: [] },
+    };
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "todo-1", content: [{ type: "text", text: "ok" }] }],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "todo-1",
+      status: "completed",
+    });
     expect(session.emittedToolCalls.has("todo-1")).toBe(false);
+  });
+
+  it("marks a permission-surfaced TodoWrite tool_call failed on an is_error tool_result", () => {
+    // E.g. the user rejected the permission request: the SDK synthesizes an
+    // is_error tool_result, which must resolve the surfaced call as failed.
+    const { session } = setup();
+    session.emittedToolCalls.add("todo-1");
+    session.toolUseCache["todo-1"] = {
+      type: "tool_use",
+      id: "todo-1",
+      name: "TodoWrite",
+      input: { todos: [] },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "todo-1",
+          is_error: true,
+          content: [{ type: "text", text: "User refused permission to run tool" }],
+        },
+      ],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "todo-1",
+      status: "failed",
+    });
+  });
+
+  it("resolves permission-surfaced Task* tool_calls too", () => {
+    // Task* tool_use/tool_result pairs are normally suppressed entirely (their
+    // state surfaces as plan snapshots), so a permission-surfaced tool_call for
+    // them also needs an explicit resolution.
+    const { session } = setup();
+    session.emittedToolCalls.add("task-1");
+    session.toolUseCache["task-1"] = {
+      type: "tool_use",
+      id: "task-1",
+      name: "TaskList",
+      input: {},
+    };
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "task-1", content: [{ type: "text", text: "[]" }] }],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "task-1",
+      status: "completed",
+    });
+  });
+
+  it("stays silent on a TodoWrite tool_result when no tool_call was surfaced", () => {
+    // The common case: TodoWrite was never permission-gated, so nothing was
+    // emitted for it and its tool_result must remain suppressed as before.
+    const { session } = setup();
+    session.toolUseCache["todo-1"] = {
+      type: "tool_use",
+      id: "todo-1",
+      name: "TodoWrite",
+      input: { todos: [] },
+    };
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "todo-1", content: [{ type: "text", text: "ok" }] }],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(0);
   });
 
   it("includes Bash terminal_info _meta in the eager tool_call so terminal output can attach", async () => {
@@ -2001,13 +2131,16 @@ describe("tool_call emitted before permission request", () => {
     });
   });
 
-  it("prunes the emission marker on a tool_result even when the tool_use was never cached", () => {
+  it("prunes the emission marker and resolves the call on a tool_result even when the tool_use was never cached", () => {
     const { session } = setup();
     // Eager-emitted via the permission flow, but the tool_use chunk never
-    // streamed (e.g. cancelled), so toolUseCache has no entry for it.
+    // streamed (e.g. the assistant message was dropped by the cancelled-turn
+    // guard), so toolUseCache has no entry for it. The surfaced tool_call must
+    // still resolve — the eager emission was its only surface — even though the
+    // tool name (and thus claudeCode meta) is unknowable here.
     session.emittedToolCalls.add("tool-1");
 
-    toAcpNotifications(
+    const notifications = toAcpNotifications(
       [{ type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "x" }] }],
       "user",
       "session-1",
@@ -2019,6 +2152,269 @@ describe("tool_call emitted before permission request", () => {
     );
 
     expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tool-1",
+      status: "completed",
+    });
+  });
+
+  it("does not resolve an uncached tool_result that was never surfaced", () => {
+    // Without an eager emission there is no pending tool_call to settle, so
+    // the untracked-result path must stay silent as before.
+    const { session } = setup();
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "tool-1", content: [{ type: "text", text: "x" }] }],
+      "user",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+      { emittedToolCalls: session.emittedToolCalls },
+    );
+
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+describe("subagent permission attribution (issue #851)", () => {
+  // A background subagent's permission requests reach canUseTool with only an
+  // `agentID`; the streamed subagent messages carry `parent_tool_use_id`
+  // instead. `task_started` bridges the two (for subagent tasks its `task_id`
+  // IS the agent id and its `tool_use_id` is the spawning Agent/Task call), so
+  // the eagerly-emitted tool_call and the permission request can be attributed
+  // to the parent tool call the same way the streamed path attributes updates.
+  function setup() {
+    const updates: SessionNotification[] = [];
+    const requests: RequestPermissionRequest[] = [];
+    const log = vi.fn();
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n);
+      },
+      requestPermission: async (params: RequestPermissionRequest) => {
+        requests.push(params);
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState();
+    return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
+  }
+
+  it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
+    const { agent, updates, requests, session } = setup();
+    session.subagentParentToolUseIds.set("agent-42", "toolu_parent");
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_sub",
+      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
+    });
+    // The request's claudeCode meta keeps the shape every other claudeCode
+    // meta has (toolName is required by ToolUpdateMeta).
+    expect(requests[0].toolCall._meta).toMatchObject({
+      claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
+    });
+  });
+
+  it("omits the attribution (and logs the miss) when the agent id has no recorded parent", async () => {
+    const { agent, updates, requests, log } = setup();
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-unknown",
+    } as any);
+
+    const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
+    expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
+    expect(requests[0].toolCall._meta).toBeUndefined();
+    // The task_id === agentID invariant is undocumented SDK behavior; a miss
+    // must be observable so an SDK bump that breaks it doesn't regress silently.
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("agent-unknown"));
+  });
+
+  it("restores the attribution via the streamed refinement when the eager emission raced task_started", () => {
+    // If canUseTool wins the race against the consumer processing
+    // task_started, the eager tool_call goes out unattributed. The streamed
+    // tool_use chunk — whose message carries parent_tool_use_id — then refines
+    // it with a tool_call_update that restores the parent meta for merging
+    // clients. This recovery is what makes the best-effort lookup acceptable.
+    const { session } = setup();
+    session.emittedToolCalls.add("toolu_sub");
+
+    const notifications = toAcpNotifications(
+      [{ type: "tool_use", id: "toolu_sub", name: "Bash", input: { command: "ls" } }],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      { emittedToolCalls: session.emittedToolCalls, parentToolUseId: "toolu_parent" },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_sub",
+      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
+    });
+  });
+
+  function taskStarted(taskId: string, toolUseId: string) {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      description: "Investigate",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function successResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** Replays the prompt's user echo (so the turn activates), then the given
+   *  messages, then settles the turn. */
+  function makeGenerator(messages: unknown[]) {
+    return async function* (input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) {
+        yield userEcho(userMessage);
+      }
+      yield* messages as any;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    };
+  }
+
+  it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      {
+        log: () => {},
+        error: () => {},
+      },
+    );
+    injectGeneratorSession(
+      agent,
+      makeGenerator([taskStarted("agent-42", "toolu_parent"), successResult()]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(agent.sessions["test-session"]!.subagentParentToolUseIds.get("agent-42")).toBe(
+      "toolu_parent",
+    );
+  });
+
+  it("prunes the mapping when the task settles (task_notification)", async () => {
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      {
+        log: () => {},
+        error: () => {},
+      },
+    );
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("agent-42", "toolu_parent"),
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_parent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(agent.sessions["test-session"]!.subagentParentToolUseIds.size).toBe(0);
+  });
+
+  it("prunes the mapping on a terminal task_updated patch (belt and braces)", async () => {
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
+      {
+        log: () => {},
+        error: () => {},
+      },
+    );
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        taskStarted("agent-42", "toolu_parent"),
+        taskStarted("agent-43", "toolu_parent_2"),
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "agent-42",
+          patch: { status: "completed" },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        // A non-terminal patch must NOT prune: the task keeps running and its
+        // permission requests still need the attribution.
+        {
+          type: "system",
+          subtype: "task_updated",
+          task_id: "agent-43",
+          patch: { status: "running", is_backgrounded: true },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const map = agent.sessions["test-session"]!.subagentParentToolUseIds;
+    expect(map.has("agent-42")).toBe(false);
+    expect(map.get("agent-43")).toBe("toolu_parent_2");
   });
 });
 
@@ -3177,6 +3573,7 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -3264,6 +3661,7 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -3368,6 +3766,7 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
     return agent.sessions[sessionId]!;
@@ -5605,6 +6004,7 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -6236,6 +6636,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      subagentParentToolUseIds: new Map(),
       messageIdToUuid: new Map(),
     };
     return { interrupt };
@@ -6994,6 +7395,7 @@ describe("agent selection config option", () => {
         taskState: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        subagentParentToolUseIds: new Map(),
         messageIdToUuid: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
