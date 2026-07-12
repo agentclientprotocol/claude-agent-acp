@@ -519,7 +519,23 @@ function availableStreamedToolInput(
     }
   }
 
-  const candidateEnds = [partialJson.length, ...topLevelCommas.reverse()];
+  // A number at the current buffer end is ambiguous (`10` may still become
+  // `100` or `10.5`). Strings, arrays, objects, booleans, and null have an
+  // unambiguous terminator, so only try the live buffer end for those values.
+  // Values before a top-level comma are always complete regardless of type.
+  const trimmed = partialJson.trimEnd();
+  const hasUnambiguousValueEnd =
+    !inString &&
+    (trimmed.endsWith('"') ||
+      trimmed.endsWith("}") ||
+      trimmed.endsWith("]") ||
+      trimmed.endsWith("true") ||
+      trimmed.endsWith("false") ||
+      trimmed.endsWith("null"));
+  const candidateEnds = [
+    ...(hasUnambiguousValueEnd ? [partialJson.length] : []),
+    ...topLevelCommas.reverse(),
+  ];
   for (const end of candidateEnds) {
     const candidate = partialJson.slice(0, end).trimEnd();
     const input = parseObject(candidate + "}");

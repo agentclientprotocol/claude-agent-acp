@@ -7279,6 +7279,295 @@ describe("streamEventToAcpNotifications", () => {
     expect(streamedToolInputs.size).toBe(0);
   });
 
+  describe("partial tool input coverage", () => {
+    function refineFromPartialInput({
+      name,
+      partialJson,
+      type = "tool_use",
+    }: {
+      name: string;
+      partialJson: string;
+      type?: "tool_use" | "server_tool_use" | "mcp_tool_use";
+    }) {
+      const toolUseCache = {};
+      const emittedToolCalls = new Set<string>();
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = {
+        cwd: "/Users/test/project",
+        emittedToolCalls,
+        streamedToolInputs,
+      };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+
+      const started = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type, id: "toolu_partial", name, input: {} },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+      const refined = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: partialJson },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+
+      return { started, refined, streamedToolInputs };
+    }
+
+    it.each([
+      {
+        case: "Agent description",
+        name: "Agent",
+        partialJson: '{"description":"Investigate issue","prompt":',
+        title: "Investigate issue",
+        rawInput: { description: "Investigate issue" },
+      },
+      {
+        case: "legacy Task description",
+        name: "Task",
+        partialJson: '{"description":"Research dependencies","prompt":',
+        title: "Research dependencies",
+        rawInput: { description: "Research dependencies" },
+      },
+      {
+        case: "Bash command with comma and escaped quotes",
+        name: "Bash",
+        partialJson: `{"command":${JSON.stringify('sleep 900, then echo "done"')},"timeout":`,
+        title: 'sleep 900, then echo "done"',
+        rawInput: { command: 'sleep 900, then echo "done"' },
+      },
+      {
+        case: "Read file path",
+        name: "Read",
+        partialJson: '{"file_path":"/Users/test/project/src/read.ts","offset":',
+        title: "Read src/read.ts",
+        rawInput: { file_path: "/Users/test/project/src/read.ts" },
+      },
+      {
+        case: "Write file path",
+        name: "Write",
+        partialJson: '{"file_path":"/Users/test/project/src/write.ts","content":',
+        title: "Write src/write.ts",
+        rawInput: { file_path: "/Users/test/project/src/write.ts" },
+      },
+      {
+        case: "Edit file path",
+        name: "Edit",
+        partialJson: '{"file_path":"/Users/test/project/src/edit.ts","old_string":',
+        title: "Edit src/edit.ts",
+        rawInput: { file_path: "/Users/test/project/src/edit.ts" },
+      },
+      {
+        case: "Glob pattern",
+        name: "Glob",
+        partialJson: '{"pattern":"**/*.ts","path":',
+        title: "Find `**/*.ts`",
+        rawInput: { pattern: "**/*.ts" },
+      },
+      {
+        case: "Grep strings, booleans, and numbers",
+        name: "Grep",
+        partialJson:
+          '{"pattern":"TODO, FIXME","-i":true,"-n":true,"-A":2,"-B":1,"-C":3,"output_mode":"files_with_matches","head_limit":10,"glob":"*.ts","type":"ts","multiline":true,"path":',
+        title:
+          'grep -i -n -A 2 -B 1 -C 3 -l | head -10 --include="*.ts" --type=ts -P "TODO, FIXME"',
+        rawInput: {
+          pattern: "TODO, FIXME",
+          "-i": true,
+          "-n": true,
+          "-A": 2,
+          "-B": 1,
+          "-C": 3,
+          output_mode: "files_with_matches",
+          head_limit: 10,
+          glob: "*.ts",
+          type: "ts",
+          multiline: true,
+        },
+      },
+      {
+        case: "WebFetch URL",
+        name: "WebFetch",
+        partialJson: '{"url":"https://example.com/docs","prompt":',
+        title: "Fetch https://example.com/docs",
+        rawInput: { url: "https://example.com/docs" },
+      },
+      {
+        case: "WebSearch query and domain array",
+        name: "WebSearch",
+        type: "server_tool_use" as const,
+        partialJson:
+          '{"query":"ACP tools","allowed_domains":["agentclientprotocol.com","github.com"],"blocked_domains":',
+        title: '"ACP tools" (allowed: agentclientprotocol.com, github.com)',
+        rawInput: {
+          query: "ACP tools",
+          allowed_domains: ["agentclientprotocol.com", "github.com"],
+        },
+      },
+      {
+        case: "ReportFindings nested array and object",
+        name: "ReportFindings",
+        partialJson:
+          '{"findings":[{"file":"src/a.ts","line":7,"summary":"Broken","failure_scenario":"Fails"}]',
+        title: "Report 1 finding",
+        rawInput: {
+          findings: [
+            {
+              file: "src/a.ts",
+              line: 7,
+              summary: "Broken",
+              failure_scenario: "Fails",
+            },
+          ],
+        },
+      },
+      {
+        case: "ExitPlanMode plan",
+        name: "ExitPlanMode",
+        partialJson: '{"plan":"Implement streamed input"',
+        title: "Ready to code?",
+        rawInput: { plan: "Implement streamed input" },
+      },
+      {
+        case: "AskUserQuestion nested questions",
+        name: "AskUserQuestion",
+        partialJson:
+          '{"questions":[{"question":"Which mode?","header":"Mode","options":[{"label":"Fast","description":"Fast mode"},{"label":"Safe","description":"Safe mode"}],"multiSelect":false}]',
+        title: "Which mode?",
+        rawInput: {
+          questions: [
+            {
+              question: "Which mode?",
+              header: "Mode",
+              options: [
+                { label: "Fast", description: "Fast mode" },
+                { label: "Safe", description: "Safe mode" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      {
+        case: "generic Other tool",
+        name: "Other",
+        partialJson: '{"query":"custom query","options":',
+        title: "Other",
+        rawInput: { query: "custom query" },
+      },
+      {
+        case: "custom MCP tool",
+        name: "mcp__demo__search",
+        type: "mcp_tool_use" as const,
+        partialJson: '{"query":"custom MCP query","options":',
+        title: "mcp__demo__search",
+        rawInput: { query: "custom MCP query" },
+      },
+    ])("refines $case before the full JSON object completes", (testCase) => {
+      const { refined, streamedToolInputs } = refineFromPartialInput(testCase);
+
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_partial",
+        title: testCase.title,
+        rawInput: testCase.rawInput,
+      });
+      expect(streamedToolInputs.size).toBe(1);
+    });
+
+    it("emits a TodoWrite plan as soon as its nested array is complete", () => {
+      const { started, refined } = refineFromPartialInput({
+        name: "TodoWrite",
+        partialJson:
+          '{"todos":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]',
+      });
+
+      expect(started).toEqual([]);
+      expect(refined).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "plan",
+            entries: [{ content: "Run tests", status: "in_progress", priority: "medium" }],
+          },
+        },
+      ]);
+    });
+
+    it.each([
+      {
+        name: "TaskCreate",
+        partialJson: '{"subject":"Create tests","description":',
+      },
+      {
+        name: "TaskUpdate",
+        partialJson: '{"taskId":"1","subject":"Update tests","status":',
+      },
+      { name: "TaskList", partialJson: "{}" },
+      { name: "TaskGet", partialJson: '{"taskId":"1"}' },
+    ])("keeps deliberately suppressed $name calls out of the tool feed", (testCase) => {
+      const { started, refined } = refineFromPartialInput(testCase);
+      expect(started).toEqual([]);
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an unfinished string", () => {
+      const { refined } = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"command":"sleep 900',
+      });
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an ambiguous number until its delimiter arrives", () => {
+      const first = refineFromPartialInput({ name: "Bash", partialJson: '{"timeout":10' });
+      expect(first.refined).toEqual([]);
+
+      const delimited = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"timeout":100,"command":',
+      });
+      expect(delimited.refined).toHaveLength(1);
+      expect(delimited.refined[0].update).toMatchObject({ rawInput: { timeout: 100 } });
+    });
+
+    it.each([
+      { label: "boolean", partialJson: '{"run_in_background":true' },
+      { label: "null", partialJson: '{"optional":null' },
+      { label: "array", partialJson: '{"items":[1,"two",false]' },
+      { label: "nested object", partialJson: '{"options":{"limit":5,"enabled":true}' },
+    ])("publishes an unambiguously completed $label value", ({ partialJson }) => {
+      const { refined } = refineFromPartialInput({ name: "CustomTool", partialJson });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({ sessionUpdate: "tool_call_update" });
+    });
+  });
+
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
     const logger = {
