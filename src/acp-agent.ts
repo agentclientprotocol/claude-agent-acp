@@ -453,6 +453,15 @@ export type ToolUseCache = {
   };
 };
 
+type StreamedToolInput = {
+  type: "tool_use" | "server_tool_use" | "mcp_tool_use";
+  id: string;
+  name: string;
+  partialJson: string;
+};
+
+export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
+
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
     return process.env.CLAUDE_CODE_EXECUTABLE;
@@ -1181,6 +1190,11 @@ export class ClaudeAcpAgent {
     // gateways that don't carry a stable/matching id across the stream and the
     // consolidated message. Reset after each consolidated message consumes it.
     const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
+    // Tool-use blocks start streaming before their JSON input. Keep the
+    // partial input per parent message and block index so a completed input can
+    // refine the pending tool call immediately, without waiting for the later
+    // consolidated assistant message.
+    const streamedToolInputs: StreamedToolInputCache = new Map();
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
@@ -2163,6 +2177,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
+                streamedToolInputs,
               },
             )) {
               await this.client.sessionUpdate(notification);
@@ -5548,28 +5563,83 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     messageId?: string;
+    streamedToolInputs?: StreamedToolInputCache;
   },
 ): SessionNotification[] {
   const event = message.event;
+  const streamKey = message.parent_tool_use_id ?? "";
+  const streamedToolInputs = options?.streamedToolInputs;
   switch (event.type) {
-    case "content_block_start":
-      return toAcpNotifications(
-        [event.content_block],
-        "assistant",
-        sessionId,
-        toolUseCache,
-        client,
-        logger,
-        {
-          clientCapabilities: options?.clientCapabilities,
-          parentToolUseId: message.parent_tool_use_id,
-          cwd: options?.cwd,
-          taskState: options?.taskState,
-          emittedToolCalls: options?.emittedToolCalls,
-          messageId: options?.messageId,
-        },
-      );
-    case "content_block_delta":
+    case "content_block_start": {
+      const block = event.content_block;
+      if (
+        streamedToolInputs &&
+        (block.type === "tool_use" ||
+          block.type === "server_tool_use" ||
+          block.type === "mcp_tool_use")
+      ) {
+        let inputsForMessage = streamedToolInputs.get(streamKey);
+        if (!inputsForMessage) {
+          inputsForMessage = new Map();
+          streamedToolInputs.set(streamKey, inputsForMessage);
+        }
+        inputsForMessage.set(event.index, {
+          type: block.type,
+          id: block.id,
+          name: block.name,
+          partialJson: "",
+        });
+      }
+      return toAcpNotifications([block], "assistant", sessionId, toolUseCache, client, logger, {
+        clientCapabilities: options?.clientCapabilities,
+        parentToolUseId: message.parent_tool_use_id,
+        cwd: options?.cwd,
+        taskState: options?.taskState,
+        emittedToolCalls: options?.emittedToolCalls,
+        messageId: options?.messageId,
+      });
+    }
+    case "content_block_delta": {
+      if (event.delta.type === "input_json_delta" && streamedToolInputs) {
+        const inputsForMessage = streamedToolInputs.get(streamKey);
+        if (!inputsForMessage) return [];
+        const streamedInput = inputsForMessage.get(event.index);
+        if (!streamedInput) return [];
+
+        streamedInput.partialJson += event.delta.partial_json;
+        let input: unknown;
+        try {
+          input = JSON.parse(streamedInput.partialJson);
+        } catch {
+          return [];
+        }
+
+        inputsForMessage.delete(event.index);
+        if (inputsForMessage.size === 0) streamedToolInputs.delete(streamKey);
+        return toAcpNotifications(
+          [
+            {
+              type: streamedInput.type,
+              id: streamedInput.id,
+              name: streamedInput.name,
+              input,
+            } as BetaContentBlock,
+          ],
+          "assistant",
+          sessionId,
+          toolUseCache,
+          client,
+          logger,
+          {
+            clientCapabilities: options?.clientCapabilities,
+            parentToolUseId: message.parent_tool_use_id,
+            cwd: options?.cwd,
+            taskState: options?.taskState,
+            emittedToolCalls: options?.emittedToolCalls,
+            messageId: options?.messageId,
+          },
+        );
+      }
       return toAcpNotifications(
         [event.delta],
         "assistant",
@@ -5586,16 +5656,26 @@ export function streamEventToAcpNotifications(
           messageId: options?.messageId,
         },
       );
+    }
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
     // `BetaRawMessageStreamEvent` union doesn't include even though the
     // wire format emits it; the `as never` cast lets us no-op it here
     // instead of letting it fall through to `unreachable`.
     case "ping" as never:
     case "message_start":
-    case "message_delta":
-    case "message_stop":
-    case "content_block_stop":
+      streamedToolInputs?.delete(streamKey);
       return [];
+    case "message_delta":
+      return [];
+    case "message_stop":
+      streamedToolInputs?.delete(streamKey);
+      return [];
+    case "content_block_stop": {
+      const inputsForMessage = streamedToolInputs?.get(streamKey);
+      inputsForMessage?.delete(event.index);
+      if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
+      return [];
+    }
 
     default:
       unreachable(event, logger);

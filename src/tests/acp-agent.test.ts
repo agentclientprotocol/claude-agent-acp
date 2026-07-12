@@ -42,6 +42,7 @@ import {
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
+  type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import {
@@ -7157,6 +7158,99 @@ describe("turn abandoned by the SDK (issue #825)", () => {
 });
 
 describe("streamEventToAcpNotifications", () => {
+  it("refines a tool call as soon as its streamed JSON input is complete", () => {
+    const toolUseCache = {};
+    const emittedToolCalls = new Set<string>();
+    const streamedToolInputs: StreamedToolInputCache = new Map();
+    const options = {
+      cwd: "/Users/test/project",
+      emittedToolCalls,
+      streamedToolInputs,
+    };
+    const baseMessage = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+
+    const start = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_read",
+            name: "Read",
+            input: {},
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(start).toHaveLength(1);
+    expect(start[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_read",
+      title: "Read File",
+      locations: [],
+    });
+
+    const partial = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"file_' },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(partial).toEqual([]);
+
+    const completed = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "input_json_delta",
+            partial_json: 'path":"/Users/test/project/src/ZodiacList.tsx"}',
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_read",
+      title: "Read src/ZodiacList.tsx",
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
+      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
+    });
+    expect(streamedToolInputs.size).toBe(0);
+  });
+
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
     const logger = {
