@@ -7158,7 +7158,7 @@ describe("turn abandoned by the SDK (issue #825)", () => {
 });
 
 describe("streamEventToAcpNotifications", () => {
-  it("refines a tool call as soon as its streamed JSON input is complete", () => {
+  it("refines a tool call as soon as a streamed input field is complete", () => {
     const toolUseCache = {};
     const emittedToolCalls = new Set<string>();
     const streamedToolInputs: StreamedToolInputCache = new Map();
@@ -7221,7 +7221,7 @@ describe("streamEventToAcpNotifications", () => {
 
     expect(partial).toEqual([]);
 
-    const completed = streamEventToAcpNotifications(
+    const pathAvailable = streamEventToAcpNotifications(
       {
         ...baseMessage,
         event: {
@@ -7229,8 +7229,36 @@ describe("streamEventToAcpNotifications", () => {
           index: 0,
           delta: {
             type: "input_json_delta",
-            partial_json: 'path":"/Users/test/project/src/ZodiacList.tsx"}',
+            partial_json: 'path":"/Users/test/project/src/ZodiacList.tsx","offset":',
           },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    // The overall JSON is still invalid, but file_path is complete and already
+    // makes this pending read distinguishable from other tool calls.
+    expect(pathAvailable).toHaveLength(1);
+    expect(pathAvailable[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_read",
+      title: "Read src/ZodiacList.tsx",
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
+      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
+    });
+    expect(streamedToolInputs.size).toBe(1);
+
+    const completed = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: "10}" },
         },
       } as Parameters<typeof streamEventToAcpNotifications>[0],
       "test-session",
@@ -7244,9 +7272,9 @@ describe("streamEventToAcpNotifications", () => {
     expect(completed[0].update).toMatchObject({
       sessionUpdate: "tool_call_update",
       toolCallId: "toolu_read",
-      title: "Read src/ZodiacList.tsx",
-      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
-      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
+      title: "Read src/ZodiacList.tsx (from line 10)",
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx", offset: 10 },
+      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 10 }],
     });
     expect(streamedToolInputs.size).toBe(0);
   });

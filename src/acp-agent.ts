@@ -458,9 +458,77 @@ type StreamedToolInput = {
   id: string;
   name: string;
   partialJson: string;
+  lastEmittedInputJson?: string;
 };
 
 export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
+
+/**
+ * Recover every complete top-level field from an input object that may still
+ * be streaming. Trying the current end first handles a completed value whose
+ * following comma has not arrived yet; falling back through top-level commas
+ * drops the currently incomplete field while preserving all earlier ones.
+ */
+function availableStreamedToolInput(
+  partialJson: string,
+): { input: Record<string, unknown>; complete: boolean } | undefined {
+  const parseObject = (json: string): Record<string, unknown> | undefined => {
+    try {
+      const value: unknown = JSON.parse(json);
+      return value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const complete = parseObject(partialJson);
+  if (complete) return { input: complete, complete: true };
+
+  const topLevelCommas: number[] = [];
+  let objectDepth = 0;
+  let arrayDepth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < partialJson.length; index++) {
+    const character = partialJson[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      inString = true;
+    } else if (character === "{") {
+      objectDepth++;
+    } else if (character === "}") {
+      objectDepth--;
+    } else if (character === "[") {
+      arrayDepth++;
+    } else if (character === "]") {
+      arrayDepth--;
+    } else if (character === "," && objectDepth === 1 && arrayDepth === 0) {
+      topLevelCommas.push(index);
+    }
+  }
+
+  const candidateEnds = [partialJson.length, ...topLevelCommas.reverse()];
+  for (const end of candidateEnds) {
+    const candidate = partialJson.slice(0, end).trimEnd();
+    const input = parseObject(candidate + "}");
+    if (input && Object.keys(input).length > 0) {
+      return { input, complete: false };
+    }
+  }
+  return undefined;
+}
 
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
@@ -5588,6 +5656,7 @@ export function streamEventToAcpNotifications(
           id: block.id,
           name: block.name,
           partialJson: "",
+          lastEmittedInputJson: JSON.stringify(block.input),
         });
       }
       return toAcpNotifications([block], "assistant", sessionId, toolUseCache, client, logger, {
@@ -5607,22 +5676,24 @@ export function streamEventToAcpNotifications(
         if (!streamedInput) return [];
 
         streamedInput.partialJson += event.delta.partial_json;
-        let input: unknown;
-        try {
-          input = JSON.parse(streamedInput.partialJson);
-        } catch {
-          return [];
-        }
+        const availableInput = availableStreamedToolInput(streamedInput.partialJson);
+        if (!availableInput) return [];
 
-        inputsForMessage.delete(event.index);
-        if (inputsForMessage.size === 0) streamedToolInputs.delete(streamKey);
+        const inputJson = JSON.stringify(availableInput.input);
+        const shouldEmit = inputJson !== streamedInput.lastEmittedInputJson;
+        streamedInput.lastEmittedInputJson = inputJson;
+        if (availableInput.complete) {
+          inputsForMessage.delete(event.index);
+          if (inputsForMessage.size === 0) streamedToolInputs.delete(streamKey);
+        }
+        if (!shouldEmit) return [];
         return toAcpNotifications(
           [
             {
               type: streamedInput.type,
               id: streamedInput.id,
               name: streamedInput.name,
-              input,
+              input: availableInput.input,
             } as BetaContentBlock,
           ],
           "assistant",
