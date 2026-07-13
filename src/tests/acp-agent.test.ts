@@ -5050,6 +5050,144 @@ describe("assembled assistant text fallback", () => {
 
     expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
   });
+
+  // Like injectSession, but serves two prompts: each turn's echo is yielded
+  // when its prompt arrives, followed by that turn's scripted messages.
+  function injectSessionTwoTurns(agent: ClaudeAcpAgent, first: any[], second: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const messages of [first, second]) {
+        const { value: userMessage, done } = await iter.next();
+        if (!done && userMessage) {
+          yield {
+            type: "user",
+            message: userMessage.message,
+            parent_tool_use_id: null,
+            uuid: userMessage.uuid,
+            session_id: "test-session",
+            isReplay: true,
+          };
+        }
+        yield* messages;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
+  it("does not re-emit the result text after an informational notice delivered it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // A hook-blocked prompt: the SDK surfaces the block reason as an
+    // informational notice and then repeats it on the result with zero output
+    // tokens. The notice is the turn's delivered text — the fallback must not
+    // emit the reason a second time.
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "hook says no",
+        level: "warning",
+        session_id: "test-session",
+      },
+      replayedResult("hook says no"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+  });
+
+  it("still forwards the result text after a turn failed without a result", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Turn A streams partial text, then the SDK goes idle without ever
+    // emitting its result (issue #825) — the turn fails, and the delivery
+    // record it leaves behind must not suppress the retry's fallback.
+    injectSessionTwoTurns(
+      agent,
+      [messageStart("msg-a"), textDelta("partial answ"), idle],
+      [replayedResult("**3**"), idle],
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] }),
+    ).rejects.toThrow();
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["partial answ", "**3**"]);
+  });
+
+  it("does not let a refusal explanation suppress the next turn's fallback", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // The refusal explanation is emitted while the refused turn's result is
+    // being handled; the stretch must still end at that result, or the next
+    // replayed turn would read the explanation as ITS delivered answer and
+    // end silently.
+    injectSessionTwoTurns(
+      agent,
+      [
+        {
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          content: "cannot help with that",
+          session_id: "test-session",
+        },
+        { ...result(), stop_reason: "refusal" },
+        idle,
+      ],
+      [replayedResult("**3**"), idle],
+    );
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "nope" }],
+    });
+    expect(first.stopReason).toBe("refusal");
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["cannot help with that", "**3**"]);
+  });
+
+  it("forwards the result text when the backend omits output_tokens", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Third-party backends have been observed emitting usage token fields as
+    // null (see snapshotFromUsage), and the replay lane of issue #453 was
+    // reported from exactly such a backend — a missing count must not
+    // disable the fallback.
+    injectSession(agent, [
+      { ...replayedResult("**3**"), usage: { ...ZERO_USAGE, output_tokens: null } },
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("forwards the result text when only subagent content preceded it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // A subagent's image block passes the text/thinking filter but carries
+    // the parentToolUseId meta — it is tool-internal, not the turn's answer,
+    // so the replayed result must still be forwarded.
+    injectSession(agent, [
+      assistantMessage(
+        "msg-sub",
+        [{ type: "image", source: { type: "base64", data: "aGk=", media_type: "image/png" } }],
+        "tool-1",
+      ),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toContain("**3**");
+  });
 });
 
 describe("emitRawSDKMessages", () => {
