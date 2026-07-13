@@ -64,17 +64,17 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
-    "@anthropic-ai/claude-agent-sdk": "0.3.206",
+    "@anthropic-ai/claude-agent-sdk": "0.3.207",
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "0.110.0",
+    "@anthropic-ai/sdk": "0.111.0",
     "@eslint/js": "10.0.1",
     "@tsconfig/node22": "22.0.5",
     "@types/node": "26.1.1",
     "@typescript-eslint/eslint-plugin": "8.63.0",
     "@typescript-eslint/parser": "8.63.0",
-    "eslint": "10.6.0",
+    "eslint": "10.7.0",
     "eslint-config-prettier": "10.1.8",
     "globals": "17.7.0",
     "prettier": "3.9.5",
