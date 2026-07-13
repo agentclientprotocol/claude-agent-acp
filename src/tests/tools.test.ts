@@ -2205,3 +2205,107 @@ describe("empty message content is not emitted", () => {
     });
   });
 });
+
+describe("Agent/Task tool_result rendering from tool_use_result", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  const TRAILER =
+    "\nagentId: a0e1eff08fcb6e2e8 (use SendMessage with to: 'a0e1eff08fcb6e2e8', summary: '<5-10 word recap>' to continue this agent)\n<usage>subagent_tokens: 11735\ntool_uses: 2\nduration_ms: 21237</usage>";
+
+  const agentToolUse = {
+    type: "tool_use" as const,
+    id: "toolu_agent",
+    name: "Task",
+    input: { description: "Explore", prompt: "look around" },
+  };
+
+  const rawResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_agent",
+    content: [{ type: "text", text: `The report.${TRAILER}` }],
+  };
+
+  const structured = {
+    status: "completed",
+    agentId: "a0e1eff08fcb6e2e8",
+    content: [{ type: "text", text: "The report." }],
+    totalTokens: 11735,
+    totalToolUseCount: 2,
+    totalDurationMs: 21237,
+  };
+
+  it("renders the structured subagent report instead of the raw trailer text", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, structured);
+
+    expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: "The report." } }],
+    });
+  });
+
+  it("falls back to the raw tool_result text when tool_use_result is absent", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false);
+
+    expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: `The report.${TRAILER}` } }],
+    });
+  });
+
+  it("falls back to the raw text when tool_use_result is the async_launched variant", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      status: "async_launched",
+      agentId: "a0e1eff08fcb6e2e8",
+      description: "Explore",
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: `The report.${TRAILER}` } },
+    ]);
+  });
+
+  it("threads options.toolUseResult through toAcpNotifications for a lone tool_result", () => {
+    const toolUseCache: ToolUseCache = { toolu_agent: agentToolUse };
+
+    const notifications = toAcpNotifications(
+      [rawResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolUseResult: structured },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_agent",
+      status: "completed",
+      content: [{ type: "content", content: { type: "text", text: "The report." } }],
+    });
+  });
+
+  it("ignores options.toolUseResult when several tool_result blocks are batched", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_agent: agentToolUse,
+      toolu_agent2: { ...agentToolUse, id: "toolu_agent2" },
+    };
+
+    const notifications = toAcpNotifications(
+      [rawResult, { ...rawResult, tool_use_id: "toolu_agent2" }] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolUseResult: structured },
+    );
+
+    expect(notifications).toHaveLength(2);
+    for (const notification of notifications) {
+      expect(notification.update).toMatchObject({
+        content: [{ type: "content", content: { type: "text", text: `The report.${TRAILER}` } }],
+      });
+    }
+  });
+});

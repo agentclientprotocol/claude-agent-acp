@@ -3318,6 +3318,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
+                toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -6302,6 +6303,11 @@ export function toAcpNotifications(
     // into a single message. Omit it (leave undefined) when unknown — never send
     // an explicit `null`.
     messageId?: string;
+    // The SDK user message's `tool_use_result`: the structured Output object of
+    // the tool_result this message carries (shape is per-tool). Used to render
+    // Agent/Task results from the structured subagent report instead of the raw
+    // text (which ends in a model-directed agentId/usage trailer).
+    toolUseResult?: unknown;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -6332,6 +6338,17 @@ export function toAcpNotifications(
 
     return [{ sessionId, update }];
   }
+
+  // `tool_use_result` is message-level and carries no tool_use_id of its own:
+  // it describes "the" tool_result block of the message it rode in on. If
+  // several tool_result blocks were ever batched into one message it couldn't
+  // be attributed, so it is only honored when the message carries exactly one.
+  const toolUseResult =
+    options?.toolUseResult !== undefined &&
+    content.filter((c) => typeof c === "object" && c !== null && c.type === "tool_result")
+      .length === 1
+      ? options.toolUseResult
+      : undefined;
 
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
@@ -6569,6 +6586,7 @@ export function toAcpNotifications(
             chunk,
             toolUseCache[chunk.tool_use_id],
             supportsTerminalOutput,
+            toolUseResult,
           );
 
           // When terminal output is supported, send terminal_output as a

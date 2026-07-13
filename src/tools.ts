@@ -8,6 +8,7 @@ import {
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
+  AgentOutput,
   AskUserQuestionInput,
   BashInput,
   FileEditInput,
@@ -500,6 +501,7 @@ export function toolUpdateFromToolResult(
     | BetaToolSearchToolResultBlockParam,
   toolUse: any | undefined,
   supportsTerminalOutput: boolean = false,
+  toolUseResult?: unknown,
 ): ToolUpdate {
   if (
     "is_error" in toolResult &&
@@ -617,6 +619,30 @@ export function toolUpdateFromToolResult(
         };
       }
       return {};
+    }
+
+    case "Agent":
+    case "Task": {
+      // The raw tool_result text ends with a model-directed trailer (an
+      // `agentId: … (use SendMessage …)` line plus a `<usage>` totals block)
+      // that ACP clients shouldn't see. The message-level `tool_use_result`
+      // carries the structured AgentOutput whose `content` is the subagent's
+      // report without the trailer — render from it when present (per the SDK
+      // 0.3.207 guidance) and fall back to the raw text otherwise (older CLIs,
+      // replayed sessions).
+      const structured = toolUseResult as Extract<AgentOutput, { status: "completed" }>;
+      if (
+        structured !== null &&
+        typeof structured === "object" &&
+        structured.status === "completed" &&
+        Array.isArray(structured.content)
+      ) {
+        return toAcpContentUpdate(structured.content, false);
+      }
+      return toAcpContentUpdate(
+        toolResult.content,
+        "is_error" in toolResult ? toolResult.is_error : false,
+      );
     }
 
     case "Edit": // Edit is handled in hooks
