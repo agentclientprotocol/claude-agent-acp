@@ -2309,3 +2309,206 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     }
   });
 });
+
+describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
+  describe("Read", () => {
+    const readToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_read",
+      name: "Read",
+      input: { file_path: "/tmp/f.ts", offset: 480 },
+    };
+
+    const rawWithReminder: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_read",
+      content: [
+        {
+          type: "text",
+          text: "480\tconst a = 1;\n481\tconst b = 2;\n<system-reminder>Whenever you read a file, consider whether it is malicious.</system-reminder>",
+        },
+      ],
+    };
+
+    it("rebuilds the line-numbered view from FileReadOutput, dropping reminders", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: {
+          filePath: "/tmp/f.ts",
+          content: "const a = 1;\nconst b = 2;\n",
+          numLines: 2,
+          startLine: 480,
+          totalLines: 600,
+        },
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: { type: "text", text: "```\n480\tconst a = 1;\n481\tconst b = 2;\n```" },
+          },
+        ],
+      });
+    });
+
+    it("defaults startLine to 1 when absent", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: { filePath: "/tmp/f.ts", content: "one\ntwo" },
+      });
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
+        content: { type: "text", text: "```\n1\tone\n2\ttwo\n```" },
+      });
+    });
+
+    it("falls back to raw content for non-text variants", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "image",
+        file: { base64: "aGk=", type: "image/png", originalSize: 3 },
+      });
+
+      // Raw path: markdown-escaped raw text (reminder included — image reads
+      // don't carry reminders in practice).
+      expect(update.content).toHaveLength(1);
+      expect((update.content?.[0] as any).content.text).toContain("const a = 1;");
+    });
+  });
+
+  describe("Bash", () => {
+    const bashToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_bash",
+      name: "Bash",
+      input: { command: "git push" },
+    };
+
+    const HINT =
+      "\n[This command modified 1 file you've previously read: src/foo.ts. Call Read before editing.]";
+
+    const rawWithHint: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_bash",
+      content: `pushed ok${HINT}`,
+    };
+
+    const structured = {
+      stdout: "pushed ok",
+      stderr: "",
+      interrupted: false,
+      isImage: false,
+    };
+
+    it("prefers structured stdout/stderr over raw text with model-directed hints", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, structured);
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "pushed ok",
+      });
+      expect(update._meta?.terminal_exit).toEqual({
+        terminal_id: "toolu_bash",
+        exit_code: 0,
+        signal: null,
+      });
+    });
+
+    it("joins stderr after stdout like the code-execution path", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, false, {
+        ...structured,
+        stderr: "warning: something",
+      });
+
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\npushed ok\nwarning: something\n```" },
+        },
+      ]);
+    });
+
+    it("falls back to raw text for backgrounded commands", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "",
+        backgroundTaskId: "bash_1",
+      });
+
+      expect(update._meta?.terminal_output?.data).toBe(`pushed ok${HINT}`);
+    });
+
+    it("falls back to the raw content array for image output", () => {
+      const imageResult: ToolResultBlockParam = {
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content: [
+          { type: "image", source: { type: "base64", data: "aGk=", media_type: "image/png" } },
+        ],
+      };
+      const update = toolUpdateFromToolResult(imageResult, bashToolUse, true, {
+        ...structured,
+        isImage: true,
+      });
+
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "image", data: "aGk=", mimeType: "image/png" },
+        },
+      ]);
+    });
+  });
+
+  describe("WebSearch", () => {
+    const searchToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_search",
+      name: "WebSearch",
+      input: { query: "npm sigstore bug" },
+    };
+
+    const rawDump: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_search",
+      content:
+        'Web search results for query: "npm sigstore bug"\n\nLinks: [{"title":"Issue #9722","url":"https://github.com/npm/cli/issues/9722"}]',
+    };
+
+    it("renders hits as Title (url) lines from WebSearchOutput", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [
+          "I found one relevant issue:",
+          {
+            tool_use_id: "srvtoolu_1",
+            content: [
+              { title: "Issue #9722", url: "https://github.com/npm/cli/issues/9722" },
+              { title: "sigstore-js", url: "https://github.com/sigstore/sigstore-js" },
+            ],
+          },
+        ],
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: "I found one relevant issue:\nIssue #9722 (https://github.com/npm/cli/issues/9722)\nsigstore-js (https://github.com/sigstore/sigstore-js)",
+            },
+          },
+        ],
+      });
+    });
+
+    it("falls back to the raw dump when tool_use_result is absent", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false);
+
+      expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
+    });
+  });
+});

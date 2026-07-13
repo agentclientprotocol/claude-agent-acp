@@ -11,8 +11,10 @@ import {
   AgentOutput,
   AskUserQuestionInput,
   BashInput,
+  BashOutput,
   FileEditInput,
   FileReadInput,
+  FileReadOutput,
   FileWriteInput,
   GlobInput,
   GrepInput,
@@ -23,6 +25,7 @@ import {
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
+  WebSearchOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
   ImageBlockParam,
@@ -515,7 +518,40 @@ export function toolUpdateFromToolResult(
   }
 
   switch (toolUse?.name) {
-    case "Read":
+    case "Read": {
+      // The raw tool_result text is the model-facing view: line-numbered
+      // content plus any appended <system-reminder> blocks (malicious-code
+      // checks, memory staleness notes, …) that clients shouldn't see. The
+      // structured FileReadOutput carries the clean content — rebuild the
+      // line-numbered view from it. Non-text variants (image/notebook/pdf)
+      // fall back to the raw content blocks, which already render fine.
+      const structuredRead = toolUseResult as FileReadOutput;
+      if (
+        structuredRead !== null &&
+        typeof structuredRead === "object" &&
+        structuredRead.type === "text" &&
+        typeof structuredRead.file?.content === "string" &&
+        // An empty file has nothing to line-number; keep the raw view (the
+        // model-facing "file is empty" note) rather than a phantom blank line.
+        structuredRead.file.content.length > 0
+      ) {
+        const startLine = structuredRead.file.startLine ?? 1;
+        // A trailing newline is a line terminator, not an extra line — don't
+        // number a phantom empty line after it.
+        const numbered = structuredRead.file.content
+          .replace(/\n$/, "")
+          .split("\n")
+          .map((line, i) => `${startLine + i}\t${line}`)
+          .join("\n");
+        return {
+          content: [
+            {
+              type: "content",
+              content: { type: "text", text: markdownEscape(numbered) },
+            },
+          ],
+        };
+      }
       if (Array.isArray(toolResult.content) && toolResult.content.length > 0) {
         return {
           content: toolResult.content.map((content: any) => ({
@@ -543,6 +579,7 @@ export function toolUpdateFromToolResult(
         };
       }
       return {};
+    }
 
     case "Bash": {
       const result = toolResult.content;
@@ -550,15 +587,32 @@ export function toolUpdateFromToolResult(
       const isError = "is_error" in toolResult && toolResult.is_error;
 
       // Extract output and exit code from either format:
-      // 1. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
-      // 2. Plain string content from a regular tool_result
-      // 3. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
+      // 1. The structured BashOutput (message-level tool_use_result): its
+      //    stdout/stderr exclude the model-directed suffixes the raw text
+      //    carries (stale-read hints, gh rate-limit hints, the
+      //    persisted-output wrapper for too-large outputs). Skipped for image
+      //    output (the raw content array carries the actual image blocks) and
+      //    backgrounded commands (the raw text carries the background-task
+      //    notice; structured stdout may be empty).
+      // 2. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
+      // 3. Plain string content from a regular tool_result
+      // 4. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
       //    or [{ type: "image", source: {...} }] when the local Bash tool
       //    produces an image, e.g. piping a base64 data URI)
       let output = "";
       let exitCode = isError ? 1 : 0;
 
+      const structuredBash = toolUseResult as BashOutput;
       if (
+        structuredBash !== null &&
+        typeof structuredBash === "object" &&
+        typeof structuredBash.stdout === "string" &&
+        typeof structuredBash.stderr === "string" &&
+        !structuredBash.isImage &&
+        structuredBash.backgroundTaskId === undefined
+      ) {
+        output = [structuredBash.stdout, structuredBash.stderr].filter(Boolean).join("\n");
+      } else if (
         result &&
         typeof result === "object" &&
         "type" in result &&
@@ -652,6 +706,41 @@ export function toolUpdateFromToolResult(
 
     case "ExitPlanMode": {
       return { title: "Exited Plan Mode" };
+    }
+
+    case "WebSearch": {
+      // The raw tool_result text is a model-directed dump ("Web search
+      // results for query: …\n\nLinks: [{…json…}]"). The structured
+      // WebSearchOutput carries the hits — render them the way server-side
+      // web_search_result blocks render ("Title (url)").
+      const structuredSearch = toolUseResult as WebSearchOutput;
+      if (
+        structuredSearch !== null &&
+        typeof structuredSearch === "object" &&
+        Array.isArray(structuredSearch.results)
+      ) {
+        const lines = structuredSearch.results.flatMap((entry) =>
+          typeof entry === "string"
+            ? [entry]
+            : Array.isArray(entry?.content)
+              ? entry.content.map((hit) => `${hit.title} (${hit.url})`)
+              : [],
+        );
+        if (lines.length > 0) {
+          return {
+            content: [
+              {
+                type: "content",
+                content: { type: "text", text: lines.join("\n") },
+              },
+            ],
+          };
+        }
+      }
+      return toAcpContentUpdate(
+        toolResult.content,
+        "is_error" in toolResult ? toolResult.is_error : false,
+      );
     }
 
     default: {
