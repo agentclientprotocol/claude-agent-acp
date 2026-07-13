@@ -510,6 +510,83 @@ export type ToolUseCache = {
   };
 };
 
+type StreamedToolInput = {
+  id: string;
+  name: string;
+  partialJson: string;
+  /** Offset into `partialJson` the scanner has consumed; each delta only scans
+   *  the newly appended fragment, so total scan work stays linear. */
+  scannedTo: number;
+  inString: boolean;
+  escaped: boolean;
+  objectDepth: number;
+  arrayDepth: number;
+  /** Offset of the most recent comma at the top level of the input object
+   *  (-1 before the first). Everything before it is a complete field. */
+  lastTopLevelComma: number;
+  /** The comma offset the last emitted refinement was sliced at (-1 before the
+   *  first), so a field boundary only triggers one recovery attempt. */
+  emittedThroughComma: number;
+};
+
+export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
+
+/**
+ * Advance the lexer state across the fragment appended since the last delta:
+ * just enough JSON awareness (string/escape, nesting depth) to spot commas
+ * that sit at the top level of the input object — everything before such a
+ * comma is a set of complete fields. Returns true once the input object's
+ * closing brace arrives.
+ */
+function scanStreamedToolInput(state: StreamedToolInput): boolean {
+  let complete = false;
+  for (let index = state.scannedTo; index < state.partialJson.length; index++) {
+    const character = state.partialJson[index];
+    if (state.inString) {
+      if (state.escaped) {
+        state.escaped = false;
+      } else if (character === "\\") {
+        state.escaped = true;
+      } else if (character === '"') {
+        state.inString = false;
+      }
+      continue;
+    }
+
+    if (character === '"') {
+      state.inString = true;
+    } else if (character === "{") {
+      state.objectDepth++;
+    } else if (character === "}") {
+      state.objectDepth--;
+      if (state.objectDepth === 0) {
+        complete = true;
+      }
+    } else if (character === "[") {
+      state.arrayDepth++;
+    } else if (character === "]") {
+      state.arrayDepth--;
+    } else if (character === "," && state.objectDepth === 1 && state.arrayDepth === 0) {
+      state.lastTopLevelComma = index;
+    }
+  }
+  state.scannedTo = state.partialJson.length;
+  return complete;
+}
+
+/** Parse the complete top-level fields before a top-level comma by closing the
+ *  object at that boundary. */
+function recoveredToolInput(prefix: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(prefix + "}");
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function claudeCliPath(): Promise<string> {
   if (process.env.CLAUDE_CODE_EXECUTABLE) {
     return process.env.CLAUDE_CODE_EXECUTABLE;
@@ -1271,6 +1348,13 @@ export class ClaudeAcpAgent {
     // gateways that don't carry a stable/matching id across the stream and the
     // consolidated message. Reset after each consolidated message consumes it.
     const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
+    // Tool-use blocks start streaming before their JSON input. Keep the
+    // partial input per parent message and block index so completed top-level
+    // fields can refine the pending tool call while it streams. Entries are
+    // dropped at block/message boundaries; the whole map is swept when a turn
+    // settles, since an interrupted subagent stream (keyed by a
+    // parent_tool_use_id that never recurs) has no boundary event of its own.
+    const streamedToolInputs: StreamedToolInputCache = new Map();
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
@@ -1489,6 +1573,7 @@ export class ClaudeAcpAgent {
       }
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
+      streamedToolInputs.clear();
       turn.resolve(result);
     };
 
@@ -1506,6 +1591,7 @@ export class ClaudeAcpAgent {
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
+      streamedToolInputs.clear();
       // A failed turn's stretch is over, and some failure lanes (the issue
       // #825 idle-fail) never see the result whose `finally` would close it —
       // start the next stretch clean, or its stale delivery record would
@@ -2557,6 +2643,7 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
+                streamedToolInputs,
               },
             )) {
               // sendUpdate records delivery; a subagent stream's chunks carry
@@ -5673,6 +5760,38 @@ function toolCallNotification(
   };
 }
 
+/** Refine a pending tool call from the complete top-level fields recovered
+ *  from its still-streaming input. Shares `toolInfoFromToolUse` with the
+ *  consolidated path but never carries `content`: content built from partial
+ *  input is misleading (an Edit missing its `new_string` renders as a pure
+ *  deletion) or invalid (a Write diff without `content` lacks the required
+ *  `newText`), and the consolidated message supplies it moments later. */
+function streamedInputRefinement(
+  toolUse: { id: string; name: string },
+  input: Record<string, unknown>,
+  supportsTerminalOutput: boolean,
+  cwd?: string,
+): SessionNotification["update"] | undefined {
+  // TodoWrite/Task* never surfaced a tool_call to refine (plan lane).
+  if (!shouldEmitToolCall(toolUse.name)) {
+    return undefined;
+  }
+  const { title, kind, locations } = toolInfoFromToolUse(
+    { ...toolUse, input },
+    supportsTerminalOutput,
+    cwd,
+  );
+  return {
+    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    toolCallId: toolUse.id,
+    sessionUpdate: "tool_call_update",
+    rawInput: input,
+    title,
+    kind,
+    ...(locations ? { locations } : {}),
+  };
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -6063,28 +6182,101 @@ export function streamEventToAcpNotifications(
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     messageId?: string;
+    streamedToolInputs?: StreamedToolInputCache;
   },
 ): SessionNotification[] {
   const event = message.event;
+  const streamKey = message.parent_tool_use_id ?? "";
+  const streamedToolInputs = options?.streamedToolInputs;
+  const forwardedOptions = {
+    clientCapabilities: options?.clientCapabilities,
+    parentToolUseId: message.parent_tool_use_id,
+    cwd: options?.cwd,
+    taskState: options?.taskState,
+    emittedToolCalls: options?.emittedToolCalls,
+    messageId: options?.messageId,
+  };
   switch (event.type) {
-    case "content_block_start":
+    case "content_block_start": {
+      const block = event.content_block;
+      if (
+        streamedToolInputs &&
+        (block.type === "tool_use" ||
+          block.type === "server_tool_use" ||
+          block.type === "mcp_tool_use")
+      ) {
+        let inputsForMessage = streamedToolInputs.get(streamKey);
+        if (!inputsForMessage) {
+          inputsForMessage = new Map();
+          streamedToolInputs.set(streamKey, inputsForMessage);
+        }
+        inputsForMessage.set(event.index, {
+          id: block.id,
+          name: block.name,
+          partialJson: "",
+          scannedTo: 0,
+          inString: false,
+          escaped: false,
+          objectDepth: 0,
+          arrayDepth: 0,
+          lastTopLevelComma: -1,
+          emittedThroughComma: -1,
+        });
+      }
       return toAcpNotifications(
-        [event.content_block],
+        [block],
         "assistant",
         sessionId,
         toolUseCache,
         client,
         logger,
-        {
-          clientCapabilities: options?.clientCapabilities,
-          parentToolUseId: message.parent_tool_use_id,
-          cwd: options?.cwd,
-          taskState: options?.taskState,
-          emittedToolCalls: options?.emittedToolCalls,
-          messageId: options?.messageId,
-        },
+        forwardedOptions,
       );
-    case "content_block_delta":
+    }
+    case "content_block_delta": {
+      if (event.delta.type === "input_json_delta") {
+        const streamedInput = streamedToolInputs?.get(streamKey)?.get(event.index);
+        if (!streamedInput) return [];
+
+        streamedInput.partialJson += event.delta.partial_json;
+        if (scanStreamedToolInput(streamedInput)) {
+          // Input complete: the consolidated assistant message replays the
+          // block with its full input and refines the call there; emitting
+          // here too would send a duplicate identical update.
+          const inputsForMessage = streamedToolInputs?.get(streamKey);
+          inputsForMessage?.delete(event.index);
+          if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
+          return [];
+        }
+        if (streamedInput.lastTopLevelComma <= streamedInput.emittedThroughComma) {
+          return [];
+        }
+        streamedInput.emittedThroughComma = streamedInput.lastTopLevelComma;
+        const input = recoveredToolInput(
+          streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
+        );
+        if (!input) return [];
+        const supportsTerminalOutput =
+          options?.clientCapabilities?._meta?.["terminal_output"] === true;
+        const update = streamedInputRefinement(
+          streamedInput,
+          input,
+          supportsTerminalOutput,
+          options?.cwd,
+        );
+        if (!update) return [];
+        if (message.parent_tool_use_id) {
+          update._meta = {
+            ...update._meta,
+            claudeCode: {
+              ...(update._meta?.claudeCode || {}),
+              parentToolUseId: message.parent_tool_use_id,
+            },
+          };
+        }
+        applyMessageId(update, options?.messageId);
+        return [{ sessionId, update }];
+      }
       return toAcpNotifications(
         [event.delta],
         "assistant",
@@ -6092,25 +6284,29 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
-        {
-          clientCapabilities: options?.clientCapabilities,
-          parentToolUseId: message.parent_tool_use_id,
-          cwd: options?.cwd,
-          taskState: options?.taskState,
-          emittedToolCalls: options?.emittedToolCalls,
-          messageId: options?.messageId,
-        },
+        forwardedOptions,
       );
+    }
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
     // `BetaRawMessageStreamEvent` union doesn't include even though the
     // wire format emits it; the `as never` cast lets us no-op it here
     // instead of letting it fall through to `unreachable`.
     case "ping" as never:
-    case "message_start":
     case "message_delta":
-    case "message_stop":
-    case "content_block_stop":
       return [];
+    // A message boundary ends every input stream on this lane: message_stop is
+    // the normal end, and a message_start clears anything a prior message on
+    // the lane left behind (e.g. a stream cut short mid-block).
+    case "message_start":
+    case "message_stop":
+      streamedToolInputs?.delete(streamKey);
+      return [];
+    case "content_block_stop": {
+      const inputsForMessage = streamedToolInputs?.get(streamKey);
+      inputsForMessage?.delete(event.index);
+      if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
+      return [];
+    }
 
     default:
       unreachable(event, logger);

@@ -43,6 +43,7 @@ import {
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
+  type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import {
@@ -8437,6 +8438,514 @@ describe("turn abandoned by the SDK (issue #825)", () => {
 });
 
 describe("streamEventToAcpNotifications", () => {
+  it("refines a tool call as soon as a streamed input field is complete", () => {
+    const toolUseCache = {};
+    const emittedToolCalls = new Set<string>();
+    const streamedToolInputs: StreamedToolInputCache = new Map();
+    const options = {
+      cwd: "/Users/test/project",
+      emittedToolCalls,
+      streamedToolInputs,
+    };
+    const baseMessage = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+
+    const start = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_read",
+            name: "Read",
+            input: {},
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(start).toHaveLength(1);
+    expect(start[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_read",
+      title: "Read File",
+      locations: [],
+    });
+
+    const partial = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"file_' },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(partial).toEqual([]);
+
+    const pathAvailable = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "input_json_delta",
+            partial_json: 'path":"/Users/test/project/src/ZodiacList.tsx","offset":',
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    // The overall JSON is still invalid, but file_path is complete and already
+    // makes this pending read distinguishable from other tool calls.
+    expect(pathAvailable).toHaveLength(1);
+    expect(pathAvailable[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_read",
+      title: "Read src/ZodiacList.tsx",
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
+      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
+    });
+    expect(streamedToolInputs.size).toBe(1);
+
+    const completed = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: "10}" },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    // Completion emits nothing: the consolidated assistant message replays the
+    // block with its full input and refines the call there — emitting here too
+    // would send a duplicate identical update. The entry is just cleaned up.
+    expect(completed).toEqual([]);
+    expect(streamedToolInputs.size).toBe(0);
+  });
+
+  describe("partial tool input coverage", () => {
+    function refineFromPartialInput({
+      name,
+      partialJson,
+      type = "tool_use",
+    }: {
+      name: string;
+      partialJson: string;
+      type?: "tool_use" | "server_tool_use" | "mcp_tool_use";
+    }) {
+      const toolUseCache = {};
+      const emittedToolCalls = new Set<string>();
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = {
+        cwd: "/Users/test/project",
+        emittedToolCalls,
+        streamedToolInputs,
+      };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+
+      const started = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type, id: "toolu_partial", name, input: {} },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+      const refined = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: partialJson },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+
+      return { started, refined, streamedToolInputs };
+    }
+
+    it.each([
+      {
+        case: "Agent description",
+        name: "Agent",
+        partialJson: '{"description":"Investigate issue","prompt":',
+        title: "Investigate issue",
+        rawInput: { description: "Investigate issue" },
+      },
+      {
+        case: "legacy Task description",
+        name: "Task",
+        partialJson: '{"description":"Research dependencies","prompt":',
+        title: "Research dependencies",
+        rawInput: { description: "Research dependencies" },
+      },
+      {
+        case: "Bash command with comma and escaped quotes",
+        name: "Bash",
+        partialJson: `{"command":${JSON.stringify('sleep 900, then echo "done"')},"timeout":`,
+        title: 'sleep 900, then echo "done"',
+        rawInput: { command: 'sleep 900, then echo "done"' },
+      },
+      {
+        case: "Read file path",
+        name: "Read",
+        partialJson: '{"file_path":"/Users/test/project/src/read.ts","offset":',
+        title: "Read src/read.ts",
+        rawInput: { file_path: "/Users/test/project/src/read.ts" },
+      },
+      {
+        case: "Write file path",
+        name: "Write",
+        partialJson: '{"file_path":"/Users/test/project/src/write.ts","content":',
+        title: "Write src/write.ts",
+        rawInput: { file_path: "/Users/test/project/src/write.ts" },
+      },
+      {
+        case: "Edit file path",
+        name: "Edit",
+        partialJson: '{"file_path":"/Users/test/project/src/edit.ts","old_string":',
+        title: "Edit src/edit.ts",
+        rawInput: { file_path: "/Users/test/project/src/edit.ts" },
+      },
+      {
+        case: "Glob pattern",
+        name: "Glob",
+        partialJson: '{"pattern":"**/*.ts","path":',
+        title: "Find `**/*.ts`",
+        rawInput: { pattern: "**/*.ts" },
+      },
+      {
+        case: "Grep strings, booleans, and numbers",
+        name: "Grep",
+        partialJson:
+          '{"pattern":"TODO, FIXME","-i":true,"-n":true,"-A":2,"-B":1,"-C":3,"output_mode":"files_with_matches","head_limit":10,"glob":"*.ts","type":"ts","multiline":true,"path":',
+        title:
+          'grep -i -n -A 2 -B 1 -C 3 -l | head -10 --include="*.ts" --type=ts -P "TODO, FIXME"',
+        rawInput: {
+          pattern: "TODO, FIXME",
+          "-i": true,
+          "-n": true,
+          "-A": 2,
+          "-B": 1,
+          "-C": 3,
+          output_mode: "files_with_matches",
+          head_limit: 10,
+          glob: "*.ts",
+          type: "ts",
+          multiline: true,
+        },
+      },
+      {
+        case: "WebFetch URL",
+        name: "WebFetch",
+        partialJson: '{"url":"https://example.com/docs","prompt":',
+        title: "Fetch https://example.com/docs",
+        rawInput: { url: "https://example.com/docs" },
+      },
+      {
+        case: "WebSearch query and domain array",
+        name: "WebSearch",
+        type: "server_tool_use" as const,
+        partialJson:
+          '{"query":"ACP tools","allowed_domains":["agentclientprotocol.com","github.com"],"blocked_domains":',
+        title: '"ACP tools" (allowed: agentclientprotocol.com, github.com)',
+        rawInput: {
+          query: "ACP tools",
+          allowed_domains: ["agentclientprotocol.com", "github.com"],
+        },
+      },
+      {
+        case: "ReportFindings nested array and object",
+        name: "ReportFindings",
+        partialJson:
+          '{"findings":[{"file":"src/a.ts","line":7,"summary":"Broken","failure_scenario":"Fails"}],"level":',
+        title: "Report 1 finding",
+        rawInput: {
+          findings: [
+            {
+              file: "src/a.ts",
+              line: 7,
+              summary: "Broken",
+              failure_scenario: "Fails",
+            },
+          ],
+        },
+      },
+      {
+        case: "generic Other tool",
+        name: "Other",
+        partialJson: '{"query":"custom query","options":',
+        title: "Other",
+        rawInput: { query: "custom query" },
+      },
+      {
+        case: "custom MCP tool",
+        name: "mcp__demo__search",
+        type: "mcp_tool_use" as const,
+        partialJson: '{"query":"custom MCP query","options":',
+        title: "mcp__demo__search",
+        rawInput: { query: "custom MCP query" },
+      },
+    ])("refines $case before the full JSON object completes", (testCase) => {
+      const { refined, streamedToolInputs } = refineFromPartialInput(testCase);
+
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_partial",
+        title: testCase.title,
+        rawInput: testCase.rawInput,
+      });
+      // Refinements never carry `content`: content built from partial input is
+      // misleading (an Edit missing new_string renders as a deletion) or
+      // invalid (a Write diff without content lacks the required newText).
+      expect(refined[0].update).not.toHaveProperty("content");
+      expect(streamedToolInputs.size).toBe(1);
+    });
+
+    it.each([
+      {
+        case: "ExitPlanMode plan",
+        name: "ExitPlanMode",
+        partialJson: '{"plan":"Implement streamed input"',
+      },
+      {
+        case: "AskUserQuestion questions",
+        name: "AskUserQuestion",
+        partialJson:
+          '{"questions":[{"question":"Which mode?","header":"Mode","options":[{"label":"Fast","description":"Fast mode"},{"label":"Safe","description":"Safe mode"}],"multiSelect":false}]',
+      },
+    ])(
+      "waits for the consolidated message when $case is the only field",
+      ({ name, partialJson }) => {
+        // A single-field input has no top-level comma, so its one field only
+        // completes when the whole object does — at which point the
+        // consolidated assistant message refines the call. No early update.
+        const { refined, streamedToolInputs } = refineFromPartialInput({ name, partialJson });
+        expect(refined).toEqual([]);
+        expect(streamedToolInputs.size).toBe(1);
+      },
+    );
+
+    it("keeps streamed TodoWrite input out of the tool feed", () => {
+      // TodoWrite surfaces as `plan` snapshots, not tool_calls; the snapshot is
+      // emitted from the consolidated assistant message once the todos array is
+      // complete, so the streamed lane stays silent.
+      const { started, refined } = refineFromPartialInput({
+        name: "TodoWrite",
+        partialJson:
+          '{"todos":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]',
+      });
+
+      expect(started).toEqual([]);
+      expect(refined).toEqual([]);
+    });
+
+    it.each([
+      {
+        name: "TaskCreate",
+        partialJson: '{"subject":"Create tests","description":',
+      },
+      {
+        name: "TaskUpdate",
+        partialJson: '{"taskId":"1","subject":"Update tests","status":',
+      },
+      { name: "TaskList", partialJson: "{}" },
+      { name: "TaskGet", partialJson: '{"taskId":"1"}' },
+    ])("keeps deliberately suppressed $name calls out of the tool feed", (testCase) => {
+      const { started, refined } = refineFromPartialInput(testCase);
+      expect(started).toEqual([]);
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an unfinished string", () => {
+      const { refined } = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"command":"sleep 900',
+      });
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an ambiguous number until its delimiter arrives", () => {
+      const first = refineFromPartialInput({ name: "Bash", partialJson: '{"timeout":10' });
+      expect(first.refined).toEqual([]);
+
+      const delimited = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"timeout":100,"command":',
+      });
+      expect(delimited.refined).toHaveLength(1);
+      expect(delimited.refined[0].update).toMatchObject({ rawInput: { timeout: 100 } });
+    });
+
+    it.each([
+      {
+        label: "boolean",
+        partialJson: '{"run_in_background":true,"command":',
+        rawInput: { run_in_background: true },
+      },
+      { label: "null", partialJson: '{"optional":null,"command":', rawInput: { optional: null } },
+      {
+        label: "array",
+        partialJson: '{"items":[1,"two",false],"command":',
+        rawInput: { items: [1, "two", false] },
+      },
+      {
+        label: "nested object",
+        partialJson: '{"options":{"limit":5,"enabled":true},"command":',
+        rawInput: { options: { limit: 5, enabled: true } },
+      },
+    ])("recovers a completed $label value at a field boundary", ({ partialJson, rawInput }) => {
+      const { refined } = refineFromPartialInput({ name: "CustomTool", partialJson });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({ sessionUpdate: "tool_call_update", rawInput });
+    });
+
+    it("survives a ping keep-alive arriving mid-stream", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_ping", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"sleep 900"' },
+      });
+      // The API interleaves ping keep-alives during long generation pauses —
+      // exactly when a large input is streaming. It must not disturb the
+      // in-flight buffer.
+      expect(send({ type: "ping" })).toEqual([]);
+      expect(streamedToolInputs.size).toBe(1);
+
+      const refined = send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: ',"timeout":' },
+      });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_ping",
+        rawInput: { command: "sleep 900" },
+      });
+    });
+
+    it("drops the buffered input at content_block_stop and message boundaries", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stop", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"tr' },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      send({ type: "content_block_stop", index: 0 });
+      expect(streamedToolInputs.size).toBe(0);
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stale", name: "Bash", input: {} },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      // A new message on the lane clears anything a cut-short stream left.
+      send({ type: "message_start", message: {} });
+      expect(streamedToolInputs.size).toBe(0);
+    });
+  });
+
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
     const logger = {
