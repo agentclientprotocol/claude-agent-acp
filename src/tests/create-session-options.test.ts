@@ -33,7 +33,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         getContextUsage: () =>
           contextUsageResult
             ? contextUsageResult()
-            : Promise.reject(new Error("no context usage mocked")),
+            : Promise.resolve({ totalTokens: 0, rawMaxTokens: 200000 }),
         [Symbol.asyncIterator]: async function* () {},
       };
     },
@@ -637,8 +637,10 @@ describe("createSession options merging", () => {
     });
 
     it("falls back to the default window when getContextUsage fails and inference misses", async () => {
-      // The default mock rejects getContextUsage, and the mock model
-      // ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") has no "1m" hint.
+      // getContextUsage rejects, and the mock model ("claude-sonnet-4-6" /
+      // "Claude Sonnet" / "Fast") has no "1m" hint.
+      contextUsageResult = () => Promise.reject(new Error("no context usage mocked"));
+
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);

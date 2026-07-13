@@ -46,6 +46,7 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       } as any;
     });
     return { getCapturedOptions: () => capturedOptions, setModelSpy };
@@ -245,6 +246,7 @@ describe("ClaudeAcpAgent settings", () => {
           setModel: setModelSpy,
           setPermissionMode: setPermissionModeSpy,
           supportedCommands: async () => [],
+          getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
         } as any;
       });
       return {
@@ -400,6 +402,7 @@ describe("ClaudeAcpAgent settings", () => {
           initializationResult: async () => ({ models }),
           setModel: setModelSpy,
           supportedCommands: async () => [],
+          getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
         } as any;
       });
       return { setModelSpy };
@@ -892,6 +895,7 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       } as any;
     });
 
@@ -933,6 +937,7 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       } as any;
     });
 
@@ -986,6 +991,7 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       } as any;
     });
 

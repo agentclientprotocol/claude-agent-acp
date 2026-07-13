@@ -27,6 +27,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
       setModel: async () => {},
       setPermissionMode: async () => {},
       supportedCommands: async () => [],
+      getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       [Symbol.asyncIterator]: async function* () {},
     };
   },

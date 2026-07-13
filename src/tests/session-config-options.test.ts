@@ -106,6 +106,7 @@ describe("session config options", () => {
         setModel: setModelSpy,
         applyFlagSettings: applyFlagSettingsSpy,
         supportedCommands: async () => [],
+        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
       },
       input: null,
       cancelled: false,

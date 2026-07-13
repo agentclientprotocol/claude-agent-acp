@@ -11,6 +11,7 @@ const mockQuery = vi.hoisted(() =>
     setModel: vi.fn(),
     setPermissionMode: vi.fn(),
     supportedCommands: vi.fn().mockResolvedValue([]),
+    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
   })),
 );
 
