@@ -161,6 +161,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     toolUseCache: {},
     emittedToolCalls: new Set(),
     liveBackgroundTasks: new Map(),
+    emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     ...overrides,
@@ -1950,6 +1951,7 @@ describe("permission request cancellation", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     } as any;
@@ -3732,6 +3734,7 @@ describe("session/close", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -3821,6 +3824,7 @@ describe("session/delete", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -3927,6 +3931,7 @@ describe("getOrCreateSession param change detection", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -6395,6 +6400,7 @@ describe("post-error recovery", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -8519,11 +8525,13 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("absorbs the interrupt's lagged trailer after cancelling a held turn", async () => {
-    // The hold's own trailer is typically absorbed mid-hold, so the idle the
-    // cancel's interrupt produces would be un-owed; lagging past the next
-    // prompt's echo it must be absorbed, not read as that fresh turn ending
-    // without a result (issue #825's false-fail).
+  it("absorbs the interrupt's lagged trailer after cancelling a held turn mid-followup", async () => {
+    // Cancelling while a followup cycle is RUNNING pre-empts its result, so
+    // the interrupt produces a trailer idle with no counted result; lagging
+    // past the next prompt's echo it must be absorbed, not read as that
+    // fresh turn ending without a result (issue #825's false-fail). (An
+    // already-idle cancel produces no trailer, and pre-counting one there
+    // would mask a future #825 detection — hence the running-state gate.)
     const agent = createMockAgent();
     let releaseAfterCancel!: () => void;
     const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
@@ -8537,7 +8545,9 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield subagentStarted("agent-1");
         yield resultMessage(); // turn 1 held
         yield idle(); // its trailer, absorbed mid-hold
-        await afterCancel;
+        yield taskNotification("agent-1");
+        yield running(); // the followup cycle starts...
+        await afterCancel; // ...and the cancel's interrupt pre-empts it
         const u2 = await iter.next();
         yield userEcho(u2.value); // turn 2 activates...
         yield idle(); // ...before the interrupt's lagged trailer arrives
@@ -8601,7 +8611,108 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     expect(response.stopReason).toBe("end_turn");
     expect(idleYielded).toBe(false);
+    // The entry survives for permission attribution (a live sync subagent is
+    // legitimately absent from the level's background-only universe) — only
+    // the hold stops waiting on it.
+    const record = agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1");
+    expect(record?.parentToolUseId).toBe("toolu_agent-1");
+    expect(record?.endedPerLevel).toBe(true);
     releaseIdle();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("keeps holding through a peer-origin autonomous result", async () => {
+    // A peer/coordinator cycle's result is not the user's; it must neither
+    // settle the held turn as a hand-off nor touch the user-turn lifecycle.
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        if (u.update?.sessionUpdate === "agent_message_chunk") {
+          events.push(`chunk:${u.update.content?.text}`);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // held
+        yield idle();
+        // A peer message wakes the model; its cycle's result must not end
+        // the hold (the subagent is still live).
+        yield resultMessage({ origin: { kind: "peer", from: "other-session" } });
+        yield idle();
+        yield assistantText("peer-cycle marker");
+        yield taskNotification("agent-1");
+        yield resultMessage({ origin: { kind: "task-notification" } }); // settles
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+      .then((r) => {
+        events.push("resolved");
+        return r;
+      });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Resolution came after the peer cycle's output — the peer result did
+    // not settle the hold.
+    const markerIndex = events.indexOf("chunk:peer-cycle marker");
+    expect(markerIndex).toBeGreaterThanOrEqual(0);
+    expect(markerIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("closes the delivery stretch when a held turn is handed off by the next echo", async () => {
+    // The held turn's followup summary latched the delivery flag; the echo
+    // hand-off settles the held turn, so the flag must reset or the next
+    // (replayed) turn's issue-#453 result-text fallback would be suppressed.
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield subagentStarted("agent-2");
+        yield resultMessage(); // held on both
+        yield idle();
+        yield taskNotification("agent-1");
+        yield assistantText("first summary"); // latches the delivery flag
+        yield resultMessage({ origin: { kind: "task-notification" } }); // still holding (agent-2)
+        yield idle();
+        const u2 = await iter.next();
+        yield userEcho(u2.value); // hand-off settles the held turn
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "next" }],
+    });
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    // The hand-off closed the held turn's stretch.
+    expect(agent.sessions["test-session"]!.emittedAssistantText).toBe(false);
     await agent.sessions["test-session"]?.consumer;
   });
 });
@@ -8681,6 +8792,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       toolUseCache: {},
       emittedToolCalls: new Set(),
       liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -9949,6 +10061,7 @@ describe("agent selection config option", () => {
         toolUseCache: {},
         emittedToolCalls: new Set(),
         liveBackgroundTasks: new Map(),
+        emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
       };
