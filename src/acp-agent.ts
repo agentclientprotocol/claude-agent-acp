@@ -454,96 +454,80 @@ export type ToolUseCache = {
 };
 
 type StreamedToolInput = {
-  type: "tool_use" | "server_tool_use" | "mcp_tool_use";
   id: string;
   name: string;
   partialJson: string;
-  lastEmittedInputJson?: string;
+  /** Offset into `partialJson` the scanner has consumed; each delta only scans
+   *  the newly appended fragment, so total scan work stays linear. */
+  scannedTo: number;
+  inString: boolean;
+  escaped: boolean;
+  objectDepth: number;
+  arrayDepth: number;
+  /** Offset of the most recent comma at the top level of the input object
+   *  (-1 before the first). Everything before it is a complete field. */
+  lastTopLevelComma: number;
+  /** The comma offset the last emitted refinement was sliced at (-1 before the
+   *  first), so a field boundary only triggers one recovery attempt. */
+  emittedThroughComma: number;
 };
 
 export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>;
 
 /**
- * Recover every complete top-level field from an input object that may still
- * be streaming. Trying the current end first handles a completed value whose
- * following comma has not arrived yet; falling back through top-level commas
- * drops the currently incomplete field while preserving all earlier ones.
+ * Advance the lexer state across the fragment appended since the last delta:
+ * just enough JSON awareness (string/escape, nesting depth) to spot commas
+ * that sit at the top level of the input object — everything before such a
+ * comma is a set of complete fields. Returns true once the input object's
+ * closing brace arrives.
  */
-function availableStreamedToolInput(
-  partialJson: string,
-): { input: Record<string, unknown>; complete: boolean } | undefined {
-  const parseObject = (json: string): Record<string, unknown> | undefined => {
-    try {
-      const value: unknown = JSON.parse(json);
-      return value !== null && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
-  const complete = parseObject(partialJson);
-  if (complete) return { input: complete, complete: true };
-
-  const topLevelCommas: number[] = [];
-  let objectDepth = 0;
-  let arrayDepth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = 0; index < partialJson.length; index++) {
-    const character = partialJson[index];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
+function scanStreamedToolInput(state: StreamedToolInput): boolean {
+  let complete = false;
+  for (let index = state.scannedTo; index < state.partialJson.length; index++) {
+    const character = state.partialJson[index];
+    if (state.inString) {
+      if (state.escaped) {
+        state.escaped = false;
       } else if (character === "\\") {
-        escaped = true;
+        state.escaped = true;
       } else if (character === '"') {
-        inString = false;
+        state.inString = false;
       }
       continue;
     }
 
     if (character === '"') {
-      inString = true;
+      state.inString = true;
     } else if (character === "{") {
-      objectDepth++;
+      state.objectDepth++;
     } else if (character === "}") {
-      objectDepth--;
+      state.objectDepth--;
+      if (state.objectDepth === 0) {
+        complete = true;
+      }
     } else if (character === "[") {
-      arrayDepth++;
+      state.arrayDepth++;
     } else if (character === "]") {
-      arrayDepth--;
-    } else if (character === "," && objectDepth === 1 && arrayDepth === 0) {
-      topLevelCommas.push(index);
+      state.arrayDepth--;
+    } else if (character === "," && state.objectDepth === 1 && state.arrayDepth === 0) {
+      state.lastTopLevelComma = index;
     }
   }
+  state.scannedTo = state.partialJson.length;
+  return complete;
+}
 
-  // A number at the current buffer end is ambiguous (`10` may still become
-  // `100` or `10.5`). Strings, arrays, objects, booleans, and null have an
-  // unambiguous terminator, so only try the live buffer end for those values.
-  // Values before a top-level comma are always complete regardless of type.
-  const trimmed = partialJson.trimEnd();
-  const hasUnambiguousValueEnd =
-    !inString &&
-    (trimmed.endsWith('"') ||
-      trimmed.endsWith("}") ||
-      trimmed.endsWith("]") ||
-      trimmed.endsWith("true") ||
-      trimmed.endsWith("false") ||
-      trimmed.endsWith("null"));
-  const candidateEnds = [
-    ...(hasUnambiguousValueEnd ? [partialJson.length] : []),
-    ...topLevelCommas.reverse(),
-  ];
-  for (const end of candidateEnds) {
-    const candidate = partialJson.slice(0, end).trimEnd();
-    const input = parseObject(candidate + "}");
-    if (input && Object.keys(input).length > 0) {
-      return { input, complete: false };
-    }
+/** Parse the complete top-level fields before a top-level comma by closing the
+ *  object at that boundary. */
+function recoveredToolInput(prefix: string): Record<string, unknown> | undefined {
+  try {
+    const value: unknown = JSON.parse(prefix + "}");
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 export async function claudeCliPath(): Promise<string> {
@@ -1275,9 +1259,11 @@ export class ClaudeAcpAgent {
     // consolidated message. Reset after each consolidated message consumes it.
     const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
     // Tool-use blocks start streaming before their JSON input. Keep the
-    // partial input per parent message and block index so a completed input can
-    // refine the pending tool call immediately, without waiting for the later
-    // consolidated assistant message.
+    // partial input per parent message and block index so completed top-level
+    // fields can refine the pending tool call while it streams. Entries are
+    // dropped at block/message boundaries; the whole map is swept when a turn
+    // settles, since an interrupted subagent stream (keyed by a
+    // parent_tool_use_id that never recurs) has no boundary event of its own.
     const streamedToolInputs: StreamedToolInputCache = new Map();
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
@@ -1380,6 +1366,7 @@ export class ClaudeAcpAgent {
       }
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
+      streamedToolInputs.clear();
       turn.resolve(result);
     };
 
@@ -1397,6 +1384,7 @@ export class ClaudeAcpAgent {
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
+      streamedToolInputs.clear();
       turn.reject(error);
     };
 
@@ -5257,6 +5245,38 @@ function toolCallNotification(
   };
 }
 
+/** Refine a pending tool call from the complete top-level fields recovered
+ *  from its still-streaming input. Shares `toolInfoFromToolUse` with the
+ *  consolidated path but never carries `content`: content built from partial
+ *  input is misleading (an Edit missing its `new_string` renders as a pure
+ *  deletion) or invalid (a Write diff without `content` lacks the required
+ *  `newText`), and the consolidated message supplies it moments later. */
+function streamedInputRefinement(
+  toolUse: { id: string; name: string },
+  input: Record<string, unknown>,
+  supportsTerminalOutput: boolean,
+  cwd?: string,
+): SessionNotification["update"] | undefined {
+  // TodoWrite/Task* never surfaced a tool_call to refine (plan lane).
+  if (!shouldEmitToolCall(toolUse.name)) {
+    return undefined;
+  }
+  const { title, kind, locations } = toolInfoFromToolUse(
+    { ...toolUse, input },
+    supportsTerminalOutput,
+    cwd,
+  );
+  return {
+    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    toolCallId: toolUse.id,
+    sessionUpdate: "tool_call_update",
+    rawInput: input,
+    title,
+    kind,
+    ...(locations ? { locations } : {}),
+  };
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -5653,6 +5673,14 @@ export function streamEventToAcpNotifications(
   const event = message.event;
   const streamKey = message.parent_tool_use_id ?? "";
   const streamedToolInputs = options?.streamedToolInputs;
+  const forwardedOptions = {
+    clientCapabilities: options?.clientCapabilities,
+    parentToolUseId: message.parent_tool_use_id,
+    cwd: options?.cwd,
+    taskState: options?.taskState,
+    emittedToolCalls: options?.emittedToolCalls,
+    messageId: options?.messageId,
+  };
   switch (event.type) {
     case "content_block_start": {
       const block = event.content_block;
@@ -5668,64 +5696,71 @@ export function streamEventToAcpNotifications(
           streamedToolInputs.set(streamKey, inputsForMessage);
         }
         inputsForMessage.set(event.index, {
-          type: block.type,
           id: block.id,
           name: block.name,
           partialJson: "",
-          lastEmittedInputJson: JSON.stringify(block.input),
+          scannedTo: 0,
+          inString: false,
+          escaped: false,
+          objectDepth: 0,
+          arrayDepth: 0,
+          lastTopLevelComma: -1,
+          emittedThroughComma: -1,
         });
       }
-      return toAcpNotifications([block], "assistant", sessionId, toolUseCache, client, logger, {
-        clientCapabilities: options?.clientCapabilities,
-        parentToolUseId: message.parent_tool_use_id,
-        cwd: options?.cwd,
-        taskState: options?.taskState,
-        emittedToolCalls: options?.emittedToolCalls,
-        messageId: options?.messageId,
-      });
+      return toAcpNotifications(
+        [block],
+        "assistant",
+        sessionId,
+        toolUseCache,
+        client,
+        logger,
+        forwardedOptions,
+      );
     }
     case "content_block_delta": {
-      if (event.delta.type === "input_json_delta" && streamedToolInputs) {
-        const inputsForMessage = streamedToolInputs.get(streamKey);
-        if (!inputsForMessage) return [];
-        const streamedInput = inputsForMessage.get(event.index);
+      if (event.delta.type === "input_json_delta") {
+        const streamedInput = streamedToolInputs?.get(streamKey)?.get(event.index);
         if (!streamedInput) return [];
 
         streamedInput.partialJson += event.delta.partial_json;
-        const availableInput = availableStreamedToolInput(streamedInput.partialJson);
-        if (!availableInput) return [];
-
-        const inputJson = JSON.stringify(availableInput.input);
-        const shouldEmit = inputJson !== streamedInput.lastEmittedInputJson;
-        streamedInput.lastEmittedInputJson = inputJson;
-        if (availableInput.complete) {
-          inputsForMessage.delete(event.index);
-          if (inputsForMessage.size === 0) streamedToolInputs.delete(streamKey);
+        if (scanStreamedToolInput(streamedInput)) {
+          // Input complete: the consolidated assistant message replays the
+          // block with its full input and refines the call there; emitting
+          // here too would send a duplicate identical update.
+          const inputsForMessage = streamedToolInputs?.get(streamKey);
+          inputsForMessage?.delete(event.index);
+          if (inputsForMessage?.size === 0) streamedToolInputs?.delete(streamKey);
+          return [];
         }
-        if (!shouldEmit) return [];
-        return toAcpNotifications(
-          [
-            {
-              type: streamedInput.type,
-              id: streamedInput.id,
-              name: streamedInput.name,
-              input: availableInput.input,
-            } as BetaContentBlock,
-          ],
-          "assistant",
-          sessionId,
-          toolUseCache,
-          client,
-          logger,
-          {
-            clientCapabilities: options?.clientCapabilities,
-            parentToolUseId: message.parent_tool_use_id,
-            cwd: options?.cwd,
-            taskState: options?.taskState,
-            emittedToolCalls: options?.emittedToolCalls,
-            messageId: options?.messageId,
-          },
+        if (streamedInput.lastTopLevelComma <= streamedInput.emittedThroughComma) {
+          return [];
+        }
+        streamedInput.emittedThroughComma = streamedInput.lastTopLevelComma;
+        const input = recoveredToolInput(
+          streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
         );
+        if (!input) return [];
+        const supportsTerminalOutput =
+          options?.clientCapabilities?._meta?.["terminal_output"] === true;
+        const update = streamedInputRefinement(
+          streamedInput,
+          input,
+          supportsTerminalOutput,
+          options?.cwd,
+        );
+        if (!update) return [];
+        if (message.parent_tool_use_id) {
+          update._meta = {
+            ...update._meta,
+            claudeCode: {
+              ...(update._meta?.claudeCode || {}),
+              parentToolUseId: message.parent_tool_use_id,
+            },
+          };
+        }
+        applyMessageId(update, options?.messageId);
+        return [{ sessionId, update }];
       }
       return toAcpNotifications(
         [event.delta],
@@ -5734,14 +5769,7 @@ export function streamEventToAcpNotifications(
         toolUseCache,
         client,
         logger,
-        {
-          clientCapabilities: options?.clientCapabilities,
-          parentToolUseId: message.parent_tool_use_id,
-          cwd: options?.cwd,
-          taskState: options?.taskState,
-          emittedToolCalls: options?.emittedToolCalls,
-          messageId: options?.messageId,
-        },
+        forwardedOptions,
       );
     }
     // No content. `ping` is a Messages-API keep-alive event that the SDK's
@@ -5749,11 +5777,12 @@ export function streamEventToAcpNotifications(
     // wire format emits it; the `as never` cast lets us no-op it here
     // instead of letting it fall through to `unreachable`.
     case "ping" as never:
-    case "message_start":
-      streamedToolInputs?.delete(streamKey);
-      return [];
     case "message_delta":
       return [];
+    // A message boundary ends every input stream on this lane: message_stop is
+    // the normal end, and a message_start clears anything a prior message on
+    // the lane left behind (e.g. a stream cut short mid-block).
+    case "message_start":
     case "message_stop":
       streamedToolInputs?.delete(streamKey);
       return [];

@@ -7268,14 +7268,10 @@ describe("streamEventToAcpNotifications", () => {
       options,
     );
 
-    expect(completed).toHaveLength(1);
-    expect(completed[0].update).toMatchObject({
-      sessionUpdate: "tool_call_update",
-      toolCallId: "toolu_read",
-      title: "Read src/ZodiacList.tsx (from line 10)",
-      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx", offset: 10 },
-      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 10 }],
-    });
+    // Completion emits nothing: the consolidated assistant message replays the
+    // block with its full input and refines the call there — emitting here too
+    // would send a duplicate identical update. The entry is just cleaned up.
+    expect(completed).toEqual([]);
     expect(streamedToolInputs.size).toBe(0);
   });
 
@@ -7432,7 +7428,7 @@ describe("streamEventToAcpNotifications", () => {
         case: "ReportFindings nested array and object",
         name: "ReportFindings",
         partialJson:
-          '{"findings":[{"file":"src/a.ts","line":7,"summary":"Broken","failure_scenario":"Fails"}]',
+          '{"findings":[{"file":"src/a.ts","line":7,"summary":"Broken","failure_scenario":"Fails"}],"level":',
         title: "Report 1 finding",
         rawInput: {
           findings: [
@@ -7441,33 +7437,6 @@ describe("streamEventToAcpNotifications", () => {
               line: 7,
               summary: "Broken",
               failure_scenario: "Fails",
-            },
-          ],
-        },
-      },
-      {
-        case: "ExitPlanMode plan",
-        name: "ExitPlanMode",
-        partialJson: '{"plan":"Implement streamed input"',
-        title: "Ready to code?",
-        rawInput: { plan: "Implement streamed input" },
-      },
-      {
-        case: "AskUserQuestion nested questions",
-        name: "AskUserQuestion",
-        partialJson:
-          '{"questions":[{"question":"Which mode?","header":"Mode","options":[{"label":"Fast","description":"Fast mode"},{"label":"Safe","description":"Safe mode"}],"multiSelect":false}]',
-        title: "Which mode?",
-        rawInput: {
-          questions: [
-            {
-              question: "Which mode?",
-              header: "Mode",
-              options: [
-                { label: "Fast", description: "Fast mode" },
-                { label: "Safe", description: "Safe mode" },
-              ],
-              multiSelect: false,
             },
           ],
         },
@@ -7497,10 +7466,41 @@ describe("streamEventToAcpNotifications", () => {
         title: testCase.title,
         rawInput: testCase.rawInput,
       });
+      // Refinements never carry `content`: content built from partial input is
+      // misleading (an Edit missing new_string renders as a deletion) or
+      // invalid (a Write diff without content lacks the required newText).
+      expect(refined[0].update).not.toHaveProperty("content");
       expect(streamedToolInputs.size).toBe(1);
     });
 
-    it("emits a TodoWrite plan as soon as its nested array is complete", () => {
+    it.each([
+      {
+        case: "ExitPlanMode plan",
+        name: "ExitPlanMode",
+        partialJson: '{"plan":"Implement streamed input"',
+      },
+      {
+        case: "AskUserQuestion questions",
+        name: "AskUserQuestion",
+        partialJson:
+          '{"questions":[{"question":"Which mode?","header":"Mode","options":[{"label":"Fast","description":"Fast mode"},{"label":"Safe","description":"Safe mode"}],"multiSelect":false}]',
+      },
+    ])(
+      "waits for the consolidated message when $case is the only field",
+      ({ name, partialJson }) => {
+        // A single-field input has no top-level comma, so its one field only
+        // completes when the whole object does — at which point the
+        // consolidated assistant message refines the call. No early update.
+        const { refined, streamedToolInputs } = refineFromPartialInput({ name, partialJson });
+        expect(refined).toEqual([]);
+        expect(streamedToolInputs.size).toBe(1);
+      },
+    );
+
+    it("keeps streamed TodoWrite input out of the tool feed", () => {
+      // TodoWrite surfaces as `plan` snapshots, not tool_calls; the snapshot is
+      // emitted from the consolidated assistant message once the todos array is
+      // complete, so the streamed lane stays silent.
       const { started, refined } = refineFromPartialInput({
         name: "TodoWrite",
         partialJson:
@@ -7508,15 +7508,7 @@ describe("streamEventToAcpNotifications", () => {
       });
 
       expect(started).toEqual([]);
-      expect(refined).toEqual([
-        {
-          sessionId: "test-session",
-          update: {
-            sessionUpdate: "plan",
-            entries: [{ content: "Run tests", status: "in_progress", priority: "medium" }],
-          },
-        },
-      ]);
+      expect(refined).toEqual([]);
     });
 
     it.each([
@@ -7557,14 +7549,120 @@ describe("streamEventToAcpNotifications", () => {
     });
 
     it.each([
-      { label: "boolean", partialJson: '{"run_in_background":true' },
-      { label: "null", partialJson: '{"optional":null' },
-      { label: "array", partialJson: '{"items":[1,"two",false]' },
-      { label: "nested object", partialJson: '{"options":{"limit":5,"enabled":true}' },
-    ])("publishes an unambiguously completed $label value", ({ partialJson }) => {
+      {
+        label: "boolean",
+        partialJson: '{"run_in_background":true,"command":',
+        rawInput: { run_in_background: true },
+      },
+      { label: "null", partialJson: '{"optional":null,"command":', rawInput: { optional: null } },
+      {
+        label: "array",
+        partialJson: '{"items":[1,"two",false],"command":',
+        rawInput: { items: [1, "two", false] },
+      },
+      {
+        label: "nested object",
+        partialJson: '{"options":{"limit":5,"enabled":true},"command":',
+        rawInput: { options: { limit: 5, enabled: true } },
+      },
+    ])("recovers a completed $label value at a field boundary", ({ partialJson, rawInput }) => {
       const { refined } = refineFromPartialInput({ name: "CustomTool", partialJson });
       expect(refined).toHaveLength(1);
-      expect(refined[0].update).toMatchObject({ sessionUpdate: "tool_call_update" });
+      expect(refined[0].update).toMatchObject({ sessionUpdate: "tool_call_update", rawInput });
+    });
+
+    it("survives a ping keep-alive arriving mid-stream", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_ping", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"sleep 900"' },
+      });
+      // The API interleaves ping keep-alives during long generation pauses —
+      // exactly when a large input is streaming. It must not disturb the
+      // in-flight buffer.
+      expect(send({ type: "ping" })).toEqual([]);
+      expect(streamedToolInputs.size).toBe(1);
+
+      const refined = send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: ',"timeout":' },
+      });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_ping",
+        rawInput: { command: "sleep 900" },
+      });
+    });
+
+    it("drops the buffered input at content_block_stop and message boundaries", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stop", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"tr' },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      send({ type: "content_block_stop", index: 0 });
+      expect(streamedToolInputs.size).toBe(0);
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stale", name: "Bash", input: {} },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      // A new message on the lane clears anything a cut-short stream left.
+      send({ type: "message_start", message: {} });
+      expect(streamedToolInputs.size).toBe(0);
     });
   });
 
