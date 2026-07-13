@@ -2229,7 +2229,7 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
   const structured = {
     status: "completed",
     agentId: "a0e1eff08fcb6e2e8",
-    content: [{ type: "text", text: "The report." }],
+    content: [{ type: "text", text: "The structured report." }],
     totalTokens: 11735,
     totalToolUseCount: 2,
     totalDurationMs: 21237,
@@ -2239,19 +2239,43 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, structured);
 
     expect(update).toEqual({
+      content: [{ type: "content", content: { type: "text", text: "The structured report." } }],
+    });
+  });
+
+  it("strips the trailer from the raw fallback when tool_use_result is absent", () => {
+    // Replayed sessions and older CLIs have no structured report; the
+    // tail-anchored strip is the only cleanup available there.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false);
+
+    expect(update).toEqual({
       content: [{ type: "content", content: { type: "text", text: "The report." } }],
     });
   });
 
-  it("falls back to the raw tool_result text when tool_use_result is absent", () => {
-    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false);
+  it("strips only matching trailer parts and leaves unrecognized text alone", () => {
+    const oddResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "Report A.\n<usage>subagent_tokens: 5</usage>" },
+        { type: "text", text: "Report B.\nagentId: abc-123 (for resuming)" },
+        { type: "text", text: "agentId mentioned mid-text (not a trailer) stays.\nDone." },
+      ],
+    };
+    const update = toolUpdateFromToolResult(oddResult, agentToolUse, false);
 
-    expect(update).toEqual({
-      content: [{ type: "content", content: { type: "text", text: `The report.${TRAILER}` } }],
-    });
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Report A." } },
+      { type: "content", content: { type: "text", text: "Report B." } },
+      {
+        type: "content",
+        content: { type: "text", text: "agentId mentioned mid-text (not a trailer) stays.\nDone." },
+      },
+    ]);
   });
 
-  it("falls back to the raw text when tool_use_result is the async_launched variant", () => {
+  it("falls back (trailer-stripped) when tool_use_result is the async_launched variant", () => {
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
       status: "async_launched",
       agentId: "a0e1eff08fcb6e2e8",
@@ -2259,11 +2283,11 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     });
 
     expect(update.content).toEqual([
-      { type: "content", content: { type: "text", text: `The report.${TRAILER}` } },
+      { type: "content", content: { type: "text", text: "The report." } },
     ]);
   });
 
-  it("falls back to the raw text when the structured content array is empty", () => {
+  it("falls back (trailer-stripped) when the structured content array is empty", () => {
     // A completed subagent can end with zero text blocks — an empty
     // structured render must not beat the raw fallback.
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
@@ -2272,7 +2296,7 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     });
 
     expect(update.content).toEqual([
-      { type: "content", content: { type: "text", text: `The report.${TRAILER}` } },
+      { type: "content", content: { type: "text", text: "The report." } },
     ]);
   });
 
@@ -2294,7 +2318,7 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
       sessionUpdate: "tool_call_update",
       toolCallId: "toolu_agent",
       status: "completed",
-      content: [{ type: "content", content: { type: "text", text: "The report." } }],
+      content: [{ type: "content", content: { type: "text", text: "The structured report." } }],
     });
   });
 
@@ -2316,8 +2340,10 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
 
     expect(notifications).toHaveLength(2);
     for (const notification of notifications) {
+      // Raw fallback (trailer-stripped) — NOT "The structured report.", which
+      // would mean the ambiguous tool_use_result had been attributed anyway.
       expect(notification.update).toMatchObject({
-        content: [{ type: "content", content: { type: "text", text: `The report.${TRAILER}` } }],
+        content: [{ type: "content", content: { type: "text", text: "The report." } }],
       });
     }
   });

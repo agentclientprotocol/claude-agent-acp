@@ -506,6 +506,39 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
     : undefined;
 }
 
+/**
+ * Strip the model-directed trailer from a raw Agent/Task tool_result text:
+ * a `<usage>…</usage>` totals block and/or an
+ * `agentId: <id> (use SendMessage …)` continuation line at the end of the
+ * text. Both patterns are tail-anchored and independent (older CLIs emit
+ * variants with only one of them), so a format change makes them stop
+ * matching rather than mangle the report.
+ */
+function stripAgentTrailer(text: string): string {
+  return text
+    .replace(/\n?<usage>[\s\S]*?<\/usage>\s*$/, "")
+    .replace(/\n?agentId: [\w-]+ \([^)]*\)\s*$/, "");
+}
+
+/** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
+ *  string or block array), leaving non-text blocks untouched. */
+function stripAgentTrailerFromContent(content: unknown): unknown {
+  if (typeof content === "string") {
+    return stripAgentTrailer(content);
+  }
+  if (Array.isArray(content)) {
+    return content.map((block) =>
+      block !== null &&
+      typeof block === "object" &&
+      block.type === "text" &&
+      typeof block.text === "string"
+        ? { ...block, text: stripAgentTrailer(block.text) }
+        : block,
+    );
+  }
+  return content;
+}
+
 export function toolUpdateFromToolResult(
   toolResult:
     | ToolResultBlockParam
@@ -764,7 +797,17 @@ export function toolUpdateFromToolResult(
           "is_error" in toolResult ? toolResult.is_error : false,
         );
       }
-      return rawContentUpdate();
+      // No structured report to render from (replayed sessions —
+      // getSessionMessages doesn't expose the transcript's toolUseResult —
+      // and older CLIs). The SDK advises rendering from tool_use_result
+      // instead of parsing the text, but with no structured value the
+      // tail-anchored strip is the only cleanup available; if the trailer
+      // format changes it simply stops matching and the full raw text
+      // renders, no worse than before.
+      return toAcpContentUpdate(
+        stripAgentTrailerFromContent(toolResult.content),
+        "is_error" in toolResult ? toolResult.is_error : false,
+      );
     }
 
     case "Edit": // Edit is handled in hooks
