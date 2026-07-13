@@ -4902,8 +4902,9 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "compact_boundary", session_id: "test-session" },
     ]);
     const session = agent.sessions["test-session"];
-    // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
-    // — getContextUsage's window field under-reports it, so we don't use it.
+    // A 1M window learned earlier (e.g. from modelUsage) must survive
+    // compaction — compaction frees occupancy, it doesn't change the window,
+    // so the handler must not overwrite it from this response.
     session.contextWindowSize = 1000000;
     (session.query as any).getContextUsage = vi
       .fn()

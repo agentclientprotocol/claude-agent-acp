@@ -336,11 +336,12 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
-  /** Context window size of the last top-level assistant model, carried across
+  /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Defaults to
-   *  DEFAULT_CONTEXT_WINDOW, refreshed from each result's modelUsage, and
-   *  invalidated when the user switches the session's model. */
+   *  before the turn's first result message arrives. Seeded from the SDK's
+   *  getContextUsage report at session creation (DEFAULT_CONTEXT_WINDOW when
+   *  that and the text heuristic both fail), refreshed the same way on model
+   *  switches, and confirmed by each result's modelUsage. */
   contextWindowSize: number;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
@@ -1743,9 +1744,9 @@ export class ClaudeAcpAgent {
                 // dropped dramatically) and replaced within seconds by the next
                 // result message.
                 //
-                // `size` keeps coming from session.contextWindowSize (learned
-                // from modelUsage / the model heuristic) — getContextUsage's
-                // window field under-reports extended 1M windows.
+                // `size` keeps coming from session.contextWindowSize —
+                // compaction frees occupancy, it doesn't change the model's
+                // window.
                 //
                 // The "Compacting completed." text is emitted from the `status`
                 // handler (keyed on `compact_result`), not here, so the failure
@@ -2372,11 +2373,10 @@ export class ClaudeAcpAgent {
                 const model = message.event.message.model;
                 if (model && model !== "<synthetic>") {
                   lastAssistantModel = model;
-                  // Only upgrade from the default — once a `result` has given
-                  // us an authoritative window, trust it over the heuristic.
-                  // Model switches invalidate the cached window via
-                  // `syncSessionConfigState`, which resets us back to the
-                  // default so this branch runs again for the new model.
+                  // Only upgrade from the default — once the SDK has given us
+                  // an authoritative window (seeded at session creation,
+                  // refreshed on model switches in `applyConfigOptionValue`,
+                  // confirmed by each `result`), trust it over the heuristic.
                   if (session.contextWindowSize === DEFAULT_CONTEXT_WINDOW) {
                     const inferred = inferContextWindowFromModel(model);
                     if (inferred !== null) {
@@ -3693,16 +3693,22 @@ export class ClaudeAcpAgent {
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
-        // The cached context window was learned for the previous model; reset
-        // to the new model's heuristic so mid-stream updates between now and
-        // the next `result` reflect the user's selection instead of the old
-        // model's window.
+        // The cached context window was learned for the previous model. The
+        // SDK is already running the new model here (user-driven switches call
+        // `query.setModel` before this, and the refusal-fallback sync only
+        // reconciles a switch the SDK already made), so ask it for the new
+        // window; fall back to the text heuristic so mid-stream updates
+        // between now and the next `result` reflect the user's selection
+        // instead of the old model's window.
         session.contextWindowSize =
+          (await fetchContextWindowSize(session.query, this.logger)) ??
           inferContextWindowFromModel(
             value,
+            newModelInfo?.resolvedModel,
             newModelInfo?.displayName,
             newModelInfo?.description,
-          ) ?? DEFAULT_CONTEXT_WINDOW;
+          ) ??
+          DEFAULT_CONTEXT_WINDOW;
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -4428,6 +4434,29 @@ export class ClaudeAcpAgent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
+    // Seed the context window from the SDK's authoritative report. Text
+    // inference alone misses aliases that resolve to extended-context models
+    // with no "1m" token anywhere in their id or description (e.g. `sonnet` →
+    // claude-sonnet-5, natively ~1M): those streamed `usage_update.size:
+    // 200000` until the first result's modelUsage corrected it — again on
+    // every process restart or session re-creation, since the learned window
+    // lives only on the Session (issue #596).
+    //
+    // The inference fallback is deliberately keyed to the allowlisted entry: a
+    // fallback-resolved sibling's resolvedModel/displayName/description can
+    // describe a different context lane than the verbatim live id (e.g. an
+    // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
+    // the id itself is a trustworthy window signal.
+    const contextWindowSize =
+      (await fetchContextWindowSize(q, this.logger)) ??
+      inferContextWindowFromModel(
+        models.currentModelId,
+        allowlistedModelInfo?.resolvedModel,
+        allowlistedModelInfo?.displayName,
+        allowlistedModelInfo?.description,
+      ) ??
+      DEFAULT_CONTEXT_WINDOW;
+
     this.sessions[sessionId] = {
       query: q,
       input: input,
@@ -4450,17 +4479,7 @@ export class ClaudeAcpAgent {
       fastModeEnabled,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      contextWindowSize:
-        // Deliberately keyed to the allowlisted entry: a fallback-resolved
-        // sibling's displayName/description can describe a different context
-        // lane than the verbatim live id (e.g. an "opus[1m]" row matched for
-        // a bare 200k id), so on the fallback path only the id itself is a
-        // trustworthy window signal.
-        inferContextWindowFromModel(
-          models.currentModelId,
-          allowlistedModelInfo?.displayName,
-          allowlistedModelInfo?.description,
-        ) ?? DEFAULT_CONTEXT_WINDOW,
+      contextWindowSize,
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -6043,12 +6062,14 @@ function commonPrefixLength(a: string, b: string) {
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
  *  matching things like "10m" or embedded substrings. Semantic aliases like
- *  `default` carry no such token in the ID, but the SDK's human-facing
- *  `displayName`/`description` do (e.g. "Opus 4.7 (1M context)"), so callers
- *  pass those too — the same `\b1m\b` token appears in "1M context". The SDK's
- *  `ModelInfo` exposes no structured context-window field, so this text scan is
- *  the only pre-`result` signal available. A miss falls back to the default
- *  window and is corrected by `result.modelUsage` within one turn. */
+ *  `default` carry no such token in the ID, but their `resolvedModel` and the
+ *  SDK's human-facing `displayName`/`description` can (e.g.
+ *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
+ *  This text scan can't catch every model — some resolve to extended-context
+ *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
+ *  ~1M) — which is why `fetchContextWindowSize` is preferred wherever a live
+ *  query is available. A miss falls back to the default window and is
+ *  corrected by `result.modelUsage` within one turn. */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
@@ -6058,18 +6079,35 @@ function inferContextWindowFromModel(...texts: Array<string | undefined>): numbe
  *  `getContextUsage` control request. Unlike the per-message API usage numbers
  *  (which only count message tokens), this `totalTokens` includes the system
  *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure.
- *
- *  Note: we deliberately do NOT use this response's window fields for `size`.
- *  They have been observed to under-report extended (1M) context windows, so
- *  the window keeps coming from `modelUsage` / `inferContextWindowFromModel`,
- *  which handle the 1M variants correctly. */
+ *  occupancy the user sees. Returns `null` on any control-request failure. */
 async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
   try {
     const usage = await query.getContextUsage();
     return usage.totalTokens;
   } catch (error) {
     logger.error("Failed to fetch context usage from SDK:", error);
+    return null;
+  }
+}
+
+/** Fetch the current model's full context window (`rawMaxTokens`) via the
+ *  `getContextUsage` control request — the same source `/context` prints.
+ *  This is the only pre-`result` signal that covers semantic aliases whose
+ *  text carries no "1m" token (e.g. `sonnet` → claude-sonnet-5, natively
+ *  ~1M), so it's the primary window source at session creation and on model
+ *  switches; `inferContextWindowFromModel` remains the fallback. A returned
+ *  window is still superseded by each `result.modelUsage.contextWindow`.
+ *
+ *  (Older CLIs under-reported extended 1M windows here — commit 20ef663
+ *  dropped the field for that reason — but the CLI vendored by the pinned
+ *  SDK reports them correctly again.) Returns `null` on any control-request
+ *  failure or a nonsensical (non-positive) window. */
+async function fetchContextWindowSize(query: Query, logger: Logger): Promise<number | null> {
+  try {
+    const usage = await query.getContextUsage();
+    return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null;
+  } catch (error) {
+    logger.error("Failed to fetch context window size from SDK:", error);
     return null;
   }
 }
