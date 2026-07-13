@@ -8049,18 +8049,25 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     };
   }
 
-  const running = () => ({
+  const stateChanged = (state: "running" | "idle" | "requires_action") => ({
     type: "system",
     subtype: "session_state_changed",
-    state: "running",
+    state,
     uuid: randomUUID(),
     session_id: "test-session",
   });
+  const running = () => stateChanged("running");
+  const idle = () => stateChanged("idle");
+  const requiresAction = () => stateChanged("requires_action");
 
-  const idle = () => ({
+  const backgroundTasksChanged = (taskIds: string[]) => ({
     type: "system",
-    subtype: "session_state_changed",
-    state: "idle",
+    subtype: "background_tasks_changed",
+    tasks: taskIds.map((task_id) => ({
+      task_id,
+      task_type: "local_agent",
+      description: "explore",
+    })),
     uuid: randomUUID(),
     session_id: "test-session",
   });
@@ -8526,12 +8533,13 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   });
 
   it("absorbs the interrupt's lagged trailer after cancelling a held turn mid-followup", async () => {
-    // Cancelling while a followup cycle is RUNNING pre-empts its result, so
+    // Cancelling while a followup cycle is live pre-empts its result, so
     // the interrupt produces a trailer idle with no counted result; lagging
     // past the next prompt's echo it must be absorbed, not read as that
     // fresh turn ending without a result (issue #825's false-fail). (An
     // already-idle cancel produces no trailer, and pre-counting one there
-    // would mask a future #825 detection — hence the running-state gate.)
+    // would mask a future #825 detection — hence the not-idle gate, which
+    // its own test pins below.)
     const agent = createMockAgent();
     let releaseAfterCancel!: () => void;
     const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
@@ -8590,13 +8598,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield running();
         yield subagentStarted("agent-1");
         // The settle bookend was lost; the level signal says nothing is live.
-        yield {
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [],
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
+        yield backgroundTasksChanged([]);
         yield resultMessage();
         await idleGate;
         idleYielded = true;
@@ -8751,37 +8753,23 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield subagentStarted("agent-1");
         // A racing level omits the live agent (payload built before its
         // registration) — marks it endedPerLevel...
-        yield {
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [],
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
+        yield backgroundTasksChanged([]);
         // ...and a later level that INCLUDES it proves it live: un-ended,
         // so the turn's result defers on it again.
-        yield {
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [{ task_id: "agent-1", task_type: "local_agent", description: "explore" }],
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
+        yield backgroundTasksChanged(["agent-1"]);
         yield resultMessage(); // must HOLD (the un-mark re-armed the wait)
         yield idle();
         await drainGate; // let the test observe the held state
         // A second racing level ends it again while held; nothing settles
         // here (the level precedes the notification in the normal ordering).
-        yield {
-          type: "system",
-          subtype: "background_tasks_changed",
-          tasks: [],
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
+        yield backgroundTasksChanged([]);
         yield idle(); // the drain fallback settles the now-unwaited hold
         const u2 = await iter.next();
-        yield userEcho(u2.value); // turn 2 activation sweeps ended entries
+        yield userEcho(u2.value); // turn 2 activation ARMS the sweep
+        yield resultMessage();
+        yield idle();
+        const u3 = await iter.next();
+        yield userEcho(u3.value); // turn 3 activation deletes the armed entry
         yield resultMessage();
         yield idle();
       }
@@ -8803,7 +8791,19 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       prompt: [{ type: "text", text: "next" }],
     });
     expect(second.stopReason).toBe("end_turn");
-    // Activation swept the ended entry (growth bound for lost bookends).
+    // The first activation only ARMS the sweep — the entry survives one full
+    // turn so a corrective inclusive level can still rescue a live agent's
+    // attribution (deletion is irreversible).
+    expect(agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1")?.sweepArmed).toBe(
+      true,
+    );
+
+    const third = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "again" }],
+    });
+    expect(third.stopReason).toBe("end_turn");
+    // The second activation deletes it (growth bound for lost bookends).
     expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-1")).toBe(false);
     await agent.sessions["test-session"]?.consumer;
   });
@@ -8827,13 +8827,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield idle(); // trailer absorbed
         yield taskNotification("agent-1");
         yield running();
-        yield {
-          type: "system",
-          subtype: "session_state_changed",
-          state: "requires_action",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        }; // the followup blocks on a permission request
+        yield requiresAction(); // the followup blocks on a permission request
         await afterCancel; // the cancel's interrupt pre-empts it
         const u2 = await iter.next();
         yield userEcho(u2.value); // turn 2 activates...
@@ -8858,6 +8852,136 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       prompt: [{ type: "text", text: "next" }],
     });
     expect(second.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("closes the stretch after autonomous prose so a replayed prompt still delivers", async () => {
+    // Autonomous prose (a wake's summary) latches the delivery flag; with no
+    // turn in flight or queued, the autonomous result must close the stretch
+    // or the next cache-replayed prompt's issue-#453 fallback is suppressed.
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        if (u.update?.sessionUpdate === "agent_message_chunk") {
+          events.push(`chunk:${u.update.content?.text}`);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield resultMessage(); // turn 1 settles normally
+        yield idle();
+        // Autonomous cycle with no turn pending: prose + result.
+        yield assistantText("background note");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+        const u2 = await iter.next();
+        yield userEcho(u2.value);
+        // Cache-replayed turn: no streaming, zero output tokens, the answer
+        // only on the result text.
+        yield resultMessage({
+          result: "replayed answer",
+          usage: {
+            input_tokens: 10,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "one" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    // The user types AFTER the background note arrived (the real sequence);
+    // prompting before the autonomous result is consumed would race the
+    // queued-turn guard, which deliberately errs toward suppression. Wait
+    // for the prose to land and the autonomous result's clear to follow.
+    await waitFor(
+      () =>
+        events.includes("chunk:background note") &&
+        agent.sessions["test-session"]!.emittedAssistantText === false,
+    );
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "two" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    expect(events).toContain("chunk:replayed answer");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("preserves a queued turn's streamed answer across an interleaved autonomous result", async () => {
+    // Mid-message echo lag: a queued turn's deltas can stream before its echo
+    // activates it (activeTurn still null). An autonomous result landing in
+    // that window must NOT close the stretch — the flag guards the queued
+    // turn's already-delivered answer, and clearing would re-emit it via the
+    // issue-#453 fallback (the duplicate direction the flag's doc forbids).
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        if (u.update?.sessionUpdate === "agent_message_chunk") {
+          events.push(`chunk:${u.update.content?.text}`);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield resultMessage(); // turn 1 settles
+        yield idle();
+        const u2 = await iter.next(); // turn 2 pushed (queued, not yet echoed)
+        // Turn 2's answer streams BEFORE its echo (mid-message echo lag).
+        yield assistantText("streamed answer");
+        // An autonomous result interleaves while activeTurn is null but
+        // turn 2 sits unsettled in the queue.
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield userEcho(u2.value); // now the echo activates turn 2
+        // Zero-output result whose text duplicates the streamed answer.
+        yield resultMessage({
+          result: "streamed answer",
+          usage: {
+            input_tokens: 10,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield idle();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "one" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "two" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    // The streamed answer must appear exactly once — the queued-turn guard
+    // kept the flag latched, so the fallback did not re-emit it.
+    expect(events.filter((e) => e === "chunk:streamed answer")).toHaveLength(1);
     await agent.sessions["test-session"]?.consumer;
   });
 

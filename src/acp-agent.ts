@@ -454,7 +454,19 @@ type Session = {
    *  the level's universe). */
   liveBackgroundTasks: Map<
     string,
-    { parentToolUseId?: string; isSubagent: boolean; endedPerLevel?: boolean }
+    {
+      parentToolUseId?: string;
+      isSubagent: boolean;
+      endedPerLevel?: boolean;
+      /** Set at the first turn activation that saw the entry ended; deleted
+       *  at the second. The one-activation grace exists for the absent-mark
+       *  race (a level payload built before a live async agent's
+       *  registration): a corrective inclusive level un-ends the entry if it
+       *  arrives within a full turn, keeping the agent's attribution —
+       *  eager deletion would be irreversible, since levels never ADD
+       *  entries. */
+      sweepArmed?: boolean;
+    }
   >;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary — a user-turn result (the result case's `finally`), a
@@ -1577,15 +1589,21 @@ export class ClaudeAcpAgent {
       session.cancelled = false;
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
-      // Sweep registry entries the level signal ended (see endedPerLevel):
-      // they were retained only so a live sync subagent's attribution
-      // survives the level's background-only universe, and any sync subagent
-      // of the PREVIOUS turn finished with that turn — same activation-time
-      // self-heal as the orphan lanes, and the growth bound for leaked
-      // entries whose settle bookends never arrive.
+      // Two-phase sweep of registry entries the level signal ended (see
+      // endedPerLevel / sweepArmed): armed at the first activation, deleted
+      // at the second — the same activation-time self-heal as the orphan
+      // lanes, and the growth bound for leaked entries whose settle
+      // bookends never arrive. The one-activation grace lets a corrective
+      // inclusive level rescue a live async agent that a racing payload
+      // absent-marked (deletion is irreversible: levels never ADD entries).
       for (const [taskId, record] of session.liveBackgroundTasks) {
-        if (record.endedPerLevel) {
+        if (!record.endedPerLevel) {
+          continue;
+        }
+        if (record.sweepArmed) {
           session.liveBackgroundTasks.delete(taskId);
+        } else {
+          record.sweepArmed = true;
         }
       }
       resetTurnScratch();
@@ -1786,12 +1804,15 @@ export class ClaudeAcpAgent {
       streamedToolInputs.clear();
       if (wasHeld) {
         // Settling a held turn is its delivery-stretch boundary: the turn's
-        // answer finished long ago, so any text streamed since the last
-        // boundary was its followups' — left latched it would suppress a
-        // following replayed turn's issue-#453 result-text fallback. (The
-        // mid-message no-clear rule at the echo hand-off applies only to
-        // NON-held turns, whose streamed deltas belong to the turn being
-        // activated.) Every held-settle lane inherits this: the drain
+        // answer finished long ago, so text streamed since the last boundary
+        // is normally its followups' — left latched it would suppress a
+        // following replayed turn's issue-#453 result-text fallback (the
+        // common post-hold sequence). Known trade: at the echo hand-off an
+        // incoming turn's pre-echo deltas share this one boolean, so a
+        // STREAMING replay on a usage-omitting backend could re-emit its
+        // answer — the flag cannot attribute text to a turn before its
+        // echo, and the suppression direction is the common one, so the
+        // clear wins. Every held-settle lane inherits this: the drain
         // settle, both hand-offs, and stream-done; cancel()'s inline mirror
         // carries its own copy.
         session.emittedAssistantText = false;
@@ -1829,8 +1850,9 @@ export class ClaudeAcpAgent {
       session.turnQueue = [];
       for (const turn of turns) {
         if (!turn.settled) {
+          const wasHeld = isHeldOpen(turn);
           turn.settled = true;
-          if (turn.deferredSettle !== undefined) {
+          if (wasHeld) {
             // A held turn's answer already streamed and its outcome is
             // recorded — a stream death during the post-answer hold is a
             // background failure, not the turn's. Resolve with the real
@@ -2557,9 +2579,12 @@ export class ClaudeAcpAgent {
                     if (live.has(taskId)) {
                       // The level proves the task live in the background
                       // universe (e.g. a foreground agent was backgrounded
-                      // after an earlier absent-marking) — un-end it so a
-                      // hold waits on it again.
+                      // after an earlier absent-marking, or that marking was
+                      // a racing payload built before the task registered) —
+                      // un-end it so a hold waits on it again, and disarm
+                      // the activation sweep.
                       record.endedPerLevel = false;
+                      record.sweepArmed = false;
                       continue;
                     }
                     if (record.isSubagent) {
@@ -2730,13 +2755,19 @@ export class ClaudeAcpAgent {
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
                 settleDeferredIfDrained();
-                // With no turn in flight (also after the settle above), the
-                // stretch holds only autonomous prose — close it, so a
-                // replayed next prompt isn't silently suppressed by the
-                // issue-#453 delivery check. With a live turn the flag may
-                // guard the USER's already-streamed text, so leave it (the
-                // documented conservative class).
-                if (!session.activeTurn) {
+                // With no turn in flight OR QUEUED (also after the settle
+                // above), the stretch holds only autonomous prose — close
+                // it, so a replayed next prompt isn't silently suppressed by
+                // the issue-#453 delivery check. A live turn's flag may
+                // guard the USER's already-streamed text — and so may a
+                // QUEUED turn's: with mid-message echo lag its deltas stream
+                // before the echo activates it (activeTurn still null), and
+                // clearing then would re-emit that answer via the fallback,
+                // the duplicate direction the flag's doc forbids.
+                if (
+                  !session.activeTurn &&
+                  !(session.turnQueue ?? []).some((turn) => !turn.settled)
+                ) {
                   session.emittedAssistantText = false;
                 }
                 break;
@@ -3075,7 +3106,9 @@ export class ClaudeAcpAgent {
                     }
                   }
                   // Unlike the no-result teardown lanes, this hand-off must
-                  // NOT clear emittedAssistantText: the echo can land
+                  // NOT clear emittedAssistantText for a NON-held previous
+                  // turn (a held one's settleActive above closes its own
+                  // stretch): the echo can land
                   // mid-message, so deltas already streamed belong to the turn
                   // being activated — clearing would forget them and let its
                   // result re-emit the answer.
@@ -3502,11 +3535,15 @@ export class ClaudeAcpAgent {
         // echo — read as the fresh turn ending without a result (issue #825
         // false-fail). Pre-count it unless the session sits idle: there the
         // interrupt emits nothing, and a debt that never drains would mask
-        // one future #825 detection. (lastSessionState is last-CONSUMED —
-        // a running transition still in the consumer's backlog reads as
-        // stale idle and under-counts; accepted, the window is one awaited
-        // client call wide and the failure additionally needs the trailer
-        // to lag past the next echo.)
+        // one future #825 detection. (lastSessionState is last-CONSUMED, so
+        // both stale reads exist and both are accepted one-cycle windows: a
+        // running transition still in the backlog reads as stale idle and
+        // under-counts — that false-fail additionally needs the trailer to
+        // lag past the next echo — while a cycle already completed into the
+        // backlog reads as stale non-idle and over-counts, masking one
+        // future #825 detection. Undefined — no state event consumed —
+        // pre-counts; that only occurs on CLIs whose missing idle events
+        // also disable the detector the debt could mask.)
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
@@ -3630,10 +3667,7 @@ export class ClaudeAcpAgent {
     // after the floor, and clear the timer so it can't outlive the deleted
     // session (it isn't unref'd and would otherwise keep the event loop alive
     // until it fires).
-    if (session.forceCancelTimer) {
-      clearTimeout(session.forceCancelTimer);
-      session.forceCancelTimer = undefined;
-    }
+    disarmForceCancel(session);
     session.cancelController?.abort();
     this.closeQueryStream(session);
     // Abort the SDK abort signal only on explicit destroy. closeQueryStream
