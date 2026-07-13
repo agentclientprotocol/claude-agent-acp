@@ -520,8 +520,13 @@ describe("createSession options merging", () => {
 
     it("ignores a non-numeric value", async () => {
       process.env.MAX_THINKING_TOKENS = "lots";
+      // The bad value is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       expect(capturedOptions!.thinking).toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("MAX_THINKING_TOKENS"));
     });
 
     it("lets a user-provided thinking option override the env default", async () => {
@@ -640,10 +645,15 @@ describe("createSession options merging", () => {
       // getContextUsage rejects, and the mock model ("claude-sonnet-4-6" /
       // "Claude Sonnet" / "Fast") has no "1m" hint.
       contextUsageResult = () => Promise.reject(new Error("no context usage mocked"));
+      // The rejection is deliberate — capture the agent's warning instead of
+      // letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(errorSpy).toHaveBeenCalled();
     });
 
     it("ignores a nonsensical (non-positive) reported window", async () => {
@@ -752,6 +762,10 @@ describe("createSession options merging", () => {
 
     it("cancels on a malformed payload without presenting anything", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
+      // The malformed payload is deliberate — capture the agent's warning
+      // instead of letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       const result = await onUserDialog(
         { dialogKind: "refusal_fallback_prompt", payload: { fallbackModel: 42 } },
@@ -760,11 +774,16 @@ describe("createSession options merging", () => {
 
       expect(result).toEqual({ behavior: "cancelled" });
       expect(createElicitation).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("unexpected shape"));
     });
 
     it("cancels when the elicitation request fails", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
       createElicitation.mockRejectedValue(new Error("client exploded"));
+      // The client failure is deliberate — capture the agent's warning
+      // instead of letting it hit the console.
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       const result = await onUserDialog(
         {
@@ -775,6 +794,7 @@ describe("createSession options merging", () => {
       );
 
       expect(result).toEqual({ behavior: "cancelled" });
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("client exploded"));
     });
   });
 });
