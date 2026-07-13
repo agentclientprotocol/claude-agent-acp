@@ -517,6 +517,12 @@ export function toolUpdateFromToolResult(
     return toAcpContentUpdate(toolResult.content, true);
   }
 
+  // Shared raw-text fallback: renders the tool_result content the model saw.
+  // The structured cases below fall back to this when `tool_use_result` is
+  // absent or fails its shape guard (older CLIs, replayed sessions).
+  const rawContentUpdate = () =>
+    toAcpContentUpdate(toolResult.content, "is_error" in toolResult ? toolResult.is_error : false);
+
   switch (toolUse?.name) {
     case "Read": {
       // The raw tool_result text is the model-facing view: line-numbered
@@ -535,14 +541,32 @@ export function toolUpdateFromToolResult(
         // model-facing "file is empty" note) rather than a phantom blank line.
         structuredRead.file.content.length > 0
       ) {
-        const startLine = structuredRead.file.startLine ?? 1;
+        // startLine is typed non-optional but defended anyway; a Read's
+        // `offset` input is the same 1-based starting line, so it beats a
+        // blind 1 when an emitter omits the field.
+        const startLine =
+          structuredRead.file.startLine ??
+          (toolUse.input as FileReadInput | undefined)?.offset ??
+          1;
         // A trailing newline is a line terminator, not an extra line — don't
         // number a phantom empty line after it.
-        const numbered = structuredRead.file.content
+        let numbered = structuredRead.file.content
           .replace(/\n$/, "")
           .split("\n")
           .map((line, i) => `${startLine + i}\t${line}`)
           .join("\n");
+        // The model-facing truncation banner doesn't survive reconstruction
+        // from file.content (the SDK flag exists for exactly this case) —
+        // re-establish it so a partial first page doesn't read as the whole
+        // file.
+        if (structuredRead.file.truncatedByTokenCap) {
+          const { numLines, totalLines } = structuredRead.file;
+          const detail =
+            typeof numLines === "number" && typeof totalLines === "number"
+              ? `: showing ${numLines} of ${totalLines} lines`
+              : "";
+          numbered += `\n[File truncated${detail}]`;
+        }
         return {
           content: [
             {
@@ -590,10 +614,12 @@ export function toolUpdateFromToolResult(
       // 1. The structured BashOutput (message-level tool_use_result): its
       //    stdout/stderr exclude the model-directed suffixes the raw text
       //    carries (stale-read hints, gh rate-limit hints, the
-      //    persisted-output wrapper for too-large outputs). Skipped for image
-      //    output (the raw content array carries the actual image blocks) and
-      //    backgrounded commands (the raw text carries the background-task
-      //    notice; structured stdout may be empty).
+      //    persisted-output wrapper for too-large outputs — the interruption
+      //    and truncation facts those carried are re-established from the
+      //    structured flags below). Skipped for image output (the raw content
+      //    array carries the actual image blocks) and backgrounded commands
+      //    (the raw text carries the background-task notice; structured
+      //    stdout may be empty).
       // 2. BetaBashCodeExecutionResultBlock: { type: "bash_code_execution_result", stdout, stderr, return_code }
       // 3. Plain string content from a regular tool_result
       // 4. Array content (e.g. [{ type: "text", text: "..." }] for stdout,
@@ -612,6 +638,30 @@ export function toolUpdateFromToolResult(
         structuredBash.backgroundTaskId === undefined
       ) {
         output = [structuredBash.stdout, structuredBash.stderr].filter(Boolean).join("\n");
+        // Two raw-text notices don't survive the structured stdout/stderr —
+        // re-establish them so the client isn't shown a clean-looking result:
+        // the CLI appends its abort marker only to the model-facing text, and
+        // an aborted command isn't a success, so synthesize a failing exit
+        // code when the result wasn't already an error.
+        if (structuredBash.interrupted) {
+          output = [output, "[Command was aborted before completion]"].filter(Boolean).join("\n");
+          exitCode = 1;
+        }
+        // Structured stdout is clipped (~30k chars) when the full output was
+        // persisted to disk; without this note the clip is silent and the
+        // path to the full output is lost.
+        if (typeof structuredBash.persistedOutputPath === "string") {
+          const size =
+            typeof structuredBash.persistedOutputSize === "number"
+              ? ` (${structuredBash.persistedOutputSize} bytes total)`
+              : "";
+          output = [
+            output,
+            `[Output truncated${size}: full output saved to ${structuredBash.persistedOutputPath}]`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+        }
       } else if (
         result &&
         typeof result === "object" &&
@@ -684,19 +734,25 @@ export function toolUpdateFromToolResult(
       // report without the trailer — render from it when present (per the SDK
       // 0.3.207 guidance) and fall back to the raw text otherwise (older CLIs,
       // replayed sessions).
-      const structured = toolUseResult as Extract<AgentOutput, { status: "completed" }>;
+      // Cast to the full union, not the completed variant — the status check
+      // below is what narrows it, and pre-narrowing would let future field
+      // reads typecheck against a variant the runtime value may not be.
+      const structured = toolUseResult as AgentOutput;
       if (
         structured !== null &&
         typeof structured === "object" &&
         structured.status === "completed" &&
-        Array.isArray(structured.content)
+        Array.isArray(structured.content) &&
+        // A completed subagent can end with zero text blocks; an empty
+        // structured render would beat the raw fallback for no benefit.
+        structured.content.length > 0
       ) {
-        return toAcpContentUpdate(structured.content, false);
+        return toAcpContentUpdate(
+          structured.content,
+          "is_error" in toolResult ? toolResult.is_error : false,
+        );
       }
-      return toAcpContentUpdate(
-        toolResult.content,
-        "is_error" in toolResult ? toolResult.is_error : false,
-      );
+      return rawContentUpdate();
     }
 
     case "Edit": // Edit is handled in hooks
@@ -723,7 +779,14 @@ export function toolUpdateFromToolResult(
           typeof entry === "string"
             ? [entry]
             : Array.isArray(entry?.content)
-              ? entry.content.map((hit) => `${hit.title} (${hit.url})`)
+              ? // tool_use_result arrives untyped across CLI version skew —
+                // skip off-spec hits rather than rendering
+                // "undefined (undefined)" lines.
+                entry.content.flatMap((hit) =>
+                  typeof hit?.title === "string" && typeof hit?.url === "string"
+                    ? [formatWebSearchHit(hit)]
+                    : [],
+                )
               : [],
         );
         if (lines.length > 0) {
@@ -737,19 +800,20 @@ export function toolUpdateFromToolResult(
           };
         }
       }
-      return toAcpContentUpdate(
-        toolResult.content,
-        "is_error" in toolResult ? toolResult.is_error : false,
-      );
+      return rawContentUpdate();
     }
 
     default: {
-      return toAcpContentUpdate(
-        toolResult.content,
-        "is_error" in toolResult ? toolResult.is_error : false,
-      );
+      return rawContentUpdate();
     }
   }
+}
+
+/** One display format for a web-search hit, shared by the structured
+ *  WebSearchOutput render and the server-side `web_search_result` block so
+ *  the two paths can't drift. */
+function formatWebSearchHit(hit: { title: string; url: string }): string {
+  return `${hit.title} (${hit.url})`;
 }
 
 function toAcpContentUpdate(
@@ -826,7 +890,7 @@ function toAcpContentBlock(content: ToolResultContent, isError: boolean): Conten
         `Error: ${content.error_code}${content.error_message ? ` - ${content.error_message}` : ""}`,
       );
     case "web_search_result":
-      return wrapText(`${content.title} (${content.url})`);
+      return wrapText(formatWebSearchHit(content));
     case "web_search_tool_result_error":
       return wrapText(`Error: ${content.error_code}`);
     case "web_fetch_result":

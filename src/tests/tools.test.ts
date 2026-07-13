@@ -2263,6 +2263,19 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     ]);
   });
 
+  it("falls back to the raw text when the structured content array is empty", () => {
+    // A completed subagent can end with zero text blocks — an empty
+    // structured render must not beat the raw fallback.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: `The report.${TRAILER}` } },
+    ]);
+  });
+
   it("threads options.toolUseResult through toAcpNotifications for a lone tool_result", () => {
     const toolUseCache: ToolUseCache = { toolu_agent: agentToolUse };
 
@@ -2352,7 +2365,9 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       });
     });
 
-    it("defaults startLine to 1 when absent", () => {
+    it("falls back to the Read input's offset when startLine is absent", () => {
+      // readToolUse carries offset: 480 — an offset read numbered from 1
+      // would mislabel every line.
       const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
         type: "text",
         file: { filePath: "/tmp/f.ts", content: "one\ntwo" },
@@ -2360,7 +2375,46 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
 
       expect(update.content?.[0]).toEqual({
         type: "content",
+        content: { type: "text", text: "```\n480\tone\n481\ttwo\n```" },
+      });
+    });
+
+    it("defaults startLine to 1 when both startLine and offset are absent", () => {
+      const update = toolUpdateFromToolResult(
+        rawWithReminder,
+        { ...readToolUse, input: { file_path: "/tmp/f.ts" } },
+        false,
+        {
+          type: "text",
+          file: { filePath: "/tmp/f.ts", content: "one\ntwo" },
+        },
+      );
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
         content: { type: "text", text: "```\n1\tone\n2\ttwo\n```" },
+      });
+    });
+
+    it("appends a truncation note when truncatedByTokenCap is set", () => {
+      const update = toolUpdateFromToolResult(rawWithReminder, readToolUse, false, {
+        type: "text",
+        file: {
+          filePath: "/tmp/f.ts",
+          content: "one\ntwo\n",
+          numLines: 2,
+          startLine: 1,
+          totalLines: 9000,
+          truncatedByTokenCap: true,
+        },
+      });
+
+      expect(update.content?.[0]).toEqual({
+        type: "content",
+        content: {
+          type: "text",
+          text: "```\n1\tone\n2\ttwo\n[File truncated: showing 2 of 9000 lines]\n```",
+        },
       });
     });
 
@@ -2459,6 +2513,38 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
         },
       ]);
     });
+
+    it("re-establishes the abort notice and a failing exit code for interrupted commands", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "partial output",
+        interrupted: true,
+      });
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "partial output\n[Command was aborted before completion]",
+      });
+      expect(update._meta?.terminal_exit).toEqual({
+        terminal_id: "toolu_bash",
+        exit_code: 1,
+        signal: null,
+      });
+    });
+
+    it("re-establishes the truncation note and persisted path for too-large outputs", () => {
+      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
+        ...structured,
+        stdout: "clipped stdout",
+        persistedOutputPath: "/tmp/tool-results/abc.txt",
+        persistedOutputSize: 38100,
+      });
+
+      expect(update._meta?.terminal_output).toEqual({
+        terminal_id: "toolu_bash",
+        data: "clipped stdout\n[Output truncated (38100 bytes total): full output saved to /tmp/tool-results/abc.txt]",
+      });
+    });
   });
 
   describe("WebSearch", () => {
@@ -2507,6 +2593,44 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
 
     it("falls back to the raw dump when tool_use_result is absent", () => {
       const update = toolUpdateFromToolResult(rawDump, searchToolUse, false);
+
+      expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
+    });
+
+    it("skips off-spec hits instead of rendering undefined fields", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [
+          {
+            tool_use_id: "srvtoolu_1",
+            content: [
+              { error_code: "provider_error" },
+              { title: "Issue #9722", url: "https://github.com/npm/cli/issues/9722" },
+            ],
+          },
+        ],
+      });
+
+      expect(update).toEqual({
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: "Issue #9722 (https://github.com/npm/cli/issues/9722)",
+            },
+          },
+        ],
+      });
+    });
+
+    it("falls back to the raw dump when every hit is off-spec", () => {
+      const update = toolUpdateFromToolResult(rawDump, searchToolUse, false, {
+        query: "npm sigstore bug",
+        durationSeconds: 5.5,
+        results: [{ tool_use_id: "srvtoolu_1", content: [{ error_code: "provider_error" }] }],
+      });
 
       expect((update.content?.[0] as any).content.text).toContain("Web search results for query");
     });
