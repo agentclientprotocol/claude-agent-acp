@@ -30,6 +30,7 @@ import {
   toAcpNotifications,
   promptToClaude,
   isLocalCommandMetadata,
+  isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
@@ -59,6 +60,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     deleteSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    // Delegates to the real implementation so integration tests that read
+    // actual transcripts keep working; unit tests override per-call with
+    // `mockResolvedValueOnce`.
+    getSessionMessages: vi.fn(actual.getSessionMessages),
   };
 });
 import type {
@@ -1467,6 +1472,94 @@ describe("isLocalCommandMetadata", () => {
         { type: "text", text: "hi" },
       ]),
     ).toBe(false);
+  });
+});
+
+describe("synthetic login message (issue #863)", () => {
+  // The exact shape the CLI persists (and streams) when a turn fails auth:
+  // model "<synthetic>", a single text block, structured `error` stripped by
+  // getSessionMessages.
+  const syntheticLoginApiMessage = {
+    id: "0a1dfa6b-1c2f-4aa2-8bff-ae1690acd6e1",
+    model: "<synthetic>",
+    role: "assistant",
+    type: "message",
+    stop_reason: "stop_sequence",
+    content: [{ type: "text", text: "Not logged in · Please run /login" }],
+  };
+
+  it("isSyntheticLoginMessage matches the CLI auth-error message", () => {
+    expect(isSyntheticLoginMessage(syntheticLoginApiMessage)).toBe(true);
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        content: [{ type: "text", text: "Session expired. Please run /login to sign in again." }],
+      }),
+    ).toBe(true);
+  });
+
+  it("isSyntheticLoginMessage does not match real assistant messages", () => {
+    // Real model output that merely mentions the phrase.
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        model: "claude-sonnet-5",
+      }),
+    ).toBe(false);
+    // Other synthetic error texts (e.g. API errors) still replay as-is.
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        content: [{ type: "text", text: "API Error: 500 Internal Server Error" }],
+      }),
+    ).toBe(false);
+    expect(isSyntheticLoginMessage(undefined)).toBe(false);
+    expect(isSyntheticLoginMessage("Not logged in · Please run /login")).toBe(false);
+  });
+
+  it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "hi, say one word" }] },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: syntheticLoginApiMessage,
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    // The user's prompt still replays…
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text.includes("hi, say one word"),
+      ),
+    ).toBe(true);
+    // …but the TUI-specific "/login" instruction never reaches the client.
+    expect(JSON.stringify(updates)).not.toContain("/login");
   });
 });
 

@@ -655,6 +655,39 @@ export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
 }
 
+/**
+ * True for the synthetic assistant message the CLI injects into the transcript
+ * when a turn fails authentication (e.g. "Not logged in · Please run /login",
+ * "Session expired. Please run /login to sign in again."). The `/login`
+ * instruction is Claude Code TUI-specific and meaningless to ACP clients
+ * (issue #863). The live prompt loop suppresses the text and fails the turn
+ * with `authRequired` so the client can run its own auth flow; replay must
+ * skip it too — both for parity with what the client saw live and because the
+ * message stays in the transcript forever, so it would resurface on every
+ * session/load even after the user has logged back in.
+ *
+ * Takes the API message (`message.message`), which replay only knows as
+ * `unknown`. The persisted record's structured `error: "authentication_failed"`
+ * marker is stripped by `getSessionMessages`, so the synthetic model + text is
+ * all both paths have to match on.
+ */
+export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
+  if (!apiMessage || typeof apiMessage !== "object") {
+    return false;
+  }
+  const { model, content } = apiMessage as { model?: unknown; content?: unknown };
+  if (model !== "<synthetic>" || !Array.isArray(content) || content.length !== 1) {
+    return false;
+  }
+  const block = content[0] as { type?: unknown; text?: unknown } | null;
+  return (
+    !!block &&
+    block.type === "text" &&
+    typeof block.text === "string" &&
+    block.text.includes("Please run /login")
+  );
+}
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   auto: "auto",
   default: "default",
@@ -2570,14 +2603,7 @@ export class ClaudeAcpAgent {
               break;
             }
 
-            if (
-              message.type === "assistant" &&
-              message.message.model === "<synthetic>" &&
-              Array.isArray(message.message.content) &&
-              message.message.content.length === 1 &&
-              message.message.content[0].type === "text" &&
-              message.message.content[0].text.includes("Please run /login")
-            ) {
+            if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
               failActive(RequestError.authRequired());
               break;
             }
@@ -3190,6 +3216,13 @@ export class ClaudeAcpAgent {
       const replaySession = this.sessions[sessionId];
       if (replaySession && replayMessageId && message.uuid) {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
+      }
+
+      // The live prompt loop converts the synthetic "Please run /login"
+      // assistant message into an authRequired error instead of showing its
+      // TUI-specific text; skip it on replay too (issue #863).
+      if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
+        continue;
       }
 
       // @ts-expect-error - untyped in SDK but we handle all of these
