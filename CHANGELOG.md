@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.59.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.58.1...v0.59.0) (2026-07-13)
+
+
+### Features
+
+* **deps-dev:** bump nanoid from 3.3.15 to 3.3.16 ([#875](https://github.com/agentclientprotocol/claude-agent-acp/issues/875)) ([e67dacd](https://github.com/agentclientprotocol/claude-agent-acp/commit/e67dacdcac629b00e5bdcda94b3de57459696b1e))
+* **deps:** bump @anthropic-ai/claude-agent-sdk to 0.3.207 ([#874](https://github.com/agentclientprotocol/claude-agent-acp/issues/874)) ([c7f5b8f](https://github.com/agentclientprotocol/claude-agent-acp/commit/c7f5b8fe768507afa28cdffe5cc3c054c56306ad))
+
+
+### Bug Fixes
+
+* Add subagent parent tool use attribution ([#859](https://github.com/agentclientprotocol/claude-agent-acp/issues/859)) ([9cd48c5](https://github.com/agentclientprotocol/claude-agent-acp/commit/9cd48c597af68f630774ec00bc3adc85f6b0fd4b))
+* forward result text when the turn emitted no assistant message ([#858](https://github.com/agentclientprotocol/claude-agent-acp/issues/858)) ([61ae860](https://github.com/agentclientprotocol/claude-agent-acp/commit/61ae8609d4343da6758c2376c6cf684c7fb0956a))
+* hold a turn open while its background subagents are still live ([#870](https://github.com/agentclientprotocol/claude-agent-acp/issues/870)) ([7a70f82](https://github.com/agentclientprotocol/claude-agent-acp/commit/7a70f82739e085014cad878f08513cdef7b7fe16))
+* Refine tool calls from streamed input ([#867](https://github.com/agentclientprotocol/claude-agent-acp/issues/867)) ([2c19974](https://github.com/agentclientprotocol/claude-agent-acp/commit/2c19974d5b80d3178b35e80a4bb0a1050588aab9))
+* Seed context window from SDK usage report ([#868](https://github.com/agentclientprotocol/claude-agent-acp/issues/868)) ([3ba2d36](https://github.com/agentclientprotocol/claude-agent-acp/commit/3ba2d367a282fe3053a73804a416a435cb01ee08)), closes [#596](https://github.com/agentclientprotocol/claude-agent-acp/issues/596)
+* Skip synthetic login messages on replay ([#869](https://github.com/agentclientprotocol/claude-agent-acp/issues/869)) ([c7dff3c](https://github.com/agentclientprotocol/claude-agent-acp/commit/c7dff3cf7eeb03cb993493efafa96344f18de81b)), closes [#863](https://github.com/agentclientprotocol/claude-agent-acp/issues/863)
+
 ## [0.58.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.58.0...v0.58.1) (2026-07-09)
 
 
