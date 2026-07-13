@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { makeMockQuery } from "./helpers.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -101,13 +102,11 @@ describe("session config options", () => {
     applyFlagSettingsSpy = vi.fn();
 
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
-      query: {
+      query: makeMockQuery({
         setPermissionMode: setPermissionModeSpy,
         setModel: setModelSpy,
         applyFlagSettings: applyFlagSettingsSpy,
-        supportedCommands: async () => [],
-        getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
-      },
+      }),
       input: null,
       cancelled: false,
       permissionMode: "default",

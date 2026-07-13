@@ -12,11 +12,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
   );
+  const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
   return {
     ...actual,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
-      return {
+      return makeMockQuery({
         initializationResult: async () => ({
           models: [
             {
@@ -27,15 +28,9 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
             },
           ],
         }),
-        setModel: async () => {},
-        setPermissionMode: async () => {},
-        supportedCommands: async () => [],
         getContextUsage: () =>
-          contextUsageResult
-            ? contextUsageResult()
-            : Promise.resolve({ totalTokens: 0, rawMaxTokens: 200000 }),
-        [Symbol.asyncIterator]: async function* () {},
-      };
+          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+      });
     },
   };
 });

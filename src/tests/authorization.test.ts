@@ -1,19 +1,8 @@
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
+import { makeMockQuery } from "./helpers.js";
 
-const mockQuery = vi.hoisted(() =>
-  vi.fn(() => ({
-    initializationResult: vi.fn().mockResolvedValue({
-      models: [
-        { value: "id", displayName: "name", description: "description", supportsAutoMode: true },
-      ],
-    }),
-    setModel: vi.fn(),
-    setPermissionMode: vi.fn(),
-    supportedCommands: vi.fn().mockResolvedValue([]),
-    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
-  })),
-);
+const mockQuery = vi.hoisted(() => vi.fn());
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
   ...(await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
@@ -25,6 +14,22 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
 describe("authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    // Set here (not in vi.fn(impl) at hoist time) so the helper import is
+    // available; afterEach's resetAllMocks clears it, beforeEach re-sets it.
+    mockQuery.mockImplementation(() =>
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "id",
+              displayName: "name",
+              description: "description",
+              supportsAutoMode: true,
+            },
+          ],
+        }),
+      }),
+    );
   });
 
   afterEach(() => {

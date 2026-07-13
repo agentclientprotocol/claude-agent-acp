@@ -7,31 +7,30 @@ import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-age
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let capturedOptions: Options | undefined;
-vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
-  ...(await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
+  const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
-  )),
-  query: ({ options }: { options: Options }) => {
-    capturedOptions = options;
-    return {
-      initializationResult: async () => ({
-        models: [
-          {
-            value: "claude-sonnet-4-6",
-            displayName: "Claude Sonnet",
-            description: "Fast",
-            supportsAutoMode: true,
-          },
-        ],
-      }),
-      setModel: async () => {},
-      setPermissionMode: async () => {},
-      supportedCommands: async () => [],
-      getContextUsage: async () => ({ totalTokens: 0, rawMaxTokens: 200000 }),
-      [Symbol.asyncIterator]: async function* () {},
-    };
-  },
-}));
+  );
+  const { makeMockQuery } = await import("./helpers.js");
+  return {
+    ...actual,
+    query: ({ options }: { options: Options }) => {
+      capturedOptions = options;
+      return makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "claude-sonnet-4-6",
+              displayName: "Claude Sonnet",
+              description: "Fast",
+              supportsAutoMode: true,
+            },
+          ],
+        }),
+      });
+    },
+  };
+});
 vi.mock("../tools.js", async () => ({
   ...(await vi.importActual<typeof import("../tools.js")>("../tools.js")),
   registerHookCallback: vi.fn(),

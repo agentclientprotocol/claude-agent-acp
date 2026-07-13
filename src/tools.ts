@@ -490,6 +490,22 @@ export function toolInfoFromToolUse(
   }
 }
 
+/**
+ * Narrow the untyped message-level `tool_use_result` toward a per-tool Output
+ * shape: rejects everything but a plain non-null object (arrays pass a bare
+ * `typeof === "object"` check, so they're excluded here). The returned value
+ * is only *nominally* typed — it arrives over the wire from arbitrary CLI
+ * versions, so each caller must still guard the specific fields it reads
+ * before trusting them.
+ */
+function structuredResult<T extends object>(toolUseResult: unknown): T | undefined {
+  return toolUseResult !== null &&
+    typeof toolUseResult === "object" &&
+    !Array.isArray(toolUseResult)
+    ? (toolUseResult as T)
+    : undefined;
+}
+
 export function toolUpdateFromToolResult(
   toolResult:
     | ToolResultBlockParam
@@ -531,11 +547,9 @@ export function toolUpdateFromToolResult(
       // structured FileReadOutput carries the clean content — rebuild the
       // line-numbered view from it. Non-text variants (image/notebook/pdf)
       // fall back to the raw content blocks, which already render fine.
-      const structuredRead = toolUseResult as FileReadOutput;
+      const structuredRead = structuredResult<FileReadOutput>(toolUseResult);
       if (
-        structuredRead !== null &&
-        typeof structuredRead === "object" &&
-        structuredRead.type === "text" &&
+        structuredRead?.type === "text" &&
         typeof structuredRead.file?.content === "string" &&
         // An empty file has nothing to line-number; keep the raw view (the
         // model-facing "file is empty" note) rather than a phantom blank line.
@@ -628,10 +642,9 @@ export function toolUpdateFromToolResult(
       let output = "";
       let exitCode = isError ? 1 : 0;
 
-      const structuredBash = toolUseResult as BashOutput;
+      const structuredBash = structuredResult<BashOutput>(toolUseResult);
       if (
-        structuredBash !== null &&
-        typeof structuredBash === "object" &&
+        structuredBash &&
         typeof structuredBash.stdout === "string" &&
         typeof structuredBash.stderr === "string" &&
         !structuredBash.isImage &&
@@ -734,14 +747,13 @@ export function toolUpdateFromToolResult(
       // report without the trailer — render from it when present (per the SDK
       // 0.3.207 guidance) and fall back to the raw text otherwise (older CLIs,
       // replayed sessions).
-      // Cast to the full union, not the completed variant — the status check
-      // below is what narrows it, and pre-narrowing would let future field
-      // reads typecheck against a variant the runtime value may not be.
-      const structured = toolUseResult as AgentOutput;
+      // Narrowed to the full union, not the completed variant — the status
+      // check below is what discriminates it, and pre-narrowing would let
+      // future field reads typecheck against a variant the runtime value may
+      // not be.
+      const structured = structuredResult<AgentOutput>(toolUseResult);
       if (
-        structured !== null &&
-        typeof structured === "object" &&
-        structured.status === "completed" &&
+        structured?.status === "completed" &&
         Array.isArray(structured.content) &&
         // A completed subagent can end with zero text blocks; an empty
         // structured render would beat the raw fallback for no benefit.
@@ -769,12 +781,8 @@ export function toolUpdateFromToolResult(
       // results for query: …\n\nLinks: [{…json…}]"). The structured
       // WebSearchOutput carries the hits — render them the way server-side
       // web_search_result blocks render ("Title (url)").
-      const structuredSearch = toolUseResult as WebSearchOutput;
-      if (
-        structuredSearch !== null &&
-        typeof structuredSearch === "object" &&
-        Array.isArray(structuredSearch.results)
-      ) {
+      const structuredSearch = structuredResult<WebSearchOutput>(toolUseResult);
+      if (structuredSearch && Array.isArray(structuredSearch.results)) {
         const lines = structuredSearch.results.flatMap((entry) =>
           typeof entry === "string"
             ? [entry]
