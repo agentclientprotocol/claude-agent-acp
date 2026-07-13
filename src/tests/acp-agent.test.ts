@@ -7667,10 +7667,10 @@ describe("post-error recovery", () => {
 
 describe("deferred settlement for live background subagents (issues #864/#866)", () => {
   // A turn whose terminal result arrives while background subagents IT
-  // spawned are still live must NOT settle at that result: a spec-compliant
-  // client stops consuming session/update at the prompt response, so the
-  // subagents' remaining output would be dropped and their permission
-  // requests would block on an RPC nobody answers. The turn is held open
+  // spawned are still live must NOT settle at that result: ACP allows
+  // out-of-turn session/update, but many clients stop consuming at the
+  // prompt response, so the subagents' remaining output would be dropped
+  // and their permission requests would block on an RPC nobody answers. The turn is held open
   // across the CLI's idle cycles (observed cadence: user result → idle →
   // subagent works → task_notification → followup turn → idle) and settles
   // once its subagents are done — at the followup's terminal result, or at
@@ -7823,7 +7823,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // reported separately, not folded into the prompt response.
     expect(response.usage?.totalTokens).toBe(15);
     // The followup summary streamed BEFORE the prompt resolved, i.e. inside
-    // the turn, where a spec-compliant client is still listening.
+    // the turn, where every client is still listening.
     const summaryIndex = events.indexOf("chunk:promised summary");
     expect(summaryIndex).toBeGreaterThanOrEqual(0);
     expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
@@ -7930,7 +7930,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("settles a deferred turn 'cancelled' at the interrupt's idle", async () => {
+  it("settles a deferred turn 'cancelled' immediately at cancel()", async () => {
+    // During the hold the session is typically already idle (its trailer
+    // fired at the result), so the interrupt may never produce a fresh idle
+    // — cancel() must not wait for one (or for the force-cancel backstop).
     const agent = createMockAgent();
     let releaseAfterCancel!: () => void;
     const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
@@ -7943,8 +7946,9 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield running();
         yield subagentStarted("agent-1");
         yield resultMessage(); // deferral point
-        await afterCancel;
-        yield idle(); // the interrupt's trailing idle
+        yield idle(); // the turn's own trailer — the hold survives it
+        await afterCancel; // nothing more comes until after the cancel
+        yield idle();
       }
       return messageGenerator();
     });
@@ -7955,14 +7959,93 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
     await agent.cancel({ sessionId: "test-session" });
-    releaseAfterCancel();
 
-    // The turn's own result already accumulated its usage — the cancelled
-    // settle must still report it (issue #844).
+    // Resolved by cancel() itself — no further stream message needed. The
+    // turn's own result already accumulated its usage; the cancelled settle
+    // must still report it (issue #844).
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: expect.objectContaining({ totalTokens: 15 }),
     });
+    releaseAfterCancel();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not fail a held turn when a followup errors while another subagent is live", async () => {
+    // A followup's is_error must never touch the user-turn lifecycle: the
+    // held turn's own result recorded a success.
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield subagentStarted("agent-2");
+        yield resultMessage(); // defers on both
+        yield idle();
+        yield taskNotification("agent-1");
+        // agent-1's followup errors while agent-2 is still live.
+        yield resultMessage({
+          origin: { kind: "task-notification" },
+          is_error: true,
+          result: "followup blew up",
+        });
+        yield idle();
+        yield taskNotification("agent-2");
+        yield resultMessage({ origin: { kind: "task-notification" } }); // settles
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not read a followup's lagged trailing idle as the next prompt being abandoned", async () => {
+    // Settling at the followup's result unblocks the client right before the
+    // followup's own trailing idle; if that idle lags past the next prompt's
+    // echo it must be absorbed, not read as the fresh turn ending without a
+    // result (issue #825's false-fail path).
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // turn 1 defers
+        yield idle(); // turn 1's trailer
+        yield taskNotification("agent-1");
+        yield resultMessage({ origin: { kind: "task-notification" } }); // settles turn 1
+        const u2 = await iter.next();
+        yield userEcho(u2.value); // turn 2 activates...
+        yield idle(); // ...before the followup's lagged trailer arrives
+        yield resultMessage(); // turn 2's own result
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });
 

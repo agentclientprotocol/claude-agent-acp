@@ -243,9 +243,10 @@ type Turn = {
    *  subagents it spawned are still live (`spawnedTaskIds` ∩
    *  `session.liveSubagentTasks`). The turn is held open — its
    *  `session/prompt` stays pending — so the subagents' streamed output,
-   *  their permission requests (which would otherwise block on an RPC no
-   *  spec-compliant client is still listening to — issue #866), and the
-   *  model's task-notification followup summary all land inside the turn.
+   *  their permission requests (which would otherwise block on an RPC a
+   *  client that stops consuming at the prompt response never answers —
+   *  issue #866), and the model's task-notification followup summary all
+   *  land inside the turn.
    *
    *  The CLI does NOT hold its trailing idle for background agents (observed
    *  on 2.1.206: `idle` follows the result immediately while the subagent
@@ -256,7 +257,13 @@ type Turn = {
    *  at the followup's terminal result (the summary has streamed by then),
    *  or at an idle with none of its subagents left (no followup came). A
    *  cancel or the next turn's echo hand-off settles it earlier, so a
-   *  long-running subagent never holds the prompt hostage. */
+   *  long-running subagent never holds the prompt hostage.
+   *
+   *  Accepted residual: if a subagent's settle bookends are ALL lost (no
+   *  task_notification, no terminal task_updated) and no later cycle emits
+   *  a result or idle, the held turn parks until `session/cancel` or the
+   *  next prompt — the same rescue contract as the adapter's other wedge
+   *  classes (see issue #825's out-of-scope notes). */
   deferredSettle?: PromptResponse;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
@@ -1457,6 +1464,16 @@ export class ClaudeAcpAgent {
       return false;
     };
 
+    /** Settle the active turn's stored deferred outcome once none of its
+     *  spawned subagents is live. The single drain rule shared by the
+     *  followup-result and idle settle sites, so the two lanes can't drift. */
+    const settleDeferredIfDrained = () => {
+      const turn = session.activeTurn;
+      if (turn?.deferredSettle && !turn.settled && !turnAwaitingSubagents(turn)) {
+        settleActive(turn.deferredSettle);
+      }
+    };
+
     /** Settle the active turn's deferred exactly once, disarm the force-cancel
      *  backstop (the turn is over), and drop it from the queue. */
     const settleActive = (result: PromptResponse) => {
@@ -1607,11 +1624,17 @@ export class ClaudeAcpAgent {
           // turn's real outcome.
           //
           // Settle the turn that was in flight so its prompt() doesn't hang:
-          // cancelled if a cancel is pending, otherwise the accumulated outcome.
-          settleActive({
-            stopReason: session.cancelled ? "cancelled" : stopReason,
-            usage: sessionUsage(session),
-          });
+          // cancelled if a cancel is pending, otherwise the outcome a
+          // deferred turn already recorded (see Turn.deferredSettle) or the
+          // accumulated scratch outcome. The scratch currently still equals
+          // a deferred turn's stored outcome (followup results never mutate
+          // it), but the stored one is the authoritative source.
+          const inFlight = session.activeTurn;
+          settleActive(
+            session.cancelled
+              ? { stopReason: "cancelled", usage: sessionUsage(session) }
+              : (inFlight?.deferredSettle ?? { stopReason, usage: sessionUsage(session) }),
+          );
           // Queued turns the SDK never started never ran, so reject them rather
           // than reporting a success (end_turn) — or a misleading "cancelled" —
           // for a prompt that produced no output. (A cancel already settled the
@@ -1859,38 +1882,24 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    // A deferred turn's result already recorded a trailer
-                    // debt (a normal cancelled turn's result was dropped
-                    // uncounted at the `session.cancelled` guard) — when it
-                    // is still outstanding, this idle is plausibly that
-                    // trailer, so consume the debt along with the settle or
-                    // it would go stale.
-                    if (session.activeTurn.deferredSettle && owedTrailingIdles > 0) {
-                      owedTrailingIdles--;
-                    }
                     settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
                   } else if (session.activeTurn?.deferredSettle && !session.activeTurn.settled) {
                     // A turn held open for its background subagents (see
                     // Turn.deferredSettle). Idles keep their normal cadence
                     // during the hold — the CLI emits one per processing
                     // cycle (the turn's own trailer, then one per followup),
-                    // NOT one final "all drained" signal — so an idle only
-                    // settles the turn once none of its spawned subagents is
-                    // left (the followup-result settle usually got there
-                    // first; this is the fallback when no followup came).
-                    // Mid-hold idles are consumed here — absorbing the owed
-                    // trailer when one is outstanding — and never fall
-                    // through: a held turn HAS its result, so reading its
-                    // idle as "turn abandoned without a result" (issue #825)
-                    // would fail a healthy prompt.
-                    if (!turnAwaitingSubagents(session.activeTurn)) {
-                      if (owedTrailingIdles > 0) {
-                        owedTrailingIdles--;
-                      }
-                      settleActive(session.activeTurn.deferredSettle);
-                    } else if (owedTrailingIdles > 0) {
+                    // NOT one final "all drained" signal — so each one
+                    // absorbs an outstanding trailer debt, and the turn only
+                    // settles once none of its spawned subagents is left
+                    // (the followup-result settle usually got there first;
+                    // this is the fallback when no followup came). Mid-hold
+                    // idles never fall through: a held turn HAS its result,
+                    // so reading its idle as "turn abandoned without a
+                    // result" (issue #825) would fail a healthy prompt.
+                    if (owedTrailingIdles > 0) {
                       owedTrailingIdles--;
                     }
+                    settleDeferredIfDrained();
                   } else if (owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -2204,7 +2213,7 @@ export class ClaudeAcpAgent {
                 // subagents), so the unspecified ordering vs. the edge
                 // bookends is safe: a level that precedes its task_started
                 // simply no-ops here.
-                {
+                if (session.liveSubagentTasks.size > 0) {
                   const live = new Set(message.tasks.map((t) => t.task_id));
                   for (const taskId of session.liveSubagentTasks) {
                     if (!live.has(taskId)) {
@@ -2261,7 +2270,15 @@ export class ClaudeAcpAgent {
             // late result after the backstop settled it — get no such settle,
             // so their trailers must be counted here or they'd later be read
             // as the next healthy turn being abandoned and false-fail it.
-            if (!isTaskNotification && (!session.cancelled || !session.activeTurn)) {
+            // Task-notification followup results are counted too: each is its
+            // own processing cycle with its own trailing idle, and that idle
+            // can lag past the next prompt's echo — which, un-owed, would be
+            // read as the fresh turn being abandoned (#825 false-fail). That
+            // lag was mostly unreachable when followups only ran with no
+            // pending turn, but a deferred turn settling AT a followup result
+            // unblocks the client at exactly that point, making the race the
+            // common case.
+            if (!session.cancelled || !session.activeTurn) {
               owedTrailingIdles++;
             }
 
@@ -2321,18 +2338,16 @@ export class ClaudeAcpAgent {
             // the promised summary has fully streamed — the trailing idle
             // would work too, but a client should not wait out another idle
             // round-trip for a response whose content is already complete.
-            // Settling BEFORE the subtype switch also keeps a followup that
-            // errored (is_error) from failActive-ing the user's turn, whose
-            // own result recorded a success. Skipped while the turn still
-            // awaits another of its subagents (parallel spawns): the next
-            // notification's followup settles it instead.
-            if (
-              isTaskNotification &&
-              session.activeTurn?.deferredSettle &&
-              !session.activeTurn.settled &&
-              !turnAwaitingSubagents(session.activeTurn)
-            ) {
-              settleActive(session.activeTurn.deferredSettle);
+            // (While the turn still awaits another of its subagents —
+            // parallel spawns — the helper holds; the next notification's
+            // followup settles it instead.) Then stop: everything below is
+            // user-turn lifecycle, and a followup's outcome must never touch
+            // it — its is_error or "Please run /login" text would otherwise
+            // failActive a live turn (the held one, or the user's next
+            // prompt) whose own result recorded a different outcome.
+            if (isTaskNotification) {
+              settleDeferredIfDrained();
+              break;
             }
 
             // A refusal can arrive on any result subtype (and may even set
@@ -2341,7 +2356,7 @@ export class ClaudeAcpAgent {
             // refused assistant message carries no visible content, so surface
             // the classifier's explanation (when available) and report ACP's
             // dedicated `refusal` stop reason.
-            if (message.stop_reason === "refusal" && !isTaskNotification) {
+            if (message.stop_reason === "refusal") {
               if (lastRefusalExplanation) {
                 await this.client.sessionUpdate({
                   sessionId: params.sessionId,
@@ -2363,9 +2378,7 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
+                  stopReason = "max_tokens";
                   break;
                 }
                 if (message.is_error) {
@@ -2376,9 +2389,7 @@ export class ClaudeAcpAgent {
                 }
                 // For local-only commands (no model invocation), the result
                 // text is the command output — forward it to the client.
-                // Task-notification followups never originate from a user
-                // slash command, so skip the forwarding for them.
-                if (session.activeTurn?.isLocalOnlyCommand && !isTaskNotification) {
+                if (session.activeTurn?.isLocalOnlyCommand) {
                   for (const notification of toAcpNotifications(
                     message.result,
                     "assistant",
@@ -2394,9 +2405,7 @@ export class ClaudeAcpAgent {
               }
               case "error_during_execution": {
                 if (message.stop_reason === "max_tokens") {
-                  if (!isTaskNotification) {
-                    stopReason = "max_tokens";
-                  }
+                  stopReason = "max_tokens";
                   break;
                 }
                 if (message.is_error) {
@@ -2408,9 +2417,7 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
-                if (!isTaskNotification) {
-                  stopReason = "end_turn";
-                }
+                stopReason = "end_turn";
                 break;
               }
               case "error_max_budget_usd":
@@ -2425,9 +2432,7 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
-                if (!isTaskNotification) {
-                  stopReason = "max_turn_requests";
-                }
+                stopReason = "max_turn_requests";
                 break;
               default:
                 unreachable(message, this.logger);
@@ -2441,10 +2446,10 @@ export class ClaudeAcpAgent {
             //
             // One exception: while background subagents this turn spawned are
             // still live, settling now would strand their remaining work
-            // outside any turn — a spec-compliant client stops consuming
-            // updates at the prompt response, and a subagent's permission
-            // request would block on an RPC nobody is listening to (issues
-            // #864/#866). Hold the turn open instead: store the outcome and
+            // outside any turn — ACP allows out-of-turn session/update, but
+            // many clients stop consuming at the prompt response, and a
+            // subagent's permission request would block on an RPC nobody
+            // answers (issues #864/#866). Hold the turn open instead: store the outcome and
             // settle with it once the subagents are done — at their followup's
             // terminal result (see the deferred-settle block above the
             // subtype switch) or at an idle with none of them left — so the
@@ -2458,7 +2463,7 @@ export class ClaudeAcpAgent {
             // then, so both branches no-op); cancellation is left to the
             // idle/abort path. settleActive is idempotent, so a duplicate
             // idle is a no-op.
-            if (!isTaskNotification && !session.cancelled) {
+            if (!session.cancelled) {
               const outcome: PromptResponse = { stopReason, usage: sessionUsage(session) };
               if (
                 session.activeTurn &&
@@ -3045,6 +3050,26 @@ export class ClaudeAcpAgent {
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
       );
+    }
+
+    // A deferred active turn (see Turn.deferredSettle) already has its
+    // result — it is only held open for its background subagents, which the
+    // interrupt below tears down. Settle it "cancelled" NOW: during the hold
+    // the session is typically already in state idle (the CLI's trailer
+    // fired at the result), so the interrupt may produce no fresh idle for
+    // the consumer's cancelled-settle path to run on, and the cancel would
+    // otherwise stall until the force-cancel backstop. Any outstanding
+    // trailer debt is absorbed by the idle handler when its idle does come.
+    // The turn's own usage snapshot is reported per the cancelled-usage
+    // contract (issue #844).
+    {
+      const active = session.activeTurn;
+      if (active?.deferredSettle && !active.settled) {
+        active.settled = true;
+        session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== active);
+        session.activeTurn = null;
+        active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
+      }
     }
 
     // Arm a backstop before interrupting: if a turn is actively consuming the
