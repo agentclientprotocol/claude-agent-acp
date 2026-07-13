@@ -7930,33 +7930,6 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("never defers when the CLI emits no session-state events (issue #497 binaries)", async () => {
-    // A stream that will never produce an idle must not park the turn on one.
-    const agent = createMockAgent();
-    let releaseEnd!: () => void;
-    const endGate = new Promise<void>((resolve) => (releaseEnd = resolve));
-
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield subagentStarted("agent-1");
-        yield resultMessage();
-        await endGate; // no session_state_changed, ever
-      }
-      return messageGenerator();
-    });
-
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "explore" }],
-    });
-    expect(response.stopReason).toBe("end_turn");
-    releaseEnd();
-    await agent.sessions["test-session"]?.consumer;
-  });
-
   it("settles a deferred turn 'cancelled' at the interrupt's idle", async () => {
     const agent = createMockAgent();
     let releaseAfterCancel!: () => void;

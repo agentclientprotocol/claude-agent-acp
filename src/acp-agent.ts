@@ -1293,13 +1293,6 @@ export class ClaudeAcpAgent {
     // idle, and detection degrades to the status quo rather than misfiring.
     let owedTrailingIdles = 0;
 
-    // Whether this stream has emitted `session_state_changed` at all. Some CLI
-    // binaries never do (issue #497), and deferred settlement (see
-    // `Turn.deferredSettle`) parks a turn until the trailing idle — engaging
-    // it on a stream that will never produce one would hang the prompt, so
-    // the deferral is gated on this latch.
-    let sawSessionState = false;
-
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
@@ -1835,7 +1828,6 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "session_state_changed": {
-                sawSessionState = true;
                 if (message.state === "idle") {
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
@@ -2460,9 +2452,7 @@ export class ClaudeAcpAgent {
             // model's promised summary all land inside the turn.
             // `session/cancel` and the next prompt's echo hand-off still
             // settle a deferred turn early, so a long-running subagent never
-            // holds the prompt hostage. Gated on having seen session-state
-            // events at all (some CLI binaries never emit them — issue #497)
-            // so the idle-based half of the settle contract exists.
+            // holds the prompt hostage.
             //
             // is_error/auth already settled via failActive (activeTurn is null
             // then, so both branches no-op); cancellation is left to the
@@ -2471,7 +2461,6 @@ export class ClaudeAcpAgent {
             if (!isTaskNotification && !session.cancelled) {
               const outcome: PromptResponse = { stopReason, usage: sessionUsage(session) };
               if (
-                sawSessionState &&
                 session.activeTurn &&
                 !session.activeTurn.settled &&
                 turnAwaitingSubagents(session.activeTurn)
