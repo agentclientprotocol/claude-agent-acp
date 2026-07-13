@@ -241,7 +241,7 @@ type Turn = {
   spawnedTaskIds?: Set<string>;
   /** Set instead of settling when the turn's terminal result arrives while
    *  subagents it spawned are still live (`spawnedTaskIds` ∩
-   *  `session.liveSubagentTasks`). The turn is held open — its
+   *  `session.liveBackgroundTasks`). The turn is held open — its
    *  `session/prompt` stays pending — so the subagents' streamed output,
    *  their permission requests (which would otherwise block on an RPC a
    *  client that stops consuming at the prompt response never answers —
@@ -409,36 +409,36 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
-  /** Maps a live subagent's agent id → the tool_use id of the Agent/Task call
-   *  that spawned it. For subagent tasks the SDK keys its task registry by
-   *  agent id, so `task_started.task_id` IS the `agentID` that `canUseTool`
-   *  later receives, and `task_started.tool_use_id` is the spawning tool call.
-   *  Populated from `task_started` and pruned when the task settles (a
-   *  `task_notification` or a terminal `task_updated` patch). Lets the
-   *  permission flow attribute a subagent's eagerly-emitted `tool_call` (and
-   *  the permission request itself) to its parent tool call via
-   *  `_meta.claudeCode.parentToolUseId`, matching the streamed subagent path.
-   *  Best-effort: a `canUseTool` that races ahead of the consumer processing
-   *  `task_started` omits the attribution from the eager tool_call, and the
-   *  streamed tool_use chunk's refining `tool_call_update` — which carries the
-   *  message-level `parent_tool_use_id` — restores it for merging clients;
-   *  that recovery is what makes best-effort acceptable here. Non-subagent
-   *  tasks (background Bash etc.) also pass through the map; see the
-   *  `task_started` handler. */
-  subagentParentToolUseIds: Map<string, string>;
-  /** Task ids of currently-live background subagents (`task_started` with a
-   *  `subagent_type`, i.e. Task/Agent-tool subagents). Pruned when the task
-   *  settles, at the same sites as `subagentParentToolUseIds`, and
-   *  reconciled against `background_tasks_changed`'s replace-semantics
-   *  payload so a lost bookend can't leak an entry. Intersected with a
-   *  turn's `spawnedTaskIds` to decide whether its settlement is deferred
-   *  (see `Turn.deferredSettle`), so the subagents' post-result output and
+  /** Registry of live background tasks, keyed by task id: populated at
+   *  `task_started`, pruned when the task settles (a `task_notification` or
+   *  a terminal `task_updated` patch), and reconciled against
+   *  `background_tasks_changed`'s replace-semantics payload so a lost
+   *  bookend can't leak an entry. One structure for both of its concerns so
+   *  a future terminal path can't prune one and not the other:
+   *
+   *  `parentToolUseId` — the tool_use id of the Agent/Task call that spawned
+   *  the task. For subagent tasks the SDK keys its registry by agent id, so
+   *  `task_started.task_id` IS the `agentID` that `canUseTool` later
+   *  receives. Lets the permission flow attribute a subagent's
+   *  eagerly-emitted `tool_call` (and the permission request itself) to its
+   *  parent tool call via `_meta.claudeCode.parentToolUseId`, matching the
+   *  streamed subagent path. Best-effort: a `canUseTool` that races ahead of
+   *  the consumer processing `task_started` omits the attribution from the
+   *  eager tool_call, and the streamed tool_use chunk's refining
+   *  `tool_call_update` — which carries the message-level
+   *  `parent_tool_use_id` — restores it for merging clients; that recovery
+   *  is what makes best-effort acceptable here.
+   *
+   *  `isSubagent` — whether the task is a Task/Agent-tool subagent
+   *  (`task_started` carried a `subagent_type`). Intersected with a turn's
+   *  `spawnedTaskIds` to decide whether its settlement is deferred (see
+   *  `Turn.deferredSettle`), so the subagents' post-result output and
    *  permission requests stay inside the turn (issues #864/#866).
-   *  Deliberately excludes non-subagent background tasks (e.g. a
+   *  Deliberately false for non-subagent background tasks (e.g. a
    *  `run_in_background` dev server): those can outlive every turn, and the
    *  model's contract with them is a wake-on-exit notification, not a
    *  turn-scoped drain. */
-  liveSubagentTasks: Set<string>;
+  liveBackgroundTasks: Map<string, { parentToolUseId?: string; isSubagent: boolean }>;
   /** Trailing-idle debt (see the consumer's init site for the full contract).
    *  Session-level rather than consumer-scoped so cancel()'s inline settle of
    *  a held turn can pre-count the interrupt's trailer — an un-owed lagged
@@ -1645,11 +1645,13 @@ export class ClaudeAcpAgent {
      *  output and permission requests land inside it (see
      *  Turn.deferredSettle). */
     const turnAwaitingSubagents = (turn: Turn) => {
-      if (!turn.spawnedTaskIds?.size || session.liveSubagentTasks.size === 0) {
+      if (!turn.spawnedTaskIds?.size || session.liveBackgroundTasks.size === 0) {
         return false;
       }
       for (const taskId of turn.spawnedTaskIds) {
-        if (session.liveSubagentTasks.has(taskId)) {
+        // spawnedTaskIds only ever holds subagent ids, so bare membership in
+        // the registry means the subagent is still live.
+        if (session.liveBackgroundTasks.has(taskId)) {
           return true;
         }
       }
@@ -2318,49 +2320,47 @@ export class ClaudeAcpAgent {
               case "task_started":
                 // For subagent tasks `task_id` is the subagent's agent id (the
                 // SDK keys its task registry by agent id) and `tool_use_id` is
-                // the Agent/Task tool_use that spawned it. Record the mapping so
-                // the subagent's permission requests — which reach canUseTool
-                // with only `agentID` — can attribute their eagerly-emitted
+                // the Agent/Task tool_use that spawned it — recorded so the
+                // subagent's permission requests, which reach canUseTool with
+                // only `agentID`, can attribute their eagerly-emitted
                 // tool_call to the parent tool call. Non-subagent tasks (e.g.
-                // background Bash) land here too; their task_ids never match an
-                // agentID, so the stray entries are inert until pruned below.
-                if (message.tool_use_id) {
-                  session.subagentParentToolUseIds.set(message.task_id, message.tool_use_id);
-                }
-                // Only subagents (Task/Agent tool) enter the live set — they
-                // are the tasks whose completion wakes the model for a
-                // followup, so they are the ones worth deferring turn
-                // settlement for. A sync subagent is pruned (terminal
-                // task_updated) before its turn's result can arrive, so set
-                // membership at result time means an async subagent. Also
-                // record the spawn on the active turn: a turn only ever
-                // waits on its own subagents, and a spawn during a held-open
-                // drain window (an agent chain) extends that turn's hold.
-                if (message.subagent_type) {
-                  session.liveSubagentTasks.add(message.task_id);
-                  if (session.activeTurn && !session.activeTurn.settled) {
-                    (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
-                  }
+                // background Bash) land here too; their task_ids never match
+                // an agentID, so those entries are inert for attribution.
+                //
+                // `isSubagent` marks Task/Agent-tool subagents — the tasks
+                // whose completion wakes the model for a followup, so the
+                // ones worth deferring turn settlement for. A sync subagent
+                // is pruned (terminal task_updated) before its turn's result
+                // can arrive, so registry membership at result time means an
+                // async subagent. Their spawn is also recorded on the active
+                // turn: a turn only ever waits on its own subagents, and a
+                // spawn during a held-open drain window (an agent chain)
+                // extends that turn's hold.
+                session.liveBackgroundTasks.set(message.task_id, {
+                  parentToolUseId: message.tool_use_id,
+                  isSubagent: !!message.subagent_type,
+                });
+                if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
+                  (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
                 break;
               case "task_notification":
-                // The task settled — no further tool calls can originate from
-                // it, so the attribution mapping can be dropped.
-                session.subagentParentToolUseIds.delete(message.task_id);
-                session.liveSubagentTasks.delete(message.task_id);
+                // The task settled — no further tool calls can originate
+                // from it, so its registry entry can be dropped.
+                session.liveBackgroundTasks.delete(message.task_id);
                 break;
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
-                // guaranteed per transition — prune on it too so the map can't
-                // grow for the session's lifetime if a notification is skipped.
+                // guaranteed per transition — prune on it too so the registry
+                // can't grow for the session's lifetime if a notification is
+                // skipped.
                 if (
                   message.patch.status === "completed" ||
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  session.subagentParentToolUseIds.delete(message.task_id);
-                  session.liveSubagentTasks.delete(message.task_id);
+                  session.liveBackgroundTasks.delete(message.task_id);
                 }
                 break;
               case "worker_shutting_down":
@@ -2457,19 +2457,20 @@ export class ClaudeAcpAgent {
               case "background_tasks_changed":
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
-                // reconcile `liveSubagentTasks` — intersecting drops any entry
-                // whose settle bookend (task_notification / terminal
-                // task_updated) was lost, so a leaked entry can't defer every
-                // later turn's settlement for the session's lifetime. It never
-                // ADDS entries (the payload doesn't say which tasks are
-                // subagents), so the unspecified ordering vs. the edge
-                // bookends is safe: a level that precedes its task_started
-                // simply no-ops here.
-                if (session.liveSubagentTasks.size > 0) {
+                // reconcile `liveBackgroundTasks` — intersecting drops any
+                // entry whose settle bookend (task_notification / terminal
+                // task_updated) was lost, so a leaked subagent entry can't
+                // defer its spawning turn's settlement forever and a leaked
+                // attribution entry can't grow the registry for the session's
+                // lifetime. It never ADDS entries (the payload carries no
+                // attribution or subagent marker), so the unspecified
+                // ordering vs. the edge bookends is safe: a level that
+                // precedes its task_started simply no-ops here.
+                if (session.liveBackgroundTasks.size > 0) {
                   const live = new Set(message.tasks.map((t) => t.task_id));
-                  for (const taskId of session.liveSubagentTasks) {
+                  for (const taskId of session.liveBackgroundTasks.keys()) {
                     if (!live.has(taskId)) {
-                      session.liveSubagentTasks.delete(taskId);
+                      session.liveBackgroundTasks.delete(taskId);
                     }
                   }
                 }
@@ -3848,8 +3849,10 @@ export class ClaudeAcpAgent {
       // When the tool call originates inside a subagent, attribute the eagerly
       // emitted tool_call (and the permission request itself) to the Agent/Task
       // tool call that spawned the subagent, mirroring the streamed subagent
-      // path's `_meta.claudeCode.parentToolUseId` (see `subagentParentToolUseIds`).
-      const parentToolUseId = agentID ? session.subagentParentToolUseIds.get(agentID) : undefined;
+      // path's `_meta.claudeCode.parentToolUseId` (see `liveBackgroundTasks`).
+      const parentToolUseId = agentID
+        ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
+        : undefined;
       if (agentID && !parentToolUseId) {
         // The attribution rests on an undocumented SDK invariant
         // (task_started.task_id === canUseTool's agentID for subagent tasks;
@@ -5002,8 +5005,7 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };

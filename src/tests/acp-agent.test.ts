@@ -160,8 +160,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     taskState: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
-    subagentParentToolUseIds: new Map(),
-    liveSubagentTasks: new Set(),
+    liveBackgroundTasks: new Map(),
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     ...overrides,
@@ -1950,8 +1949,7 @@ describe("permission request cancellation", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     } as any;
@@ -2327,7 +2325,10 @@ describe("subagent permission attribution (issue #851)", () => {
 
   it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
     const { agent, updates, requests, session } = setup();
-    session.subagentParentToolUseIds.set("agent-42", "toolu_parent");
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
       signal: new AbortController().signal,
@@ -2459,9 +2460,9 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(agent.sessions["test-session"]!.subagentParentToolUseIds.get("agent-42")).toBe(
-      "toolu_parent",
-    );
+    expect(
+      agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-42")?.parentToolUseId,
+    ).toBe("toolu_parent");
   });
 
   it("prunes the mapping when the task settles (task_notification)", async () => {
@@ -2493,7 +2494,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(agent.sessions["test-session"]!.subagentParentToolUseIds.size).toBe(0);
+    expect(agent.sessions["test-session"]!.liveBackgroundTasks.size).toBe(0);
   });
 
   it("prunes the mapping on a terminal task_updated patch (belt and braces)", async () => {
@@ -2533,9 +2534,9 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    const map = agent.sessions["test-session"]!.subagentParentToolUseIds;
+    const map = agent.sessions["test-session"]!.liveBackgroundTasks;
     expect(map.has("agent-42")).toBe(false);
-    expect(map.get("agent-43")).toBe("toolu_parent_2");
+    expect(map.get("agent-43")?.parentToolUseId).toBe("toolu_parent_2");
   });
 });
 
@@ -3730,8 +3731,7 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -3820,8 +3820,7 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -3927,8 +3926,7 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -6396,8 +6394,7 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -8683,8 +8680,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      subagentParentToolUseIds: new Map(),
-      liveSubagentTasks: new Set(),
+      liveBackgroundTasks: new Map(),
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
     };
@@ -9952,8 +9948,7 @@ describe("agent selection config option", () => {
         taskState: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
-        subagentParentToolUseIds: new Map(),
-        liveSubagentTasks: new Set(),
+        liveBackgroundTasks: new Map(),
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
       };
