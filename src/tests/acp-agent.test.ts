@@ -8060,6 +8060,34 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   const idle = () => stateChanged("idle");
   const requiresAction = () => stateChanged("requires_action");
 
+  /** Agent whose client records top-level agent_message_chunk texts as
+   *  `chunk:<text>` in the returned events array. */
+  const chunkCapturingAgent = () => {
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async (u: any) => {
+        if (u.update?.sessionUpdate === "agent_message_chunk") {
+          events.push(`chunk:${u.update.content?.text}`);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    return { agent, events };
+  };
+
+  /** The issue-#453 cache-replay shape: zero output tokens, no streaming,
+   *  the answer only on the result text. */
+  const replayedResult = (text: string) =>
+    resultMessage({
+      result: text,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    });
+
   const backgroundTasksChanged = (taskIds: string[]) => ({
     type: "system",
     subtype: "background_tasks_changed",
@@ -8116,15 +8144,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   });
 
   it("holds the prompt open while a subagent is live and resolves at the followup's result", async () => {
-    const events: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "agent_message_chunk") {
-          events.push(`chunk:${u.update.content?.text}`);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -8618,7 +8638,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // the hold stops waiting on it.
     const record = agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1");
     expect(record?.parentToolUseId).toBe("toolu_agent-1");
-    expect(record?.endedPerLevel).toBe(true);
+    expect(record?.endedPerLevel).toBe("ended");
     releaseIdle();
     await agent.sessions["test-session"]?.consumer;
   });
@@ -8626,15 +8646,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   it("keeps holding through a peer-origin autonomous result", async () => {
     // A peer/coordinator cycle's result is not the user's; it must neither
     // settle the held turn as a hand-off nor touch the user-turn lifecycle.
-    const events: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "agent_message_chunk") {
-          events.push(`chunk:${u.update.content?.text}`);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -8679,15 +8691,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // (replayed) turn's issue-#453 result-text fallback is suppressed.
     // Asserted on the observable: the replayed turn's result text IS
     // forwarded (a flag check after turn 2's finally would pass vacuously).
-    const events: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "agent_message_chunk") {
-          events.push(`chunk:${u.update.content?.text}`);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -8707,15 +8711,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield userEcho(u2.value); // hand-off settles the held turn
         // Turn 2 is a cache-replayed turn: nothing streams, zero output
         // tokens, the answer only on the result text (issue #453's shape).
-        yield resultMessage({
-          result: "replayed answer",
-          usage: {
-            input_tokens: 10,
-            output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-          },
-        });
+        yield replayedResult("replayed answer");
         yield idle();
       }
       return messageGenerator();
@@ -8794,8 +8790,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // The first activation only ARMS the sweep — the entry survives one full
     // turn so a corrective inclusive level can still rescue a live agent's
     // attribution (deletion is irreversible).
-    expect(agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1")?.sweepArmed).toBe(
-      true,
+    expect(agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1")?.endedPerLevel).toBe(
+      "sweep-armed",
     );
 
     const third = await agent.prompt({
@@ -8805,6 +8801,48 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     expect(third.stopReason).toBe("end_turn");
     // The second activation deletes it (growth bound for lost bookends).
     expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-1")).toBe(false);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("rescues a sweep-armed entry when an inclusive level arrives mid-grace", async () => {
+    // The grace's whole point: an entry armed at one activation must be
+    // rescued — attribution intact, sweep disarmed in the same assignment —
+    // by an inclusive level before the next activation deletes it.
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield backgroundTasksChanged([]); // racing payload marks it ended
+        yield resultMessage(); // no hold (ended) — settles at the result
+        yield idle();
+        const u2 = await iter.next();
+        yield userEcho(u2.value); // activation arms the sweep
+        yield resultMessage();
+        yield backgroundTasksChanged(["agent-1"]); // mid-grace rescue
+        yield idle();
+        const u3 = await iter.next();
+        yield userEcho(u3.value); // must NOT delete the rescued entry
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    for (const text of ["one", "two", "three"]) {
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+    }
+    const record = agent.sessions["test-session"]!.liveBackgroundTasks.get("agent-1");
+    expect(record?.parentToolUseId).toBe("toolu_agent-1");
+    expect(record?.endedPerLevel).toBeUndefined();
     await agent.sessions["test-session"]?.consumer;
   });
 
@@ -8859,15 +8897,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // Autonomous prose (a wake's summary) latches the delivery flag; with no
     // turn in flight or queued, the autonomous result must close the stretch
     // or the next cache-replayed prompt's issue-#453 fallback is suppressed.
-    const events: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "agent_message_chunk") {
-          events.push(`chunk:${u.update.content?.text}`);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -8885,15 +8915,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield userEcho(u2.value);
         // Cache-replayed turn: no streaming, zero output tokens, the answer
         // only on the result text.
-        yield resultMessage({
-          result: "replayed answer",
-          usage: {
-            input_tokens: 10,
-            output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-          },
-        });
+        yield replayedResult("replayed answer");
         yield idle();
       }
       return messageGenerator();
@@ -8928,15 +8950,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // that window must NOT close the stretch — the flag guards the queued
     // turn's already-delivered answer, and clearing would re-emit it via the
     // issue-#453 fallback (the duplicate direction the flag's doc forbids).
-    const events: string[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "agent_message_chunk") {
-          events.push(`chunk:${u.update.content?.text}`);
-        }
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -8954,15 +8968,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield resultMessage({ origin: { kind: "task-notification" } });
         yield userEcho(u2.value); // now the echo activates turn 2
         // Zero-output result whose text duplicates the streamed answer.
-        yield resultMessage({
-          result: "streamed answer",
-          usage: {
-            input_tokens: 10,
-            output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-          },
-        });
+        yield replayedResult("streamed answer");
         yield idle();
         yield idle();
       }

@@ -457,35 +457,47 @@ type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
-      endedPerLevel?: boolean;
-      /** Set at the first turn activation that saw the entry ended; deleted
-       *  at the second. The one-activation grace exists for the absent-mark
-       *  race (a level payload built before a live async agent's
-       *  registration): a corrective inclusive level un-ends the entry if it
-       *  arrives within a full turn, keeping the agent's attribution —
-       *  eager deletion would be irreversible, since levels never ADD
-       *  entries. */
-      sweepArmed?: boolean;
+      /** Absent-from-level lifecycle, one field so the illegal
+       *  armed-but-not-ended state is unrepresentable: undefined = live per
+       *  the level signal; "ended" = a level omitted the task (holds stop
+       *  waiting on it; attribution is kept); "sweep-armed" = a turn
+       *  activation saw it ended — the NEXT activation deletes it. The
+       *  one-activation grace exists for the absent-mark race (a level
+       *  payload built before a live async agent's registration): a
+       *  corrective inclusive level resets the field to undefined — one
+       *  assignment, disarming any in-flight sweep — if it arrives within a
+       *  full turn, keeping the agent's attribution; eager deletion would
+       *  be irreversible, since levels never ADD entries. A re-mark
+       *  preserves an in-flight arm (`??=`), keeping a continuously absent
+       *  entry on its two-activation clock. */
+      endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
   /** Whether any top-level assistant text reached the client since the last
-   *  stretch boundary — a user-turn result (the result case's `finally`), a
-   *  turn torn down without one (failActive, the cancel settles), or a held
-   *  turn settling (every held-turn settle lane clears it: the drain settle,
-   *  both hand-offs, and cancel()'s inline settle — which is why this lives
-   *  on the Session rather than in the consumer closure). Set as a side
-   *  effect of sending in the consumer's `sendUpdate`, never at an emission
-   *  site. Read at the terminal `result` to tell a turn whose answer was
-   *  already delivered from one that only ever carried it on `result`
-   *  (issue #453). Deliberately NOT reset on turn activation: activation can
-   *  fire mid-message (see the echo hand-off), so a flag cleared there would
+   *  stretch boundary. Set as a side effect of sending in the consumer's
+   *  `sendUpdate`, never at an emission site; read at the terminal `result`
+   *  to tell a turn whose answer was already delivered from one that only
+   *  ever carried it on `result` (issue #453). Session-level (not
+   *  consumer-scoped) so cancel()'s inline settle can clear it.
+   *
+   *  The CURRENT boundary set — a new clear site must be added here: the
+   *  result case's `finally` (user-turn results), settleActive's wasHeld
+   *  clear (every held-turn settle lane: drain settle, both hand-offs,
+   *  stream-done), failActive, the force-cancel backstop, the idle
+   *  cancelled-settle, the autonomous-result close (only with no turn
+   *  active OR queued — see its queued-turn guard), and cancel()'s inline
+   *  mirror.
+   *
+   *  Deliberately NOT reset on turn activation: activation can fire
+   *  mid-message (see the echo hand-off), so a flag cleared there would
    *  forget text that already streamed and the result text would be emitted
    *  a second time. Neither the consolidated `assistant` message nor a
-   *  `stream_event` carries `origin`, so an autonomous cycle's prose (or a
-   *  compaction banner) is indistinguishable from a user turn's here and
-   *  sets the flag too: a replayed turn right behind one stays silent rather
-   *  than risk a duplicate, which is the pre-#453 behavior for that turn and
-   *  never a double emission. */
+   *  `stream_event` carries `origin`, so an autonomous cycle's prose is
+   *  indistinguishable from a user turn's here and sets the flag too; the
+   *  autonomous-result close normally ends that stretch so a replayed
+   *  prompt behind it still delivers, and only in the racing window (a
+   *  turn already active or queued when the autonomous result lands) does
+   *  the replayed turn stay silent rather than risk a duplicate. */
   emittedAssistantText: boolean;
   /** The most recent `session_state_changed` state the consumer processed.
    *  Read by cancel() to decide whether the interrupt will produce a
@@ -1590,20 +1602,26 @@ export class ClaudeAcpAgent {
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
-      // endedPerLevel / sweepArmed): armed at the first activation, deleted
-      // at the second — the same activation-time self-heal as the orphan
-      // lanes, and the growth bound for leaked entries whose settle
+      // the endedPerLevel field doc): armed at the first activation,
+      // deleted at the second — the same activation-time self-heal as the
+      // orphan lanes, and the growth bound for leaked entries whose settle
       // bookends never arrive. The one-activation grace lets a corrective
       // inclusive level rescue a live async agent that a racing payload
       // absent-marked (deletion is irreversible: levels never ADD entries).
-      for (const [taskId, record] of session.liveBackgroundTasks) {
-        if (!record.endedPerLevel) {
-          continue;
-        }
-        if (record.sweepArmed) {
-          session.liveBackgroundTasks.delete(taskId);
-        } else {
-          record.sweepArmed = true;
+      // Local-only commands don't advance the clock: two quick /context
+      // calls would otherwise burn the whole grace in seconds of wall time
+      // while the corrective level is still in flight, and they interact
+      // with no tasks — a later real turn still bounds growth.
+      if (!turn.isLocalOnlyCommand) {
+        for (const [taskId, record] of session.liveBackgroundTasks) {
+          if (!record.endedPerLevel) {
+            continue;
+          }
+          if (record.endedPerLevel === "sweep-armed") {
+            session.liveBackgroundTasks.delete(taskId);
+          } else {
+            record.endedPerLevel = "sweep-armed";
+          }
         }
       }
       resetTurnScratch();
@@ -1699,7 +1717,7 @@ export class ClaudeAcpAgent {
           return;
         }
       }
-      const head = (session.turnQueue ?? []).find((t) => !t.settled);
+      const head = firstUnsettledQueuedTurn();
       if (!head) {
         return;
       }
@@ -1736,6 +1754,11 @@ export class ClaudeAcpAgent {
     /** The unsettled in-flight turn owning this prompt uuid, if any. */
     const findUnsettledTurn = (uuid: string) =>
       (session.turnQueue ?? []).find((t) => t.promptUuid === uuid && !t.settled);
+
+    /** The first queued turn still awaiting its outcome, if any — the single
+     *  spelling of "a prompt is pending" shared by the head promotion and
+     *  the autonomous stretch-close guard. */
+    const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
@@ -2583,8 +2606,7 @@ export class ClaudeAcpAgent {
                       // a racing payload built before the task registered) —
                       // un-end it so a hold waits on it again, and disarm
                       // the activation sweep.
-                      record.endedPerLevel = false;
-                      record.sweepArmed = false;
+                      record.endedPerLevel = undefined;
                       continue;
                     }
                     if (record.isSubagent) {
@@ -2595,7 +2617,7 @@ export class ClaudeAcpAgent {
                       // stop any hold from waiting on the id: an absent id
                       // can equally be a leaked async entry whose settle
                       // bookends were lost.
-                      record.endedPerLevel = true;
+                      record.endedPerLevel ??= "ended";
                     } else {
                       session.liveBackgroundTasks.delete(taskId);
                     }
@@ -2764,10 +2786,7 @@ export class ClaudeAcpAgent {
                 // before the echo activates it (activeTurn still null), and
                 // clearing then would re-emit that answer via the fallback,
                 // the duplicate direction the flag's doc forbids.
-                if (
-                  !session.activeTurn &&
-                  !(session.turnQueue ?? []).some((turn) => !turn.settled)
-                ) {
+                if (!session.activeTurn && !firstUnsettledQueuedTurn()) {
                   session.emittedAssistantText = false;
                 }
                 break;
