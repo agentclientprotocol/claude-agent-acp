@@ -398,8 +398,8 @@ type Session = {
    *  naturally yields the turn-boundary uuid when one `msg_…` spans several
    *  content-block messages.
    *
-   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
-   *  fork/rewind. */
+   *  Read by `session/fork` when `_meta.claudeCode.rewindTo` is set — see
+   *  `resolveMessageUuid`. */
   messageIdToUuid: Map<string, string>;
 };
 
@@ -452,6 +452,22 @@ export type NewSessionMeta = {
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
   };
   additionalRoots?: string[];
+};
+
+/**
+ * Extra metadata that can be given when forking a session.
+ */
+export type ForkSessionMeta = {
+  claudeCode?: {
+    /**
+     * ACP message id (the id delivered to clients in `agent_message_chunk`
+     * updates and in replayed history) of the assistant turn to fork from.
+     * The forked session resumes from that message; turns after it are not
+     * part of the fork. Translated internally to the SDK message uuid that
+     * `resumeSessionAt` expects (see `Session.messageIdToUuid`).
+     */
+    rewindTo?: string;
+  };
 };
 
 /**
@@ -1069,6 +1085,7 @@ export class ClaudeAcpAgent {
         _meta: {
           claudeCode: {
             promptQueueing: true,
+            rewind: true,
           },
         },
         promptCapabilities: {
@@ -1117,6 +1134,11 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    const rewindTo = (params._meta as ForkSessionMeta | undefined)?.claudeCode?.rewindTo;
+    const resumeSessionAt =
+      rewindTo === undefined
+        ? undefined
+        : await this.resolveMessageUuid(params.sessionId, rewindTo);
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1127,6 +1149,7 @@ export class ClaudeAcpAgent {
       {
         resume: params.sessionId,
         forkSession: true,
+        ...(resumeSessionAt === undefined ? {} : { resumeSessionAt }),
       },
     );
     // Needs to happen after we return the session
@@ -1134,6 +1157,35 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
+  }
+
+  /** Translate the ACP messageId a client was given (see `messageIdForGrouping`)
+   *  into the SDK message uuid that `resumeSessionAt` keys on. Prefers the
+   *  in-memory map maintained by the message loop and history replay; falls
+   *  back to a `getSessionMessages` scan for sessions whose history this
+   *  process hasn't observed (e.g. forking a session straight from disk). */
+  private async resolveMessageUuid(sessionId: string, messageId: string): Promise<string> {
+    const cached = this.sessions[sessionId]?.messageIdToUuid.get(messageId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const messages = await getSessionMessages(sessionId);
+    let uuid: string | undefined;
+    for (const message of messages) {
+      // Last-write-wins mirrors how `messageIdToUuid` is populated: when one
+      // `msg_…` spans several content-block messages, keep the turn-boundary uuid.
+      const mapped = messageIdForGrouping(message);
+      if (mapped === messageId && typeof message.uuid === "string" && message.uuid.length > 0) {
+        uuid = message.uuid;
+      }
+    }
+    if (uuid === undefined) {
+      throw RequestError.invalidParams(
+        { rewindTo: messageId },
+        `No message with id \`${messageId}\` found in session \`${sessionId}\``,
+      );
+    }
+    return uuid;
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -4231,7 +4283,7 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: { resume?: string; forkSession?: boolean; resumeSessionAt?: string } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
