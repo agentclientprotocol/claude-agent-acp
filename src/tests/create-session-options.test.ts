@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
+let contextUsageResult: (() => Promise<{ rawMaxTokens: number }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -29,6 +30,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         setModel: async () => {},
         setPermissionMode: async () => {},
         supportedCommands: async () => [],
+        getContextUsage: () =>
+          contextUsageResult
+            ? contextUsageResult()
+            : Promise.reject(new Error("no context usage mocked")),
         [Symbol.asyncIterator]: async function* () {},
       };
     },
@@ -58,6 +63,7 @@ describe("createSession options merging", () => {
 
   beforeEach(async () => {
     capturedOptions = undefined;
+    contextUsageResult = undefined;
 
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
@@ -611,6 +617,39 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.disallowedTools).toContain("WebSearch");
       expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+    });
+  });
+
+  describe("context window seeding", () => {
+    function sessionFor(sessionId: string) {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
+    }
+
+    it("seeds contextWindowSize from the SDK's getContextUsage report", async () => {
+      // Aliases like `sonnet` can resolve to an extended-context model with no
+      // "1m" token anywhere in id/displayName/description, so the authoritative
+      // report must win over text inference (issue #596).
+      contextUsageResult = async () => ({ rawMaxTokens: 967000 });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000);
+    });
+
+    it("falls back to the default window when getContextUsage fails and inference misses", async () => {
+      // The default mock rejects getContextUsage, and the mock model
+      // ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") has no "1m" hint.
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+    });
+
+    it("ignores a nonsensical (non-positive) reported window", async () => {
+      contextUsageResult = async () => ({ rawMaxTokens: 0 });
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
     });
   });
 

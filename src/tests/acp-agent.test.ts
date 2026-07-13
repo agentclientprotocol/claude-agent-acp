@@ -30,6 +30,7 @@ import {
   toAcpNotifications,
   promptToClaude,
   isLocalCommandMetadata,
+  isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
@@ -42,6 +43,7 @@ import {
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
+  type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import {
@@ -59,6 +61,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     deleteSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    // Delegates to the real implementation so integration tests that read
+    // actual transcripts keep working; unit tests override per-call with
+    // `mockResolvedValueOnce`.
+    getSessionMessages: vi.fn(actual.getSessionMessages),
   };
 });
 import type {
@@ -1468,6 +1474,94 @@ describe("isLocalCommandMetadata", () => {
         { type: "text", text: "hi" },
       ]),
     ).toBe(false);
+  });
+});
+
+describe("synthetic login message (issue #863)", () => {
+  // The exact shape the CLI persists (and streams) when a turn fails auth:
+  // model "<synthetic>", a single text block, structured `error` stripped by
+  // getSessionMessages.
+  const syntheticLoginApiMessage = {
+    id: "0a1dfa6b-1c2f-4aa2-8bff-ae1690acd6e1",
+    model: "<synthetic>",
+    role: "assistant",
+    type: "message",
+    stop_reason: "stop_sequence",
+    content: [{ type: "text", text: "Not logged in · Please run /login" }],
+  };
+
+  it("isSyntheticLoginMessage matches the CLI auth-error message", () => {
+    expect(isSyntheticLoginMessage(syntheticLoginApiMessage)).toBe(true);
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        content: [{ type: "text", text: "Session expired. Please run /login to sign in again." }],
+      }),
+    ).toBe(true);
+  });
+
+  it("isSyntheticLoginMessage does not match real assistant messages", () => {
+    // Real model output that merely mentions the phrase.
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        model: "claude-sonnet-5",
+      }),
+    ).toBe(false);
+    // Other synthetic error texts (e.g. API errors) still replay as-is.
+    expect(
+      isSyntheticLoginMessage({
+        ...syntheticLoginApiMessage,
+        content: [{ type: "text", text: "API Error: 500 Internal Server Error" }],
+      }),
+    ).toBe(false);
+    expect(isSyntheticLoginMessage(undefined)).toBe(false);
+    expect(isSyntheticLoginMessage("Not logged in · Please run /login")).toBe(false);
+  });
+
+  it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "hi, say one word" }] },
+      },
+      {
+        type: "assistant",
+        uuid: "a1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: syntheticLoginApiMessage,
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    // The user's prompt still replays…
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text.includes("hi, say one word"),
+      ),
+    ).toBe(true);
+    // …but the TUI-specific "/login" instruction never reaches the client.
+    expect(JSON.stringify(updates)).not.toContain("/login");
   });
 });
 
@@ -4907,8 +5001,9 @@ describe("usage_update computation", () => {
       { type: "system", subtype: "compact_boundary", session_id: "test-session" },
     ]);
     const session = agent.sessions["test-session"];
-    // A 1M window learned earlier (e.g. from modelUsage) must survive compaction
-    // — getContextUsage's window field under-reports it, so we don't use it.
+    // A 1M window learned earlier (e.g. from modelUsage) must survive
+    // compaction — compaction frees occupancy, it doesn't change the window,
+    // so the handler must not overwrite it from this response.
     session.contextWindowSize = 1000000;
     (session.query as any).getContextUsage = vi
       .fn()
@@ -5422,6 +5517,234 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
     expect(messageChunkTexts(updates)).toEqual(["answer", "answer"]);
+  });
+
+  // A cache-replayed turn reports output_tokens: 0 and, on some CLIs, carries
+  // the answer only on the result — no deltas, no consolidated message.
+  function replayedResult(text: string) {
+    return { ...result(), result: text };
+  }
+
+  it("forwards the result text when nothing else carried it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [replayedResult("**3**"), idle]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("does not re-emit the result text after the consolidated message delivered it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      assistantMessage("msg-1", [{ type: "text", text: "**3**" }]),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("does not re-emit the result text when the echo lands mid-message", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // The echo activates the turn after the text has already streamed, and the
+    // consolidated message then dedupes to nothing. The delivery flag survives
+    // that activation, so the result must not re-emit the answer.
+    injectSessionEchoAt(agent, [
+      messageStart("msg-streamed"),
+      textDelta("**3**"),
+      "ECHO",
+      assistantMessage("msg-streamed", [{ type: "text", text: "**3**" }]),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("leaves the result text alone when the turn generated output tokens", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // output_tokens > 0 means the model produced this turn's text through the
+    // stream/assistant paths; the result is their trailing copy, not the only one.
+    injectSession(agent, [
+      { ...replayedResult("**3**"), usage: { ...ZERO_USAGE, output_tokens: 5 } },
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("does not forward the result text of a task-notification followup", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      { ...replayedResult("background output"), origin: { kind: "task-notification" } },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("does not forward the result text of a turn that only emitted status text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // `/compact` carries no echo, so it is promoted at its own result, and its
+    // status text is emitted directly rather than through the forwarding loops.
+    // That text still counts as delivered, so the result must not follow it.
+    injectSession(agent, [
+      { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+  });
+
+  // Like injectSession, but serves two prompts: each turn's echo is yielded
+  // when its prompt arrives, followed by that turn's scripted messages.
+  function injectSessionTwoTurns(agent: ClaudeAcpAgent, first: any[], second: any[]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const messages of [first, second]) {
+        const { value: userMessage, done } = await iter.next();
+        if (!done && userMessage) {
+          yield {
+            type: "user",
+            message: userMessage.message,
+            parent_tool_use_id: null,
+            uuid: userMessage.uuid,
+            session_id: "test-session",
+            isReplay: true,
+          };
+        }
+        yield* messages;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
+  it("does not re-emit the result text after an informational notice delivered it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // A hook-blocked prompt: the SDK surfaces the block reason as an
+    // informational notice and then repeats it on the result with zero output
+    // tokens. The notice is the turn's delivered text — the fallback must not
+    // emit the reason a second time.
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "hook says no",
+        level: "warning",
+        session_id: "test-session",
+      },
+      replayedResult("hook says no"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+  });
+
+  it("still forwards the result text after a turn failed without a result", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Turn A streams partial text, then the SDK goes idle without ever
+    // emitting its result (issue #825) — the turn fails, and the delivery
+    // record it leaves behind must not suppress the retry's fallback.
+    injectSessionTwoTurns(
+      agent,
+      [messageStart("msg-a"), textDelta("partial answ"), idle],
+      [replayedResult("**3**"), idle],
+    );
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] }),
+    ).rejects.toThrow();
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["partial answ", "**3**"]);
+  });
+
+  it("does not let a refusal explanation suppress the next turn's fallback", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // The refusal explanation is emitted while the refused turn's result is
+    // being handled; the stretch must still end at that result, or the next
+    // replayed turn would read the explanation as ITS delivered answer and
+    // end silently.
+    injectSessionTwoTurns(
+      agent,
+      [
+        {
+          type: "system",
+          subtype: "model_refusal_no_fallback",
+          content: "cannot help with that",
+          session_id: "test-session",
+        },
+        { ...result(), stop_reason: "refusal" },
+        idle,
+      ],
+      [replayedResult("**3**"), idle],
+    );
+
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "nope" }],
+    });
+    expect(first.stopReason).toBe("refusal");
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["cannot help with that", "**3**"]);
+  });
+
+  it("forwards the result text when the backend omits output_tokens", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // Third-party backends have been observed emitting usage token fields as
+    // null (see snapshotFromUsage), and the replay lane of issue #453 was
+    // reported from exactly such a backend — a missing count must not
+    // disable the fallback.
+    injectSession(agent, [
+      { ...replayedResult("**3**"), usage: { ...ZERO_USAGE, output_tokens: null } },
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("forwards the result text when only subagent content preceded it", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    // A subagent's image block passes the text/thinking filter but carries
+    // the parentToolUseId meta — it is tool-internal, not the turn's answer,
+    // so the replayed result must still be forwarded.
+    injectSession(agent, [
+      assistantMessage(
+        "msg-sub",
+        [{ type: "image", source: { type: "base64", data: "aGk=", media_type: "image/png" } }],
+        "tool-1",
+      ),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toContain("**3**");
   });
 });
 
@@ -8588,6 +8911,514 @@ describe("turn abandoned by the SDK (issue #825)", () => {
 });
 
 describe("streamEventToAcpNotifications", () => {
+  it("refines a tool call as soon as a streamed input field is complete", () => {
+    const toolUseCache = {};
+    const emittedToolCalls = new Set<string>();
+    const streamedToolInputs: StreamedToolInputCache = new Map();
+    const options = {
+      cwd: "/Users/test/project",
+      emittedToolCalls,
+      streamedToolInputs,
+    };
+    const baseMessage = {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+
+    const start = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_read",
+            name: "Read",
+            input: {},
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(start).toHaveLength(1);
+    expect(start[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_read",
+      title: "Read File",
+      locations: [],
+    });
+
+    const partial = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"file_' },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    expect(partial).toEqual([]);
+
+    const pathAvailable = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: {
+            type: "input_json_delta",
+            partial_json: 'path":"/Users/test/project/src/ZodiacList.tsx","offset":',
+          },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    // The overall JSON is still invalid, but file_path is complete and already
+    // makes this pending read distinguishable from other tool calls.
+    expect(pathAvailable).toHaveLength(1);
+    expect(pathAvailable[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_read",
+      title: "Read src/ZodiacList.tsx",
+      rawInput: { file_path: "/Users/test/project/src/ZodiacList.tsx" },
+      locations: [{ path: "/Users/test/project/src/ZodiacList.tsx", line: 1 }],
+    });
+    expect(streamedToolInputs.size).toBe(1);
+
+    const completed = streamEventToAcpNotifications(
+      {
+        ...baseMessage,
+        event: {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: "10}" },
+        },
+      } as Parameters<typeof streamEventToAcpNotifications>[0],
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      options,
+    );
+
+    // Completion emits nothing: the consolidated assistant message replays the
+    // block with its full input and refines the call there — emitting here too
+    // would send a duplicate identical update. The entry is just cleaned up.
+    expect(completed).toEqual([]);
+    expect(streamedToolInputs.size).toBe(0);
+  });
+
+  describe("partial tool input coverage", () => {
+    function refineFromPartialInput({
+      name,
+      partialJson,
+      type = "tool_use",
+    }: {
+      name: string;
+      partialJson: string;
+      type?: "tool_use" | "server_tool_use" | "mcp_tool_use";
+    }) {
+      const toolUseCache = {};
+      const emittedToolCalls = new Set<string>();
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = {
+        cwd: "/Users/test/project",
+        emittedToolCalls,
+        streamedToolInputs,
+      };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+
+      const started = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type, id: "toolu_partial", name, input: {} },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+      const refined = streamEventToAcpNotifications(
+        {
+          ...baseMessage,
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: partialJson },
+          },
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+
+      return { started, refined, streamedToolInputs };
+    }
+
+    it.each([
+      {
+        case: "Agent description",
+        name: "Agent",
+        partialJson: '{"description":"Investigate issue","prompt":',
+        title: "Investigate issue",
+        rawInput: { description: "Investigate issue" },
+      },
+      {
+        case: "legacy Task description",
+        name: "Task",
+        partialJson: '{"description":"Research dependencies","prompt":',
+        title: "Research dependencies",
+        rawInput: { description: "Research dependencies" },
+      },
+      {
+        case: "Bash command with comma and escaped quotes",
+        name: "Bash",
+        partialJson: `{"command":${JSON.stringify('sleep 900, then echo "done"')},"timeout":`,
+        title: 'sleep 900, then echo "done"',
+        rawInput: { command: 'sleep 900, then echo "done"' },
+      },
+      {
+        case: "Read file path",
+        name: "Read",
+        partialJson: '{"file_path":"/Users/test/project/src/read.ts","offset":',
+        title: "Read src/read.ts",
+        rawInput: { file_path: "/Users/test/project/src/read.ts" },
+      },
+      {
+        case: "Write file path",
+        name: "Write",
+        partialJson: '{"file_path":"/Users/test/project/src/write.ts","content":',
+        title: "Write src/write.ts",
+        rawInput: { file_path: "/Users/test/project/src/write.ts" },
+      },
+      {
+        case: "Edit file path",
+        name: "Edit",
+        partialJson: '{"file_path":"/Users/test/project/src/edit.ts","old_string":',
+        title: "Edit src/edit.ts",
+        rawInput: { file_path: "/Users/test/project/src/edit.ts" },
+      },
+      {
+        case: "Glob pattern",
+        name: "Glob",
+        partialJson: '{"pattern":"**/*.ts","path":',
+        title: "Find `**/*.ts`",
+        rawInput: { pattern: "**/*.ts" },
+      },
+      {
+        case: "Grep strings, booleans, and numbers",
+        name: "Grep",
+        partialJson:
+          '{"pattern":"TODO, FIXME","-i":true,"-n":true,"-A":2,"-B":1,"-C":3,"output_mode":"files_with_matches","head_limit":10,"glob":"*.ts","type":"ts","multiline":true,"path":',
+        title:
+          'grep -i -n -A 2 -B 1 -C 3 -l | head -10 --include="*.ts" --type=ts -P "TODO, FIXME"',
+        rawInput: {
+          pattern: "TODO, FIXME",
+          "-i": true,
+          "-n": true,
+          "-A": 2,
+          "-B": 1,
+          "-C": 3,
+          output_mode: "files_with_matches",
+          head_limit: 10,
+          glob: "*.ts",
+          type: "ts",
+          multiline: true,
+        },
+      },
+      {
+        case: "WebFetch URL",
+        name: "WebFetch",
+        partialJson: '{"url":"https://example.com/docs","prompt":',
+        title: "Fetch https://example.com/docs",
+        rawInput: { url: "https://example.com/docs" },
+      },
+      {
+        case: "WebSearch query and domain array",
+        name: "WebSearch",
+        type: "server_tool_use" as const,
+        partialJson:
+          '{"query":"ACP tools","allowed_domains":["agentclientprotocol.com","github.com"],"blocked_domains":',
+        title: '"ACP tools" (allowed: agentclientprotocol.com, github.com)',
+        rawInput: {
+          query: "ACP tools",
+          allowed_domains: ["agentclientprotocol.com", "github.com"],
+        },
+      },
+      {
+        case: "ReportFindings nested array and object",
+        name: "ReportFindings",
+        partialJson:
+          '{"findings":[{"file":"src/a.ts","line":7,"summary":"Broken","failure_scenario":"Fails"}],"level":',
+        title: "Report 1 finding",
+        rawInput: {
+          findings: [
+            {
+              file: "src/a.ts",
+              line: 7,
+              summary: "Broken",
+              failure_scenario: "Fails",
+            },
+          ],
+        },
+      },
+      {
+        case: "generic Other tool",
+        name: "Other",
+        partialJson: '{"query":"custom query","options":',
+        title: "Other",
+        rawInput: { query: "custom query" },
+      },
+      {
+        case: "custom MCP tool",
+        name: "mcp__demo__search",
+        type: "mcp_tool_use" as const,
+        partialJson: '{"query":"custom MCP query","options":',
+        title: "mcp__demo__search",
+        rawInput: { query: "custom MCP query" },
+      },
+    ])("refines $case before the full JSON object completes", (testCase) => {
+      const { refined, streamedToolInputs } = refineFromPartialInput(testCase);
+
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_partial",
+        title: testCase.title,
+        rawInput: testCase.rawInput,
+      });
+      // Refinements never carry `content`: content built from partial input is
+      // misleading (an Edit missing new_string renders as a deletion) or
+      // invalid (a Write diff without content lacks the required newText).
+      expect(refined[0].update).not.toHaveProperty("content");
+      expect(streamedToolInputs.size).toBe(1);
+    });
+
+    it.each([
+      {
+        case: "ExitPlanMode plan",
+        name: "ExitPlanMode",
+        partialJson: '{"plan":"Implement streamed input"',
+      },
+      {
+        case: "AskUserQuestion questions",
+        name: "AskUserQuestion",
+        partialJson:
+          '{"questions":[{"question":"Which mode?","header":"Mode","options":[{"label":"Fast","description":"Fast mode"},{"label":"Safe","description":"Safe mode"}],"multiSelect":false}]',
+      },
+    ])(
+      "waits for the consolidated message when $case is the only field",
+      ({ name, partialJson }) => {
+        // A single-field input has no top-level comma, so its one field only
+        // completes when the whole object does — at which point the
+        // consolidated assistant message refines the call. No early update.
+        const { refined, streamedToolInputs } = refineFromPartialInput({ name, partialJson });
+        expect(refined).toEqual([]);
+        expect(streamedToolInputs.size).toBe(1);
+      },
+    );
+
+    it("keeps streamed TodoWrite input out of the tool feed", () => {
+      // TodoWrite surfaces as `plan` snapshots, not tool_calls; the snapshot is
+      // emitted from the consolidated assistant message once the todos array is
+      // complete, so the streamed lane stays silent.
+      const { started, refined } = refineFromPartialInput({
+        name: "TodoWrite",
+        partialJson:
+          '{"todos":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]',
+      });
+
+      expect(started).toEqual([]);
+      expect(refined).toEqual([]);
+    });
+
+    it.each([
+      {
+        name: "TaskCreate",
+        partialJson: '{"subject":"Create tests","description":',
+      },
+      {
+        name: "TaskUpdate",
+        partialJson: '{"taskId":"1","subject":"Update tests","status":',
+      },
+      { name: "TaskList", partialJson: "{}" },
+      { name: "TaskGet", partialJson: '{"taskId":"1"}' },
+    ])("keeps deliberately suppressed $name calls out of the tool feed", (testCase) => {
+      const { started, refined } = refineFromPartialInput(testCase);
+      expect(started).toEqual([]);
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an unfinished string", () => {
+      const { refined } = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"command":"sleep 900',
+      });
+      expect(refined).toEqual([]);
+    });
+
+    it("does not publish an ambiguous number until its delimiter arrives", () => {
+      const first = refineFromPartialInput({ name: "Bash", partialJson: '{"timeout":10' });
+      expect(first.refined).toEqual([]);
+
+      const delimited = refineFromPartialInput({
+        name: "Bash",
+        partialJson: '{"timeout":100,"command":',
+      });
+      expect(delimited.refined).toHaveLength(1);
+      expect(delimited.refined[0].update).toMatchObject({ rawInput: { timeout: 100 } });
+    });
+
+    it.each([
+      {
+        label: "boolean",
+        partialJson: '{"run_in_background":true,"command":',
+        rawInput: { run_in_background: true },
+      },
+      { label: "null", partialJson: '{"optional":null,"command":', rawInput: { optional: null } },
+      {
+        label: "array",
+        partialJson: '{"items":[1,"two",false],"command":',
+        rawInput: { items: [1, "two", false] },
+      },
+      {
+        label: "nested object",
+        partialJson: '{"options":{"limit":5,"enabled":true},"command":',
+        rawInput: { options: { limit: 5, enabled: true } },
+      },
+    ])("recovers a completed $label value at a field boundary", ({ partialJson, rawInput }) => {
+      const { refined } = refineFromPartialInput({ name: "CustomTool", partialJson });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({ sessionUpdate: "tool_call_update", rawInput });
+    });
+
+    it("survives a ping keep-alive arriving mid-stream", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_ping", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"sleep 900"' },
+      });
+      // The API interleaves ping keep-alives during long generation pauses —
+      // exactly when a large input is streaming. It must not disturb the
+      // in-flight buffer.
+      expect(send({ type: "ping" })).toEqual([]);
+      expect(streamedToolInputs.size).toBe(1);
+
+      const refined = send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: ',"timeout":' },
+      });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_ping",
+        rawInput: { command: "sleep 900" },
+      });
+    });
+
+    it("drops the buffered input at content_block_stop and message boundaries", () => {
+      const toolUseCache = {};
+      const streamedToolInputs: StreamedToolInputCache = new Map();
+      const options = { emittedToolCalls: new Set<string>(), streamedToolInputs };
+      const baseMessage = {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const send = (event: unknown) =>
+        streamEventToAcpNotifications(
+          { ...baseMessage, event } as Parameters<typeof streamEventToAcpNotifications>[0],
+          "test-session",
+          toolUseCache,
+          {} as AcpClient,
+          console,
+          options,
+        );
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stop", name: "Bash", input: {} },
+      });
+      send({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: '{"command":"tr' },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      send({ type: "content_block_stop", index: 0 });
+      expect(streamedToolInputs.size).toBe(0);
+
+      send({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_stale", name: "Bash", input: {} },
+      });
+      expect(streamedToolInputs.size).toBe(1);
+      // A new message on the lane clears anything a cut-short stream left.
+      send({ type: "message_start", message: {} });
+      expect(streamedToolInputs.size).toBe(0);
+    });
+  });
+
   it("treats `ping` keep-alive events as no-ops without logging to stderr", () => {
     const errors: unknown[][] = [];
     const logger = {

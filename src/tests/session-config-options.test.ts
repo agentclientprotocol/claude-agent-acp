@@ -927,6 +927,75 @@ describe("session config options", () => {
     });
   });
 
+  describe("context window on model change", () => {
+    beforeEach(() => {
+      populateSession();
+    });
+
+    function getSession() {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+    }
+
+    it("refreshes contextWindowSize from getContextUsage when the model changes", async () => {
+      const session = getSession();
+      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(session.query.getContextUsage).toHaveBeenCalled();
+      expect(session.contextWindowSize).toBe(967000);
+    });
+
+    it("falls back to resolvedModel text inference when getContextUsage fails", async () => {
+      const session = getSession();
+      session.query.getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+      session.modelInfos = session.modelInfos.map((m: ModelInfo) =>
+        m.value === "claude-sonnet-4-6" ? { ...m, resolvedModel: "claude-sonnet-5[1m]" } : m,
+      );
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(session.contextWindowSize).toBe(1_000_000);
+    });
+
+    it("falls back to the default window when the SDK and inference both miss", async () => {
+      const session = getSession();
+      session.contextWindowSize = 1_000_000;
+      session.query.getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(session.contextWindowSize).toBe(200000);
+    });
+
+    it("keeps the learned window when re-asserting the current model", async () => {
+      const session = getSession();
+      session.contextWindowSize = 1_000_000;
+      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+
+      expect(session.query.getContextUsage).not.toHaveBeenCalled();
+      expect(session.contextWindowSize).toBe(1_000_000);
+    });
+  });
+
   describe("auto mode availability per model", () => {
     /**
      * Augment the session populated by `populateSession()` with a Haiku entry
