@@ -515,9 +515,63 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
  * matching rather than mangle the report.
  */
 function stripAgentTrailer(text: string): string {
-  return text
-    .replace(/\n?<usage>[\s\S]*?<\/usage>\s*$/, "")
-    .replace(/\n?agentId: [\w-]+ \([^)]*\)\s*$/, "");
+  return stripTrailingAgentId(stripTrailingUsage(text));
+}
+
+/** Remove a terminal `<usage>` block with a bounded number of linear scans. */
+function stripTrailingUsage(text: string): string {
+  const trimmedEnd = text.trimEnd();
+  const closingTag = "</usage>";
+  if (!trimmedEnd.endsWith(closingTag)) {
+    return text;
+  }
+
+  const openingTagIndex = trimmedEnd.lastIndexOf("<usage>", trimmedEnd.length - closingTag.length);
+  if (openingTagIndex === -1) {
+    return text;
+  }
+
+  const trailerStart =
+    openingTagIndex > 0 && text[openingTagIndex - 1] === "\n"
+      ? openingTagIndex - 1
+      : openingTagIndex;
+  return text.slice(0, trailerStart);
+}
+
+/** Remove a terminal `agentId: … (…)` continuation line with linear parsing. */
+function stripTrailingAgentId(text: string): string {
+  const trimmedEnd = text.trimEnd();
+  const prefix = "agentId: ";
+  const trailerStart = trimmedEnd.lastIndexOf(prefix);
+  if (trailerStart === -1) {
+    return text;
+  }
+
+  let cursor = trailerStart + prefix.length;
+  const idStart = cursor;
+  while (
+    cursor < trimmedEnd.length &&
+    ((trimmedEnd[cursor] >= "a" && trimmedEnd[cursor] <= "z") ||
+      (trimmedEnd[cursor] >= "A" && trimmedEnd[cursor] <= "Z") ||
+      (trimmedEnd[cursor] >= "0" && trimmedEnd[cursor] <= "9") ||
+      trimmedEnd[cursor] === "_" ||
+      trimmedEnd[cursor] === "-")
+  ) {
+    cursor += 1;
+  }
+  if (cursor === idStart || trimmedEnd.slice(cursor, cursor + 2) !== " (") {
+    return text;
+  }
+
+  const messageStart = cursor + 2;
+  const closingParen = trimmedEnd.indexOf(")", messageStart);
+  if (closingParen !== trimmedEnd.length - 1) {
+    return text;
+  }
+
+  const start =
+    trailerStart > 0 && text[trailerStart - 1] === "\n" ? trailerStart - 1 : trailerStart;
+  return text.slice(0, start);
 }
 
 /** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain

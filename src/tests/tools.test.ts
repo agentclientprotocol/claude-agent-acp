@@ -2275,6 +2275,28 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     ]);
   });
 
+  it("leaves malformed trailers alone", () => {
+    // Incomplete trailers are ordinary report text, not metadata to strip.
+    const malformedResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "Report.\n<usage>missing closing tag" },
+        { type: "text", text: "Report.\nagentId: abc-123 (missing closing paren" },
+      ],
+    };
+
+    const update = toolUpdateFromToolResult(malformedResult, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Report.\n<usage>missing closing tag" } },
+      {
+        type: "content",
+        content: { type: "text", text: "Report.\nagentId: abc-123 (missing closing paren" },
+      },
+    ]);
+  });
+
   it("falls back (trailer-stripped) when tool_use_result is the async_launched variant", () => {
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
       status: "async_launched",
