@@ -517,7 +517,7 @@ describe("tool conversions", () => {
 
     expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
       kind: "execute",
-      title: "rm README.md.rm",
+      title: "Delete README.md.rm file",
       content: [
         {
           content: {
@@ -527,6 +527,22 @@ describe("tool conversions", () => {
           type: "content",
         },
       ],
+    });
+  });
+
+  it("should use the Bash command as the title when no description is provided", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_01VtsS2mxUFwpBJZYd7BmbC9",
+      name: "Bash",
+      input: {
+        command: "git diff",
+      },
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toMatchObject({
+      kind: "execute",
+      title: "git diff",
     });
   });
 
@@ -1801,7 +1817,7 @@ describe("permission requests", () => {
           name: "Bash",
           input: { command: "ls -la", description: "List files" },
         },
-        expectedTitlePart: "ls -la",
+        expectedTitlePart: "List files",
       },
       {
         toolUse: {
@@ -10306,6 +10322,13 @@ describe("streamEventToAcpNotifications", () => {
         partialJson: '{"description":"Research dependencies","prompt":',
         title: "Research dependencies",
         rawInput: { description: "Research dependencies" },
+      },
+      {
+        case: "Bash description",
+        name: "Bash",
+        partialJson: '{"command":"git diff","description":"Show current diff","timeout":',
+        title: "Show current diff",
+        rawInput: { command: "git diff", description: "Show current diff" },
       },
       {
         case: "Bash command with comma and escaped quotes",
