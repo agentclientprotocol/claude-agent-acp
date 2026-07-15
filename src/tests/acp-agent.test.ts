@@ -156,6 +156,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     currentAgent: "default",
     abortController: new AbortController(),
     emitRawSDKMessages: false,
+    forwardSubagentText: false,
     contextWindowSize: 200000,
     contextWindowAuthoritative: false,
     providerCacheKey: "default",
@@ -589,6 +590,58 @@ describe("tool conversions", () => {
           type: "content",
         },
       ],
+    });
+  });
+
+  it("marks Agent and legacy Task tool calls as subagent launches", () => {
+    for (const name of ["Agent", "Task"]) {
+      const notifications = toAcpNotifications(
+        [
+          {
+            type: "tool_use",
+            id: `toolu_${name}`,
+            name,
+            input: { description: "Explore", prompt: "Inspect the project" },
+          },
+        ] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        console,
+      );
+
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        _meta: { claudeCode: { toolName: name, subagent: true } },
+      });
+    }
+
+    const nestedAgent = toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "nested-agent",
+          name: "Agent",
+          input: { description: "Review tests", prompt: "Inspect tests" },
+        },
+      ] as any,
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      console,
+      { parentToolUseId: "outer-agent" },
+    );
+    expect(nestedAgent[0]?.update).toMatchObject({
+      sessionUpdate: "tool_call",
+      _meta: {
+        claudeCode: {
+          toolName: "Agent",
+          subagent: true,
+          parentToolUseId: "outer-agent",
+        },
+      },
     });
   });
 
@@ -1584,6 +1637,90 @@ describe("synthetic login message (issue #863)", () => {
   });
 });
 
+describe("subagent transcript replay", () => {
+  const replayHistory = [
+    {
+      type: "assistant",
+      uuid: "subagent-message",
+      session_id: "s1",
+      parent_tool_use_id: "parent-agent-call",
+      parent_agent_id: "agent-1",
+      message: {
+        id: "api-subagent-message",
+        model: "claude-sonnet-4-5",
+        role: "assistant",
+        type: "message",
+        stop_reason: "tool_use",
+        content: [
+          { type: "text", text: "nested report" },
+          { type: "tool_use", id: "child-tool", name: "Bash", input: { command: "pwd" } },
+        ],
+      },
+    },
+  ] as Awaited<ReturnType<typeof getSessionMessages>>;
+
+  async function replay(capable: boolean): Promise<SessionNotification[]> {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    (agent as any).clientCapabilities = capable ? { _meta: { "subagent-transcript": true } } : {};
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return updates;
+  }
+
+  it("preserves nested text and child tool attribution for capable clients", async () => {
+    const updates = await replay(true);
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "nested report" },
+            _meta: expect.objectContaining({
+              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool",
+            _meta: expect.objectContaining({
+              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
+            }),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps legacy text filtering without losing child tool attribution", async () => {
+    const updates = await replay(false);
+    expect(updates.some(({ update }) => update.sessionUpdate === "agent_message_chunk")).toBe(
+      false,
+    );
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool",
+            _meta: expect.objectContaining({
+              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
+            }),
+          }),
+        }),
+      ]),
+    );
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
@@ -1964,6 +2101,7 @@ describe("permission request cancellation", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -3814,6 +3952,7 @@ describe("session/close", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -3906,6 +4045,7 @@ describe("session/delete", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -4015,6 +4155,7 @@ describe("getOrCreateSession param change detection", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -5932,6 +6073,39 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual([]);
   });
 
+  it("forwards subagent text and thinking as nested chunks for capable clients", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    injectSession(agent, [
+      assistantMessage(
+        "msg-subagent",
+        [
+          { type: "thinking", thinking: "checking" },
+          { type: "text", text: "nested report" },
+        ],
+        "tool_use_1",
+      ),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const nestedUpdates = updates.filter(
+      ({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" ||
+        update.sessionUpdate === "agent_thought_chunk",
+    );
+    expect(nestedUpdates).toHaveLength(2);
+    for (const { update } of nestedUpdates) {
+      expect(update._meta).toMatchObject({
+        claudeCode: { parentToolUseId: "tool_use_1" },
+      });
+    }
+    expect(messageChunkTexts(updates)).toContain("nested report");
+    expect(thoughtChunkTexts(updates)).toContain("checking");
+  });
+
   it("forwards distinct blocks that a gateway splits across same-id messages", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Observed with OpenAI-compatible gateways: one response id split into an
@@ -6839,6 +7013,7 @@ describe("post-error recovery", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -9750,6 +9925,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
+      forwardSubagentText: false,
       contextWindowSize: 200000,
       contextWindowAuthoritative: false,
       providerCacheKey: "default",
@@ -11034,6 +11210,7 @@ describe("agent selection config option", () => {
         fastModeEnabled: false,
         abortController: new AbortController(),
         emitRawSDKMessages: false,
+        forwardSubagentText: false,
         contextWindowSize: 200000,
         contextWindowAuthoritative: false,
         providerCacheKey: "default",

@@ -12,11 +12,23 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Following
 - Edit review
 - TODO lists
+- Nested subagent transcripts
 - Interactive (and background) terminals
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+
+### Nested subagent transcripts
+
+ACP 1.2 has no standard subagent tool kind or nested-message relationship. Clients that can render
+nested transcripts can opt in with `clientCapabilities._meta["subagent-transcript"] = true`.
+The agent then forwards subagent text, thinking, and tool calls, relating nested updates to the
+launching Agent/Task call through `_meta.claudeCode.parentToolUseId`. Agent/Task calls are marked
+with `_meta.claudeCode.subagent = true`.
+
+Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
+the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
 
 ## Contribution Policy
 

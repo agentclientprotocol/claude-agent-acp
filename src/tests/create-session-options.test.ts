@@ -263,6 +263,38 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.tools).toEqual([]);
   });
 
+  describe("subagent transcript forwarding", () => {
+    it("keeps the legacy default when neither the client nor caller opts in", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.forwardSubagentText).toBe(false);
+    });
+
+    it("preserves the pre-existing caller-provided SDK option", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { forwardSubagentText: true } } },
+      });
+
+      expect(capturedOptions!.forwardSubagentText).toBe(true);
+    });
+
+    it("enables SDK forwarding when the ACP client advertises support", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { _meta: { "subagent-transcript": true } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { forwardSubagentText: false } } },
+      });
+
+      expect(capturedOptions!.forwardSubagentText).toBe(true);
+    });
+  });
+
   describe("systemPrompt via _meta", () => {
     it("defaults to the claude_code preset when not provided", async () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
