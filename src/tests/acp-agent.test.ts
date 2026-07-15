@@ -517,7 +517,7 @@ describe("tool conversions", () => {
 
     expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
       kind: "execute",
-      title: "Delete README.md.rm file",
+      title: "rm README.md.rm",
       content: [
         {
           content: {
@@ -1817,7 +1817,7 @@ describe("permission requests", () => {
           name: "Bash",
           input: { command: "ls -la", description: "List files" },
         },
-        expectedTitlePart: "List files",
+        expectedTitlePart: "ls -la",
       },
       {
         toolUse: {
@@ -2062,11 +2062,15 @@ describe("tool_call emitted before permission request", () => {
   it("emits the tool_call (then asks permission) when the stream hasn't yet", async () => {
     const { agent, events, updates, session } = setup();
 
-    const result = await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
-      signal: new AbortController().signal,
-      suggestions: [],
-      toolUseID: "tool-1",
-    } as any);
+    const result = await agent.canUseTool("session-1")(
+      "Bash",
+      { command: "git diff", description: "Show current diff" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any,
+    );
 
     // tool_call is sent before the permission request is raised.
     expect(events).toEqual(["update:tool_call", "permission"]);
@@ -2074,6 +2078,10 @@ describe("tool_call emitted before permission request", () => {
       sessionUpdate: "tool_call",
       toolCallId: "tool-1",
       status: "pending",
+      title: "git diff",
+      _meta: {
+        claudeCode: { toolName: "Bash", title: "Show current diff" },
+      },
     });
     expect(session.emittedToolCalls.has("tool-1")).toBe(true);
     expect(result).toMatchObject({ behavior: "allow" });
@@ -10327,7 +10335,8 @@ describe("streamEventToAcpNotifications", () => {
         case: "Bash description",
         name: "Bash",
         partialJson: '{"command":"git diff","description":"Show current diff","timeout":',
-        title: "Show current diff",
+        title: "git diff",
+        metaTitle: "Show current diff",
         rawInput: { command: "git diff", description: "Show current diff" },
       },
       {
@@ -10447,6 +10456,11 @@ describe("streamEventToAcpNotifications", () => {
         title: testCase.title,
         rawInput: testCase.rawInput,
       });
+      if ("metaTitle" in testCase) {
+        expect(refined[0].update._meta).toMatchObject({
+          claudeCode: { title: testCase.metaTitle },
+        });
+      }
       // Refinements never carry `content`: content built from partial input is
       // misleading (an Edit missing new_string renders as a deletion) or
       // invalid (a Write diff without content lacks the required newText).

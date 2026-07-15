@@ -798,6 +798,8 @@ export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
+    /* A human-readable title supplied by Claude Code for the tool call. */
+    title?: string;
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
@@ -6714,6 +6716,28 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
+ *  are kept out of ACP's standard `title`, which clients may use as the shell
+ *  command preview, while still giving clients access to Claude's concise
+ *  human-readable title. */
+function claudeCodeMetaFromToolUse(toolUse: {
+  name: string;
+  input?: unknown;
+}): NonNullable<ToolUpdateMeta["claudeCode"]> {
+  const description =
+    toolUse.name === "Bash" &&
+    toolUse.input !== null &&
+    typeof toolUse.input === "object" &&
+    "description" in toolUse.input &&
+    typeof toolUse.input.description === "string"
+      ? toolUse.input.description
+      : undefined;
+  return {
+    toolName: toolUse.name,
+    ...(description ? { title: description } : {}),
+  };
+}
+
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
@@ -6730,7 +6754,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse) } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -6739,7 +6763,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: { toolName: toolUse.name },
+      claudeCode: claudeCodeMetaFromToolUse(toolUse),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -6774,7 +6798,9 @@ function streamedInputRefinement(
     cwd,
   );
   return {
-    _meta: { claudeCode: { toolName: toolUse.name } } satisfies ToolUpdateMeta,
+    _meta: {
+      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }),
+    } satisfies ToolUpdateMeta,
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call_update",
     rawInput: input,
