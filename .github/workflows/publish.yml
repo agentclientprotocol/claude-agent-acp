@@ -53,3 +53,28 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm publish
+
+  trigger-registry-update:
+    needs: publish-npm
+    runs-on: ubuntu-latest
+    environment: release
+    permissions: {}
+    steps:
+      - name: Generate token scoped to the registry repo
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        id: registry-token
+        with:
+          app-id: ${{ secrets.REGISTRY_UPDATER_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_UPDATER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: registry
+
+      - name: Dispatch registry version update
+        env:
+          GH_TOKEN: ${{ steps.registry-token.outputs.token }}
+        run: |
+          gh workflow run update-versions.yml \
+            --repo ${{ github.repository_owner }}/registry \
+            --ref main \
+            -f apply=true \
+            -f agents=claude-acp
