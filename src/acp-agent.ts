@@ -391,6 +391,11 @@ type Session = {
    *  cancel. */
   forceCancelTimer?: ReturnType<typeof setTimeout>;
   emitRawSDKMessages: boolean | SDKMessageFilter[];
+  /** When true, subagent (`parent_tool_use_id !== null`) text and thinking
+   *  blocks are forwarded to the client instead of being dropped, so consumers
+   *  can render a nested subagent transcript. Opt-in (default false) to preserve
+   *  the upstream behavior of keeping subagent prose out of the top-level feed. */
+  forwardSubagentText?: boolean;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded from the SDK's
@@ -3459,11 +3464,15 @@ export class ClaudeAcpAgent {
             } else if (message.type === "assistant") {
               // Subagent assistant message (`parent_tool_use_id !== null`). It is
               // never streamed live and its text/thinking is internal to the tool
-              // call — keep dropping it so subagent prose doesn't leak into the
-              // top-level feed.
-              content = message.message.content.filter(
-                (item) => item.type !== "text" && item.type !== "thinking",
-              );
+              // call. By default we keep dropping it so subagent prose doesn't leak
+              // into the top-level feed; when the client opted in via
+              // `forwardSubagentText`, forward the full content so it can render a
+              // nested subagent transcript.
+              content = session.forwardSubagentText
+                ? message.message.content
+                : message.message.content.filter(
+                    (item) => item.type !== "text" && item.type !== "thinking",
+                  );
             } else {
               content = message.message.content;
             }
@@ -5354,6 +5363,8 @@ export class ClaudeAcpAgent {
       fastModeEnabled,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
+      forwardSubagentText:
+        sessionMeta?.claudeCode?.options?.forwardSubagentText ?? false,
       contextWindowSize,
       taskState,
       toolUseCache: {},
