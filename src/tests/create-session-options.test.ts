@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
-let contextUsageResult: (() => Promise<{ rawMaxTokens: number }>) | undefined;
+let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -646,6 +646,80 @@ describe("createSession options merging", () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
+    });
+
+    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
+      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
+      // it to restore the live model), and the same response carries the
+      // authoritative window (`rawMaxTokens`). After a process restart the
+      // module cache is empty and text inference misses natively-1M aliases, so
+      // discarding this in-hand value would replay the issue-#596 flicker on
+      // every reload — the flagship scenario. 888_000 can only come from the
+      // report: inference on the mock model yields null → 200_000 default.
+      contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
+
+      await (
+        agent as unknown as {
+          createSession: (params: object, opts: { resume?: string }) => Promise<unknown>;
+        }
+      ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
+
+      const session = sessionFor("resumed-window-probe");
+      expect(session.contextWindowSize).toBe(888_000);
+      expect(session.contextWindowAuthoritative).toBe(true);
+    });
+
+    it("scopes providerCacheKey by per-session env routing", async () => {
+      // The context-window cache key must distinguish backends exactly as the
+      // CLI will see them: a session routed to a proxy via _meta env shares a
+      // model id spelling with default-routed sessions but not a context lane,
+      // so it must land in its own cache bucket (and two default-routed
+      // sessions must share one).
+      const r1 = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const r2 = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: { env: { ANTHROPIC_BASE_URL: "https://window-probe-proxy.example" } },
+          },
+        },
+      });
+      const r3 = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(r2.sessionId).providerCacheKey).not.toBe(
+        sessionFor(r1.sessionId).providerCacheKey,
+      );
+      expect(sessionFor(r3.sessionId).providerCacheKey).toBe(
+        sessionFor(r1.sessionId).providerCacheKey,
+      );
+    });
+
+    it("scopes providerCacheKey by provider headers: same endpoint, different headers → different buckets", async () => {
+      // Two providers/set configs sharing apiType+baseUrl but differing in
+      // headers (e.g. an `anthropic-beta: context-1m-…` routing header) can
+      // serve different context lanes for the same model id, so they must not
+      // share a window-cache bucket.
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: {},
+      });
+      const plain = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.unstable_setProvider({
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gw.example",
+        headers: { "anthropic-beta": "context-1m-2025-08-07" },
+      });
+      const beta = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(sessionFor(beta.sessionId).providerCacheKey).not.toBe(
+        sessionFor(plain.sessionId).providerCacheKey,
+      );
     });
   });
 

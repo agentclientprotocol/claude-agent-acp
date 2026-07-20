@@ -157,6 +157,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     contextWindowSize: 200000,
+    contextWindowAuthoritative: false,
     providerCacheKey: "default",
     taskState: new Map(),
     toolUseCache: {},
@@ -1948,6 +1949,8 @@ describe("permission request cancellation", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -3731,6 +3734,8 @@ describe("session/close", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -3821,6 +3826,8 @@ describe("session/delete", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -3928,6 +3935,8 @@ describe("getOrCreateSession param change detection", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -5274,6 +5283,130 @@ describe("usage_update computation", () => {
       value: "alias",
     });
     expect(session.contextWindowSize).toBe(1_000_000);
+  });
+
+  it("does not let the message_start heuristic clobber an authoritative 200k window", async () => {
+    // An authoritative window can legitimately equal DEFAULT_CONTEXT_WINDOW
+    // (e.g. a third-party backend serving a 200k lane under a "[1m]"-spelled
+    // id). The message_start upgrade must key off the authoritative flag, not
+    // the value — otherwise the "1m" text match overwrites the cache-seeded
+    // 200k with 1M mid-stream on every turn.
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-authprobe-1[1m]",
+        usage: {
+          input_tokens: 100,
+          output_tokens: 10,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      // Empty modelUsage: the result settles the turn without supplying a
+      // window of its own, so the assertion isolates the message_start path.
+      createResultMessageWithModel({ modelUsage: {} }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"]!;
+    // Simulate a cache-seeded authoritative window that equals the default.
+    session.contextWindowSize = 200000;
+    session.contextWindowAuthoritative = true;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(session.contextWindowSize).toBe(200000);
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    for (const u of usageUpdates) {
+      expect(u.update.size).toBe(200000);
+    }
+  });
+
+  it("still upgrades a heuristic default window from the message_start model id", async () => {
+    // Companion to the authoritative-200k test: with no authoritative seed the
+    // old behavior stands — a "1m"-carrying live model id upgrades the default
+    // mid-stream so usage_update reports the right size before the result.
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-authprobe-2[1m]",
+        usage: {
+          input_tokens: 100,
+          output_tokens: 10,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      // Empty modelUsage: settles the turn without a window of its own.
+      createResultMessageWithModel({ modelUsage: {} }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"]!;
+    expect(session.contextWindowAuthoritative).toBe(false);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(session.contextWindowSize).toBe(1_000_000);
+  });
+
+  it("caches the turn's window under the bare assistant-message id too, so resolvedModel-less rows can hit", async () => {
+    // Seed-time reads fall back to the picker value / verbatim live id when a
+    // model row carries no resolvedModel (the synthesized out-of-allowlist
+    // resume row sets it undefined on purpose). Those spellings match the
+    // assistant message's bare `.model`, not the "[1m]"-decorated modelUsage
+    // key, so the result handler must write both spellings — otherwise such
+    // rows silently never hit the cache. 555_000 can only come from the cache:
+    // inference on the bare id (no "1m" token) yields the 200_000 default, and
+    // the pre-switch sentinel is 123_456.
+    const BARE_ID = "claude-bareprobe-7";
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: BARE_ID }),
+      createResultMessageWithModel({
+        modelUsage: {
+          [`${BARE_ID}[1m]`]: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0,
+            contextWindow: 555_000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"]!;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    expect(session.contextWindowSize).toBe(555_000);
+
+    // Switch to a row registered under the bare id with NO resolvedModel —
+    // the shape of the out-of-allowlist resume row.
+    session.contextWindowSize = 123_456; // sentinel
+    session.contextWindowAuthoritative = false;
+    session.models = { currentModelId: "default", availableModels: [] };
+    session.modelInfos = [{ value: BARE_ID, displayName: "Bare", description: "probe" }] as any;
+    session.configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: "default",
+        options: [{ value: BARE_ID, name: "Bare" }],
+      },
+    ] as any;
+
+    await agent.setSessionConfigOption({
+      sessionId: "test-session",
+      configId: "model",
+      value: BARE_ID,
+    });
+
+    expect(session.contextWindowSize).toBe(555_000);
+    expect(session.contextWindowAuthoritative).toBe(true);
   });
 });
 
@@ -6626,6 +6759,8 @@ describe("post-error recovery", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -9337,6 +9472,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       abortController: new AbortController(),
       emitRawSDKMessages: false,
       contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -10606,6 +10743,8 @@ describe("agent selection config option", () => {
         abortController: new AbortController(),
         emitRawSDKMessages: false,
         contextWindowSize: 200000,
+        contextWindowAuthoritative: false,
+        providerCacheKey: "default",
         taskState: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
