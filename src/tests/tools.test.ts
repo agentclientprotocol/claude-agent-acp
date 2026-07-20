@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -1024,7 +1024,7 @@ describe("Bash terminal output", () => {
       );
 
       // Fire PostToolUse hook with a structuredPatch in tool_response
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1102,7 +1102,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1182,7 +1182,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1202,6 +1202,36 @@ describe("Bash terminal output", () => {
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate.content).toBeUndefined();
       expect(hookUpdate.locations).toBeUndefined();
+    });
+
+    // Regression for issue #889: tool uses that never register a callback
+    // (TodoWrite/Task* are rendered as plan updates, not tool_calls) fire the
+    // PostToolUse hook too. That's expected — the hook must stay silent
+    // instead of spamming "No onPostToolUseHook found" to stderr.
+    it("should not log an error when no callback is registered for the tool use", async () => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const hook = createPostToolUseHook();
+        const result = await hook(
+          {
+            hook_event_name: "PostToolUse",
+            tool_name: "TodoWrite",
+            tool_input: { todos: [] },
+            tool_response: { success: true },
+            tool_use_id: "toolu_todo_no_callback",
+            session_id: "test-session",
+            transcript_path: "/tmp/test",
+            cwd: "/tmp",
+          },
+          "toolu_todo_no_callback",
+          { signal: AbortSignal.abort() },
+        );
+
+        expect(result).toEqual({ continue: true });
+        expect(errorSpy).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
     });
   });
 
@@ -1239,7 +1269,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1315,7 +1345,7 @@ describe("Bash terminal output", () => {
         mockLogger,
       );
 
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1438,7 +1468,7 @@ describe("Bash terminal output", () => {
       expect((resultNotifications[1].update as any).status).toBe("completed");
 
       // Step 3: Fire the PostToolUse hook (simulates what Claude Code SDK does)
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",
@@ -1519,7 +1549,7 @@ describe("Bash terminal output", () => {
       );
 
       // Fire hook
-      const hook = createPostToolUseHook(mockLogger);
+      const hook = createPostToolUseHook();
       await hook(
         {
           hook_event_name: "PostToolUse",

@@ -60,7 +60,6 @@ import {
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import path from "node:path";
-import { Logger } from "./acp-agent.js";
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -1217,12 +1216,7 @@ export const registerHookCallback = (
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
-  (
-    logger: Logger = console,
-    options?: {
-      onEnterPlanMode?: () => Promise<void>;
-    },
-  ): HookCallback =>
+  (options?: { onEnterPlanMode?: () => Promise<void> }): HookCallback =>
   async (input: any, toolUseID: string | undefined): Promise<{ continue: boolean }> => {
     if (input.hook_event_name === "PostToolUse") {
       // Handle EnterPlanMode tool - notify client of mode change after successful execution
@@ -1234,11 +1228,8 @@ export const createPostToolUseHook =
         const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
         if (onPostToolUseHook) {
           await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
-          delete toolUseCallbacks[toolUseID]; // Cleanup after execution
-        } else {
-          logger.error(`No onPostToolUseHook found for tool use ID: ${toolUseID}`);
-          delete toolUseCallbacks[toolUseID];
         }
+        delete toolUseCallbacks[toolUseID]; // Cleanup after execution
       }
     }
     return { continue: true };

@@ -5081,7 +5081,7 @@ export class ClaudeAcpAgent {
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
             hooks: [
-              createPostToolUseHook(this.logger, {
+              createPostToolUseHook({
                 onEnterPlanMode: async () => {
                   await this.client.sessionUpdate({
                     sessionId,
