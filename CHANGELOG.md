@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.60.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.59.0...v0.60.0) (2026-07-20)
+
+
+### Features
+
+* **deps:** Update to claude-agent-sdk 0.3.215 ([#890](https://github.com/agentclientprotocol/claude-agent-acp/issues/890)) ([92548f0](https://github.com/agentclientprotocol/claude-agent-acp/commit/92548f043547b0ddac95921ece020e69f7c12c5f))
+* implement configurable LLM providers ([#853](https://github.com/agentclientprotocol/claude-agent-acp/issues/853)) ([82cd692](https://github.com/agentclientprotocol/claude-agent-acp/commit/82cd692e500eedec182f817b18cebb005c4b98ce))
+
+
+### Bug Fixes
+
+* parse Agent/Task trailers without regex ([#879](https://github.com/agentclientprotocol/claude-agent-acp/issues/879)) ([06c3d7b](https://github.com/agentclientprotocol/claude-agent-acp/commit/06c3d7bdbd8cc9415c8cabac060a50e0951c758b))
+* remove ~15s stall on session/new and model switch by seeding the context window synchronously ([#894](https://github.com/agentclientprotocol/claude-agent-acp/issues/894)) ([ff9b96d](https://github.com/agentclientprotocol/claude-agent-acp/commit/ff9b96d462831b1c3b96722ea20215ff6e529cb1))
+* Silence missing PostToolUse callbacks ([#895](https://github.com/agentclientprotocol/claude-agent-acp/issues/895)) ([1887ada](https://github.com/agentclientprotocol/claude-agent-acp/commit/1887ada215b27bb1025d9b7696a46ae7a4ac0f7a)), closes [#889](https://github.com/agentclientprotocol/claude-agent-acp/issues/889)
+
 ## [0.59.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.58.1...v0.59.0) (2026-07-13)
 
 
