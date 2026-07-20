@@ -2297,6 +2297,40 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     ]);
   });
 
+  it("strips only the trailer when the report itself mentions <usage>", () => {
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: "Grep for <usage> found 3 hits.\n<usage>subagent_tokens: 5</usage>",
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "Grep for <usage> found 3 hits." } },
+    ]);
+  });
+
+  it("handles adversarial trailer-shaped input in linear time", () => {
+    // Regression: the old regex-based strip backtracked quadratically on
+    // these shapes (CodeQL js/polynomial-redos) — at this size it would
+    // blow the test timeout rather than merely run slow.
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [
+        { type: "text", text: "agentId: - (".repeat(20000) },
+        { type: "text", text: "<usage>".repeat(30000) },
+      ],
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    // Neither is a real trailer, so both come through unchanged.
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: "agentId: - (".repeat(20000) } },
+      { type: "content", content: { type: "text", text: "<usage>".repeat(30000) } },
+    ]);
+  });
+
   it("falls back (trailer-stripped) when tool_use_result is the async_launched variant", () => {
     const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
       status: "async_launched",

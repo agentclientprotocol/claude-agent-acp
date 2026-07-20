@@ -515,63 +515,42 @@ function structuredResult<T extends object>(toolUseResult: unknown): T | undefin
  * matching rather than mangle the report.
  */
 function stripAgentTrailer(text: string): string {
-  return stripTrailingAgentId(stripTrailingUsage(text));
+  return stripAgentIdLine(stripUsageBlock(text));
 }
 
-/** Remove a terminal `<usage>` block with a bounded number of linear scans. */
-function stripTrailingUsage(text: string): string {
-  const trimmedEnd = text.trimEnd();
-  const closingTag = "</usage>";
-  if (!trimmedEnd.endsWith(closingTag)) {
+const USAGE_OPEN = "<usage>";
+const USAGE_CLOSE = "</usage>";
+
+/** Remove a trailing `<usage>…</usage>` block, plus trailing whitespace and
+ *  one preceding newline. Matches from the *last* `<usage>` so a report that
+ *  merely mentions the marker earlier isn't truncated at the mention. */
+function stripUsageBlock(text: string): string {
+  const body = text.trimEnd();
+  if (!body.endsWith(USAGE_CLOSE)) {
     return text;
   }
-
-  const openingTagIndex = trimmedEnd.lastIndexOf("<usage>", trimmedEnd.length - closingTag.length);
-  if (openingTagIndex === -1) {
+  const open = body.lastIndexOf(USAGE_OPEN, body.length - USAGE_CLOSE.length - USAGE_OPEN.length);
+  if (open === -1) {
     return text;
   }
-
-  const trailerStart =
-    openingTagIndex > 0 && text[openingTagIndex - 1] === "\n"
-      ? openingTagIndex - 1
-      : openingTagIndex;
-  return text.slice(0, trailerStart);
+  return body.slice(0, open > 0 && body[open - 1] === "\n" ? open - 1 : open);
 }
 
-/** Remove a terminal `agentId: … (…)` continuation line with linear parsing. */
-function stripTrailingAgentId(text: string): string {
-  const trimmedEnd = text.trimEnd();
-  const prefix = "agentId: ";
-  const trailerStart = trimmedEnd.lastIndexOf(prefix);
-  if (trailerStart === -1) {
+/** The continuation line, anchored to a whole line so the regex has a single
+ *  start position and no ambiguous repetition (`[\w-]+` can't consume the
+ *  following space, `[^)]*` can't consume the closing paren) — it runs in
+ *  linear time on any input. */
+const AGENT_ID_LINE = /^agentId: [\w-]+ \([^)]*\)$/;
+
+/** Remove a final `agentId: <id> (…)` line, plus trailing whitespace and the
+ *  newline that preceded the line. */
+function stripAgentIdLine(text: string): string {
+  const body = text.trimEnd();
+  const lineStart = body.lastIndexOf("\n") + 1;
+  if (!AGENT_ID_LINE.test(body.slice(lineStart))) {
     return text;
   }
-
-  let cursor = trailerStart + prefix.length;
-  const idStart = cursor;
-  while (
-    cursor < trimmedEnd.length &&
-    ((trimmedEnd[cursor] >= "a" && trimmedEnd[cursor] <= "z") ||
-      (trimmedEnd[cursor] >= "A" && trimmedEnd[cursor] <= "Z") ||
-      (trimmedEnd[cursor] >= "0" && trimmedEnd[cursor] <= "9") ||
-      trimmedEnd[cursor] === "_" ||
-      trimmedEnd[cursor] === "-")
-  ) {
-    cursor += 1;
-  }
-  if (cursor === idStart || trimmedEnd.slice(cursor, cursor + 2) !== " (") {
-    return text;
-  }
-
-  const messageStart = cursor + 2;
-  const closingParen = trimmedEnd.indexOf(")", messageStart);
-  if (closingParen !== trimmedEnd.length - 1) {
-    return text;
-  }
-
-  const start =
-    trailerStart > 0 && text[trailerStart - 1] === "\n" ? trailerStart - 1 : trailerStart;
-  return text.slice(0, start);
+  return body.slice(0, Math.max(lineStart - 1, 0));
 }
 
 /** Apply {@link stripAgentTrailer} across a raw tool_result `content` (plain
