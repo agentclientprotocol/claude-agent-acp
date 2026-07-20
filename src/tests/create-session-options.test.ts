@@ -625,34 +625,23 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("seeds contextWindowSize from the SDK's getContextUsage report", async () => {
-      // Aliases like `sonnet` can resolve to an extended-context model with no
-      // "1m" token anywhere in id/displayName/description, so the authoritative
-      // report must win over text inference (issue #596).
+    it("does not call getContextUsage during session creation", async () => {
+      // getContextUsage stalls until the session's first prompt turn has run
+      // (it is not serviced pre-turn), so session/new must never call it —
+      // awaiting it inline is what regressed session/new latency in 0.59.0.
+      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      contextUsageResult = ctxSpy;
+
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(ctxSpy).not.toHaveBeenCalled();
+    });
+
+    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+      // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
+      // no "1m" token anywhere, so inference misses and the window falls back to
+      // the default; the authoritative value arrives later via result.modelUsage.
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
-
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000);
-    });
-
-    it("falls back to the default window when getContextUsage fails and inference misses", async () => {
-      // getContextUsage rejects, and the mock model ("claude-sonnet-4-6" /
-      // "Claude Sonnet" / "Fast") has no "1m" hint.
-      contextUsageResult = () => Promise.reject(new Error("no context usage mocked"));
-      // The rejection is deliberate — capture the agent's warning instead of
-      // letting it hit the console.
-      const errorSpy = vi.fn();
-      (agent as any).logger = { log: () => {}, error: errorSpy };
-
-      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
-      expect(errorSpy).toHaveBeenCalled();
-    });
-
-    it("ignores a nonsensical (non-positive) reported window", async () => {
-      contextUsageResult = async () => ({ rawMaxTokens: 0 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 

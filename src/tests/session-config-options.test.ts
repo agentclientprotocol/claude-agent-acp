@@ -936,30 +936,16 @@ describe("session config options", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
     }
 
-    it("refreshes contextWindowSize from getContextUsage when the model changes", async () => {
+    it("sets the window from text inference on model switch, without any getContextUsage IPC", async () => {
+      // getContextUsage stalls until the session's first prompt turn, so the
+      // switch path must never call it; the window is seeded from the text
+      // heuristic (here via the new model's resolvedModel) and later confirmed
+      // by result.modelUsage.
       const session = getSession();
       session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
-
-      await agent.setSessionConfigOption({
-        sessionId: SESSION_ID,
-        configId: "model",
-        value: "claude-sonnet-4-6",
-      });
-
-      expect(session.query.getContextUsage).toHaveBeenCalled();
-      expect(session.contextWindowSize).toBe(967000);
-    });
-
-    it("falls back to resolvedModel text inference when getContextUsage fails", async () => {
-      const session = getSession();
-      session.query.getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
       session.modelInfos = session.modelInfos.map((m: ModelInfo) =>
         m.value === "claude-sonnet-4-6" ? { ...m, resolvedModel: "claude-sonnet-5[1m]" } : m,
       );
-      // The rejection is deliberate — capture the agent's warning instead of
-      // letting it hit the console.
-      const errorSpy = vi.fn();
-      (agent as any).logger = { log: () => {}, error: errorSpy };
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -967,18 +953,17 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
+      expect(session.query.getContextUsage).not.toHaveBeenCalled();
       expect(session.contextWindowSize).toBe(1_000_000);
-      expect(errorSpy).toHaveBeenCalled();
     });
 
-    it("falls back to the default window when the SDK and inference both miss", async () => {
+    it("falls back to the default window when inference misses, without any getContextUsage IPC", async () => {
       const session = getSession();
       session.contextWindowSize = 1_000_000;
-      session.query.getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
-      // The rejection is deliberate — capture the agent's warning instead of
-      // letting it hit the console.
-      const errorSpy = vi.fn();
-      (agent as any).logger = { log: () => {}, error: errorSpy };
+      // Present but must NOT be called; the switch never consults it.
+      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      // claude-sonnet-4-6 carries no "1m" token in its id, resolvedModel,
+      // displayName, or description, so inference misses → default window.
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -986,8 +971,22 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
+      expect(session.query.getContextUsage).not.toHaveBeenCalled();
       expect(session.contextWindowSize).toBe(200000);
-      expect(errorSpy).toHaveBeenCalled();
+    });
+
+    it("does not call getContextUsage even when switching to a fresh model", async () => {
+      const session = getSession();
+      const spy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      session.query.getContextUsage = spy;
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      expect(spy).not.toHaveBeenCalled();
     });
 
     it("keeps the learned window when re-asserting the current model", async () => {

@@ -393,11 +393,24 @@ type Session = {
   emitRawSDKMessages: boolean | SDKMessageFilter[];
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
-   *  before the turn's first result message arrives. Seeded from the SDK's
-   *  getContextUsage report at session creation (DEFAULT_CONTEXT_WINDOW when
-   *  that and the text heuristic both fail), refreshed the same way on model
-   *  switches, and confirmed by each result's modelUsage. */
+   *  before the turn's first result message arrives. Seeded synchronously at
+   *  session creation and on model switches from the per-model cache or the
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), then confirmed —
+   *  and the cache populated — by each result's modelUsage. No `getContextUsage`
+   *  IPC is on these paths: it stalls until the first turn runs (see the
+   *  seeding call sites and `contextWindowCache`). */
   contextWindowSize: number;
+  /** Stable identifier of the LLM backend this session's query was created
+   *  against (apiType + baseUrl, see {@link providerCacheKeyFor}). The context
+   *  window is a property of (model id, provider) — a resolved model id can name
+   *  different windows behind different providers — so this scopes the
+   *  module-global `contextWindowCache` per provider. Captured at session
+   *  creation because the effective provider (`resolveProviderConfig`) can change
+   *  process-wide over the adapter's lifetime, while the query is baked to the
+   *  provider in effect when it was created. Optional only so test/husk session
+   *  literals need not set it; `contextWindowCacheKey` treats an unset value as
+   *  the "default" provider bucket. */
+  providerCacheKey?: string;
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
@@ -2890,12 +2903,29 @@ export class ClaudeAcpAgent {
               const matchingModelUsage = lastAssistantModel
                 ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
                 : null;
-              // Only overwrite when we have an authoritative value — a miss
-              // (e.g. a turn with no top-level assistant message) would
-              // otherwise discard the window learned on a prior turn and
-              // leave the next prompt's mid-stream updates reporting 200k.
-              if (matchingModelUsage) {
-                session.contextWindowSize = matchingModelUsage.contextWindow;
+              // Only overwrite when we have an authoritative, sane value. A miss
+              // (e.g. a turn with no top-level assistant message), or a
+              // nonsensical non-positive/NaN window (observed from third-party
+              // backends), would otherwise discard the window learned on a prior
+              // turn and leave the next prompt's mid-stream updates reporting a
+              // wrong size. `cacheContextWindow` applies the same `> 0` guard, so
+              // a bad value never reaches the cross-session cache either.
+              if (
+                matchingModelUsage &&
+                typeof matchingModelUsage.usage.contextWindow === "number" &&
+                matchingModelUsage.usage.contextWindow > 0
+              ) {
+                session.contextWindowSize = matchingModelUsage.usage.contextWindow;
+                // Authoritative: fold it into the cross-session cache keyed on
+                // (this session's provider, the resolved model id —
+                // matchingModelUsage.key, e.g. "claude-sonnet-5[1m]") so a later
+                // session/new or switch on the same provider that resolves to
+                // this model seeds the correct window synchronously, with no
+                // getContextUsage IPC.
+                cacheContextWindow(
+                  contextWindowCacheKey(session.providerCacheKey, matchingModelUsage.key),
+                  matchingModelUsage.usage.contextWindow,
+                );
               }
 
               // Send usage_update notification
@@ -4565,22 +4595,24 @@ export class ClaudeAcpAgent {
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
       if (session.models.currentModelId !== value) {
-        // The cached context window was learned for the previous model. The
-        // SDK is already running the new model here (user-driven switches call
-        // `query.setModel` before this, and the refusal-fallback sync only
-        // reconciles a switch the SDK already made), so ask it for the new
-        // window; fall back to the text heuristic so mid-stream updates
-        // between now and the next `result` reflect the user's selection
-        // instead of the old model's window.
-        session.contextWindowSize =
-          (await fetchContextWindowSize(session.query, this.logger)) ??
-          inferContextWindowFromModel(
-            value,
-            newModelInfo?.resolvedModel,
-            newModelInfo?.displayName,
-            newModelInfo?.description,
-          ) ??
-          DEFAULT_CONTEXT_WINDOW;
+        // Seed the new model's context window WITHOUT any IPC on the switch
+        // path: cached authoritative value if we've already learned it (from a
+        // prior turn's `result.modelUsage`), else the text heuristic, else the
+        // default. We deliberately do NOT call `getContextUsage` here — that
+        // control request stalls ~15s until the session's first prompt turn
+        // has run, and (because SDK control requests are serialized over one
+        // channel) it would drag the awaited `setModel` down with it. The
+        // authoritative window arrives on the first `result.modelUsage` for the
+        // model and is cached from there; until then a switched-to alias that
+        // has never run a turn shows the heuristic/default window, which
+        // self-corrects on its first response (matches pre-0.59.0 behavior).
+        session.contextWindowSize = immediateContextWindow(
+          contextWindowCacheKey(session.providerCacheKey, newModelInfo?.resolvedModel ?? value),
+          value,
+          newModelInfo?.resolvedModel,
+          newModelInfo?.displayName,
+          newModelInfo?.description,
+        );
       }
       session.models = { ...session.models, currentModelId: value };
 
@@ -5309,28 +5341,39 @@ export class ClaudeAcpAgent {
         effortLevel: initialEffort.currentValue as Settings["effortLevel"],
       });
     }
-    // Seed the context window from the SDK's authoritative report. Text
-    // inference alone misses aliases that resolve to extended-context models
-    // with no "1m" token anywhere in their id or description (e.g. `sonnet` →
-    // claude-sonnet-5, natively ~1M): those streamed `usage_update.size:
-    // 200000` until the first result's modelUsage corrected it — again on
-    // every process restart or session re-creation, since the learned window
-    // lives only on the Session (issue #596).
+    // Seed the context window WITHOUT any IPC on the session/new path. Use the
+    // cached authoritative window if we've already learned it for this model (a
+    // prior turn's `result.modelUsage`, cross-session), else the text
+    // heuristic, else the default. We deliberately do NOT call `getContextUsage`
+    // here: it stalls ~15s until the session's first prompt turn runs (that
+    // control request is not serviced pre-turn), so awaiting it — as 0.59.0 did
+    // — made session/new take ~15s. The authoritative window arrives on the
+    // first `result.modelUsage` and is cached from there.
+    //
+    // Text inference alone misses aliases that resolve to extended-context
+    // models with no "1m" token anywhere in their id or description (e.g.
+    // `sonnet` → claude-sonnet-5, natively ~1M): those stream
+    // `usage_update.size: 200000` until the first result's modelUsage corrects
+    // it — but the cache means only the FIRST session to ever run a turn on such
+    // a model eats that window, not every process restart (issue #596).
     //
     // The inference fallback is deliberately keyed to the allowlisted entry: a
     // fallback-resolved sibling's resolvedModel/displayName/description can
     // describe a different context lane than the verbatim live id (e.g. an
     // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
     // the id itself is a trustworthy window signal.
-    const contextWindowSize =
-      (await fetchContextWindowSize(q, this.logger)) ??
-      inferContextWindowFromModel(
-        models.currentModelId,
-        allowlistedModelInfo?.resolvedModel,
-        allowlistedModelInfo?.displayName,
-        allowlistedModelInfo?.description,
-      ) ??
-      DEFAULT_CONTEXT_WINDOW;
+    // The window cache is scoped per provider (see `contextWindowCache`).
+    // Capture the provider the query above was created against so both this
+    // pre-turn read and the later result-handler write use the same key even if
+    // the process-wide effective provider changes later.
+    const providerCacheKey = providerCacheKeyFor(this.resolveProviderConfig());
+    const contextWindowSize = immediateContextWindow(
+      contextWindowCacheKey(providerCacheKey, allowlistedModelInfo?.resolvedModel ?? models.currentModelId),
+      models.currentModelId,
+      allowlistedModelInfo?.resolvedModel,
+      allowlistedModelInfo?.displayName,
+      allowlistedModelInfo?.description,
+    );
 
     this.sessions[sessionId] = {
       query: q,
@@ -5355,6 +5398,7 @@ export class ClaudeAcpAgent {
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
       contextWindowSize,
+      providerCacheKey,
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
@@ -7113,9 +7157,9 @@ function commonPrefixLength(a: string, b: string) {
   return i;
 }
 
-/** Best-effort first guess of a model's context window, used only as a
- *  fallback when the SDK's authoritative `getContextUsage` is unavailable (and
- *  until a `result` message arrives with the `modelUsage` value).
+/** Best-effort first guess of a model's context window, used to seed the
+ *  window synchronously (via `immediateContextWindow`) until a `result` message
+ *  arrives with the authoritative `modelUsage` value.
  *
  *  Anthropic 1M-context variants encode "1m" as a distinct token in the SDK
  *  model ID (e.g., "claude-opus-4-6-1m"), which `\b1m\b` catches without also
@@ -7125,9 +7169,10 @@ function commonPrefixLength(a: string, b: string) {
  *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
  *  This text scan can't catch every model — some resolve to extended-context
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M) — which is why `fetchContextWindowSize` is preferred wherever a live
- *  query is available. A miss falls back to the default window and is
- *  corrected by `result.modelUsage` within one turn. */
+ *  ~1M). Such a miss falls back to the default window and is corrected by
+ *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
+ *  SDK's `getContextUsage` to close that gap: it is not serviced before the
+ *  first turn (see `contextWindowCache`). */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
@@ -7148,26 +7193,77 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
   }
 }
 
-/** Fetch the current model's full context window (`rawMaxTokens`) via the
- *  `getContextUsage` control request — the same source `/context` prints.
- *  This is the only pre-`result` signal that covers semantic aliases whose
- *  text carries no "1m" token (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M), so it's the primary window source at session creation and on model
- *  switches; `inferContextWindowFromModel` remains the fallback. A returned
- *  window is still superseded by each `result.modelUsage.contextWindow`.
+/** Cross-session cache of authoritative context windows, keyed by
+ *  `${providerCacheKey}\0${resolvedModelId}` (see {@link contextWindowCacheKey}).
+ *  The window is a property of (model id, provider): a resolved model id (e.g.
+ *  "claude-sonnet-5[1m]", the same spelling as the `result.modelUsage` keys) can
+ *  name different context lanes behind different providers, so the key carries
+ *  both. Caching it module-level lets a later session/new or switch that
+ *  resolves to the same (provider, model) — in this session or any other, within
+ *  the adapter's lifetime — seed the correct window synchronously with no IPC.
+ *  Keying on the resolved id (rather than the picker value) means aliases that
+ *  resolve to the same concrete model share one entry; keying on the provider
+ *  means two providers that reuse an id string for different windows stay
+ *  separated.
  *
- *  (Older CLIs under-reported extended 1M windows here — commit 20ef663
- *  dropped the field for that reason — but the CLI vendored by the pinned
- *  SDK reports them correctly again.) Returns `null` on any control-request
- *  failure or a nonsensical (non-positive) window. */
-async function fetchContextWindowSize(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null;
-  } catch (error) {
-    logger.error("Failed to fetch context window size from SDK:", error);
-    return null;
+ *  Populated authoritatively by each `result.modelUsage` a turn confirms (see
+ *  the consumer's result handler, which caches under the matched modelUsage
+ *  key). We deliberately never populate it from `getContextUsage`: that control
+ *  request is not serviced until the session's first prompt turn has run (it
+ *  stalls ~15s before then, and serializes ahead of an awaited `setModel`), so
+ *  it can neither beat the first `result` nor be issued cheaply before one — see
+ *  the seeding call sites for the full rationale. */
+const contextWindowCache = new Map<string, number>();
+
+/** Stable identifier for the LLM backend a session's query is created against,
+ *  used to scope {@link contextWindowCache} per provider. Derived from the
+ *  non-secret routing fields (apiType + baseUrl, plus Vertex project/region);
+ *  `headers` are excluded (they carry secrets and don't change which backend is
+ *  addressed). `null` (no client-managed routing — the adapter's own default) is
+ *  a stable key of its own. */
+function providerCacheKeyFor(config: ProviderConfig | null): string {
+  if (!config) return "default";
+  const parts = [config.apiType, config.baseUrl];
+  if (config.vertex) parts.push(config.vertex.projectId, config.vertex.region);
+  return parts.join(" ");
+}
+
+/** Compose the `contextWindowCache` key from a session's provider key and a
+ *  resolved model id. Returns undefined when the model id is undefined so the
+ *  cache read/write becomes a no-op (never a `${provider}\0undefined` entry). */
+function contextWindowCacheKey(
+  providerCacheKey: string | undefined,
+  resolvedModelId: string | undefined,
+): string | undefined {
+  if (resolvedModelId === undefined) return undefined;
+  return `${providerCacheKey ?? "default"} ${resolvedModelId}`;
+}
+
+function cacheContextWindow(modelKey: string | undefined, window: number | null | undefined): void {
+  if (modelKey && typeof window === "number" && window > 0) {
+    contextWindowCache.set(modelKey, window);
   }
+}
+
+/** The context window to report *right now* for a model, with NO IPC on the
+ *  critical path: the cached authoritative value if we've learned it (from a
+ *  prior turn's `result.modelUsage`, this or any session with the same provider),
+ *  else the text heuristic on the supplied identity strings, else the default.
+ *  `cacheKey` is the composite (provider, resolved model id) lookup key from
+ *  {@link contextWindowCacheKey} — the same key the write site uses; the
+ *  remaining `inferTexts` feed `inferContextWindowFromModel` exactly as the old
+ *  inline fallback did. The authoritative window arrives on the first
+ *  `result.modelUsage` for the model and is cached from there, superseding a
+ *  heuristic/default miss. */
+function immediateContextWindow(
+  cacheKey: string | undefined,
+  ...inferTexts: Array<string | undefined>
+): number {
+  if (cacheKey !== undefined) {
+    const cached = contextWindowCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+  }
+  return inferContextWindowFromModel(...inferTexts) ?? DEFAULT_CONTEXT_WINDOW;
 }
 
 /** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
@@ -7216,6 +7312,11 @@ function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentMo
   }
 
   if (bestKey) {
-    return modelUsage[bestKey];
+    // `bestKey` is the SDK's resolved model id (e.g. "claude-sonnet-5[1m]"),
+    // the same spelling as ModelInfo.resolvedModel — the key we cache the
+    // window under. `currentModel` (the assistant message's `.model`) can be
+    // the bare form (e.g. "claude-sonnet-5"), so callers that want to cache
+    // must use `key`, not `currentModel`.
+    return { key: bestKey, usage: modelUsage[bestKey] };
   }
 }

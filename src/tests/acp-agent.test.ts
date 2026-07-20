@@ -157,6 +157,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     contextWindowSize: 200000,
+    providerCacheKey: "default",
     taskState: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
@@ -5044,6 +5045,230 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(0);
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
+  });
+
+  it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {
+    // End-to-end for the cross-session context-window cache:
+    //  - WRITE: a turn's result.modelUsage is the only authoritative window. The
+    //    assistant message reports the BARE model id ("…-9") while modelUsage is
+    //    keyed by the RESOLVED id ("…-9[1m]"); the cache must be written under the
+    //    resolved key (matched by getMatchingModelUsage), the same spelling as
+    //    ModelInfo.resolvedModel — otherwise a later read never hits.
+    //  - READ: switching to a picker value whose resolvedModel is that key seeds
+    //    the window synchronously from the cache, with NO getContextUsage.
+    // 777_000 is chosen so it can only come from the cache: text inference on the
+    // resolved id "…-9[1m]" would yield 1_000_000 (the "1m" token), the default
+    // is 200_000, and the pre-switch sentinel is 123_456.
+    //
+    // The `contextWindowCache` is module-global and this file does not
+    // vi.resetModules() per test, so it persists across tests. This test stays
+    // isolated by using a unique resolved id ("claude-cachehit-probe-9[1m]") that
+    // no other test writes or reads — the convention here, since a statically
+    // imported module's cache can't be cleared from a test.
+    const RESOLVED_ID = "claude-cachehit-probe-9[1m]";
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-cachehit-probe-9" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          [RESOLVED_ID]: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0,
+            contextWindow: 777_000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const session = agent.sessions["test-session"]!;
+    // The turn learned the window from modelUsage even though the assistant
+    // message carried the bare id — confirms the write matched on the resolved key.
+    expect(session.contextWindowSize).toBe(777_000);
+
+    // Now switch to a picker value that resolves to the cached id. Seed a
+    // sentinel and a getContextUsage spy first: a cache miss would surface as
+    // 1_000_000 (inference on the "1m" id), and any IPC as a spy call.
+    const getContextUsage = vi.fn(async () => ({ rawMaxTokens: 200000 }));
+    (session.query as any).getContextUsage = getContextUsage;
+    session.contextWindowSize = 123_456;
+    session.models = { currentModelId: "default", availableModels: [] };
+    session.modelInfos = [
+      {
+        value: "probe-alias",
+        displayName: "Probe",
+        description: "probe model",
+        resolvedModel: RESOLVED_ID,
+      },
+    ] as any;
+    session.configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: "default",
+        options: [{ value: "probe-alias", name: "Probe" }],
+      },
+    ] as any;
+
+    await agent.setSessionConfigOption({
+      sessionId: "test-session",
+      configId: "model",
+      value: "probe-alias",
+    });
+
+    expect(getContextUsage).not.toHaveBeenCalled();
+    expect(session.contextWindowSize).toBe(777_000);
+  });
+
+  it("scopes the window cache per provider: a switch on a different provider does not read another provider's window", async () => {
+    // The window is a property of (model id, provider). A turn on provider-A
+    // learns 500_000 for RESOLVED_ID; a switch to the SAME resolved id on
+    // provider-B must NOT read it (falls to inference → 1_000_000 for the "1m"
+    // id), while a switch on provider-A DOES read it (500_000). All three
+    // outcomes are distinct: cached 500_000 vs inference 1_000_000 vs default.
+    // Uses a unique resolved id ("claude-provkey-probe[1m]") so the module-global
+    // cache (not reset per test in this file) can't cross this test with others.
+    const RESOLVED_ID = "claude-provkey-probe[1m]";
+    const { agent } = createMockAgentWithCapture();
+
+    // Provider-A session learns the authoritative window on a turn.
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-provkey-probe" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          [RESOLVED_ID]: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0,
+            contextWindow: 500_000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const sessionA = agent.sessions["test-session"]!;
+    sessionA.providerCacheKey = "apiType-A https://a.example";
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    expect(sessionA.contextWindowSize).toBe(500_000);
+
+    const modelInfos = [
+      { value: "alias", displayName: "Alias", description: "probe model", resolvedModel: RESOLVED_ID },
+    ];
+    const configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: "default",
+        options: [{ value: "alias", name: "Alias" }],
+      },
+    ];
+
+    // A DIFFERENT provider seeing the same resolved id must not inherit A's
+    // window — it falls to inference (1_000_000), not the cached 500_000.
+    agent.sessions["session-B"] = mockSessionState({
+      providerCacheKey: "apiType-B https://b.example",
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos,
+      configOptions,
+      query: {
+        setModel: vi.fn(async () => {}),
+        setPermissionMode: vi.fn(async () => {}),
+        applyFlagSettings: vi.fn(async () => {}),
+        getContextUsage: vi.fn(async () => ({ rawMaxTokens: 200000 })),
+        supportedCommands: vi.fn(async () => []),
+      },
+    });
+    await agent.setSessionConfigOption({
+      sessionId: "session-B",
+      configId: "model",
+      value: "alias",
+    });
+    expect(agent.sessions["session-B"]!.contextWindowSize).toBe(1_000_000);
+
+    // The SAME provider (A) switching to that id DOES read the cached window.
+    sessionA.contextWindowSize = 123_456; // sentinel
+    sessionA.models = { currentModelId: "default", availableModels: [] };
+    sessionA.modelInfos = modelInfos as any;
+    sessionA.configOptions = configOptions as any;
+    await agent.setSessionConfigOption({
+      sessionId: "test-session",
+      configId: "model",
+      value: "alias",
+    });
+    expect(sessionA.contextWindowSize).toBe(500_000);
+  });
+
+  it("ignores a nonsensical (non-positive) reported window: keeps the prior window and doesn't poison the cache", async () => {
+    // A result.modelUsage that reports a non-positive contextWindow (observed
+    // from third-party backends) must not overwrite the window learned earlier,
+    // nor be written to the cross-session cache. Unique id keeps this isolated
+    // from other tests sharing the module-global cache (no resetModules here).
+    const RESOLVED_ID = "claude-nonpositive-probe[1m]";
+    const { agent } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createAssistantMessage({ model: "claude-nonpositive-probe" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          [RESOLVED_ID]: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0,
+            contextWindow: 0, // nonsensical
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+    const session = agent.sessions["test-session"]!;
+    session.contextWindowSize = 900_000; // a window learned on a prior turn
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // The bad window was ignored — the prior window is preserved.
+    expect(session.contextWindowSize).toBe(900_000);
+
+    // And it never reached the cache: a switch to that id falls to inference
+    // (1_000_000 for the "1m" id), not the bad 0.
+    session.contextWindowSize = 123_456; // sentinel
+    session.models = { currentModelId: "default", availableModels: [] };
+    session.modelInfos = [
+      { value: "alias", displayName: "Alias", description: "probe", resolvedModel: RESOLVED_ID },
+    ] as any;
+    session.configOptions = [
+      {
+        id: "model",
+        name: "Model",
+        type: "select",
+        category: "model",
+        currentValue: "default",
+        options: [{ value: "alias", name: "Alias" }],
+      },
+    ] as any;
+    await agent.setSessionConfigOption({
+      sessionId: "test-session",
+      configId: "model",
+      value: "alias",
+    });
+    expect(session.contextWindowSize).toBe(1_000_000);
   });
 });
 
