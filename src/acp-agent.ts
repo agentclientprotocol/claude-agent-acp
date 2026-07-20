@@ -5368,7 +5368,10 @@ export class ClaudeAcpAgent {
     // the process-wide effective provider changes later.
     const providerCacheKey = providerCacheKeyFor(this.resolveProviderConfig());
     const contextWindowSize = immediateContextWindow(
-      contextWindowCacheKey(providerCacheKey, allowlistedModelInfo?.resolvedModel ?? models.currentModelId),
+      contextWindowCacheKey(
+        providerCacheKey,
+        allowlistedModelInfo?.resolvedModel ?? models.currentModelId,
+      ),
       models.currentModelId,
       allowlistedModelInfo?.resolvedModel,
       allowlistedModelInfo?.displayName,

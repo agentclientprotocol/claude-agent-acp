@@ -5165,7 +5165,12 @@ describe("usage_update computation", () => {
     expect(sessionA.contextWindowSize).toBe(500_000);
 
     const modelInfos = [
-      { value: "alias", displayName: "Alias", description: "probe model", resolvedModel: RESOLVED_ID },
+      {
+        value: "alias",
+        displayName: "Alias",
+        description: "probe model",
+        resolvedModel: RESOLVED_ID,
+      },
     ];
     const configOptions = [
       {
