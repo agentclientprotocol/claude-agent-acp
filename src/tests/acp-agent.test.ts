@@ -2300,6 +2300,63 @@ describe("tool_call emitted before permission request", () => {
   });
 });
 
+describe("canUseTool in bypassPermissions mode", () => {
+  function setup() {
+    const events: string[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => {
+        events.push("permission");
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState({
+      modes: { currentModeId: "bypassPermissions", availableModes: [] },
+    });
+    // The tool_call was already surfaced by the streamed tool_use chunk, so
+    // the permission flow (when taken) goes straight to requestPermission.
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+    return { agent, events };
+  }
+
+  it("auto-allows asks that carry no matchedAskRule", async () => {
+    const { agent, events } = setup();
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(events).toEqual([]);
+    expect(result).toMatchObject({ behavior: "allow" });
+  });
+
+  // The asks that still reach canUseTool in bypass mode are the ones the CLI
+  // insists on prompting for even under --dangerously-skip-permissions. When
+  // one was forced by the user's own permissions.ask rule (matchedAskRule),
+  // honoring that rule beats bypass: it must go to the client instead of
+  // being silently auto-allowed.
+  it("prompts the client when the ask was forced by a permissions.ask rule", async () => {
+    const { agent, events } = setup();
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "terraform destroy" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      matchedAskRule: {
+        source: "projectSettings",
+        toolName: "Bash",
+        ruleContent: "Bash(terraform:*)",
+      },
+    } as any);
+
+    expect(events).toEqual(["permission"]);
+    expect(result).toMatchObject({ behavior: "allow" });
+  });
+});
+
 describe("subagent permission attribution (issue #851)", () => {
   // A background subagent's permission requests reach canUseTool with only an
   // `agentID`; the streamed subagent messages carry `parent_tool_use_id`

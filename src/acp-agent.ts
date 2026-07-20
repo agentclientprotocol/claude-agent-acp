@@ -59,6 +59,7 @@ import {
   AgentInfo,
   CanUseTool,
   deleteSession,
+  EffortLevel,
   FastModeState,
   getSessionInfo,
   getSessionMessages,
@@ -74,7 +75,6 @@ import {
   PermissionUpdate,
   Query,
   query,
-  Settings,
   SDKAssistantMessageError,
   SDKMessage,
   SDKMessageOrigin,
@@ -3503,7 +3503,20 @@ export class ClaudeAcpAgent {
                 _meta: {
                   claudeCode: {
                     toolName: message.tool_name,
-                    toolResponse: { elapsedTimeSeconds: message.elapsed_time_seconds },
+                    toolResponse: {
+                      elapsedTimeSeconds: message.elapsed_time_seconds,
+                      // For Agent/Task calls: the subagent's type, and — when
+                      // the subagent is waiting out an API rate-limit retry —
+                      // the SDK's retry counters (attempt, max_retries,
+                      // retry_delay_ms, …), forwarded verbatim so clients can
+                      // show why a spawn looks stalled.
+                      ...(message.subagent_type !== undefined && {
+                        subagentType: message.subagent_type,
+                      }),
+                      ...(message.subagent_retry !== undefined && {
+                        subagentRetry: message.subagent_retry,
+                      }),
+                    },
                   },
                 } satisfies ToolUpdateMeta,
               },
@@ -4185,7 +4198,11 @@ export class ClaudeAcpAgent {
   }
 
   canUseTool(sessionId: string): CanUseTool {
-    return async (toolName, toolInput, { signal, suggestions, toolUseID, agentID }) => {
+    return async (
+      toolName,
+      toolInput,
+      { signal, suggestions, toolUseID, agentID, matchedAskRule },
+    ) => {
       const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -4321,7 +4338,14 @@ export class ClaudeAcpAgent {
         }
       }
 
-      if (session.modes.currentModeId === "bypassPermissions") {
+      // In bypass mode the CLI skips permission checks itself; the asks that
+      // still reach canUseTool are the ones it insists on prompting for even
+      // under --dangerously-skip-permissions. Keep auto-allowing those —
+      // bypass means bypass — EXCEPT rule-forced asks (`matchedAskRule`): the
+      // user explicitly configured a permissions.ask rule for this tool, and
+      // the SDK's guidance is that hosts running auto-approval must treat such
+      // asks as a human prompt. Fall through to the normal request below.
+      if (session.modes.currentModeId === "bypassPermissions" && !matchedAskRule) {
         return {
           behavior: "allow",
           updatedInput: toolInput,
@@ -5306,7 +5330,7 @@ export class ClaudeAcpAgent {
       initialEffort.currentValue !== "default"
     ) {
       await q.applyFlagSettings({
-        effortLevel: initialEffort.currentValue as Settings["effortLevel"],
+        effortLevel: toSdkEffortLevel(initialEffort.currentValue),
       });
     }
     // Seed the context window from the SDK's authoritative report. Text
@@ -5590,9 +5614,12 @@ function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState
 // and only clears a key when an explicit `null` is sent — see
 // `applyFlagSettings` in @anthropic-ai/claude-agent-sdk. Mapping both the
 // `"default"` sentinel and `undefined` (effort option absent for the model) to
-// `null` ensures any previously-applied flag is actually cleared.
-function toSdkEffortLevel(value: string | undefined): Settings["effortLevel"] | null {
-  return value === undefined || value === "default" ? null : (value as Settings["effortLevel"]);
+// `null` ensures any previously-applied flag is actually cleared. Typed as
+// `EffortLevel` (not `Settings["effortLevel"]`): the picker offers whatever
+// `supportedEffortLevels` reports, which includes the session-scoped `"max"`
+// that the persisted Settings shape deliberately excludes.
+function toSdkEffortLevel(value: string | undefined): EffortLevel | null {
+  return value === undefined || value === "default" ? null : (value as EffortLevel);
 }
 
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
@@ -6349,6 +6376,12 @@ export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
     },
     session_id: prompt.sessionId,
     parent_tool_use_id: null,
+    // ACP prompts are the user's own input relayed by the client. Stamp the
+    // provenance explicitly: per the SDK, a host wrapping keyboard input must
+    // send `{kind: "human"}` — an absent `origin` is treated as unattributed
+    // and fails closed at the CLI's strict isHuman() trust gates (e.g. the
+    // ultracode keyword opt-in honors only human-originated turns).
+    origin: { kind: "human" },
   };
 }
 
