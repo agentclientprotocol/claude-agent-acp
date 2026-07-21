@@ -1206,8 +1206,8 @@ export class ClaudeAcpAgent {
     const turnInFlight = (session.turnQueue ?? []).some((t) => !t.settled);
     const promptRequest: PromptRequest = {
       sessionId: sessionId,
-      prompt: prompt
-    }
+      prompt: prompt,
+    };
 
     if (!turnInFlight) {
       // Race: the turn we meant to steer already finished. Per the protocol the
