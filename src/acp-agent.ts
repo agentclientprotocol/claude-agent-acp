@@ -1190,7 +1190,10 @@ export class ClaudeAcpAgent {
    *  `prompt()`/`session/update` path, so we return the outcome immediately
    *  rather than awaiting turn completion. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
-    const session = this.sessions[params.sessionId];
+    const sessionId = params.sessionId;
+    const prompt = params.prompt;
+
+    const session = this.sessions[sessionId];
     if (!session) {
       throw new Error("Session not found");
     }
@@ -1201,6 +1204,11 @@ export class ClaudeAcpAgent {
     // the activated turn and one just submitted but not yet echoed/activated,
     // which is exactly the window in which steering is meaningful.
     const turnInFlight = (session.turnQueue ?? []).some((t) => !t.settled);
+    const promptRequest: PromptRequest = {
+      sessionId: sessionId,
+      prompt: prompt
+    }
+
     if (!turnInFlight) {
       // Race: the turn we meant to steer already finished. Per the protocol the
       // message must not be dropped nor surfaced as an error — start a fresh
@@ -1208,13 +1216,13 @@ export class ClaudeAcpAgent {
       // its PromptResponse is consumed by the normal prompt() path; we only owe
       // the client the outcome. `.catch` keeps the detached promise from
       // becoming an unhandled rejection.
-      this.prompt(params as PromptRequest).catch((error) => {
-        this.logger.error(`Session ${params.sessionId}: steered new turn failed: ${error}`);
+      this.prompt(promptRequest).catch((error) => {
+        this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
       });
       return { outcome: "startedNewTurn" };
     }
 
-    const userMessage = promptToClaude(params as PromptRequest);
+    const userMessage = promptToClaude(promptRequest);
     userMessage.uuid = randomUUID();
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
