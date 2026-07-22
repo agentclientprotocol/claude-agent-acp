@@ -744,6 +744,15 @@ export type ToolUpdateMeta = {
        Agent/Task call that spawned the subagent. Mirrors the SDK's
        `parent_tool_use_id` on streamed subagent messages. */
     parentToolUseId?: string;
+    /* On a "failed" tool_call_update: why the tool never actually ran, so a
+       client can render the denial/cancellation distinctly from a real tool
+       failure. From the SDK's `tool_result_meta` non_execution_kind:
+       "user-rejected", "permission-rule", "interrupted", "cancelled", …
+       (open set). Absent when the tool executed — including real failures. */
+    nonExecutionKind?: string;
+    /* Free-text the user supplied when rejecting the tool call, when the
+       harness collected any. Only ever present alongside nonExecutionKind. */
+    userFeedback?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -3548,6 +3557,12 @@ export class ClaudeAcpAgent {
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
+                // On the wire since CLI 2.1.216 but not in SDKUserMessage's
+                // type, hence the cast. Validated by parseToolResultMeta.
+                toolResultMeta:
+                  message.type === "user"
+                    ? (message as { tool_result_meta?: unknown }).tool_result_meta
+                    : undefined,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -6635,6 +6650,36 @@ function streamedInputRefinement(
   };
 }
 
+/** Validates the SDK user message's `tool_result_meta` sidecar (emitted on the
+ *  wire by CLI ≥ 2.1.216 but absent from sdk.d.ts, hence unknown-typed) into a
+ *  by-tool_use_id lookup. Each entry explains why an is_error tool_result
+ *  carries harness prose instead of the tool's own output — "user-rejected",
+ *  "permission-rule", "interrupted", "cancelled", … (open set: new kinds ship
+ *  on the wire ahead of schema updates, so no enum check). Malformed entries
+ *  are skipped rather than failing the message. */
+function parseToolResultMeta(
+  raw: unknown,
+): Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  let byToolUseId: Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined;
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) {
+      continue;
+    }
+    const { id, non_execution_kind, user_feedback } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || typeof non_execution_kind !== "string") {
+      continue;
+    }
+    (byToolUseId ??= new Map()).set(id, {
+      nonExecutionKind: non_execution_kind,
+      ...(typeof user_feedback === "string" ? { userFeedback: user_feedback } : {}),
+    });
+  }
+  return byToolUseId;
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -6670,6 +6715,10 @@ export function toAcpNotifications(
     // Agent/Task results from the structured subagent report instead of the raw
     // text (which ends in a model-directed agentId/usage trailer).
     toolUseResult?: unknown;
+    // The SDK user message's `tool_result_meta` sidecar, passed raw (it's
+    // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
+    // denied/interrupted tool_call_updates with why the tool never ran.
+    toolResultMeta?: unknown;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -6711,6 +6760,10 @@ export function toAcpNotifications(
       .length === 1
       ? options.toolUseResult
       : undefined;
+
+  // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
+  // messages need no single-block guard.
+  const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
 
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
@@ -6862,6 +6915,12 @@ export function toAcpNotifications(
       case "mcp_tool_result": {
         const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
+        // Why this is_error result carries harness prose instead of tool
+        // output (user-rejected / interrupted / …), when the SDK said so.
+        // Spread into the claudeCode meta of every update emitted below; the
+        // untracked-tool fallback can't carry it (claudeCode metas always
+        // carry `toolName`, which is unknown there).
+        const nonExecution = toolResultMeta?.get(chunk.tool_use_id);
         const toolUse = toolUseCache[chunk.tool_use_id];
         if (!toolUse) {
           // The permission flow may have surfaced this tool_call even though
@@ -6905,6 +6964,7 @@ export function toAcpNotifications(
               _meta: {
                 claudeCode: {
                   toolName: toolUse.name,
+                  ...(nonExecution ?? {}),
                   ...(options?.parentToolUseId ? { parentToolUseId: options.parentToolUseId } : {}),
                 },
               } satisfies ToolUpdateMeta,
@@ -6976,6 +7036,7 @@ export function toAcpNotifications(
             _meta: {
               claudeCode: {
                 toolName: toolUse.name,
+                ...(nonExecution ?? {}),
               },
               ...(toolMeta?.terminal_exit ? { terminal_exit: toolMeta.terminal_exit } : {}),
             } satisfies ToolUpdateMeta,

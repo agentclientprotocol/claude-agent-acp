@@ -2435,6 +2435,154 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
   });
 });
 
+describe("tool_result_meta non-execution stamping", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  const bashToolUse = {
+    type: "tool_use" as const,
+    id: "toolu_bash",
+    name: "Bash",
+    input: { command: "rm -rf build" },
+  };
+
+  const deniedResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_bash",
+    is_error: true,
+    content: "The user doesn't want to proceed with this tool use.",
+  };
+
+  it("stamps nonExecutionKind and userFeedback on the failed tool_call_update", () => {
+    const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+
+    const notifications = toAcpNotifications(
+      [deniedResult] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        toolResultMeta: [
+          { id: "toolu_bash", non_execution_kind: "user-rejected", user_feedback: "use npm" },
+        ],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "failed",
+      _meta: {
+        claudeCode: {
+          toolName: "Bash",
+          nonExecutionKind: "user-rejected",
+          userFeedback: "use npm",
+        },
+      },
+    });
+  });
+
+  it("attributes entries by tool_use_id, so only the flagged result in a batch is stamped", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_bash: bashToolUse,
+      toolu_bash2: { ...bashToolUse, id: "toolu_bash2" },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        deniedResult,
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash2",
+          content: "ok",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_bash", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(2);
+    const [denied, ran] = notifications.map((n) => n.update) as any[];
+    expect(denied._meta.claudeCode).toMatchObject({ nonExecutionKind: "user-rejected" });
+    // No user_feedback on the wire entry → no userFeedback key at all.
+    expect(denied._meta.claudeCode).not.toHaveProperty("userFeedback");
+    expect(ran._meta.claudeCode).not.toHaveProperty("nonExecutionKind");
+  });
+
+  it("ignores a malformed sidecar and malformed entries", () => {
+    for (const malformed of [
+      "user-rejected", // not an array
+      [{ non_execution_kind: "user-rejected" }], // entry missing id
+      [{ id: "toolu_bash", non_execution_kind: 7 }], // kind not a string
+      [null, 42], // entries not objects
+    ]) {
+      const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };
+      const notifications = toAcpNotifications(
+        [deniedResult] as any,
+        "user",
+        "test-session",
+        toolUseCache,
+        mockClient,
+        mockLogger,
+        { toolResultMeta: malformed },
+      );
+
+      expect(notifications).toHaveLength(1);
+      expect((notifications[0].update as any)._meta.claudeCode).not.toHaveProperty(
+        "nonExecutionKind",
+      );
+    }
+  });
+
+  it("stamps the resolve of a permission-surfaced suppressed tool (Task*)", () => {
+    // A TaskGet surfaced as a real tool_call by the permission flow never gets
+    // a tool_call_update from the suppressed Task* branch; the wasEmitted
+    // resolve must carry the denial kind too.
+    const taskGetToolUse = {
+      type: "tool_use" as const,
+      id: "toolu_taskget",
+      name: "TaskGet",
+      input: { taskId: "1" },
+    };
+    const toolUseCache: ToolUseCache = { toolu_taskget: taskGetToolUse };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_taskget",
+          is_error: true,
+          content: "The user doesn't want to proceed with this tool use.",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        emittedToolCalls: new Set(["toolu_taskget"]),
+        toolResultMeta: [{ id: "toolu_taskget", non_execution_kind: "user-rejected" }],
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_taskget",
+      status: "failed",
+      _meta: { claudeCode: { toolName: "TaskGet", nonExecutionKind: "user-rejected" } },
+    });
+  });
+});
+
 describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
   describe("Read", () => {
     const readToolUse = {
