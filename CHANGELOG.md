@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.61.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.60.0...v0.61.0) (2026-07-22)
+
+
+### Features
+
+* **deps:** Bump actions/setup-node from 6.4.0 to 7.0.0 ([#897](https://github.com/agentclientprotocol/claude-agent-acp/issues/897)) ([d9bd36d](https://github.com/agentclientprotocol/claude-agent-acp/commit/d9bd36d8b06764d63656d0387ad9430ec9fcb27d))
+* **deps:** Update to @anthropic-ai/claude-agent-sdk 0.3.217 ([#899](https://github.com/agentclientprotocol/claude-agent-acp/issues/899)) ([edf3af0](https://github.com/agentclientprotocol/claude-agent-acp/commit/edf3af043b6d00e5caca2cc81a2285c477c8b2ab))
+
 ## [0.60.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.59.0...v0.60.0) (2026-07-20)
 
 
