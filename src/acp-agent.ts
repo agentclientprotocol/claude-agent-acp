@@ -2552,9 +2552,9 @@ export class ClaudeAcpAgent {
                 // Push the full slash-command list after a mid-session change
                 // (e.g. skills discovered dynamically as the agent works in a
                 // subdirectory). The client should REPLACE its cached command
-                // list with this payload: supportedCommands() is captured once
-                // at initialize and never reflects mid-session changes, so we
-                // forward message.commands directly rather than re-querying.
+                // list with this payload. Forward message.commands directly —
+                // it's authoritative, and re-querying supportedCommands()
+                // would just return the same list with an extra round-trip.
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
