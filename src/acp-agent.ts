@@ -185,6 +185,11 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** Ceiling for the SDK control round-trip that applies or restores prompt trace
+ *  environment. A timed-out control response leaves the live env unknowable,
+ *  so the session is closed before prompt admission is released. */
+const DEFAULT_TRACE_ENV_CONTROL_TIMEOUT_MS = 10_000;
+
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -365,10 +370,31 @@ type Turn = {
   reject: (error: unknown) => void;
 };
 
+type BaseFlagEnv =
+  | {
+      known: true;
+      value: Record<string, string> | null;
+    }
+  | { known: false };
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
+  /** Arrival-ordered, short critical section for prompt validation, live
+   * settings mutation, and enqueue. It never waits for a Turn to settle. */
+  promptSubmissionActive?: boolean;
+  promptSubmissionQueue?: Array<() => void>;
+  /** Invalidates prompt preparation that began before cancel(). */
+  promptPreparationGeneration?: number;
+  /** Reference count keeps the prompt barrier raised across overlapping
+   * cancel() calls until every awaited interrupt has completed. */
+  cancelInProgressCount?: number;
+  /** Original flag-layer env. A settings path makes the value unknowable, so
+   * trace propagation is rejected rather than replacing unrelated variables. */
+  baseFlagEnv?: BaseFlagEnv;
+  /** Whether the live flag-layer env currently contains prompt trace context. */
+  traceEnvApplied?: boolean;
   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
    *  processing; later entries are queued and will be echoed in order. */
   turnQueue?: Turn[];
@@ -751,6 +777,57 @@ export type NewSessionMeta = {
   };
   additionalRoots?: string[];
 };
+
+/** W3C trace context accepted at the root of `session/prompt.params._meta`. */
+export type PromptMeta = {
+  traceparent?: string;
+  tracestate?: string;
+};
+
+type ParsedPromptTrace =
+  { present: false } | { present: true; traceparent?: string; tracestate?: string };
+
+function initialBaseFlagEnv(settings: Options["settings"]): BaseFlagEnv {
+  if (typeof settings === "string") {
+    return { known: false };
+  }
+  if (settings === undefined || settings.env === undefined) {
+    return { known: true, value: null };
+  }
+  if (
+    settings.env === null ||
+    typeof settings.env !== "object" ||
+    Array.isArray(settings.env) ||
+    Object.values(settings.env).some((value) => typeof value !== "string")
+  ) {
+    return { known: false };
+  }
+  return { known: true, value: { ...settings.env } };
+}
+
+function parsePromptTrace(meta: PromptRequest["_meta"]): ParsedPromptTrace {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return { present: false };
+  }
+
+  const traceparent = meta.traceparent;
+  const tracestate = meta.tracestate;
+  if (typeof traceparent !== "string" && typeof tracestate !== "string") {
+    return { present: false };
+  }
+  return {
+    present: true,
+    ...(typeof traceparent === "string" && { traceparent }),
+    ...(typeof tracestate === "string" && { tracestate }),
+  };
+}
+
+function isPromptPreparationInvalid(session: Session, generation: number): boolean {
+  return (
+    generation !== (session.promptPreparationGeneration ?? 0) ||
+    (session.cancelInProgressCount ?? 0) > 0
+  );
+}
 
 /**
  * Extra metadata for 'gateway' authentication requests.
@@ -1404,6 +1481,8 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /** Timeout for prompt trace env control requests. Mutable for tests. */
+  traceEnvControlTimeoutMs: number = DEFAULT_TRACE_ENV_CONTROL_TIMEOUT_MS;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -1823,49 +1902,217 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private withPromptSubmission<T>(session: Session, work: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const release = () => {
+        const next = session.promptSubmissionQueue?.shift();
+        if (next) {
+          next();
+        } else {
+          session.promptSubmissionActive = false;
+          session.promptSubmissionQueue = undefined;
+        }
+      };
+      const run = () => {
+        session.promptSubmissionActive = true;
+        let pending: Promise<T>;
+        try {
+          pending = work();
+        } catch (error) {
+          release();
+          reject(error);
+          return;
+        }
+        pending.then(
+          (value) => {
+            release();
+            resolve(value);
+          },
+          (error) => {
+            release();
+            reject(error);
+          },
+        );
+      };
+
+      if (session.promptSubmissionActive) {
+        session.promptSubmissionQueue ??= [];
+        session.promptSubmissionQueue.push(run);
+      } else {
+        run();
+      }
+    });
+  }
+
+  private async restoreBaseFlagEnv(session: Session, baseline: BaseFlagEnv): Promise<void> {
+    if (session.queryClosed) {
+      return;
+    }
+    if (!baseline.known) {
+      this.closeQueryStream(session);
+      return;
+    }
+    try {
+      await this.applyTraceEnvSettings(session, baseline.value);
+      session.traceEnvApplied = false;
+    } catch (error) {
+      this.logger.error(
+        "Failed to restore ACP trace context; closing the session because its environment is unknown:",
+        error,
+      );
+      this.closeQueryStream(session);
+    }
+  }
+
+  private async applyTraceEnvSettings(
+    session: Session,
+    env: Record<string, string> | null,
+  ): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        this.closeQueryStream(session);
+        reject(new Error("Timed out while applying ACP trace context."));
+      }, this.traceEnvControlTimeoutMs);
+    });
+    try {
+      await Promise.race([session.query.applyFlagSettings({ env }), timedOut]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
     }
-    // The SDK query stream already terminated (see `queryClosed`); its iterator
-    // can't be revived, so enqueueing here would hang on a deferred that never
-    // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
-    const userMessage = promptToClaude(params);
-    const promptUuid = randomUUID();
-    userMessage.uuid = promptUuid;
+    const generation = session.promptPreparationGeneration ?? 0;
+    const cancellationActiveAtRegistration = (session.cancelInProgressCount ?? 0) > 0;
+    const prepared = await this.withPromptSubmission(session, async () => {
+      if (cancellationActiveAtRegistration) {
+        return { cancelled: true } as const;
+      }
+      if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
+      if (isPromptPreparationInvalid(session, generation)) {
+        return { cancelled: true } as const;
+      }
 
-    // Local-only commands (e.g. `/clear`) return a result without replaying the
-    // user message, so the consumer can't promote the turn from the echo.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    const isLocalOnlyCommand =
-      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+      const promptTrace = parsePromptTrace(params._meta);
+      const shouldUpdateTraceEnv = promptTrace.present || session.traceEnvApplied === true;
+      if (
+        shouldUpdateTraceEnv &&
+        ((session.turnQueue?.some((turn) => !turn.settled) ?? false) ||
+          (session.pendingOrphanResults ?? 0) > 0 ||
+          (session.orphanCommands?.size ?? 0) > 0)
+      ) {
+        throw RequestError.invalidParams(
+          undefined,
+          "Prompt trace context requires an idle session; await pending prompts and cancellation cleanup before retrying.",
+        );
+      }
 
-    // Each prompt is a Turn whose deferred the persistent consumer settles once
-    // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
-    // turn, pushes the user message onto the streaming input, makes sure the
-    // consumer is running, and awaits the deferred.
-    const turn: Turn = {
-      promptUuid,
-      isLocalOnlyCommand,
-      settled: false,
-      resolve: () => {},
-      reject: () => {},
-    };
-    const response = new Promise<PromptResponse>((resolve, reject) => {
-      turn.resolve = resolve;
-      turn.reject = reject;
+      const userMessage = promptToClaude(params);
+      const promptUuid = randomUUID();
+      userMessage.uuid = promptUuid;
+      const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+      const isLocalOnlyCommand =
+        firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+
+      const baseline = session.baseFlagEnv ?? {
+        known: true,
+        value: null,
+      };
+      let envApplied = false;
+      if (shouldUpdateTraceEnv) {
+        if (!baseline.known) {
+          throw RequestError.invalidParams(
+            undefined,
+            "Prompt trace context requires inline or absent session settings; an opaque settings path cannot be updated safely.",
+          );
+        }
+        const baseEnv = { ...(baseline.value ?? {}) };
+        delete baseEnv.TRACEPARENT;
+        delete baseEnv.TRACESTATE;
+        const env = promptTrace.present
+          ? {
+              ...baseEnv,
+              ...(promptTrace.traceparent !== undefined && {
+                TRACEPARENT: promptTrace.traceparent,
+              }),
+              ...(promptTrace.tracestate !== undefined && {
+                TRACESTATE: promptTrace.tracestate,
+              }),
+            }
+          : baseline.value;
+        try {
+          await this.applyTraceEnvSettings(session, env);
+          envApplied = true;
+        } catch {
+          if (isPromptPreparationInvalid(session, generation)) {
+            return { cancelled: true } as const;
+          }
+          throw RequestError.internalError(undefined, "Failed to apply ACP trace context.");
+        }
+      }
+
+      const compensateTraceEnv = async () => {
+        if (!envApplied) {
+          return;
+        }
+        envApplied = false;
+        await this.restoreBaseFlagEnv(session, baseline);
+      };
+
+      if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+        await compensateTraceEnv();
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
+      if (isPromptPreparationInvalid(session, generation)) {
+        await compensateTraceEnv();
+        return { cancelled: true } as const;
+      }
+
+      const turn: Turn = {
+        promptUuid,
+        isLocalOnlyCommand,
+        settled: false,
+        resolve: () => {},
+        reject: () => {},
+      };
+      const response = new Promise<PromptResponse>((resolve, reject) => {
+        turn.resolve = resolve;
+        turn.reject = reject;
+      });
+
+      session.turnQueue ??= [];
+      session.turnQueue.push(turn);
+      try {
+        session.input.push(userMessage);
+        this.ensureConsumer(session, params.sessionId);
+      } catch {
+        turn.settled = true;
+        session.turnQueue = session.turnQueue.filter((queued) => queued !== turn);
+        await compensateTraceEnv();
+        throw RequestError.internalError(undefined, "Failed to enqueue the prompt.");
+      }
+
+      session.traceEnvApplied = promptTrace.present;
+      return { cancelled: false, response } as const;
     });
 
-    session.turnQueue ??= [];
-    session.turnQueue.push(turn);
-    session.input.push(userMessage);
-    this.ensureConsumer(session, params.sessionId);
-    return response;
+    if (prepared.cancelled) {
+      return { stopReason: "cancelled" };
+    }
+    return prepared.response;
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -4027,6 +4274,7 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       return;
     }
+    session.promptPreparationGeneration = (session.promptPreparationGeneration ?? 0) + 1;
     session.cancelled = true;
     // Capture the orphan-accounting lane before anything can await: the
     // consumer latches msgLifecycleV1 when it drains the first system/init,
@@ -4173,7 +4421,12 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
-    const receipt = await session.query.interrupt();
+    session.cancelInProgressCount = (session.cancelInProgressCount ?? 0) + 1;
+    const receipt = await Promise.resolve()
+      .then(() => session.query.interrupt())
+      .finally(() => {
+        session.cancelInProgressCount = Math.max(0, (session.cancelInProgressCount ?? 0) - 1);
+      });
     // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
     // lists exactly which queued messages survive the interrupt and will still
     // run. An orphaned turn whose uuid is absent was dropped by the interrupt
@@ -5841,6 +6094,10 @@ export class ClaudeAcpAgent {
       query: q,
       input: input,
       cancelled: false,
+      promptPreparationGeneration: 0,
+      cancelInProgressCount: 0,
+      baseFlagEnv: initialBaseFlagEnv(options.settings),
+      traceEnvApplied: false,
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,

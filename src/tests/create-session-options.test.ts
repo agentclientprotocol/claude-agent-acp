@@ -59,7 +59,6 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
-
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
@@ -203,6 +202,50 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
+  });
+
+  it("seeds an empty trace-env baseline when settings have no env", async () => {
+    const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect((agent.sessions[response.sessionId] as any).baseFlagEnv).toEqual({
+      known: true,
+      value: null,
+    });
+    expect((agent.sessions[response.sessionId] as any).traceEnvApplied).toBe(false);
+  });
+
+  it("seeds the trace-env baseline from inline flag settings", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { settings: { env: { BASELINE_ENV: "initial" } } },
+        },
+      },
+    });
+
+    const baseline = (agent.sessions[response.sessionId] as any).baseFlagEnv;
+    expect(baseline).toEqual({
+      known: true,
+      value: { BASELINE_ENV: "initial" },
+    });
+    (capturedOptions!.settings as { env: Record<string, string> }).env.BASELINE_ENV = "mutated";
+    expect(baseline.value.BASELINE_ENV).toBe("initial");
+  });
+
+  it("marks a path-based trace-env baseline as unknown", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { settings: "/opaque/settings.json" },
+        },
+      },
+    });
+
+    expect((agent.sessions[response.sessionId] as any).baseFlagEnv).toEqual({ known: false });
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {

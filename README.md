@@ -30,6 +30,25 @@ with `_meta.claudeCode.subagent = true`.
 Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
 the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
 
+## Trace context metadata
+
+Send W3C trace context on a prompt through ACP's standard root-level `_meta` fields:
+
+```json
+{
+  "sessionId": "existing-session-id",
+  "prompt": [{ "type": "text", "text": "Run the task" }],
+  "_meta": {
+    "traceparent": "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+    "tracestate": "vendor=value"
+  }
+}
+```
+
+String-valued `traceparent` and `tracestate` are propagated for the prompt; `baggage` is currently
+ignored. Trace context changes require an idle session, so await the previous `session/prompt`
+response before sending a prompt with different trace metadata.
+
 ## Contribution Policy
 
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:

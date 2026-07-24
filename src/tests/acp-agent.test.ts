@@ -123,13 +123,13 @@ const cancelledTurnUsage = {
 };
 
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
- *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
- *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
+ *  of iteration so a bare generator doesn't trip "x is not a function". */
 function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
+    applyFlagSettings: vi.fn(async () => {}),
   }) as any;
 }
 
@@ -167,6 +167,10 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
+    promptPreparationGeneration: 0,
+    cancelInProgressCount: 0,
+    baseFlagEnv: { known: true, value: null },
+    traceEnvApplied: false,
     ...overrides,
   } as any;
 }
@@ -188,6 +192,255 @@ function injectGeneratorSession(
   });
   return input;
 }
+
+describe("ACP prompt trace context", () => {
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function setupSession(options: { beforeResult?: () => Promise<void>; overrides?: any } = {}) {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const input = injectGeneratorSession(
+      agent,
+      (stream) => {
+        async function* generator() {
+          for await (const message of stream) {
+            yield userEcho(message);
+            await options.beforeResult?.();
+            yield {
+              type: "result",
+              subtype: "success",
+              stop_reason: "end_turn",
+              is_error: false,
+              result: "ok",
+              duration_ms: 0,
+              duration_api_ms: 0,
+              num_turns: 1,
+              total_cost_usd: 0,
+              usage: {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+              modelUsage: {},
+              permission_denials: [],
+              uuid: randomUUID(),
+              session_id: "test-session",
+            };
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          }
+        }
+        return generator();
+      },
+      options.overrides,
+    );
+    const query = agent.sessions["test-session"].query as any;
+    const push = vi.spyOn(input, "push");
+    return { agent, query, push };
+  }
+
+  const prompt = (meta?: PromptRequest["_meta"]): PromptRequest => ({
+    sessionId: "test-session",
+    prompt: [{ type: "text", text: "trace me" }],
+    ...(meta && { _meta: meta }),
+  });
+
+  it("maps trace metadata to Claude Code env and clears it on the next prompt", async () => {
+    const { agent, query, push } = setupSession();
+
+    await agent.prompt(
+      prompt({
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
+      }),
+    );
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [
+        {
+          env: {
+            TRACEPARENT: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+            TRACESTATE: "vendor=value",
+          },
+        },
+      ],
+      [{ env: null }],
+    ]);
+    expect(query.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      push.mock.invocationCallOrder[0],
+    );
+    expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("80e1afed08e019fc");
+  });
+
+  it("preserves inline flag-layer env while applying and clearing trace context", async () => {
+    const { agent, query } = setupSession({
+      overrides: {
+        baseFlagEnv: {
+          known: true,
+          value: {
+            BASE_ENV: "base",
+            TRACEPARENT: "ambient-parent",
+            TRACESTATE: "ambient=state",
+          },
+        },
+      },
+    });
+
+    await agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [
+        {
+          env: {
+            BASE_ENV: "base",
+            TRACEPARENT: "00-trace-parent",
+          },
+        },
+      ],
+      [
+        {
+          env: {
+            BASE_ENV: "base",
+            TRACEPARENT: "ambient-parent",
+            TRACESTATE: "ambient=state",
+          },
+        },
+      ],
+    ]);
+  });
+
+  it("ignores baggage metadata", async () => {
+    const { agent, query, push } = setupSession();
+
+    await agent.prompt(
+      prompt({
+        baggage: "tenant=ignored",
+      }),
+    );
+
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+    expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("tenant=ignored");
+  });
+
+  it("rejects trace mutation while another prompt is still running", async () => {
+    const result = deferred();
+    const { agent, query, push } = setupSession({ beforeResult: () => result.promise });
+
+    const ordinary = agent.prompt(prompt());
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "requires an idle session",
+    );
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+
+    result.resolve();
+    await ordinary;
+  });
+
+  it.each([
+    ["an untraced prompt", undefined],
+    ["another traced prompt", { traceparent: "00-second-trace-parent" }],
+  ])("rejects %s while a traced prompt is still running", async (_name, nextMeta) => {
+    const result = deferred();
+    const { agent, query, push } = setupSession({ beforeResult: () => result.promise });
+
+    const first = agent.prompt(prompt({ traceparent: "00-first-trace-parent" }));
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    await expect(agent.prompt(prompt(nextMeta))).rejects.toThrow("requires an idle session");
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
+    expect(push).toHaveBeenCalledTimes(1);
+
+    result.resolve();
+    await first;
+  });
+
+  it("rejects trace propagation when settings use an opaque path", async () => {
+    const { agent, query, push } = setupSession({
+      overrides: { baseFlagEnv: { known: false } },
+    });
+
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "opaque settings path",
+    );
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("rolls trace env back when cancellation invalidates prompt preparation", async () => {
+    const apply = deferred();
+    const { agent, query, push } = setupSession();
+    query.applyFlagSettings.mockImplementationOnce(() => apply.promise);
+
+    const pending = agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+    await vi.waitFor(() => expect(query.applyFlagSettings).toHaveBeenCalledTimes(1));
+    await agent.cancel({ sessionId: "test-session" });
+    apply.resolve();
+
+    await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [
+        {
+          env: {
+            TRACEPARENT: "00-trace-parent",
+          },
+        },
+      ],
+      [{ env: null }],
+    ]);
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it("closes the session when applying trace env times out", async () => {
+    const { agent, query, push } = setupSession();
+    agent.traceEnvControlTimeoutMs = 5;
+    query.applyFlagSettings.mockImplementationOnce(() => new Promise(() => {}));
+
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "Failed to apply ACP trace context",
+    );
+
+    expect(push).not.toHaveBeenCalled();
+    expect(query.close).toHaveBeenCalledTimes(1);
+    expect(agent.sessions["test-session"].queryClosed).toBe(true);
+    await expect(agent.prompt(prompt())).rejects.toThrow("session has ended");
+  });
+
+  it("bounds a rollback wait and logs before closing the session", async () => {
+    const { agent, query, push } = setupSession();
+    agent.traceEnvControlTimeoutMs = 5;
+    const log = vi.spyOn(agent.logger, "error");
+    push.mockImplementationOnce(() => {
+      throw new Error("input closed");
+    });
+    query.applyFlagSettings
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "Failed to enqueue the prompt",
+    );
+
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to restore ACP trace context"),
+      expect.any(Error),
+    );
+    expect(query.close).toHaveBeenCalledTimes(1);
+    expect(agent.sessions["test-session"].queryClosed).toBe(true);
+  });
+});
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
@@ -1735,6 +1988,37 @@ describe("escape markdown", () => {
 });
 
 describe("prompt conversion", () => {
+  it("keeps ACP trace context out of model-visible SDK messages", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [{ type: "text", text: "trace me" }],
+      _meta: {
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
+        baggage: "tenant=example",
+        "zed.dev/debugMode": true,
+      },
+    });
+
+    expect(JSON.stringify(message)).not.toContain("80e1afed08e019fc");
+    expect(JSON.stringify(message)).not.toContain("tenant=example");
+    expect(message).not.toHaveProperty("_meta");
+  });
+
+  it("ignores non-string trace context values", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [{ type: "text", text: "trace me" }],
+      _meta: {
+        traceparent: 123,
+        tracestate: null,
+        baggage: ["invalid"],
+      },
+    });
+
+    expect(message).not.toHaveProperty("_meta");
+  });
+
   it("should not change built-in slash commands", () => {
     const message = promptToClaude({
       sessionId: "test",
