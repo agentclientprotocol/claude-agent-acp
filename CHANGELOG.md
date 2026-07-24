@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.62.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.61.0...v0.62.0) (2026-07-24)
+
+
+### Features
+
+* **deps:** Bump @hono/node-server from 1.19.14 to 1.19.15 ([#908](https://github.com/agentclientprotocol/claude-agent-acp/issues/908)) ([5193604](https://github.com/agentclientprotocol/claude-agent-acp/commit/51936049e175274de8e0fd90bc1be2af988c3ca6))
+* **deps:** Bump media-typer from 1.1.0 to 1.1.1 ([#909](https://github.com/agentclientprotocol/claude-agent-acp/issues/909)) ([5d35001](https://github.com/agentclientprotocol/claude-agent-acp/commit/5d35001563ffd702a29c3bac3b7ca134e40c77f8))
+* **deps:** Bump the minor group with 2 updates ([#900](https://github.com/agentclientprotocol/claude-agent-acp/issues/900)) ([809d41c](https://github.com/agentclientprotocol/claude-agent-acp/commit/809d41c6b7c9e7ba3cb5b206d00793a70edba64a))
+* **deps:** Bump the minor group with 2 updates ([#907](https://github.com/agentclientprotocol/claude-agent-acp/issues/907)) ([14d0627](https://github.com/agentclientprotocol/claude-agent-acp/commit/14d06273c01ad4ae944912e36700f6b5599c4c4d))
+* Update to claude-agent-sdk 0.3.218 ([#904](https://github.com/agentclientprotocol/claude-agent-acp/issues/904)) ([8cbaf97](https://github.com/agentclientprotocol/claude-agent-acp/commit/8cbaf97254576089a3b5ee6ae222fb763003c01d))
+
 ## [0.61.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.60.0...v0.61.0) (2026-07-22)
 
 
