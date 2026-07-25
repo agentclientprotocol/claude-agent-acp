@@ -184,6 +184,12 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** `tool_progress` heartbeats report under a derived `<tool_use_id>-heartbeat-<n>`
+ *  rather than the id of the call they describe. The beat carries `heartbeat: true`,
+ *  but that flag alone can't recover the original id, so the suffix has to be
+ *  stripped. Revisit if the SDK stops deriving the id this way. */
+const HEARTBEAT_ID_SUFFIX = /-heartbeat-\d+$/;
+
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -3708,11 +3714,22 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
+            // Heartbeat beats arrive under a synthetic `<tool_use_id>-heartbeat-<n>`
+            // that no `tool_call` was ever emitted for, so forwarding it verbatim
+            // leaves the client resolving an id it has never seen (the same trap
+            // `ensureToolCallEmitted` documents for #851). Report the beat against
+            // the call it describes instead.
+            const toolCallId = message.tool_use_id.replace(HEARTBEAT_ID_SUFFIX, "");
+            // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
+            // beat that races past completion from reopening a finished call.
+            if (!session.emittedToolCalls.has(toolCallId)) {
+              break;
+            }
             await sendUpdate({
               sessionId: message.session_id,
               update: {
                 sessionUpdate: "tool_call_update",
-                toolCallId: message.tool_use_id,
+                toolCallId,
                 status: "in_progress",
                 _meta: {
                   claudeCode: {

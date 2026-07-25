@@ -11067,3 +11067,119 @@ describe("agent selection config option", () => {
     });
   });
 });
+
+describe("tool_progress heartbeats", () => {
+  // Heartbeat beats identify themselves with a derived
+  // `<tool_use_id>-heartbeat-<n>` that never had a `tool_call` of its own.
+  // Forwarding that id verbatim made clients synthesize a phantom tool call per
+  // beat, one every ~30s for the life of the tool.
+  type ToolCallUpdate = Extract<
+    SessionNotification["update"],
+    { sessionUpdate: "tool_call_update" }
+  >;
+
+  /** Run a turn carrying `messages`, with `inFlight` tool calls already emitted,
+   *  and return the tool_call_updates it produced. */
+  async function run(messages: any[], inFlight: string[]) {
+    const updates: SessionNotification[] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const { value, done } = await input[Symbol.asyncIterator]().next();
+      if (!done && value) {
+        yield {
+          type: "user",
+          message: value.message,
+          parent_tool_use_id: null,
+          uuid: value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        usage: {},
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      emittedToolCalls: new Set(inFlight),
+    });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    return updates
+      .map((n) => n.update)
+      .filter((u): u is ToolCallUpdate => u.sessionUpdate === "tool_call_update");
+  }
+
+  function beat(toolUseId: string, extra: Record<string, any> = {}) {
+    return {
+      type: "tool_progress",
+      tool_use_id: toolUseId,
+      tool_name: "Bash",
+      parent_tool_use_id: null,
+      elapsed_time_seconds: 30,
+      heartbeat: true,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...extra,
+    };
+  }
+
+  it("reports every beat against the tool call it describes", async () => {
+    const sent = await run(
+      [beat("toolu_abc-heartbeat-0"), beat("toolu_abc-heartbeat-1")],
+      ["toolu_abc"],
+    );
+
+    expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_abc", "toolu_abc"]);
+    expect(sent[0].status).toBe("in_progress");
+  });
+
+  // Covers a call that was never emitted and one whose tool_result already
+  // removed it, so a straggling beat can't reopen a call seen to finish.
+  it("drops a beat for a tool call that is not in flight", async () => {
+    expect(await run([beat("toolu_ghost-heartbeat-0")], [])).toHaveLength(0);
+  });
+
+  it("preserves the elapsed time and subagent meta", async () => {
+    const sent = await run(
+      [
+        beat("toolu_task-heartbeat-0", {
+          elapsed_time_seconds: 90,
+          tool_name: "Task",
+          subagent_type: "code-reviewer",
+        }),
+      ],
+      ["toolu_task"],
+    );
+
+    expect(sent[0].toolCallId).toBe("toolu_task");
+    expect((sent[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Task",
+      toolResponse: { elapsedTimeSeconds: 90, subagentType: "code-reviewer" },
+    });
+  });
+
+  it("leaves an unsuffixed progress message alone", async () => {
+    const sent = await run([beat("toolu_plain", { heartbeat: undefined })], ["toolu_plain"]);
+
+    expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_plain"]);
+  });
+});
