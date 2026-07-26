@@ -20,8 +20,8 @@
  *        - "promptRequired" the turn had already finished (an unavoidable race),
  *                           so the message was NOT consumed and the client must
  *                           start a normal `session/prompt` to send it.
- *      Both are success outcomes — the message is never dropped and the race is
- *      never surfaced as an error.
+ *      Both are success outcomes: the Adapter either consumes the message in
+ *      the running turn or leaves it Host-owned for explicit prompt delivery.
  *
  * This example launches the agent as a subprocess, starts a deliberately
  * long-running prompt, and — as soon as the agent begins streaming — injects a
@@ -42,7 +42,13 @@ import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { client as acpClient, methods, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  client as acpClient,
+  methods,
+  ndJsonStream,
+  type PromptRequest,
+  type PromptResponse,
+} from "@agentclientprotocol/sdk";
 
 /** The steering extension method, per the ACP steering wire protocol. */
 const STEERING_METHOD = "_session/steering";
@@ -98,104 +104,116 @@ async function main() {
   });
   child.on("error", (err) => {
     log(`failed to spawn agent (${AGENT_ENTRY}): ${err}`);
-    process.exit(1);
   });
 
-  const stream = ndJsonStream(
-    Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
-    Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
-  );
+  try {
+    const stream = ndJsonStream(
+      Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
+    );
 
-  // Resolves the first time the agent streams assistant text — our signal that
-  // the turn is genuinely underway and therefore steerable.
-  let signalFirstOutput = () => {};
-  const firstOutput = new Promise<void>((resolve) => (signalFirstOutput = resolve));
+    // Resolves the first time the agent streams assistant text — our signal that
+    // the turn is genuinely underway and therefore steerable.
+    let signalFirstOutput = () => {};
+    const firstOutput = new Promise<void>((resolve) => (signalFirstOutput = resolve));
 
-  const connection = acpClient({ name: "steering-example" })
-    .onNotification(methods.client.session.update, (ctx) => {
-      const update = ctx.params.update;
-      if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-        process.stdout.write(update.content.text);
-        signalFirstOutput();
+    const connection = acpClient({ name: "steering-example" })
+      .onNotification(methods.client.session.update, (ctx) => {
+        const update = ctx.params.update;
+        if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+          process.stdout.write(update.content.text);
+          signalFirstOutput();
+        }
+      })
+      // Auto-approve permission prompts so the turn is never blocked on us.
+      .onRequest(methods.client.session.requestPermission, (ctx) => {
+        const options = ctx.params.options;
+        const option = options.find((o) => o.kind === "allow_once") ?? options[0];
+        return { outcome: { outcome: "selected", optionId: option.optionId } };
+      })
+      // Minimal file-system stubs; the example prompts don't touch files.
+      .onRequest(methods.client.fs.readTextFile, () => ({ content: "" }))
+      .onRequest(methods.client.fs.writeTextFile, () => ({}))
+      .connect(stream);
+
+    try {
+      const agent = connection.agent;
+
+      // 1. Initialize and confirm the agent advertises steering. Per the wire
+      //    protocol the capability lives at the TOP-LEVEL `_meta` of the initialize
+      //    result — a sibling of `agentCapabilities`, not nested inside it.
+      const init = await agent.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+      });
+      const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)
+        ?.steering;
+      if (steering?.supported !== true || steering.idleBehavior !== "promptRequired") {
+        throw new Error("agent does not advertise the promptRequired steering contract");
       }
-    })
-    // Auto-approve permission prompts so the turn is never blocked on us.
-    .onRequest(methods.client.session.requestPermission, (ctx) => {
-      const options = ctx.params.options;
-      const option = options.find((o) => o.kind === "allow_once") ?? options[0];
-      return { outcome: { outcome: "selected", optionId: option.optionId } };
-    })
-    // Minimal file-system stubs; the example prompts don't touch files.
-    .onRequest(methods.client.fs.readTextFile, () => ({ content: "" }))
-    .onRequest(methods.client.fs.writeTextFile, () => ({}))
-    .connect(stream);
+      log(`agent steering idle behavior: ${steering.idleBehavior}`);
 
-  const agent = connection.agent;
+      // 2. Open a session.
+      const { sessionId } = await agent.request(methods.agent.session.new, {
+        cwd: CWD,
+        mcpServers: [],
+      });
+      log(`session: ${sessionId}`);
 
-  // 1. Initialize and confirm the agent advertises steering. Per the wire
-  //    protocol the capability lives at the TOP-LEVEL `_meta` of the initialize
-  //    result — a sibling of `agentCapabilities`, not nested inside it.
-  const init = await agent.request(methods.agent.initialize, {
-    protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
-  });
-  const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)?.steering;
-  if (steering?.supported !== true || steering.idleBehavior !== "promptRequired") {
-    throw new Error("agent does not advertise the promptRequired steering contract");
+      // 3. Start a long turn, but DON'T await it yet — we need it in flight so we
+      //    can steer it. Its output streams through the notification handler above.
+      log(`prompt: ${PROMPT}`);
+      process.stdout.write("\n----- agent output -----\n");
+      const turn = agent.request(methods.agent.session.prompt, {
+        sessionId,
+        prompt: [{ type: "text", text: PROMPT }],
+      });
+
+      // 4. Once the turn is producing output, inject the follow-up. Wait for the
+      //    first streamed chunk (with a fallback) plus a beat, so the steer clearly
+      //    lands mid-turn.
+      await Promise.race([firstOutput, delay(5000)]);
+      await delay(1000);
+
+      process.stdout.write("\n");
+      log(`steer: ${STEER}`);
+      const steerRequest: SteeringRequest = {
+        sessionId,
+        prompt: [{ type: "text", text: STEER }],
+      };
+      const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
+      log(`steer outcome: ${result.outcome}`);
+
+      if (result.outcome === "promptRequired") {
+        // The target turn already settled, so steering did not consume the message.
+        // Start a normal session/prompt on the same session to deliver it — that
+        // request owns the continuation's updates and terminal response.
+        log(`steer fallback: ${result.reason}; starting a normal session/prompt`);
+        const continuationRequest: PromptRequest = {
+          sessionId: steerRequest.sessionId,
+          prompt: steerRequest.prompt,
+        };
+        const continuation = await agent.request<PromptResponse, PromptRequest>(
+          methods.agent.session.prompt,
+          continuationRequest,
+        );
+        log(`continuation stopReason: ${continuation.stopReason}`);
+      }
+
+      // 5. Await the original turn. With outcome "injected" the steer already
+      //    reshaped the output above; the promptRequired branch owns its own turn.
+      const response = await turn;
+      log(`original turn stopReason: ${response.stopReason}`);
+      process.stdout.write("\n----- end of agent output -----\n");
+    } finally {
+      connection.close();
+    }
+  } finally {
+    child.kill();
   }
-  log(`agent steering idle behavior: ${steering.idleBehavior}`);
-
-  // 2. Open a session.
-  const { sessionId } = await agent.request(methods.agent.session.new, {
-    cwd: CWD,
-    mcpServers: [],
-  });
-  log(`session: ${sessionId}`);
-
-  // 3. Start a long turn, but DON'T await it yet — we need it in flight so we
-  //    can steer it. Its output streams through the notification handler above.
-  log(`prompt: ${PROMPT}`);
-  process.stdout.write("\n----- agent output -----\n");
-  const turn = agent.request(methods.agent.session.prompt, {
-    sessionId,
-    prompt: [{ type: "text", text: PROMPT }],
-  });
-
-  // 4. Once the turn is producing output, inject the follow-up. Wait for the
-  //    first streamed chunk (with a fallback) plus a beat, so the steer clearly
-  //    lands mid-turn.
-  await Promise.race([firstOutput, delay(5000)]);
-  await delay(1000);
-
-  process.stdout.write("\n");
-  log(`steer: ${STEER}`);
-  const steerRequest: SteeringRequest = {
-    sessionId,
-    prompt: [{ type: "text", text: STEER }],
-  };
-  const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
-  log(`steer outcome: ${result.outcome}`);
-
-  if (result.outcome === "promptRequired") {
-    // The target turn already settled, so steering did not consume the message.
-    // Start a normal session/prompt on the same session to deliver it — that
-    // request owns the continuation's updates and terminal response.
-    log(`steer fallback: ${result.reason}; starting a normal session/prompt`);
-    const continuation = await agent.request(methods.agent.session.prompt, steerRequest);
-    log(`continuation stopReason: ${continuation.stopReason}`);
-  }
-
-  // 5. Await the original turn. With outcome "injected" the steer already
-  //    reshaped the output above; the promptRequired branch owns its own turn.
-  const response = await turn;
-  log(`original turn stopReason: ${response.stopReason}`);
-  process.stdout.write("\n----- end of agent output -----\n");
-
-  connection.close();
-  child.kill();
 }
 
 main().catch((err) => {
   log(`fatal: ${err?.stack ?? err}`);
-  process.exit(1);
+  process.exitCode = 1;
 });
