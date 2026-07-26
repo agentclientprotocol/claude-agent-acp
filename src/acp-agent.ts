@@ -216,21 +216,14 @@ export type SteerRequest = {
   prompt: PromptRequest["prompt"];
 };
 
-/** Where a steering message was accepted, per the wire protocol's two
- *  successful outcomes:
- *   - `injected`: a turn was still running and the message was applied to it;
- *   - `startedNewTurn`: the turn we meant to steer had already finished (an
- *     unavoidable race), so the message began a fresh turn instead of being
- *     dropped.
- *  Both are success results — never a JSON-RPC error — and tell the client
- *  where the message landed. */
-type SteerOutcome = "injected" | "startedNewTurn";
-
-/** Result of a {@link STEER_METHOD} request: the single required `outcome`
- *  field the client reads to learn where its steering message was accepted. */
-export type SteerResponse = {
-  outcome: SteerOutcome;
-};
+/** Result of a {@link STEER_METHOD} request. `injected` means the message joined
+ *  the running turn; `promptRequired` is the expected race outcome when the
+ *  target turn settled before steering arrived — in that branch the prompt
+ *  remains Host-owned and was NOT enqueued, injected, or otherwise consumed by
+ *  the Adapter, so the Host retries it through a normal `session/prompt` on the
+ *  same session. Both are success results, never JSON-RPC errors. */
+export type SteerResponse =
+  { outcome: "injected" } | { outcome: "promptRequired"; reason: "noRunningTurn" };
 
 /** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
  *  content blocks are handed to `promptToClaude`, which tolerates unknown block
@@ -1440,10 +1433,14 @@ export class ClaudeAcpAgent {
       // Top-level `_meta` (sibling of `agentCapabilities`), per the ACP steering
       // wire protocol: advertises the `_session/steering` extension request so
       // clients know they may inject a follow-up into the running turn (see
-      // STEER_METHOD) instead of queuing it as a separate `session/prompt`.
+      // STEER_METHOD) instead of queuing it as a separate `session/prompt`. The
+      // `idleBehavior` narrows the contract: when the target turn has already
+      // settled, steering returns `promptRequired` (Host-owned retry) rather
+      // than starting a detached turn the client cannot own.
       _meta: {
         steering: {
           supported: true,
+          idleBehavior: "promptRequired",
         },
       },
     };
@@ -1743,11 +1740,12 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  /** Steer the session per the ACP steering wire protocol: apply a follow-up
-   *  message to the turn that is currently running, or — if that turn already
-   *  finished — start a fresh turn with it. Never drops the message and never
-   *  returns a JSON-RPC error for the "arrived too late" race; both paths are
-   *  success outcomes (see {@link SteerOutcome}).
+  /** Steer the session per the ACP steering wire protocol: inject a follow-up
+   *  message into the turn that is currently running. If that turn already
+   *  settled (the unavoidable "arrived too late" race), the message is left
+   *  untouched and the Host is told to start a normal `session/prompt`
+   *  continuation on the same session — steering never starts a detached turn
+   *  and never returns a JSON-RPC error for the race (see {@link SteerResponse}).
    *
    *  When a turn is in flight this injects (returns `injected`): unlike
    *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
@@ -1761,15 +1759,15 @@ export class ClaudeAcpAgent {
    *  this response.
    *
    *  When the session is idle (no unsettled turn — the turn we meant to steer
-   *  raced ahead and finished), this starts a normal new turn with the message
-   *  and returns `startedNewTurn`. That turn is fire-and-forget from the steer
-   *  request's view: its `PromptResponse` and output flow through the usual
-   *  `prompt()`/`session/update` path, so we return the outcome immediately
-   *  rather than awaiting turn completion. */
+   *  raced ahead and finished), this returns `promptRequired` WITHOUT calling
+   *  `prompt()`, pushing SDK input, or mutating `turnQueue`: the content stays
+   *  Host-owned so the Host can submit it through a standard `session/prompt`
+   *  whose updates, cancellation, error, usage, and terminal response all have
+   *  an owning request. The check for an unsettled turn and the active-path
+   *  `session.input.push(...)` stay in one synchronous section so the selected
+   *  turn cannot settle between deciding to inject and enqueueing the message. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
-    const prompt = params.prompt;
-
     const session = this.sessions[sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -1777,28 +1775,25 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+
     // "A turn is running" = the queue holds an unsettled turn. This covers both
     // the activated turn and one just submitted but not yet echoed/activated,
-    // which is exactly the window in which steering is meaningful.
-    const turnInFlight = (session.turnQueue ?? []).some((t) => !t.settled);
-    const promptRequest: PromptRequest = {
-      sessionId: sessionId,
-      prompt: prompt,
-    };
-
+    // which is exactly the window in which steering is meaningful. This check
+    // and the active-path push below stay in one synchronous section so the
+    // turn cannot settle in the gap between deciding to inject and enqueueing.
+    const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
     if (!turnInFlight) {
-      // Race: the turn we meant to steer already finished. Per the protocol the
-      // message must not be dropped nor surfaced as an error — start a fresh
-      // turn with it. Don't await: the new turn streams via session/update and
-      // its PromptResponse is consumed by the normal prompt() path; we only owe
-      // the client the outcome. `.catch` keeps the detached promise from
-      // becoming an unhandled rejection.
-      this.prompt(promptRequest).catch((error) => {
-        this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
-      });
-      return { outcome: "startedNewTurn" };
+      // Race: the turn we meant to steer already finished. Do NOT start a
+      // detached turn — its PromptResponse would have no owning ACP request.
+      // Leave the content untouched and tell the Host to retry via a normal
+      // session/prompt on the same session (preserving conversation context).
+      return { outcome: "promptRequired", reason: "noRunningTurn" };
     }
 
+    const promptRequest: PromptRequest = {
+      sessionId,
+      prompt: params.prompt,
+    };
     const userMessage = promptToClaude(promptRequest);
     userMessage.uuid = randomUUID();
     // Deliver into the running turn rather than queuing behind it as a fresh
