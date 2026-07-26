@@ -491,6 +491,62 @@ describe("Bash terminal output", () => {
       });
     });
 
+    it("keys the terminal metas off the tool_use id, which is what was announced", () => {
+      // `toolInfoFromToolUse` announces the terminal as `toolUse.id`, so the
+      // result's metas have to use the same value for the client to match them
+      // up. A result block that disagrees (or omits `tool_use_id`) must not be
+      // allowed to retarget them.
+      const toolResult = {
+        ...makeBashResult("out", "", 0),
+        tool_use_id: "toolu_something_else",
+      };
+      const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("falls back to the result's tool_use_id when the tool_use is unavailable", () => {
+      const toolResult = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(toolResult, { name: "Bash" }, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("renders a code block instead of a dangling terminal when no id is available", () => {
+      // Previously this emitted `terminal_id: ""` for all three metas. Nothing
+      // on the client has a terminal under that id, so the output was stranded
+      // (Zed buffers output/exit for unknown terminals indefinitely) and the
+      // user saw an empty terminal. Degrade to the non-terminal rendering.
+      // `tool_use_id` is required on every result-block type, so a block without
+      // it can only arrive at runtime (an older or non-conforming emitter). The
+      // source guards for it with `"tool_use_id" in toolResult`, so exercise that
+      // path with a cast rather than pretending the type allows it.
+      const { content, type } = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(
+        { content, type } as unknown as Parameters<typeof toolUpdateFromToolResult>[0],
+        { name: "Bash" },
+        true,
+      );
+
+      expect(update._meta).toBeUndefined();
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\nout\n```" },
+        },
+      ]);
+    });
+
     it("should include exit_code from return_code in terminal_exit", () => {
       const toolResult = makeBashResult("", "command not found", 127);
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);

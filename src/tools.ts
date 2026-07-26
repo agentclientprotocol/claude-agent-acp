@@ -686,7 +686,18 @@ export function toolUpdateFromToolResult(
 
     case "Bash": {
       const result = toolResult.content;
-      const terminalId = "tool_use_id" in toolResult ? String(toolResult.tool_use_id) : "";
+      // The terminal was announced under the tool_use's own id (see
+      // `toolInfoFromToolUse`), so key the output/exit metas off that: it is the
+      // id the client actually created a terminal for. `toolResult.tool_use_id`
+      // is the same value whenever present — the caller looks the tool_use up by
+      // it — so preferring `toolUse.id` only adds a source for the case where the
+      // result block carries no id at all.
+      const terminalId: string | undefined =
+        toolUse?.id !== undefined
+          ? String(toolUse.id)
+          : "tool_use_id" in toolResult
+            ? String(toolResult.tool_use_id)
+            : undefined;
       const isError = "is_error" in toolResult && toolResult.is_error;
 
       // Extract output and exit code from either format:
@@ -767,7 +778,14 @@ export function toolUpdateFromToolResult(
         }
       }
 
-      if (supportsTerminalOutput) {
+      // Without a terminal id there is nothing the client can reconcile these
+      // metas against, and emitting them anyway strands the output: a client that
+      // buffers output/exit for terminals it has not been told about (Zed keeps
+      // them in `pending_terminal_output`/`pending_terminal_exit`, drained only on
+      // a matching create) would hold them forever behind an id that never
+      // arrives, showing an empty terminal. Fall through to the code-block
+      // rendering below instead.
+      if (supportsTerminalOutput && terminalId !== undefined) {
         return {
           content: [{ type: "terminal" as const, terminalId }],
           _meta: {
