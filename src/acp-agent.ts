@@ -727,6 +727,13 @@ export type NewSessionMeta = {
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
   };
   additionalRoots?: string[];
+  /**
+   * Harness-neutral title for a newly created session, forwarded to the SDK as
+   * `Options.title`. Only applied when creating or forking a session — the SDK
+   * does not honor `title` on resume. `_meta.claudeCode.options.title` takes
+   * precedence when both are given.
+   */
+  sessionTitle?: string;
 };
 
 /**
@@ -5193,6 +5200,20 @@ export class ClaudeAcpAgent {
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
 
+    // Harness-neutral session title, mapped onto the SDK's own `title` option.
+    // Only a genuinely new session (creation or fork) gets one: the SDK ignores
+    // `title` when resuming, so gating here makes that explicit. A non-string
+    // is ignored rather than rejected, matching how the other `_meta` reads
+    // here treat malformed input.
+    const isNewSession = creationOpts.resume === undefined || creationOpts.forkSession === true;
+    const sessionTitle =
+      isNewSession && typeof sessionMeta?.sessionTitle === "string"
+        ? sanitizeTitle(sessionMeta.sessionTitle)
+        : "";
+    // `_meta.claudeCode.options.title` is the SDK-shaped spelling and already
+    // reaches the SDK today, so it wins when a caller supplies both.
+    const title = userProvidedOptions?.title ?? sessionTitle;
+
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
 
@@ -5255,6 +5276,7 @@ export class ClaudeAcpAgent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
+      ...(title && { title }),
       // CLAUDE_MODEL_CONFIG env var is a fallback for model
       // configuration (e.g. Bedrock model ID overrides). When the caller
       // provides settings via _meta, we intentionally ignore the env var —
