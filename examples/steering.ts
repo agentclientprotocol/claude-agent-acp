@@ -8,16 +8,18 @@
  * agent can adapt immediately (it shines in multi-step / tool-using turns,
  * where the message slots in between tool calls).
  *
- * The wire protocol (see ../steering_protocol.md) has three moving parts:
+ * The wire protocol has three moving parts:
  *
  *   1. The agent advertises support in its `initialize` response, at the
- *      top-level `_meta.steering.supported` (a sibling of `agentCapabilities`).
+ *      top-level `_meta.steering` (a sibling of `agentCapabilities`), including
+ *      `idleBehavior: "promptRequired"` so the client knows the idle contract.
  *   2. The client calls the `_session/steering` request with `{ sessionId,
  *      prompt }` while a turn is running.
  *   3. The agent replies with an `outcome`:
  *        - "injected"       the message joined the running turn;
- *        - "startedNewTurn" the turn had already finished (an unavoidable race),
- *                           so the message began a fresh turn instead.
+ *        - "promptRequired" the turn had already finished (an unavoidable race),
+ *                           so the message was NOT consumed and the client must
+ *                           start a normal `session/prompt` to send it.
  *      Both are success outcomes — the message is never dropped and the race is
  *      never surfaced as an error.
  *
@@ -52,10 +54,19 @@ type SteeringRequest = {
   prompt: Array<{ type: "text"; text: string }>;
 };
 
-/** Result of a `_session/steering` request. Both values are successes: they
- *  tell the client where the message landed, not whether it succeeded. */
-type SteeringResponse = {
-  outcome: "injected" | "startedNewTurn";
+/** Result of a `_session/steering` request. `injected` means the message joined
+ *  the running turn; `promptRequired` means the turn had already settled, so the
+ *  message was NOT consumed and must be (re)sent through a normal
+ *  `session/prompt`. Both are successes. */
+type SteeringResponse =
+  { outcome: "injected" } | { outcome: "promptRequired"; reason: "noRunningTurn" };
+
+/** The steering capability advertised at the top-level `_meta.steering` of the
+ *  `initialize` result. `idleBehavior` narrows the idle contract this example
+ *  relies on. */
+type SteeringCapability = {
+  supported?: boolean;
+  idleBehavior?: "promptRequired";
 };
 
 // The built agent entry. Run `npm run build` first so this exists.
@@ -128,12 +139,11 @@ async function main() {
     protocolVersion: 1,
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
   });
-  const meta = init._meta as { steering?: { supported?: boolean } } | null | undefined;
-  const steeringSupported = meta?.steering?.supported === true;
-  log(`agent advertises steering: ${steeringSupported}`);
-  if (!steeringSupported) {
-    log("agent does not advertise steering; the steering request may be rejected.");
+  const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)?.steering;
+  if (steering?.supported !== true || steering.idleBehavior !== "promptRequired") {
+    throw new Error("agent does not advertise the promptRequired steering contract");
   }
+  log(`agent steering idle behavior: ${steering.idleBehavior}`);
 
   // 2. Open a session.
   const { sessionId } = await agent.request(methods.agent.session.new, {
@@ -163,22 +173,22 @@ async function main() {
     sessionId,
     prompt: [{ type: "text", text: STEER }],
   };
-  try {
-    const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
-    log(`steer outcome: ${result.outcome}`);
-  } catch (err) {
-    log(`steer rejected: ${err}`);
+  const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
+  log(`steer outcome: ${result.outcome}`);
+
+  if (result.outcome === "promptRequired") {
+    // The target turn already settled, so steering did not consume the message.
+    // Start a normal session/prompt on the same session to deliver it — that
+    // request owns the continuation's updates and terminal response.
+    log(`steer fallback: ${result.reason}; starting a normal session/prompt`);
+    const continuation = await agent.request(methods.agent.session.prompt, steerRequest);
+    log(`continuation stopReason: ${continuation.stopReason}`);
   }
 
-  // 5. Await the turn. With outcome "injected" the steer already reshaped the
-  //    output above; with "startedNewTurn" the follow-up runs as a fresh turn
-  //    that may still be streaming, so linger briefly to capture it.
-  const response = await turn.catch((err: unknown) => {
-    log(`turn error: ${err}`);
-    return undefined;
-  });
-  if (response) log(`turn stopReason: ${response.stopReason}`);
-  await delay(3000);
+  // 5. Await the original turn. With outcome "injected" the steer already
+  //    reshaped the output above; the promptRequired branch owns its own turn.
+  const response = await turn;
+  log(`original turn stopReason: ${response.stopReason}`);
   process.stdout.write("\n----- end of agent output -----\n");
 
   connection.close();
