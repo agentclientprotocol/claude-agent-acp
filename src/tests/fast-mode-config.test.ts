@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
-import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
   createFastModeConfigOption,
   fastModeStateEnabled,
+  normalizeFastModeDisabledReason,
   resolveFastModeEnabled,
   FAST_MODE_CONFIG_ID,
   FAST_MODE_ON,
@@ -40,6 +41,28 @@ describe("createFastModeConfigOption", () => {
       type: "boolean",
       currentValue: true,
     });
+  });
+
+  it("explains a blocking disabled reason while the toggle reads off", () => {
+    const option = createFastModeConfigOption(false, true, "free");
+    expect(option.description).toBe(
+      "Faster responses on supported models — not available on the free plan",
+    );
+  });
+
+  it("ignores routine and on-state reasons", () => {
+    // Every SDK session starts at `sdk_opt_in_required` — the toggle IS the
+    // opt-in, so it must not read as a blocker.
+    expect(createFastModeConfigOption(false, true, "sdk_opt_in_required").description).toBe(
+      "Faster responses on supported models",
+    );
+    expect(createFastModeConfigOption(false, true, "preference").description).toBe(
+      "Faster responses on supported models",
+    );
+    // A reason riding an `on` state isn't blocking anything right now.
+    expect(createFastModeConfigOption(true, true, "free").description).toBe(
+      "Faster responses on supported models",
+    );
   });
 
   it("falls back to an on/off select when the client did not opt in", () => {
@@ -101,6 +124,28 @@ describe("fastModeStateEnabled", () => {
     expect(fastModeStateEnabled("on")).toBe(true);
     expect(fastModeStateEnabled("cooldown")).toBe(true);
     expect(fastModeStateEnabled("off")).toBe(false);
+  });
+});
+
+describe("normalizeFastModeDisabledReason", () => {
+  it("retains only reasons we have an explanation for", () => {
+    expect(normalizeFastModeDisabledReason("free")).toBe("free");
+    expect(normalizeFastModeDisabledReason("extra_usage_disabled")).toBe("extra_usage_disabled");
+    expect(normalizeFastModeDisabledReason("model_not_allowed")).toBe("model_not_allowed");
+    expect(normalizeFastModeDisabledReason("not_first_party")).toBe("not_first_party");
+    expect(normalizeFastModeDisabledReason("disabled_by_env")).toBe("disabled_by_env");
+    expect(normalizeFastModeDisabledReason("network_error")).toBe("network_error");
+  });
+
+  it("drops routine states and unknown values", () => {
+    expect(normalizeFastModeDisabledReason("sdk_opt_in_required")).toBeUndefined();
+    expect(normalizeFastModeDisabledReason("preference")).toBeUndefined();
+    expect(normalizeFastModeDisabledReason("pending")).toBeUndefined();
+    expect(normalizeFastModeDisabledReason("unknown")).toBeUndefined();
+    expect(normalizeFastModeDisabledReason(undefined)).toBeUndefined();
+    expect(
+      normalizeFastModeDisabledReason("some_future_reason" as FastModeDisabledReason),
+    ).toBeUndefined();
   });
 });
 
@@ -249,6 +294,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     const session = {
       query: {},
       fastModeEnabled: opts.fastModeEnabled,
+      fastModeDisabledReason: undefined as FastModeDisabledReason | undefined,
       configOptions: opts.withOption
         ? [createFastModeConfigOption(opts.fastModeEnabled, true)]
         : [],
@@ -261,6 +307,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
           sessionId: string,
           session: unknown,
           state: string | undefined,
+          reason?: FastModeDisabledReason,
         ) => Promise<void>;
       }
     ).syncFastModeState.bind(agent);
@@ -319,8 +366,63 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
 
     await sync(SESSION_ID, session, undefined);
     await sync(SESSION_ID, session, "off");
+    // A routine reason normalizes away, so it's still "unchanged" — an
+    // `sdk_opt_in_required` on every turn's result must not churn the option.
+    await sync(SESSION_ID, session, "off", "sdk_opt_in_required");
 
     expect(sessionUpdates).toHaveLength(0);
+  });
+
+  it("explains a blocking reason once when the SDK refuses a toggle the user turned on", async () => {
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
+
+    await sync(SESSION_ID, session, "off", "extra_usage_disabled");
+
+    expect(session.fastModeEnabled).toBe(false);
+    expect(session.fastModeDisabledReason).toBe("extra_usage_disabled");
+    expect(sessionUpdates).toHaveLength(2);
+    expect(sessionUpdates[0].update).toEqual({
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "**Fast mode turned off:** requires extra usage to be enabled for this account.",
+      },
+    });
+    expect(sessionUpdates[1].update).toMatchObject({ sessionUpdate: "config_option_update" });
+    expect(session.configOptions).toContainEqual(
+      createFastModeConfigOption(false, true, "extra_usage_disabled"),
+    );
+
+    // The same report again changes nothing the user can see: no repeat notice.
+    await sync(SESSION_ID, session, "off", "extra_usage_disabled");
+    expect(sessionUpdates).toHaveLength(2);
+  });
+
+  it("updates the description when only the reason changes", async () => {
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
+
+    await sync(SESSION_ID, session, "off", "not_first_party");
+
+    expect(session.fastModeEnabled).toBe(false);
+    // The toggle was already off, so the flip-time notice doesn't fire — only
+    // the description carries the explanation.
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0].update).toMatchObject({ sessionUpdate: "config_option_update" });
+    expect(session.configOptions).toContainEqual(
+      createFastModeConfigOption(false, true, "not_first_party"),
+    );
+  });
+
+  it("drops a retained reason once fast mode comes back on", async () => {
+    const { sync, session } = setup({ fastModeEnabled: false, withOption: true });
+
+    await sync(SESSION_ID, session, "off", "network_error");
+    expect(session.fastModeDisabledReason).toBe("network_error");
+
+    await sync(SESSION_ID, session, "on");
+    expect(session.fastModeEnabled).toBe(true);
+    expect(session.fastModeDisabledReason).toBeUndefined();
+    expect(session.configOptions).toContainEqual(createFastModeConfigOption(true, true));
   });
 
   it("preserves the retained setting (no clobber) when the model has no Fast mode option", async () => {
