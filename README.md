@@ -49,6 +49,22 @@ String-valued `traceparent` and `tracestate` are propagated for the prompt; `bag
 ignored. Trace context changes require an idle session, so await the previous `session/prompt`
 response before sending a prompt with different trace metadata.
 
+Claude Code parents that prompt's `claude_code.interaction` span under the supplied context, but it
+only emits spans at all when tracing is switched on in the environment the agent is launched with:
+
+```sh
+CLAUDE_CODE_ENABLE_TELEMETRY=1 \
+CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 \
+OTEL_TRACES_EXPORTER=otlp \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+Without `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` no trace spans are exported and the metadata has no
+observable effect. See the
+[Claude Code monitoring docs](https://docs.claude.com/en/docs/claude-code/monitoring-usage) for the
+full set of telemetry variables.
+
 ## Contribution Policy
 
 This project does not require a Contributor License Agreement (CLA). Instead, contributions are accepted under the following terms:

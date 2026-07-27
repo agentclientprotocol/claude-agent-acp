@@ -168,7 +168,6 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     promptPreparationGeneration: 0,
-    cancelInProgressCount: 0,
     baseFlagEnv: { known: true, value: null },
     traceEnvApplied: false,
     ...overrides,
@@ -255,7 +254,11 @@ describe("ACP prompt trace context", () => {
     ...(meta && { _meta: meta }),
   });
 
-  it("maps trace metadata to Claude Code env and clears it on the next prompt", async () => {
+  // The clear must BLANK the vars, not drop them from the flag layer: the CLI
+  // only assigns settings `env` onto its live `process.env`, so `{env: null}`
+  // (or an object that simply omits them) leaves the previous prompt's
+  // traceparent in place and every later prompt is parented under it.
+  it("maps trace metadata to Claude Code env and blanks it on the next prompt", async () => {
     const { agent, query, push } = setupSession();
 
     await agent.prompt(
@@ -275,7 +278,7 @@ describe("ACP prompt trace context", () => {
           },
         },
       ],
-      [{ env: null }],
+      [{ env: { TRACEPARENT: "", TRACESTATE: "" } }],
     ]);
     expect(query.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
       push.mock.invocationCallOrder[0],
@@ -306,6 +309,10 @@ describe("ACP prompt trace context", () => {
           env: {
             BASE_ENV: "base",
             TRACEPARENT: "00-trace-parent",
+            // A `tracestate` only means anything alongside the `traceparent` it
+            // shipped with, so the ambient one is blanked rather than carried
+            // over onto the prompt's trace.
+            TRACESTATE: "",
           },
         },
       ],
@@ -394,12 +401,34 @@ describe("ACP prompt trace context", () => {
         {
           env: {
             TRACEPARENT: "00-trace-parent",
+            TRACESTATE: "",
           },
         },
       ],
-      [{ env: null }],
+      [{ env: { TRACEPARENT: "", TRACESTATE: "" } }],
     ]);
     expect(push).not.toHaveBeenCalled();
+  });
+
+  // Trace propagation must not change how ordinary prompts are admitted. A
+  // client that hits stop and immediately sends a new message does exactly
+  // this, and interrupt() is a control round-trip that can take a while —
+  // short-circuiting the prompt to "cancelled" would silently drop it.
+  it("still enqueues an untraced prompt that arrives while interrupt() is in flight", async () => {
+    const interrupted = deferred();
+    const { agent, query, push } = setupSession();
+    query.interrupt.mockImplementationOnce(() => interrupted.promise);
+
+    const cancelling = agent.cancel({ sessionId: "test-session" });
+    await vi.waitFor(() => expect(query.interrupt).toHaveBeenCalledTimes(1));
+
+    const pending = agent.prompt(prompt());
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+
+    interrupted.resolve();
+    await cancelling;
+    await pending;
   });
 
   it("closes the session when applying trace env times out", async () => {

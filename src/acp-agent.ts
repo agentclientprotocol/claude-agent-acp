@@ -385,11 +385,8 @@ type Session = {
    * settings mutation, and enqueue. It never waits for a Turn to settle. */
   promptSubmissionActive?: boolean;
   promptSubmissionQueue?: Array<() => void>;
-  /** Invalidates prompt preparation that began before cancel(). */
+  /** Invalidates trace-env preparation that began before cancel(). */
   promptPreparationGeneration?: number;
-  /** Reference count keeps the prompt barrier raised across overlapping
-   * cancel() calls until every awaited interrupt has completed. */
-  cancelInProgressCount?: number;
   /** Original flag-layer env. A settings path makes the value unknowable, so
    * trace propagation is rejected rather than replacing unrelated variables. */
   baseFlagEnv?: BaseFlagEnv;
@@ -822,11 +819,36 @@ function parsePromptTrace(meta: PromptRequest["_meta"]): ParsedPromptTrace {
   };
 }
 
+/** Flag-layer `env` for a prompt's trace context.
+ *
+ *  `TRACEPARENT`/`TRACESTATE` are always written — blank when they should be
+ *  absent — never omitted. The CLI only ever *assigns* settings `env` onto its
+ *  live `process.env`; a key merely dropped from the flag layer keeps its old
+ *  value there, so omitting them would leave one prompt's trace context
+ *  parenting every later prompt in the session. An empty value reads as absent
+ *  to the CLI's span-context extraction, which makes it the only way to clear
+ *  trace context mid-session. */
+function traceEnvFor(
+  baseline: Record<string, string> | null,
+  trace: ParsedPromptTrace,
+): Record<string, string> {
+  // Prompt-supplied context replaces the session's ambient value wholesale: a
+  // `tracestate` is only meaningful alongside the `traceparent` it shipped with,
+  // so a field the prompt omits blanks rather than inherits.
+  return {
+    ...(baseline ?? {}),
+    TRACEPARENT: (trace.present ? trace.traceparent : baseline?.TRACEPARENT) ?? "",
+    TRACESTATE: (trace.present ? trace.tracestate : baseline?.TRACESTATE) ?? "",
+  };
+}
+
+/** Whether a `cancel()` landed while this prompt was mid-preparation, i.e.
+ *  during the awaited trace-env control round-trip — `cancel()` bumps the
+ *  generation before it awaits anything. Only consulted when that round-trip
+ *  actually happened: a prompt that carries no trace context never blocks on
+ *  the SDK and must be admitted exactly as it would be without this feature. */
 function isPromptPreparationInvalid(session: Session, generation: number): boolean {
-  return (
-    generation !== (session.promptPreparationGeneration ?? 0) ||
-    (session.cancelInProgressCount ?? 0) > 0
-  );
+  return generation !== (session.promptPreparationGeneration ?? 0);
 }
 
 /**
@@ -1953,7 +1975,7 @@ export class ClaudeAcpAgent {
       return;
     }
     try {
-      await this.applyTraceEnvSettings(session, baseline.value);
+      await this.applyTraceEnvSettings(session, traceEnvFor(baseline.value, { present: false }));
       session.traceEnvApplied = false;
     } catch (error) {
       this.logger.error(
@@ -1966,7 +1988,7 @@ export class ClaudeAcpAgent {
 
   private async applyTraceEnvSettings(
     session: Session,
-    env: Record<string, string> | null,
+    env: Record<string, string>,
   ): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<never>((_resolve, reject) => {
@@ -1994,16 +2016,9 @@ export class ClaudeAcpAgent {
     }
 
     const generation = session.promptPreparationGeneration ?? 0;
-    const cancellationActiveAtRegistration = (session.cancelInProgressCount ?? 0) > 0;
     const prepared = await this.withPromptSubmission(session, async () => {
-      if (cancellationActiveAtRegistration) {
-        return { cancelled: true } as const;
-      }
       if (this.sessions[params.sessionId] !== session || session.queryClosed) {
         throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
-      }
-      if (isPromptPreparationInvalid(session, generation)) {
-        return { cancelled: true } as const;
       }
 
       const promptTrace = parsePromptTrace(params._meta);
@@ -2039,22 +2054,8 @@ export class ClaudeAcpAgent {
             "Prompt trace context requires inline or absent session settings; an opaque settings path cannot be updated safely.",
           );
         }
-        const baseEnv = { ...(baseline.value ?? {}) };
-        delete baseEnv.TRACEPARENT;
-        delete baseEnv.TRACESTATE;
-        const env = promptTrace.present
-          ? {
-              ...baseEnv,
-              ...(promptTrace.traceparent !== undefined && {
-                TRACEPARENT: promptTrace.traceparent,
-              }),
-              ...(promptTrace.tracestate !== undefined && {
-                TRACESTATE: promptTrace.tracestate,
-              }),
-            }
-          : baseline.value;
         try {
-          await this.applyTraceEnvSettings(session, env);
+          await this.applyTraceEnvSettings(session, traceEnvFor(baseline.value, promptTrace));
           envApplied = true;
         } catch {
           if (isPromptPreparationInvalid(session, generation)) {
@@ -2076,7 +2077,7 @@ export class ClaudeAcpAgent {
         await compensateTraceEnv();
         throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
       }
-      if (isPromptPreparationInvalid(session, generation)) {
+      if (envApplied && isPromptPreparationInvalid(session, generation)) {
         await compensateTraceEnv();
         return { cancelled: true } as const;
       }
@@ -4421,12 +4422,7 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
-    session.cancelInProgressCount = (session.cancelInProgressCount ?? 0) + 1;
-    const receipt = await Promise.resolve()
-      .then(() => session.query.interrupt())
-      .finally(() => {
-        session.cancelInProgressCount = Math.max(0, (session.cancelInProgressCount ?? 0) - 1);
-      });
+    const receipt = await session.query.interrupt();
     // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
     // lists exactly which queued messages survive the interrupt and will still
     // run. An orphaned turn whose uuid is absent was dropped by the interrupt
@@ -6095,7 +6091,6 @@ export class ClaudeAcpAgent {
       input: input,
       cancelled: false,
       promptPreparationGeneration: 0,
-      cancelInProgressCount: 0,
       baseFlagEnv: initialBaseFlagEnv(options.settings),
       traceEnvApplied: false,
       cwd: params.cwd,
