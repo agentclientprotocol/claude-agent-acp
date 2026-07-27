@@ -11444,3 +11444,237 @@ describe("tool_progress heartbeats", () => {
     expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_inner"]);
   });
 });
+
+describe("permission_denied", () => {
+  // The SDK enqueues this frame from inside canUseTool, so it lands between the
+  // denied call's `tool_use` and the `tool_result` carrying the rejection: the
+  // call is announced and still in flight. The handler forwarded it without
+  // checking, which mattered for the denials that arrive outside that window.
+  type ToolCallUpdate = Extract<
+    SessionNotification["update"],
+    { sessionUpdate: "tool_call_update" }
+  >;
+
+  /** Run a turn carrying `messages` and return the updates it produced. */
+  async function run(messages: any[], overrides: Record<string, any> = {}) {
+    const updates: SessionNotification["update"][] = [];
+    const mockClient = {
+      sessionUpdate: async (n: SessionNotification) => {
+        updates.push(n.update);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const { value, done } = await input[Symbol.asyncIterator]().next();
+      if (!done && value) {
+        yield {
+          type: "user",
+          message: value.message,
+          parent_tool_use_id: null,
+          uuid: value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+      }
+      yield* messages;
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        usage: {},
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      ...overrides,
+    });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    return updates;
+  }
+
+  /** The assistant message announcing `toolUseId`, as the streamed tool_use
+   *  arrives when partial messages are off. */
+  function toolUse(toolUseId: string, parentToolUseId: string | null = null) {
+    return {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: toolUseId,
+            name: "Write",
+            input: { file_path: "/tmp/denied.txt", content: "hi" },
+          },
+        ],
+        usage: {},
+      },
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** The rejection the model sees, which follows the denial frame. */
+  function toolResult(toolUseId: string, parentToolUseId: string | null = null) {
+    return {
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: "Permission to use Write has been denied.",
+            is_error: true,
+          },
+        ],
+      },
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  function denial(toolUseId: string, extra: Record<string, any> = {}) {
+    return {
+      type: "system",
+      subtype: "permission_denied",
+      tool_name: "Write",
+      tool_use_id: toolUseId,
+      decision_reason_type: "mode",
+      decision_reason: "dontAsk mode denies tools that require approval",
+      message: "Permission to use Write has been denied.",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...extra,
+    };
+  }
+
+  const denials = (updates: SessionNotification["update"][]) =>
+    updates.filter(
+      (u): u is ToolCallUpdate =>
+        u.sessionUpdate === "tool_call_update" &&
+        JSON.stringify(u.content ?? "").includes("Permission denied"),
+    );
+
+  it("marks the announced tool call failed with the denial reason", async () => {
+    const updates = await run([
+      toolUse("toolu_denied"),
+      denial("toolu_denied"),
+      toolResult("toolu_denied"),
+    ]);
+
+    // The denial resolves the call the preceding tool_call announced, before the
+    // tool_result's own failed update lands.
+    expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "toolu_denied" });
+    const sent = denials(updates);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      toolCallId: "toolu_denied",
+      status: "failed",
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "Permission denied: dontAsk mode denies tools that require approval",
+          },
+        },
+      ],
+    });
+    expect((sent[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Write",
+      toolResponse: { decisionReasonType: "mode" },
+    });
+    // Top-level denial: nothing to attribute it to.
+    expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
+  });
+
+  it("falls back to the SDK's rejection message when there is no decision reason", async () => {
+    const updates = await run([
+      toolUse("toolu_denied"),
+      denial("toolu_denied", { decision_reason: undefined }),
+    ]);
+
+    expect(denials(updates)[0].content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: "Permission denied: Permission to use Write has been denied.",
+        },
+      },
+    ]);
+  });
+
+  // A cancel drops the assistant message carrying the tool_use, so no tool_call
+  // is emitted; a denial for it still arrives. Forwarding that left the client
+  // resolving an id it was never given — the case the tool_result fallback in
+  // `toAcpNotifications` already gates on `wasEmitted` for.
+  it("drops a denial for a tool call that was never announced", async () => {
+    expect(denials(await run([denial("toolu_ghost")]))).toHaveLength(0);
+  });
+
+  // Ids leave `emittedToolCalls` at `tool_result`, so a denial that somehow
+  // trails its own result can't flip a call the client has seen finish back to
+  // failed.
+  it("drops a denial for a tool call that already resolved", async () => {
+    const updates = await run([
+      toolUse("toolu_denied"),
+      toolResult("toolu_denied"),
+      denial("toolu_denied"),
+    ]);
+
+    expect(denials(updates)).toHaveLength(0);
+  });
+
+  // A subagent's denial names the subagent (`agent_id`), never the Agent/Task
+  // call that spawned it, so without the `liveBackgroundTasks` lookup the update
+  // lands at the top level while the tool_call it resolves sits in the
+  // subagent's transcript.
+  it("attributes a subagent denial to the Agent call that spawned it", async () => {
+    const updates = await run([
+      {
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent",
+        subagent_type: "general-purpose",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      toolUse("toolu_inner", "toolu_agent"),
+      denial("toolu_inner", { agent_id: "agent-1" }),
+    ]);
+
+    expect((denials(updates)[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Write",
+      parentToolUseId: "toolu_agent",
+    });
+  });
+
+  // The attribution rests on `task_started` having been seen for the agent id.
+  // If it wasn't, the denial still resolves the call — unattributed beats
+  // dropped.
+  it("still resolves a subagent denial when the parent is unknown", async () => {
+    const updates = await run([
+      toolUse("toolu_inner", "toolu_agent"),
+      denial("toolu_inner", { agent_id: "agent-unknown" }),
+    ]);
+
+    const sent = denials(updates);
+    expect(sent).toHaveLength(1);
+    expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
+  });
+});
