@@ -482,6 +482,9 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
+  /** Whether a Remote Control bridge is currently active for this session, so
+   *  `/remote-control` toggles connect/disconnect. */
+  remoteControlActive?: boolean;
   /** Last session title we pushed to the client via `session_info_update`.
    *  The SDK auto-generates a title in a background task and persists it to the
    *  session file; we poll it on each turn-end (`session_state_changed: idle`)
@@ -630,6 +633,19 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+};
+
+/** Result of the SDK's `remote_control` control request. The method exists on
+ *  the runtime `Query` object (since claude-agent-sdk 0.3.x) but is not yet in
+ *  its published type definitions, so we narrow to it via this shim. */
+type RemoteControlResponse = {
+  session_url?: string;
+  connect_url?: string;
+  environment_id?: string;
+};
+
+type QueryWithRemoteControl = Query & {
+  enableRemoteControl(enabled: boolean, name?: string): Promise<RemoteControlResponse | undefined>;
 };
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
@@ -979,6 +995,29 @@ const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+// Commands that toggle the Remote Control bridge. These are intercepted before
+// reaching the model: the SDK's terminal `local-jsx` UI for `/remote-control`
+// can't render over ACP, so we drive the control request directly and surface
+// the session URL back to the client instead.
+const REMOTE_CONTROL_COMMANDS = new Set(["/remote-control", "/rc"]);
+
+// Advertised so ACP clients (e.g. Zed) accept these commands and forward them
+// to prompt(); the SDK doesn't report the terminal-only `/remote-control` UI
+// through supportedCommands.
+const REMOTE_CONTROL_AVAILABLE_COMMANDS: AvailableCommand[] = [
+  {
+    name: "remote-control",
+    description:
+      "Connect this session to claude.ai/code for Remote Control (run again to disconnect)",
+    input: { hint: "[name]" },
+  },
+  {
+    name: "rc",
+    description: "Alias for /remote-control",
+    input: { hint: "[name]" },
+  },
+];
 
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
@@ -1564,6 +1603,66 @@ export class ClaudeAcpAgent {
     throw new Error("Method not implemented.");
   }
 
+  private async emitAgentText(sessionId: string, text: string): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+      },
+    });
+  }
+
+  /** Connect or disconnect a Remote Control bridge for this session, mirroring
+   *  the official VS Code `/remote-control` behavior over ACP: send the
+   *  `remote_control` control request to the Claude binary, then surface the
+   *  returned session URL (or an error) back to the client. */
+  private async toggleRemoteControl(
+    session: Session,
+    sessionId: string,
+    commandText: string,
+  ): Promise<PromptResponse> {
+    const query = session.query as QueryWithRemoteControl;
+    if (typeof query.enableRemoteControl !== "function") {
+      await this.emitAgentText(
+        sessionId,
+        "Remote Control isn't available in this Claude Code version. Upgrade to a build that supports it (claude-agent-sdk 0.3.x or later).",
+      );
+      return { stopReason: "end_turn" };
+    }
+
+    const name = commandText.split(/\s+/).slice(1).join(" ").trim() || undefined;
+    const enabling = !session.remoteControlActive;
+
+    try {
+      const response = await query.enableRemoteControl(enabling, name);
+      if (enabling) {
+        session.remoteControlActive = true;
+        const url = response?.session_url;
+        if (url) {
+          await this.emitAgentText(
+            sessionId,
+            `🔗 Remote Control is active. Continue this session from any device:\n\n${url}\n\nRun /remote-control (or /rc) again to disconnect.`,
+          );
+        } else {
+          await this.emitAgentText(
+            sessionId,
+            "Remote Control was enabled, but no session URL was returned.",
+          );
+        }
+      } else {
+        session.remoteControlActive = false;
+        await this.emitAgentText(sessionId, "Remote Control disconnected.");
+      }
+    } catch (error) {
+      session.remoteControlActive = false;
+      const message = error instanceof Error ? error.message : String(error);
+      await this.emitAgentText(sessionId, `Remote Control failed: ${message}`);
+    }
+
+    return { stopReason: "end_turn" };
+  }
+
   /**
    * `providers/list` — returns the single client-configurable custom gateway
    * provider (`main`). `current` carries only non-secret routing (never headers,
@@ -1708,6 +1807,13 @@ export class ClaudeAcpAgent {
     // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+
+    // Intercept /remote-control (or /rc) before entering the turn queue.
+    const firstPromptText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    const firstCommand = firstPromptText.startsWith("/") ? firstPromptText.split(/\s+/, 1)[0] : "";
+    if (REMOTE_CONTROL_COMMANDS.has(firstCommand)) {
+      return await this.toggleRemoteControl(session, params.sessionId, firstPromptText);
     }
 
     const userMessage = promptToClaude(params);
@@ -6508,7 +6614,7 @@ async function getAvailableModels(
   };
 }
 
-function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
+export function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "clear",
     "cost",
@@ -6520,7 +6626,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
     "todos",
   ];
 
-  return commands
+  const mapped = commands
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -6540,6 +6646,12 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  const advertised = new Set(mapped.map((command) => command.name));
+  const remoteControl = REMOTE_CONTROL_AVAILABLE_COMMANDS.filter(
+    (command) => !advertised.has(command.name),
+  );
+  return [...mapped, ...remoteControl];
 }
 
 function formatUriAsLink(uri: string): string {
