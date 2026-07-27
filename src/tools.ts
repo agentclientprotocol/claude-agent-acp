@@ -691,13 +691,14 @@ export function toolUpdateFromToolResult(
       // id the client actually created a terminal for. `toolResult.tool_use_id`
       // is the same value whenever present — the caller looks the tool_use up by
       // it — so preferring `toolUse.id` only adds a source for the case where the
-      // result block carries no id at all.
+      // result block carries no id at all. Anything that isn't a non-empty
+      // string is no id at all: `""` matches no terminal, and stringifying a
+      // present-but-undefined field would invent the literal `"undefined"`.
+      const terminalIdOf = (id: unknown): string | undefined =>
+        typeof id === "string" && id.length > 0 ? id : undefined;
       const terminalId: string | undefined =
-        toolUse?.id !== undefined
-          ? String(toolUse.id)
-          : "tool_use_id" in toolResult
-            ? String(toolResult.tool_use_id)
-            : undefined;
+        terminalIdOf(toolUse?.id) ??
+        terminalIdOf("tool_use_id" in toolResult ? toolResult.tool_use_id : undefined);
       const isError = "is_error" in toolResult && toolResult.is_error;
 
       // Extract output and exit code from either format:

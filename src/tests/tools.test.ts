@@ -547,6 +547,38 @@ describe("Bash terminal output", () => {
       ]);
     });
 
+    it("treats an empty tool_use id as no id and falls back to the result block", () => {
+      const toolResult = makeBashResult("out", "", 0);
+      const update = toolUpdateFromToolResult(toolResult, { id: "", name: "Bash" }, true);
+
+      expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
+      expect(update._meta).toEqual({
+        terminal_info: { terminal_id: "toolu_bash" },
+        terminal_output: { terminal_id: "toolu_bash", data: "out" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 0, signal: null },
+      });
+    });
+
+    it("renders a code block when neither id is a usable string", () => {
+      // A present-but-undefined `tool_use_id` still satisfies an `in` check, and
+      // stringifying it would key all three metas on the literal "undefined" — an
+      // id no client ever created a terminal for, so the output strands exactly as
+      // it did under the old empty-string id.
+      const toolResult = {
+        ...makeBashResult("out", "", 0),
+        tool_use_id: undefined,
+      } as unknown as Parameters<typeof toolUpdateFromToolResult>[0];
+      const update = toolUpdateFromToolResult(toolResult, { id: "", name: "Bash" }, true);
+
+      expect(update._meta).toBeUndefined();
+      expect(update.content).toEqual([
+        {
+          type: "content",
+          content: { type: "text", text: "```console\nout\n```" },
+        },
+      ]);
+    });
+
     it("should include exit_code from return_code in terminal_exit", () => {
       const toolResult = makeBashResult("", "command not found", 127);
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
