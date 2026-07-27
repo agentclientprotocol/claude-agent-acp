@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.63.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.62.0...v0.63.0) (2026-07-27)
+
+
+### Features
+
+* Update to claude agent sdk v0.3.220 ([#921](https://github.com/agentclientprotocol/claude-agent-acp/issues/921)) ([4c7b897](https://github.com/agentclientprotocol/claude-agent-acp/commit/4c7b89718306229254879e5045a183233b5ed073))
+
+
+### Bug Fixes
+
+* Only resolve a denied tool call the client was told about ([#923](https://github.com/agentclientprotocol/claude-agent-acp/issues/923)) ([8f67b6a](https://github.com/agentclientprotocol/claude-agent-acp/commit/8f67b6a92bec24ae43b3dfbd087fe35df0531857)), closes [#918](https://github.com/agentclientprotocol/claude-agent-acp/issues/918)
+* Report tool_progress heartbeats against the tool call they describe ([#916](https://github.com/agentclientprotocol/claude-agent-acp/issues/916)) ([5559ba8](https://github.com/agentclientprotocol/claude-agent-acp/commit/5559ba890ca614cdaa189500aba65d81cc4cd51a))
+* **tools:** key Bash terminal metas off the announced tool_use id ([#917](https://github.com/agentclientprotocol/claude-agent-acp/issues/917)) ([d060414](https://github.com/agentclientprotocol/claude-agent-acp/commit/d0604140f907adbf9747f26a070690926e1de82d))
+
 ## [0.62.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.61.0...v0.62.0) (2026-07-24)
 
 
