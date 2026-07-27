@@ -11128,12 +11128,18 @@ describe("tool_progress heartbeats", () => {
       .filter((u): u is ToolCallUpdate => u.sessionUpdate === "tool_call_update");
   }
 
-  function beat(toolUseId: string, extra: Record<string, any> = {}) {
+  /** A heartbeat as the SDK emits it: a derived `tool_use_id`, with
+   *  `parent_tool_use_id` stamped with the real id of the executing tool. */
+  function beat(
+    toolUseId: string,
+    parentToolUseId: string | null,
+    extra: Record<string, any> = {},
+  ) {
     return {
       type: "tool_progress",
       tool_use_id: toolUseId,
       tool_name: "Bash",
-      parent_tool_use_id: null,
+      parent_tool_use_id: parentToolUseId,
       elapsed_time_seconds: 30,
       heartbeat: true,
       uuid: randomUUID(),
@@ -11144,7 +11150,7 @@ describe("tool_progress heartbeats", () => {
 
   it("reports every beat against the tool call it describes", async () => {
     const sent = await run(
-      [beat("toolu_abc-heartbeat-0"), beat("toolu_abc-heartbeat-1")],
+      [beat("toolu_abc-heartbeat-0", "toolu_abc"), beat("toolu_abc-heartbeat-1", "toolu_abc")],
       ["toolu_abc"],
     );
 
@@ -11155,17 +11161,48 @@ describe("tool_progress heartbeats", () => {
   // Covers a call that was never emitted and one whose tool_result already
   // removed it, so a straggling beat can't reopen a call seen to finish.
   it("drops a beat for a tool call that is not in flight", async () => {
-    expect(await run([beat("toolu_ghost-heartbeat-0")], [])).toHaveLength(0);
+    expect(await run([beat("toolu_ghost-heartbeat-0", "toolu_ghost")], [])).toHaveLength(0);
   });
 
-  it("preserves the elapsed time and subagent meta", async () => {
+  it("preserves the elapsed time", async () => {
+    const sent = await run(
+      [beat("toolu_abc-heartbeat-2", "toolu_abc", { elapsed_time_seconds: 90 })],
+      ["toolu_abc"],
+    );
+
+    expect(sent[0].toolCallId).toBe("toolu_abc");
+    expect((sent[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Bash",
+      toolResponse: { elapsedTimeSeconds: 90 },
+    });
+  });
+
+  // `agent_api_retry` beats — the only source of `subagentType`/`subagentRetry`
+  // — are not heartbeats and don't use the `-heartbeat-<n>` id shape: they
+  // report under `agent_<assistant_message_id>`, with the retrying Agent call's
+  // real id in `parent_tool_use_id`. Resolving via the suffix alone dropped
+  // them, leaving a stalled spawn with no explanation.
+  it("reports a subagent retry beat against the Agent call that is retrying", async () => {
     const sent = await run(
       [
-        beat("toolu_task-heartbeat-0", {
-          elapsed_time_seconds: 90,
+        {
+          type: "tool_progress",
+          tool_use_id: "agent_msg_01xyz",
           tool_name: "Task",
+          parent_tool_use_id: "toolu_task",
+          elapsed_time_seconds: 0,
           subagent_type: "code-reviewer",
-        }),
+          subagent_retry: {
+            agent_id: "agent-1",
+            attempt: 2,
+            max_retries: 5,
+            retry_delay_ms: 4000,
+            error_status: 529,
+            error_category: "overloaded",
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
       ],
       ["toolu_task"],
     );
@@ -11173,13 +11210,22 @@ describe("tool_progress heartbeats", () => {
     expect(sent[0].toolCallId).toBe("toolu_task");
     expect((sent[0]._meta as any).claudeCode).toMatchObject({
       toolName: "Task",
-      toolResponse: { elapsedTimeSeconds: 90, subagentType: "code-reviewer" },
+      toolResponse: {
+        subagentType: "code-reviewer",
+        subagentRetry: { attempt: 2, max_retries: 5, error_status: 529 },
+      },
     });
   });
 
-  it("leaves an unsuffixed progress message alone", async () => {
-    const sent = await run([beat("toolu_plain", { heartbeat: undefined })], ["toolu_plain"]);
+  // A subagent's own `bash_progress` reports the inner tool's real id, with the
+  // spawning Agent call as its parent. The real id wins so the beat lands on the
+  // nested call rather than being hoisted onto the Agent card.
+  it("leaves a beat that reports a real tool call alone", async () => {
+    const sent = await run(
+      [beat("toolu_inner", "toolu_task", { heartbeat: undefined })],
+      ["toolu_task", "toolu_inner"],
+    );
 
-    expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_plain"]);
+    expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_inner"]);
   });
 });

@@ -184,12 +184,6 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
-/** `tool_progress` heartbeats report under a derived `<tool_use_id>-heartbeat-<n>`
- *  rather than the id of the call they describe. The beat carries `heartbeat: true`,
- *  but that flag alone can't recover the original id, so the suffix has to be
- *  stripped. Revisit if the SDK stops deriving the id this way. */
-const HEARTBEAT_ID_SUFFIX = /-heartbeat-\d+$/;
-
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -3714,15 +3708,23 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_progress": {
-            // Heartbeat beats arrive under a synthetic `<tool_use_id>-heartbeat-<n>`
-            // that no `tool_call` was ever emitted for, so forwarding it verbatim
-            // leaves the client resolving an id it has never seen (the same trap
-            // `ensureToolCallEmitted` documents for #851). Report the beat against
-            // the call it describes instead.
-            const toolCallId = message.tool_use_id.replace(HEARTBEAT_ID_SUFFIX, "");
+            // Not every beat reports under the id of a tool call the client has
+            // seen: heartbeats derive `<tool_use_id>-heartbeat-<n>`, and the
+            // `agent_api_retry` beats behind `subagentRetry` report under
+            // `agent_<assistant_message_id>`. Forwarding those verbatim leaves the
+            // client resolving an id it has never been told about (the same trap
+            // `ensureToolCallEmitted` documents for #851). The SDK stamps
+            // `parent_tool_use_id` with the executing tool's real id whenever the
+            // beat doesn't carry one of its own, so fall back to it rather than
+            // pattern-matching each synthetic id shape. Beats that do report a real
+            // id (a subagent's `bash_progress`, whose parent is the spawning Agent
+            // call) keep resolving to that id.
+            const toolCallId = session.emittedToolCalls.has(message.tool_use_id)
+              ? message.tool_use_id
+              : message.parent_tool_use_id;
             // Ids leave `emittedToolCalls` at `tool_result`, so this also stops a
             // beat that races past completion from reopening a finished call.
-            if (!session.emittedToolCalls.has(toolCallId)) {
+            if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
               break;
             }
             await sendUpdate({
