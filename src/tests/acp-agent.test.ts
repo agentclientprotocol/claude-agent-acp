@@ -167,8 +167,6 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
-    promptPreparationGeneration: 0,
-    baseFlagEnv: { known: true, value: null },
     traceEnvApplied: false,
     ...overrides,
   } as any;
@@ -286,46 +284,39 @@ describe("ACP prompt trace context", () => {
     expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("80e1afed08e019fc");
   });
 
-  it("preserves inline flag-layer env while applying and clearing trace context", async () => {
+  it("reverts to the session's trace context, not to nothing, after a prompt override", async () => {
     const { agent, query } = setupSession({
       overrides: {
-        baseFlagEnv: {
-          known: true,
-          value: {
-            BASE_ENV: "base",
-            TRACEPARENT: "ambient-parent",
-            TRACESTATE: "ambient=state",
-          },
-        },
+        sessionTrace: { traceparent: "00-session-parent", tracestate: "session=state" },
       },
     });
 
-    await agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+    await agent.prompt(prompt({ traceparent: "00-prompt-parent" }));
     await agent.prompt(prompt());
 
     expect(query.applyFlagSettings.mock.calls).toEqual([
       [
         {
           env: {
-            BASE_ENV: "base",
-            TRACEPARENT: "00-trace-parent",
+            TRACEPARENT: "00-prompt-parent",
             // A `tracestate` only means anything alongside the `traceparent` it
-            // shipped with, so the ambient one is blanked rather than carried
-            // over onto the prompt's trace.
+            // shipped with, so the session's is blanked rather than carried over
+            // onto the prompt's trace.
             TRACESTATE: "",
           },
         },
       ],
-      [
-        {
-          env: {
-            BASE_ENV: "base",
-            TRACEPARENT: "ambient-parent",
-            TRACESTATE: "ambient=state",
-          },
-        },
-      ],
+      [{ env: { TRACEPARENT: "00-session-parent", TRACESTATE: "session=state" } }],
     ]);
+  });
+
+  it("costs nothing for untraced prompts in a session with no trace context", async () => {
+    const { agent, query } = setupSession();
+
+    await agent.prompt(prompt());
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
   });
 
   it("ignores baggage metadata", async () => {
@@ -341,51 +332,53 @@ describe("ACP prompt trace context", () => {
     expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("tenant=ignored");
   });
 
-  it("rejects trace mutation while another prompt is still running", async () => {
-    const result = deferred();
-    const { agent, query, push } = setupSession({ beforeResult: () => result.promise });
-
-    const ordinary = agent.prompt(prompt());
-    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
-    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
-      "requires an idle session",
-    );
-    expect(query.applyFlagSettings).not.toHaveBeenCalled();
-
-    result.resolve();
-    await ordinary;
-  });
-
+  // The CLI reads TRACEPARENT when it dequeues a message, so a turn the CLI has
+  // already started is not at risk of being pulled into this prompt's trace.
+  // Queueing behind a running turn is the ordinary "send a follow-up while the
+  // agent works" flow, and it must keep working for traced prompts.
   it.each([
+    ["a traced prompt", { traceparent: "00-second-trace-parent" }],
     ["an untraced prompt", undefined],
-    ["another traced prompt", { traceparent: "00-second-trace-parent" }],
-  ])("rejects %s while a traced prompt is still running", async (_name, nextMeta) => {
+  ])("queues %s behind a turn the CLI has already started", async (_name, nextMeta) => {
     const result = deferred();
     const { agent, query, push } = setupSession({ beforeResult: () => result.promise });
 
     const first = agent.prompt(prompt({ traceparent: "00-first-trace-parent" }));
-    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
-    await expect(agent.prompt(prompt(nextMeta))).rejects.toThrow("requires an idle session");
-    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
-    expect(push).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(agent.sessions["test-session"].activeTurn).toBeTruthy());
+
+    const second = agent.prompt(prompt(nextMeta));
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(2));
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(2);
+    expect(query.applyFlagSettings.mock.calls[1][0].env.TRACEPARENT).toBe(
+      nextMeta?.traceparent ?? "",
+    );
 
     result.resolve();
     await first;
+    await second;
   });
 
-  it("rejects trace propagation when settings use an opaque path", async () => {
+  // Retargeting the env now would land on that earlier message instead, because
+  // the CLI has not read TRACEPARENT for it yet.
+  it("rejects a traced prompt while an earlier prompt has not been started yet", async () => {
     const { agent, query, push } = setupSession({
-      overrides: { baseFlagEnv: { known: false } },
+      overrides: {
+        turnQueue: [{ promptUuid: randomUUID(), isLocalOnlyCommand: false, settled: false }],
+        activeTurn: null,
+      },
     });
 
     await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
-      "opaque settings path",
+      "has started",
     );
     expect(query.applyFlagSettings).not.toHaveBeenCalled();
     expect(push).not.toHaveBeenCalled();
   });
 
-  it("rolls trace env back when cancellation invalidates prompt preparation", async () => {
+  // A cancel landing mid-preparation no longer needs a rollback: the prompt is
+  // submitted like any other and the consumer settles it, exactly as it would
+  // for a prompt that carried no trace context at all.
+  it("submits a traced prompt whose preparation overlapped a cancel", async () => {
     const apply = deferred();
     const { agent, query, push } = setupSession();
     query.applyFlagSettings.mockImplementationOnce(() => apply.promise);
@@ -395,19 +388,9 @@ describe("ACP prompt trace context", () => {
     await agent.cancel({ sessionId: "test-session" });
     apply.resolve();
 
-    await expect(pending).resolves.toEqual({ stopReason: "cancelled" });
-    expect(query.applyFlagSettings.mock.calls).toEqual([
-      [
-        {
-          env: {
-            TRACEPARENT: "00-trace-parent",
-            TRACESTATE: "",
-          },
-        },
-      ],
-      [{ env: { TRACEPARENT: "", TRACESTATE: "" } }],
-    ]);
-    expect(push).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
+    await pending;
   });
 
   // Trace propagation must not change how ordinary prompts are admitted. A
@@ -431,43 +414,47 @@ describe("ACP prompt trace context", () => {
     await pending;
   });
 
-  it("closes the session when applying trace env times out", async () => {
-    const { agent, query, push } = setupSession();
-    agent.traceEnvControlTimeoutMs = 5;
-    query.applyFlagSettings.mockImplementationOnce(() => new Promise(() => {}));
-
-    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
-      "Failed to apply ACP trace context",
-    );
-
-    expect(push).not.toHaveBeenCalled();
-    expect(query.close).toHaveBeenCalledTimes(1);
-    expect(agent.sessions["test-session"].queryClosed).toBe(true);
-    await expect(agent.prompt(prompt())).rejects.toThrow("session has ended");
-  });
-
-  it("bounds a rollback wait and logs before closing the session", async () => {
+  // Losing a parent span means a new root, not a failed turn, so a wedged
+  // control channel must cost the caller neither the prompt nor the session.
+  it("runs the prompt anyway when applying trace env times out", async () => {
     const { agent, query, push } = setupSession();
     agent.traceEnvControlTimeoutMs = 5;
     const log = vi.spyOn(agent.logger, "error");
+    query.applyFlagSettings.mockImplementationOnce(() => new Promise(() => {}));
+
+    await agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(query.close).not.toHaveBeenCalled();
+    expect(agent.sessions["test-session"].queryClosed).toBeFalsy();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to apply ACP trace context"),
+      expect.any(Error),
+    );
+
+    // The live env is unknowable after a failed apply, so the next prompt still
+    // tries to reset it rather than assuming nothing was written.
+    await agent.prompt(prompt());
+    expect(query.applyFlagSettings).toHaveBeenLastCalledWith({
+      env: { TRACEPARENT: "", TRACESTATE: "" },
+    });
+  });
+
+  // A failed enqueue is the caller's error to see; there is no trace state to
+  // unwind, so it must not turn into a second control round-trip or a teardown.
+  it("reports a failed enqueue without a compensating trace round-trip", async () => {
+    const { agent, query, push } = setupSession();
     push.mockImplementationOnce(() => {
       throw new Error("input closed");
     });
-    query.applyFlagSettings
-      .mockResolvedValueOnce(undefined)
-      .mockImplementationOnce(() => new Promise(() => {}));
 
     await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
       "Failed to enqueue the prompt",
     );
 
-    expect(query.applyFlagSettings).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith(
-      expect.stringContaining("Failed to restore ACP trace context"),
-      expect.any(Error),
-    );
-    expect(query.close).toHaveBeenCalledTimes(1);
-    expect(agent.sessions["test-session"].queryClosed).toBe(true);
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
+    expect(query.close).not.toHaveBeenCalled();
+    expect(agent.sessions["test-session"].turnQueue).toEqual([]);
   });
 });
 

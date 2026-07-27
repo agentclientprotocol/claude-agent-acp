@@ -204,48 +204,77 @@ describe("createSession options merging", () => {
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
   });
 
-  it("seeds an empty trace-env baseline when settings have no env", async () => {
+  it("leaves trace env alone when the session carries no trace context", async () => {
     const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-    expect((agent.sessions[response.sessionId] as any).baseFlagEnv).toEqual({
-      known: true,
-      value: null,
-    });
+    expect(capturedOptions?.env).not.toHaveProperty("TRACEPARENT");
+    expect(capturedOptions?.env).not.toHaveProperty("TRACESTATE");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toBeUndefined();
     expect((agent.sessions[response.sessionId] as any).traceEnvApplied).toBe(false);
   });
 
-  it("seeds the trace-env baseline from inline flag settings", async () => {
+  it("bakes session trace context into the spawn env", async () => {
     const response = await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
       _meta: {
-        claudeCode: {
-          options: { settings: { env: { BASELINE_ENV: "initial" } } },
-        },
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
       },
     });
 
-    const baseline = (agent.sessions[response.sessionId] as any).baseFlagEnv;
-    expect(baseline).toEqual({
-      known: true,
-      value: { BASELINE_ENV: "initial" },
+    expect(capturedOptions?.env?.TRACEPARENT).toBe(
+      "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+    );
+    expect(capturedOptions?.env?.TRACESTATE).toBe("vendor=value");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toEqual({
+      traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+      tracestate: "vendor=value",
     });
-    (capturedOptions!.settings as { env: Record<string, string> }).env.BASELINE_ENV = "mutated";
-    expect(baseline.value.BASELINE_ENV).toBe("initial");
+    // No control round-trip: the value is in place before the CLI starts.
+    expect((agent.sessions[response.sessionId] as any).traceEnvApplied).toBe(false);
   });
 
-  it("marks a path-based trace-env baseline as unknown", async () => {
+  it("blanks the unsupplied half of session trace context so it can't be inherited", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { traceparent: "00-trace-parent" },
+    });
+
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-trace-parent");
+    expect(capturedOptions?.env?.TRACESTATE).toBe("");
+  });
+
+  it("lets session trace context win over the options.env escape hatch", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        traceparent: "00-from-meta",
+        claudeCode: { options: { env: { TRACEPARENT: "00-from-options-env" } } },
+      },
+    });
+
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-from-meta");
+  });
+
+  it("accepts session trace context alongside a path-based settings option", async () => {
     const response = await agent.newSession({
       cwd: process.cwd(),
       mcpServers: [],
       _meta: {
-        claudeCode: {
-          options: { settings: "/opaque/settings.json" },
-        },
+        traceparent: "00-trace-parent",
+        claudeCode: { options: { settings: "/opaque/settings.json" } },
       },
     });
 
-    expect((agent.sessions[response.sessionId] as any).baseFlagEnv).toEqual({ known: false });
+    // Nothing here needs to know what that settings file contains: the adapter
+    // only ever writes the two trace vars, and never reproduces a baseline.
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-trace-parent");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toEqual({
+      traceparent: "00-trace-parent",
+    });
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {
