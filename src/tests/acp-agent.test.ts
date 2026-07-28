@@ -43,6 +43,7 @@ import {
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
+  type SteerRequest,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -9549,22 +9550,37 @@ describe("turn steering (_session/steering)", () => {
     ).rejects.toThrow();
   });
 
-  it("advertises the prompt-required idle behavior in the steering capability", async () => {
+  it("preserves the existing steering capability declaration", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    // Top-level _meta (sibling of agentCapabilities), per the wire protocol. The
-    // idleBehavior tells hosts that an idle steer returns promptRequired rather
-    // than starting a detached turn they cannot own.
+    // Top-level _meta (sibling of agentCapabilities), per the existing steering
+    // extension contract. Idle behavior is selected per steering request.
     expect((response._meta as any)?.steering).toEqual({
       supported: true,
-      idleBehavior: "promptRequired",
     });
   });
 
-  it("returns promptRequired without consuming the prompt when no turn is in flight", async () => {
+  it("preserves startedNewTurn by default when no turn is in flight", async () => {
+    const agent = createMockAgent();
+    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
+    agent.sessions["test-session"] = mockSessionState({
+      input: new Pushable<any>(),
+      turnQueue: [],
+    });
+
+    const request: SteerRequest = {
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late follow-up" }],
+    };
+
+    await expect(agent.steer(request)).resolves.toEqual({ outcome: "startedNewTurn" });
+    expect(prompt).toHaveBeenCalledWith(request);
+  });
+
+  it("returns promptRequired without consuming an opted-in prompt", async () => {
     const agent = createMockAgent();
     const input = new Pushable<any>();
     const inputPush = vi.spyOn(input, "push");
@@ -9579,6 +9595,7 @@ describe("turn steering (_session/steering)", () => {
     const response = await agent.steer({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "late follow-up" }],
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     });
 
     expect(response).toEqual({
@@ -9619,9 +9636,10 @@ describe("turn steering (_session/steering)", () => {
       },
       { turnQueue: [] },
     );
-    const request: PromptRequest = {
+    const request: SteerRequest = {
       sessionId: "test-session",
       prompt: [{ type: "text", text: "late follow-up" }],
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     };
 
     // Steering an idle session leaves the content unconsumed...

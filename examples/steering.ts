@@ -11,17 +11,15 @@
  * The wire protocol has three moving parts:
  *
  *   1. The agent advertises support in its `initialize` response, at the
- *      top-level `_meta.steering` (a sibling of `agentCapabilities`), including
- *      `idleBehavior: "promptRequired"` so the client knows the idle contract.
+ *      top-level `_meta.steering` (a sibling of `agentCapabilities`).
  *   2. The client calls the `_session/steering` request with `{ sessionId,
  *      prompt }` while a turn is running.
  *   3. The agent replies with an `outcome`:
  *        - "injected"       the message joined the running turn;
- *        - "promptRequired" the turn had already finished (an unavoidable race),
- *                           so the message was NOT consumed and the client must
- *                           start a normal `session/prompt` to send it.
- *      Both are success outcomes: the Adapter either consumes the message in
- *      the running turn or leaves it Host-owned for explicit prompt delivery.
+ *        - "startedNewTurn" the turn had already finished and the legacy
+ *                           detached fallback was used;
+ *        - "promptRequired" the turn had already finished, but this request
+ *                           explicitly opted into Host-owned prompt delivery.
  *
  * This example launches the agent as a subprocess, starts a deliberately
  * long-running prompt, and — as soon as the agent begins streaming — injects a
@@ -58,6 +56,7 @@ const STEERING_METHOD = "_session/steering";
 type SteeringRequest = {
   sessionId: string;
   prompt: Array<{ type: "text"; text: string }>;
+  _meta?: { steering?: { idleBehavior?: "promptRequired" } };
 };
 
 /** Result of a `_session/steering` request. `injected` means the message joined
@@ -65,14 +64,14 @@ type SteeringRequest = {
  *  message was NOT consumed and must be (re)sent through a normal
  *  `session/prompt`. Both are successes. */
 type SteeringResponse =
-  { outcome: "injected" } | { outcome: "promptRequired"; reason: "noRunningTurn" };
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
 
-/** The steering capability advertised at the top-level `_meta.steering` of the
- *  `initialize` result. `idleBehavior` narrows the idle contract this example
- *  relies on. */
+/** The existing steering capability advertised at the top-level `_meta.steering`
+ *  of the `initialize` result. The idle behavior is selected per request. */
 type SteeringCapability = {
   supported?: boolean;
-  idleBehavior?: "promptRequired";
 };
 
 // The built agent entry. Run `npm run build` first so this exists.
@@ -148,10 +147,10 @@ async function main() {
       });
       const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)
         ?.steering;
-      if (steering?.supported !== true || steering.idleBehavior !== "promptRequired") {
-        throw new Error("agent does not advertise the promptRequired steering contract");
+      if (steering?.supported !== true) {
+        throw new Error("agent does not advertise steering support");
       }
-      log(`agent steering idle behavior: ${steering.idleBehavior}`);
+      log("agent advertises steering support");
 
       // 2. Open a session.
       const { sessionId } = await agent.request(methods.agent.session.new, {
@@ -180,6 +179,9 @@ async function main() {
       const steerRequest: SteeringRequest = {
         sessionId,
         prompt: [{ type: "text", text: STEER }],
+        // Opt into the host-owned idle fallback. Without this request metadata,
+        // the Adapter preserves its legacy `startedNewTurn` behavior.
+        _meta: { steering: { idleBehavior: "promptRequired" } },
       };
       const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
       log(`steer outcome: ${result.outcome}`);

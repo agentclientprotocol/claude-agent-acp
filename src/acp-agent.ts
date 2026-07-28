@@ -207,6 +207,15 @@ const STEER_METHOD = "_session/steering";
  *  steering always uses `now` so the running turn adapts as soon as possible. */
 const STEER_PRIORITY = "now" as const;
 
+/** Request-level steering options. `promptRequired` is opt-in so existing Hosts
+ *  keep the established idle fallback behavior. */
+type SteerMeta = {
+  [key: string]: unknown;
+  steering?: {
+    idleBehavior?: "promptRequired";
+  };
+};
+
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
@@ -214,16 +223,16 @@ const STEER_PRIORITY = "now" as const;
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
+  _meta?: SteerMeta | null;
 };
 
-/** Result of a {@link STEER_METHOD} request. `injected` means the message joined
- *  the running turn; `promptRequired` is the expected race outcome when the
- *  target turn settled before steering arrived — in that branch the prompt
- *  remains Host-owned and was NOT enqueued, injected, or otherwise consumed by
- *  the Adapter, so the Host retries it through a normal `session/prompt` on the
- *  same session. Both are success results, never JSON-RPC errors. */
+/** Result of a {@link STEER_METHOD} request. The legacy `startedNewTurn` result
+ *  remains the default idle behavior; `promptRequired` is returned only when the
+ *  Host explicitly opts into the host-owned fallback in request `_meta`. */
 export type SteerResponse =
-  { outcome: "injected" } | { outcome: "promptRequired"; reason: "noRunningTurn" };
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
 
 /** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
  *  content blocks are handed to `promptToClaude`, which tolerates unknown block
@@ -232,16 +241,26 @@ function parseSteerRequest(params: unknown): SteerRequest {
   if (!params || typeof params !== "object") {
     throw RequestError.invalidParams(undefined, "steer params must be an object");
   }
-  const { sessionId, prompt } = params as Record<string, unknown>;
+  const { sessionId, prompt, _meta } = params as Record<string, unknown>;
   if (typeof sessionId !== "string" || sessionId.length === 0) {
     throw RequestError.invalidParams(undefined, "steer params require a non-empty sessionId");
   }
   if (!Array.isArray(prompt) || prompt.length === 0) {
     throw RequestError.invalidParams(undefined, "steer params require a non-empty prompt array");
   }
+  const steering =
+    _meta && typeof _meta === "object" ? (_meta as Record<string, unknown>).steering : undefined;
+  const idleBehavior =
+    steering && typeof steering === "object"
+      ? (steering as Record<string, unknown>).idleBehavior
+      : undefined;
+  if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
+    throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  }
   return {
     sessionId,
     prompt: prompt as PromptRequest["prompt"],
+    _meta: _meta as SteerMeta | null | undefined,
   };
 }
 
@@ -1430,17 +1449,12 @@ export class ClaudeAcpAgent {
         ...terminalAuthMethods,
         ...(supportsGatewayAuth ? [gatewayAuthMethod, gatewayBedrockAuthMethod] : []),
       ],
-      // Top-level `_meta` (sibling of `agentCapabilities`), per the ACP steering
-      // wire protocol: advertises the `_session/steering` extension request so
-      // clients know they may inject a follow-up into the running turn (see
-      // STEER_METHOD) instead of queuing it as a separate `session/prompt`. The
-      // `idleBehavior` narrows the contract: when the target turn has already
-      // settled, steering returns `promptRequired` (Host-owned retry) rather
-      // than starting a detached turn the client cannot own.
+      // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
+      // steering extension contract: advertises the `_session/steering` request
+      // so clients know they may inject a follow-up into a running turn.
       _meta: {
         steering: {
           supported: true,
-          idleBehavior: "promptRequired",
         },
       },
     };
@@ -1742,10 +1756,8 @@ export class ClaudeAcpAgent {
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
    *  message into the turn that is currently running. If that turn already
-   *  settled (the unavoidable "arrived too late" race), the message is left
-   *  untouched and the Host is told to start a normal `session/prompt`
-   *  continuation on the same session — steering never starts a detached turn
-   *  and never returns a JSON-RPC error for the race (see {@link SteerResponse}).
+   *  settled, the established default starts a new detached turn; Hosts may opt
+   *  into the host-owned `promptRequired` fallback through request `_meta`.
    *
    *  When a turn is in flight this injects (returns `injected`): unlike
    *  `prompt()`, it does NOT create a Turn or enqueue on `turnQueue`; it pushes
@@ -1758,14 +1770,11 @@ export class ClaudeAcpAgent {
    *  calls). The steered message's own output streams via `session/update`, not
    *  this response.
    *
-   *  When the session is idle (no unsettled turn — the turn we meant to steer
-   *  raced ahead and finished), this returns `promptRequired` WITHOUT calling
-   *  `prompt()`, pushing SDK input, or mutating `turnQueue`: the content stays
-   *  Host-owned so the Host can submit it through a standard `session/prompt`
-   *  whose updates, cancellation, error, usage, and terminal response all have
-   *  an owning request. The check for an unsettled turn and the active-path
-   *  `session.input.push(...)` stay in one synchronous section so the selected
-   *  turn cannot settle between deciding to inject and enqueueing the message. */
+   *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
+   *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
+   *  stays Host-owned so the Host can submit it through a standard
+   *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
+   *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
     const session = this.sessions[sessionId];
@@ -1783,11 +1792,22 @@ export class ClaudeAcpAgent {
     // turn cannot settle in the gap between deciding to inject and enqueueing.
     const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
     if (!turnInFlight) {
-      // Race: the turn we meant to steer already finished. Do NOT start a
-      // detached turn — its PromptResponse would have no owning ACP request.
-      // Leave the content untouched and tell the Host to retry via a normal
-      // session/prompt on the same session (preserving conversation context).
-      return { outcome: "promptRequired", reason: "noRunningTurn" };
+      const promptRequest: PromptRequest = {
+        sessionId,
+        prompt: params.prompt,
+      };
+      if (params._meta?.steering?.idleBehavior === "promptRequired") {
+        // The opt-in path leaves the content untouched so the Host can retry via
+        // a normal session/prompt whose lifecycle owns the continuation result.
+        return { outcome: "promptRequired", reason: "noRunningTurn" };
+      }
+
+      // Preserve the established default for Hosts that do not opt in. This is
+      // intentionally detached for compatibility with the existing contract.
+      this.prompt(promptRequest).catch((error) => {
+        this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
+      });
+      return { outcome: "startedNewTurn" };
     }
 
     const promptRequest: PromptRequest = {
