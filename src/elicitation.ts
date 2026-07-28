@@ -147,7 +147,14 @@ function questionCustomFieldKey(index: number): string {
  * extensions (`_claude/...`).
  */
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
-const CUSTOM_ANSWER_META_KEY = "_claude/askUserQuestionCustomAnswer";
+
+/**
+ * Shared `_meta` key for marking a per-question free-text field as the custom
+ * answer companion for a select question. This intentionally has no
+ * agent-specific namespace so ACP clients can recognize the same marker across
+ * Codex, Claude, and other AskUserQuestion bridges.
+ */
+const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
 
 /**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.

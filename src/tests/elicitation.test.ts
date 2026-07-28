@@ -265,7 +265,7 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        "_claude/askUserQuestionCustomAnswer": {
+        _askUserQuestionCustomAnswer: {
           questionId: "question_0",
           isCustomAnswer: true,
         },
@@ -275,7 +275,7 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        "_claude/askUserQuestionCustomAnswer": {
+        _askUserQuestionCustomAnswer: {
           questionId: "question_1",
           isCustomAnswer: true,
         },
