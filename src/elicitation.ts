@@ -147,6 +147,7 @@ function questionCustomFieldKey(index: number): string {
  * extensions (`_claude/...`).
  */
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
+const CUSTOM_ANSWER_META_KEY = "_claude/askUserQuestionCustomAnswer";
 
 /**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
@@ -204,6 +205,12 @@ export function askUserQuestionsToCreateRequest(
       type: "string",
       title: "Other",
       description: "Type your own answer instead of choosing an option above (optional).",
+      _meta: {
+        [CUSTOM_ANSWER_META_KEY]: {
+          questionId: questionFieldKey(index),
+          isCustomAnswer: true,
+        },
+      },
     };
   });
 
