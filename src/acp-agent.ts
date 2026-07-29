@@ -1182,48 +1182,122 @@ export function resolvePermissionMode(
   return mapped;
 }
 
-/**
- * Builds the label for the "Always Allow" permission option so the user can see
- * the exact scope they are committing to. Uses the SDK-provided suggestions
- * when available (e.g. `Bash(npm test:*)`) and falls back to naming the whole
- * tool so "Always Allow" is never a blank check without disclosure.
- */
-export function describeAlwaysAllow(
+function permissionLifetime(destination: PermissionUpdate["destination"]): Record<string, string> {
+  switch (destination) {
+    case "session":
+      return { scope: "session" };
+    case "cliArg":
+      return { scope: "process", storage: "cli_argument" };
+    case "userSettings":
+      return { scope: "persistent", storage: "user" };
+    case "projectSettings":
+      return { scope: "persistent", storage: "project" };
+    case "localSettings":
+      return { scope: "persistent", storage: "project_local" };
+    default:
+      return { scope: "unknown" };
+  }
+}
+
+function permissionMetadataForAlwaysAllow(
   suggestions: PermissionUpdate[] | undefined,
   toolName: string,
-): string {
-  if (!suggestions || suggestions.length === 0) {
-    return `Always Allow all ${toolName}`;
-  }
+): Record<string, unknown> {
+  const effectiveSuggestions =
+    suggestions && suggestions.length > 0
+      ? suggestions
+      : [
+          {
+            type: "addRules" as const,
+            rules: [{ toolName }],
+            behavior: "allow" as const,
+            destination: "session" as const,
+          },
+        ];
+  const changes: Array<Record<string, unknown>> = [];
 
-  const ruleLabels: string[] = [];
-  const directories: string[] = [];
-
-  for (const update of suggestions) {
-    if (update.type === "addRules" && update.behavior === "allow") {
-      for (const rule of update.rules) {
-        ruleLabels.push(
-          rule.ruleContent ? `${rule.toolName}(${rule.ruleContent})` : `all ${rule.toolName}`,
-        );
+  for (const update of effectiveSuggestions) {
+    switch (update.type) {
+      case "addRules":
+      case "removeRules":
+      case "replaceRules": {
+        const operation =
+          update.type === "addRules" ? "add" : update.type === "removeRules" ? "remove" : "replace";
+        const targets = update.rules.map((rule) => ({
+          type: "tool",
+          toolName: rule.toolName,
+          ...(rule.ruleContent
+            ? {
+                matcher: {
+                  type: "provider_rule",
+                  provider: "claudeCode",
+                  value: rule.ruleContent,
+                },
+              }
+            : {}),
+        }));
+        const renderedRules = update.rules
+          .map((rule) =>
+            rule.ruleContent
+              ? `${rule.toolName} calls matching ${rule.ruleContent}`
+              : `all ${rule.toolName} calls`,
+          )
+          .join(", ");
+        const verb =
+          operation === "add"
+            ? update.behavior === "allow"
+              ? "Allow"
+              : update.behavior === "deny"
+                ? "Deny"
+                : "Ask before"
+            : operation === "remove"
+              ? `Remove ${update.behavior} rules for`
+              : `Replace ${update.behavior} rules with`;
+        changes.push({
+          type: "policy_rule",
+          operation,
+          ruleBehavior: update.behavior,
+          description: `${verb} ${renderedRules}`,
+          lifetime: permissionLifetime(update.destination),
+          targets,
+        });
+        break;
       }
-    } else if (update.type === "addDirectories") {
-      directories.push(...update.directories);
+      case "addDirectories":
+      case "removeDirectories": {
+        const operation = update.type === "addDirectories" ? "add" : "remove";
+        changes.push({
+          type: "policy_rule",
+          operation,
+          ruleBehavior: "allow",
+          description:
+            operation === "add"
+              ? `Allow filesystem access under ${update.directories.join(", ")}`
+              : `Remove additional filesystem access under ${update.directories.join(", ")}`,
+          lifetime: permissionLifetime(update.destination),
+          targets: update.directories.map((path) => ({
+            type: "filesystem",
+            matcher: { type: "directory", path },
+          })),
+        });
+        break;
+      }
+      case "setMode":
+        changes.push({
+          type: "permission_mode",
+          operation: "set",
+          provider: "claudeCode",
+          mode: update.mode,
+          description: `Set Claude Code permission mode to ${update.mode}`,
+          lifetime: permissionLifetime(update.destination),
+        });
+        break;
+      default:
+        break;
     }
   }
 
-  const parts: string[] = [];
-  if (ruleLabels.length > 0) {
-    parts.push(ruleLabels.join(", "));
-  }
-  if (directories.length > 0) {
-    parts.push(`access to ${directories.join(", ")}`);
-  }
-
-  if (parts.length === 0) {
-    return `Always Allow all ${toolName}`;
-  }
-
-  return `Always Allow ${parts.join(" and ")}`;
+  return { version: 1, changes };
 }
 
 /**
@@ -4521,7 +4595,6 @@ export class ClaudeAcpAgent {
       toolInput,
       { signal, suggestions, toolUseID, agentID, matchedAskRule },
     ) => {
-      const alwaysAllowLabel = describeAlwaysAllow(suggestions, toolName);
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
@@ -4676,13 +4749,16 @@ export class ClaudeAcpAgent {
       const response = await this.requestPermissionFromClient(
         {
           options: [
+            { kind: "reject_once", name: "Deny", optionId: "reject" },
+            { kind: "allow_once", name: "Allow Once", optionId: "allow" },
             {
               kind: "allow_always",
-              name: alwaysAllowLabel,
+              name: "Always Allow",
               optionId: "allow_always",
+              _meta: {
+                permission: permissionMetadataForAlwaysAllow(suggestions, toolName),
+              },
             },
-            { kind: "allow_once", name: "Allow", optionId: "allow" },
-            { kind: "reject_once", name: "Reject", optionId: "reject" },
           ],
           sessionId,
           toolCall: {

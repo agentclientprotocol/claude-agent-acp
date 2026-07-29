@@ -34,7 +34,6 @@ import {
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
-  describeAlwaysAllow,
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
@@ -1999,81 +1998,6 @@ describe("permission requests", () => {
       expect(Array.isArray(requestStructure.toolCall.content)).toBe(true);
     }
   });
-
-  describe("describeAlwaysAllow", () => {
-    it("falls back to naming the whole tool when no suggestions are provided", () => {
-      expect(describeAlwaysAllow(undefined, "Bash")).toBe("Always Allow all Bash");
-      expect(describeAlwaysAllow([], "Read")).toBe("Always Allow all Read");
-    });
-
-    it("includes the scoped rule content from a suggestion", () => {
-      const label = describeAlwaysAllow(
-        [
-          {
-            type: "addRules",
-            rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
-            behavior: "allow",
-            destination: "session",
-          },
-        ],
-        "Bash",
-      );
-      expect(label).toBe("Always Allow Bash(npm test:*)");
-    });
-
-    it("indicates a tool-wide rule when the suggestion has no ruleContent", () => {
-      const label = describeAlwaysAllow(
-        [
-          {
-            type: "addRules",
-            rules: [{ toolName: "Read" }],
-            behavior: "allow",
-            destination: "session",
-          },
-        ],
-        "Read",
-      );
-      expect(label).toBe("Always Allow all Read");
-    });
-
-    it("joins multiple rules and directory suggestions", () => {
-      const label = describeAlwaysAllow(
-        [
-          {
-            type: "addRules",
-            rules: [
-              { toolName: "Bash", ruleContent: "git status" },
-              { toolName: "Bash", ruleContent: "git diff:*" },
-            ],
-            behavior: "allow",
-            destination: "session",
-          },
-          {
-            type: "addDirectories",
-            directories: ["/tmp/work"],
-            destination: "session",
-          },
-        ],
-        "Bash",
-      );
-      expect(label).toBe("Always Allow Bash(git status), Bash(git diff:*) and access to /tmp/work");
-    });
-
-    it("ignores non-allow rules and falls back when nothing is left", () => {
-      const label = describeAlwaysAllow(
-        [
-          {
-            type: "addRules",
-            rules: [{ toolName: "Bash", ruleContent: "rm -rf:*" }],
-            behavior: "deny",
-            destination: "session",
-          },
-        ],
-        "Bash",
-      );
-      expect(label).toBe("Always Allow all Bash");
-    });
-  });
 });
 
 describe("permission request cancellation", () => {
@@ -2171,6 +2095,201 @@ describe("permission request cancellation", () => {
         toolUseID: "tool-1",
       } as any),
     ).rejects.toThrow("Tool use aborted");
+  });
+
+  it("offers the approval actions in deny, once, always order with human-readable labels", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(request?.options).toEqual([
+      { kind: "reject_once", name: "Deny", optionId: "reject" },
+      { kind: "allow_once", name: "Allow Once", optionId: "allow" },
+      {
+        kind: "allow_always",
+        name: "Always Allow",
+        optionId: "allow_always",
+        _meta: {
+          permission: {
+            version: 1,
+            changes: [
+              {
+                type: "policy_rule",
+                operation: "add",
+                ruleBehavior: "allow",
+                description: "Allow all Bash calls",
+                lifetime: { scope: "session" },
+                targets: [{ type: "tool", toolName: "Bash" }],
+              },
+            ],
+          },
+        },
+      },
+    ]);
+  });
+
+  it("attaches structured permission changes to the always-allow ACP option", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "npm test" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+          behavior: "allow",
+          destination: "session",
+        },
+        {
+          type: "addDirectories",
+          directories: ["/tmp/work"],
+          destination: "session",
+        },
+      ],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(request?.options.find((option) => option.optionId === "allow_always")?._meta).toEqual({
+      permission: {
+        version: 1,
+        changes: [
+          {
+            type: "policy_rule",
+            operation: "add",
+            ruleBehavior: "allow",
+            description: "Allow Bash calls matching npm test:*",
+            lifetime: { scope: "session" },
+            targets: [
+              {
+                type: "tool",
+                toolName: "Bash",
+                matcher: {
+                  type: "provider_rule",
+                  provider: "claudeCode",
+                  value: "npm test:*",
+                },
+              },
+            ],
+          },
+          {
+            type: "policy_rule",
+            operation: "add",
+            ruleBehavior: "allow",
+            description: "Allow filesystem access under /tmp/work",
+            lifetime: { scope: "session" },
+            targets: [
+              {
+                type: "filesystem",
+                matcher: { type: "directory", path: "/tmp/work" },
+              },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
+  it("preserves replace, remove, deny, destination, and mode suggestion semantics", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "rm generated.txt" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "replaceRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm generated.txt" }],
+          behavior: "deny",
+          destination: "projectSettings",
+        },
+        {
+          type: "removeDirectories",
+          directories: ["/tmp/old"],
+          destination: "localSettings",
+        },
+        {
+          type: "setMode",
+          mode: "default",
+          destination: "session",
+        },
+      ],
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(
+      (request?.options.find((option) => option.optionId === "allow_always")?._meta as any)
+        ?.permission.changes,
+    ).toEqual([
+      {
+        type: "policy_rule",
+        operation: "replace",
+        ruleBehavior: "deny",
+        description: "Replace deny rules with Bash calls matching rm generated.txt",
+        lifetime: { scope: "persistent", storage: "project" },
+        targets: [
+          {
+            type: "tool",
+            toolName: "Bash",
+            matcher: {
+              type: "provider_rule",
+              provider: "claudeCode",
+              value: "rm generated.txt",
+            },
+          },
+        ],
+      },
+      {
+        type: "policy_rule",
+        operation: "remove",
+        ruleBehavior: "allow",
+        description: "Remove additional filesystem access under /tmp/old",
+        lifetime: { scope: "persistent", storage: "project_local" },
+        targets: [
+          {
+            type: "filesystem",
+            matcher: { type: "directory", path: "/tmp/old" },
+          },
+        ],
+      },
+      {
+        type: "permission_mode",
+        operation: "set",
+        provider: "claudeCode",
+        mode: "default",
+        description: "Set Claude Code permission mode to default",
+        lifetime: { scope: "session" },
+      },
+    ]);
   });
 });
 
