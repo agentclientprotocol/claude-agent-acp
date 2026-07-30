@@ -8,18 +8,18 @@
  * agent can adapt immediately (it shines in multi-step / tool-using turns,
  * where the message slots in between tool calls).
  *
- * The wire protocol (see ../steering_protocol.md) has three moving parts:
+ * The wire protocol has three moving parts:
  *
  *   1. The agent advertises support in its `initialize` response, at the
- *      top-level `_meta.steering.supported` (a sibling of `agentCapabilities`).
+ *      top-level `_meta.steering` (a sibling of `agentCapabilities`).
  *   2. The client calls the `_session/steering` request with `{ sessionId,
  *      prompt }` while a turn is running.
  *   3. The agent replies with an `outcome`:
  *        - "injected"       the message joined the running turn;
- *        - "startedNewTurn" the turn had already finished (an unavoidable race),
- *                           so the message began a fresh turn instead.
- *      Both are success outcomes — the message is never dropped and the race is
- *      never surfaced as an error.
+ *        - "startedNewTurn" the turn had already finished and the legacy
+ *                           detached fallback was used;
+ *        - "promptRequired" the turn had already finished, but this request
+ *                           explicitly opted into Host-owned prompt delivery.
  *
  * This example launches the agent as a subprocess, starts a deliberately
  * long-running prompt, and — as soon as the agent begins streaming — injects a
@@ -40,7 +40,13 @@ import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { client as acpClient, methods, ndJsonStream } from "@agentclientprotocol/sdk";
+import {
+  client as acpClient,
+  methods,
+  ndJsonStream,
+  type PromptRequest,
+  type PromptResponse,
+} from "@agentclientprotocol/sdk";
 
 /** The steering extension method, per the ACP steering wire protocol. */
 const STEERING_METHOD = "_session/steering";
@@ -50,12 +56,22 @@ const STEERING_METHOD = "_session/steering";
 type SteeringRequest = {
   sessionId: string;
   prompt: Array<{ type: "text"; text: string }>;
+  _meta?: { steering?: { idleBehavior?: "promptRequired" } };
 };
 
-/** Result of a `_session/steering` request. Both values are successes: they
- *  tell the client where the message landed, not whether it succeeded. */
-type SteeringResponse = {
-  outcome: "injected" | "startedNewTurn";
+/** Result of a `_session/steering` request. `injected` means the message joined
+ *  the running turn; `promptRequired` means the turn had already settled, so the
+ *  message was NOT consumed and must be (re)sent through a normal
+ *  `session/prompt`. Both are successes. */
+type SteeringResponse =
+  | { outcome: "injected" }
+  | { outcome: "startedNewTurn" }
+  | { outcome: "promptRequired"; reason: "noRunningTurn" };
+
+/** The existing steering capability advertised at the top-level `_meta.steering`
+ *  of the `initialize` result. The idle behavior is selected per request. */
+type SteeringCapability = {
+  supported?: boolean;
 };
 
 // The built agent entry. Run `npm run build` first so this exists.
@@ -87,105 +103,119 @@ async function main() {
   });
   child.on("error", (err) => {
     log(`failed to spawn agent (${AGENT_ENTRY}): ${err}`);
-    process.exit(1);
   });
 
-  const stream = ndJsonStream(
-    Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
-    Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
-  );
-
-  // Resolves the first time the agent streams assistant text — our signal that
-  // the turn is genuinely underway and therefore steerable.
-  let signalFirstOutput = () => {};
-  const firstOutput = new Promise<void>((resolve) => (signalFirstOutput = resolve));
-
-  const connection = acpClient({ name: "steering-example" })
-    .onNotification(methods.client.session.update, (ctx) => {
-      const update = ctx.params.update;
-      if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-        process.stdout.write(update.content.text);
-        signalFirstOutput();
-      }
-    })
-    // Auto-approve permission prompts so the turn is never blocked on us.
-    .onRequest(methods.client.session.requestPermission, (ctx) => {
-      const options = ctx.params.options;
-      const option = options.find((o) => o.kind === "allow_once") ?? options[0];
-      return { outcome: { outcome: "selected", optionId: option.optionId } };
-    })
-    // Minimal file-system stubs; the example prompts don't touch files.
-    .onRequest(methods.client.fs.readTextFile, () => ({ content: "" }))
-    .onRequest(methods.client.fs.writeTextFile, () => ({}))
-    .connect(stream);
-
-  const agent = connection.agent;
-
-  // 1. Initialize and confirm the agent advertises steering. Per the wire
-  //    protocol the capability lives at the TOP-LEVEL `_meta` of the initialize
-  //    result — a sibling of `agentCapabilities`, not nested inside it.
-  const init = await agent.request(methods.agent.initialize, {
-    protocolVersion: 1,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
-  });
-  const meta = init._meta as { steering?: { supported?: boolean } } | null | undefined;
-  const steeringSupported = meta?.steering?.supported === true;
-  log(`agent advertises steering: ${steeringSupported}`);
-  if (!steeringSupported) {
-    log("agent does not advertise steering; the steering request may be rejected.");
-  }
-
-  // 2. Open a session.
-  const { sessionId } = await agent.request(methods.agent.session.new, {
-    cwd: CWD,
-    mcpServers: [],
-  });
-  log(`session: ${sessionId}`);
-
-  // 3. Start a long turn, but DON'T await it yet — we need it in flight so we
-  //    can steer it. Its output streams through the notification handler above.
-  log(`prompt: ${PROMPT}`);
-  process.stdout.write("\n----- agent output -----\n");
-  const turn = agent.request(methods.agent.session.prompt, {
-    sessionId,
-    prompt: [{ type: "text", text: PROMPT }],
-  });
-
-  // 4. Once the turn is producing output, inject the follow-up. Wait for the
-  //    first streamed chunk (with a fallback) plus a beat, so the steer clearly
-  //    lands mid-turn.
-  await Promise.race([firstOutput, delay(5000)]);
-  await delay(1000);
-
-  process.stdout.write("\n");
-  log(`steer: ${STEER}`);
-  const steerRequest: SteeringRequest = {
-    sessionId,
-    prompt: [{ type: "text", text: STEER }],
-  };
   try {
-    const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
-    log(`steer outcome: ${result.outcome}`);
-  } catch (err) {
-    log(`steer rejected: ${err}`);
+    const stream = ndJsonStream(
+      Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
+      Readable.toWeb(child.stdout!) as unknown as ReadableStream<Uint8Array>,
+    );
+
+    // Resolves the first time the agent streams assistant text — our signal that
+    // the turn is genuinely underway and therefore steerable.
+    let signalFirstOutput = () => {};
+    const firstOutput = new Promise<void>((resolve) => (signalFirstOutput = resolve));
+
+    const connection = acpClient({ name: "steering-example" })
+      .onNotification(methods.client.session.update, (ctx) => {
+        const update = ctx.params.update;
+        if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+          process.stdout.write(update.content.text);
+          signalFirstOutput();
+        }
+      })
+      // Auto-approve permission prompts so the turn is never blocked on us.
+      .onRequest(methods.client.session.requestPermission, (ctx) => {
+        const options = ctx.params.options;
+        const option = options.find((o) => o.kind === "allow_once") ?? options[0];
+        return { outcome: { outcome: "selected", optionId: option.optionId } };
+      })
+      // Minimal file-system stubs; the example prompts don't touch files.
+      .onRequest(methods.client.fs.readTextFile, () => ({ content: "" }))
+      .onRequest(methods.client.fs.writeTextFile, () => ({}))
+      .connect(stream);
+
+    try {
+      const agent = connection.agent;
+
+      // 1. Initialize and confirm the agent advertises steering. Per the wire
+      //    protocol the capability lives at the TOP-LEVEL `_meta` of the initialize
+      //    result — a sibling of `agentCapabilities`, not nested inside it.
+      const init = await agent.request(methods.agent.initialize, {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
+      });
+      const steering = (init._meta as { steering?: SteeringCapability } | null | undefined)
+        ?.steering;
+      if (steering?.supported !== true) {
+        throw new Error("agent does not advertise steering support");
+      }
+      log("agent advertises steering support");
+
+      // 2. Open a session.
+      const { sessionId } = await agent.request(methods.agent.session.new, {
+        cwd: CWD,
+        mcpServers: [],
+      });
+      log(`session: ${sessionId}`);
+
+      // 3. Start a long turn, but DON'T await it yet — we need it in flight so we
+      //    can steer it. Its output streams through the notification handler above.
+      log(`prompt: ${PROMPT}`);
+      process.stdout.write("\n----- agent output -----\n");
+      const turn = agent.request(methods.agent.session.prompt, {
+        sessionId,
+        prompt: [{ type: "text", text: PROMPT }],
+      });
+
+      // 4. Once the turn is producing output, inject the follow-up. Wait for the
+      //    first streamed chunk (with a fallback) plus a beat, so the steer clearly
+      //    lands mid-turn.
+      await Promise.race([firstOutput, delay(5000)]);
+      await delay(1000);
+
+      process.stdout.write("\n");
+      log(`steer: ${STEER}`);
+      const steerRequest: SteeringRequest = {
+        sessionId,
+        prompt: [{ type: "text", text: STEER }],
+        // Opt into the host-owned idle fallback. Without this request metadata,
+        // the Adapter preserves its legacy `startedNewTurn` behavior.
+        _meta: { steering: { idleBehavior: "promptRequired" } },
+      };
+      const result = await agent.request<SteeringResponse>(STEERING_METHOD, steerRequest);
+      log(`steer outcome: ${result.outcome}`);
+
+      if (result.outcome === "promptRequired") {
+        // The target turn already settled, so steering did not consume the message.
+        // Start a normal session/prompt on the same session to deliver it — that
+        // request owns the continuation's updates and terminal response.
+        log(`steer fallback: ${result.reason}; starting a normal session/prompt`);
+        const continuationRequest: PromptRequest = {
+          sessionId: steerRequest.sessionId,
+          prompt: steerRequest.prompt,
+        };
+        const continuation = await agent.request<PromptResponse, PromptRequest>(
+          methods.agent.session.prompt,
+          continuationRequest,
+        );
+        log(`continuation stopReason: ${continuation.stopReason}`);
+      }
+
+      // 5. Await the original turn. With outcome "injected" the steer already
+      //    reshaped the output above; the promptRequired branch owns its own turn.
+      const response = await turn;
+      log(`original turn stopReason: ${response.stopReason}`);
+      process.stdout.write("\n----- end of agent output -----\n");
+    } finally {
+      connection.close();
+    }
+  } finally {
+    child.kill();
   }
-
-  // 5. Await the turn. With outcome "injected" the steer already reshaped the
-  //    output above; with "startedNewTurn" the follow-up runs as a fresh turn
-  //    that may still be streaming, so linger briefly to capture it.
-  const response = await turn.catch((err: unknown) => {
-    log(`turn error: ${err}`);
-    return undefined;
-  });
-  if (response) log(`turn stopReason: ${response.stopReason}`);
-  await delay(3000);
-  process.stdout.write("\n----- end of agent output -----\n");
-
-  connection.close();
-  child.kill();
 }
 
 main().catch((err) => {
   log(`fatal: ${err?.stack ?? err}`);
-  process.exit(1);
+  process.exitCode = 1;
 });

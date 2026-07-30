@@ -42,6 +42,7 @@ import {
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
+  type SteerRequest,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
@@ -9810,6 +9811,29 @@ describe("turn steering (_session/steering)", () => {
     };
   }
 
+  // A minimal SDK assistant message carrying a single text block. Used by the
+  // promptRequired retry test to model the continuation turn's streamed reply.
+  function createAssistantText(text: string) {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4-5",
+        stop_reason: "end_turn",
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        content: [{ type: "text", text }],
+      },
+    };
+  }
+
   const waitFor = async (cond: () => boolean) => {
     for (let i = 0; i < 200; i++) {
       if (cond()) return;
@@ -9845,30 +9869,85 @@ describe("turn steering (_session/steering)", () => {
     ).rejects.toThrow();
   });
 
-  it("advertises steering support at _meta.steering.supported", async () => {
+  it("preserves the existing steering capability declaration", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    // Top-level _meta (sibling of agentCapabilities), per the wire protocol.
-    expect((response._meta as any)?.steering).toEqual({ supported: true });
+    // Top-level _meta (sibling of agentCapabilities), per the existing steering
+    // extension contract. Idle behavior is selected per steering request.
+    expect((response._meta as any)?.steering).toEqual({
+      supported: true,
+    });
   });
 
-  it("starts a new turn (outcome 'startedNewTurn') when no turn is in flight (race)", async () => {
+  it("preserves startedNewTurn by default when no turn is in flight", async () => {
     const agent = createMockAgent();
+    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
+    agent.sessions["test-session"] = mockSessionState({
+      input: new Pushable<any>(),
+      turnQueue: [],
+    });
+
+    const request: SteerRequest = {
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late follow-up" }],
+    };
+
+    await expect(agent.steer(request)).resolves.toEqual({ outcome: "startedNewTurn" });
+    expect(prompt).toHaveBeenCalledWith(request);
+  });
+
+  it("returns promptRequired without consuming an opted-in prompt", async () => {
+    const agent = createMockAgent();
+    const input = new Pushable<any>();
+    const inputPush = vi.spyOn(input, "push");
+    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
+    // Idle session: turnQueue is empty, so the turn we meant to steer has (from
+    // the agent's view) already finished. The content must stay Host-owned.
+    agent.sessions["test-session"] = mockSessionState({
+      input,
+      turnQueue: [],
+    });
+
+    const response = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late follow-up" }],
+      _meta: { steering: { idleBehavior: "promptRequired" } },
+    });
+
+    expect(response).toEqual({
+      outcome: "promptRequired",
+      reason: "noRunningTurn",
+    });
+    // The idle branch must not start a detached turn, push SDK input, or mutate
+    // the queue — the Host retries the exact same content via session/prompt.
+    expect(prompt).not.toHaveBeenCalled();
+    expect(inputPush).not.toHaveBeenCalled();
+    expect(agent.sessions["test-session"].turnQueue).toEqual([]);
+  });
+
+  it("lets the host retry promptRequired content through session/prompt exactly once", async () => {
+    const updates: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          updates.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     const captured: any[] = [];
-    // Idle session: turnQueue starts empty, so the turn we meant to steer has
-    // (from the agent's view) already finished. Steering must not error — it
-    // starts a fresh turn with the message.
     injectGeneratorSession(
       agent,
       (input) => {
         async function* messageGenerator() {
           const iter = input[Symbol.asyncIterator]();
-          const u1 = await iter.next();
-          captured.push(u1.value);
-          yield userEcho(u1.value); // activates the new turn
+          const continuation = await iter.next();
+          captured.push(continuation.value);
+          yield userEcho(continuation.value);
+          yield createAssistantText("continuation response");
           yield createResultMessage();
           yield { type: "system", subtype: "session_state_changed", state: "idle" };
         }
@@ -9876,19 +9955,31 @@ describe("turn steering (_session/steering)", () => {
       },
       { turnQueue: [] },
     );
-
-    const res = await agent.steer({
+    const request: SteerRequest = {
       sessionId: "test-session",
       prompt: [{ type: "text", text: "late follow-up" }],
-    });
-    expect(res.outcome).toBe("startedNewTurn");
+      _meta: { steering: { idleBehavior: "promptRequired" } },
+    };
 
-    // A real turn was enqueued and drains like any normal prompt.
-    await waitFor(() => (agent.sessions["test-session"].turnQueue ?? []).length === 0);
+    // Steering an idle session leaves the content unconsumed...
+    await expect(agent.steer(request)).resolves.toEqual({
+      outcome: "promptRequired",
+      reason: "noRunningTurn",
+    });
+    await Promise.resolve();
+    expect(captured).toHaveLength(0);
+
+    // ...so the Host can submit the same content through a normal session/prompt,
+    // which owns the continuation's updates and terminal response.
+    await expect(agent.prompt(request)).resolves.toEqual(
+      expect.objectContaining({ stopReason: "end_turn" }),
+    );
     expect(captured).toHaveLength(1);
-    // It went through the normal prompt() path — no steering delivery priority.
     expect(captured[0].priority).toBeUndefined();
     expect(JSON.stringify(captured[0].message.content)).toContain("late follow-up");
+    expect(updates).toContain("continuation response");
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+    await agent.sessions["test-session"]?.consumer;
   });
 
   it("injects (outcome 'injected') a priority:'now' message into the running turn without spawning a new turn", async () => {

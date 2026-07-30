@@ -149,6 +149,14 @@ function questionCustomFieldKey(index: number): string {
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
 
 /**
+ * Shared `_meta` key for marking a per-question free-text field as the custom
+ * answer companion for a select question. This intentionally has no
+ * agent-specific namespace so ACP clients can recognize the same marker across
+ * Codex, Claude, and other AskUserQuestion bridges.
+ */
+const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
+
+/**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
  *
  * Fields are keyed by a short stable id (`question_<n>`) rather than the full
@@ -204,6 +212,12 @@ export function askUserQuestionsToCreateRequest(
       type: "string",
       title: "Other",
       description: "Type your own answer instead of choosing an option above (optional).",
+      _meta: {
+        [CUSTOM_ANSWER_META_KEY]: {
+          questionId: questionFieldKey(index),
+          isCustomAnswer: true,
+        },
+      },
     };
   });
 
