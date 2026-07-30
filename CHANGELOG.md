@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.64.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.63.0...v0.64.0) (2026-07-30)
+
+
+### Features
+
+* **deps:** Bump actions/checkout from 7.0.0 to 7.0.1 ([#925](https://github.com/agentclientprotocol/claude-agent-acp/issues/925)) ([8e099e8](https://github.com/agentclientprotocol/claude-agent-acp/commit/8e099e844254c3e91508c79a02e3e7dc2239fcbb))
+* **deps:** Bump the minor group with 7 updates ([#928](https://github.com/agentclientprotocol/claude-agent-acp/issues/928)) ([3f60921](https://github.com/agentclientprotocol/claude-agent-acp/commit/3f609219592e63b947539f79c696b3cedb421060))
+
+
+### Bug Fixes
+
+* **steering:** add opt-in host-owned fallback ([#919](https://github.com/agentclientprotocol/claude-agent-acp/issues/919)) ([43af4ec](https://github.com/agentclientprotocol/claude-agent-acp/commit/43af4ec29ea5396c2614813af05967bfb0b1bac8)), closes [#903](https://github.com/agentclientprotocol/claude-agent-acp/issues/903)
+
 ## [0.63.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.62.0...v0.63.0) (2026-07-27)
 
 
