@@ -29,6 +29,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "npm run build && npm run start",
+    "example:simple-client": "node --experimental-strip-types --disable-warning=ExperimentalWarning examples/simple-client.ts",
     "lint": "eslint src --ext .ts",
     "lint:fix": "eslint src --ext .ts --fix",
     "format": "prettier --write .",
