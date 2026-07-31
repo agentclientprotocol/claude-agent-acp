@@ -18,20 +18,31 @@
  * flush left and undecorated — select it and you have valid JSON on the
  * clipboard. This exists to show you the protocol, not to summarize it.
  *
- * Follow-up messages: a line typed while a turn is still running is *buffered*
- * and sent as a fresh `session/prompt` once that turn's response arrives. Two
- * alternatives are deliberately not used here — the agent advertises
- * `promptQueueing`, so a second `session/prompt` mid-turn would be queued
- * agent-side instead (same order, different owner of the backlog), and
- * `_session/steering` injects a message into the *running* turn (see
- * ./steering.ts).
+ * There are four ways for a client to get a message to this agent, and all four
+ * are reachable from the prompt so you can watch what each one looks like on
+ * the wire. Plain text is the first; the rest are `!`-prefixed commands, chosen
+ * so they cannot be confused with the agent's own slash commands (`/compact`
+ * and friends are ordinary prompt text here). `!!` escapes a literal `!`.
+ *
+ *   <text>          `session/prompt`. Typed mid-turn it is *buffered* by this
+ *                   client and sent once the running turn responds.
+ *   !steer <text>   `_session/steering` — injected into the turn that is
+ *                   already running, so it can change course between tool
+ *                   calls. Answers "injected", or "startedNewTurn" if the turn
+ *                   beat us to the finish. Either way the reply arrives as
+ *                   `session/update` notifications that can outlast the
+ *                   `stopReason` of the turn you steered. See ./steering.ts.
+ *   !queue <text>   `session/prompt` sent mid-turn anyway. The agent advertises
+ *                   `promptQueueing`, so it takes the backlog instead of us —
+ *                   same ordering, different owner.
+ *   !cancel         `session/cancel` for the running turn, as Ctrl-C does.
  *
  * Run (build the agent first so `dist/index.js` exists):
  *
  *   npm run build
  *   node examples/simple-client.ts
  *
- * or, equivalently, `npm run example:client`.
+ * or, equivalently, `npm run example:simple-client`.
  *
  * To debug the agent itself, pass a port. The agent is then rebuilt with source
  * maps and started under `--inspect-brk=<port>`, i.e. paused before its first
@@ -46,7 +57,7 @@
  * (Node < 22.18 needs `node --experimental-strip-types examples/simple-client.ts`.)
  *
  * Keys: Enter sends (or buffers), Ctrl-C cancels the running turn (again to
- * quit), Ctrl-D drains anything buffered and exits.
+ * quit), Ctrl-D drains anything buffered and exits. `!help` lists the commands.
  *
  * Flags: --debug-port=<port>, --no-build, --help.
  * Env:   AGENT_ENTRY (default dist/index.js), CWD (default process.cwd()).
@@ -73,6 +84,26 @@ import {
 // Type-only: Node's type stripping does not elide value imports, and these two
 // exist only in the .d.ts — importing them normally is a runtime SyntaxError.
 import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
+
+// ---------------------------------------------------------------- steering
+
+/**
+ * The steering extension (../steering_protocol.md, and ./steering.ts for a
+ * scripted walkthrough). It is not part of ACP proper, so it has no entry in
+ * `methods` and is sent as a raw method name with hand-written types.
+ */
+const STEERING_METHOD = "_session/steering";
+
+type SteeringRequest = {
+  sessionId: string;
+  prompt: Array<{ type: "text"; text: string }>;
+};
+
+/** Both outcomes are successes; they say where the message landed, not whether
+ *  it worked. "startedNewTurn" means the turn finished before we got there. */
+type SteeringResponse = {
+  outcome: "injected" | "startedNewTurn";
+};
 
 // ---------------------------------------------------------------- arguments
 
@@ -118,6 +149,15 @@ if (
   process.exit(1);
 }
 
+/** Shown by `!help`, and once at startup. */
+const HELP = [
+  "<text>          send it — as a new turn, or buffered until this turn ends",
+  "!steer <text>   inject into the running turn (_session/steering)",
+  "!queue <text>   send session/prompt now and let the agent queue it",
+  "!cancel         session/cancel the running turn (same as Ctrl-C)",
+  "!help           this list; !! sends a line that really starts with '!'",
+];
+
 // How long to wait for a cancelled turn to settle, and for the agent to exit
 // after we close its stdin, before escalating during shutdown.
 const CANCEL_TIMEOUT_MS = 5_000;
@@ -135,7 +175,10 @@ const startedAt = Date.now();
 let rl: readline.Interface | null = null;
 let shuttingDown = false;
 let queue: string[] = [];
-let turnRunning = false;
+// How many `session/prompt` requests are awaiting a response. Usually 0 or 1;
+// `!queue` deliberately drives it higher to exercise the agent's own queueing.
+let inFlight = 0;
+const turnRunning = () => inFlight > 0;
 let cancelRequested = false;
 let lastUpdateKind = "";
 // False until `initialize` returns — an agent still paused under --inspect-brk
@@ -165,8 +208,9 @@ function log(message: string) {
 function refreshPrompt() {
   if (!rl) return;
   const queued = queue.length > 0 ? `[${queue.length} queued] ` : "";
-  const busy = turnRunning ? dim(`⋯ ${lastUpdateKind} `) : "";
-  rl.setPrompt(`${busy}${queued}› `);
+  const running = inFlight > 1 ? `[${inFlight} turns] ` : "";
+  const busy = turnRunning() ? dim(`⋯ ${lastUpdateKind} `) : "";
+  rl.setPrompt(`${busy}${running}${queued}› `);
   if (TTY) rl.prompt(true);
 }
 
@@ -342,18 +386,18 @@ async function main() {
   // wait below is unbounded, and a client that dies without running shutdown()
   // orphans a paused agent still holding the debug port.
   const onInterrupt = () => {
-    if (turnRunning && !cancelRequested) {
+    if (turnRunning() && !cancelRequested) {
       cancelRequested = true;
       const dropped = queue.length;
       queue = [];
-      // A notification, not a request: the turn still settles through its own
-      // session/prompt response, normally with stopReason "cancelled".
+      // A notification, not a request: every turn in flight settles through its
+      // own session/prompt response, normally with stopReason "cancelled".
       void agent.notify(methods.agent.session.cancel, { sessionId });
-      log(`^C — sent session/cancel${dropped > 0 ? `, dropped ${dropped} queued line(s)` : ""}`);
+      log(`sent session/cancel${dropped > 0 ? `, dropped ${dropped} queued line(s)` : ""}`);
       refreshPrompt();
       return;
     }
-    void shutdown(turnRunning ? "^C while cancelling" : "^C");
+    void shutdown(turnRunning() ? "^C while cancelling" : "^C");
   };
   // In terminal mode readline puts stdin in raw mode and owns ^C, so this only
   // ever fires for an explicit `kill -INT`; with piped stdin it is the ^C path.
@@ -388,6 +432,18 @@ async function main() {
   agentReady = true;
   log(`connected to ${init.agentInfo?.name ?? "agent"} ${init.agentInfo?.version ?? ""}`.trim());
 
+  // Steering is advertised at the TOP-LEVEL `_meta` of the initialize result —
+  // a sibling of `agentCapabilities`, not nested inside it. Prompt queueing is
+  // a Claude-specific capability flag and does live inside.
+  const initMeta = init._meta as { steering?: { supported?: boolean } } | null | undefined;
+  const steeringSupported = initMeta?.steering?.supported === true;
+  const queueMeta = init.agentCapabilities?._meta as
+    { claudeCode?: { promptQueueing?: boolean } } | null | undefined;
+  log(
+    `agent supports: steering=${steeringSupported} ` +
+      `promptQueueing=${queueMeta?.claudeCode?.promptQueueing === true}`,
+  );
+
   // 2. Open a session.
   let sessionId: string;
   try {
@@ -401,45 +457,128 @@ async function main() {
   }
   log(`session ${sessionId} in ${CWD}`);
 
-  // 3. Turns. One `session/prompt` is in flight at a time; anything typed in the
-  //    meantime waits in `queue` and is sent when the current turn responds.
+  // 3. Turns. There are four ways to get a message to the agent, and the client
+  //    can drive all of them (see `handleCommand`); plain text uses the first.
+  //
+  //      session/prompt      a new turn, or — for text typed mid-turn — one
+  //                          buffered here and sent when the turn responds
+  //      session/prompt      sent mid-turn anyway, so the *agent* queues it
+  //        (!queue)          (it advertises `_meta.claudeCode.promptQueueing`)
+  //      _session/steering   injected into the turn that is already running
+  //        (!steer)
+  //      session/cancel      abandon the running turn
+  //        (!cancel, ^C)
   let draining = false;
 
+  /** One `session/prompt` round-trip. Several may be in flight at once when
+   *  `!queue` is used; the agent runs them in order. */
+  async function sendPrompt(text: string) {
+    inFlight += 1;
+    cancelRequested = false;
+    refreshPrompt();
+    try {
+      const result = await agent.request(methods.agent.session.prompt, {
+        sessionId,
+        prompt: [{ type: "text", text }],
+      });
+      log(`turn ended: ${result.stopReason}`);
+    } catch (err) {
+      // The error response itself was already printed by the tap; this is
+      // the human-readable "your prompt did not run".
+      log(`prompt failed: ${err}`);
+      if (connection.signal.aborted) queue = [];
+    } finally {
+      inFlight -= 1;
+      refreshPrompt();
+      exitWhenIdle();
+    }
+  }
+
+  /** Sends the buffered lines one turn at a time, oldest first. */
   async function drain() {
     if (draining) return;
     draining = true;
     try {
       while (queue.length > 0 && !shuttingDown) {
-        const text = queue.shift()!;
-        cancelRequested = false;
-        turnRunning = true;
-        refreshPrompt();
-        try {
-          const result = await agent.request(methods.agent.session.prompt, {
-            sessionId,
-            prompt: [{ type: "text", text }],
-          });
-          log(`turn ended: ${result.stopReason}`);
-        } catch (err) {
-          // The error response itself was already printed by the tap; this is
-          // the human-readable "your prompt did not run".
-          log(`prompt failed: ${err}`);
-          if (connection.signal.aborted) {
-            queue = [];
-            break;
-          }
-        } finally {
-          turnRunning = false;
-        }
+        await sendPrompt(queue.shift()!);
+        if (connection.signal.aborted) break;
       }
     } finally {
       draining = false;
       refreshPrompt();
-      if (inputClosed && queue.length === 0) void shutdown("input closed, queue drained");
+      exitWhenIdle();
+    }
+  }
+
+  /** A piped stdin ends; exiting has to wait for the work already handed out. */
+  function exitWhenIdle() {
+    if (inputClosed && !draining && queue.length === 0 && inFlight === 0) {
+      void shutdown("input closed, queue drained");
+    }
+  }
+
+  /**
+   * Client-side commands, prefixed with `!` so they cannot collide with the
+   * agent's own slash commands (`/compact` and friends, which are just prompt
+   * text as far as this client is concerned). `!!` escapes a literal `!`.
+   */
+  function handleCommand(line: string) {
+    const word = line.split(/\s+/)[0];
+    const text = line.slice(word.length).trim();
+    switch (word) {
+      case "!steer":
+        if (text.length === 0) {
+          log("usage: !steer <message> — injects into the turn that is running");
+          break;
+        }
+        if (!steeringSupported) log("agent did not advertise steering; trying anyway");
+        void steer(text);
+        break;
+      case "!queue":
+        if (text.length === 0) {
+          log("usage: !queue <message> — sends session/prompt now, agent queues it");
+          break;
+        }
+        void sendPrompt(text);
+        break;
+      case "!cancel":
+        if (!turnRunning()) {
+          log("nothing to cancel");
+          break;
+        }
+        onInterrupt();
+        break;
+      case "!help":
+        for (const entry of HELP) log(entry);
+        break;
+      default:
+        log(`unknown command ${word} — try !help`);
+        break;
+    }
+    refreshPrompt();
+  }
+
+  /** `_session/steering`: deliver a message to the turn already in progress. */
+  async function steer(text: string) {
+    const params: SteeringRequest = { sessionId, prompt: [{ type: "text", text }] };
+    try {
+      const result = await agent.request<SteeringResponse>(STEERING_METHOD, params);
+      // Either way the steered message's own output arrives as `session/update`
+      // notifications, not in this response — and it may well keep streaming
+      // after the turn we steered has already answered with its stopReason.
+      log(
+        result.outcome === "injected"
+          ? "steer outcome: injected into the running turn"
+          : "steer outcome: startedNewTurn — the turn had already finished, so the " +
+              "agent began a new one that no session/prompt of ours is tracking",
+      );
+    } catch (err) {
+      log(`steer rejected: ${err}`);
     }
   }
 
   let inputClosed = false;
+  let steerHinted = false;
 
   rl = readline.createInterface({
     input: process.stdin,
@@ -450,13 +589,24 @@ async function main() {
   });
 
   rl.on("line", (raw) => {
-    const text = raw.trim();
-    if (text.length === 0 || shuttingDown) {
+    const line = raw.trim();
+    if (line.length === 0 || shuttingDown) {
       refreshPrompt();
       return;
     }
-    queue.push(text);
-    if (turnRunning) log(`buffered — will send when this turn ends (${queue.length} queued)`);
+    if (line.startsWith("!") && !line.startsWith("!!")) {
+      handleCommand(line);
+      return;
+    }
+    // "!!steer …" is how you send text that begins with the command prefix.
+    queue.push(line.startsWith("!!") ? line.slice(1) : line);
+    if (turnRunning()) {
+      log(`buffered — will send when this turn ends (${queue.length} queued)`);
+      if (!steerHinted) {
+        steerHinted = true;
+        log("…or use !steer <text> to inject into the running turn instead");
+      }
+    }
     refreshPrompt();
     void drain();
   });
@@ -465,14 +615,15 @@ async function main() {
 
   rl.on("close", () => {
     inputClosed = true;
-    if (!draining && queue.length === 0) void shutdown("stdin closed");
+    exitWhenIdle();
   });
 
   void connection.closed.then(() => {
     if (!shuttingDown) void shutdown("connection closed");
   });
 
-  log("type a message and press Enter (Ctrl-C cancels a turn, Ctrl-D exits)");
+  for (const entry of HELP) log(entry);
+  log("Enter sends, Ctrl-C cancels a turn, Ctrl-D exits");
   refreshPrompt();
 
   /**
@@ -490,7 +641,7 @@ async function main() {
     rl?.removeAllListeners("close");
     rl?.close();
 
-    if (turnRunning) {
+    if (turnRunning()) {
       if (!cancelRequested) {
         try {
           await agent.notify(methods.agent.session.cancel, { sessionId });
@@ -499,7 +650,7 @@ async function main() {
         }
       }
       const deadline = Date.now() + CANCEL_TIMEOUT_MS;
-      while (turnRunning && Date.now() < deadline) await delay(50);
+      while (turnRunning() && Date.now() < deadline) await delay(50);
     }
 
     child.stdin?.end();
