@@ -1698,6 +1698,90 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     expect(info.kind).toBe("switch_mode");
     expect(info.content).toEqual([]);
   });
+
+  it("publishes Markdown through plan_update for capable clients and keeps the tool call compact", () => {
+    const toolUse = {
+      type: "tool_use" as const,
+      name: "ExitPlanMode",
+      id: "toolu_plan_capable",
+      input: { plan: "# Implement\n\nRun the tests." },
+    };
+    const emittedPlanContent = new Map<string, string>();
+
+    const notifications = toAcpNotifications(
+      [toolUse],
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+      {
+        clientCapabilities: { plan: {} },
+        emittedPlanContent,
+      },
+    );
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0].update).toEqual({
+      sessionUpdate: "plan_update",
+      plan: {
+        type: "markdown",
+        planId: "claude-plan",
+        content: "# Implement\n\nRun the tests.",
+      },
+    });
+    expect(notifications[1].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_plan_capable",
+      kind: "switch_mode",
+      rawInput: { plan: "# Implement\n\nRun the tests." },
+      content: [],
+    });
+
+    const repeated = toAcpNotifications(
+      [toolUse],
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+      {
+        clientCapabilities: { plan: {} },
+        emittedPlanContent,
+      },
+    );
+    expect(repeated.filter((n) => n.update.sessionUpdate === "plan_update")).toHaveLength(0);
+  });
+
+  it("keeps Markdown in the switch_mode tool call when plan_update is unsupported", () => {
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          name: "ExitPlanMode",
+          id: "toolu_plan_fallback",
+          input: { plan: "# Fallback plan" },
+        },
+      ],
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      kind: "switch_mode",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "# Fallback plan" },
+        },
+      ],
+    });
+  });
 });
 
 describe("toolInfoFromToolUse - undefined input regression", () => {

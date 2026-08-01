@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { SessionNotification } from "@agentclientprotocol/sdk";
+import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
@@ -1356,6 +1356,49 @@ describe("session config options", () => {
       expect(capturedPermissionRequest).not.toBeNull();
       const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
       expect(optionIds).toContain("auto");
+    });
+
+    it("sends plan_update before permission when the tool call was already streamed", async () => {
+      (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
+        plan: {},
+      };
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.emittedToolCalls.add("toolu_plan_update");
+
+      const canUseTool = (agent as any).canUseTool(SESSION_ID);
+      try {
+        await canUseTool(
+          "ExitPlanMode",
+          { plan: "# Approved plan" },
+          {
+            signal: new AbortController().signal,
+            suggestions: undefined,
+            toolUseID: "toolu_plan_update",
+          },
+        );
+      } catch {
+        // The mock returns cancelled after capturing the request.
+      }
+
+      expect(sessionUpdates).toEqual([
+        {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: "plan_update",
+            plan: {
+              type: "markdown",
+              planId: "claude-plan",
+              content: "# Approved plan",
+            },
+          },
+        },
+      ]);
+      expect(capturedPermissionRequest.toolCall).toMatchObject({
+        toolCallId: "toolu_plan_update",
+        kind: "switch_mode",
+        rawInput: { plan: "# Approved plan" },
+        content: [],
+      });
     });
   });
 });
