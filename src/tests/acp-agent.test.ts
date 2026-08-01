@@ -8791,6 +8791,21 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     };
   }
 
+  /** The CLI result for a command the SDK pre-empted to process an injected
+   *  steering message: stop_reason null with zero usage (issue #934). */
+  const interruptedResult = () =>
+    resultMessage({
+      stop_reason: null,
+      is_error: false,
+      result: "1. ",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    });
+
   const stateChanged = (state: "running" | "idle" | "requires_action") => ({
     type: "system",
     subtype: "session_state_changed",
@@ -9776,6 +9791,463 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("keeps a deferred subagent turn held across steering, re-holding at the steered result until the subagent drains (issue #934)", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // still held
+        const steered = await iter.next(); // the injected steering message
+        // The interrupt boundary must NOT settle the held prompt with the
+        // pre-steering outcome.
+        yield interruptedResult();
+        yield userEcho(steered.value);
+        yield assistantText("STEERED-REAL-OK");
+        yield resultMessage(); // steered terminal result; subagent STILL live -> held again
+        yield idle(); // still held
+        yield taskNotification("agent-1"); // subagent done
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } }); // followup result -> settles held turn
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // The turn must be held open (deferredSettle) before steering, so steer()
+    // injects into the LIVE held turn rather than falling back to a new turn.
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    const response = await turn.then((r) => {
+      events.push("resolved");
+      return r;
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Original command 10/5 + interrupted 0/0 + steered 10/5. The followup's
+    // tokens are reported separately, not folded into the prompt response.
+    expect(response.usage?.totalTokens).toBe(30);
+    // The steered output AND the followup summary streamed inside the still-open
+    // turn, before the prompt resolved.
+    const steeredIndex = events.indexOf("chunk:STEERED-REAL-OK");
+    expect(steeredIndex).toBeGreaterThanOrEqual(0);
+    expect(steeredIndex).toBeLessThan(events.indexOf("resolved"));
+    const summaryIndex = events.indexOf("chunk:promised summary");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("settles a deferred subagent turn at the steered result once the subagent has drained (issue #934)", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // still held
+        yield taskNotification("agent-1"); // subagent done, turn still held
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult();
+        yield userEcho(steered.value);
+        yield assistantText("STEERED-REAL-OK");
+        yield resultMessage(); // steered terminal result; subagent already drained -> settles here
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Hold the turn open (deferredSettle) BEFORE steering, then let the
+    // subagent drain; steering still injects into the live held turn.
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    const response = await turn.then((r) => {
+      events.push("resolved");
+      return r;
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Original command 10/5 + interrupted 0/0 + steered 10/5.
+    expect(response.usage?.totalTokens).toBe(30);
+    const steeredIndex = events.indexOf("chunk:STEERED-REAL-OK");
+    expect(steeredIndex).toBeGreaterThanOrEqual(0);
+    expect(steeredIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("fails a held prompt when the injected echo never arrives and the subagent is still live (issue #934)", async () => {
+    const { agent } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        await iter.next(); // the injected steering message
+        // The interrupt boundary must NOT settle the held prompt with the
+        // pre-steering outcome.
+        yield interruptedResult();
+        // No injected echo: an unowed idle while the retained marker still
+        // awaits its echo must fail the held prompt with the standard
+        // no-result error instead of leaving it pending forever behind the
+        // still-live subagent (settleDeferredIfDrained is a no-op there).
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Pre-armed guard: the no-result rejection can land while the waitFor polls
+    // below, before the assertion below attaches its own handler.
+    turn.catch(() => {});
+    // The turn must be held open (deferredSettle) before steering, so steer()
+    // injects into the LIVE held turn rather than falling back to a new turn.
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    await waitFor(() => !agent.sessions["test-session"]?.activeTurn);
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("fails a held prompt with no_result on the missing echo once the subagent has drained (issue #934)", async () => {
+    const { agent } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        yield taskNotification("agent-1"); // subagent done; turn still held
+        await iter.next(); // the injected steering message
+        yield interruptedResult(); // superseded boundary, must NOT settle
+        // No injected echo and no subagent left: the ordinary held-turn idle
+        // fallback would settle the prompt with the PRE-steering deferred
+        // outcome (wrong usage, no steered content). The retained missing-echo
+        // state must instead fail it with the standard no-result error.
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Pre-armed guard: the no-result rejection can land while the waitFor polls
+    // below, before the assertion below attaches its own handler.
+    turn.catch(() => {});
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    await waitFor(() => !agent.sessions["test-session"]?.activeTurn);
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("clears the retained steering marker when a steered refusal re-holds the turn behind a live subagent (issue #934)", async () => {
+    const { agent } = chunkCapturingAgent();
+    let releaseStream!: () => void;
+    // Keep the query stream open after the refusal so the turn stays held and
+    // the test can observe the retained marker — without it, the consumer's
+    // stream-end handler settles the held turn and the state is gone.
+    const streamGate = new Promise<void>((resolve) => (releaseStream = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle();
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult();
+        yield userEcho(steered.value); // retained phase -> active
+        // A refusal lands after the echo; the refusal lane re-defers the turn
+        // behind the still-live subagent.
+        yield resultMessage({ stop_reason: "refusal" });
+        await streamGate;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    // The retained marker must be claimed and cleared even though the turn
+    // re-holds behind the live subagent: a stale phase:active marker would
+    // make ensureActiveTurn skip the next echo-less result's hand-off.
+    await waitFor(
+      () => agent.sessions["test-session"]?.activeTurn?.deferredSettle?.stopReason === "refusal",
+    );
+    expect(agent.sessions["test-session"]?.activeTurn?.retainedSteering).toBeUndefined();
+    releaseStream();
+    await agent.sessions["test-session"]?.consumer;
+    // The stream-end settle resolves the still-held prompt with the refusal
+    // outcome the re-hold recorded.
+    await expect(turn).resolves.toMatchObject({ stopReason: "refusal" });
+  });
+
+  it("keeps a held prompt pending when an autonomous followup lands before the injected echo (issue #934)", async () => {
+    // A drained subagent's autonomous followup result arrives between the
+    // interrupted boundary and the injected echo (marker still awaiting_echo).
+    // It must NOT settle the held prompt with the PRE-steering deferred
+    // outcome — neither at the result nor at the followup's trailing idle —
+    // or the steered output would stream outside the already-ended prompt.
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult(); // superseded boundary, marker stays awaiting_echo
+        yield taskNotification("agent-1"); // subagent done; turn still held
+        yield resultMessage({ origin: { kind: "task-notification" } }); // autonomous followup
+        yield idle(); // the autonomous followup's trailing idle
+        yield userEcho(steered.value); // injected echo replays -> phase active
+        yield assistantText("STEERED-AFTER-AUTONOMOUS");
+        yield resultMessage(); // steered terminal result -> settles
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    const response = await turn.then((r) => {
+      events.push("resolved");
+      return r;
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Original command 10/5 + interrupted 0/0 + steered 10/5 — NOT the
+    // pre-steering deferred outcome (15), which would prove an early settle.
+    expect(response.usage?.totalTokens).toBe(30);
+    // The steered output streamed inside the still-open prompt.
+    const steeredIndex = events.indexOf("chunk:STEERED-AFTER-AUTONOMOUS");
+    expect(steeredIndex).toBeGreaterThanOrEqual(0);
+    expect(steeredIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("keeps a held prompt pending when an autonomous followup lands after the injected echo (issue #934)", async () => {
+    // Same as above but the autonomous followup arrives AFTER the echo
+    // replayed (marker phase active), while the steered generation is still
+    // running. It must neither claim the retained marker nor settle the held
+    // prompt; only the steered terminal result may.
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult(); // superseded boundary, marker stays awaiting_echo
+        yield taskNotification("agent-1"); // subagent done; turn still held
+        yield userEcho(steered.value); // injected echo replays -> phase active
+        yield resultMessage({ origin: { kind: "task-notification" } }); // autonomous followup
+        yield idle(); // the autonomous followup's trailing idle
+        yield assistantText("STEERED-AFTER-AUTONOMOUS");
+        yield resultMessage(); // steered terminal result -> settles
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    const response = await turn.then((r) => {
+      events.push("resolved");
+      return r;
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    // Original command 10/5 + interrupted 0/0 + steered 10/5 — NOT the
+    // pre-steering deferred outcome (15), which would prove an early settle.
+    expect(response.usage?.totalTokens).toBe(30);
+    // The steered output streamed inside the still-open prompt.
+    const steeredIndex = events.indexOf("chunk:STEERED-AFTER-AUTONOMOUS");
+    expect(steeredIndex).toBeGreaterThanOrEqual(0);
+    expect(steeredIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("fails a held prompt when the steered generation never emits its final result while a subagent is still live (issue #934)", async () => {
+    // The injected echo replayed (retained phase -> active) but no steered
+    // terminal result ever arrives. An unowed idle with a retained marker
+    // still set means the SDK turned over without the response the prompt is
+    // owed — the held no-result branch must fail it (issue #934) rather than
+    // leave it pending forever behind the still-live subagent.
+    const { agent } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult(); // superseded boundary, marker stays awaiting_echo
+        yield userEcho(steered.value); // retained phase -> active
+        // No steered terminal result. Unowed idle: the retained response is
+        // missing, so the held prompt must fail rather than hang.
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Pre-armed guard: the no-result rejection can land while the waitFor polls
+    // below, before the assertion below attaches its own handler.
+    turn.catch(() => {});
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    await waitFor(() => !agent.sessions["test-session"]?.activeTurn);
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("fails a held prompt when the steered generation never emits its final result once the subagent has drained (issue #934)", async () => {
+    // Same as above with the subagent drained first: the ordinary held idle
+    // fallback must not settle the prompt with the PRE-steering deferred
+    // outcome either — the missing retained response fails it.
+    const { agent } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // original terminal result -> held (subagent live)
+        yield idle(); // absorbs the trailer debt
+        yield taskNotification("agent-1"); // subagent done; turn still held
+        const steered = await iter.next(); // the injected steering message
+        yield interruptedResult(); // superseded boundary, marker stays awaiting_echo
+        yield userEcho(steered.value); // retained phase -> active
+        // No steered terminal result. Unowed idle with the retained marker
+        // still set: fail the prompt with the standard no-result error.
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Pre-armed guard: the no-result rejection can land while the waitFor polls
+    // below, before the assertion below attaches its own handler.
+    turn.catch(() => {});
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    await waitFor(() => !agent.sessions["test-session"]?.activeTurn);
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("turn steering (_session/steering)", () => {
@@ -9808,6 +10280,37 @@ describe("turn steering (_session/steering)", () => {
       permission_denials: [],
       uuid: randomUUID(),
       session_id: "test-session",
+    };
+  }
+
+  // The result the CLI emits for the interrupted command when the SDK
+  // pre-empts it to handle the injected steering message: `stop_reason: null`
+  // with zero usage (the interrupt consumed no tokens). Regression fixtures for
+  // issue #934 — the original session/prompt must NOT settle on this result.
+  function createInterruptedSuccessResult() {
+    return {
+      ...createResultMessage(),
+      stop_reason: null,
+      is_error: false,
+      result: "1. ",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    };
+  }
+
+  // A second real manifestation of the same interrupted result: the CLI rejects
+  // the interrupted command with an `[ede_diagnostic]` payload. Production code
+  // must treat it like any other pre-echo result and never parse its text.
+  function createInterruptedDiagnosticResult() {
+    return {
+      ...createResultMessage(),
+      stop_reason: null,
+      is_error: true,
+      result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
     };
   }
 
@@ -9991,10 +10494,11 @@ describe("turn steering (_session/steering)", () => {
         const u1 = await iter.next();
         yield userEcho(u1.value); // turn becomes active
         // The steered message is pushed next; capture it, replay its echo
-        // (which matches no queued turn and must be dropped), then finish.
+        // (which promotes the retained steering phase and must NOT settle a
+        // turn), then finish.
         const steered = await iter.next();
         captured.push(steered.value);
-        yield userEcho(steered.value); // unrelated replay — must NOT settle a turn
+        yield userEcho(steered.value); // retained-steering echo — must NOT settle a turn
         yield createResultMessage();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
@@ -10039,6 +10543,9 @@ describe("turn steering (_session/steering)", () => {
         yield userEcho(u1.value);
         const steered = await iter.next();
         captured.push(steered.value);
+        // The injected echo must precede the result: without it, the result
+        // would be read as the interrupted command's and the prompt failed.
+        yield userEcho(steered.value);
         yield createResultMessage();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
@@ -10063,6 +10570,480 @@ describe("turn steering (_session/steering)", () => {
 
     expect(res.outcome).toBe("injected");
     expect(captured[0]?.priority).toBe("now");
+  });
+
+  it("keeps the original prompt pending through the steered result (issue #934, interrupted success)", async () => {
+    const updates: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          updates.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    // Two deferred gates: the generator signals after the interrupted result is
+    // consumed, then waits until the test has asserted the original prompt is
+    // still pending before releasing the injected echo.
+    let releaseAfterInterrupted!: () => void;
+    let releaseInjectedEcho!: () => void;
+    const afterInterrupted = new Promise<void>((resolve) => (releaseAfterInterrupted = resolve));
+    const injectedEchoGate = new Promise<void>((resolve) => (releaseInjectedEcho = resolve));
+
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // original user echo activates the original turn
+        const steered = await iter.next(); // the pushed steering message
+        captured.push(steered.value);
+        yield createInterruptedSuccessResult(); // pre-echo interrupted result
+        releaseAfterInterrupted();
+        await injectedEchoGate;
+        yield userEcho(steered.value); // injected user echo
+        yield createAssistantText("STEERED-REAL-OK");
+        yield createResultMessage(); // steered terminal result
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const originalPrompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    // Observe settlement immediately so the RED run cannot leave an unhandled
+    // rejection on the original prompt when the interrupted result settles it.
+    let turnSettledAfterInterruptedResult = false;
+    originalPrompt.then(
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+    );
+
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Stop and reply with exactly: STEERED-REAL-OK" }],
+    });
+
+    expect(steerResponse).toEqual({ outcome: "injected" });
+    expect(captured).toHaveLength(1);
+    const injected = captured[0];
+    expect(injected.priority).toBe("now");
+
+    // The interrupted result must not settle the prompt; only the injected
+    // echo + steered terminal result may.
+    await afterInterrupted;
+    expect(turnSettledAfterInterruptedResult).toBe(false);
+    releaseInjectedEcho();
+
+    const response = await originalPrompt;
+    expect(response).toEqual(
+      expect.objectContaining({
+        stopReason: "end_turn",
+        usage: expect.objectContaining({ inputTokens: 10, outputTokens: 5 }),
+      }),
+    );
+    expect(updates.join("")).toContain("STEERED-REAL-OK");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not settle or reject the prompt on the interrupted diagnostic result (issue #934)", async () => {
+    const updates: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          updates.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    let releaseAfterInterrupted!: () => void;
+    let releaseInjectedEcho!: () => void;
+    const afterInterrupted = new Promise<void>((resolve) => (releaseAfterInterrupted = resolve));
+    const injectedEchoGate = new Promise<void>((resolve) => (releaseInjectedEcho = resolve));
+
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield createInterruptedDiagnosticResult(); // is_error=true, stop_reason=null
+        releaseAfterInterrupted();
+        await injectedEchoGate;
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-REAL-OK");
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const originalPrompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    let turnSettledAfterInterruptedResult = false;
+    originalPrompt.then(
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+    );
+
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Stop and reply with exactly: STEERED-REAL-OK" }],
+    });
+
+    expect(steerResponse).toEqual({ outcome: "injected" });
+    expect(captured[0].priority).toBe("now");
+
+    // Neither reject nor resolve on the diagnostic result; the final success
+    // result is the one that settles the prompt.
+    await afterInterrupted;
+    expect(turnSettledAfterInterruptedResult).toBe(false);
+    releaseInjectedEcho();
+
+    await expect(originalPrompt).resolves.toEqual(
+      expect.objectContaining({ stopReason: "end_turn" }),
+    );
+    expect(updates.join("")).toContain("STEERED-REAL-OK");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("steers a submitted-but-not-yet-echoed turn and keeps the queued prompt as the owner (issue #934)", async () => {
+    const agent = createMockAgent();
+    let releaseAfterInterrupted!: () => void;
+    let releaseInjectedEcho!: () => void;
+    const afterInterrupted = new Promise<void>((resolve) => (releaseAfterInterrupted = resolve));
+    const injectedEchoGate = new Promise<void>((resolve) => (releaseInjectedEcho = resolve));
+
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // original echo activates the queued turn
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield createInterruptedSuccessResult();
+        releaseAfterInterrupted();
+        await injectedEchoGate;
+        yield userEcho(steered.value);
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    // prompt() then steer() before the generator emits the original echo: a
+    // submitted-but-not-yet-echoed turn is still steerable, and the queued
+    // Turn becomes the owner of the steered terminal result.
+    const originalPrompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    let turnSettledAfterInterruptedResult = false;
+    originalPrompt.then(
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+      () => {
+        turnSettledAfterInterruptedResult = true;
+      },
+    );
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late steer" }],
+    });
+
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    // The generator reads the pushed steering message asynchronously; wait for
+    // it so `captured` is populated before the assertions.
+    await waitFor(() => captured.length === 1);
+    expect(captured[0].priority).toBe("now");
+
+    await afterInterrupted;
+    expect(turnSettledAfterInterruptedResult).toBe(false);
+    releaseInjectedEcho();
+
+    await expect(originalPrompt).resolves.toEqual(
+      expect.objectContaining({ stopReason: "end_turn" }),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("fails the prompt when the injected echo never arrives (issue #934)", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield createInterruptedSuccessResult();
+        // No injected echo: an unowed idle is the SDK's turn-over signal, so the
+        // still-unsettled prompt fails with the standard no-result error.
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].priority).toBe("now");
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("resolves the prompt cancelled when cancel lands before the injected echo (issue #934)", async () => {
+    const agent = createMockAgent();
+    let releaseAfterInterrupted!: () => void;
+    let releaseIdle!: () => void;
+    const afterInterrupted = new Promise<void>((resolve) => (releaseAfterInterrupted = resolve));
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        await iter.next(); // the injected message is consumed but never echoed
+        yield createInterruptedSuccessResult();
+        releaseAfterInterrupted();
+        await idleGate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    // Cancel while retained Steering is still awaiting its echo; the trailing
+    // idle then settles the still-active prompt "cancelled" exactly once.
+    await afterInterrupted;
+    await agent.cancel({ sessionId: "test-session" });
+    releaseIdle();
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("preserves cancelled-turn behavior when cancel lands after the injected echo (issue #934)", async () => {
+    const agent = createMockAgent();
+    let releaseAfterEcho!: () => void;
+    let releaseFinal!: () => void;
+    const afterEcho = new Promise<void>((resolve) => (releaseAfterEcho = resolve));
+    const finalGate = new Promise<void>((resolve) => (releaseFinal = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        yield createInterruptedSuccessResult();
+        yield userEcho(steered.value); // injected echo -> retained phase becomes active
+        releaseAfterEcho();
+        await finalGate;
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+
+    // The retained response is active; the steered result that follows a cancel
+    // is dropped at the cancelled guard and the idle settles the turn.
+    await afterEcho;
+    await agent.cancel({ sessionId: "test-session" });
+    releaseFinal();
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("counts interrupted and steered usage exactly once in the final response (issue #934)", async () => {
+    const agent = createMockAgent();
+    const interruptedUsage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 1,
+    };
+    const steeredUsage = {
+      input_tokens: 20,
+      output_tokens: 10,
+      cache_read_input_tokens: 3,
+      cache_creation_input_tokens: 4,
+    };
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield { ...createInterruptedSuccessResult(), usage: interruptedUsage };
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-REAL-OK");
+        yield { ...createResultMessage(), usage: steeredUsage };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "late steer" }],
+    });
+    expect(steerResponse).toEqual({ outcome: "injected" });
+    expect(captured).toHaveLength(1);
+
+    // Both results are real spend on the one turn: the final PromptResponse
+    // carries their component-wise sum, counted exactly once.
+    const response = await turn;
+    expect(response).toEqual(
+      expect.objectContaining({
+        stopReason: "end_turn",
+        usage: {
+          inputTokens: 30,
+          outputTokens: 15,
+          cachedReadTokens: 5,
+          cachedWriteTokens: 5,
+          totalTokens: 55,
+        },
+      }),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("uses the latest accepted steering UUID as the terminal boundary (issue #934)", async () => {
+    const updates: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          updates.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steerA = await iter.next();
+        captured.push(steerA.value);
+        const steerB = await iter.next();
+        captured.push(steerB.value);
+        // A's generation is interrupted; its echo follows. Under a first-wins
+        // regression the echo of steer A would promote the retained response,
+        // so the SECOND interrupted result (B pre-empting A's continuation)
+        // would then run terminal handling and settle the prompt early. With
+        // the fix, steer B is still awaiting its echo, so this result is a
+        // superseded boundary and the prompt stays pending.
+        yield createInterruptedSuccessResult();
+        yield userEcho(steerA.value); // superseded UUID -> unrelated replay
+        yield createInterruptedSuccessResult();
+        yield userEcho(steerB.value); // latest UUID -> activates retained response
+        yield createAssistantText("STEERED-B");
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerAResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer A" }],
+    });
+    const steerBResponse = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "steer B" }],
+    });
+    expect(steerAResponse).toEqual({ outcome: "injected" });
+    expect(steerBResponse).toEqual({ outcome: "injected" });
+
+    await waitFor(() => captured.length === 2);
+    expect(captured[0].priority).toBe("now");
+    expect(captured[1].priority).toBe("now");
+
+    // Only the latest accepted UUID controls the terminal boundary: the second
+    // interrupted result still cannot settle the prompt while steer B awaits
+    // its echo, and the echo of the superseded steer A cannot activate it. A
+    // first-wins regression settles the prompt at the second interrupted result
+    // (zero usage), so the original turn resolves before STEERED-B ever streams.
+    const response = await turn;
+    expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(updates.join("")).toContain("STEERED-B");
+    await agent.sessions["test-session"]?.consumer;
   });
 });
 

@@ -283,6 +283,14 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
+  /** Active Steering remains part of this ACP v1 prompt turn until the SDK
+   *  echoes the latest injected UUID and then emits its terminal result. The
+   *  newest accepted steering message overwrites the previous one, so only the
+   *  latest UUID can become the terminal boundary (see steer()). */
+  retainedSteering?: {
+    promptUuid: string;
+    phase: "awaiting_echo" | "active";
+  };
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -1904,8 +1912,8 @@ export class ClaudeAcpAgent {
     // which is exactly the window in which steering is meaningful. This check
     // and the active-path push below stay in one synchronous section so the
     // turn cannot settle in the gap between deciding to inject and enqueueing.
-    const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
-    if (!turnInFlight) {
+    const runningTurn = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    if (!runningTurn) {
       const promptRequest: PromptRequest = {
         sessionId,
         prompt: params.prompt,
@@ -1930,8 +1938,17 @@ export class ClaudeAcpAgent {
     };
     const userMessage = promptToClaude(promptRequest);
     userMessage.uuid = randomUUID();
-    // Deliver into the running turn rather than queuing behind it as a fresh
-    // prompt would.
+    // Record that this injected message belongs to the running turn so the
+    // consumer can recognize its echo and keep the original session/prompt
+    // owning the steered terminal result (issue #934). Assigning a NEW value
+    // on every accepted steer makes the latest UUID the terminal boundary:
+    // an interrupted result before the newest echo can never settle the turn,
+    // and an older echo can never activate it. Deliver into the running turn
+    // rather than queuing behind it as a fresh prompt would.
+    runningTurn.retainedSteering = {
+      promptUuid: userMessage.uuid,
+      phase: "awaiting_echo",
+    };
     userMessage.priority = STEER_PRIORITY;
     session.input.push(userMessage);
     return { outcome: "injected" };
@@ -2027,22 +2044,26 @@ export class ClaudeAcpAgent {
       await this.client.sessionUpdate(notification);
     };
 
-    const resetTurnScratch = () => {
+    // Response-scoped scratch reset: everything tied to the current assistant
+    // response. Splitting this from the turn-level reset lets the injected
+    // steering echo start a fresh response WITHOUT wiping the accumulated usage
+    // the interrupted result already added (issue #934). Like the turn-level
+    // reset, it must NOT clear currentStreamMessageId or streamedBlocks: the
+    // echo can land mid-message, and clearing the streamed-content record then
+    // would drop the blocks that streamed before it and re-emit them as
+    // duplicates (see activateTurn).
+    const resetResponseScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
       lastAssistantModel = null;
       lastAssistantError = undefined;
       lastRefusalExplanation = null;
       compactionInProgress = false;
-      // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
-      // activation can fire mid-message (the replayed user echo with
-      // --replay-user-messages lands between a message's blocks); clearing the
-      // streamed-content record on activation would drop the blocks that
-      // streamed before the echo, so the consolidated assistant message would
-      // re-emit them as duplicates. streamedBlocks is bounded instead by being
-      // cleared when each consolidated message consumes it. #785 stopped
-      // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
+    };
+
+    const resetTurnScratch = () => {
+      resetResponseScratch();
       session.accumulatedUsage = {
         inputTokens: 0,
         outputTokens: 0,
@@ -2108,6 +2129,17 @@ export class ClaudeAcpAgent {
     const ensureActiveTurn = () => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
+          return;
+        }
+        // A retained-steering held turn still owns the in-flight injected
+        // response: its interrupt boundary result and its steered terminal
+        // result belong to THIS turn, not to a queued command. Settling it
+        // here with the pre-steering outcome would resolve the original
+        // session/prompt before the injected echo — the premature settle
+        // #934 forbids. Keep it held and let the result handler decide (the
+        // superseded break for the interrupt; settleOrDefer for the steered
+        // terminal result, which re-defers while subagents stay live).
+        if (session.activeTurn.retainedSteering) {
           return;
         }
         // A held turn (Turn.deferredSettle) already produced its result, so
@@ -2729,6 +2761,39 @@ export class ClaudeAcpAgent {
                     // turn-over signal, and stale partial-text state would
                     // suppress the next turn's issue-#453 fallback.
                     session.emittedAssistantText = false;
+                  } else if (
+                    isHeldOpen(session.activeTurn) &&
+                    session.activeTurn.retainedSteering !== undefined &&
+                    session.owedTrailingIdles === 0
+                  ) {
+                    // A held turn with a retained steering marker received an
+                    // UNOWED idle: the SDK turned over without delivering the
+                    // retained response it owes — the injected echo (phase
+                    // awaiting_echo) or the steered terminal result (phase
+                    // active). Idle is the SDK's authoritative turn-over
+                    // signal (see the #825 branch below), so a response that
+                    // has not arrived by it will never arrive; the original
+                    // prompt must not hang behind the hold — neither waiting
+                    // out a still-live subagent (settleDeferredIfDrained is a
+                    // no-op then) nor, once the subagent has drained, settling
+                    // with the PRE-steering deferred outcome (wrong usage, no
+                    // steered content). Fail it with the standard no-result
+                    // error, the same contract as the #825 idle-fail (issue
+                    // #934). An idle WITH debt does not match: it belongs to a
+                    // counted result (an autonomous followup's trailer, say),
+                    // and the ordinary held branch absorbs it.
+                    session.activeTurn.retainedSteering = undefined;
+                    this.logger.error(
+                      `Session ${params.sessionId}: SDK went idle while a held turn ` +
+                        `awaited its retained steering response; failing the in-flight ` +
+                        `prompt (issue #934)`,
+                    );
+                    failActive(
+                      RequestError.internalError(
+                        errorKindData("no_result"),
+                        TURN_NO_RESULT_MESSAGE,
+                      ),
+                    );
                   } else if (isHeldOpen(session.activeTurn)) {
                     // A turn held open for its background subagents (see
                     // Turn.deferredSettle). Idles keep their normal cadence
@@ -2745,7 +2810,16 @@ export class ClaudeAcpAgent {
                     if (session.owedTrailingIdles > 0) {
                       session.owedTrailingIdles--;
                     }
-                    settleDeferredIfDrained();
+                    // Skip the drained-settle while retained Steering is in
+                    // flight: an idle during the injection belongs to the
+                    // interrupted/steered cadence, and settling here — on the
+                    // autonomous followup's own trailing idle, say — would
+                    // resolve the held prompt with the PRE-steering deferred
+                    // outcome (issue #934). The steered terminal result
+                    // settles (or re-defers) it instead.
+                    if (!session.activeTurn.retainedSteering) {
+                      settleDeferredIfDrained();
+                    }
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -3158,6 +3232,17 @@ export class ClaudeAcpAgent {
                 ensureActiveTurn();
               }
 
+              // A result received while retained Steering is still awaiting its
+              // injected echo is the INTERRUPTED command's response, not the
+              // steered turn's (issue #934). The SDK cancels the running
+              // generation when it processes the priority:"now" message, and
+              // emits this boundary result before replaying the injected echo.
+              // It must not settle the original prompt, count idle debt, or run
+              // any terminal handling; only its usage is real and retained.
+              const isSupersededSteeringResult =
+                !isAutonomousResult &&
+                session.activeTurn?.retainedSteering?.phase === "awaiting_echo";
+
               // A result closes the stretch of output it terminates: snapshot
               // the delivery record — AFTER ensureActiveTurn, whose held-turn
               // hand-off closes the held stretch, so an echo-less command
@@ -3201,7 +3286,14 @@ export class ClaudeAcpAgent {
               // turn's OWN result — a followup result arriving inside the
               // cancel window still gets its own trailer and must be counted,
               // or that idle would later false-fail the next prompt.
-              if (isAutonomousResult || !session.cancelled || !session.activeTurn) {
+              // A superseded Steering result has NO separate trailing idle: the
+              // interrupt hands control to the injected command and the single
+              // observed idle belongs to the steered terminal result, which
+              // counts it. Counting here would double-charge the debt.
+              if (
+                !isSupersededSteeringResult &&
+                (isAutonomousResult || !session.cancelled || !session.activeTurn)
+              ) {
                 session.owedTrailingIdles++;
               }
 
@@ -3280,6 +3372,36 @@ export class ClaudeAcpAgent {
                 });
               }
 
+              if (isSupersededSteeringResult) {
+                // The interrupted command's usage is accounted for; the steered
+                // generation's own terminal result is what settles the prompt.
+                // Skip cancellation, refusal, error, subtype, and settle handling
+                // — none of them apply to this boundary result. The `finally`
+                // clears the delivery record so the steered output streams fresh.
+                break;
+              }
+
+              // A result past the superseded boundary claims the retained
+              // steering marker once its echo has been replayed (phase
+              // "active"): the injected response is over, so any hold that
+              // follows (a still-live subagent re-defers a steered
+              // refusal/error) must be treated as an ordinary held turn again.
+              // Only a USER-DRIVEN result claims it: an autonomous followup (a
+              // drained subagent's terminal result, a peer/channel/coordinator
+              // cycle) is not the steered turn's response, and clearing the
+              // marker on it would let the next held-turn idle settle the
+              // prompt with the PRE-steering deferred outcome. Clear BEFORE
+              // the terminal early-return lanes — clearing only at the bottom
+              // of the normal path left a stale phase:active marker on a turn
+              // re-held by a steered refusal, which then made ensureActiveTurn
+              // skip the next echo-less result's hand-off (issue #934). A
+              // result still awaiting its echo keeps the marker: an autonomous
+              // subagent followup landing before the echo must not discard the
+              // pending injected boundary.
+              if (!isAutonomousResult && session.activeTurn?.retainedSteering?.phase === "active") {
+                session.activeTurn.retainedSteering = undefined;
+              }
+
               if (session.cancelled) {
                 if (!isAutonomousResult) {
                   stopReason = "cancelled";
@@ -3303,7 +3425,16 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
-                settleDeferredIfDrained();
+                // An autonomous followup must never settle a held prompt while
+                // Steering is in flight: the retained marker means the injected
+                // response has not yet produced its terminal result, and
+                // settling now would resolve the original prompt with the
+                // PRE-steering deferred outcome — wrong usage, no steered
+                // content (issue #934). The steered terminal result is what
+                // claims the marker and settles (or re-defers) the prompt.
+                if (!session.activeTurn?.retainedSteering) {
+                  settleDeferredIfDrained();
+                }
                 // With no turn in flight OR QUEUED (also after the settle
                 // above), the stretch holds only autonomous prose — close
                 // it, so a replayed next prompt isn't silently suppressed by
@@ -3458,6 +3589,10 @@ export class ClaudeAcpAgent {
               // idle/abort path. settleActive is idempotent, so a duplicate
               // idle is a no-op.
               if (!session.cancelled) {
+                // The retained marker was already claimed and cleared above
+                // (before the early-return lanes); the steered terminal result
+                // (phase "active") reaches here with it gone, so a held turn
+                // handoff-settles like any ordinary deferred turn.
                 settleOrDefer({ stopReason, usage: sessionUsage(session) });
               }
             } finally {
@@ -3667,6 +3802,20 @@ export class ClaudeAcpAgent {
                   // result re-emit the answer.
                   activateTurn(queued);
                 }
+                break;
+              }
+              // The replayed echo of the latest accepted steering message: the
+              // interrupted response is over and the steered generation starts.
+              // The original turn stays active and its accumulated usage must
+              // survive, so this resets only the response scratch, not the
+              // turn's (issue #934). Do NOT activateTurn() — that would reset
+              // usage and clear the turn's active role. An echo of an older,
+              // superseded steering UUID does not match the latest retained
+              // UUID and falls through to the unrelated-replay branch.
+              const retained = session.activeTurn?.retainedSteering;
+              if (retained?.phase === "awaiting_echo" && message.uuid === retained.promptUuid) {
+                retained.phase = "active";
+                resetResponseScratch();
                 break;
               }
               if ("isReplay" in message && message.isReplay) {

@@ -15,7 +15,15 @@
  *   2. The client calls the `_session/steering` request with `{ sessionId,
  *      prompt }` while a turn is running.
  *   3. The agent replies with an `outcome`:
- *        - "injected"       the message joined the running turn;
+ *        - "injected"       the message joined the running turn. The ORIGINAL
+ *                           `session/prompt` request stays pending while the
+ *                           SDK interrupts the running generation to handle the
+ *                           injected message; that interrupt's boundary result
+ *                           is folded into the same turn, and only the steered
+ *                           terminal result settles the original prompt — which
+ *                           is the request whose `PromptResponse` the client
+ *                           awaits. Its `usage` is the sum of the interrupted
+ *                           and steered commands;
  *        - "startedNewTurn" the turn had already finished and the legacy
  *                           detached fallback was used;
  *        - "promptRequired" the turn had already finished, but this request
@@ -60,9 +68,11 @@ type SteeringRequest = {
 };
 
 /** Result of a `_session/steering` request. `injected` means the message joined
- *  the running turn; `promptRequired` means the turn had already settled, so the
- *  message was NOT consumed and must be (re)sent through a normal
- *  `session/prompt`. Both are successes. */
+ *  the running turn — the original `session/prompt` remains pending through the
+ *  SDK's interrupted boundary result and the steered final result, and is the
+ *  request whose `PromptResponse` carries the turn's outcome. `promptRequired`
+ *  means the turn had already settled, so the message was NOT consumed and must
+ *  be (re)sent through a normal `session/prompt`. Both are successes. */
 type SteeringResponse =
   | { outcome: "injected" }
   | { outcome: "startedNewTurn" }
@@ -202,8 +212,12 @@ async function main() {
         log(`continuation stopReason: ${continuation.stopReason}`);
       }
 
-      // 5. Await the original turn. With outcome "injected" the steer already
-      //    reshaped the output above; the promptRequired branch owns its own turn.
+      // 5. Await the ORIGINAL turn — the pending session/prompt from step 3. On
+      //    "injected" this is the request that owns the steered outcome: it stays
+      //    pending through the interrupted boundary result and the steered
+      //    terminal result, and settles here with the combined usage. On
+      //    "promptRequired" the original turn settled on its own earlier and the
+      //    continuation branch above owns its separate turn.
       const response = await turn;
       log(`original turn stopReason: ${response.stopReason}`);
       process.stdout.write("\n----- end of agent output -----\n");
