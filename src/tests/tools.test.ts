@@ -1753,6 +1753,92 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     expect(repeated.filter((n) => n.update.sessionUpdate === "plan_update")).toHaveLength(0);
   });
 
+  it("defers live plan_update to the permission path while keeping the tool call compact", () => {
+    const emittedPlanContent = new Map<string, string>();
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          name: "ExitPlanMode",
+          id: "toolu_plan_live",
+          input: { plan: "# Live plan" },
+        },
+      ],
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+      {
+        clientCapabilities: { plan: {} },
+        emittedPlanContent,
+        emitExitPlanUpdates: false,
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_plan_live",
+      kind: "switch_mode",
+      content: [],
+    });
+    expect(emittedPlanContent.size).toBe(0);
+  });
+
+  it("does not create plan_update for an empty Markdown plan", () => {
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_use" as const,
+          name: "ExitPlanMode",
+          id: "toolu_plan_empty",
+          input: { plan: "  \n" },
+        },
+      ],
+      "assistant",
+      "test-session",
+      {},
+      {} as AcpClient,
+      { log: () => {}, error: () => {} },
+      { clientCapabilities: { plan: {} } },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update.sessionUpdate).toBe("tool_call");
+  });
+
+  it("scopes replayed subagent plans by their parent tool call", () => {
+    const emittedPlanContent = new Map<string, string>();
+    const render = (parentToolUseId: string, id: string, plan: string) =>
+      toAcpNotifications(
+        [{ type: "tool_use" as const, name: "ExitPlanMode", id, input: { plan } }],
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        { log: () => {}, error: () => {} },
+        {
+          clientCapabilities: { plan: {} },
+          emittedPlanContent,
+          parentToolUseId,
+        },
+      );
+
+    const first = render("agent-parent-1", "toolu_subplan_1", "# First subagent plan");
+    const second = render("agent-parent-2", "toolu_subplan_2", "# Second subagent plan");
+
+    expect(first[0].update).toMatchObject({
+      sessionUpdate: "plan_update",
+      plan: { planId: "claude-plan:agent-parent-1" },
+    });
+    expect(second[0].update).toMatchObject({
+      sessionUpdate: "plan_update",
+      plan: { planId: "claude-plan:agent-parent-2" },
+    });
+    expect(emittedPlanContent.size).toBe(2);
+  });
+
   it("keeps Markdown in the switch_mode tool call when plan_update is unsupported", () => {
     const notifications = toAcpNotifications(
       [

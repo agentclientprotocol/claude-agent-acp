@@ -1722,6 +1722,57 @@ describe("subagent transcript replay", () => {
   });
 });
 
+describe("ExitPlanMode replay", () => {
+  it("replays Markdown through plan_update for capable clients without duplicating tool content", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    agent.clientCapabilities = { plan: {} };
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "plan-message",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          id: "api-plan-message",
+          model: "claude-sonnet-4-5",
+          role: "assistant",
+          type: "message",
+          stop_reason: "tool_use",
+          content: [
+            {
+              type: "tool_use",
+              id: "exit-plan-tool",
+              name: "ExitPlanMode",
+              input: { plan: "# Replayed plan" },
+            },
+          ],
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(updates.map((u) => u.update.sessionUpdate)).toEqual(["plan_update", "tool_call"]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "plan_update",
+      plan: { type: "markdown", planId: "claude-plan", content: "# Replayed plan" },
+    });
+    expect(updates[1].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "exit-plan-tool",
+      kind: "switch_mode",
+      content: [],
+    });
+  });
+});
+
 describe("escape markdown", () => {
   it("should escape markdown characters", () => {
     let text = "Hello *world*!";
@@ -2239,6 +2290,118 @@ describe("tool_call emitted before permission request", () => {
     expect(events).toEqual(["permission"]);
   });
 
+  it("delivers plan_update and tool_call before an ExitPlanMode permission-first request", async () => {
+    const { agent, events, updates, session } = setup();
+    agent.clientCapabilities = { plan: {} };
+
+    await agent.canUseTool("session-1")("ExitPlanMode", { plan: "# Permission-first plan" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "plan-tool-1",
+    } as any);
+
+    expect(events).toEqual(["update:plan_update", "update:tool_call", "permission"]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "plan_update",
+      plan: {
+        type: "markdown",
+        planId: "claude-plan",
+        content: "# Permission-first plan",
+      },
+    });
+    expect(updates[1].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "plan-tool-1",
+      kind: "switch_mode",
+      content: [],
+    });
+    expect(session.emittedPlanContent?.get("claude-plan")).toBe("# Permission-first plan");
+
+    const streamed = toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "plan-tool-1",
+          name: "ExitPlanMode",
+          input: { plan: "# Permission-first plan" },
+        },
+      ],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      {} as AcpClient,
+      console,
+      {
+        clientCapabilities: agent.clientCapabilities,
+        emittedToolCalls: session.emittedToolCalls,
+        emittedPlanContent: session.emittedPlanContent,
+        emitExitPlanUpdates: false,
+      },
+    );
+    expect(streamed.map((n) => n.update.sessionUpdate)).toEqual(["tool_call_update"]);
+  });
+
+  it("delivers a streamed tool_call, then plan_update, before the permission request", async () => {
+    const { agent, events, session } = setup();
+    agent.clientCapabilities = { plan: {} };
+
+    const streamed = toAcpNotifications(
+      [
+        {
+          type: "tool_use",
+          id: "plan-tool-2",
+          name: "ExitPlanMode",
+          input: { plan: "# Stream-first plan" },
+        },
+      ],
+      "assistant",
+      "session-1",
+      session.toolUseCache,
+      agent.client,
+      console,
+      {
+        clientCapabilities: agent.clientCapabilities,
+        emittedToolCalls: session.emittedToolCalls,
+        emittedPlanContent: session.emittedPlanContent,
+        emitExitPlanUpdates: false,
+      },
+    );
+    for (const notification of streamed) {
+      await agent.client.sessionUpdate(notification);
+    }
+
+    await agent.canUseTool("session-1")("ExitPlanMode", { plan: "# Stream-first plan" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "plan-tool-2",
+    } as any);
+
+    expect(events).toEqual(["update:tool_call", "update:plan_update", "permission"]);
+  });
+
+  it("keeps the ExitPlanMode Markdown in the permission tool call for legacy clients", async () => {
+    const { agent, events, updates } = setup();
+
+    await agent.canUseTool("session-1")("ExitPlanMode", { plan: "# Legacy plan" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "plan-tool-legacy",
+    } as any);
+
+    expect(events).toEqual(["update:tool_call", "permission"]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "plan-tool-legacy",
+      kind: "switch_mode",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "# Legacy plan" },
+        },
+      ],
+    });
+  });
+
   it("refines the eagerly-emitted tool_call with a tool_call_update when the chunk streams", () => {
     const { session } = setup();
     // Permission flow already emitted the tool_call for this id.
@@ -2572,6 +2735,36 @@ describe("subagent permission attribution (issue #851)", () => {
     // meta has (toolName is required by ToolUpdateMeta).
     expect(requests[0].toolCall._meta).toMatchObject({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
+    });
+  });
+
+  it("scopes a subagent ExitPlanMode plan to the spawning tool call", async () => {
+    const { agent, updates, session } = setup();
+    agent.clientCapabilities = { plan: {} };
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+
+    await agent.canUseTool("session-1")("ExitPlanMode", { plan: "# Subagent plan" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub_plan",
+      agentID: "agent-42",
+    } as any);
+
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "plan_update",
+      plan: {
+        type: "markdown",
+        planId: "claude-plan:toolu_parent",
+        content: "# Subagent plan",
+      },
+    });
+    expect(updates[1].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_sub_plan",
+      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
   });
 
