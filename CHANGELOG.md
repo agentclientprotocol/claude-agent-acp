@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.64.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.0...v0.64.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* release 0.65.0 ([#939](https://github.com/agentclientprotocol/claude-agent-acp/issues/939)) ([0936ec2](https://github.com/agentclientprotocol/claude-agent-acp/commit/0936ec281ec730714c605e3da732069ff47d8969))
+
 ## [0.64.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.63.0...v0.64.0) (2026-07-30)
 
 
