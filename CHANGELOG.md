@@ -1,12 +1,5 @@
 # Changelog
 
-## [0.64.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.1...v0.64.2) (2026-08-02)
-
-
-### Bug Fixes
-
-* restore the single-tool representation for ExitPlanMode ([#942](https://github.com/agentclientprotocol/claude-agent-acp/issues/942)) ([4302a4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/4302a4b0b6df821b164cbe4857f26cf5b44b532c))
-
 ## [0.64.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.0...v0.64.1) (2026-08-02)
 
 
