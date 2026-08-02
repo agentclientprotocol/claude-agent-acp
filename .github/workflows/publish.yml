@@ -65,6 +65,7 @@ jobs:
 
   trigger-registry-update:
     needs: publish-npm
+    if: ${{ always() && needs.publish-npm.result == 'success' }}
     runs-on: ubuntu-latest
     environment: release
     permissions: {}
