@@ -9,6 +9,11 @@ on:
         description: Tag or commit to publish
         required: true
         type: string
+      publish_npm:
+        description: Publish the package before updating the registry
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   release-please:
@@ -45,7 +50,7 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs: [release-please]
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.release-please.outputs.release_created == 'true') }}
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && inputs.publish_npm) || needs.release-please.outputs.release_created == 'true') }}
     environment: release # Optional: for enhanced security
     permissions:
       contents: read
@@ -65,7 +70,7 @@ jobs:
 
   trigger-registry-update:
     needs: publish-npm
-    if: ${{ always() && needs.publish-npm.result == 'success' }}
+    if: ${{ always() && (needs.publish-npm.result == 'success' || (github.event_name == 'workflow_dispatch' && !inputs.publish_npm)) }}
     runs-on: ubuntu-latest
     environment: release
     permissions: {}
