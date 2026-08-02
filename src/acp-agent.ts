@@ -525,11 +525,6 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
-  /** Last Markdown delivered through ACP's experimental `plan_update` lane,
-   *  keyed by plan id. Live ExitPlanMode updates are owned by the permission
-   *  path so the plan and referenced tool call are both delivered before the
-   *  permission request; replay uses the same cache without a concurrent ask. */
-  emittedPlanContent?: Map<string, string>;
   /** Registry of live background tasks, keyed by task id: populated at
    *  `task_started`, pruned when the task settles (a `task_notification` or
    *  a terminal `task_updated` patch), and reconciled against
@@ -3594,8 +3589,6 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
-                emittedPlanContent: session.emittedPlanContent,
-                emitExitPlanUpdates: false,
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
               },
@@ -3862,8 +3855,6 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
-                emittedPlanContent: session.emittedPlanContent,
-                emitExitPlanUpdates: false,
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
@@ -4463,7 +4454,6 @@ export class ClaudeAcpAgent {
 
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
-    const emittedPlanContent = new Map<string, string>();
     const messages = await getSessionMessages(sessionId);
     const forwardSubagentText =
       this.sessions[sessionId]?.forwardSubagentText ??
@@ -4513,7 +4503,6 @@ export class ClaudeAcpAgent {
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
-          emittedPlanContent,
           messageId: replayMessageId,
           parentToolUseId,
         },
@@ -4592,21 +4581,6 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
-    const planUpdate = exitPlanUpdate(
-      sessionId,
-      toolName,
-      toolInput,
-      this.clientCapabilities,
-      (session.emittedPlanContent ??= new Map()),
-      parentToolUseId,
-    );
-    if (planUpdate) {
-      await this.client.sessionUpdate(planUpdate);
-      session.emittedPlanContent.set(
-        claudePlanId(parentToolUseId),
-        (toolInput as { plan: string }).plan,
-      );
-    }
     if (session.emittedToolCalls.has(toolCallId)) {
       return;
     }
@@ -4617,7 +4591,6 @@ export class ClaudeAcpAgent {
       toolInput,
       supportsTerminalOutput,
       session.cwd,
-      supportsPlanUpdates(this.clientCapabilities),
     );
     if (parentToolUseId) {
       update._meta = {
@@ -4721,7 +4694,6 @@ export class ClaudeAcpAgent {
                 { name: toolName, input: toolInput, id: toolUseID },
                 supportsTerminalOutput,
                 session?.cwd,
-                supportsPlanUpdates(this.clientCapabilities),
               ),
               // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
               // so clients can rely on one shape everywhere.
@@ -5895,7 +5867,6 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
-      emittedPlanContent: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -7074,7 +7045,6 @@ function toolCallNotification(
   rawInput: unknown,
   supportsTerminalOutput: boolean,
   cwd?: string,
-  usePlanUpdate = false,
   refine = false,
 ): SessionNotification["update"] {
   if (refine) {
@@ -7083,7 +7053,7 @@ function toolCallNotification(
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
-      ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd, usePlanUpdate),
+      ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
     };
   }
   return {
@@ -7097,56 +7067,7 @@ function toolCallNotification(
     sessionUpdate: "tool_call",
     rawInput,
     status: "pending",
-    ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd, usePlanUpdate),
-  };
-}
-
-const CLAUDE_PLAN_ID = "claude-plan";
-
-function claudePlanId(parentToolUseId?: string | null): string {
-  return parentToolUseId ? `${CLAUDE_PLAN_ID}:${parentToolUseId}` : CLAUDE_PLAN_ID;
-}
-
-function supportsPlanUpdates(clientCapabilities?: ClientCapabilities | null): boolean {
-  return clientCapabilities?.plan != null;
-}
-
-/** Build a Markdown plan update for ExitPlanMode when the client opts into the
- * experimental plan capability. A stable per-session plan id lets a revised
- * plan replace the previous draft instead of accumulating one plan per tool
- * call. `rawInput.plan` remains on the switch_mode call used by the permission
- * request; this only moves visual rendering out of that call. */
-function exitPlanUpdate(
-  sessionId: string,
-  toolName: string,
-  toolInput: unknown,
-  clientCapabilities?: ClientCapabilities | null,
-  emittedPlanContent?: Map<string, string>,
-  parentToolUseId?: string | null,
-): SessionNotification | undefined {
-  const planId = claudePlanId(parentToolUseId);
-  if (
-    toolName !== "ExitPlanMode" ||
-    !supportsPlanUpdates(clientCapabilities) ||
-    toolInput === null ||
-    typeof toolInput !== "object" ||
-    !("plan" in toolInput) ||
-    typeof toolInput.plan !== "string" ||
-    toolInput.plan.trim().length === 0 ||
-    emittedPlanContent?.get(planId) === toolInput.plan
-  ) {
-    return undefined;
-  }
-  return {
-    sessionId,
-    update: {
-      sessionUpdate: "plan_update",
-      plan: {
-        type: "markdown",
-        planId,
-        content: toolInput.plan,
-      },
-    },
+    ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
   };
 }
 
@@ -7238,11 +7159,6 @@ export function toAcpNotifications(
     // tool_call/update decision falls back to `toolUseCache` presence (the
     // historical single-source behavior).
     emittedToolCalls?: Set<string>;
-    emittedPlanContent?: Map<string, string>;
-    // Live ExitPlanMode plan updates are sent from canUseTool immediately
-    // before requestPermission, which gives strict clients deterministic
-    // ordering. Replay has no concurrent permission request and emits here.
-    emitExitPlanUpdates?: boolean;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -7263,7 +7179,6 @@ export function toAcpNotifications(
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
-  const usePlanUpdate = supportsPlanUpdates(options?.clientCapabilities);
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];
@@ -7367,23 +7282,6 @@ export function toAcpNotifications(
           // tool_result time once we have the task ID (for TaskCreate) and
           // confirmation that the change took effect.
         } else {
-          if (options?.emitExitPlanUpdates !== false) {
-            const planUpdate = exitPlanUpdate(
-              sessionId,
-              chunk.name,
-              chunk.input,
-              options?.clientCapabilities,
-              options?.emittedPlanContent,
-              options?.parentToolUseId,
-            );
-            if (planUpdate) {
-              output.push(planUpdate);
-              options?.emittedPlanContent?.set(
-                claudePlanId(options?.parentToolUseId),
-                (chunk.input as { plan: string }).plan,
-              );
-            }
-          }
           // Only register hooks on first encounter to avoid double-firing
           if (registerHooks && !alreadyCached) {
             // Capture the tool name in the closure rather than re-reading the
@@ -7451,19 +7349,12 @@ export function toAcpNotifications(
               rawInput,
               supportsTerminalOutput,
               options?.cwd,
-              usePlanUpdate,
               true,
             );
           } else {
             // First surface (streaming content_block_start or replay) — send as
             // tool_call (with terminal_info for Bash).
-            update = toolCallNotification(
-              chunk,
-              rawInput,
-              supportsTerminalOutput,
-              options?.cwd,
-              usePlanUpdate,
-            );
+            update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
           }
         }
         break;
@@ -7666,8 +7557,6 @@ export function streamEventToAcpNotifications(
     cwd?: string;
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
-    emittedPlanContent?: Map<string, string>;
-    emitExitPlanUpdates?: boolean;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
   },
@@ -7681,8 +7570,6 @@ export function streamEventToAcpNotifications(
     cwd: options?.cwd,
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
-    emittedPlanContent: options?.emittedPlanContent,
-    emitExitPlanUpdates: options?.emitExitPlanUpdates,
     messageId: options?.messageId,
   };
   switch (event.type) {

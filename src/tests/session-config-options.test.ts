@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
@@ -1356,104 +1356,6 @@ describe("session config options", () => {
       expect(capturedPermissionRequest).not.toBeNull();
       const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
       expect(optionIds).toContain("auto");
-    });
-
-    it("sends plan_update before permission when the tool call was already streamed", async () => {
-      (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
-        plan: {},
-      };
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.emittedToolCalls.add("toolu_plan_update");
-
-      const canUseTool = (agent as any).canUseTool(SESSION_ID);
-      await expect(
-        canUseTool(
-          "ExitPlanMode",
-          { plan: "# Approved plan" },
-          {
-            signal: new AbortController().signal,
-            suggestions: undefined,
-            toolUseID: "toolu_plan_update",
-          },
-        ),
-      ).rejects.toThrow("Tool use aborted");
-
-      expect(sessionUpdates).toEqual([
-        {
-          sessionId: SESSION_ID,
-          update: {
-            sessionUpdate: "plan_update",
-            plan: {
-              type: "markdown",
-              planId: "claude-plan",
-              content: "# Approved plan",
-            },
-          },
-        },
-      ]);
-      expect(capturedPermissionRequest.toolCall).toMatchObject({
-        toolCallId: "toolu_plan_update",
-        kind: "switch_mode",
-        rawInput: { plan: "# Approved plan" },
-        content: [],
-      });
-    });
-
-    it("approves ExitPlanMode after publishing the capable-client plan", async () => {
-      (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
-        plan: {},
-      };
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modes.currentModeId = "plan";
-      permissionResponse = { outcome: { outcome: "selected", optionId: "default" } };
-
-      const result = await (agent as any).canUseTool(SESSION_ID)(
-        "ExitPlanMode",
-        { plan: "# Implement it" },
-        {
-          signal: new AbortController().signal,
-          suggestions: undefined,
-          toolUseID: "toolu_plan_approve",
-        },
-      );
-
-      expect(result.behavior).toBe("allow");
-      expect(session.modes.currentModeId).toBe("default");
-      expect(sessionUpdates.map((n) => n.update.sessionUpdate)).toEqual([
-        "plan_update",
-        "tool_call",
-        "current_mode_update",
-        "config_option_update",
-      ]);
-    });
-
-    it("rejects ExitPlanMode without switching mode after publishing the plan", async () => {
-      (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
-        plan: {},
-      };
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modes.currentModeId = "plan";
-      permissionResponse = { outcome: { outcome: "selected", optionId: "plan" } };
-
-      const result = await (agent as any).canUseTool(SESSION_ID)(
-        "ExitPlanMode",
-        { plan: "# Keep planning" },
-        {
-          signal: new AbortController().signal,
-          suggestions: undefined,
-          toolUseID: "toolu_plan_reject",
-        },
-      );
-
-      expect(result).toMatchObject({
-        behavior: "deny",
-        message: "User rejected request to exit plan mode.",
-      });
-      expect(session.modes.currentModeId).toBe("plan");
-      expect(sessionUpdates.map((n) => n.update.sessionUpdate)).toEqual([
-        "plan_update",
-        "tool_call",
-      ]);
     });
   });
 });

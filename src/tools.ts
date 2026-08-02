@@ -130,7 +130,6 @@ export function toolInfoFromToolUse(
   toolUse: any,
   supportsTerminalOutput: boolean = false,
   cwd?: string,
-  usePlanUpdate: boolean = false,
 ): ToolInfo {
   const name = toolUse.name;
 
@@ -434,15 +433,9 @@ export function toolInfoFromToolUse(
       return {
         title: "Ready to code?",
         kind: "switch_mode",
-        content:
-          !usePlanUpdate && planInput?.plan
-            ? [
-                {
-                  type: "content" as const,
-                  content: { type: "text" as const, text: planInput.plan },
-                },
-              ]
-            : [],
+        content: planInput?.plan
+          ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
+          : [],
       };
     }
 
