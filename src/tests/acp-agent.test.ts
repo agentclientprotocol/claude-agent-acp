@@ -6890,6 +6890,7 @@ describe("result origin handling", () => {
 });
 
 describe("accounting usage extension", () => {
+  /** Captures standard and extension notifications independently for channel assertions. */
   function createAccountingCaptureAgent() {
     const updates: SessionNotification[] = [];
     const extNotifications: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -6905,6 +6906,7 @@ describe("accounting usage extension", () => {
     return { agent, updates, extNotifications };
   }
 
+  /** Enables exactly the version-1 capability expected by the production negotiation helper. */
   async function negotiateAccounting(agent: ClaudeAcpAgent) {
     await agent.initialize({
       protocolVersion: 1,
@@ -6914,6 +6916,7 @@ describe("accounting usage extension", () => {
     });
   }
 
+  /** Waits for asynchronous turn activation without coupling cancellation tests to timers. */
   async function waitForAccounting(condition: () => boolean) {
     for (let attempt = 0; attempt < 100; attempt += 1) {
       if (condition()) return;
@@ -6922,6 +6925,7 @@ describe("accounting usage extension", () => {
     throw new Error("timed out waiting for accounting test state");
   }
 
+  /** Creates an assistant frame that drives the existing context-occupancy update path. */
   function accountingAssistant(
     usage = {
       input_tokens: 7,
@@ -6943,6 +6947,7 @@ describe("accounting usage extension", () => {
     };
   }
 
+  /** Installs a deterministic result sequence behind the real session consumer. */
   function injectAccountingMessages(agent: ClaudeAcpAgent, messages: unknown[]) {
     const input = new Pushable<any>();
     async function* messageGenerator() {
@@ -6958,6 +6963,7 @@ describe("accounting usage extension", () => {
     });
   }
 
+  /** Installs one result followed by idle for ordinary prompt lifecycle tests. */
   function injectAccountingSession(agent: ClaudeAcpAgent, result: Record<string, unknown>) {
     injectAccountingMessages(agent, [
       result,
@@ -6965,6 +6971,7 @@ describe("accounting usage extension", () => {
     ]);
   }
 
+  /** Builds one SDK result whose provider snapshot intentionally exceeds top-level usage. */
   function accountingResult(overrides: Record<string, unknown> = {}) {
     return {
       type: "result" as const,
@@ -7336,6 +7343,37 @@ describe("accounting usage extension", () => {
       cachedWriteTokens: 19,
       totalTokens: 60,
     });
+  });
+
+  it("preserves the standard result lifecycle when accounting delivery fails", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
+      extNotification: async () => {
+        throw new Error("accounting transport failed");
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    await negotiateAccounting(agent);
+    injectAccountingSession(agent, accountingResult());
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 7,
+        outputTokens: 4,
+        cachedReadTokens: 2,
+        cachedWriteTokens: 1,
+        totalTokens: 14,
+      },
+    });
+    expect(
+      updates.some((notification) => notification.update.sessionUpdate === "usage_update"),
+    ).toBe(true);
   });
 });
 

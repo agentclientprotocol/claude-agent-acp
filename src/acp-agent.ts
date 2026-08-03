@@ -3151,7 +3151,14 @@ export class ClaudeAcpAgent {
                 isAutonomousResult ? "autonomous" : "user_turn",
               );
               if (accounting) {
-                await this.client.extNotification(ACCOUNTING_USAGE_METHOD, accounting);
+                try {
+                  await this.client.extNotification(ACCOUNTING_USAGE_METHOD, accounting);
+                } catch (error) {
+                  // Accounting is an optional extension and must not alter standard result handling.
+                  this.logger.error(
+                    `Session ${params.sessionId}: failed to send accounting usage: ${error}`,
+                  );
+                }
               }
             }
 

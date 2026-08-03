@@ -7,6 +7,7 @@ import {
   recordAccountingResult,
 } from "../accounting-usage.js";
 
+/** Builds one complete SDK model row so tests vary only the accounting counters. */
 function modelUsage(
   inputTokens: number,
   outputTokens: number,
@@ -25,6 +26,7 @@ function modelUsage(
   };
 }
 
+/** Builds a minimal SDK result with caller-controlled cumulative and per-result usage. */
 function result(
   uuid: string,
   models: Record<string, ModelUsage>,
@@ -188,12 +190,16 @@ describe("accounting usage snapshot state", () => {
 
   it("falls back to normalized result usage when modelUsage is empty", () => {
     const state = createAccountingUsageState();
-    const sdkResult = result("result-1", {}, {
-      input_tokens: 2,
-      output_tokens: 3,
-      cache_read_input_tokens: 5,
-      cache_creation_input_tokens: 7,
-    });
+    const sdkResult = result(
+      "result-1",
+      {},
+      {
+        input_tokens: 2,
+        output_tokens: 3,
+        cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 7,
+      },
+    );
 
     const event = recordAccountingResult(state, "acp-session", sdkResult, "autonomous");
 
@@ -216,6 +222,213 @@ describe("accounting usage snapshot state", () => {
         totalTokens: 17,
       },
     });
+    expect(state.previousModelUsageTotals).toBeNull();
+  });
+
+  it("does not count fallback usage again when a cumulative snapshot resumes", () => {
+    const state = createAccountingUsageState();
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-1", { sonnet: modelUsage(10, 0, 0, 0) }),
+      "user_turn",
+    );
+    const fallback = recordAccountingResult(
+      state,
+      "acp-session",
+      result(
+        "result-2",
+        {},
+        {
+          input_tokens: 2,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      ),
+      "user_turn",
+    );
+
+    const resumed = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-3", { sonnet: modelUsage(15, 0, 0, 0) }),
+      "user_turn",
+    );
+
+    expect(fallback?.usage.totalTokens).toBe(2);
+    expect(resumed?.usage).toEqual({
+      inputTokens: 3,
+      outputTokens: 0,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 3,
+    });
+  });
+
+  it("reconciles consecutive fallback results across token buckets without going negative", () => {
+    const state = createAccountingUsageState();
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-1", { sonnet: modelUsage(10, 5, 0, 0) }),
+      "user_turn",
+    );
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result(
+        "result-2",
+        {},
+        {
+          input_tokens: 4,
+          output_tokens: 2,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      ),
+      "user_turn",
+    );
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result(
+        "result-3",
+        {},
+        {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      ),
+      "user_turn",
+    );
+
+    const partial = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-4", { sonnet: modelUsage(13, 9, 0, 0) }),
+      "user_turn",
+    );
+    const completed = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-5", { sonnet: modelUsage(17, 10, 0, 0) }),
+      "user_turn",
+    );
+
+    expect(partial?.usage).toEqual({
+      inputTokens: 0,
+      outputTokens: 1,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 1,
+    });
+    expect(completed?.usage).toEqual({
+      inputTokens: 2,
+      outputTokens: 1,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 3,
+    });
+    expect(state.unreconciledFallbackUsage.totalTokens).toBe(0);
+  });
+
+  it("clears prior fallback debt when a cumulative snapshot resets", () => {
+    const state = createAccountingUsageState();
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-1", { sonnet: modelUsage(10, 5, 20, 3) }),
+      "user_turn",
+    );
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result(
+        "result-2",
+        {},
+        {
+          input_tokens: 2,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      ),
+      "user_turn",
+    );
+
+    const reset = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-3", { sonnet: modelUsage(4, 2, 8, 1) }),
+      "user_turn",
+    );
+
+    expect(reset).toMatchObject({
+      snapshotReset: true,
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        cachedReadTokens: 8,
+        cachedWriteTokens: 1,
+        totalTokens: 15,
+      },
+    });
+    expect(state.unreconciledFallbackUsage.totalTokens).toBe(0);
+  });
+
+  it("does not add duplicate fallback results to reconciliation debt", () => {
+    const state = createAccountingUsageState();
+    recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-1", { sonnet: modelUsage(10, 0, 0, 0) }),
+      "user_turn",
+    );
+    const fallback = result(
+      "fallback",
+      {},
+      {
+        input_tokens: 2,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    );
+    recordAccountingResult(state, "acp-session", fallback, "user_turn");
+    recordAccountingResult(state, "acp-session", fallback, "user_turn");
+
+    const resumed = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-3", { sonnet: modelUsage(15, 0, 0, 0) }),
+      "user_turn",
+    );
+
+    expect(resumed?.usage.inputTokens).toBe(3);
+    expect(state.unreconciledFallbackUsage.totalTokens).toBe(0);
+  });
+
+  it("rejects the entire model snapshot when any model row is invalid", () => {
+    const state = createAccountingUsageState();
+    const invalidModel = {
+      ...modelUsage(5, 1, 2, 3),
+      cacheReadInputTokens: Number.NaN,
+    } as ModelUsage;
+
+    const event = recordAccountingResult(
+      state,
+      "acp-session",
+      result("result-1", {
+        valid: modelUsage(10, 5, 20, 3),
+        invalid: invalidModel,
+      }),
+      "user_turn",
+    );
+
+    expect(event?.source).toBe("result_usage_fallback");
     expect(state.previousModelUsageTotals).toBeNull();
   });
 

@@ -35,6 +35,8 @@ export type AccountingUsageNotification = {
 
 export type AccountingUsageState = {
   previousModelUsageTotals: AccountingTokenUsage | null;
+  /** Fallback tokens already emitted but not yet observed in a valid cumulative snapshot. */
+  unreconciledFallbackUsage: AccountingTokenUsage;
   emittedResultIds: Set<string>;
 };
 
@@ -48,11 +50,28 @@ function withTotal(usage: Omit<AccountingTokenUsage, "totalTokens">): Accounting
   return {
     ...usage,
     totalTokens:
-      usage.inputTokens +
-      usage.outputTokens +
-      usage.cachedReadTokens +
-      usage.cachedWriteTokens,
+      usage.inputTokens + usage.outputTokens + usage.cachedReadTokens + usage.cachedWriteTokens,
   };
+}
+
+/** Creates an empty four-bucket usage value for state initialization and reconciliation. */
+function zeroUsage(): AccountingTokenUsage {
+  return withTotal({
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedReadTokens: 0,
+    cachedWriteTokens: 0,
+  });
+}
+
+/** Adds two usage values while deriving the total from their four provider buckets. */
+function addUsage(left: AccountingTokenUsage, right: AccountingTokenUsage): AccountingTokenUsage {
+  return withTotal({
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cachedReadTokens: left.cachedReadTokens + right.cachedReadTokens,
+    cachedWriteTokens: left.cachedWriteTokens + right.cachedWriteTokens,
+  });
 }
 
 /** Checks whether one model row can participate in an authoritative aggregate snapshot. */
@@ -80,8 +99,8 @@ function resultTokenUsage(result: SDKResultMessage): AccountingTokenUsage {
 
 /** Aggregates model rows before differencing so model key changes cannot alter accounting. */
 function aggregateModelUsage(modelUsage: Record<string, ModelUsage>): AccountingTokenUsage | null {
-  const rows = Object.values(modelUsage).filter(isValidModelUsage);
-  if (rows.length === 0) return null;
+  const rows = Object.values(modelUsage);
+  if (rows.length === 0 || !rows.every(isValidModelUsage)) return null;
 
   return withTotal(
     rows.reduce(
@@ -94,6 +113,38 @@ function aggregateModelUsage(modelUsage: Record<string, ModelUsage>): Accounting
       { inputTokens: 0, outputTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0 },
     ),
   );
+}
+
+/**
+ * Removes fallback tokens that were already emitted from the next monotonic provider delta.
+ * A reset starts a new accounting epoch, so fallback debt from the prior epoch is cleared.
+ */
+function reconcileFallbackUsage(
+  delta: { usage: AccountingTokenUsage; snapshotReset: boolean },
+  pending: AccountingTokenUsage,
+): { usage: AccountingTokenUsage; remaining: AccountingTokenUsage } {
+  if (delta.snapshotReset) return { usage: delta.usage, remaining: zeroUsage() };
+
+  const applied = {
+    inputTokens: Math.min(delta.usage.inputTokens, pending.inputTokens),
+    outputTokens: Math.min(delta.usage.outputTokens, pending.outputTokens),
+    cachedReadTokens: Math.min(delta.usage.cachedReadTokens, pending.cachedReadTokens),
+    cachedWriteTokens: Math.min(delta.usage.cachedWriteTokens, pending.cachedWriteTokens),
+  };
+  return {
+    usage: withTotal({
+      inputTokens: delta.usage.inputTokens - applied.inputTokens,
+      outputTokens: delta.usage.outputTokens - applied.outputTokens,
+      cachedReadTokens: delta.usage.cachedReadTokens - applied.cachedReadTokens,
+      cachedWriteTokens: delta.usage.cachedWriteTokens - applied.cachedWriteTokens,
+    }),
+    remaining: withTotal({
+      inputTokens: pending.inputTokens - applied.inputTokens,
+      outputTokens: pending.outputTokens - applied.outputTokens,
+      cachedReadTokens: pending.cachedReadTokens - applied.cachedReadTokens,
+      cachedWriteTokens: pending.cachedWriteTokens - applied.cachedWriteTokens,
+    }),
+  };
 }
 
 /** Computes one additive delta and explicitly marks any cumulative snapshot reset. */
@@ -125,6 +176,7 @@ function diffSnapshot(
 export function createAccountingUsageState(): AccountingUsageState {
   return {
     previousModelUsageTotals: null,
+    unreconciledFallbackUsage: zeroUsage(),
     emittedResultIds: new Set(),
   };
 }
@@ -147,7 +199,15 @@ export function recordAccountingResult(
     ? diffSnapshot(currentSnapshot, state.previousModelUsageTotals)
     : { usage: resultUsage, snapshotReset: false };
 
-  if (currentSnapshot) state.previousModelUsageTotals = currentSnapshot;
+  let accountingUsage = delta.usage;
+  if (currentSnapshot) {
+    const reconciled = reconcileFallbackUsage(delta, state.unreconciledFallbackUsage);
+    accountingUsage = reconciled.usage;
+    state.unreconciledFallbackUsage = reconciled.remaining;
+    state.previousModelUsageTotals = currentSnapshot;
+  } else {
+    state.unreconciledFallbackUsage = addUsage(state.unreconciledFallbackUsage, resultUsage);
+  }
 
   return {
     sessionId,
@@ -159,7 +219,7 @@ export function recordAccountingResult(
     ...(result.origin ? { origin: result.origin } : {}),
     source: currentSnapshot ? "model_usage_delta" : "result_usage_fallback",
     snapshotReset: delta.snapshotReset,
-    usage: delta.usage,
+    usage: accountingUsage,
     resultUsage,
     modelUsage,
     modelUsageSemantics: "sdk_session_cumulative_snapshot",
