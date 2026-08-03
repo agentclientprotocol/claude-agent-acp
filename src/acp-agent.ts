@@ -95,6 +95,13 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
 import {
+  ACCOUNTING_USAGE_METHOD,
+  ACCOUNTING_USAGE_VERSION,
+  createAccountingUsageState,
+  recordAccountingResult,
+  type AccountingUsageState,
+} from "./accounting-usage.js";
+import {
   applyAskElicitationResponse,
   askUserQuestionsToCreateRequest,
   createElicitationResponseToElicitResult,
@@ -435,6 +442,8 @@ type Session = {
   sessionFingerprint: string;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
+  /** Provider accounting state spans the SDK query lifetime and never resets per prompt. */
+  accountingUsage: AccountingUsageState;
   modes: SessionModeState;
   models: SessionModelState;
   modelInfos: ModelInfo[];
@@ -1527,6 +1536,10 @@ export class ClaudeAcpAgent {
         _meta: {
           claudeCode: {
             promptQueueing: true,
+            accountingUsage: {
+              method: ACCOUNTING_USAGE_METHOD,
+              version: ACCOUNTING_USAGE_VERSION,
+            },
           },
         },
         promptCapabilities: {
@@ -3129,6 +3142,18 @@ export class ClaudeAcpAgent {
             // slash-command output forwarding), though their cost is real.
             const isAutonomousResult =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+
+            if (supportsAccountingUsage(this.clientCapabilities)) {
+              const accounting = recordAccountingResult(
+                session.accountingUsage,
+                params.sessionId,
+                message,
+                isAutonomousResult ? "autonomous" : "user_turn",
+              );
+              if (accounting) {
+                await this.client.extNotification(ACCOUNTING_USAGE_METHOD, accounting);
+              }
+            }
 
             try {
               // Reconcile the Fast mode toggle with the SDK's reported state.
@@ -5850,6 +5875,7 @@ export class ClaudeAcpAgent {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       modes,
       models,
       modelInfos,
@@ -6193,6 +6219,18 @@ export function normalizeFastModeDisabledReason(
   reason: FastModeDisabledReason | undefined,
 ): FastModeDisabledReason | undefined {
   return reason && FAST_MODE_UNAVAILABLE_EXPLANATIONS[reason] ? reason : undefined;
+}
+
+/** Accepts only the explicitly negotiated version of the Claude accounting extension. */
+function supportsAccountingUsage(capabilities: ClientCapabilities | undefined): boolean {
+  const claudeCode = capabilities?._meta?.claudeCode;
+  if (!claudeCode || typeof claudeCode !== "object") return false;
+  const accountingUsage = (claudeCode as Record<string, unknown>).accountingUsage;
+  return (
+    accountingUsage !== null &&
+    typeof accountingUsage === "object" &&
+    (accountingUsage as Record<string, unknown>).version === ACCOUNTING_USAGE_VERSION
+  );
 }
 
 /** Whether the Client advertised support for boolean session config options

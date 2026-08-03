@@ -46,6 +46,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
+import { createAccountingUsageState } from "../accounting-usage.js";
 import {
   deleteSession,
   getSessionInfo,
@@ -151,6 +152,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
       cachedReadTokens: 0,
       cachedWriteTokens: 0,
     },
+    accountingUsage: createAccountingUsageState(),
     configOptions: [],
     agents: [],
     currentAgent: "default",
@@ -2021,6 +2023,7 @@ describe("permission request cancellation", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -4024,13 +4027,22 @@ describe("logout", () => {
     return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
   }
 
-  it("advertises the logout capability during initialize", async () => {
+  it("advertises logout and accounting usage capabilities during initialize", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
+    expect(response.agentCapabilities?._meta).toMatchObject({
+      claudeCode: {
+        promptQueueing: true,
+        accountingUsage: {
+          method: "_claude/accountingUsage",
+          version: 1,
+        },
+      },
+    });
   });
 });
 
@@ -4067,6 +4079,7 @@ describe("session/close", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -4160,6 +4173,7 @@ describe("session/delete", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -4270,6 +4284,7 @@ describe("getOrCreateSession param change detection", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -6874,6 +6889,185 @@ describe("result origin handling", () => {
   });
 });
 
+describe("accounting usage extension", () => {
+  function createAccountingCaptureAgent() {
+    const updates: SessionNotification[] = [];
+    const extNotifications: Array<{ method: string; params: Record<string, unknown> }> = [];
+    const client = {
+      sessionUpdate: async (notification: SessionNotification) => {
+        updates.push(notification);
+      },
+      extNotification: async (method: string, params: Record<string, unknown>) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    return { agent, updates, extNotifications };
+  }
+
+  function injectAccountingSession(agent: ClaudeAcpAgent, result: Record<string, unknown>) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) yield userEcho(userMessage);
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          model: "claude-sonnet-4-6",
+          content: [{ type: "text", text: "done" }],
+          usage: {
+            input_tokens: 7,
+            output_tokens: 4,
+            cache_read_input_tokens: 2,
+            cache_creation_input_tokens: 1,
+          },
+        },
+      };
+      yield result;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
+  function accountingResult() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: "end_turn",
+      is_error: false,
+      result: "done",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0.01,
+      usage: {
+        input_tokens: 7,
+        output_tokens: 4,
+        cache_read_input_tokens: 2,
+        cache_creation_input_tokens: 1,
+      },
+      modelUsage: {
+        "claude-sonnet-4-6": {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 20,
+          cacheCreationInputTokens: 3,
+          webSearchRequests: 0,
+          costUSD: 0.01,
+          contextWindow: 200000,
+          maxOutputTokens: 64000,
+        },
+      },
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  it("emits the version 1 accounting usage payload only when negotiated", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { claudeCode: { accountingUsage: { version: 1 } } },
+      },
+    });
+    const result = accountingResult();
+    injectAccountingSession(agent, result);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    expect(extNotifications).toContainEqual({
+      method: "_claude/accountingUsage",
+      params: {
+        sessionId: "test-session",
+        version: 1,
+        resultId: result.uuid,
+        resultSubtype: "success",
+        isError: false,
+        scope: "user_turn",
+        source: "model_usage_delta",
+        snapshotReset: false,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cachedReadTokens: 20,
+          cachedWriteTokens: 3,
+          totalTokens: 38,
+        },
+        resultUsage: {
+          inputTokens: 7,
+          outputTokens: 4,
+          cachedReadTokens: 2,
+          cachedWriteTokens: 1,
+          totalTokens: 14,
+        },
+        modelUsage: result.modelUsage,
+        modelUsageSemantics: "sdk_session_cumulative_snapshot",
+      },
+    });
+  });
+
+  it.each([
+    ["missing capability", {}],
+    ["boolean capability", { _meta: { claudeCode: { accountingUsage: true } } }],
+    ["string version", { _meta: { claudeCode: { accountingUsage: { version: "1" } } } }],
+    ["future version", { _meta: { claudeCode: { accountingUsage: { version: 2 } } } }],
+  ])("does not emit accounting usage for %s", async (_label, clientCapabilities) => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities });
+    injectAccountingSession(agent, accountingResult());
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    expect(extNotifications).toEqual([]);
+  });
+
+  it("keeps PromptResponse usage beside accounting usage and consumers must not sum them", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { claudeCode: { accountingUsage: { version: 1 } } },
+      },
+    });
+    const result = accountingResult();
+    injectAccountingSession(agent, result);
+
+    const promptResponse = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const accountingEvent = extNotifications.find(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+
+    expect(promptResponse.usage).toEqual({
+      inputTokens: 7,
+      outputTokens: 4,
+      cachedReadTokens: 2,
+      cachedWriteTokens: 1,
+      totalTokens: 14,
+    });
+    expect(accountingEvent?.params.resultId).toBe(result.uuid);
+    expect(accountingEvent?.params.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedReadTokens: 20,
+      cachedWriteTokens: 3,
+      totalTokens: 38,
+    });
+  });
+});
+
 describe("memory_recall handling", () => {
   function createMockAgentWithCapture() {
     const updates: any[] = [];
@@ -7128,6 +7322,7 @@ describe("post-error recovery", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -10130,6 +10325,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accountingUsage: createAccountingUsageState(),
       configOptions: [],
       agents: [],
       currentAgent: "default",
@@ -11415,6 +11611,7 @@ describe("agent selection config option", () => {
           cachedReadTokens: 0,
           cachedWriteTokens: 0,
         },
+        accountingUsage: createAccountingUsageState(),
         configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
         agents,
         currentAgent: "default",
