@@ -6905,30 +6905,52 @@ describe("accounting usage extension", () => {
     return { agent, updates, extNotifications };
   }
 
-  function injectAccountingSession(agent: ClaudeAcpAgent, result: Record<string, unknown>) {
+  async function negotiateAccounting(agent: ClaudeAcpAgent) {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { claudeCode: { accountingUsage: { version: 1 } } },
+      },
+    });
+  }
+
+  async function waitForAccounting(condition: () => boolean) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (condition()) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error("timed out waiting for accounting test state");
+  }
+
+  function accountingAssistant(
+    usage = {
+      input_tokens: 7,
+      output_tokens: 4,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 1,
+    },
+  ) {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "done" }],
+        usage,
+      },
+    };
+  }
+
+  function injectAccountingMessages(agent: ClaudeAcpAgent, messages: unknown[]) {
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
       const { value: userMessage, done } = await iter.next();
       if (!done && userMessage) yield userEcho(userMessage);
-      yield {
-        type: "assistant",
-        parent_tool_use_id: null,
-        uuid: randomUUID(),
-        session_id: "test-session",
-        message: {
-          model: "claude-sonnet-4-6",
-          content: [{ type: "text", text: "done" }],
-          usage: {
-            input_tokens: 7,
-            output_tokens: 4,
-            cache_read_input_tokens: 2,
-            cache_creation_input_tokens: 1,
-          },
-        },
-      };
-      yield result;
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      yield accountingAssistant();
+      yield* messages as any;
     }
     agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
@@ -6936,7 +6958,14 @@ describe("accounting usage extension", () => {
     });
   }
 
-  function accountingResult() {
+  function injectAccountingSession(agent: ClaudeAcpAgent, result: Record<string, unknown>) {
+    injectAccountingMessages(agent, [
+      result,
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+  }
+
+  function accountingResult(overrides: Record<string, unknown> = {}) {
     return {
       type: "result" as const,
       subtype: "success" as const,
@@ -6969,17 +6998,13 @@ describe("accounting usage extension", () => {
       permission_denials: [],
       uuid: randomUUID(),
       session_id: "test-session",
+      ...overrides,
     };
   }
 
   it("emits the version 1 accounting usage payload only when negotiated", async () => {
     const { agent, extNotifications } = createAccountingCaptureAgent();
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { claudeCode: { accountingUsage: { version: 1 } } },
-      },
-    });
+    await negotiateAccounting(agent);
     const result = accountingResult();
     injectAccountingSession(agent, result);
 
@@ -7032,13 +7057,8 @@ describe("accounting usage extension", () => {
   });
 
   it("keeps PromptResponse usage beside accounting usage and consumers must not sum them", async () => {
-    const { agent, extNotifications } = createAccountingCaptureAgent();
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {
-        _meta: { claudeCode: { accountingUsage: { version: 1 } } },
-      },
-    });
+    const { agent, updates, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
     const result = accountingResult();
     injectAccountingSession(agent, result);
 
@@ -7064,6 +7084,257 @@ describe("accounting usage extension", () => {
       cachedReadTokens: 20,
       cachedWriteTokens: 3,
       totalTokens: 38,
+    });
+    const usageUpdate = updates.find(
+      (notification) => notification.update.sessionUpdate === "usage_update",
+    );
+    expect(usageUpdate?.update).toMatchObject({
+      sessionUpdate: "usage_update",
+      used: 14,
+    });
+  });
+
+  it.each([
+    "error_during_execution",
+    "error_max_turns",
+    "error_max_budget_usd",
+    "error_max_structured_output_retries",
+  ] as const)("emits accounting usage before rejecting %s", async (subtype) => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    const sdkResult = accountingResult({
+      subtype,
+      is_error: true,
+      errors: [subtype],
+    });
+    injectAccountingSession(agent, sdkResult);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
+
+    const event = extNotifications.find(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+    expect(event?.params).toMatchObject({
+      resultId: sdkResult.uuid,
+      resultSubtype: subtype,
+      isError: true,
+      scope: "user_turn",
+    });
+  });
+
+  it.each([
+    ["task-notification", { kind: "task-notification" }],
+    ["peer", { kind: "peer", from: "peer-session" }],
+  ])("isolates %s autonomous accounting from PromptResponse usage", async (_label, origin) => {
+    const { agent, updates, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    const userResult = accountingResult();
+    const autonomousResult = accountingResult({
+      origin,
+      usage: {
+        input_tokens: 3,
+        output_tokens: 2,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 1,
+      },
+      modelUsage: {
+        "claude-sonnet-4-6": {
+          inputTokens: 14,
+          outputTokens: 7,
+          cacheReadInputTokens: 29,
+          cacheCreationInputTokens: 8,
+          webSearchRequests: 0,
+          costUSD: 0.02,
+          contextWindow: 200000,
+          maxOutputTokens: 64000,
+        },
+      },
+    });
+    injectAccountingMessages(agent, [
+      userResult,
+      accountingAssistant({
+        input_tokens: 3,
+        output_tokens: 2,
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 1,
+      }),
+      autonomousResult,
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+
+    const events = extNotifications.filter(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+    expect(events).toHaveLength(2);
+    expect(events[0].params).toMatchObject({ resultId: userResult.uuid, scope: "user_turn" });
+    expect(events[1].params).toMatchObject({
+      resultId: autonomousResult.uuid,
+      scope: "autonomous",
+      usage: {
+        inputTokens: 4,
+        outputTokens: 2,
+        cachedReadTokens: 9,
+        cachedWriteTokens: 5,
+        totalTokens: 20,
+      },
+    });
+    expect(response.usage).toEqual({
+      inputTokens: 7,
+      outputTokens: 4,
+      cachedReadTokens: 2,
+      cachedWriteTokens: 1,
+      totalTokens: 14,
+    });
+    expect(
+      updates.filter((notification) => notification.update.sessionUpdate === "usage_update"),
+    ).toHaveLength(2);
+  });
+
+  it("reports a result received after cancellation", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    let releaseResult!: () => void;
+    const resultReady = new Promise<void>((resolve) => (releaseResult = resolve));
+    const sdkResult = accountingResult();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const userMessage = await iter.next();
+        yield userEcho(userMessage.value);
+        await resultReady;
+        yield sdkResult;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await waitForAccounting(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.cancel({ sessionId: "test-session" });
+    releaseResult();
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    const events = extNotifications.filter(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0].params.resultId).toBe(sdkResult.uuid);
+  });
+
+  it("does not fabricate accounting usage when cancellation pre-empts every result", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    let releaseIdle!: () => void;
+    const idleReady = new Promise<void>((resolve) => (releaseIdle = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const userMessage = await iter.next();
+        yield userEcho(userMessage.value);
+        await idleReady;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await waitForAccounting(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.cancel({ sessionId: "test-session" });
+    releaseIdle();
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(extNotifications).toEqual([]);
+  });
+
+  it("suppresses duplicate result UUIDs without advancing the snapshot baseline", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    const first = accountingResult();
+    const advanced = accountingResult({
+      modelUsage: {
+        "claude-sonnet-4-6": {
+          inputTokens: 14,
+          outputTokens: 7,
+          cacheReadInputTokens: 29,
+          cacheCreationInputTokens: 8,
+          webSearchRequests: 0,
+          costUSD: 0.02,
+          contextWindow: 200000,
+          maxOutputTokens: 64000,
+        },
+      },
+    });
+    injectAccountingMessages(agent, [
+      first,
+      first,
+      advanced,
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    const events = extNotifications.filter(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+    expect(events.filter((event) => event.params.resultId === first.uuid)).toHaveLength(1);
+    expect(events).toHaveLength(2);
+    expect(events[1].params.usage).toEqual({
+      inputTokens: 4,
+      outputTokens: 2,
+      cachedReadTokens: 9,
+      cachedWriteTokens: 5,
+      totalTokens: 20,
+    });
+  });
+
+  it("preserves all four token categories through the wire payload", async () => {
+    const { agent, extNotifications } = createAccountingCaptureAgent();
+    await negotiateAccounting(agent);
+    injectAccountingSession(
+      agent,
+      accountingResult({
+        modelUsage: {
+          "claude-sonnet-4-6": {
+            inputTokens: 11,
+            outputTokens: 13,
+            cacheReadInputTokens: 17,
+            cacheCreationInputTokens: 19,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 64000,
+          },
+        },
+      }),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const event = extNotifications.find(
+      (notification) => notification.method === "_claude/accountingUsage",
+    );
+    const roundTrip = JSON.parse(JSON.stringify(event));
+
+    expect(roundTrip.params.usage).toEqual({
+      inputTokens: 11,
+      outputTokens: 13,
+      cachedReadTokens: 17,
+      cachedWriteTokens: 19,
+      totalTokens: 60,
     });
   });
 });
