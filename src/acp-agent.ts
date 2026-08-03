@@ -287,6 +287,10 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Exact SDK `local_command_output` payloads already forwarded for this turn.
+   *  The terminal result can repeat one verbatim; retaining provenance here
+   *  avoids a client-side/global text dedupe while preserving distinct output. */
+  localCommandOutputs?: Set<string>;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
@@ -2680,6 +2684,26 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                // Local-only commands have no user echo, so their turn normally
+                // remains queued until the result promotes it. Attribute the
+                // output to that queue head now, before forwarding erases its
+                // SDK origin at the ACP boundary.
+                // A pending orphan is FIFO-ahead of every live queued turn.
+                // Its unkeyed output must not become dedupe evidence for the
+                // next command before the orphan result/frame drains the lane.
+                const hasPendingOrphan =
+                  (session.pendingOrphanResults ?? 0) > 0 ||
+                  (session.orphanCommands?.size ?? 0) > 0;
+                const turn = hasPendingOrphan
+                  ? undefined
+                  : isHeldOpen(session.activeTurn)
+                    ? (session.turnQueue ?? []).find(
+                        (candidate) => candidate !== session.activeTurn && !candidate.settled,
+                      )
+                    : (session.activeTurn ?? firstUnsettledQueuedTurn());
+                if (turn?.isLocalOnlyCommand) {
+                  (turn.localCommandOutputs ??= new Set()).add(message.content);
+                }
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -3380,8 +3404,11 @@ export class ClaudeAcpAgent {
                   // the fallback there. (Autonomous results never get here —
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
+                  const localCommandResultAlreadyDelivered =
+                    session.activeTurn?.localCommandOutputs?.has(message.result) ?? false;
                   if (
-                    session.activeTurn?.isLocalOnlyCommand ||
+                    (session.activeTurn?.isLocalOnlyCommand &&
+                      !localCommandResultAlreadyDelivered) ||
                     (!deliveredAssistantText && (message.usage.output_tokens ?? 0) === 0)
                   ) {
                     for (const notification of toAcpNotifications(

@@ -6272,6 +6272,117 @@ describe("assembled assistant text fallback", () => {
     return { ...result(), result: text };
   }
 
+  function localCommandOutput(content: string) {
+    return {
+      type: "system" as const,
+      subtype: "local_command_output" as const,
+      content,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  // Local-only commands do not replay a user echo. Consume each pushed prompt
+  // before yielding its scripted SDK messages so tests preserve that ordering.
+  function injectLocalOnlyTurns(agent: ClaudeAcpAgent, turns: any[][]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const messages of turns) {
+        await iter.next();
+        yield* messages;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
+  it("does not re-emit local-only command output already delivered by local_command_output", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [localCommandOutput("Context Usage"), replayedResult("Context Usage"), idle],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
+  it("forwards a local-only command result when local_command_output is absent", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [[replayedResult("Context Usage"), idle]]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
+  it("preserves a distinct local-only command result after local_command_output", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [localCommandOutput("Preparing context"), replayedResult("Context Usage"), idle],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Preparing context", "Context Usage"]);
+  });
+
+  it("does not suppress identical local-command output in a later turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [localCommandOutput("Context Usage"), replayedResult("Context Usage"), idle],
+      [localCommandOutput("Context Usage"), replayedResult("Context Usage"), idle],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage", "Context Usage"]);
+  });
+
+  it("does not attribute legacy orphan local-command output to a new turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [
+        localCommandOutput("Context Usage"),
+        replayedResult("Context Usage"), // cancelled command's orphan result
+        {
+          ...replayedResult("Context Usage"),
+          usage: { ...ZERO_USAGE, output_tokens: 5 }, // new command's result-only output
+        },
+        idle,
+      ],
+    ]);
+    agent.sessions["test-session"]!.pendingOrphanResults = 1;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage", "Context Usage"]);
+  });
+
+  it("does not attribute lifecycle-tracked orphan local-command output to a new turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [
+        localCommandOutput("Context Usage"),
+        replayedResult("Context Usage"), // cancelled command's orphan result
+        {
+          ...replayedResult("Context Usage"),
+          usage: { ...ZERO_USAGE, output_tokens: 5 }, // new command's result-only output
+        },
+        idle,
+      ],
+    ]);
+    agent.sessions["test-session"]!.orphanCommands = new Map([["cancelled-context", "started"]]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage", "Context Usage"]);
+  });
+
   it("forwards the result text when nothing else carried it", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [replayedResult("**3**"), idle]);
@@ -9194,8 +9305,9 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // An echo-less queued command has no user echo to trigger the hand-off,
     // so its result must do it: settle the held turn with ITS recorded
     // outcome and promote the queued turn — not overwrite the held turn's
-    // outcome and leave the queued prompt hanging.
-    const agent = createMockAgent();
+    // outcome and leave the queued prompt hanging. Its local command output
+    // also belongs to that queued turn, not the still-active held turn.
+    const { agent, events } = chunkCapturingAgent();
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -9207,7 +9319,14 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield resultMessage({ stop_reason: "max_tokens" }); // turn 1 held
         yield idle();
         await iter.next(); // second prompt pushed — echo-less, only a result
-        yield resultMessage();
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Context Usage",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield resultMessage({ result: "Context Usage" });
         yield idle();
       }
       return messageGenerator();
@@ -9225,6 +9344,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
 
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "max_tokens" }));
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(events).toEqual(["chunk:Context Usage"]);
     await agent.sessions["test-session"]?.consumer;
   });
 
