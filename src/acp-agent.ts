@@ -287,9 +287,9 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
-  /** Exact SDK `local_command_output` payloads already forwarded for this turn.
-   *  The terminal result can repeat one verbatim; retaining provenance here
-   *  avoids a client-side/global text dedupe while preserving distinct output. */
+  /** Canonical, source-identified `local_command_output` payloads already
+   *  forwarded for this turn. Consolidated assistant candidates are tracked
+   *  separately per SDK cycle because their turn is unknown until result. */
   localCommandOutputs?: Set<string>;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
@@ -368,6 +368,13 @@ type Turn = {
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
+
+/** Build the narrow comparison key used only for duplicate local-command
+ *  sources. The SDK result may append blank lines that are absent from the
+ *  corresponding earlier output; all other text remains significant. */
+function localCommandOutputKey(text: string): string {
+  return text.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+}
 
 type Session = {
   query: Query;
@@ -2011,6 +2018,12 @@ export class ClaudeAcpAgent {
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
+    /** Canonical text from the top-level consolidated assistant message that
+     *  belongs to the next terminal result. Result origin is the first reliable
+     *  way to distinguish a queued local command from a held turn's autonomous
+     *  followup, so this evidence is deliberately cycle-local rather than
+     *  assigned to a Turn before the result arrives. */
+    const pendingAssistantResultOutputs = new Set<string>();
     /** The consumer's single send chokepoint: every `sessionUpdate` in this
      *  loop goes through here (never `this.client.sessionUpdate` directly) so
      *  answer-delivery tracking is a property of sending, not something each
@@ -2226,6 +2239,26 @@ export class ClaudeAcpAgent {
      *  spelling of "a prompt is pending" shared by the head promotion and
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
+
+    /** Remember text already delivered for a local-only command before its
+     *  terminal result arrives. Such commands have no user echo, so they may
+     *  still be queued; a held turn means the output belongs to the next live
+     *  queued command. Pending orphan lanes stay ahead in SDK FIFO order and
+     *  must not contribute evidence to a newer turn. */
+    const rememberLocalCommandOutput = (text: string) => {
+      const hasPendingOrphan =
+        (session.pendingOrphanResults ?? 0) > 0 || (session.orphanCommands?.size ?? 0) > 0;
+      const turn = hasPendingOrphan
+        ? undefined
+        : isHeldOpen(session.activeTurn)
+          ? (session.turnQueue ?? []).find(
+              (candidate) => candidate !== session.activeTurn && !candidate.settled,
+            )
+          : (session.activeTurn ?? firstUnsettledQueuedTurn());
+      if (turn?.isLocalOnlyCommand) {
+        (turn.localCommandOutputs ??= new Set()).add(localCommandOutputKey(text));
+      }
+    };
 
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
@@ -2688,22 +2721,7 @@ export class ClaudeAcpAgent {
                 // remains queued until the result promotes it. Attribute the
                 // output to that queue head now, before forwarding erases its
                 // SDK origin at the ACP boundary.
-                // A pending orphan is FIFO-ahead of every live queued turn.
-                // Its unkeyed output must not become dedupe evidence for the
-                // next command before the orphan result/frame drains the lane.
-                const hasPendingOrphan =
-                  (session.pendingOrphanResults ?? 0) > 0 ||
-                  (session.orphanCommands?.size ?? 0) > 0;
-                const turn = hasPendingOrphan
-                  ? undefined
-                  : isHeldOpen(session.activeTurn)
-                    ? (session.turnQueue ?? []).find(
-                        (candidate) => candidate !== session.activeTurn && !candidate.settled,
-                      )
-                    : (session.activeTurn ?? firstUnsettledQueuedTurn());
-                if (turn?.isLocalOnlyCommand) {
-                  (turn.localCommandOutputs ??= new Set()).add(message.content);
-                }
+                rememberLocalCommandOutput(message.content);
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -2716,6 +2734,12 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 session.lastSessionState = message.state;
                 if (message.state === "idle") {
+                  // A lagged trailer for an already-seen result must not clear
+                  // consolidated text from a newer cycle that has already
+                  // started. Every other idle authoritatively closes a cycle
+                  // that produced no result, so its unmatched dedupe evidence
+                  // must not leak into the next turn.
+                  let consumedLaggedResultIdle = false;
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -2768,6 +2792,7 @@ export class ClaudeAcpAgent {
                     // result" (issue #825) would fail a healthy prompt.
                     if (session.owedTrailingIdles > 0) {
                       session.owedTrailingIdles--;
+                      consumedLaggedResultIdle = true;
                     }
                     settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
@@ -2777,6 +2802,7 @@ export class ClaudeAcpAgent {
                     // still belongs to that settled turn, and skipping the
                     // decrement would leak the debt permanently.
                     session.owedTrailingIdles--;
+                    consumedLaggedResultIdle = true;
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
@@ -2800,6 +2826,9 @@ export class ClaudeAcpAgent {
                         TURN_NO_RESULT_MESSAGE,
                       ),
                     );
+                  }
+                  if (!consumedLaggedResultIdle) {
+                    pendingAssistantResultOutputs.clear();
                   }
                   // The SDK generates the session title in a background task and
                   // persists it to the session file; `idle` is the turn-over
@@ -3385,10 +3414,12 @@ export class ClaudeAcpAgent {
                     );
                     break;
                   }
-                  // The result text is forwarded in two cases. Local-only
-                  // commands (no model invocation): the result IS the command
-                  // output. Otherwise the result is normally a trailing copy of
-                  // text that already streamed — but a cache-replayed turn
+                  // The result text is forwarded in two cases. For local-only
+                  // commands (no model invocation), the result carries the
+                  // command output but may repeat a consolidated assistant
+                  // message already delivered above. Otherwise the result is
+                  // normally a trailing copy of text that already streamed —
+                  // but a cache-replayed turn
                   // generates no tokens, and some CLIs then skip streaming
                   // entirely and answer on the `result` alone: no `stream_event`
                   // deltas, no consolidated `assistant` message (issue #453).
@@ -3405,7 +3436,11 @@ export class ClaudeAcpAgent {
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
                   const localCommandResultAlreadyDelivered =
-                    session.activeTurn?.localCommandOutputs?.has(message.result) ?? false;
+                    (session.activeTurn?.localCommandOutputs?.has(
+                      localCommandOutputKey(message.result),
+                    ) ??
+                      false) ||
+                    pendingAssistantResultOutputs.has(localCommandOutputKey(message.result));
                   if (
                     (session.activeTurn?.isLocalOnlyCommand &&
                       !localCommandResultAlreadyDelivered) ||
@@ -3488,6 +3523,10 @@ export class ClaudeAcpAgent {
                 settleOrDefer({ stopReason, usage: sessionUsage(session) });
               }
             } finally {
+              // A consolidated assistant message and its result form one SDK
+              // cycle. Autonomous results must clear their own text so it can
+              // never suppress a queued user's result-only local command.
+              pendingAssistantResultOutputs.clear();
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
               }
@@ -3793,6 +3832,17 @@ export class ClaudeAcpAgent {
 
             let content: typeof message.message.content;
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
+              // Current SDKs emit local-only command output as a consolidated
+              // assistant message, followed by the same terminal result with
+              // extra trailing newlines. Record the full assembled text before
+              // streamed-block diffing mutates it to the unsent remainder.
+              const assembledText = message.message.content
+                .filter((item) => item.type === "text")
+                .map((item) => item.text)
+                .join("");
+              if (assembledText.length > 0) {
+                pendingAssistantResultOutputs.add(localCommandOutputKey(assembledText));
+              }
               // Top-level assistant message: each text/thinking block may have
               // already been streamed live as deltas. Diff each against what
               // streamed (`streamedBlocks`, in document order) and forward only

@@ -6310,6 +6310,21 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
   });
 
+  it("dedupes a local-only command assistant message repeated by result with trailing line breaks", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [
+        assistantMessage("msg-context", [{ type: "text", text: "Context Usage" }]),
+        replayedResult("Context Usage\n\n"),
+        idle,
+      ],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
   it("forwards a local-only command result when local_command_output is absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectLocalOnlyTurns(agent, [[replayedResult("Context Usage"), idle]]);
@@ -6319,10 +6334,14 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
   });
 
-  it("preserves a distinct local-only command result after local_command_output", async () => {
+  it("preserves a distinct local-only command result after an assistant message", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectLocalOnlyTurns(agent, [
-      [localCommandOutput("Preparing context"), replayedResult("Context Usage"), idle],
+      [
+        assistantMessage("msg-context", [{ type: "text", text: "Preparing context" }]),
+        replayedResult("Context Usage"),
+        idle,
+      ],
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
@@ -9319,14 +9338,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         yield resultMessage({ stop_reason: "max_tokens" }); // turn 1 held
         yield idle();
         await iter.next(); // second prompt pushed — echo-less, only a result
-        yield {
-          type: "system",
-          subtype: "local_command_output",
-          content: "Context Usage",
-          uuid: randomUUID(),
-          session_id: "test-session",
-        };
-        yield resultMessage({ result: "Context Usage" });
+        yield assistantText("Context Usage");
+        yield resultMessage({ result: "Context Usage\n\n" });
         yield idle();
       }
       return messageGenerator();
@@ -9345,6 +9358,83 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "max_tokens" }));
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     expect(events).toEqual(["chunk:Context Usage"]);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not treat a held turn's autonomous assistant text as queued local-command output", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage({ stop_reason: "max_tokens" });
+        yield idle();
+        await iter.next(); // queued /context has no echo
+        yield taskNotification("agent-1");
+        yield assistantText("Context Usage"); // held turn's autonomous followup
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+        yield resultMessage({ result: "Context Usage\n\n" }); // /context result-only output
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/context" }],
+    });
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "max_tokens" }));
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(events).toEqual(["chunk:Context Usage", "chunk:Context Usage\n\n"]);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not carry assistant dedupe evidence across a cancelled cycle with no result", async () => {
+    const { agent, events } = chunkCapturingAgent();
+    let releaseIdle!: () => void;
+    const idleGate = new Promise<void>((resolve) => (releaseIdle = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield assistantText("Context Usage");
+        await idleGate; // cancel pre-empts turn 1's result
+        yield idle();
+        await iter.next(); // queued /context has no echo
+        yield resultMessage({ result: "Context Usage\n\n" });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => events.includes("chunk:Context Usage"));
+    await agent.cancel({ sessionId: "test-session" });
+    releaseIdle();
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/context" }],
+    });
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(events).toEqual(["chunk:Context Usage", "chunk:Context Usage\n\n"]);
     await agent.sessions["test-session"]?.consumer;
   });
 
