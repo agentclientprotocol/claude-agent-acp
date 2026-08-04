@@ -10029,6 +10029,96 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  // A steer does not join the running cycle — it ABORTS it: the CLI interrupts
+  // the in-flight query as soon as a queued message carries priority 'now'. The
+  // interrupted cycle therefore ends with an ordinary human-origin `result`, and
+  // the steered message runs as a SECOND cycle. Treating that first result as
+  // the turn's terminal one answers session/prompt mid-work: the client is told
+  // `end_turn`, then keeps receiving the turn's remaining tool calls and its
+  // actual answer as updates belonging to no turn.
+  it("keeps the turn open across the interrupt its own steer caused", async () => {
+    // One ordered record of what the client saw, so "the response came before
+    // the output it was supposed to cover" is a plain assertion rather than a
+    // timing dance.
+    const timeline: string[] = [];
+    const client = {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          timeline.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    /** The result the CLI emits for the cycle the steer aborted. `origin.kind`
+     *  "human" is not one of AUTONOMOUS_RESULT_ORIGINS, so it reaches the
+     *  user-turn lifecycle. Which subtype an abort picks is the CLI's business
+     *  and nothing here depends on it: every non-error subtype maps to
+     *  `end_turn`, the stop reason clients actually observe. */
+    const interruptedCycleResult = () => ({
+      ...createResultMessage(),
+      origin: { kind: "human" },
+    });
+    const idle = () => ({ type: "system", subtype: "session_state_changed", state: "idle" });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn becomes active
+        yield createAssistantText("working on it");
+        // The steered message is pushed at priority 'now'...
+        const steered = await iter.next();
+        // ...so the CLI aborts the query: the interrupted cycle ends with a
+        // result of its own, followed by that cycle's trailing idle.
+        yield interruptedCycleResult();
+        yield idle();
+        // Only now does the steered message run, as a second cycle. Its echo
+        // matches no queued turn (dropped as an unrelated replay), its output is
+        // the answer the user is waiting for, and its result is the one that
+        // genuinely ends the turn.
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    // Drain the rest of the stream so the timeline is complete either way —
+    // when the turn settles early, the steered output arrives after `response`.
+    await agent.sessions["test-session"]?.consumer;
+
+    // The steered continuation is part of the turn the client is waiting on, so
+    // all of it precedes that turn's response. A `prompt:` entry anywhere but
+    // last is the bug: updates outlived the stopReason.
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // Both cycles ran for this one prompt, so its usage covers both (2 × the
+    // mock result's 10 in / 5 out) rather than stopping at the interrupt.
+    expect(response.usage).toEqual({
+      inputTokens: 20,
+      outputTokens: 10,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 30,
+    });
+    // Still exactly one response for one prompt, and nothing left behind.
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
     const agent = createMockAgent();
     const captured: any[] = [];
