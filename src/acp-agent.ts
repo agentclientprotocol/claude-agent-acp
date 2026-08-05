@@ -4578,6 +4578,9 @@ export class ClaudeAcpAgent {
       supportsSubagentTranscript(this.clientCapabilities);
 
     for (const message of messages) {
+      const persistedTimestamp = (message as unknown as { timestamp?: unknown }).timestamp;
+      const replayTimestamp =
+        typeof persistedTimestamp === "string" ? persistedTimestamp : undefined;
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
       // observe live (resumed/loaded sessions), so rewind/resume can translate
       // a client-supplied id without an extra getSessionMessages read. Not read
@@ -4625,6 +4628,15 @@ export class ClaudeAcpAgent {
           parentToolUseId,
         },
       )) {
+        if (replayTimestamp) {
+          notification.update._meta = {
+            ...notification.update._meta,
+            claudeCode: {
+              ...(notification.update._meta?.claudeCode || {}),
+              timestamp: replayTimestamp,
+            },
+          };
+        }
         await this.client.sessionUpdate(notification);
       }
     }

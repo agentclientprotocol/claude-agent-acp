@@ -1638,6 +1638,48 @@ describe("synthetic login message (issue #863)", () => {
   });
 });
 
+describe("replay timestamps", () => {
+  it("forwards a persisted message timestamp on every replayed update", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "a1",
+        timestamp: "2026-08-05T18:42:13.456Z",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          id: "api-message",
+          model: "claude-sonnet-4-5",
+          role: "assistant",
+          type: "message",
+          stop_reason: "tool_use",
+          content: [
+            { type: "text", text: "Checking" },
+            { type: "tool_use", id: "tool-1", name: "Bash", input: { command: "pwd" } },
+          ],
+        },
+      },
+    ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(updates.length).toBeGreaterThan(0);
+    for (const { update } of updates) {
+      expect(update._meta?.claudeCode).toMatchObject({
+        timestamp: "2026-08-05T18:42:13.456Z",
+      });
+    }
+  });
+});
+
 describe("subagent transcript replay", () => {
   const replayHistory = [
     {
