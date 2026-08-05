@@ -30,10 +30,10 @@
  *                   already running, so it can change course between tool
  *                   calls. Answers "injected", or "startedNewTurn" if the turn
  *                   beat us to the finish. An injected reply streams as
- *                   `session/update` notifications *within* that turn: its
- *                   `stopReason` waits for the steered work to finish. The
- *                   "startedNewTurn" output belongs to a detached turn no
- *                   `session/prompt` of ours tracks. See ./steering.ts.
+ *                   `session/update` notifications inside that turn, whose
+ *                   `stopReason` waits for it. "startedNewTurn" output belongs
+ *                   to a detached turn no `session/prompt` of ours tracks.
+ *                   See ./steering.ts.
  *   !queue <text>   `session/prompt` sent mid-turn anyway. The agent advertises
  *                   `promptQueueing`, so it takes the backlog instead of us —
  *                   same ordering, different owner.
@@ -566,8 +566,8 @@ async function main() {
     try {
       const result = await agent.request<SteeringResponse>(STEERING_METHOD, params);
       // Either way the steered message's own output arrives as `session/update`
-      // notifications, not in this response. When it was injected, that output
-      // lands inside the turn we steered — whose `stopReason` waits for it.
+      // notifications, not in this response. When injected, it lands inside the
+      // turn we steered, whose `stopReason` waits for it.
       log(
         result.outcome === "injected"
           ? "steer outcome: injected into the running turn"
