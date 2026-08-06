@@ -1,0 +1,48 @@
+name: Conventional PRs
+
+# Squash merges use the PR title as the commit subject, which is what
+# release-please parses to compute the next version and CHANGELOG entry.
+on:
+  pull_request:
+    branches: [main]
+    # labeled/unlabeled so validation re-runs when `dependencies` is applied.
+    types: [opened, reopened, edited, synchronize, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: "conventional-prs-${{ github.event.pull_request.number }}"
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+
+    steps:
+      # Config reference: https://github.com/amannn/action-semantic-pull-request#configuration
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Exactly the types release-please understands. feat/fix/perf/revert/docs
+          # appear in the changelog; the rest are valid but hidden. Any other type
+          # would be dropped silently, so it is rejected here instead.
+          types: |
+            feat
+            fix
+            perf
+            revert
+            docs
+            style
+            chore
+            refactor
+            test
+            build
+            ci
+          # Dependabot titles itself conventionally already; don't block bot PRs.
+          ignoreLabels: |
+            dependencies

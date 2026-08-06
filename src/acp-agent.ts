@@ -367,6 +367,26 @@ type Turn = {
    *  pre-hold behavior (pending wakes are not countable: notifications can
    *  batch into one followup). */
   deferredSettle?: PromptResponse;
+  /** Uuids of `steer()`-injected messages the SDK has not replayed back yet.
+   *
+   *  A steer is delivered at {@link STEER_PRIORITY} (`now`), so the CLI ABORTS
+   *  the running cycle: it emits its own human-origin `result` —
+   *  indistinguishable from a turn's terminal one — and the steered message runs
+   *  as a SECOND cycle. Settling at that result would answer `session/prompt`
+   *  mid-work, so a steered turn's results only RECORD their outcome
+   *  (`steeredSettle`) and it settles at the SDK's `idle`, the only signal
+   *  spanning both cycles (CLI 2.1.220).
+   *
+   *  A non-empty set at an idle means the steered cycle hasn't started — the CLI
+   *  replays a message only when it picks it up, always after the interrupted
+   *  cycle's result — so that idle is swallowed. Drained by the replay handler.
+   *
+   *  Residual: a message the CLI drops unreplayed parks the turn until
+   *  `session/cancel` or the next prompt (both settle it). */
+  steeredEchoes?: Set<string>;
+  /** What a steered turn settles with once its steered work has run: the outcome
+   *  of its latest result, so its usage covers every cycle the turn ran. */
+  steeredSettle?: PromptResponse;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
 };
@@ -704,6 +724,12 @@ function isHeldOpen(
   turn: Turn | null | undefined,
 ): turn is Turn & { deferredSettle: PromptResponse } {
   return turn != null && turn.deferredSettle !== undefined && !turn.settled;
+}
+
+/** Whether a steer moved this turn's settlement off the next result and onto the
+ *  SDK's `idle` (see Turn.steeredEchoes). Shared by the consumer's settle lanes. */
+function isSteering(turn: Turn | null | undefined): turn is Turn & { steeredEchoes: Set<string> } {
+  return turn != null && turn.steeredEchoes !== undefined && !turn.settled;
 }
 
 /** Disarm the force-cancel backstop (see Session.forceCancelTimer). Every
@@ -2082,6 +2108,10 @@ export class ClaudeAcpAgent {
    *  calls). The steered message's own output streams via `session/update`, not
    *  this response.
    *
+   *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
+   *  own and the steered message runs as a second one, so the turn is marked
+   *  (`Turn.steeredEchoes`) to settle at the SDK's `idle` instead of that result.
+   *
    *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
    *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
    *  stays Host-owned so the Host can submit it through a standard
@@ -2102,7 +2132,7 @@ export class ClaudeAcpAgent {
     // which is exactly the window in which steering is meaningful. This check
     // and the active-path push below stay in one synchronous section so the
     // turn cannot settle in the gap between deciding to inject and enqueueing.
-    const turnInFlight = (session.turnQueue ?? []).some((turn) => !turn.settled);
+    const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
     if (!turnInFlight) {
       const promptRequest: PromptRequest = {
         sessionId,
@@ -2127,10 +2157,23 @@ export class ClaudeAcpAgent {
       prompt: params.prompt,
     };
     const userMessage = promptToClaude(promptRequest);
-    userMessage.uuid = randomUUID();
+    const steeredUuid = randomUUID();
+    userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
     userMessage.priority = STEER_PRIORITY;
+    // Mark before the push and in the same synchronous section as the in-flight
+    // check: the interrupt can have the CLI finalizing the aborted cycle by the
+    // time the consumer next runs, and an unmarked result would settle the turn
+    // (see Turn.steeredEchoes).
+    (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
+    // A turn already held for background subagents has a recorded outcome the
+    // steer supersedes: move it into the steer lane so one lane owns settlement.
+    // The idle handler re-applies the hold through the subagent gate.
+    if (turnInFlight.deferredSettle !== undefined) {
+      turnInFlight.steeredSettle = turnInFlight.deferredSettle;
+      turnInFlight.deferredSettle = undefined;
+    }
     session.input.push(userMessage);
     return { outcome: "injected" };
   }
@@ -2461,6 +2504,14 @@ export class ClaudeAcpAgent {
      *  calling settleActive directly bypasses the hold and re-opens the
      *  out-of-turn permission deadlock (issue #866) through its lane. */
     const settleOrDefer = (outcome: PromptResponse) => {
+      // No result ends a steered turn: the steer aborted the cycle this result
+      // may belong to, and the steered one is still to come. Record the outcome
+      // for the idle lane (see Turn.steeredEchoes); later cycles overwrite it,
+      // so the last result and its usage win.
+      if (isSteering(session.activeTurn)) {
+        session.activeTurn.steeredSettle = outcome;
+        return;
+      }
       if (
         session.activeTurn &&
         !session.activeTurn.settled &&
@@ -2950,7 +3001,31 @@ export class ClaudeAcpAgent {
                     // this lagged idle (no active turn to settle): the idle
                     // still belongs to that settled turn, and skipping the
                     // decrement would leak the debt permanently.
+                    // Deliberately BEFORE the steer lane below: an owed idle
+                    // belongs to an earlier turn, and reading it as the steered
+                    // sequence's turn-over signal would settle a turn whose
+                    // steered cycle is still running. Steered results owe none.
                     session.owedTrailingIdles--;
+                  } else if (isSteering(session.activeTurn)) {
+                    // A steered turn settles here, not at a result: this idle is
+                    // the only signal spanning the interrupted and steered cycles
+                    // (see Turn.steeredEchoes). An idle before the steered echo,
+                    // or before any result was recorded, means the answer is
+                    // still ahead — swallow it, and never let it reach the #825
+                    // fail below, which would reject a prompt about to answer.
+                    //
+                    // Plain Turn so the fields can be cleared below; isSteering
+                    // narrows steeredEchoes to non-optional.
+                    const steered: Turn = session.activeTurn;
+                    if (steered.steeredEchoes?.size === 0 && steered.steeredSettle !== undefined) {
+                      // Via the subagent gate, not settleActive: a steered turn
+                      // can also have spawned background subagents, which own it
+                      // from here (settles now if none is live, holds otherwise).
+                      steered.deferredSettle = steered.steeredSettle;
+                      steered.steeredEchoes = undefined;
+                      steered.steeredSettle = undefined;
+                      settleDeferredIfDrained();
+                    }
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
@@ -3399,7 +3474,16 @@ export class ClaudeAcpAgent {
               // turn's OWN result — a followup result arriving inside the
               // cancel window still gets its own trailer and must be counted,
               // or that idle would later false-fail the next prompt.
-              if (isAutonomousResult || !session.cancelled || !session.activeTurn) {
+              // A second exclusion: a steered turn's own results (see
+              // Turn.steeredEchoes). One idle covers the whole interrupted +
+              // steered sequence and that idle settles the turn, so counting
+              // either result would leave a debt that swallows it. Autonomous
+              // results inside a steered turn keep their own trailers.
+              const owesTrailingIdle = isAutonomousResult || !isSteering(session.activeTurn);
+              if (
+                owesTrailingIdle &&
+                (isAutonomousResult || !session.cancelled || !session.activeTurn)
+              ) {
                 session.owedTrailingIdles++;
               }
 
@@ -3852,6 +3936,23 @@ export class ClaudeAcpAgent {
                       // either. Its trailing-idle debt stands and is absorbed
                       // when the drain idle eventually arrives.
                       settleActive(session.activeTurn.deferredSettle);
+                    } else if (
+                      isSteering(session.activeTurn) &&
+                      session.activeTurn.steeredSettle !== undefined
+                    ) {
+                      // Same for a turn with an open steer (see
+                      // Turn.steeredEchoes): the user moving on outranks the
+                      // steered continuation, but its last result's stop reason
+                      // stands. With no result yet it falls through to the
+                      // end_turn hand-off below, owing nothing there.
+                      //
+                      // The steer lane normally pays for that result's trailing
+                      // idle by settling on it; this hand-off settles instead,
+                      // so count it here or it arrives un-owed against the fresh
+                      // turn and false-fails it (issue #825). Harmless if it
+                      // never comes: the debt absorbs one future idle.
+                      session.owedTrailingIdles++;
+                      settleActive(session.activeTurn.steeredSettle);
                     } else {
                       settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
                     }
@@ -3868,6 +3969,13 @@ export class ClaudeAcpAgent {
                 break;
               }
               if ("isReplay" in message && message.isReplay) {
+                // A steered message's echo matches no turn (steer() creates
+                // none), but it marks the steered cycle as running — how the idle
+                // lane tells "the answer is still ahead" from "the turn is over"
+                // (see Turn.steeredEchoes).
+                if (isSteering(session.activeTurn)) {
+                  session.activeTurn.steeredEchoes.delete(message.uuid);
+                }
                 // Unrelated replay (e.g. the echo of an already-settled turn).
                 break;
               }
@@ -4343,6 +4451,16 @@ export class ClaudeAcpAgent {
         }
         active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
       }
+    }
+
+    // A steered active turn (see Turn.steeredEchoes) settles "cancelled" in the
+    // consumer at the interrupt's trailing idle, like any live turn. But the
+    // steer lane pays for its last result's trailer by settling on it, which
+    // this cancel pre-empts, so count that trailer here or it arrives un-owed
+    // against the next prompt and false-fails it (issue #825). Over-counting
+    // when only one trailer comes absorbs a future idle.
+    if (isSteering(session.activeTurn) && session.activeTurn.steeredSettle !== undefined) {
+      session.owedTrailingIdles++;
     }
 
     // Arm a backstop before interrupting: if a turn is actively consuming the
