@@ -54,6 +54,7 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+import { GOAL_CONTROL_METHOD, parseGoalControlRequest, toGoalSnapshot } from "../goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -3297,6 +3298,93 @@ describe("stop reason propagation", () => {
 
     expect(response.stopReason).toBe("end_turn");
     expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
+  });
+
+  it("publishes active_goal as provider-neutral session state without changing turn settlement", async () => {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => updates.push(notification),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "  Finish the migration  ",
+            iterations: 3,
+            set_at: 1710000000123,
+            tokens_at_start: 42,
+            last_reason: "Tests still need work",
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield {
+          type: "active_goal",
+          value: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          goal: {
+            objective: "Finish the migration",
+            status: "active",
+            iterations: 3,
+            lastReason: "Tests still need work",
+            createdAt: 1710000000123,
+            controlMethod: GOAL_CONTROL_METHOD,
+          },
+        },
+      },
+    });
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: { sessionUpdate: "session_info_update", _meta: { goal: null } },
+    });
+    expect(updates.some((notification) => notification.update?._meta?.claudeCode?.goal)).toBe(
+      false,
+    );
+  });
+
+  it("maps the SDK goal shape without exposing provider fields", () => {
+    expect(
+      toGoalSnapshot({
+        type: "active_goal",
+        value: {
+          condition: "Goal",
+          iterations: 1,
+          set_at: 1710000000000,
+          tokens_at_start: 99,
+        },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      }),
+    ).toEqual({
+      objective: "Goal",
+      status: "active",
+      iterations: 1,
+      lastReason: null,
+      createdAt: 1710000000000,
+      controlMethod: GOAL_CONTROL_METHOD,
+    });
   });
 
   it("settles a no-echo command result (e.g. /compact) by promoting the head turn", async () => {
@@ -9905,6 +9993,34 @@ describe("turn steering (_session/steering)", () => {
     expect((response._meta as any)?.steering).toEqual({
       supported: true,
     });
+    expect((response._meta as any)?.goal).toEqual({
+      version: 1,
+      controlMethod: GOAL_CONTROL_METHOD,
+      actions: ["clear"],
+    });
+  });
+
+  it("submits clear through the session prompt queue", async () => {
+    const agent = createMockAgent();
+    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
+
+    await expect(
+      agent.controlGoal({ sessionId: "test-session", action: "clear" }),
+    ).resolves.toEqual({});
+    expect(prompt).toHaveBeenCalledWith({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal clear" }],
+    });
+  });
+
+  it("validates goal control requests", () => {
+    expect(parseGoalControlRequest({ sessionId: "test-session", action: "clear" })).toEqual({
+      sessionId: "test-session",
+      action: "clear",
+    });
+    expect(() => parseGoalControlRequest({ sessionId: "test-session", action: "pause" })).toThrow(
+      'goal action must be "clear"',
+    );
   });
 
   it("preserves startedNewTurn by default when no turn is in flight", async () => {
