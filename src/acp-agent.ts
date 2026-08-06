@@ -76,6 +76,7 @@ import {
   PermissionUpdate,
   Query,
   query,
+  RewindFilesResult,
   SDKAssistantMessageError,
   SDKActiveGoalMessage,
   SDKMessage,
@@ -211,6 +212,27 @@ const TURN_NO_RESULT_MESSAGE =
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
 
+/** Custom (extension) request method listing the points a session can rewind
+ *  its files to: one entry per top-level user message, newest last. Clients that
+ *  retained the `messageId` on the message chunks they rendered can skip this
+ *  and call {@link REWIND_METHOD} directly. */
+const REWIND_POINTS_METHOD = "_session/rewind_points";
+
+/** Custom (extension) request method restoring tracked files to their state at
+ *  an earlier user message, the equivalent of the Claude Code CLI's `/rewind`.
+ *  Only files move: the conversation is left alone, so the agent still has the
+ *  edits in context. Requires `enableFileCheckpointing`, which
+ *  {@link ClaudeAcpAgent.createSession} turns on by default. */
+const REWIND_METHOD = "_session/rewind";
+
+/** How much of a user message {@link REWIND_POINTS_METHOD} returns. Enough to
+ *  recognize a turn in a picker without shipping a whole pasted file. */
+const REWIND_POINT_TEXT_LIMIT = 300;
+
+/** Accepted {@link RewindRequest.mode} values, in one place so the parser's
+ *  error message cannot drift from the type. */
+const REWIND_MODES = ["files", "conversation", "both"] as const;
+
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
  *  contract. `now` pre-empts the current generation and handles the message
@@ -245,6 +267,105 @@ export type SteerResponse =
   | { outcome: "injected" }
   | { outcome: "startedNewTurn" }
   | { outcome: "promptRequired"; reason: "noRunningTurn" };
+
+/** Params of a {@link REWIND_POINTS_METHOD} request. */
+export type RewindPointsRequest = { sessionId: string };
+
+/** One rewind target.
+ *
+ *  `messageId` is the id the message chunks for that user turn carried, so a
+ *  client can match it against what it rendered; it is what file rewind keys
+ *  on. `resumeAtMessageId` is the assistant message immediately BEFORE that
+ *  turn, which is what conversation rewind keys on — the two halves of a
+ *  rewind are anchored at different messages, so both are reported here rather
+ *  than leaving clients to work it out. It is null for the first prompt of a
+ *  session, which has no preceding assistant message and therefore cannot be
+ *  rewound to conversationally. `index` is 1-based in transcript order. */
+export type RewindPoint = {
+  messageId: string;
+  resumeAtMessageId: string | null;
+  text: string;
+  index: number;
+};
+
+/** Result of a {@link REWIND_POINTS_METHOD} request. */
+export type RewindPointsResponse = { points: RewindPoint[] };
+
+/** What a {@link REWIND_METHOD} request should undo. `files` restores the
+ *  working tree, `conversation` drops the turns from the transcript so the
+ *  agent forgets them, `both` is the pair — the choice the CLI's `/rewind`
+ *  offers. Defaults to `files`, the only one that leaves the session's message
+ *  history untouched. */
+export type RewindMode = "files" | "conversation" | "both";
+
+/** Params of a {@link REWIND_METHOD} request. `messageId` is an id this session
+ *  handed the client (see {@link messageIdForGrouping}). `dryRun` previews the
+ *  change without applying it. */
+export type RewindRequest = {
+  sessionId: string;
+  messageId: string;
+  mode?: RewindMode;
+  dryRun?: boolean;
+};
+
+/** Outcome of the conversation half of a rewind. On a `dryRun`,
+ *  `messagesDropped` is what WOULD be dropped and nothing has changed yet. */
+export type ConversationRewindResult = {
+  rewound: boolean;
+  messagesDropped: number;
+  error?: string;
+};
+
+/** Result of a {@link REWIND_METHOD} request. Each half is present only when
+ *  the requested mode asked for it. */
+export type RewindResponse = {
+  files?: RewindFilesResult;
+  conversation?: ConversationRewindResult;
+};
+
+/** Validate raw JSON-RPC params into a {@link RewindPointsRequest}. */
+export function parseRewindPointsRequest(params: unknown): RewindPointsRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "rewind_points params must be an object");
+  }
+  const { sessionId } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(
+      undefined,
+      "rewind_points params require a non-empty sessionId",
+    );
+  }
+  return { sessionId };
+}
+
+/** Validate raw JSON-RPC params into a {@link RewindRequest}. */
+export function parseRewindRequest(params: unknown): RewindRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "rewind params must be an object");
+  }
+  const { sessionId, messageId, mode, dryRun } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, "rewind params require a non-empty sessionId");
+  }
+  if (typeof messageId !== "string" || messageId.length === 0) {
+    throw RequestError.invalidParams(undefined, "rewind params require a non-empty messageId");
+  }
+  if (mode !== undefined && !REWIND_MODES.includes(mode as RewindMode)) {
+    throw RequestError.invalidParams(
+      undefined,
+      `rewind params mode must be one of ${REWIND_MODES.join(", ")}`,
+    );
+  }
+  if (dryRun !== undefined && typeof dryRun !== "boolean") {
+    throw RequestError.invalidParams(undefined, "rewind params dryRun must be a boolean");
+  }
+  return {
+    sessionId,
+    messageId,
+    mode: (mode as RewindMode) ?? "files",
+    dryRun: dryRun === true,
+  };
+}
 
 /** Validate raw JSON-RPC params into a {@link SteerRequest}. Kept minimal — the
  *  content blocks are handed to `promptToClaude`, which tolerates unknown block
@@ -464,6 +585,16 @@ type Session = {
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
+  /** The request that built this session, kept so the query can be rebuilt
+   *  faithfully. `unstable_rewind` in a conversation mode has to tear the SDK
+   *  query down and start a new one (`resumeSessionAt` is a creation option,
+   *  not a live call), and without this the rebuild would silently drop the
+   *  client's `_meta.claudeCode.options` — its thinking config, hooks and MCP
+   *  servers — leaving a session that looks the same but no longer behaves the
+   *  way the client asked for. `sessionFingerprint` is not enough: it covers
+   *  only cwd and mcpServers, and deliberately so, being a change detector
+   *  rather than a record. */
+  creationParams: NewSessionRequest;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
@@ -681,8 +812,9 @@ type Session = {
    *  naturally yields the turn-boundary uuid when one `msg_…` spans several
    *  content-block messages.
    *
-   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
-   *  fork/rewind. */
+   *  Read by `resolveMessageUuid`, for callers handed a client-facing
+   *  `messageId` that need the SDK uuid behind it — `Query.rewindFiles` and
+   *  `resumeSessionAt` both key on the uuid. */
   messageIdToUuid: Map<string, string>;
 };
 
@@ -1564,6 +1696,17 @@ export class ClaudeAcpAgent {
         _meta: {
           claudeCode: {
             promptQueueing: true,
+            // Presence means REWIND_POINTS_METHOD and REWIND_METHOD are served;
+            // `modes` is the accepted `RewindRequest.mode` set. Without this a
+            // client can only discover the methods by calling one and catching
+            // "method not found", which is not a feature check.
+            //
+            // Named `rewindSession` rather than `rewind` deliberately: #872
+            // proposes `_meta.claudeCode.rewind` for fork-at-a-message, a
+            // different operation (new session, original untouched). Two
+            // capabilities both reading "rewind" would be worse than a longer
+            // name.
+            rewindSession: { modes: REWIND_MODES },
           },
         },
         promptCapabilities: {
@@ -1646,6 +1789,224 @@ export class ClaudeAcpAgent {
       this.sendAvailableCommandsUpdate(response.sessionId);
     }, 0);
     return response;
+  }
+
+  /**
+   * List the points this session can rewind its files to: one per top-level
+   * user message.
+   *
+   * Read from the transcript via `getSessionMessages` rather than from
+   * `Session.messageIdToUuid`, which only holds what this process observed and
+   * so would miss turns from before a resume.
+   */
+  async unstable_rewindPoints(params: RewindPointsRequest): Promise<RewindPointsResponse> {
+    if (!this.sessions[params.sessionId]) {
+      throw RequestError.invalidParams(undefined, "Session not found");
+    }
+    const messages = await getSessionMessages(params.sessionId);
+    const points: RewindPoint[] = [];
+    // The assistant message most recently seen. Conversation rewind resumes
+    // INCLUSIVELY at an assistant uuid, so undoing a user turn means resuming
+    // at the assistant message just before it.
+    let lastAssistantUuid: string | null = null;
+    for (const message of messages) {
+      if (message.type === "assistant" && !message.parent_tool_use_id) {
+        lastAssistantUuid = message.uuid;
+      }
+      // `rewindFiles` keys on a top-level user message. A subagent's messages
+      // carry parent_tool_use_id and are not rewind targets.
+      if (message.type !== "user" || message.parent_tool_use_id) continue;
+      const messageId = messageIdForGrouping(message);
+      if (!messageId) continue;
+      const content = (message.message as { content?: unknown } | undefined)?.content;
+      const text = (
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content
+                .filter(
+                  (block): block is { type: "text"; text: string } =>
+                    (block as { type?: unknown })?.type === "text" &&
+                    typeof (block as { text?: unknown })?.text === "string",
+                )
+                .map((block) => block.text)
+                .join(" ")
+            : ""
+      )
+        .replace(/\s+/g, " ")
+        .trim();
+      // Skip tool results and the CLI's synthetic `<...>` envelopes: neither is
+      // something a person would recognize in a picker.
+      if (!text || text.startsWith("<")) continue;
+      points.push({
+        messageId,
+        resumeAtMessageId: lastAssistantUuid,
+        text: text.slice(0, REWIND_POINT_TEXT_LIMIT),
+        index: points.length + 1,
+      });
+    }
+    return { points };
+  }
+
+  /**
+   * Translate the ACP `messageId` a client was given (see
+   * `messageIdForGrouping`) into the SDK message uuid the rewind APIs key on.
+   * For a user turn the two are equal, so this matters when a client passes an
+   * assistant `msg_…` id, which is what `messageIdToUuid` is maintained for.
+   *
+   * Prefers that in-memory map, falling back to a `getSessionMessages` scan for
+   * sessions whose history this process has not observed. An id matching
+   * nothing is an error rather than something to pass through: handing the SDK
+   * an id it does not know fails later and far less legibly.
+   *
+   * Shares its shape with the helper of the same name in #872, which needs the
+   * same translation for fork-at-a-message. Whichever lands first, the other
+   * should drop its copy.
+   */
+  private async resolveMessageUuid(sessionId: string, messageId: string): Promise<string> {
+    const cached = this.sessions[sessionId]?.messageIdToUuid.get(messageId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const messages = await getSessionMessages(sessionId);
+    let uuid: string | undefined;
+    for (const message of messages) {
+      // Last-write-wins mirrors how `messageIdToUuid` is populated: when one
+      // `msg_…` spans several content-block messages, keep the turn-boundary uuid.
+      if (
+        messageIdForGrouping(message) === messageId &&
+        typeof message.uuid === "string" &&
+        message.uuid.length > 0
+      ) {
+        uuid = message.uuid;
+      }
+    }
+    if (uuid === undefined) {
+      throw RequestError.invalidParams(
+        { messageId },
+        `No message with id \`${messageId}\` found in session \`${sessionId}\``,
+      );
+    }
+    return uuid;
+  }
+
+  /**
+   * Restore tracked files to their state at an earlier user message.
+   *
+   * The client-facing `messageId` is resolved back to the SDK uuid by
+   * `resolveMessageUuid`.
+   */
+  async unstable_rewind(params: RewindRequest): Promise<RewindResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw RequestError.invalidParams(undefined, "Session not found");
+    }
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    // A rewind pulls the ground out from under a running turn: the file half
+    // would race the edits still being applied, and the conversation half
+    // replaces the query the turn is streaming from.
+    if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+      throw RequestError.invalidParams(
+        undefined,
+        "Cannot rewind while a turn is running; cancel it first",
+      );
+    }
+    const mode = params.mode ?? "files";
+    const response: RewindResponse = {};
+
+    // Files first, and not only for tidiness: `rewindFiles` is a method on the
+    // LIVE query, and the conversation half below replaces that query. Doing it
+    // the other way round would call it on a torn-down session.
+    if (mode === "files" || mode === "both") {
+      // Resolved here rather than up front: the conversation half locates its
+      // own anchor from the transcript, so a conversation-only rewind has no
+      // use for this uuid and should not pay for the lookup.
+      const uuid = await this.resolveMessageUuid(params.sessionId, params.messageId);
+      response.files = await session.query.rewindFiles(uuid, { dryRun: params.dryRun === true });
+      // A refused file rewind in `both` mode stops here rather than dropping
+      // the conversation anyway: half a rewind is worse than none, and leaves
+      // the agent with no memory of edits that are still on disk.
+      if (mode === "both" && response.files.canRewind === false) {
+        response.conversation = {
+          rewound: false,
+          messagesDropped: 0,
+          error: "skipped because the file rewind was refused",
+        };
+        return response;
+      }
+    }
+
+    if (mode === "conversation" || mode === "both") {
+      response.conversation = await this.rewindConversation(
+        params.sessionId,
+        params.messageId,
+        params.dryRun === true,
+      );
+    }
+
+    return response;
+  }
+
+  /**
+   * Drop every turn after a point from the session's transcript.
+   *
+   * `resumeSessionAt` is a query CREATION option rather than a live call, so
+   * this tears the SDK query down and starts a new one resuming the same
+   * session id truncated at `resumeAtMessageId`. The transcript is genuinely
+   * truncated, not branched — the dropped turns leave both the file and the
+   * model's context — which is what makes this the counterpart to the CLI's
+   * `/rewind` rather than to `session/fork`.
+   *
+   * The ACP session id is unchanged, so the client keeps its handle.
+   *
+   * The truncation is immediate for the agent but reaches the transcript on
+   * disk only when the next turn is written. Until then `getSessionMessages`
+   * still returns the dropped turns, and tearing the session down and resuming
+   * it reloads them, silently undoing the rewind. Clients must not re-render by
+   * restarting for this reason; see docs/rewind-extension.md.
+   */
+  private async rewindConversation(
+    sessionId: string,
+    messageId: string,
+    dryRun: boolean,
+  ): Promise<ConversationRewindResult> {
+    const session = this.sessions[sessionId];
+    const messages = await getSessionMessages(sessionId);
+    const target = messages.find((message) => messageIdForGrouping(message) === messageId);
+    if (!target) {
+      return { rewound: false, messagesDropped: 0, error: "message not found in this session" };
+    }
+    const targetIndex = messages.indexOf(target);
+    // Resume INCLUSIVELY at the assistant message before the target turn.
+    let resumeAt: string | undefined;
+    for (let i = targetIndex - 1; i >= 0; i--) {
+      if (messages[i].type === "assistant" && !messages[i].parent_tool_use_id) {
+        resumeAt = messages[i].uuid;
+        break;
+      }
+    }
+    if (!resumeAt) {
+      return {
+        rewound: false,
+        messagesDropped: 0,
+        error:
+          "nothing precedes that message; rewinding the whole conversation means starting a new session",
+      };
+    }
+    const resumeIndex = messages.findIndex((message) => message.uuid === resumeAt);
+    const messagesDropped = messages.length - (resumeIndex + 1);
+    if (dryRun) {
+      return { rewound: false, messagesDropped };
+    }
+
+    // Rebuild from the request that made this session, so the client's
+    // `_meta.claudeCode.options` survive the round trip (see `creationParams`).
+    const creationParams = session.creationParams;
+    await this.teardownSession(sessionId);
+    await this.createSession(creationParams, { resume: sessionId, resumeSessionAt: resumeAt });
+    return { rewound: true, messagesDropped };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -5501,7 +5862,7 @@ export class ClaudeAcpAgent {
 
   private async createSession(
     params: NewSessionRequest,
-    creationOpts: { resume?: string; forkSession?: boolean } = {},
+    creationOpts: { resume?: string; forkSession?: boolean; resumeSessionAt?: string } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -5646,6 +6007,12 @@ export class ClaudeAcpAgent {
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
+      // Snapshot files before edits so REWIND_METHOD has something to restore.
+      // Deliberately placed BEFORE the `...userProvidedOptions` spread rather
+      // than in the ACP-controlled overrides below: checkpointing costs disk
+      // and I/O on every edit, so a client that does not offer rewind can turn
+      // it back off with `_meta.claudeCode.options.enableFileCheckpointing`.
+      enableFileCheckpointing: true,
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
       // CLAUDE_MODEL_CONFIG env var is a fallback for model
@@ -6000,6 +6367,7 @@ export class ClaudeAcpAgent {
       cancelled: false,
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
+      creationParams: params,
       settingsManager,
       accumulatedUsage: {
         inputTokens: 0,
@@ -7915,6 +8283,14 @@ export function runAcp() {
       runPromptWithCancellation(agent, ctx.params, ctx.signal),
     )
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
+    .onRequest<RewindPointsRequest, RewindPointsResponse>(
+      REWIND_POINTS_METHOD,
+      { parse: parseRewindPointsRequest },
+      (ctx) => agent.unstable_rewindPoints(ctx.params),
+    )
+    .onRequest<RewindRequest, RewindResponse>(REWIND_METHOD, { parse: parseRewindRequest }, (ctx) =>
+      agent.unstable_rewind(ctx.params),
+    )
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
     )

@@ -87,6 +87,33 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
+  it("enables file checkpointing by default, so a rewind has something to restore", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.enableFileCheckpointing).toBe(true);
+  });
+
+  it("lets a client that offers no rewind turn file checkpointing back off", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            enableFileCheckpointing: false,
+          },
+        },
+      },
+    });
+
+    // The default is a default, not an ACP-controlled override: snapshotting
+    // costs disk and I/O on every edit, so the client gets the last word.
+    expect(capturedOptions!.enableFileCheckpointing).toBe(false);
+  });
+
   it("works when user provides no disallowedTools", async () => {
     await agent.newSession({
       cwd: process.cwd(),
