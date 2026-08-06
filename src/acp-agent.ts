@@ -86,11 +86,13 @@ import {
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  GOAL_ACTIONS,
   GOAL_CONTROL_METHOD,
   GOAL_EXTENSION_VERSION,
-  GoalControlRequest,
+  GoalCapability,
+  GoalRequest,
   GoalControlResponse,
-  parseGoalControlRequest,
+  parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
@@ -1608,8 +1610,8 @@ export class ClaudeAcpAgent {
         goal: {
           version: GOAL_EXTENSION_VERSION,
           controlMethod: GOAL_CONTROL_METHOD,
-          actions: ["clear"],
-        },
+          actions: [...GOAL_ACTIONS],
+        } satisfies GoalCapability,
       },
     };
   }
@@ -1908,7 +1910,7 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  async controlGoal(params: GoalControlRequest): Promise<GoalControlResponse> {
+  async goal(params: GoalRequest): Promise<GoalControlResponse> {
     await this.prompt({
       sessionId: params.sessionId,
       prompt: [{ type: "text", text: "/goal clear" }],
@@ -7916,10 +7918,10 @@ export function runAcp() {
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
     )
-    .onRequest<GoalControlRequest, GoalControlResponse>(
+    .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,
-      { parse: parseGoalControlRequest },
-      (ctx) => agent.controlGoal(ctx.params),
+      { parse: parseGoalRequest },
+      (ctx) => agent.goal(ctx.params),
     )
     .connect(stream);
 

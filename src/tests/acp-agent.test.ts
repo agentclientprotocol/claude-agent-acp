@@ -54,7 +54,7 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
-import { GOAL_CONTROL_METHOD, parseGoalControlRequest, toGoalSnapshot } from "../goal-extension.js";
+import { GOAL_CONTROL_METHOD, parseGoalRequest, toGoalSnapshot } from "../goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -10004,9 +10004,7 @@ describe("turn steering (_session/steering)", () => {
     const agent = createMockAgent();
     const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
 
-    await expect(
-      agent.controlGoal({ sessionId: "test-session", action: "clear" }),
-    ).resolves.toEqual({});
+    await expect(agent.goal({ sessionId: "test-session", action: "clear" })).resolves.toEqual({});
     expect(prompt).toHaveBeenCalledWith({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/goal clear" }],
@@ -10014,11 +10012,11 @@ describe("turn steering (_session/steering)", () => {
   });
 
   it("validates goal control requests", () => {
-    expect(parseGoalControlRequest({ sessionId: "test-session", action: "clear" })).toEqual({
+    expect(parseGoalRequest({ sessionId: "test-session", action: "clear" })).toEqual({
       sessionId: "test-session",
       action: "clear",
     });
-    expect(() => parseGoalControlRequest({ sessionId: "test-session", action: "pause" })).toThrow(
+    expect(() => parseGoalRequest({ sessionId: "test-session", action: "pause" })).toThrow(
       'goal action must be "clear"',
     );
   });
