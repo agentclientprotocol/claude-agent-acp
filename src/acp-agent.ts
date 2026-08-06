@@ -77,6 +77,7 @@ import {
   Query,
   query,
   SDKAssistantMessageError,
+  SDKActiveGoalMessage,
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
@@ -84,6 +85,16 @@ import {
   SlashCommand,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
+import {
+  GOAL_ACTIONS,
+  GOAL_CONTROL_METHOD,
+  GOAL_EXTENSION_VERSION,
+  GoalCapability,
+  GoalRequest,
+  GoalControlResponse,
+  parseGoalRequest,
+  toGoalSnapshot,
+} from "./goal-extension.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -1693,6 +1704,11 @@ export class ClaudeAcpAgent {
         steering: {
           supported: true,
         },
+        goal: {
+          version: GOAL_EXTENSION_VERSION,
+          controlMethod: GOAL_CONTROL_METHOD,
+          actions: [...GOAL_ACTIONS],
+        } satisfies GoalCapability,
       },
     };
   }
@@ -2090,6 +2106,14 @@ export class ClaudeAcpAgent {
       return { response };
     });
     return prepared.response;
+  }
+
+  async goal(params: GoalRequest): Promise<GoalControlResponse> {
+    await this.prompt({
+      sessionId: params.sessionId,
+      prompt: [{ type: "text", text: "/goal clear" }],
+    });
+    return {};
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -2830,6 +2854,21 @@ export class ClaudeAcpAgent {
               }
               break;
           }
+          continue;
+        }
+
+        // `active_goal` is emitted by the Claude runtime but is not currently
+        // included in the public SDKMessage union. Handle it before the
+        // exhaustive switch and publish only the provider-neutral ACP shape.
+        if ((message as { type: string }).type === "active_goal") {
+          const activeGoal = message as unknown as SDKActiveGoalMessage;
+          await this.client.sessionUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "session_info_update",
+              _meta: { goal: toGoalSnapshot(activeGoal) },
+            },
+          });
           continue;
         }
 
@@ -8095,6 +8134,11 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<GoalRequest, GoalControlResponse>(
+      GOAL_CONTROL_METHOD,
+      { parse: parseGoalRequest },
+      (ctx) => agent.goal(ctx.params),
     )
     .connect(stream);
 
