@@ -8,6 +8,7 @@ export {
   streamEventToAcpNotifications,
   type ToolUpdateMeta,
   type NewSessionMeta,
+  type TraceContext,
   type SDKMessageFilter,
 } from "./acp-agent.js";
 export { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";

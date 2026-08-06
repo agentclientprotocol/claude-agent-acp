@@ -59,7 +59,6 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
-
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
@@ -203,6 +202,79 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
+  });
+
+  it("leaves trace env alone when the session carries no trace context", async () => {
+    const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(capturedOptions?.env).not.toHaveProperty("TRACEPARENT");
+    expect(capturedOptions?.env).not.toHaveProperty("TRACESTATE");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toBeUndefined();
+    expect((agent.sessions[response.sessionId] as any).traceEnvApplied).toBe(false);
+  });
+
+  it("bakes session trace context into the spawn env", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
+      },
+    });
+
+    expect(capturedOptions?.env?.TRACEPARENT).toBe(
+      "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+    );
+    expect(capturedOptions?.env?.TRACESTATE).toBe("vendor=value");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toEqual({
+      traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+      tracestate: "vendor=value",
+    });
+    // No control round-trip: the value is in place before the CLI starts.
+    expect((agent.sessions[response.sessionId] as any).traceEnvApplied).toBe(false);
+  });
+
+  it("blanks the unsupplied half of session trace context so it can't be inherited", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { traceparent: "00-trace-parent" },
+    });
+
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-trace-parent");
+    expect(capturedOptions?.env?.TRACESTATE).toBe("");
+  });
+
+  it("lets session trace context win over the options.env escape hatch", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        traceparent: "00-from-meta",
+        claudeCode: { options: { env: { TRACEPARENT: "00-from-options-env" } } },
+      },
+    });
+
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-from-meta");
+  });
+
+  it("accepts session trace context alongside a path-based settings option", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        traceparent: "00-trace-parent",
+        claudeCode: { options: { settings: "/opaque/settings.json" } },
+      },
+    });
+
+    // Nothing here needs to know what that settings file contains: the adapter
+    // only ever writes the two trace vars, and never reproduces a baseline.
+    expect(capturedOptions?.env?.TRACEPARENT).toBe("00-trace-parent");
+    expect((agent.sessions[response.sessionId] as any).sessionTrace).toEqual({
+      traceparent: "00-trace-parent",
+    });
   });
 
   it("defaults tools to claude_code preset when not provided", async () => {

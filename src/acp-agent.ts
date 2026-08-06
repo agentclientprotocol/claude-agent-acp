@@ -196,6 +196,12 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 
+/** Ceiling for the SDK control round-trip that applies prompt trace context.
+ *  Exceeding it abandons the update — the prompt still runs, carrying whatever
+ *  trace state the session already had. Trace context is observability, so a
+ *  slow control channel must not cost the user their turn. */
+const DEFAULT_TRACE_ENV_CONTROL_TIMEOUT_MS = 10_000;
+
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
  *  `result` — a model stream that dropped mid-turn, or an async agent that
@@ -400,6 +406,17 @@ type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
+  /** Arrival-ordered, short critical section for prompt validation, live
+   * settings mutation, and enqueue. It never waits for a Turn to settle. */
+  promptSubmissionActive?: boolean;
+  promptSubmissionQueue?: Array<() => void>;
+  /** Session-wide trace context from `session/new`'s `_meta`, baked into the
+   * query's spawn env. Prompt-level context overrides it for one prompt; this is
+   * what the prompt after that reverts to. */
+  sessionTrace?: TraceContext;
+  /** Whether the flag layer currently holds prompt trace context, i.e. whether
+   * the next prompt has something to revert. */
+  traceEnvApplied?: boolean;
   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
    *  processing; later entries are queued and will be echoed in order. */
   turnQueue?: Turn[];
@@ -787,7 +804,85 @@ export type NewSessionMeta = {
     emitRawSDKMessages?: boolean | SDKMessageFilter[];
   };
   additionalRoots?: string[];
+  /**
+   * W3C trace context for every prompt in the session, applied to the Claude Code
+   * process environment at startup. Prefer this over per-prompt trace context
+   * unless prompts genuinely belong to different traces: it needs no control
+   * round-trip and places no restriction on submitting prompts.
+   */
+  traceparent?: string;
+  tracestate?: string;
 };
+
+/** W3C trace context, read from the root of `_meta` on both `session/new` and
+ *  `session/prompt`. ACP reserves `traceparent`/`tracestate`/`baggage` there for
+ *  exactly this, to stay interoperable with MCP and OpenTelemetry tooling;
+ *  `baggage` is not propagated yet. */
+export type TraceContext = {
+  traceparent?: string;
+  tracestate?: string;
+};
+
+/** Retained name for the prompt-level shape. */
+export type PromptMeta = TraceContext;
+
+/** Reads the reserved trace-context keys out of an ACP `_meta` bag. `undefined`
+ *  when neither key is a string, so "carries no trace context" stays distinct
+ *  from "carries trace context whose fields are empty". */
+function parseTraceContext(meta: PromptRequest["_meta"]): TraceContext | undefined {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+    return undefined;
+  }
+
+  const traceparent = meta.traceparent;
+  const tracestate = meta.tracestate;
+  if (typeof traceparent !== "string" && typeof tracestate !== "string") {
+    return undefined;
+  }
+  return {
+    ...(typeof traceparent === "string" && { traceparent }),
+    ...(typeof tracestate === "string" && { tracestate }),
+  };
+}
+
+/** The flag-layer `env` that puts a prompt in the right trace.
+ *
+ *  Both vars are always written — blank when they should be absent — never
+ *  omitted. The CLI only ever *assigns* settings `env` onto its live
+ *  `process.env`; a key dropped from the flag layer keeps its old value there,
+ *  so omitting them would leave one prompt's trace context parenting every later
+ *  prompt. An empty value reads as absent to the CLI's span-context extraction,
+ *  which makes it the only way to clear trace context mid-session.
+ *
+ *  That same non-deletion is why writing *only* these two keys is safe: this
+ *  replaces the flag layer's whole `env` object, but it cannot unset env the
+ *  session inherited from its inline `settings` or from a lower settings layer. */
+function traceEnvFor(
+  session: TraceContext | undefined,
+  prompt: TraceContext | undefined,
+): Record<string, string> {
+  // A prompt's own context replaces the session's wholesale, rather than merging
+  // field by field: a `tracestate` is only meaningful alongside the `traceparent`
+  // it shipped with. An untraced prompt falls back to the session's, blanking
+  // whatever the previous prompt left behind.
+  const source = prompt ?? session ?? {};
+  return {
+    TRACEPARENT: source.traceparent ?? "",
+    TRACESTATE: source.tracestate ?? "",
+  };
+}
+
+/** Whether some turn's user message has been handed to the SDK but not yet
+ *  dequeued by the CLI.
+ *
+ *  The CLI reads `TRACEPARENT` when it *dequeues* a message, not when the
+ *  message is enqueued, so retargeting the trace env while such a turn is
+ *  outstanding would pull that turn into this prompt's trace instead. A turn
+ *  that has already been echoed (`activeTurn`) is past that point, which is what
+ *  makes it safe to queue a traced prompt behind a running one. */
+function hasUndequeuedTurn(session: Session): boolean {
+  return session.turnQueue?.some((turn) => !turn.settled && turn !== session.activeTurn) ?? false;
+}
 
 /**
  * Extra metadata for 'gateway' authentication requests.
@@ -1441,6 +1536,8 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /** Timeout for prompt trace env control requests. Mutable for tests. */
+  traceEnvControlTimeoutMs: number = DEFAULT_TRACE_ENV_CONTROL_TIMEOUT_MS;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -1865,49 +1962,150 @@ export class ClaudeAcpAgent {
     }
   }
 
+  private withPromptSubmission<T>(session: Session, work: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const release = () => {
+        const next = session.promptSubmissionQueue?.shift();
+        if (next) {
+          next();
+        } else {
+          session.promptSubmissionActive = false;
+          session.promptSubmissionQueue = undefined;
+        }
+      };
+      const run = () => {
+        session.promptSubmissionActive = true;
+        let pending: Promise<T>;
+        try {
+          pending = work();
+        } catch (error) {
+          release();
+          reject(error);
+          return;
+        }
+        pending.then(
+          (value) => {
+            release();
+            resolve(value);
+          },
+          (error) => {
+            release();
+            reject(error);
+          },
+        );
+      };
+
+      if (session.promptSubmissionActive) {
+        session.promptSubmissionQueue ??= [];
+        session.promptSubmissionQueue.push(run);
+      } else {
+        run();
+      }
+    });
+  }
+
+  private async applyTraceEnvSettings(
+    session: Session,
+    env: Record<string, string>,
+  ): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        reject(new Error("Timed out while applying ACP trace context."));
+      }, this.traceEnvControlTimeoutMs);
+    });
+    try {
+      await Promise.race([session.query.applyFlagSettings({ env }), timedOut]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
+  }
+
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
     }
-    // The SDK query stream already terminated (see `queryClosed`); its iterator
-    // can't be revived, so enqueueing here would hang on a deferred that never
-    // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
-    const userMessage = promptToClaude(params);
-    const promptUuid = randomUUID();
-    userMessage.uuid = promptUuid;
+    // The turn's deferred is handed back wrapped: returning it bare from this
+    // `async` callback would make the callback await the whole turn, and the
+    // submission critical section would stay held until the turn finished.
+    const prepared = await this.withPromptSubmission(session, async () => {
+      if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
 
-    // Local-only commands (e.g. `/clear`) return a result without replaying the
-    // user message, so the consumer can't promote the turn from the echo.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    const isLocalOnlyCommand =
-      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+      const promptTrace = parseTraceContext(params._meta);
+      // Nothing to do for an untraced prompt in a session that has no prompt
+      // trace context outstanding — the overwhelmingly common case pays nothing.
+      const shouldUpdateTraceEnv = promptTrace !== undefined || session.traceEnvApplied === true;
+      if (shouldUpdateTraceEnv && hasUndequeuedTurn(session)) {
+        throw RequestError.invalidParams(
+          undefined,
+          "Prompt trace context requires that every previously submitted prompt has started; await the running prompt's response, or retry.",
+        );
+      }
 
-    // Each prompt is a Turn whose deferred the persistent consumer settles once
-    // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
-    // turn, pushes the user message onto the streaming input, makes sure the
-    // consumer is running, and awaits the deferred.
-    const turn: Turn = {
-      promptUuid,
-      isLocalOnlyCommand,
-      settled: false,
-      resolve: () => {},
-      reject: () => {},
-    };
-    const response = new Promise<PromptResponse>((resolve, reject) => {
-      turn.resolve = resolve;
-      turn.reject = reject;
+      const userMessage = promptToClaude(params);
+      const promptUuid = randomUUID();
+      userMessage.uuid = promptUuid;
+      const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+      const isLocalOnlyCommand =
+        firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+
+      if (shouldUpdateTraceEnv) {
+        // Best effort by design: trace context is observability, and losing a
+        // parent span means a new root, not a failed turn. On failure the live
+        // env is unknowable, so record it as still carrying prompt context and
+        // let the next prompt try to reset it — an extra reset attempt is
+        // harmless, a missed one leaks this trace into later prompts.
+        try {
+          await this.applyTraceEnvSettings(session, traceEnvFor(session.sessionTrace, promptTrace));
+          session.traceEnvApplied = promptTrace !== undefined;
+        } catch (error) {
+          this.logger.error(
+            "Failed to apply ACP trace context; the prompt runs with the session's previous trace state:",
+            error,
+          );
+          session.traceEnvApplied = true;
+        }
+      }
+
+      if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
+
+      const turn: Turn = {
+        promptUuid,
+        isLocalOnlyCommand,
+        settled: false,
+        resolve: () => {},
+        reject: () => {},
+      };
+      const response = new Promise<PromptResponse>((resolve, reject) => {
+        turn.resolve = resolve;
+        turn.reject = reject;
+      });
+
+      session.turnQueue ??= [];
+      session.turnQueue.push(turn);
+      try {
+        session.input.push(userMessage);
+        this.ensureConsumer(session, params.sessionId);
+      } catch {
+        turn.settled = true;
+        session.turnQueue = session.turnQueue.filter((queued) => queued !== turn);
+        throw RequestError.internalError(undefined, "Failed to enqueue the prompt.");
+      }
+
+      return { response };
     });
-
-    session.turnQueue ??= [];
-    session.turnQueue.push(turn);
-    session.input.push(userMessage);
-    this.ensureConsumer(session, params.sessionId);
-    return response;
+    return prepared.response;
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
@@ -5586,6 +5784,13 @@ export class ClaudeAcpAgent {
       supportsSubagentTranscript(this.clientCapabilities) ||
       userProvidedOptions?.forwardSubagentText === true;
 
+    // Trace context for the whole session. Baked into the spawn env below, so it
+    // costs no control round-trip, cannot race a queued prompt, and needs no
+    // clearing — everything the per-prompt path has to work for. A prompt that
+    // carries its own context overrides this for that one prompt and reverts to
+    // it afterwards (see `traceEnvFor`).
+    const sessionTrace = parseTraceContext(params._meta);
+
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
 
@@ -5636,6 +5841,16 @@ export class ClaudeAcpAgent {
       ...createEnvForProvider(this.resolveProviderConfig()),
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
+      // Last, so the ACP-standard `_meta` channel beats both ambient env and the
+      // `_meta.claudeCode.options.env` escape hatch. Both keys are written even
+      // when only one was supplied: a `tracestate` inherited from this process
+      // does not belong to the caller's `traceparent`. The SDK leaves TRACEPARENT
+      // alone when `options.env` already sets it, so this also wins over the
+      // context it would otherwise inject from an ambient span.
+      ...(sessionTrace && {
+        TRACEPARENT: sessionTrace.traceparent ?? "",
+        TRACESTATE: sessionTrace.tracestate ?? "",
+      }),
     };
     // Scopes the context-window cache to this query's backend (see
     // `contextWindowCache`). Derived from the same `env` object handed to the
@@ -5998,6 +6213,8 @@ export class ClaudeAcpAgent {
       query: q,
       input: input,
       cancelled: false,
+      sessionTrace,
+      traceEnvApplied: false,
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,

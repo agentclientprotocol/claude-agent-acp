@@ -124,13 +124,13 @@ const cancelledTurnUsage = {
 };
 
 /** Wrap a mock async generator with the `Query` methods the agent calls outside
- *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
- *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
+ *  of iteration so a bare generator doesn't trip "x is not a function". */
 function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
+    applyFlagSettings: vi.fn(async () => {}),
   }) as any;
 }
 
@@ -168,6 +168,7 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
+    traceEnvApplied: false,
     ...overrides,
   } as any;
 }
@@ -189,6 +190,274 @@ function injectGeneratorSession(
   });
   return input;
 }
+
+describe("ACP prompt trace context", () => {
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function setupSession(options: { beforeResult?: () => Promise<void>; overrides?: any } = {}) {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const input = injectGeneratorSession(
+      agent,
+      (stream) => {
+        async function* generator() {
+          for await (const message of stream) {
+            yield userEcho(message);
+            await options.beforeResult?.();
+            yield {
+              type: "result",
+              subtype: "success",
+              stop_reason: "end_turn",
+              is_error: false,
+              result: "ok",
+              duration_ms: 0,
+              duration_api_ms: 0,
+              num_turns: 1,
+              total_cost_usd: 0,
+              usage: {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+              },
+              modelUsage: {},
+              permission_denials: [],
+              uuid: randomUUID(),
+              session_id: "test-session",
+            };
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          }
+        }
+        return generator();
+      },
+      options.overrides,
+    );
+    const query = agent.sessions["test-session"].query as any;
+    const push = vi.spyOn(input, "push");
+    return { agent, query, push };
+  }
+
+  const prompt = (meta?: PromptRequest["_meta"]): PromptRequest => ({
+    sessionId: "test-session",
+    prompt: [{ type: "text", text: "trace me" }],
+    ...(meta && { _meta: meta }),
+  });
+
+  // The clear must BLANK the vars, not drop them from the flag layer: the CLI
+  // only assigns settings `env` onto its live `process.env`, so `{env: null}`
+  // (or an object that simply omits them) leaves the previous prompt's
+  // traceparent in place and every later prompt is parented under it.
+  it("maps trace metadata to Claude Code env and blanks it on the next prompt", async () => {
+    const { agent, query, push } = setupSession();
+
+    await agent.prompt(
+      prompt({
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
+      }),
+    );
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [
+        {
+          env: {
+            TRACEPARENT: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+            TRACESTATE: "vendor=value",
+          },
+        },
+      ],
+      [{ env: { TRACEPARENT: "", TRACESTATE: "" } }],
+    ]);
+    expect(query.applyFlagSettings.mock.invocationCallOrder[0]).toBeLessThan(
+      push.mock.invocationCallOrder[0],
+    );
+    expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("80e1afed08e019fc");
+  });
+
+  it("reverts to the session's trace context, not to nothing, after a prompt override", async () => {
+    const { agent, query } = setupSession({
+      overrides: {
+        sessionTrace: { traceparent: "00-session-parent", tracestate: "session=state" },
+      },
+    });
+
+    await agent.prompt(prompt({ traceparent: "00-prompt-parent" }));
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings.mock.calls).toEqual([
+      [
+        {
+          env: {
+            TRACEPARENT: "00-prompt-parent",
+            // A `tracestate` only means anything alongside the `traceparent` it
+            // shipped with, so the session's is blanked rather than carried over
+            // onto the prompt's trace.
+            TRACESTATE: "",
+          },
+        },
+      ],
+      [{ env: { TRACEPARENT: "00-session-parent", TRACESTATE: "session=state" } }],
+    ]);
+  });
+
+  it("costs nothing for untraced prompts in a session with no trace context", async () => {
+    const { agent, query } = setupSession();
+
+    await agent.prompt(prompt());
+    await agent.prompt(prompt());
+
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+  });
+
+  it("ignores baggage metadata", async () => {
+    const { agent, query, push } = setupSession();
+
+    await agent.prompt(
+      prompt({
+        baggage: "tenant=ignored",
+      }),
+    );
+
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+    expect(JSON.stringify(push.mock.calls[0][0])).not.toContain("tenant=ignored");
+  });
+
+  // The CLI reads TRACEPARENT when it dequeues a message, so a turn the CLI has
+  // already started is not at risk of being pulled into this prompt's trace.
+  // Queueing behind a running turn is the ordinary "send a follow-up while the
+  // agent works" flow, and it must keep working for traced prompts.
+  it.each([
+    ["a traced prompt", { traceparent: "00-second-trace-parent" }],
+    ["an untraced prompt", undefined],
+  ])("queues %s behind a turn the CLI has already started", async (_name, nextMeta) => {
+    const result = deferred();
+    const { agent, query, push } = setupSession({ beforeResult: () => result.promise });
+
+    const first = agent.prompt(prompt({ traceparent: "00-first-trace-parent" }));
+    await vi.waitFor(() => expect(agent.sessions["test-session"].activeTurn).toBeTruthy());
+
+    const second = agent.prompt(prompt(nextMeta));
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(2));
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(2);
+    expect(query.applyFlagSettings.mock.calls[1][0].env.TRACEPARENT).toBe(
+      nextMeta?.traceparent ?? "",
+    );
+
+    result.resolve();
+    await first;
+    await second;
+  });
+
+  // Retargeting the env now would land on that earlier message instead, because
+  // the CLI has not read TRACEPARENT for it yet.
+  it("rejects a traced prompt while an earlier prompt has not been started yet", async () => {
+    const { agent, query, push } = setupSession({
+      overrides: {
+        turnQueue: [{ promptUuid: randomUUID(), isLocalOnlyCommand: false, settled: false }],
+        activeTurn: null,
+      },
+    });
+
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "has started",
+    );
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  // A cancel landing mid-preparation no longer needs a rollback: the prompt is
+  // submitted like any other and the consumer settles it, exactly as it would
+  // for a prompt that carried no trace context at all.
+  it("submits a traced prompt whose preparation overlapped a cancel", async () => {
+    const apply = deferred();
+    const { agent, query, push } = setupSession();
+    query.applyFlagSettings.mockImplementationOnce(() => apply.promise);
+
+    const pending = agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+    await vi.waitFor(() => expect(query.applyFlagSettings).toHaveBeenCalledTimes(1));
+    await agent.cancel({ sessionId: "test-session" });
+    apply.resolve();
+
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
+    await pending;
+  });
+
+  // Trace propagation must not change how ordinary prompts are admitted. A
+  // client that hits stop and immediately sends a new message does exactly
+  // this, and interrupt() is a control round-trip that can take a while —
+  // short-circuiting the prompt to "cancelled" would silently drop it.
+  it("still enqueues an untraced prompt that arrives while interrupt() is in flight", async () => {
+    const interrupted = deferred();
+    const { agent, query, push } = setupSession();
+    query.interrupt.mockImplementationOnce(() => interrupted.promise);
+
+    const cancelling = agent.cancel({ sessionId: "test-session" });
+    await vi.waitFor(() => expect(query.interrupt).toHaveBeenCalledTimes(1));
+
+    const pending = agent.prompt(prompt());
+    await vi.waitFor(() => expect(push).toHaveBeenCalledTimes(1));
+    expect(query.applyFlagSettings).not.toHaveBeenCalled();
+
+    interrupted.resolve();
+    await cancelling;
+    await pending;
+  });
+
+  // Losing a parent span means a new root, not a failed turn, so a wedged
+  // control channel must cost the caller neither the prompt nor the session.
+  it("runs the prompt anyway when applying trace env times out", async () => {
+    const { agent, query, push } = setupSession();
+    agent.traceEnvControlTimeoutMs = 5;
+    const log = vi.spyOn(agent.logger, "error");
+    query.applyFlagSettings.mockImplementationOnce(() => new Promise(() => {}));
+
+    await agent.prompt(prompt({ traceparent: "00-trace-parent" }));
+
+    expect(push).toHaveBeenCalledTimes(1);
+    expect(query.close).not.toHaveBeenCalled();
+    expect(agent.sessions["test-session"].queryClosed).toBeFalsy();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to apply ACP trace context"),
+      expect.any(Error),
+    );
+
+    // The live env is unknowable after a failed apply, so the next prompt still
+    // tries to reset it rather than assuming nothing was written.
+    await agent.prompt(prompt());
+    expect(query.applyFlagSettings).toHaveBeenLastCalledWith({
+      env: { TRACEPARENT: "", TRACESTATE: "" },
+    });
+  });
+
+  // A failed enqueue is the caller's error to see; there is no trace state to
+  // unwind, so it must not turn into a second control round-trip or a teardown.
+  it("reports a failed enqueue without a compensating trace round-trip", async () => {
+    const { agent, query, push } = setupSession();
+    push.mockImplementationOnce(() => {
+      throw new Error("input closed");
+    });
+
+    await expect(agent.prompt(prompt({ traceparent: "00-trace-parent" }))).rejects.toThrow(
+      "Failed to enqueue the prompt",
+    );
+
+    expect(query.applyFlagSettings).toHaveBeenCalledTimes(1);
+    expect(query.close).not.toHaveBeenCalled();
+    expect(agent.sessions["test-session"].turnQueue).toEqual([]);
+  });
+});
 
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
@@ -1736,6 +2005,37 @@ describe("escape markdown", () => {
 });
 
 describe("prompt conversion", () => {
+  it("keeps ACP trace context out of model-visible SDK messages", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [{ type: "text", text: "trace me" }],
+      _meta: {
+        traceparent: "00-80e1afed08e019fc1110464cfa66635c-7a085853722dc6d2-01",
+        tracestate: "vendor=value",
+        baggage: "tenant=example",
+        "zed.dev/debugMode": true,
+      },
+    });
+
+    expect(JSON.stringify(message)).not.toContain("80e1afed08e019fc");
+    expect(JSON.stringify(message)).not.toContain("tenant=example");
+    expect(message).not.toHaveProperty("_meta");
+  });
+
+  it("ignores non-string trace context values", () => {
+    const message = promptToClaude({
+      sessionId: "test",
+      prompt: [{ type: "text", text: "trace me" }],
+      _meta: {
+        traceparent: 123,
+        tracestate: null,
+        baggage: ["invalid"],
+      },
+    });
+
+    expect(message).not.toHaveProperty("_meta");
+  });
+
   it("should not change built-in slash commands", () => {
     const message = promptToClaude({
       sessionId: "test",
