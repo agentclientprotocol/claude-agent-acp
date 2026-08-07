@@ -9931,6 +9931,17 @@ describe("turn steering (_session/steering)", () => {
     return { ...createResultMessage(), stop_reason: "tool_use", origin: { kind: "human" } };
   }
 
+  /** Models the diagnostic error emitted when the CLI interrupts a user cycle
+   *  before replaying the priority:'now' steering message. */
+  function interruptedDiagnosticResult() {
+    return {
+      ...createResultMessage(),
+      stop_reason: null,
+      is_error: true,
+      result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+    };
+  }
+
   /** The SDK's authoritative turn-over signal. */
   function idleMessage() {
     return { type: "system", subtype: "session_state_changed", state: "idle" };
@@ -10238,6 +10249,101 @@ describe("turn steering (_session/steering)", () => {
     });
     // Still exactly one response for one prompt, and nothing left behind.
     expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
+  it("keeps the turn open when the interrupted cycle reports a diagnostic error", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+    let releaseAfterInterrupted!: () => void;
+    let releaseInjectedEcho!: () => void;
+    const afterInterrupted = new Promise<void>((resolve) => (releaseAfterInterrupted = resolve));
+    const injectedEchoGate = new Promise<void>((resolve) => (releaseInjectedEcho = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        const steered = await iter.next();
+        yield interruptedDiagnosticResult();
+        releaseAfterInterrupted();
+        await injectedEchoGate;
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    let settledBeforeEcho = false;
+    turn.then(
+      () => {
+        settledBeforeEcho = true;
+      },
+      () => {
+        settledBeforeEcho = true;
+      },
+    );
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await afterInterrupted;
+    await Promise.resolve();
+    const diagnosticSettledTurn = settledBeforeEcho;
+    releaseInjectedEcho();
+
+    expect(diagnosticSettledTurn).toBe(false);
+    await expect(turn).resolves.toEqual(
+      expect.objectContaining({
+        stopReason: "end_turn",
+        usage: expect.objectContaining({ totalTokens: 30 }),
+      }),
+    );
+    expect(timeline).toEqual(["STEERED-OK"]);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("does not reuse the interrupted result after the steered echo", async () => {
+    const agent = createMockAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        // The stream turns idle and closes without a result for the steered cycle.
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    turn.catch(() => {});
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
   });
 
   // The other steer ordering: the cycle had already finished when the steer

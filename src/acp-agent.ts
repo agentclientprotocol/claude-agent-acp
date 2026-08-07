@@ -2850,22 +2850,37 @@ export class ClaudeAcpAgent {
                   } else if (isSteering(session.activeTurn)) {
                     // A steered turn settles here, not at a result: this idle is
                     // the only signal spanning the interrupted and steered cycles
-                    // (see Turn.steeredEchoes). An idle before the steered echo,
-                    // or before any result was recorded, means the answer is
-                    // still ahead — swallow it, and never let it reach the #825
-                    // fail below, which would reject a prompt about to answer.
+                    // (see Turn.steeredEchoes). An idle before the steered echo
+                    // means the answer is still ahead — swallow it, and never
+                    // let it reach the #825 fail below, which would reject a
+                    // prompt about to answer. Once every echo arrived, however,
+                    // this idle is terminal: without a newer result the SDK
+                    // ended the steered cycle without the outcome it owes.
                     //
                     // Plain Turn so the fields can be cleared below; isSteering
                     // narrows steeredEchoes to non-optional.
                     const steered: Turn = session.activeTurn;
-                    if (steered.steeredEchoes?.size === 0 && steered.steeredSettle !== undefined) {
-                      // Via the subagent gate, not settleActive: a steered turn
-                      // can also have spawned background subagents, which own it
-                      // from here (settles now if none is live, holds otherwise).
-                      steered.deferredSettle = steered.steeredSettle;
-                      steered.steeredEchoes = undefined;
-                      steered.steeredSettle = undefined;
-                      settleDeferredIfDrained();
+                    if (steered.steeredEchoes?.size === 0) {
+                      if (steered.steeredSettle !== undefined) {
+                        // Via the subagent gate, not settleActive: a steered turn
+                        // can also have spawned background subagents, which own it
+                        // from here (settles now if none is live, holds otherwise).
+                        steered.deferredSettle = steered.steeredSettle;
+                        steered.steeredEchoes = undefined;
+                        steered.steeredSettle = undefined;
+                        settleDeferredIfDrained();
+                      } else {
+                        this.logger.error(
+                          `Session ${params.sessionId}: SDK went idle after a steering echo ` +
+                            `without emitting the steered result; failing the in-flight prompt`,
+                        );
+                        failActive(
+                          RequestError.internalError(
+                            errorKindData("no_result"),
+                            TURN_NO_RESULT_MESSAGE,
+                          ),
+                        );
+                      }
                     }
                   } else if (
                     !session.cancelled &&
@@ -3442,6 +3457,15 @@ export class ClaudeAcpAgent {
                 break;
               }
 
+              // A user result received before the latest steering echo belongs
+              // to the cycle that priority:'now' interrupted. Its usage and
+              // outcome still count, but its diagnostic/auth/refusal payloads
+              // must not terminate the prompt that now owns the steered cycle.
+              if (isSteering(session.activeTurn) && session.activeTurn.steeredEchoes.size > 0) {
+                settleOrDefer({ stopReason, usage: sessionUsage(session) });
+                break;
+              }
+
               // A refusal can arrive on any result subtype (and may even set
               // is_error), so handle it before the subtype switch — otherwise the
               // is_error throw below would surface it as an internal error. The
@@ -3815,7 +3839,12 @@ export class ClaudeAcpAgent {
                 // lane tells "the answer is still ahead" from "the turn is over"
                 // (see Turn.steeredEchoes).
                 if (isSteering(session.activeTurn)) {
-                  session.activeTurn.steeredEchoes.delete(message.uuid);
+                  const matchedSteeredEcho = session.activeTurn.steeredEchoes.delete(message.uuid);
+                  if (matchedSteeredEcho) {
+                    // The saved outcome predates this replay and therefore
+                    // cannot stand in for the steered cycle's own result.
+                    session.activeTurn.steeredSettle = undefined;
+                  }
                 }
                 // Unrelated replay (e.g. the echo of an already-settled turn).
                 break;
