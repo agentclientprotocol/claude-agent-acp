@@ -10052,7 +10052,7 @@ describe("turn steering (_session/steering)", () => {
     expect((response._meta as any)?.goal).toEqual({
       version: 1,
       controlMethod: GOAL_CONTROL_METHOD,
-      actions: ["clear"],
+      actions: ["set", "clear"],
     });
   });
 
@@ -10115,6 +10115,58 @@ describe("turn steering (_session/steering)", () => {
     await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
+  it("replaces a running goal through the goal extension and publishes it immediately", async () => {
+    const updates: any[] = [];
+    const captured: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const goal = await iter.next();
+        yield userEcho(goal.value);
+        const replacement = await iter.next();
+        captured.push(replacement.value);
+        yield createResultMessage();
+        yield userEcho(replacement.value);
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const runningGoal = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Keep working" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    await expect(
+      agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" }),
+    ).resolves.toEqual({});
+    expect(captured).toHaveLength(1);
+    expect(captured[0].priority).toBe("now");
+    expect(JSON.stringify(captured[0].message.content)).toContain("/goal Replacement");
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          goal: {
+            objective: "Replacement",
+            status: "active",
+            controlMethod: GOAL_CONTROL_METHOD,
+          },
+        },
+      },
+    });
+    await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
   it("cancels the running turn without clearing the persistent goal", async () => {
     const updates: any[] = [];
     let releaseAfterCancel!: () => void;
@@ -10160,11 +10212,17 @@ describe("turn steering (_session/steering)", () => {
       sessionId: "test-session",
       action: "clear",
     });
+    expect(
+      parseGoalRequest({ sessionId: "test-session", action: "set", objective: "  Replacement  " }),
+    ).toEqual({ sessionId: "test-session", action: "set", objective: "Replacement" });
+    expect(() => parseGoalRequest({ sessionId: "test-session", action: "set" })).toThrow(
+      'goal action "set" requires a non-empty objective',
+    );
     expect(() => parseGoalRequest({ sessionId: "test-session", action: "pause" })).toThrow(
-      'goal action must be "clear"',
+      'goal action must be "set" or "clear"',
     );
     expect(() => parseGoalRequest({ sessionId: "test-session", action: "resume" })).toThrow(
-      'goal action must be "clear"',
+      'goal action must be "set" or "clear"',
     );
     expect(goalUpdateFromPrompt("/goal pause")).toMatchObject({
       objective: "pause",
@@ -10317,6 +10375,88 @@ describe("turn steering (_session/steering)", () => {
     expect(injected.priority).toBe("now");
     expect(typeof injected.uuid).toBe("string");
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
+  });
+
+  it("publishes an optimistic goal update for a steered goal replacement", async () => {
+    const updates: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const input = new Pushable<any>();
+    agent.sessions["test-session"] = mockSessionState({
+      input,
+      turnQueue: [
+        {
+          promptUuid: "running",
+          isLocalOnlyCommand: false,
+          settled: false,
+          resolve: () => {},
+          reject: () => {},
+        },
+      ],
+    });
+
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Replace the objective" }],
+    });
+
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          goal: {
+            objective: "Replace the objective",
+            status: "active",
+            controlMethod: GOAL_CONTROL_METHOD,
+          },
+        },
+      },
+    });
+  });
+
+  it("does not attribute a cancelled pending steer result to the next prompt", async () => {
+    const agent = createMockAgent();
+    let releaseCancel!: () => void;
+    const cancelGate = new Promise<void>((resolve) => (releaseCancel = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        const staleSteer = await iter.next();
+        await cancelGate;
+        yield idleMessage();
+        const replacement = await iter.next();
+        yield userEcho(staleSteer.value);
+        yield { ...createResultMessage(), stop_reason: "max_tokens" };
+        yield userEcho(replacement.value);
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Original" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.goal({ sessionId: "test-session", action: "clear" });
+    await agent.cancel({ sessionId: "test-session" });
+    releaseCancel();
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "/goal Replacement" }],
+      }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
   // A steer does not join the running cycle — it ABORTS it: the CLI interrupts

@@ -1909,15 +1909,13 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    const goalUpdate = goalUpdateFromPrompt(firstText);
-    if (goalUpdate !== undefined) {
-      await this.publishGoal(params.sessionId, goalUpdate);
-    }
+    await this.publishGoalFromPrompt(params.sessionId, firstText);
     return response;
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
-    const prompt = [{ type: "text" as const, text: "/goal clear" }];
+    const command = params.action === "set" ? `/goal ${params.objective}` : "/goal clear";
+    const prompt = [{ type: "text" as const, text: command }];
     const steering = await this.steer({
       sessionId: params.sessionId,
       prompt,
@@ -1925,10 +1923,6 @@ export class ClaudeAcpAgent {
     });
     if (steering.outcome === "promptRequired") {
       await this.prompt({ sessionId: params.sessionId, prompt });
-    } else {
-      // The injected command bypasses prompt(), so publish its optimistic
-      // removal here. A later SDK active_goal message remains authoritative.
-      await this.publishGoal(params.sessionId, null);
     }
     return {};
   }
@@ -1941,6 +1935,13 @@ export class ClaudeAcpAgent {
         _meta: { goal },
       },
     });
+  }
+
+  private async publishGoalFromPrompt(sessionId: string, prompt: string): Promise<void> {
+    const goalUpdate = goalUpdateFromPrompt(prompt);
+    if (goalUpdate !== undefined) {
+      await this.publishGoal(sessionId, goalUpdate);
+    }
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -2026,6 +2027,8 @@ export class ClaudeAcpAgent {
       turnInFlight.deferredSettle = undefined;
     }
     session.input.push(userMessage);
+    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+    await this.publishGoalFromPrompt(sessionId, firstText);
     return { outcome: "injected" };
   }
 
@@ -4208,6 +4211,14 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // A priority steer may still be queued in the SDK when cancellation
+    // settles its owning turn. Its later echo matches no live turn, and its
+    // result must be skipped rather than promoted onto the next prompt.
+    if (isSteering(session.activeTurn)) {
+      for (const uuid of session.activeTurn.steeredEchoes) {
+        this.trackOrphanCommand(session, uuid, "pending");
+      }
+    }
     // Capture the orphan-accounting lane before anything can await: the
     // consumer latches msgLifecycleV1 when it drains the first system/init,
     // which can happen DURING the awaited interrupt() below — the receipt
