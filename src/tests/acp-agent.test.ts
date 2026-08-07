@@ -54,6 +54,7 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+import { GOAL_CONTROL_METHOD, parseGoalRequest, toGoalSnapshot } from "../goal-extension.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -3297,6 +3298,93 @@ describe("stop reason propagation", () => {
 
     expect(response.stopReason).toBe("end_turn");
     expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
+  });
+
+  it("publishes active_goal as provider-neutral session state without changing turn settlement", async () => {
+    const updates: any[] = [];
+    const mockClient = {
+      sessionUpdate: async (notification: any) => updates.push(notification),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "  Finish the migration  ",
+            iterations: 3,
+            set_at: 1710000000123,
+            tokens_at_start: 42,
+            last_reason: "Tests still need work",
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield {
+          type: "active_goal",
+          value: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          goal: {
+            objective: "Finish the migration",
+            status: "active",
+            iterations: 3,
+            lastReason: "Tests still need work",
+            createdAt: 1710000000123,
+            controlMethod: GOAL_CONTROL_METHOD,
+          },
+        },
+      },
+    });
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: { sessionUpdate: "session_info_update", _meta: { goal: null } },
+    });
+    expect(updates.some((notification) => notification.update?._meta?.claudeCode?.goal)).toBe(
+      false,
+    );
+  });
+
+  it("maps the SDK goal shape without exposing provider fields", () => {
+    expect(
+      toGoalSnapshot({
+        type: "active_goal",
+        value: {
+          condition: "Goal",
+          iterations: 1,
+          set_at: 1710000000000,
+          tokens_at_start: 99,
+        },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      }),
+    ).toEqual({
+      objective: "Goal",
+      status: "active",
+      iterations: 1,
+      lastReason: null,
+      createdAt: 1710000000000,
+      controlMethod: GOAL_CONTROL_METHOD,
+    });
   });
 
   it("settles a no-echo command result (e.g. /compact) by promoting the head turn", async () => {
@@ -10044,6 +10132,31 @@ describe("turn steering (_session/steering)", () => {
     };
   }
 
+  /** The `result` the CLI emits for the cycle a priority:'now' steer aborted, as
+   *  observed on CLI 2.1.220: `origin.kind` "human" (not autonomous, so it
+   *  reaches the user-turn lifecycle) and `stop_reason` "tool_use" — the abort
+   *  landed on a pending tool call. No test here depends on either: every
+   *  non-error combination maps to the `end_turn` clients observe. */
+  function interruptedCycleResult() {
+    return { ...createResultMessage(), stop_reason: "tool_use", origin: { kind: "human" } };
+  }
+
+  /** The SDK's authoritative turn-over signal. */
+  function idleMessage() {
+    return { type: "system", subtype: "session_state_changed", state: "idle" };
+  }
+
+  /** Records every `agent_message_chunk` the client observes. */
+  function timelineClient(timeline: string[]) {
+    return {
+      sessionUpdate: async (notification: any) => {
+        if (notification.update?.sessionUpdate === "agent_message_chunk") {
+          timeline.push(notification.update.content?.text);
+        }
+      },
+    } as unknown as AcpClient;
+  }
+
   const waitFor = async (cond: () => boolean) => {
     for (let i = 0; i < 200; i++) {
       if (cond()) return;
@@ -10090,6 +10203,32 @@ describe("turn steering (_session/steering)", () => {
     expect((response._meta as any)?.steering).toEqual({
       supported: true,
     });
+    expect((response._meta as any)?.goal).toEqual({
+      version: 1,
+      controlMethod: GOAL_CONTROL_METHOD,
+      actions: ["clear"],
+    });
+  });
+
+  it("submits clear through the session prompt queue", async () => {
+    const agent = createMockAgent();
+    const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
+
+    await expect(agent.goal({ sessionId: "test-session", action: "clear" })).resolves.toEqual({});
+    expect(prompt).toHaveBeenCalledWith({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal clear" }],
+    });
+  });
+
+  it("validates goal control requests", () => {
+    expect(parseGoalRequest({ sessionId: "test-session", action: "clear" })).toEqual({
+      sessionId: "test-session",
+      action: "clear",
+    });
+    expect(() => parseGoalRequest({ sessionId: "test-session", action: "pause" })).toThrow(
+      'goal action must be "clear"',
+    );
   });
 
   it("preserves startedNewTurn by default when no turn is in flight", async () => {
@@ -10237,6 +10376,249 @@ describe("turn steering (_session/steering)", () => {
     expect(injected.priority).toBe("now");
     expect(typeof injected.uuid).toBe("string");
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
+  });
+
+  // A steer does not join the running cycle — it ABORTS it: the CLI interrupts
+  // the in-flight query as soon as a queued message carries priority 'now'. The
+  // interrupted cycle ends with an ordinary human-origin `result` and the
+  // steered message runs as a SECOND cycle. Treating that first result as
+  // terminal answers session/prompt mid-work: the client is told `end_turn`,
+  // then keeps receiving the turn's remaining tool calls and its actual answer
+  // as updates belonging to no turn.
+  it("keeps the turn open across the interrupt its own steer caused", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value); // turn becomes active
+        yield createAssistantText("working on it");
+        // The steered message is pushed at priority 'now'...
+        const steered = await iter.next();
+        // ...so the CLI aborts the query, ending the interrupted cycle with a
+        // result of its own. No idle follows it: one comes at the very end, for
+        // the whole interrupted + steered sequence.
+        yield interruptedCycleResult();
+        // Only now does the steered message run, as a second cycle. Its echo
+        // matches no queued turn (dropped as an unrelated replay), its output is
+        // the answer the user is waiting for, and its result has the last word
+        // on the turn's stop reason.
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    // Drain the rest of the stream so the timeline is complete either way — on
+    // an early settle the steered output arrives after `response`.
+    await agent.sessions["test-session"]?.consumer;
+
+    // The steered continuation belongs to the turn the client is waiting on, so
+    // all of it precedes that turn's response. A `prompt:` entry anywhere but
+    // last is the bug: updates outlived the stopReason.
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // Both cycles ran for this one prompt, so its usage covers both (2 × the
+    // mock result's 10 in / 5 out) rather than stopping at the interrupt.
+    expect(response.usage).toEqual({
+      inputTokens: 20,
+      outputTokens: 10,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 30,
+    });
+    // Still exactly one response for one prompt, and nothing left behind.
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
+  // The other steer ordering: the cycle had already finished when the steer
+  // landed, so nothing was aborted and its result is a natural one — followed by
+  // its own idle, before the steered message is picked up. Settling on that idle
+  // would answer the prompt with the steered work still ahead, so the turn waits
+  // for the steered message's echo (Turn.steeredEchoes).
+  it("does not settle a steered turn at an idle that precedes the steered echo", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        // The cycle ends and goes idle before the steered message is dequeued.
+        yield interruptedCycleResult();
+        yield idleMessage();
+        // Then the steered message runs as its own cycle.
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // The swallowed idle must not leave a phantom debt that would absorb a later
+    // turn's trailing idle (and blind the issue-#825 detector).
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+  });
+
+  // A steer must not hold a prompt hostage: the next prompt's echo hands the
+  // steered turn off, reporting — like the subagent hold — the stop reason its
+  // last result recorded rather than a guessed one.
+  it("hands a steered turn off to the next prompt with its recorded outcome", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        await iter.next(); // the steered message, which this CLI never replays
+        yield interruptedCycleResult();
+        // The user moves on: the second prompt's echo arrives while the steered
+        // turn is still open.
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield createAssistantText("second turn");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`first:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    const second = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] })
+      .then((response) => {
+        timeline.push(`second:${response.stopReason}`);
+        return response;
+      });
+
+    const firstResponse = await first;
+    await second;
+    await agent.sessions["test-session"]?.consumer;
+
+    // The steered turn ends at the hand-off — before the new turn's output — and
+    // carries the interrupted cycle's own usage, not the next turn's.
+    expect(timeline).toEqual(["working on it", "first:end_turn", "second turn", "second:end_turn"]);
+    expect(firstResponse.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      cachedReadTokens: 0,
+      cachedWriteTokens: 0,
+      totalTokens: 15,
+    });
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
+  // Cancelling a steered turn answers "cancelled" through the normal lane, but
+  // its last result's trailing idle went uncounted (the steer lane pays for its
+  // idles by settling on them, which the cancel pre-empted). That idle can lag
+  // past the next prompt's echo, where an un-owed idle reads as "the SDK went
+  // idle without a result" and false-fails a healthy prompt (#825).
+  it("cancels a steered turn without false-failing the next prompt", async () => {
+    const agent = createMockAgent();
+    let releaseAfterCancel = () => {};
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        await iter.next(); // the steered message
+        yield interruptedCycleResult();
+        await afterCancel;
+        yield idleMessage(); // the interrupt's trailer: settles the turn "cancelled"
+        const second = await iter.next();
+        yield userEcho(second.value); // activates the next turn, clears `cancelled`
+        yield idleMessage(); // the steered result's lagged trailer — must be absorbed
+        yield createAssistantText("second turn");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+    // The interrupted cycle's result has been recorded on the turn (not settled).
+    await waitFor(() => agent.sessions["test-session"]?.activeTurn?.steeredSettle !== undefined);
+
+    await agent.cancel({ sessionId: "test-session" });
+    releaseAfterCancel();
+
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    // The next prompt runs to completion instead of being rejected by the #825
+    // detector when the steered turn's lagged idle lands.
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
