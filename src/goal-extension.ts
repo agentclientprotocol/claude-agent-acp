@@ -35,6 +35,22 @@ export type GoalRequest = {
 
 export type GoalControlResponse = Record<string, never>;
 
+export function goalUpdateFromPrompt(prompt: string): GoalSnapshot | null | undefined {
+  const match = /^\/goal(?:\s+([\s\S]*))?$/.exec(prompt);
+  const argument = match?.[1]?.trim();
+  if (!argument) {
+    return undefined;
+  }
+  if (argument === "clear") {
+    return null;
+  }
+  return {
+    objective: argument,
+    status: "active",
+    controlMethod: GOAL_CONTROL_METHOD,
+  };
+}
+
 export function parseGoalRequest(params: unknown): GoalRequest {
   if (!params || typeof params !== "object") {
     throw RequestError.invalidParams(undefined, "goal params must be an object");

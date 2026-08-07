@@ -92,6 +92,8 @@ import {
   GoalCapability,
   GoalRequest,
   GoalControlResponse,
+  GoalSnapshot,
+  goalUpdateFromPrompt,
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
@@ -1907,15 +1909,38 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
+    const goalUpdate = goalUpdateFromPrompt(firstText);
+    if (goalUpdate !== undefined) {
+      await this.publishGoal(params.sessionId, goalUpdate);
+    }
     return response;
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
-    await this.prompt({
+    const prompt = [{ type: "text" as const, text: "/goal clear" }];
+    const steering = await this.steer({
       sessionId: params.sessionId,
-      prompt: [{ type: "text", text: "/goal clear" }],
+      prompt,
+      _meta: { steering: { idleBehavior: "promptRequired" } },
     });
+    if (steering.outcome === "promptRequired") {
+      await this.prompt({ sessionId: params.sessionId, prompt });
+    } else {
+      // The injected command bypasses prompt(), so publish its optimistic
+      // removal here. A later SDK active_goal message remains authoritative.
+      await this.publishGoal(params.sessionId, null);
+    }
     return {};
+  }
+
+  private async publishGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { goal },
+      },
+    });
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -2664,13 +2689,7 @@ export class ClaudeAcpAgent {
         // exhaustive switch and publish only the provider-neutral ACP shape.
         if ((message as { type: string }).type === "active_goal") {
           const activeGoal = message as unknown as SDKActiveGoalMessage;
-          await this.client.sessionUpdate({
-            sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "session_info_update",
-              _meta: { goal: toGoalSnapshot(activeGoal) },
-            },
-          });
+          await this.publishGoal(params.sessionId, toGoalSnapshot(activeGoal));
           continue;
         }
 
@@ -3465,6 +3484,20 @@ export class ClaudeAcpAgent {
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
                 settleOrDefer({ stopReason: "refusal", usage: sessionUsage(session) });
+                break;
+              }
+
+              // A priority:'now' steer can make the SDK terminate the
+              // interrupted cycle with an error-shaped diagnostic result
+              // before it replays the injected message's echo. That result is
+              // not the steered command's outcome: keep it on the steer lane
+              // and let the cycle after the pending echo decide the turn.
+              if (
+                message.is_error &&
+                isSteering(session.activeTurn) &&
+                session.activeTurn.steeredEchoes.size > 0
+              ) {
+                settleOrDefer({ stopReason: "end_turn", usage: sessionUsage(session) });
                 break;
               }
 
