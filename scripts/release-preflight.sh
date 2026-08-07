@@ -64,8 +64,12 @@ pass "one open release PR: #$pr_number ($pr_title)"
 # release-please reads the version to tag from the PR title, while npm publishes
 # whatever package.json says. If those disagree the tag and the published package
 # describe different releases, so check all three sources against each other.
-case $pr_title in
-*"release "*) title_version=${pr_title##*release } ;;
+# The version is the last field, not everything after 'release': release-please
+# writes the component into the title as 'release <component> X.Y.Z' whenever it
+# is configured to tag with one.
+title_version=${pr_title##* }
+case $title_version in
+[0-9]*.[0-9]*.[0-9]*) ;;
 *) fail "cannot read a version from PR title '$pr_title'." ;;
 esac
 pkg_version=$(gh api "repos/$repo/contents/package.json?ref=$head_ref" \
@@ -80,6 +84,23 @@ if [ "$title_version" != "$pkg_version" ] || [ "$title_version" != "$manifest_ve
       .release-please-manifest.json $manifest_version"
 fi
 pass "version agrees across PR title, package.json and manifest: $title_version"
+
+# The tag comes from the config, not from the PR title. With
+# include-component-in-tag left on, release-please tags <component>-vX.Y.Z, which
+# breaks the vX.Y.Z scheme the rest of this script and docs/RELEASES.md rely on,
+# and makes it rewrite the whole history into the changelog because no tag under
+# that scheme exists yet. The compare link it writes into the PR body names the
+# tags it is going to use, so check those rather than trusting the config.
+compare_tag=$(gh pr view "$pr_number" --repo "$repo" --json body --jq '
+  .body | capture("/compare/[^)]*[.][.][.](?<to>[^)\\s]+)").to // ""' 2>/dev/null || true)
+case $compare_tag in
+"" | "v$title_version") ;;
+*) fail "release-please is going to tag '$compare_tag', not 'v$title_version'.
+      Every previous release is tagged vX.Y.Z, and the changelog for #$pr_number
+      covers the whole history rather than just this release, because no tag
+      under that scheme exists. Set 'include-component-in-tag': false in
+      release-please-config.json, then let it rewrite the release PR." ;;
+esac
 
 if gh release view "v$title_version" --repo "$repo" >/dev/null 2>&1; then
   fail "tag v$title_version already exists. Merging would try to release it twice."

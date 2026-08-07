@@ -64,6 +64,14 @@ Note that `config-file` only takes effect while the workflow does **not** pass a
 `release-type` input to the action — with `release-type` set, the action ignores
 the config entirely. The release type is declared inside the config instead.
 
+Because the config is what is read, it also has to say
+`"include-component-in-tag": false`. Left at its default, release-please derives a
+component from the package name and tags `claude-agent-acp-vX.Y.Z` instead of
+`vX.Y.Z`. That renames the tag every step here looks up, and because no tag under
+the new scheme exists, it also walks the entire commit history into the changelog
+rather than just what landed since the last release. The preflight checks the tag
+release-please is going to use, so this cannot reach a published release.
+
 Releasing 1.0.0 is therefore an explicit act: add `"release-as": "1.0.0"` to
 `release-please-config.json` in its own PR, release, then remove it again.
 
