@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.65.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.2...v0.65.0) (2026-08-05)
+
+
+### Features
+
+* **deps-dev:** Bump nanoid from 3.3.16 to 3.3.17 ([#951](https://github.com/agentclientprotocol/claude-agent-acp/issues/951)) ([b965dd2](https://github.com/agentclientprotocol/claude-agent-acp/commit/b965dd21917e822b56f5012c3572902f26c065c9))
+* **deps-dev:** Bump tinyexec from 1.2.4 to 1.3.0 in the minor group ([#959](https://github.com/agentclientprotocol/claude-agent-acp/issues/959)) ([15b4eb4](https://github.com/agentclientprotocol/claude-agent-acp/commit/15b4eb46f329566837eae58f2ee4b05e3e81bf64))
+* **deps:** Bump @hono/node-server from 1.19.17 to 2.1.0 ([#956](https://github.com/agentclientprotocol/claude-agent-acp/issues/956)) ([f9123f3](https://github.com/agentclientprotocol/claude-agent-acp/commit/f9123f3e18560b580398aabf49e2190f69746976))
+* **deps:** Bump fast-uri from 3.1.4 to 3.1.5 ([#952](https://github.com/agentclientprotocol/claude-agent-acp/issues/952)) ([0988438](https://github.com/agentclientprotocol/claude-agent-acp/commit/098843842895dcb450746bd064dbb1509e3049d1))
+* **steering:** settle a steered turn at idle, not at the interrupt ([#958](https://github.com/agentclientprotocol/claude-agent-acp/issues/958)) ([a84b810](https://github.com/agentclientprotocol/claude-agent-acp/commit/a84b81080a4127edf40bc448fc8bf2b15503304d))
+
+## [0.64.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.1...v0.64.2) (2026-08-02)
+
+
+### Bug Fixes
+
+* restore the single-tool representation for ExitPlanMode ([#942](https://github.com/agentclientprotocol/claude-agent-acp/issues/942)) ([4302a4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/4302a4b0b6df821b164cbe4857f26cf5b44b532c))
+
 ## [0.64.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.0...v0.64.1) (2026-08-02)
 
 
