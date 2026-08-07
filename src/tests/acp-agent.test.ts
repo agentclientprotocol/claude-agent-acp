@@ -3413,6 +3413,74 @@ describe("stop reason propagation", () => {
     await expect(response).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
+  it("rolls back an optimistic goal update when the goal command fails", async () => {
+    const updates: any[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: original } = await iter.next();
+        yield userEcho(original);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "Original",
+            iterations: 2,
+            set_at: 1710000000000,
+            tokens_at_start: 0,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        const { value: replacement } = await iter.next();
+        yield userEcho(replacement);
+        yield createResultMessage({
+          subtype: "success",
+          stop_reason: null,
+          is_error: true,
+          result: "goal rejected",
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "/goal Original" }],
+      }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "/goal Replacement" }],
+      }),
+    ).rejects.toBeDefined();
+
+    const goalUpdates = updates
+      .map(({ update }) => update._meta?.goal)
+      .filter((goal) => goal !== undefined);
+    expect(goalUpdates.at(-2)).toEqual(
+      expect.objectContaining({ objective: "Replacement", status: "active" }),
+    );
+    expect(goalUpdates.at(-1)).toEqual(
+      expect.objectContaining({ objective: "Original", iterations: 2 }),
+    );
+  });
+
   it("derives only state-changing goal slash commands", () => {
     expect(goalUpdateFromPrompt("/goal clear")).toBeNull();
     expect(goalUpdateFromPrompt("/goal")).toBeUndefined();
@@ -10056,7 +10124,7 @@ describe("turn steering (_session/steering)", () => {
     });
   });
 
-  it("submits clear through the session prompt queue when the session is idle", async () => {
+  it("submits set and clear through the session prompt queue when the session is idle", async () => {
     const agent = createMockAgent();
     const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });
     agent.sessions["test-session"] = mockSessionState({
@@ -10064,8 +10132,15 @@ describe("turn steering (_session/steering)", () => {
       turnQueue: [],
     });
 
+    await expect(
+      agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" }),
+    ).resolves.toEqual({});
     await expect(agent.goal({ sessionId: "test-session", action: "clear" })).resolves.toEqual({});
-    expect(prompt).toHaveBeenCalledWith({
+    expect(prompt).toHaveBeenNthCalledWith(1, {
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Replacement" }],
+    });
+    expect(prompt).toHaveBeenNthCalledWith(2, {
       sessionId: "test-session",
       prompt: [{ type: "text", text: "/goal clear" }],
     });
@@ -10087,6 +10162,17 @@ describe("turn steering (_session/steering)", () => {
         yield userEcho(goal.value);
         const clear = await iter.next();
         captured.push(clear.value);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "Keep working",
+            iterations: 2,
+            set_at: 1710000000000,
+            tokens_at_start: 0,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
         yield createResultMessage();
         yield userEcho(clear.value);
         yield createResultMessage();
@@ -10113,6 +10199,14 @@ describe("turn steering (_session/steering)", () => {
       },
     });
     await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    const goalUpdates = updates
+      .map(({ update }) => update._meta?.goal)
+      .filter((goal) => goal !== undefined);
+    const clearIndex = goalUpdates.findIndex((goal) => goal === null);
+    expect(clearIndex).toBeGreaterThanOrEqual(0);
+    expect(goalUpdates.slice(clearIndex + 1)).not.toContainEqual(
+      expect.objectContaining({ objective: "Keep working" }),
+    );
   });
 
   it("replaces a running goal through the goal extension and publishes it immediately", async () => {
@@ -10167,6 +10261,101 @@ describe("turn steering (_session/steering)", () => {
     await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
+  it("does not let a stale runtime update overwrite an optimistic goal replacement", async () => {
+    const updates: any[] = [];
+    let staleUpdateEmitted!: () => void;
+    const staleUpdate = new Promise<void>((resolve) => (staleUpdateEmitted = resolve));
+    let releaseReplacement!: () => void;
+    const replacementGate = new Promise<void>((resolve) => (releaseReplacement = resolve));
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: any) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "Original",
+            iterations: 1,
+            set_at: 1710000000000,
+            tokens_at_start: 0,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        const replacement = await iter.next();
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "Original",
+            iterations: 2,
+            set_at: 1710000000000,
+            tokens_at_start: 0,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        staleUpdateEmitted();
+        await replacementGate;
+        yield userEcho(replacement.value);
+        yield {
+          type: "active_goal",
+          value: {
+            condition: "Replacement",
+            iterations: 1,
+            set_at: 1710000001000,
+            tokens_at_start: 0,
+          },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const runningGoal = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Original" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.goal({ sessionId: "test-session", action: "set", objective: "Replacement" });
+    await staleUpdate;
+
+    const goalUpdates = updates
+      .map(({ update }) => update._meta?.goal)
+      .filter((goal) => goal !== undefined);
+    const replacementIndex = goalUpdates.findIndex((goal) => goal?.objective === "Replacement");
+    expect(replacementIndex).toBeGreaterThanOrEqual(0);
+    expect(goalUpdates.slice(replacementIndex + 1)).not.toContainEqual(
+      expect.objectContaining({ objective: "Original" }),
+    );
+
+    releaseReplacement();
+    await expect(runningGoal).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(goalUpdates).not.toContainEqual(
+      expect.objectContaining({ objective: "Replacement", iterations: 1 }),
+    );
+    await vi.waitFor(() => {
+      expect(updates).toContainEqual({
+        sessionId: "test-session",
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: {
+            goal: expect.objectContaining({ objective: "Replacement", iterations: 1 }),
+          },
+        },
+      });
+    });
+  });
+
   it("cancels the running turn without clearing the persistent goal", async () => {
     const updates: any[] = [];
     let releaseAfterCancel!: () => void;
@@ -10218,6 +10407,9 @@ describe("turn steering (_session/steering)", () => {
     expect(() => parseGoalRequest({ sessionId: "test-session", action: "set" })).toThrow(
       'goal action "set" requires a non-empty objective',
     );
+    expect(() =>
+      parseGoalRequest({ sessionId: "test-session", action: "set", objective: "   " }),
+    ).toThrow('goal action "set" requires a non-empty objective');
     expect(() => parseGoalRequest({ sessionId: "test-session", action: "pause" })).toThrow(
       'goal action must be "set" or "clear"',
     );

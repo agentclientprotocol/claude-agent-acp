@@ -408,6 +408,20 @@ type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
+  /** Optimistic goal state published for a submitted `/goal` command whose
+   *  matching runtime update has not arrived yet. Runtime updates for the old
+   *  goal are suppressed until this command is echoed or completes, otherwise
+   *  a late old-goal update can overwrite a replacement that the runtime never
+   *  announces (the compatibility case the optimistic update exists for). */
+  pendingGoalUpdate?: {
+    commandUuid: string;
+    expected: GoalSnapshot | null;
+    previous: GoalSnapshot | null | undefined;
+    started: boolean;
+  };
+  /** Last goal snapshot sent to the ACP client, used to roll back an
+   *  optimistic `/goal` update when the command itself fails. */
+  lastPublishedGoal?: GoalSnapshot | null;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -1909,7 +1923,7 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    await this.publishGoalFromPrompt(params.sessionId, firstText);
+    await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
     return response;
   }
 
@@ -1928,6 +1942,10 @@ export class ClaudeAcpAgent {
   }
 
   private async publishGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (session) {
+      session.lastPublishedGoal = goal;
+    }
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -1937,11 +1955,40 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async publishGoalFromPrompt(sessionId: string, prompt: string): Promise<void> {
+  private async publishGoalFromPrompt(
+    sessionId: string,
+    prompt: string,
+    commandUuid: string,
+  ): Promise<void> {
     const goalUpdate = goalUpdateFromPrompt(prompt);
     if (goalUpdate !== undefined) {
+      const session = this.sessions[sessionId];
+      if (session) {
+        session.pendingGoalUpdate = {
+          commandUuid,
+          expected: goalUpdate,
+          previous: session.lastPublishedGoal,
+          started: false,
+        };
+      }
       await this.publishGoal(sessionId, goalUpdate);
     }
+  }
+
+  private async publishRuntimeGoal(sessionId: string, goal: GoalSnapshot | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    const pending = session?.pendingGoalUpdate;
+    if (pending) {
+      const matchesPending =
+        pending.expected === null
+          ? goal === null
+          : goal !== null && goal.objective === pending.expected.objective;
+      if (!matchesPending) {
+        return;
+      }
+      session.pendingGoalUpdate = undefined;
+    }
+    await this.publishGoal(sessionId, goal);
   }
 
   /** Steer the session per the ACP steering wire protocol: inject a follow-up
@@ -2028,7 +2075,7 @@ export class ClaudeAcpAgent {
     }
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    await this.publishGoalFromPrompt(sessionId, firstText);
+    await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
   }
 
@@ -2692,7 +2739,7 @@ export class ClaudeAcpAgent {
         // exhaustive switch and publish only the provider-neutral ACP shape.
         if ((message as { type: string }).type === "active_goal") {
           const activeGoal = message as unknown as SDKActiveGoalMessage;
-          await this.publishGoal(params.sessionId, toGoalSnapshot(activeGoal));
+          await this.publishRuntimeGoal(params.sessionId, toGoalSnapshot(activeGoal));
           continue;
         }
 
@@ -3292,6 +3339,21 @@ export class ClaudeAcpAgent {
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
                 ensureActiveTurn();
+                // Once the submitted goal command has produced its own result,
+                // no older runtime update can still precede it in the ordered
+                // SDK stream. Stop suppressing updates even when this runtime
+                // omitted the matching active_goal notification entirely.
+                if (session.pendingGoalUpdate?.started) {
+                  const pendingGoalUpdate = session.pendingGoalUpdate;
+                  session.pendingGoalUpdate = undefined;
+                  const goalCommandFailed =
+                    message.is_error ||
+                    message.stop_reason === "refusal" ||
+                    ("result" in message && message.result.includes("Please run /login"));
+                  if (goalCommandFailed) {
+                    await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
+                  }
+                }
               }
 
               // A result closes the stretch of output it terminates: snapshot
@@ -3776,6 +3838,9 @@ export class ClaudeAcpAgent {
             // is still promoted — activateTurn() clears the flag. The turn's own
             // echo is then dropped from the feed (the client already shows it).
             if (message.type === "user" && "uuid" in message && message.uuid) {
+              if (session.pendingGoalUpdate?.commandUuid === message.uuid) {
+                session.pendingGoalUpdate.started = true;
+              }
               const queued = findUnsettledTurn(message.uuid);
               if (queued) {
                 // Only (re)activate if this isn't already the active turn — a
