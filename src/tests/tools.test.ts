@@ -18,8 +18,10 @@ import {
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
+  applyTaskList,
   applyTaskUpdate,
   parseTaskCreateOutput,
+  parseTaskListOutput,
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
@@ -1817,6 +1819,14 @@ describe("planEntries - undefined input regression", () => {
       { content: "Task 2", status: "completed", priority: "medium" },
     ]);
   });
+
+  it("uses activeForm while a todo is in progress", () => {
+    expect(
+      planEntries({
+        todos: [{ content: "Run tests", status: "in_progress", activeForm: "Running tests" }],
+      }),
+    ).toEqual([{ content: "Running tests", status: "in_progress", priority: "medium" }]);
+  });
 });
 
 describe("toAcpNotifications - TodoWrite with undefined input regression", () => {
@@ -1884,6 +1894,20 @@ describe("parseTaskCreateOutput", () => {
     expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
   });
 
+  it("continues past unrelated JSON blocks", () => {
+    const parsed = parseTaskCreateOutput([
+      { type: "text", text: JSON.stringify({ metadata: "unrelated" }) },
+      { type: "text", text: JSON.stringify({ task: { id: "2", subject: "Y" } }) },
+    ]);
+    expect(parsed).toEqual({ task: { id: "2", subject: "Y" } });
+  });
+
+  it("parses the human-readable TaskCreate format used in session history", () => {
+    expect(parseTaskCreateOutput("Task #42 created successfully: Run tests")).toEqual({
+      task: { id: "42", subject: "Run tests" },
+    });
+  });
+
   it("returns undefined for non-JSON content", () => {
     expect(parseTaskCreateOutput("not json")).toBeUndefined();
     expect(parseTaskCreateOutput([{ type: "text", text: "not json" }])).toBeUndefined();
@@ -1918,11 +1942,15 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
 
   it("updates fields by task ID and keeps insertion order in plan entries", () => {
     const state: TaskState = new Map();
-    applyTaskCreate(state, { subject: "A", description: "" }, { task: { id: "1", subject: "A" } });
+    applyTaskCreate(
+      state,
+      { subject: "A", description: "", activeForm: "Working on A" },
+      { task: { id: "1", subject: "A" } },
+    );
     applyTaskCreate(state, { subject: "B", description: "" }, { task: { id: "2", subject: "B" } });
     applyTaskUpdate(state, { taskId: "1", status: "in_progress" });
     expect(taskStateToPlanEntries(state)).toEqual([
-      { content: "A", status: "in_progress", priority: "medium" },
+      { content: "Working on A", status: "in_progress", priority: "medium" },
       { content: "B", status: "pending", priority: "medium" },
     ]);
   });
@@ -1951,6 +1979,84 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     // Without a subject we'd render an empty-content plan entry, so the
     // update is dropped instead of synthesizing a blank placeholder.
     expect(state.has("5")).toBe(false);
+  });
+
+  it("rebuilds task state from TaskList while preserving richer local fields", () => {
+    const state: TaskState = new Map([
+      [
+        "1",
+        {
+          subject: "Old subject",
+          status: "pending",
+          activeForm: "Running the task",
+          description: "Details",
+        },
+      ],
+      ["deleted", { subject: "Stale", status: "pending" }],
+    ]);
+    const output = parseTaskListOutput(
+      JSON.stringify({
+        tasks: [
+          { id: "1", subject: "Current subject", status: "in_progress", blockedBy: [] },
+          { id: "2", subject: "New task", status: "pending", blockedBy: [] },
+        ],
+      }),
+    );
+
+    expect(output).toBeDefined();
+    applyTaskList(state, output!);
+
+    expect([...state.entries()]).toEqual([
+      [
+        "1",
+        {
+          subject: "Current subject",
+          status: "in_progress",
+          activeForm: "Running the task",
+          description: "Details",
+        },
+      ],
+      [
+        "2",
+        {
+          subject: "New task",
+          status: "pending",
+          activeForm: undefined,
+          description: undefined,
+        },
+      ],
+    ]);
+  });
+
+  it("finds a TaskList snapshot after an unrelated JSON block", () => {
+    expect(
+      parseTaskListOutput([
+        { type: "text", text: JSON.stringify({ metadata: "unrelated" }) },
+        {
+          type: "text",
+          text: JSON.stringify({
+            tasks: [{ id: "1", subject: "Recovered", status: "pending", blockedBy: [] }],
+          }),
+        },
+      ]),
+    ).toEqual({
+      tasks: [{ id: "1", subject: "Recovered", status: "pending", blockedBy: [] }],
+    });
+  });
+
+  it("parses the human-readable TaskList format used in session history", () => {
+    expect(
+      parseTaskListOutput(
+        "#1 [in_progress] Run tests\n#2 [pending] Write release notes [blocked by #1]",
+      ),
+    ).toEqual({
+      tasks: [
+        { id: "1", subject: "Run tests", status: "in_progress", blockedBy: [] },
+        { id: "2", subject: "Write release notes", status: "pending", blockedBy: ["1"] },
+      ],
+    });
+
+    expect(parseTaskListOutput("No tasks found")).toEqual({ tasks: [] });
   });
 });
 
@@ -2112,10 +2218,9 @@ describe("toAcpNotifications - Task* tools", () => {
     });
   });
 
-  it("suppresses TaskList and TaskGet tool_result without touching task state", () => {
+  it("uses the structured TaskList result as an authoritative plan snapshot", () => {
     const toolUseCache: ToolUseCache = {
       "list-1": { type: "tool_use", id: "list-1", name: "TaskList", input: {} },
-      "get-1": { type: "tool_use", id: "get-1", name: "TaskGet", input: { taskId: "1" } },
     };
     const taskState: TaskState = new Map([
       ["1", { subject: "Existing", status: "in_progress" as const }],
@@ -2123,8 +2228,93 @@ describe("toAcpNotifications - Task* tools", () => {
 
     const notifications = toAcpNotifications(
       [
-        { type: "tool_result", tool_use_id: "list-1", content: "...", is_error: false },
-        { type: "tool_result", tool_use_id: "get-1", content: "...", is_error: false },
+        {
+          type: "tool_result",
+          tool_use_id: "list-1",
+          content: "#2 [pending] Recovered",
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        taskState,
+        toolUseResult: {
+          tasks: [{ id: "2", subject: "Recovered", status: "pending", blockedBy: [] }],
+        },
+      },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "plan",
+      entries: [{ content: "Recovered", status: "pending", priority: "medium" }],
+    });
+    expect([...taskState.keys()]).toEqual(["2"]);
+  });
+
+  it("does not apply a logically failed TaskUpdate", () => {
+    const toolUseCache: ToolUseCache = {
+      "update-1": {
+        type: "tool_use",
+        id: "update-1",
+        name: "TaskUpdate",
+        input: { taskId: "1", status: "completed" },
+      },
+    };
+    const taskState: TaskState = new Map([["1", { subject: "Existing", status: "pending" }]]);
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: "Task #1 not found",
+          is_error: false,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      {
+        taskState,
+        toolUseResult: {
+          success: false,
+          taskId: "1",
+          updatedFields: [],
+          error: "Task not found",
+        },
+      },
+    );
+
+    expect(notifications).toHaveLength(0);
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "pending" });
+  });
+
+  it("does not apply a replayed TaskUpdate failure without structured output", () => {
+    const toolUseCache: ToolUseCache = {
+      "update-1": {
+        type: "tool_use",
+        id: "update-1",
+        name: "TaskUpdate",
+        input: { taskId: "1", status: "completed" },
+      },
+    };
+    const taskState: TaskState = new Map([["1", { subject: "Existing", status: "pending" }]]);
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "update-1",
+          content: "Task #1 not found",
+          is_error: false,
+        },
       ] as any,
       "user",
       "test-session",
@@ -2135,7 +2325,7 @@ describe("toAcpNotifications - Task* tools", () => {
     );
 
     expect(notifications).toHaveLength(0);
-    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "in_progress" });
+    expect(taskState.get("1")).toEqual({ subject: "Existing", status: "pending" });
   });
 
   it("does not apply TaskCreate/TaskUpdate when the tool_result reports an error", () => {

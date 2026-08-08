@@ -122,11 +122,14 @@ import {
 import { SettingsManager } from "./settings.js";
 import {
   applyTaskCreate,
+  applyTaskList,
   applyTaskUpdate,
   ClaudePlanEntry,
   createPostToolUseHook,
   createTaskHook,
   parseTaskCreateOutput,
+  parseTaskListOutput,
+  parseTaskUpdateOutput,
   planEntries,
   registerHookCallback,
   TaskState,
@@ -1893,6 +1896,10 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
+      await this.publishTaskPlan(params.sessionId, session.taskState);
+    }
+
     const userMessage = promptToClaude(params);
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
@@ -1951,6 +1958,16 @@ export class ClaudeAcpAgent {
       update: {
         sessionUpdate: "session_info_update",
         _meta: { goal },
+      },
+    });
+  }
+
+  private async publishTaskPlan(sessionId: string, taskState: TaskState): Promise<void> {
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "plan",
+        entries: taskStateToPlanEntries(taskState),
       },
     });
   }
@@ -4184,13 +4201,18 @@ export class ClaudeAcpAgent {
             }
             break;
           }
-          // `conversation_reset` (from `/clear`, plan-mode exit, fresh-session
-          // flows) is safe to drop: turn lifecycle here is driven by
-          // results/idle, and the client owns its own transcript view.
+          case "conversation_reset": {
+            // The SDK has switched to a fresh conversation, whose Task* IDs
+            // and task store are independent of the previous transcript.
+            // Clear both the in-memory snapshot and the client's visible plan
+            // before any follow-up prompt can republish stale tasks.
+            session.taskState.clear();
+            await this.publishTaskPlan(params.sessionId, session.taskState);
+            break;
+          }
           case "tool_use_summary":
           case "auth_status":
           case "prompt_suggestion":
-          case "conversation_reset":
             break;
           default:
             unreachable(message, this.logger);
@@ -5832,15 +5854,7 @@ export class ClaudeAcpAgent {
             hooks: [
               createTaskHook({
                 taskState,
-                onChange: async () => {
-                  await this.client.sessionUpdate({
-                    sessionId,
-                    update: {
-                      sessionUpdate: "plan",
-                      entries: taskStateToPlanEntries(taskState),
-                    },
-                  });
-                },
+                onChange: () => this.publishTaskPlan(sessionId, taskState),
               }),
             ],
           },
@@ -5851,15 +5865,7 @@ export class ClaudeAcpAgent {
             hooks: [
               createTaskHook({
                 taskState,
-                onChange: async () => {
-                  await this.client.sessionUpdate({
-                    sessionId,
-                    update: {
-                      sessionUpdate: "plan",
-                      entries: taskStateToPlanEntries(taskState),
-                    },
-                  });
-                },
+                onChange: () => this.publishTaskPlan(sessionId, taskState),
               }),
             ],
           },
@@ -7702,23 +7708,44 @@ export function toAcpNotifications(
 
         if (isTaskTool(toolUse.name)) {
           // Headless/SDK sessions emit Task* tools instead of TodoWrite.
-          // TaskCreate / TaskUpdate mutate the accumulated task list; TaskList
-          // and TaskGet are read-only so we just suppress their tool_call /
-          // tool_result events. The plan update is emitted as a snapshot of
-          // the accumulated state, mirroring the legacy TodoWrite behavior.
+          // TaskCreate / TaskUpdate mutate the accumulated task list. TaskList
+          // reconciles it from the SDK's authoritative snapshot, which repairs
+          // resumed or compacted sessions whose creating calls are no longer in
+          // replay history. TaskGet is read-only and remains suppressed. Plan
+          // updates always carry the full accumulated snapshot, mirroring the
+          // legacy TodoWrite behavior.
           const isError = "is_error" in chunk && chunk.is_error;
+          let shouldEmitTaskPlan = false;
           if (!isError) {
             if (toolUse.name === "TaskCreate") {
               applyTaskCreate(
                 taskState,
                 toolUse.input as Parameters<typeof applyTaskCreate>[1],
-                parseTaskCreateOutput(chunk.content),
+                parseTaskCreateOutput(toolUseResult) ?? parseTaskCreateOutput(chunk.content),
               );
+              shouldEmitTaskPlan = true;
             } else if (toolUse.name === "TaskUpdate") {
-              applyTaskUpdate(taskState, toolUse.input as Parameters<typeof applyTaskUpdate>[1]);
+              const input = toolUse.input as Parameters<typeof applyTaskUpdate>[1];
+              const output =
+                parseTaskUpdateOutput(toolUseResult, input?.taskId) ??
+                parseTaskUpdateOutput(chunk.content, input?.taskId);
+              // Older CLI transcripts have no structured output, so retain the
+              // input-based fallback. When an output is available, only apply a
+              // confirmed update for the same task.
+              if (!output || (output.success && output.taskId === input?.taskId)) {
+                applyTaskUpdate(taskState, input);
+                shouldEmitTaskPlan = true;
+              }
+            } else if (toolUse.name === "TaskList") {
+              const output =
+                parseTaskListOutput(toolUseResult) ?? parseTaskListOutput(chunk.content);
+              if (output) {
+                applyTaskList(taskState, output);
+                shouldEmitTaskPlan = true;
+              }
             }
           }
-          if (!isError && (toolUse.name === "TaskCreate" || toolUse.name === "TaskUpdate")) {
+          if (shouldEmitTaskPlan) {
             update = {
               sessionUpdate: "plan",
               entries: taskStateToPlanEntries(taskState),

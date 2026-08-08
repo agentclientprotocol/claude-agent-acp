@@ -21,7 +21,9 @@ import {
   ReportFindingsInput,
   TaskCreateInput,
   TaskCreateOutput,
+  TaskListOutput,
   TaskUpdateInput,
+  TaskUpdateOutput,
   TodoWriteInput,
   WebFetchInput,
   WebSearchInput,
@@ -1030,7 +1032,7 @@ export type ClaudePlanEntry = {
 
 export function planEntries(input: { todos: ClaudePlanEntry[] } | undefined): PlanEntry[] {
   return (input?.todos ?? []).map((todo) => ({
-    content: todo.content,
+    content: todo.status === "in_progress" && todo.activeForm ? todo.activeForm : todo.content,
     status: todo.status,
     priority: "medium",
   }));
@@ -1052,30 +1054,28 @@ export type TaskEntry = {
 export type TaskState = Map<string, TaskEntry>;
 
 /**
- * Best-effort parse of a TaskCreate tool_result content into the structured
- * TaskCreateOutput. The SDK delivers tool outputs either as a string or as
- * an array of TextBlockParam-like blocks containing JSON text; try both.
+ * Best-effort parse of a structured Task* tool_result. The SDK delivers tool
+ * outputs either as a string or as an array of TextBlockParam-like blocks
+ * containing JSON text; try both.
  */
-export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
-  const tryParse = (text: string): TaskCreateOutput | undefined => {
+function parseJsonToolOutput<T>(
+  content: unknown,
+  isExpectedOutput: (value: unknown) => value is T,
+): T | undefined {
+  const tryParse = (text: string): T | undefined => {
     try {
-      const parsed = JSON.parse(text);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        parsed.task &&
-        typeof parsed.task.id === "string"
-      ) {
-        return parsed as TaskCreateOutput;
-      }
+      const parsed: unknown = JSON.parse(text);
+      return isExpectedOutput(parsed) ? parsed : undefined;
     } catch {
-      // ignore
+      return undefined;
     }
-    return undefined;
   };
 
   if (typeof content === "string") {
     return tryParse(content);
+  }
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    return isExpectedOutput(content) ? content : undefined;
   }
   if (Array.isArray(content)) {
     for (const block of content) {
@@ -1086,6 +1086,119 @@ export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | unde
           if (parsed) return parsed;
         }
       }
+    }
+  }
+  return undefined;
+}
+
+function toolOutputTexts(content: unknown): string[] {
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) =>
+    block &&
+    typeof block === "object" &&
+    "type" in block &&
+    block.type === "text" &&
+    "text" in block &&
+    typeof block.text === "string"
+      ? [block.text]
+      : [],
+  );
+}
+
+export function parseTaskCreateOutput(content: unknown): TaskCreateOutput | undefined {
+  const structured = parseJsonToolOutput(content, (parsed): parsed is TaskCreateOutput =>
+    Boolean(
+      parsed &&
+      typeof parsed === "object" &&
+      "task" in parsed &&
+      parsed.task &&
+      typeof parsed.task === "object" &&
+      "id" in parsed.task &&
+      typeof parsed.task.id === "string",
+    ),
+  );
+  if (structured) return structured;
+
+  for (const text of toolOutputTexts(content)) {
+    const match = /^Task #(\S+) created successfully: (.+)$/.exec(text.trim());
+    if (match) return { task: { id: match[1], subject: match[2] } };
+  }
+  return undefined;
+}
+
+export function parseTaskListOutput(content: unknown): TaskListOutput | undefined {
+  const validStatuses = new Set(["pending", "in_progress", "completed"]);
+  const structured = parseJsonToolOutput(content, (parsed): parsed is TaskListOutput =>
+    Boolean(
+      parsed &&
+      typeof parsed === "object" &&
+      "tasks" in parsed &&
+      Array.isArray(parsed.tasks) &&
+      parsed.tasks.every(
+        (task) =>
+          task &&
+          typeof task === "object" &&
+          typeof task.id === "string" &&
+          typeof task.subject === "string" &&
+          typeof task.status === "string" &&
+          validStatuses.has(task.status),
+      ),
+    ),
+  );
+  if (structured) return structured;
+
+  for (const text of toolOutputTexts(content)) {
+    if (text.trim() === "No tasks found") return { tasks: [] };
+
+    const tasks: TaskListOutput["tasks"] = [];
+    const lines = text.trim().split("\n");
+    for (const line of lines) {
+      const match =
+        /^#(\S+) \[(pending|in_progress|completed)\] (.+?)(?: \(([^()]*)\))?(?: \[blocked by ((?:#[^,\]]+(?:, )?)+)\])?$/.exec(
+          line,
+        );
+      if (!match) {
+        tasks.length = 0;
+        break;
+      }
+      tasks.push({
+        id: match[1],
+        subject: match[3],
+        status: match[2] as TaskListOutput["tasks"][number]["status"],
+        ...(match[4] ? { owner: match[4] } : {}),
+        blockedBy: match[5] ? match[5].split(", ").map((id) => id.slice(1)) : [],
+      });
+    }
+    if (tasks.length > 0) return { tasks };
+  }
+  return undefined;
+}
+
+export function parseTaskUpdateOutput(
+  content: unknown,
+  expectedTaskId?: string,
+): TaskUpdateOutput | undefined {
+  const structured = parseJsonToolOutput(content, (parsed): parsed is TaskUpdateOutput =>
+    Boolean(
+      parsed &&
+      typeof parsed === "object" &&
+      "success" in parsed &&
+      typeof parsed.success === "boolean" &&
+      "taskId" in parsed &&
+      typeof parsed.taskId === "string" &&
+      "updatedFields" in parsed &&
+      Array.isArray(parsed.updatedFields) &&
+      parsed.updatedFields.every((field) => typeof field === "string"),
+    ),
+  );
+  if (structured) return structured;
+
+  for (const text of toolOutputTexts(content)) {
+    const notFound = /^Task #(\S+) not found$/.exec(text.trim());
+    const taskId = notFound?.[1] ?? expectedTaskId;
+    if (taskId && (notFound || text.trim() === "Failed to delete task")) {
+      return { success: false, taskId, updatedFields: [], error: text.trim() };
     }
   }
   return undefined;
@@ -1125,9 +1238,23 @@ export function applyTaskUpdate(state: TaskState, input: TaskUpdateInput | undef
   });
 }
 
+export function applyTaskList(state: TaskState, output: TaskListOutput): void {
+  const previous = new Map(state);
+  state.clear();
+  for (const task of output.tasks) {
+    const existing = previous.get(task.id);
+    state.set(task.id, {
+      subject: task.subject,
+      status: task.status,
+      activeForm: existing?.activeForm,
+      description: existing?.description,
+    });
+  }
+}
+
 export function taskStateToPlanEntries(state: TaskState): PlanEntry[] {
   return Array.from(state.values()).map((task) => ({
-    content: task.subject,
+    content: task.status === "in_progress" && task.activeForm ? task.activeForm : task.subject,
     status: task.status,
     priority: "medium",
   }));

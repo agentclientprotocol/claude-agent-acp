@@ -195,6 +195,150 @@ function injectGeneratorSession(
   return input;
 }
 
+describe("task plan lifecycle", () => {
+  function setup(
+    taskState: Map<string, any>,
+    makeGenerator: (input: Pushable<any>) => AsyncGenerator<any> = successfulPrompt,
+  ) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, makeGenerator, { taskState });
+    return { agent, updates };
+  }
+
+  function successfulResult() {
+    return {
+      type: "result",
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  async function* successfulPrompt(input: Pushable<any>) {
+    const iter = input[Symbol.asyncIterator]();
+    const { value: userMessage } = await iter.next();
+    yield userEcho(userMessage);
+    yield successfulResult();
+  }
+
+  it("republishes the session task snapshot when a follow-up prompt starts", async () => {
+    const { agent, updates } = setup(
+      new Map([
+        [
+          "task-1",
+          {
+            subject: "Run tests",
+            status: "in_progress",
+            activeForm: "Running tests",
+          },
+        ],
+        ["task-2", { subject: "Write release notes", status: "pending" }],
+      ]),
+    );
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Continue" }],
+    });
+
+    expect(updates.filter((notification) => notification.update.sessionUpdate === "plan")).toEqual([
+      {
+        sessionId: "test-session",
+        update: {
+          sessionUpdate: "plan",
+          entries: [
+            { content: "Running tests", status: "in_progress", priority: "medium" },
+            { content: "Write release notes", status: "pending", priority: "medium" },
+          ],
+        },
+      },
+    ]);
+  });
+
+  it("does not republish a completed plan on an unrelated follow-up", async () => {
+    const { agent, updates } = setup(
+      new Map([["task-1", { subject: "Run tests", status: "completed" }]]),
+    );
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Start something else" }],
+    });
+
+    expect(updates.filter((notification) => notification.update.sessionUpdate === "plan")).toEqual(
+      [],
+    );
+  });
+
+  it("clears the task plan on a conversation reset", async () => {
+    const taskState = new Map([["task-1", { subject: "Run tests", status: "in_progress" }]]);
+    const { agent, updates } = setup(taskState, async function* (input) {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      yield userEcho(first.value);
+      yield {
+        type: "conversation_reset",
+        new_conversation_id: randomUUID(),
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield successfulResult();
+
+      const second = await iter.next();
+      yield userEcho(second.value);
+      yield successfulResult();
+    });
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/clear" }],
+    });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Start fresh" }],
+    });
+
+    expect(taskState.size).toBe(0);
+    expect(updates.filter((notification) => notification.update.sessionUpdate === "plan")).toEqual([
+      {
+        sessionId: "test-session",
+        update: {
+          sessionUpdate: "plan",
+          entries: [{ content: "Run tests", status: "in_progress", priority: "medium" }],
+        },
+      },
+      {
+        sessionId: "test-session",
+        update: { sessionUpdate: "plan", entries: [] },
+      },
+    ]);
+  });
+});
+
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
 
@@ -1006,7 +1150,7 @@ describe("tool conversions", () => {
           sessionUpdate: "plan",
           entries: [
             {
-              content: "Analyze existing test coverage and identify gaps",
+              content: "Analyzing existing test coverage",
               priority: "medium",
               status: "in_progress",
             },
