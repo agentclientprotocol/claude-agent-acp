@@ -916,9 +916,124 @@ export type ToolUpdateMeta = {
 };
 
 const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
+const AIR_EXTENSION_VERSION = 1;
 
 function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
   return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
+}
+
+type AirSessionFailureCategory =
+  | "auth_required"
+  | "bad_request"
+  | "budget_exhausted"
+  | "context_exhausted"
+  | "internal_error"
+  | "overloaded"
+  | "provider_error"
+  | "quota_exhausted"
+  | "rate_limited"
+  | "transport_lost"
+  | "worker_shutdown";
+
+const AIR_FAILURE_PRESENTATION: Record<
+  AirSessionFailureCategory,
+  { message: string; retryable: boolean; actions: string[] }
+> = {
+  auth_required: {
+    message: "Sign in to continue using Claude.",
+    retryable: false,
+    actions: ["login"],
+  },
+  bad_request: {
+    message: "Claude could not process this request.",
+    retryable: false,
+    actions: ["new_turn"],
+  },
+  budget_exhausted: {
+    message: "This Claude session reached its configured budget.",
+    retryable: false,
+    actions: ["new_session"],
+  },
+  context_exhausted: {
+    message: "This Claude turn reached its configured limit.",
+    retryable: false,
+    actions: ["new_turn"],
+  },
+  internal_error: {
+    message: "Claude Agent encountered an internal error.",
+    retryable: true,
+    actions: ["retry"],
+  },
+  overloaded: {
+    message: "Claude is temporarily overloaded.",
+    retryable: true,
+    actions: ["retry"],
+  },
+  provider_error: {
+    message: "The model provider reported an error.",
+    retryable: true,
+    actions: ["retry"],
+  },
+  quota_exhausted: {
+    message: "The Claude account has no available quota.",
+    retryable: false,
+    actions: ["new_session"],
+  },
+  rate_limited: {
+    message: "Claude is temporarily rate limited.",
+    retryable: true,
+    actions: ["retry"],
+  },
+  transport_lost: {
+    message: "The connection to Claude was lost.",
+    retryable: false,
+    actions: ["new_session"],
+  },
+  worker_shutdown: {
+    message: "The Claude worker is shutting down.",
+    retryable: false,
+    actions: ["new_session"],
+  },
+};
+
+function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
+  const jetbrains = capabilities?._meta?.["jetbrains"] as Record<string, unknown> | undefined;
+  const air = jetbrains?.["air"] as Record<string, unknown> | undefined;
+  const version = air?.["version"];
+  const advertised = air?.["capabilities"];
+  return (
+    typeof version === "number" &&
+    Number.isFinite(version) &&
+    Number.isInteger(version) &&
+    version >= AIR_EXTENSION_VERSION &&
+    Array.isArray(advertised) &&
+    advertised.some((capability) => capability === "sessionFailure")
+  );
+}
+
+function providerFailureCategory(errorKind?: SDKAssistantMessageError): AirSessionFailureCategory {
+  switch (errorKind) {
+    case "authentication_failed":
+    case "oauth_org_not_allowed":
+      return "auth_required";
+    case "billing_error":
+      return "quota_exhausted";
+    case "rate_limit":
+      return "rate_limited";
+    case "overloaded":
+      return "overloaded";
+    case "invalid_request":
+    case "model_not_found":
+      return "bad_request";
+    case "max_output_tokens":
+      return "context_exhausted";
+    case "server_error":
+    case "unknown":
+    case undefined:
+      return "provider_error";
+    default:
+      return "provider_error";
+  }
 }
 
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
@@ -1623,6 +1738,12 @@ export class ClaudeAcpAgent {
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
       _meta: {
+        jetbrains: {
+          air: {
+            version: AIR_EXTENSION_VERSION,
+            capabilities: ["sessionFailure"],
+          },
+        },
         steering: {
           supported: true,
         },
@@ -2186,6 +2307,127 @@ export class ClaudeAcpAgent {
       await this.client.sessionUpdate(notification);
     };
 
+    type PublishedSessionFailure = {
+      id: string;
+      revision: number;
+      category: AirSessionFailureCategory;
+      turnId?: string;
+    };
+    const failureRevisions = new Map<string, number>();
+    const sessionFailureEpoch = randomUUID();
+    const activeSessionFailures = new Map<string, PublishedSessionFailure>();
+    let pendingWorkerShutdown = false;
+    const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
+
+    const sessionFailureMeta = (failure: PublishedSessionFailure, phase: "active" | "cleared") => {
+      const presentation = AIR_FAILURE_PRESENTATION[failure.category];
+      return {
+        jetbrains: {
+          air: {
+            version: AIR_EXTENSION_VERSION,
+            sessionFailure: {
+              id: failure.id,
+              revision: failure.revision,
+              phase,
+              category: failure.category,
+              source: "claude",
+              safeMessage: presentation.message,
+              retryable: presentation.retryable,
+              actions: presentation.actions,
+              ...(failure.turnId ? { turnId: failure.turnId } : {}),
+            },
+          },
+        },
+      };
+    };
+
+    const emitSessionFailure = async (
+      failure: PublishedSessionFailure,
+      phase: "active" | "cleared",
+    ): Promise<boolean> => {
+      if (!isCurrentConsumer()) {
+        this.logger.error(
+          `Session ${params.sessionId}: ignored AIR session failure from a stale query consumer`,
+        );
+        return false;
+      }
+      try {
+        await sendUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            _meta: sessionFailureMeta(failure, phase),
+          },
+        });
+        return true;
+      } catch (error) {
+        this.logger.error(
+          `Session ${params.sessionId}: failed to publish AIR session failure: ${error}`,
+        );
+        return false;
+      }
+    };
+
+    const clearSessionFailure = async (
+      shouldClear: (failure: PublishedSessionFailure) => boolean = () => true,
+    ) => {
+      if (!supportsAirSessionFailures(this.clientCapabilities)) return;
+      for (const failure of [...activeSessionFailures.values()]) {
+        if (!shouldClear(failure)) continue;
+        const cleared = {
+          ...failure,
+          revision: failure.revision + 1,
+        };
+        if (await emitSessionFailure(cleared, "cleared")) {
+          failureRevisions.set(cleared.id, cleared.revision);
+          activeSessionFailures.delete(cleared.id);
+        }
+      }
+    };
+
+    const createSessionFailure = async (
+      category: AirSessionFailureCategory,
+      options: { turnScoped?: boolean } = {},
+    ): Promise<PublishedSessionFailure | undefined> => {
+      if (!supportsAirSessionFailures(this.clientCapabilities) || !isCurrentConsumer()) {
+        return undefined;
+      }
+      const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
+      const id = turnId
+        ? `${turnId}:error`
+        : `${params.sessionId}:session-error:${sessionFailureEpoch}`;
+      await clearSessionFailure((failure) => failure.id !== id);
+      return {
+        id,
+        revision: (failureRevisions.get(id) ?? 0) + 1,
+        category,
+        ...(turnId ? { turnId } : {}),
+      };
+    };
+
+    const publishSessionFailure = async (
+      category: AirSessionFailureCategory,
+      options: { turnScoped?: boolean } = {},
+    ) => {
+      const failure = await createSessionFailure(category, options);
+      if (!failure) return;
+      if (await emitSessionFailure(failure, "active")) {
+        failureRevisions.set(failure.id, failure.revision);
+        activeSessionFailures.set(failure.id, failure);
+      }
+    };
+
+    const clearFailuresFromEarlierTurns = async () => {
+      const activeTurnId = session.activeTurn?.promptUuid;
+      await clearSessionFailure((failure) => failure.turnId !== activeTurnId);
+    };
+
+    const internalErrorForClient = (data: unknown, rawDetail?: string) =>
+      RequestError.internalError(
+        data,
+        supportsAirSessionFailures(this.clientCapabilities) ? undefined : rawDetail,
+      );
+
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
@@ -2479,6 +2721,9 @@ export class ClaudeAcpAgent {
       disarmForceCancel(session);
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
+        this.logger.error(
+          `Session ${params.sessionId}: cannot fail active turn because no unsettled active turn exists: ${error}`,
+        );
         return;
       }
       turn.settled = true;
@@ -2491,6 +2736,38 @@ export class ClaudeAcpAgent {
       // suppress the next turn's issue-#453 result-text fallback.
       session.emittedAssistantText = false;
       turn.reject(error);
+    };
+
+    /** Complete a negotiated terminal failure on the prompt response itself,
+     *  which is the canonical AIR carrier. Legacy clients keep the historical
+     *  JSON-RPC rejection path. */
+    const failActiveWithSessionFailure = async (
+      category: AirSessionFailureCategory,
+      error: unknown,
+    ) => {
+      if (!supportsAirSessionFailures(this.clientCapabilities)) {
+        failActive(error);
+        return;
+      }
+      if (!session.activeTurn || session.activeTurn.settled) {
+        this.logger.error(
+          `Session ${params.sessionId}: cannot attach ${category} to a prompt response because no active turn exists; publishing a session-scoped failure`,
+        );
+        await publishSessionFailure(category, { turnScoped: false });
+        return;
+      }
+      const failure = await createSessionFailure(category);
+      if (!failure) {
+        failActive(error);
+        return;
+      }
+      failureRevisions.set(failure.id, failure.revision);
+      activeSessionFailures.set(failure.id, failure);
+      settleActive({
+        stopReason: "end_turn",
+        usage: sessionUsage(session),
+        _meta: sessionFailureMeta(failure, "active"),
+      });
     };
 
     /** Reject every in-flight turn — used when the stream dies. */
@@ -2614,6 +2891,25 @@ export class ClaudeAcpAgent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
+          if (pendingWorkerShutdown) {
+            pendingWorkerShutdown = false;
+            if (session.activeTurn) {
+              if (!isHeldOpen(session.activeTurn)) {
+                await failActiveWithSessionFailure(
+                  "worker_shutdown",
+                  internalErrorForClient({ errorKind: "worker_shutdown" }),
+                );
+              } else {
+                // The held turn already has its authoritative terminal outcome,
+                // but EOF permanently closes the non-revivable Query. Preserve
+                // the turn result below and report the independent session-health
+                // failure without a turnId so AIR can offer a new session.
+                await publishSessionFailure("worker_shutdown", { turnScoped: false });
+              }
+            } else {
+              await publishSessionFailure("worker_shutdown", { turnScoped: false });
+            }
+          }
           // The stream ended. Settle the in-flight turns FIRST, then release the
           // stream resources — same order as the error paths (failAllTurns before
           // closeQueryStream). Settling is the user-facing contract; resource
@@ -2970,7 +3266,8 @@ export class ClaudeAcpAgent {
                       `Session ${params.sessionId}: SDK went idle without emitting a result ` +
                         `for the active turn; failing the in-flight prompt (issue #825)`,
                     );
-                    failActive(
+                    await failActiveWithSessionFailure(
+                      "internal_error",
                       RequestError.internalError(
                         errorKindData("no_result"),
                         TURN_NO_RESULT_MESSAGE,
@@ -3183,9 +3480,14 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "worker_shutting_down":
-                // A Remote Control worker announced a graceful teardown. This is a
-                // live-tail signal for remote clients to explain why a session went
-                // away; it's not meaningful for a local stdio ACP session.
+                // Defer until stream end. The announcement is durable and may be
+                // replayed before later frames, but those frames do not prove that
+                // a new worker epoch began: they can be buffered output from the
+                // shutting-down worker. Keep the signal armed until the transport
+                // actually ends. Deliberately do not add a quiet-period timer: the
+                // iterator has no replay/live boundary, so a timeout could publish
+                // while a slow replay is still in flight.
+                pendingWorkerShutdown = true;
                 break;
               case "elicitation_complete": {
                 // A url-mode MCP elicitation finished server-side. Let the client
@@ -3506,6 +3808,7 @@ export class ClaudeAcpAgent {
 
               if (session.cancelled) {
                 if (!isAutonomousResult) {
+                  await clearFailuresFromEarlierTurns();
                   stopReason = "cancelled";
                 }
                 break;
@@ -3542,6 +3845,8 @@ export class ClaudeAcpAgent {
                 }
                 break;
               }
+
+              await clearFailuresFromEarlierTurns();
 
               // A refusal can arrive on any result subtype (and may even set
               // is_error), so handle it before the subtype switch — otherwise the
@@ -3583,10 +3888,17 @@ export class ClaudeAcpAgent {
                 break;
               }
 
+              if (!message.is_error) {
+                await clearSessionFailure();
+              }
+
               switch (message.subtype) {
                 case "success": {
                   if (message.result.includes("Please run /login")) {
-                    failActive(RequestError.authRequired());
+                    await failActiveWithSessionFailure(
+                      "auth_required",
+                      RequestError.authRequired(),
+                    );
                     break;
                   }
                   if (message.stop_reason === "max_tokens") {
@@ -3594,8 +3906,9 @@ export class ClaudeAcpAgent {
                     break;
                   }
                   if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(errorKindData(lastAssistantError), message.result),
+                    await failActiveWithSessionFailure(
+                      providerFailureCategory(lastAssistantError),
+                      internalErrorForClient(errorKindData(lastAssistantError), message.result),
                     );
                     break;
                   }
@@ -3641,8 +3954,9 @@ export class ClaudeAcpAgent {
                     break;
                   }
                   if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(
+                    await failActiveWithSessionFailure(
+                      providerFailureCategory(lastAssistantError),
+                      internalErrorForClient(
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
@@ -3653,11 +3967,36 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 case "error_max_budget_usd":
+                  if (message.is_error) {
+                    await failActiveWithSessionFailure(
+                      "budget_exhausted",
+                      internalErrorForClient(
+                        errorKindData(lastAssistantError),
+                        message.errors.join(", ") || message.subtype,
+                      ),
+                    );
+                    break;
+                  }
+                  stopReason = "max_turn_requests";
+                  break;
                 case "error_max_turns":
+                  if (message.is_error) {
+                    await failActiveWithSessionFailure(
+                      "provider_error",
+                      internalErrorForClient(
+                        errorKindData(lastAssistantError),
+                        message.errors.join(", ") || message.subtype,
+                      ),
+                    );
+                    break;
+                  }
+                  stopReason = "max_turn_requests";
+                  break;
                 case "error_max_structured_output_retries":
                   if (message.is_error) {
-                    failActive(
-                      RequestError.internalError(
+                    await failActiveWithSessionFailure(
+                      "provider_error",
+                      internalErrorForClient(
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
@@ -4025,7 +4364,7 @@ export class ClaudeAcpAgent {
             }
 
             if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
-              failActive(RequestError.authRequired());
+              await failActiveWithSessionFailure("auth_required", RequestError.authRequired());
               break;
             }
 
@@ -4211,8 +4550,12 @@ export class ClaudeAcpAgent {
             break;
           }
           case "tool_use_summary":
-          case "auth_status":
           case "prompt_suggestion":
+            break;
+          case "auth_status":
+            if (!message.isAuthenticating && message.error === undefined) {
+              await clearSessionFailure((failure) => failure.category === "auth_required");
+            }
             break;
           default:
             unreachable(message, this.logger);
@@ -4234,6 +4577,20 @@ export class ClaudeAcpAgent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
+      if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
+        if (!isHeldOpen(session.activeTurn)) {
+          await failActiveWithSessionFailure(
+            "transport_lost",
+            internalErrorForClient({ errorKind: "transport_lost" }),
+          );
+        } else {
+          // The held turn keeps its recorded PromptResponse outcome, while the
+          // exhausted Query makes the session independently unrecoverable.
+          await publishSessionFailure("transport_lost", { turnScoped: false });
+        }
+      } else {
+        await publishSessionFailure("transport_lost", { turnScoped: false });
+      }
       // Either way the query iterator is finished and the consumer is exiting,
       // so release its resources via closeQueryStream (idempotent). A process
       // death is unrecoverable, so additionally evict the session so the client
@@ -4251,7 +4608,11 @@ export class ClaudeAcpAgent {
         delete this.sessions[params.sessionId];
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
-        failAllTurns(error);
+        failAllTurns(
+          supportsAirSessionFailures(this.clientCapabilities)
+            ? internalErrorForClient({ errorKind: "transport_lost" })
+            : error,
+        );
         this.closeQueryStream(session);
       }
     }

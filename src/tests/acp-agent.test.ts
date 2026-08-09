@@ -3123,7 +3123,12 @@ describe("stop reason propagation", () => {
   }
 
   function createResultMessage(overrides: {
-    subtype: "success" | "error_during_execution";
+    subtype:
+      | "success"
+      | "error_during_execution"
+      | "error_max_budget_usd"
+      | "error_max_turns"
+      | "error_max_structured_output_retries";
     stop_reason: string | null;
     is_error: boolean;
     result?: string;
@@ -3152,6 +3157,49 @@ describe("stop reason propagation", () => {
       session_id: "test-session",
     };
   }
+
+  function createAssistantError(error: SDKAssistantMessage["error"]): SDKAssistantMessage {
+    return {
+      type: "assistant",
+      parent_tool_use_id: null,
+      error,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        id: `msg-${error}`,
+        type: "message",
+        role: "assistant",
+        container: null,
+        model: "claude-sonnet-4-20250514",
+        content: [],
+        stop_reason: "stop_sequence",
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+          service_tier: null,
+          cache_creation: {
+            ephemeral_1h_input_tokens: 0,
+            ephemeral_5m_input_tokens: 0,
+          },
+        } as any,
+      } as any,
+    };
+  }
+
+  const airSessionFailureCapabilities = {
+    _meta: {
+      jetbrains: {
+        air: { version: 1, capabilities: ["sessionFailure"] },
+      },
+    },
+  };
+
+  const sessionFailureFromResponse = (response: PromptResponse) =>
+    (response._meta as any)?.jetbrains?.air?.sessionFailure;
 
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
     const input = new Pushable<any>();
@@ -3934,6 +3982,783 @@ describe("stop reason propagation", () => {
     ).rejects.toThrow("Internal error");
   });
 
+  it.each([1, 2])(
+    "publishes a safe typed failure for compatible AIR version %i",
+    async (version) => {
+      const updates: SessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: SessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version, capabilities: ["sessionFailure"] } } },
+        },
+      });
+      injectSession(agent, [
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: true,
+          result: "raw provider secret must not be shown",
+        }),
+      ]);
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      expect(sessionFailureFromResponse(response)).toEqual(
+        expect.objectContaining({
+          revision: 1,
+          phase: "active",
+          category: "provider_error",
+          source: "claude",
+          safeMessage: "The model provider reported an error.",
+          retryable: true,
+          actions: ["retry"],
+        }),
+      );
+      expect(JSON.stringify(response)).not.toContain("raw provider secret");
+      expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+    },
+  );
+
+  it.each([
+    ["missing envelope", {}],
+    ["missing capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } }],
+    [
+      "string version",
+      { _meta: { jetbrains: { air: { version: "1", capabilities: ["sessionFailure"] } } } },
+    ],
+    [
+      "fractional version",
+      { _meta: { jetbrains: { air: { version: 1.5, capabilities: ["sessionFailure"] } } } },
+    ],
+    [
+      "zero version",
+      { _meta: { jetbrains: { air: { version: 0, capabilities: ["sessionFailure"] } } } },
+    ],
+    [
+      "negative version",
+      { _meta: { jetbrains: { air: { version: -1, capabilities: ["sessionFailure"] } } } },
+    ],
+    [
+      "non-finite version",
+      { _meta: { jetbrains: { air: { version: Number.NaN, capabilities: ["sessionFailure"] } } } },
+    ],
+    ["non-string capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [1] } } } }],
+    [
+      "legacy nested version",
+      { _meta: { jetbrains: { air: { sessionFailure: { version: 1 } } } } },
+    ],
+  ])("does not publish typed failures for %s", async (_label, capabilities) => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: capabilities,
+    });
+    injectSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "provider detail",
+      }),
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow("provider detail");
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it.each([
+    ["authentication_failed", "auth_required", false],
+    ["billing_error", "quota_exhausted", false],
+    ["overloaded", "overloaded", true],
+    ["invalid_request", "bad_request", false],
+    ["max_output_tokens", "context_exhausted", false],
+  ] as const)("maps SDK error %s to %s", async (sdkError, expectedCategory, retryable) => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createAssistantError(sdkError),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private provider detail",
+      }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: expectedCategory, retryable }),
+    );
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it.each([
+    ["error_max_budget_usd", "budget_exhausted"],
+    ["error_max_turns", "provider_error"],
+    ["error_max_structured_output_retries", "provider_error"],
+  ] as const)("maps terminal subtype %s to %s", async (subtype, expectedCategory) => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createResultMessage({
+        subtype,
+        stop_reason: null,
+        is_error: true,
+        errors: ["private provider detail"],
+      }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: expectedCategory }),
+    );
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it("clears auth_required after a successful auth_status without leaking auth output", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createAssistantError("authentication_failed"),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private auth detail",
+      }),
+      {
+        type: "auth_status",
+        isAuthenticating: false,
+        output: ["private login token"],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+    const active = sessionFailureFromResponse(response);
+    const cleared = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    expect(active).toEqual(expect.objectContaining({ category: "auth_required", revision: 1 }));
+    expect(cleared).toEqual(
+      expect.objectContaining({ id: active.id, revision: 2, phase: "cleared" }),
+    );
+    expect(JSON.stringify({ response, updates })).not.toContain("private");
+  });
+
+  it("keeps auth_required active when auth_status reports an error", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createAssistantError("authentication_failed"),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private auth detail",
+      }),
+      {
+        type: "auth_status",
+        isAuthenticating: false,
+        output: ["private login token"],
+        error: "private login error",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: "auth_required", phase: "active" }),
+    );
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+    expect(JSON.stringify({ response, updates })).not.toContain("private");
+  });
+
+  it("clears the active failure with the same id and a higher revision after recovery", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const first = await iter.next();
+      yield {
+        type: "user",
+        message: first.value.message,
+        parent_tool_use_id: null,
+        uuid: first.value.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "first turn failed",
+      });
+      const second = await iter.next();
+      yield {
+        type: "user",
+        message: second.value.message,
+        parent_tool_use_id: null,
+        uuid: second.value.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "recovered",
+      });
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const failed = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    const active = sessionFailureFromResponse(failed);
+    expect(active).toEqual(expect.objectContaining({ revision: 1, phase: "active" }));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
+      expect.objectContaining({
+        id: active.id,
+        revision: 2,
+        phase: "cleared",
+      }),
+    );
+  });
+
+  it("clears a previous turn failure when the next turn is refused", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const result of [
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: true,
+          result: "first turn failed",
+        }),
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "refusal",
+          is_error: true,
+        }),
+      ]) {
+        const user = await iter.next();
+        yield {
+          type: "user",
+          message: user.value.message,
+          parent_tool_use_id: null,
+          uuid: user.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+        yield result;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const failed = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] }),
+    ).resolves.toEqual(expect.objectContaining({ stopReason: "refusal" }));
+
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    const active = sessionFailureFromResponse(failed);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
+      expect.objectContaining({ id: active.id, revision: 2, phase: "cleared" }),
+    );
+  });
+
+  it("retries a clear whose first delivery failed", async () => {
+    const updates: SessionNotification[] = [];
+    let rejectFirstClear = true;
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          const failure = (update.update._meta as any)?.jetbrains?.air?.sessionFailure;
+          if (failure?.phase === "cleared" && rejectFirstClear) {
+            rejectFirstClear = false;
+            throw new Error("temporary client write failure");
+          }
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const results = [
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: true,
+          result: "first turn failed",
+        }),
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        }),
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: false,
+        }),
+      ];
+      for (const result of results) {
+        const user = await iter.next();
+        yield {
+          type: "user",
+          message: user.value.message,
+          parent_tool_use_id: null,
+          uuid: user.value.uuid,
+          session_id: "test-session",
+          isReplay: true,
+        };
+        yield result;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const failed = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "third" }] });
+
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    const active = sessionFailureFromResponse(failed);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
+      expect.objectContaining({ id: active.id, revision: 2, phase: "cleared" }),
+    );
+  });
+
+  it("logs loudly when a failure has no active turn to reject", async () => {
+    const errors: string[] = [];
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: (message) => errors.push(String(message)),
+    });
+    injectSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "first failure",
+      }),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "late duplicate failure",
+      }),
+    ]);
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const consumer = agent.sessions["test-session"]?.consumer;
+    await expect(prompt).rejects.toThrow("first failure");
+    await consumer;
+
+    expect(errors).toContainEqual(expect.stringContaining("no unsettled active turn exists"));
+    expect(errors).toContainEqual(expect.stringContaining("late duplicate failure"));
+  });
+
+  it("retains a replayed worker shutdown through later buffered activity", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "worker_shutting_down",
+        reason: "historical_host_exit",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+      }),
+    ]);
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const consumer = agent.sessions["test-session"]?.consumer;
+    const response = await prompt;
+    await consumer;
+
+    expect(sessionFailureFromResponse(response)).toBeUndefined();
+    const failure = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find((candidate) => candidate?.category === "worker_shutdown");
+    expect(failure).toEqual(expect.objectContaining({ phase: "active", revision: 1 }));
+  });
+
+  it("returns an active-turn worker shutdown on PromptResponse only at live tail", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    let reachedQuietTail!: () => void;
+    const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
+    let closeStream!: () => void;
+    const streamClose = new Promise<void>((resolve) => (closeStream = resolve));
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const user = await iter.next();
+      yield {
+        type: "user",
+        message: user.value.message,
+        parent_tool_use_id: null,
+        uuid: user.value.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield {
+        type: "system",
+        subtype: "worker_shutting_down",
+        reason: "host_exit",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      reachedQuietTail();
+      await streamClose;
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await quietTail;
+    expect(JSON.stringify(updates)).not.toContain("worker_shutdown");
+    closeStream();
+    const response = await prompt;
+    const failure = sessionFailureFromResponse(response);
+    expect(failure).toEqual(
+      expect.objectContaining({ category: "worker_shutdown", phase: "active", revision: 1 }),
+    );
+    expect(failure).toHaveProperty("turnId");
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it("publishes an idle worker shutdown as a session update only", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
+      {
+        type: "system",
+        subtype: "worker_shutting_down",
+        reason: "host_exit",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(sessionFailureFromResponse(response)).toBeUndefined();
+    const failure = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find((candidate) => candidate?.category === "worker_shutdown");
+    expect(failure).toEqual(expect.objectContaining({ phase: "active", revision: 1 }));
+    expect(failure).not.toHaveProperty("turnId");
+  });
+
+  it("ignores a late worker shutdown from a replaced query consumer", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    let reachedQuietTail!: () => void;
+    const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
+    let closeOldStream!: () => void;
+    const oldStreamClose = new Promise<void>((resolve) => (closeOldStream = resolve));
+    const input = new Pushable<any>();
+    async function* oldMessageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const user = await iter.next();
+      yield {
+        type: "user",
+        message: user.value.message,
+        parent_tool_use_id: null,
+        uuid: user.value.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+      yield {
+        type: "system",
+        subtype: "worker_shutting_down",
+        reason: "old_host_exit",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      reachedQuietTail();
+      await oldStreamClose;
+    }
+    const oldSession = mockSessionState({ query: wrapQuery(oldMessageGenerator()), input });
+    agent.sessions["test-session"] = oldSession;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const oldConsumer = oldSession.consumer;
+    await quietTail;
+    agent.sessions["test-session"] = mockSessionState();
+    closeOldStream();
+    await oldConsumer;
+
+    expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(JSON.stringify(updates)).not.toContain("worker_shutdown");
+  });
+
+  it("uses a fresh session-scoped failure identity for each query-stream consumer", async () => {
+    const runWorkerTail = async () => {
+      const updates: SessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: SessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      (agent as any).clientCapabilities = airSessionFailureCapabilities;
+      injectSession(agent, [
+        createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
+        {
+          type: "system",
+          subtype: "worker_shutting_down",
+          reason: "host_exit",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+      ]);
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      const consumer = agent.sessions["test-session"]?.consumer;
+      await prompt;
+      await consumer;
+      return updates
+        .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+        .find((candidate) => candidate?.category === "worker_shutdown");
+    };
+
+    const first = await runWorkerTail();
+    const restarted = await runWorkerTail();
+    expect(first).toEqual(expect.objectContaining({ revision: 1, phase: "active" }));
+    expect(restarted).toEqual(expect.objectContaining({ revision: 1, phase: "active" }));
+    expect(restarted.id).not.toBe(first.id);
+  });
+
+  it("publishes and returns a sanitized transport failure when the query iterator throws", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const user = await iter.next();
+      yield {
+        type: "user",
+        message: user.value.message,
+        parent_tool_use_id: null,
+        uuid: user.value.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      throw new Error("private transport URL and token");
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({
+        category: "transport_lost",
+        retryable: false,
+        actions: ["new_session"],
+      }),
+    );
+    expect(JSON.stringify(response)).not.toContain("private transport URL and token");
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
   it("forwards SDKAssistantMessage.error as structured data on internal errors", async () => {
     const agent = createMockAgent();
     const assistantMessage: SDKAssistantMessage = {
@@ -4403,6 +5228,38 @@ describe("logout", () => {
       clientCapabilities: {},
     });
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
+  });
+
+  it("advertises canonical AIR sessionFailure support during initialize", async () => {
+    const agent = createMockAgent();
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          jetbrains: {
+            air: { version: 1, capabilities: ["sessionFailure"] },
+          },
+        },
+      },
+    });
+
+    expect((response._meta as any)?.jetbrains?.air).toEqual({
+      version: 1,
+      capabilities: ["sessionFailure"],
+    });
+  });
+
+  it("advertises AIR sessionFailure support even before client negotiation", async () => {
+    const agent = createMockAgent();
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+
+    expect((response._meta as any)?.jetbrains?.air).toEqual({
+      version: 1,
+      capabilities: ["sessionFailure"],
+    });
   });
 });
 
@@ -9639,10 +10496,21 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
-  it("resolves a held turn with its recorded outcome when the stream dies", async () => {
+  it("resolves a held turn and reports the dead session when the transport dies", async () => {
     // The held turn's answer already streamed; a stream death during the
     // post-answer hold is a background failure, not the turn's.
-    const agent = createMockAgent();
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+    };
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -9664,6 +10532,84 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     expect(response.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
+    const failure = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find((candidate) => candidate?.category === "transport_lost");
+    expect(failure).toEqual(
+      expect.objectContaining({
+        phase: "active",
+        retryable: false,
+        actions: ["new_session"],
+      }),
+    );
+    expect(failure).not.toHaveProperty("turnId");
+    expect((response._meta as any)?.jetbrains?.air?.sessionFailure).toBeUndefined();
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "continue" }],
+      }),
+    ).rejects.toThrow("session has ended");
+  });
+
+  it("resolves a held turn and reports the dead session on worker-shutdown EOF", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+    };
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // held
+        yield idle();
+        yield {
+          type: "system",
+          subtype: "worker_shutting_down",
+          reason: "host_exit",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+    const failure = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find((candidate) => candidate?.category === "worker_shutdown");
+    expect(failure).toEqual(
+      expect.objectContaining({
+        phase: "active",
+        retryable: false,
+        actions: ["new_session"],
+      }),
+    );
+    expect(failure).not.toHaveProperty("turnId");
+    expect((response._meta as any)?.jetbrains?.air?.sessionFailure).toBeUndefined();
+    await expect(
+      agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "continue" }],
+      }),
+    ).rejects.toThrow("session has ended");
   });
 
   it("absorbs the interrupt's lagged trailer after cancelling a held turn mid-followup", async () => {
