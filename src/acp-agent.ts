@@ -401,6 +401,12 @@ type Turn = {
   reject: (error: unknown) => void;
 };
 
+type BackgroundAgentTerminalStatus = "completed" | "failed" | "killed" | "stopped";
+type EarlyBackgroundAgentTerminal = {
+  status: BackgroundAgentTerminalStatus;
+  parentToolUseId?: string;
+};
+
 type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -575,6 +581,13 @@ type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** Agent/Task tool_use ids whose immediate result only acknowledges an
+   *  asynchronous launch. These calls stay in progress until the matching
+   *  background task emits a real terminal signal. */
+  backgroundAgentToolUseIds: Set<string>;
+  /** Terminal signals that raced ahead of their async-launch acknowledgement,
+   *  keyed by task id and consumed as soon as that acknowledgement arrives. */
+  earlyBackgroundAgentTerminals: Map<string, EarlyBackgroundAgentTerminal>;
   /** Registry of live background tasks, keyed by task id: populated at
    *  `task_started`, pruned when the task settles (a `task_notification` or
    *  a terminal `task_updated` patch), and reconciled against
@@ -899,6 +912,9 @@ export type ToolUpdateMeta = {
        transcripts need a namespaced marker instead of inferring from
        `toolName` or the generic `think` kind. */
     subagent?: true;
+    /* Original provider status for a background Agent terminal signal. ACP
+       collapses stopped/killed into failed, so preserve the distinction here. */
+    taskStatus?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -2186,6 +2202,80 @@ export class ClaudeAcpAgent {
       await this.client.sessionUpdate(notification);
     };
 
+    /** Close a parent Agent/Task call only if its immediate result previously
+     *  proved it was an asynchronous launch. This guard leaves synchronous
+     *  subagents and background Bash tasks on their existing lifecycle. */
+    const settleBackgroundAgent = async (
+      taskId: string,
+      providerStatus: BackgroundAgentTerminalStatus,
+      hintedParentToolUseId?: string,
+    ) => {
+      const record = session.liveBackgroundTasks.get(taskId);
+      const parentToolUseId = hintedParentToolUseId ?? record?.parentToolUseId;
+      if (!parentToolUseId || !session.backgroundAgentToolUseIds.has(parentToolUseId)) {
+        return false;
+      }
+
+      const toolUse = session.toolUseCache[parentToolUseId];
+      const toolName =
+        toolUse?.name === "Agent" || toolUse?.name === "Task" ? toolUse.name : undefined;
+      const earlyTerminal = session.earlyBackgroundAgentTerminals.get(taskId);
+      if (!toolName && earlyTerminal?.parentToolUseId !== parentToolUseId) {
+        return false;
+      }
+
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: parentToolUseId,
+          status: providerStatus === "completed" ? "completed" : "failed",
+          ...(toolName
+            ? {
+                _meta: {
+                  claudeCode: {
+                    toolName,
+                    taskStatus: providerStatus,
+                  },
+                } satisfies ToolUpdateMeta,
+              }
+            : {}),
+        },
+      });
+      session.backgroundAgentToolUseIds.delete(parentToolUseId);
+      session.earlyBackgroundAgentTerminals.delete(taskId);
+      session.liveBackgroundTasks.delete(taskId);
+      session.emittedToolCalls.delete(parentToolUseId);
+      delete session.toolUseCache[parentToolUseId];
+      return true;
+    };
+
+    /** Settle immediately when the async acknowledgement is known, otherwise
+     *  retain a subagent terminal that raced ahead of that acknowledgement. */
+    const handleBackgroundAgentTerminal = async (
+      taskId: string,
+      providerStatus: BackgroundAgentTerminalStatus,
+      hintedParentToolUseId?: string,
+    ) => {
+      const record = session.liveBackgroundTasks.get(taskId);
+      const parentToolUseId = hintedParentToolUseId ?? record?.parentToolUseId;
+      const settled = await settleBackgroundAgent(taskId, providerStatus, parentToolUseId);
+      if (!settled && !session.earlyBackgroundAgentTerminals.has(taskId)) {
+        const toolUse = parentToolUseId ? session.toolUseCache[parentToolUseId] : undefined;
+        if (
+          parentToolUseId &&
+          session.emittedToolCalls.has(parentToolUseId) &&
+          (record?.isSubagent || toolUse?.name === "Agent" || toolUse?.name === "Task")
+        ) {
+          session.earlyBackgroundAgentTerminals.set(taskId, {
+            status: providerStatus,
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+          });
+        }
+      }
+      session.liveBackgroundTasks.delete(taskId);
+    };
+
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
@@ -3136,7 +3226,7 @@ export class ClaudeAcpAgent {
               case "files_persisted":
               case "task_progress":
                 break;
-              case "task_started":
+              case "task_started": {
                 // For subagent tasks `task_id` is the subagent's agent id (the
                 // SDK keys its task registry by agent id) and `tool_use_id` is
                 // the Agent/Task tool_use that spawned it — recorded so the
@@ -3155,15 +3245,22 @@ export class ClaudeAcpAgent {
                 // turn: a turn only ever waits on its own subagents, and a
                 // spawn during a held-open drain window (an agent chain)
                 // extends that turn's hold.
+                const existingTask = session.liveBackgroundTasks.get(message.task_id);
                 session.liveBackgroundTasks.set(message.task_id, {
-                  parentToolUseId: message.tool_use_id,
-                  isSubagent: !!message.subagent_type,
+                  parentToolUseId: message.tool_use_id ?? existingTask?.parentToolUseId,
+                  isSubagent: !!message.subagent_type || existingTask?.isSubagent === true,
                 });
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
                 break;
+              }
               case "task_notification":
+                await handleBackgroundAgentTerminal(
+                  message.task_id,
+                  message.status,
+                  message.tool_use_id,
+                );
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
@@ -3179,6 +3276,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
+                  await handleBackgroundAgentTerminal(message.task_id, message.patch.status);
                   session.liveBackgroundTasks.delete(message.task_id);
                 }
                 break;
@@ -3944,6 +4042,21 @@ export class ClaudeAcpAgent {
               break;
             }
 
+            // Newer Claude runtimes can surface the background-task bookend as
+            // a user-role message. Only the SDK-stamped origin is trusted; an
+            // ordinary user message with the same XML remains inert.
+            if (message.type === "user") {
+              const taskNotification = readBackgroundTaskNotification(message);
+              if (taskNotification) {
+                await handleBackgroundAgentTerminal(
+                  taskNotification.taskId,
+                  taskNotification.status,
+                  taskNotification.parentToolUseId,
+                );
+                break;
+              }
+            }
+
             // Snapshot the latest top-level assistant usage and model so the
             // next `result` can emit a usage_update tied to the right context
             // window. Subagent messages are excluded to keep the snapshot
@@ -4107,6 +4220,32 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
+            const toolUseResult = message.type === "user" ? message.tool_use_result : undefined;
+            const resultToolUseId = singleToolResultId(content);
+            const asyncAgentLaunch = readAsyncAgentLaunch(
+              content,
+              toolUseResult,
+              session.toolUseCache,
+              session.earlyBackgroundAgentTerminals,
+            );
+            const taskOutputTerminal = readTaskOutputTerminal(
+              content,
+              toolUseResult,
+              session.toolUseCache,
+            );
+            if (asyncAgentLaunch) {
+              const existingTask = session.liveBackgroundTasks.get(asyncAgentLaunch.taskId);
+              session.liveBackgroundTasks.set(asyncAgentLaunch.taskId, {
+                parentToolUseId: asyncAgentLaunch.parentToolUseId,
+                isSubagent: true,
+                endedPerLevel: existingTask?.endedPerLevel,
+              });
+              session.backgroundAgentToolUseIds.add(asyncAgentLaunch.parentToolUseId);
+              if (session.activeTurn && !session.activeTurn.settled) {
+                (session.activeTurn.spawnedTaskIds ??= new Set()).add(asyncAgentLaunch.taskId);
+              }
+            }
+
             for (const notification of toAcpNotifications(
               content,
               message.message.role,
@@ -4121,7 +4260,8 @@ export class ClaudeAcpAgent {
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: messageIdForGrouping(message),
-                toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
+                toolUseResult,
+                backgroundAgentToolUseIds: session.backgroundAgentToolUseIds,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
                 // type, hence the cast. Validated by parseToolResultMeta.
                 toolResultMeta:
@@ -4135,6 +4275,36 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(notification);
+            }
+            if (asyncAgentLaunch) {
+              const earlyTerminal = session.earlyBackgroundAgentTerminals.get(
+                asyncAgentLaunch.taskId,
+              );
+              if (earlyTerminal) {
+                await handleBackgroundAgentTerminal(
+                  asyncAgentLaunch.taskId,
+                  earlyTerminal.status,
+                  earlyTerminal.parentToolUseId,
+                );
+              }
+            } else if (resultToolUseId) {
+              // A synchronous Agent can also emit task terminal frames before
+              // its normal tool_result. Drop any speculative buffer entry now
+              // that the ordinary tool lifecycle has resolved the call.
+              for (const [taskId, terminal] of session.earlyBackgroundAgentTerminals) {
+                if (terminal.parentToolUseId === resultToolUseId) {
+                  session.earlyBackgroundAgentTerminals.delete(taskId);
+                }
+              }
+            }
+            // TaskOutput itself resolves first; then its structured task state
+            // closes the original background Agent call when no task bookend
+            // was forwarded by the runtime.
+            if (taskOutputTerminal) {
+              await handleBackgroundAgentTerminal(
+                taskOutputTerminal.taskId,
+                taskOutputTerminal.status,
+              );
             }
             break;
           }
@@ -6139,6 +6309,8 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -7407,6 +7579,150 @@ function parseToolResultMeta(
   return byToolUseId;
 }
 
+/** Return the tool_use id only when a message carries exactly one tool_result,
+ *  which is the only shape a message-level tool_use_result can describe. */
+function singleToolResultId(content: unknown): string | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const ids = content.flatMap((chunk) =>
+    typeof chunk === "object" &&
+    chunk !== null &&
+    "type" in chunk &&
+    chunk.type === "tool_result" &&
+    "tool_use_id" in chunk &&
+    typeof chunk.tool_use_id === "string"
+      ? [chunk.tool_use_id]
+      : [],
+  );
+  return ids.length === 1 ? ids[0] : undefined;
+}
+
+/** Read the structured acknowledgement returned when Agent/Task launches in
+ *  the background. The matching tool_result supplies the parent tool_use id;
+ *  validating its cached tool name prevents similarly shaped outputs from
+ *  other tools from entering the background Agent lifecycle. */
+function readAsyncAgentLaunch(
+  content: unknown,
+  toolUseResult: unknown,
+  toolUseCache: ToolUseCache,
+  earlyTerminals?: ReadonlyMap<string, EarlyBackgroundAgentTerminal>,
+): { taskId: string; parentToolUseId: string } | undefined {
+  if (
+    !Array.isArray(content) ||
+    typeof toolUseResult !== "object" ||
+    toolUseResult === null ||
+    !("status" in toolUseResult) ||
+    toolUseResult.status !== "async_launched" ||
+    !("agentId" in toolUseResult) ||
+    typeof toolUseResult.agentId !== "string" ||
+    toolUseResult.agentId.length === 0
+  ) {
+    return undefined;
+  }
+
+  const parentToolUseId = singleToolResultId(content);
+  if (!parentToolUseId) {
+    return undefined;
+  }
+
+  const toolUse = toolUseCache[parentToolUseId];
+  const earlyTerminal = earlyTerminals?.get(toolUseResult.agentId);
+  if (
+    (!toolUse || (toolUse.name !== "Agent" && toolUse.name !== "Task")) &&
+    earlyTerminal?.parentToolUseId !== parentToolUseId
+  ) {
+    return undefined;
+  }
+  return { taskId: toolUseResult.agentId, parentToolUseId };
+}
+
+/** Parse a task-notification user message only when the SDK has stamped its
+ *  trusted origin. Ordinary user text must never be able to close a tool call. */
+function readBackgroundTaskNotification(message: unknown):
+  | {
+      taskId: string;
+      parentToolUseId: string;
+      status: BackgroundAgentTerminalStatus;
+    }
+  | undefined {
+  if (typeof message !== "object" || message === null) {
+    return undefined;
+  }
+  const candidate = message as {
+    type?: unknown;
+    origin?: { kind?: unknown };
+    message?: { content?: unknown };
+  };
+  if (candidate.type !== "user" || candidate.origin?.kind !== "task-notification") {
+    return undefined;
+  }
+
+  const content = candidate.message?.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content) &&
+          content.length === 1 &&
+          typeof content[0] === "object" &&
+          content[0] !== null &&
+          "type" in content[0] &&
+          content[0].type === "text" &&
+          "text" in content[0] &&
+          typeof content[0].text === "string"
+        ? content[0].text
+        : undefined;
+  if (!text?.includes("<task-notification>")) {
+    return undefined;
+  }
+
+  const readTag = (tag: string) => text.match(new RegExp(`<${tag}>([^<]+)</${tag}>`))?.[1]?.trim();
+  const taskId = readTag("task-id");
+  const parentToolUseId = readTag("tool-use-id");
+  const status = readTag("status");
+  if (
+    !taskId ||
+    !parentToolUseId ||
+    (status !== "completed" && status !== "failed" && status !== "killed" && status !== "stopped")
+  ) {
+    return undefined;
+  }
+  return { taskId, parentToolUseId, status };
+}
+
+/** Read the terminal state returned by Claude's TaskOutput tool. This is a
+ *  fallback for streams where no task_notification/task_updated bookend is
+ *  forwarded. The cache check prevents unrelated structured JSON from closing
+ *  a background Agent call. */
+function readTaskOutputTerminal(
+  content: unknown,
+  toolUseResult: unknown,
+  toolUseCache: ToolUseCache,
+): { taskId: string; status: Exclude<BackgroundAgentTerminalStatus, "stopped"> } | undefined {
+  if (!Array.isArray(content) || typeof toolUseResult !== "object" || toolUseResult === null) {
+    return undefined;
+  }
+  const toolUseId = singleToolResultId(content);
+  if (!toolUseId || toolUseCache[toolUseId]?.name !== "TaskOutput") {
+    return undefined;
+  }
+
+  const result = toolUseResult as {
+    retrieval_status?: unknown;
+    task?: { task_id?: unknown; status?: unknown };
+  };
+  const { task } = result;
+  if (
+    result.retrieval_status !== "success" ||
+    typeof task?.task_id !== "string" ||
+    task.task_id.length === 0 ||
+    (task.status !== "completed" && task.status !== "failed" && task.status !== "killed")
+  ) {
+    return undefined;
+  }
+  return { taskId: task.task_id, status: task.status };
+}
+
 /**
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
@@ -7446,6 +7762,9 @@ export function toAcpNotifications(
     // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
     // denied/interrupted tool_call_updates with why the tool never ran.
     toolResultMeta?: unknown;
+    // Agent/Task calls that returned only an async-launch acknowledgement.
+    // Their tool_result content is forwarded while their status remains live.
+    backgroundAgentToolUseIds?: ReadonlySet<string>;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
@@ -7641,6 +7960,45 @@ export function toAcpNotifications(
       case "text_editor_code_execution_tool_result":
       case "mcp_tool_result": {
         const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
+        const pendingBackgroundAgent = toolUseCache[chunk.tool_use_id];
+        if (options?.backgroundAgentToolUseIds?.has(chunk.tool_use_id)) {
+          if (
+            pendingBackgroundAgent &&
+            (pendingBackgroundAgent.name === "Agent" || pendingBackgroundAgent.name === "Task")
+          ) {
+            const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
+              chunk,
+              pendingBackgroundAgent,
+              supportsTerminalOutput,
+              toolUseResult,
+            );
+            update = {
+              _meta: {
+                ...toolMeta,
+                claudeCode: { toolName: pendingBackgroundAgent.name },
+              } satisfies ToolUpdateMeta,
+              toolCallId: chunk.tool_use_id,
+              sessionUpdate: "tool_call_update",
+              status: "in_progress",
+              rawOutput: chunk.content,
+              ...toolUpdate,
+            };
+          } else if (wasEmitted) {
+            // A permission request may have emitted the card before a cancelled
+            // turn dropped its tool_use. The trusted early-terminal record can
+            // still prove this result belongs to an async Agent call.
+            update = {
+              toolCallId: chunk.tool_use_id,
+              sessionUpdate: "tool_call_update",
+              status: "in_progress",
+              rawOutput: chunk.content,
+            };
+          }
+          // This result only acknowledges the launch. Keep the cache and the
+          // emitted-call marker until a real background-task terminal arrives.
+          break;
+        }
+
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
         // Why this is_error result carries harness prose instead of tool
         // output (user-rejected / interrupted / …), when the SDK said so.

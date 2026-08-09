@@ -169,6 +169,8 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     taskState: new Map(),
     toolUseCache: {},
     emittedToolCalls: new Set(),
+    backgroundAgentToolUseIds: new Set(),
+    earlyBackgroundAgentTerminals: new Map(),
     liveBackgroundTasks: new Map(),
     emittedAssistantText: false,
     owedTrailingIdles: 0,
@@ -2200,6 +2202,8 @@ describe("permission request cancellation", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -3049,6 +3053,441 @@ describe("subagent permission attribution (issue #851)", () => {
     const map = agent.sessions["test-session"]!.liveBackgroundTasks;
     expect(map.has("agent-42")).toBe(false);
     expect(map.get("agent-43")?.parentToolUseId).toBe("toolu_parent_2");
+  });
+});
+
+describe("background Agent tool lifecycle (issue #865)", () => {
+  const agentToolUse = (toolUseId = "toolu_agent") => ({
+    type: "tool_use" as const,
+    id: toolUseId,
+    name: "Agent",
+    input: { description: "Investigate", prompt: "Inspect the project" },
+  });
+
+  const toolResult = (toolUseId: string, content: string) => ({
+    type: "tool_result" as const,
+    tool_use_id: toolUseId,
+    content,
+  });
+
+  const asyncLaunchResult = (
+    taskId = "agent-42",
+    toolUseId = "toolu_agent",
+    includeIsAsync = true,
+  ) => ({
+    type: "user" as const,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "user" as const,
+      content: [toolResult(toolUseId, "Async agent launched successfully")],
+    },
+    tool_use_result: {
+      ...(includeIsAsync ? { isAsync: true } : {}),
+      status: "async_launched",
+      agentId: taskId,
+    },
+  });
+
+  const taskTerminal = (
+    subtype: "task_notification" | "task_updated",
+    status: "completed" | "failed" | "stopped" | "killed",
+    taskId = "agent-42",
+  ) =>
+    subtype === "task_notification"
+      ? {
+          type: "system",
+          subtype,
+          task_id: taskId,
+          tool_use_id: "toolu_agent",
+          status,
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        }
+      : {
+          type: "system",
+          subtype,
+          task_id: taskId,
+          patch: { status },
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+
+  const taskNotificationUserMessage = (
+    origin: "task-notification" | "human",
+    status: "completed" | "failed" | "killed",
+  ) => ({
+    type: "user" as const,
+    parent_tool_use_id: null,
+    origin: { kind: origin },
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "user" as const,
+      content: `<task-notification>\n<task-id>agent-42</task-id>\n<tool-use-id>toolu_agent</tool-use-id>\n<status>${status}</status>\n</task-notification>`,
+    },
+  });
+
+  const assistantToolUse = (toolUse: Record<string, any>) => ({
+    type: "assistant" as const,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "assistant" as const,
+      model: "claude-sonnet-4-5",
+      usage: {},
+      content: [toolUse],
+    },
+  });
+
+  const successResult = () => ({
+    type: "result" as const,
+    subtype: "success" as const,
+    stop_reason: "end_turn",
+    is_error: false,
+    result: "",
+    errors: [],
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 1,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  async function runLifecycle(
+    messages: unknown[],
+    inspectSession?: (session: any) => void,
+    configureSession?: (session: any) => void,
+  ) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage, done } = await iter.next();
+        if (!done && userMessage) {
+          yield userEcho(userMessage);
+        }
+        yield* messages as any;
+        yield successResult();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+    configureSession?.(agent.sessions["test-session"]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    inspectSession?.(agent.sessions["test-session"]);
+
+    type AgentToolUpdate = Extract<
+      SessionNotification["update"],
+      { sessionUpdate: "tool_call_update" }
+    >;
+    return updates
+      .map((notification) => notification.update)
+      .filter(
+        (update): update is AgentToolUpdate =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "toolu_agent" &&
+          update.status !== undefined,
+      );
+  }
+
+  it.each([
+    ["task_updated", "completed", "completed"],
+    ["task_updated", "failed", "failed"],
+    ["task_updated", "killed", "failed"],
+    ["task_notification", "completed", "completed"],
+    ["task_notification", "failed", "failed"],
+    ["task_notification", "stopped", "failed"],
+  ] as const)(
+    "keeps the Agent call in progress until %s reports %s",
+    async (subtype, providerStatus, acpStatus) => {
+      const updates = await runLifecycle([
+        assistantToolUse(agentToolUse()),
+        asyncLaunchResult(),
+        taskTerminal(subtype, providerStatus),
+      ]);
+
+      expect(updates.map((update) => update.status)).toEqual(["in_progress", acpStatus]);
+      expect(updates[1]?._meta).toMatchObject({
+        claudeCode: { taskStatus: providerStatus },
+      });
+    },
+  );
+
+  it("treats duplicate terminal signals as a no-op", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult(),
+      taskTerminal("task_updated", "completed"),
+      taskTerminal("task_notification", "failed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("recognizes async_launched when the optional isAsync flag is absent", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult("agent-42", "toolu_agent", false),
+      taskTerminal("task_updated", "completed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("buffers a terminal signal that arrives before the async launch result", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      {
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-42",
+        tool_use_id: "toolu_agent",
+        description: "Investigate",
+        subagent_type: "Explore",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      taskTerminal("task_updated", "completed"),
+      asyncLaunchResult(),
+      {
+        type: "system",
+        subtype: "background_tasks_changed",
+        tasks: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("does not buffer a late terminal signal after a synchronous Agent result", async () => {
+    let bufferedTerminals = -1;
+    const synchronousResult = {
+      ...asyncLaunchResult(),
+      tool_use_result: {
+        status: "completed",
+        agentId: "agent-42",
+        content: [{ type: "text", text: "done" }],
+      },
+    };
+    const updates = await runLifecycle(
+      [
+        assistantToolUse(agentToolUse()),
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-42",
+          tool_use_id: "toolu_agent",
+          description: "Investigate",
+          subagent_type: "Explore",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        synchronousResult,
+        taskTerminal("task_updated", "completed"),
+      ],
+      (session) => {
+        bufferedTerminals = session.earlyBackgroundAgentTerminals.size;
+      },
+    );
+
+    expect(updates.map((update) => update.status)).toEqual(["completed"]);
+    expect(bufferedTerminals).toBe(0);
+  });
+
+  it("buffers an early terminal when permission emitted the Agent call before its tool_use", async () => {
+    const updates = await runLifecycle(
+      [
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-42",
+          tool_use_id: "toolu_agent",
+          description: "Investigate",
+          subagent_type: "Explore",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        taskTerminal("task_updated", "completed"),
+        assistantToolUse(agentToolUse()),
+        asyncLaunchResult(),
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+      ],
+      undefined,
+      (session) => session.emittedToolCalls.add("toolu_agent"),
+    );
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("uses the buffered terminal when the async result arrives without a cached tool_use", async () => {
+    const updates = await runLifecycle(
+      [
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-42",
+          tool_use_id: "toolu_agent",
+          description: "Investigate",
+          subagent_type: "Explore",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        taskTerminal("task_updated", "failed"),
+        // The assistant tool_use can be dropped by a cancelled-turn guard;
+        // its straggling tool_result still has to resolve the eager card.
+        asyncLaunchResult(),
+        {
+          type: "system",
+          subtype: "background_tasks_changed",
+          tasks: [],
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+      ],
+      undefined,
+      (session) => session.emittedToolCalls.add("toolu_agent"),
+    );
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "failed"]);
+  });
+
+  it("keeps async-launch attribution when task_started arrives later without it", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult(),
+      {
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-42",
+        description: "Investigate",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      taskTerminal("task_updated", "completed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("accepts a trusted task-notification user message as the terminal signal", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult(),
+      taskNotificationUserMessage("task-notification", "completed"),
+      taskTerminal("task_updated", "failed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+  });
+
+  it("does not let ordinary user text forge a terminal signal", async () => {
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult(),
+      taskNotificationUserMessage("human", "completed"),
+      taskTerminal("task_updated", "failed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "failed"]);
+  });
+
+  it("uses a successful TaskOutput result as a terminal fallback", async () => {
+    const taskOutputUse = {
+      type: "tool_use" as const,
+      id: "toolu_task_output",
+      name: "TaskOutput",
+      input: { task_id: "agent-42", block: true },
+    };
+    const taskOutputResult = {
+      type: "user" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "user" as const,
+        content: [toolResult("toolu_task_output", "Task failed")],
+      },
+      tool_use_result: {
+        retrieval_status: "success",
+        task: { task_id: "agent-42", status: "failed" },
+      },
+    };
+    const updates = await runLifecycle([
+      assistantToolUse(agentToolUse()),
+      asyncLaunchResult(),
+      assistantToolUse(taskOutputUse),
+      taskOutputResult,
+      taskTerminal("task_updated", "completed"),
+    ]);
+
+    expect(updates.map((update) => update.status)).toEqual(["in_progress", "failed"]);
+  });
+
+  it.each([
+    ["Agent", { status: "completed", content: [{ type: "text", text: "done" }] }],
+    ["Bash", { backgroundTaskId: "shell-1", stdout: "", stderr: "" }],
+  ])("does not defer a foreground %s tool result", (name, toolUseResult) => {
+    const toolUseCache = {
+      toolu_target: {
+        type: "tool_use" as const,
+        id: "toolu_target",
+        name,
+        input: name === "Bash" ? { command: "sleep 10" } : { description: "Explore" },
+      },
+    };
+    const notifications = toAcpNotifications(
+      [toolResult("toolu_target", "done")] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      {} as AcpClient,
+      console,
+      {
+        emittedToolCalls: new Set(["toolu_target"]),
+        toolUseResult,
+        backgroundAgentToolUseIds: new Set<string>(),
+      } as any,
+    );
+
+    expect(notifications.at(-1)?.update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_target",
+      status: "completed",
+    });
   });
 });
 
@@ -4452,6 +4891,8 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -4545,6 +4986,8 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -4655,6 +5098,8 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -7513,6 +7958,8 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -11202,6 +11649,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      backgroundAgentToolUseIds: new Set(),
+      earlyBackgroundAgentTerminals: new Map(),
       liveBackgroundTasks: new Map(),
       emittedAssistantText: false,
       owedTrailingIdles: 0,
@@ -12561,6 +13010,8 @@ describe("agent selection config option", () => {
         taskState: new Map(),
         toolUseCache: {},
         emittedToolCalls: new Set(),
+        backgroundAgentToolUseIds: new Set(),
+        earlyBackgroundAgentTerminals: new Map(),
         liveBackgroundTasks: new Map(),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
