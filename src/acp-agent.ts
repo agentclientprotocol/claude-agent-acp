@@ -4803,10 +4803,12 @@ export class ClaudeAcpAgent {
     // trailer debt is absorbed by the idle handler when its idle does come.
     // The turn's own usage snapshot is reported per the cancelled-usage
     // contract (issue #844).
+    let settledHeldTurn = false;
     {
       const active = session.activeTurn;
       if (isHeldOpen(active)) {
         this.finishFileChangeAudit(session, active, "cancelled");
+        settledHeldTurn = true;
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -4851,6 +4853,47 @@ export class ClaudeAcpAgent {
     // when only one trailer comes absorbs a future idle.
     if (isSteering(session.activeTurn) && session.activeTurn.steeredSettle !== undefined) {
       session.owedTrailingIdles++;
+    }
+
+    // Nothing is left to interrupt: the turn settled just above was only
+    // PARKED for its background subagents — its result had already arrived and
+    // the CLI's trailer had fired — and no other turn is active or queued.
+    // Interrupting here would tear those subagents down to cancel work the
+    // model already finished.
+    //
+    // That is the shape a client produces on every FOLLOW-UP prompt, not just
+    // on an explicit cancel: Zed's `run_turn` cancels unconditionally before
+    // sending, and a held turn keeps `session/prompt` pending, so a session
+    // waiting on background subagents always reads as "still running". Without
+    // this skip the hold — which exists to keep subagent output inside the turn
+    // — makes every follow-up message kill the very subagents it serves, losing
+    // their work and the task notifications that would have reported it.
+    //
+    // Clearing the cancelled latch is part of the skip, not a detail: while it
+    // is set the consumer drops every incoming message and only `activateTurn`
+    // clears it, so leaving it set would swallow the surviving subagents'
+    // output anyway — and forever if no next prompt follows. Nothing is left
+    // latched for: the prompt was already answered "cancelled" above, and the
+    // session is quiescent.
+    //
+    // Subagents surviving a cancel matches how background SHELLS already
+    // behave: they never defer a turn (see `liveBackgroundTasks.isSubagent`),
+    // so no cancel has ever reached them. Both have the same wake-on-
+    // notification contract with the model rather than a turn-scoped one.
+    if (
+      settledHeldTurn &&
+      !session.activeTurn &&
+      orphanedTurns.length === 0 &&
+      (session.turnQueue?.length ?? 0) === 0 &&
+      // The one state in which the hold provably sits on a quiet SDK. Anything
+      // else means a cycle is genuinely running (or blocked on a permission
+      // request) and must still be interrupted. Same read as the trailer-debt
+      // decision above, which keeps the two branches complementary: this path
+      // never records a debt, and never produces the idle a debt would drain.
+      session.lastSessionState === "idle"
+    ) {
+      session.cancelled = false;
+      return;
     }
 
     // Arm a backstop before interrupting: if a turn is actively consuming the

@@ -11061,6 +11061,114 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("keeps a hold's subagents alive across a cancel on a quiet session", async () => {
+    // A client cancels unconditionally before each prompt (Zed's run_turn
+    // does), and a held turn keeps session/prompt pending — so an ordinary
+    // FOLLOW-UP message reaches cancel() looking exactly like an abort.
+    // Interrupting there would tear down subagents whose results the model is
+    // still waiting on, and the notifications reporting their work would never
+    // arrive: the hold would kill the very subagents it exists to serve.
+    const { agent, events } = chunkCapturingAgent();
+    let releaseAfterCancel!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // deferral point
+        yield idle(); // the turn's trailer: the SDK is quiet, the subagent is not
+        await afterCancel;
+        // The subagent survives the cancel and reports afterwards.
+        yield taskNotification("agent-1");
+        yield assistantText("post-cancel summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+    await agent.cancel({ sessionId: "test-session" });
+
+    // The prompt is still answered per the ACP cancellation contract.
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: expect.objectContaining({ totalTokens: 15 }),
+    });
+
+    const session = agent.sessions["test-session"];
+    // The hold sat on a quiet SDK — the only thing left to interrupt was the
+    // subagent, which is exactly what must survive.
+    expect(session.query.interrupt).not.toHaveBeenCalled();
+    // The latch makes the consumer drop every message it sees, so leaving it
+    // set would lose the surviving subagent's output just as surely.
+    expect(session.cancelled).toBe(false);
+
+    releaseAfterCancel();
+    await session.consumer;
+    // The whole point: work done after the cancel still reaches the client.
+    expect(events).toContain("chunk:post-cancel summary");
+    expect(session.liveBackgroundTasks.has("agent-1")).toBe(false);
+  });
+
+  it("still interrupts a cancel during a hold whose session is running", async () => {
+    // The skip is scoped to a provably quiet SDK. Once a subagent's
+    // notification wakes the model, the turn is still held but a cycle is
+    // genuinely in flight — a cancel must reach it, or an explicit abort
+    // during a followup would do nothing.
+    const agent = createMockAgent();
+    let releaseAfterCancel!: () => void;
+    const afterCancel = new Promise<void>((resolve) => (releaseAfterCancel = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // deferral point
+        yield idle();
+        yield taskNotification("agent-1"); // the model wakes for the summary
+        yield running();
+        await afterCancel;
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Both conditions in one wait: the turn's OWN result also runs through a
+    // "running" state, so waiting on them separately could latch on that one
+    // and race the trailing idle that follows it.
+    await waitFor(
+      () =>
+        !!agent.sessions["test-session"]?.activeTurn?.deferredSettle &&
+        agent.sessions["test-session"]?.lastSessionState === "running",
+    );
+    await agent.cancel({ sessionId: "test-session" });
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: expect.objectContaining({ totalTokens: 15 }),
+    });
+    expect(agent.sessions["test-session"].query.interrupt).toHaveBeenCalled();
+
+    releaseAfterCancel();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("does not fail a held turn when a followup errors while another subagent is live", async () => {
     // A followup's is_error must never touch the user-turn lifecycle: the
     // held turn's own result recorded a success.
