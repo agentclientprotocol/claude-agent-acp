@@ -218,7 +218,7 @@ export function toolInfoFromToolUse(
       }
       const displayPath = input?.file_path ? toDisplayPath(input.file_path, cwd) : undefined;
       return {
-        title: displayPath ? `Write ${displayPath}` : "Write",
+        title: displayPath ? `Write ${displayPath}` : "Preparing file…",
         kind: "edit",
         content,
         locations: input?.file_path ? [{ path: input.file_path }] : [],

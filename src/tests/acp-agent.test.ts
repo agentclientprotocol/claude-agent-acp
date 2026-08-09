@@ -838,6 +838,22 @@ describe("tool conversions", () => {
     });
   });
 
+  it("should describe a pending Write before its file path arrives", () => {
+    const tool_use = {
+      type: "tool_use",
+      id: "toolu_pending_write",
+      name: "Write",
+      input: {},
+    };
+
+    expect(toolInfoFromToolUse(tool_use)).toStrictEqual({
+      kind: "edit",
+      title: "Preparing file…",
+      content: [],
+      locations: [],
+    });
+  });
+
   it("should handle Write tool calls", () => {
     const tool_use = {
       type: "tool_use",
@@ -11743,8 +11759,82 @@ describe("streamEventToAcpNotifications", () => {
         options,
       );
 
-      return { started, refined, streamedToolInputs };
+      return { started, refined, streamedToolInputs, toolUseCache, emittedToolCalls };
     }
+
+    it("refines a pending Write title when its file path arrives", () => {
+      const { started, refined } = refineFromPartialInput({
+        name: "Write",
+        partialJson: '{"file_path":"/Users/test/project/src/write.ts","content":',
+      });
+
+      expect(started).toHaveLength(1);
+      expect(started[0].update).toMatchObject({
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_partial",
+        title: "Preparing file…",
+        kind: "edit",
+        status: "pending",
+        locations: [],
+      });
+      expect(refined).toHaveLength(1);
+      expect(refined[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_partial",
+        title: "Write src/write.ts",
+        rawInput: { file_path: "/Users/test/project/src/write.ts" },
+        locations: [{ path: "/Users/test/project/src/write.ts" }],
+      });
+      expect(refined[0].update).not.toHaveProperty("content");
+    });
+
+    it("refines a pending Write from the consolidated block after complete streamed input", () => {
+      const { started, refined, streamedToolInputs, toolUseCache, emittedToolCalls } =
+        refineFromPartialInput({
+          name: "Write",
+          partialJson: '{"file_path":"/Users/test/project/src/write.ts","content":"hello"}',
+        });
+
+      expect(started[0].update).toMatchObject({
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_partial",
+        title: "Preparing file…",
+      });
+      expect(refined).toEqual([]);
+      expect(streamedToolInputs.size).toBe(0);
+
+      const consolidated = toAcpNotifications(
+        [
+          {
+            type: "tool_use",
+            id: "toolu_partial",
+            name: "Write",
+            input: {
+              file_path: "/Users/test/project/src/write.ts",
+              content: "hello",
+            },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        { cwd: "/Users/test/project", emittedToolCalls },
+      );
+
+      expect(consolidated).toHaveLength(1);
+      expect(consolidated[0].update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_partial",
+        title: "Write src/write.ts",
+        rawInput: {
+          file_path: "/Users/test/project/src/write.ts",
+          content: "hello",
+        },
+        locations: [{ path: "/Users/test/project/src/write.ts" }],
+      });
+    });
 
     it.each([
       {
