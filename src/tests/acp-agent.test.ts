@@ -3133,6 +3133,14 @@ describe("stop reason propagation", () => {
     is_error: boolean;
     result?: string;
     errors?: string[];
+    terminal_reason?:
+      | "prompt_too_long"
+      | "budget_exhausted"
+      | "max_turns"
+      | "structured_output_retry_exhausted"
+      | "tool_deferred"
+      | "tool_deferred_unavailable";
+    deferred_tool_use?: { id: string; name: string; input: Record<string, unknown> };
   }) {
     return {
       type: "result" as const,
@@ -3153,6 +3161,8 @@ describe("stop reason propagation", () => {
       },
       modelUsage: {},
       permission_denials: [],
+      ...(overrides.terminal_reason ? { terminal_reason: overrides.terminal_reason } : {}),
+      ...(overrides.deferred_tool_use ? { deferred_tool_use: overrides.deferred_tool_use } : {}),
       uuid: randomUUID(),
       session_id: "test-session",
     };
@@ -3198,8 +3208,40 @@ describe("stop reason propagation", () => {
     },
   };
 
+  const airCompletionCapabilities = {
+    _meta: {
+      jetbrains: {
+        air: { version: 1, capabilities: ["sessionFailure", "completionDetails"] },
+      },
+    },
+  };
+
   const sessionFailureFromResponse = (response: PromptResponse) =>
     (response._meta as any)?.jetbrains?.air?.sessionFailure;
+
+  const completionDetailsFromResponse = (response: PromptResponse) =>
+    (response._meta as any)?.jetbrains?.air?.completionDetails;
+
+  function createAssistantText(text: string) {
+    return {
+      type: "assistant" as const,
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4-5",
+        stop_reason: "end_turn",
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        content: [{ type: "text", text }],
+      },
+    };
+  }
 
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
     const input = new Pushable<any>();
@@ -3293,6 +3335,117 @@ describe("stop reason propagation", () => {
     });
 
     expect(response.stopReason).toBe("end_turn");
+  });
+
+  it.each([
+    ["error_max_budget_usd", "budget", false, ["new_turn"]],
+    ["error_max_turns", "max_turns", false, ["new_turn"]],
+    ["error_max_structured_output_retries", "structured_output", true, ["retry"]],
+  ] as const)(
+    "publishes completion details for %s",
+    async (subtype, limitKind, retryable, actions) => {
+      const agent = createMockAgent();
+      (agent as any).clientCapabilities = airCompletionCapabilities;
+      injectSession(agent, [
+        createResultMessage({ subtype, stop_reason: null, is_error: false }),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ]);
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+
+      expect(response.stopReason).toBe("max_turn_requests");
+      expect(completionDetailsFromResponse(response)).toEqual({
+        turnId: expect.any(String),
+        partial: false,
+        retryable,
+        limitKind,
+        actions: [...actions],
+      });
+    },
+  );
+
+  it("publishes deferred tool identity and resume action", async () => {
+    const agent = createMockAgent();
+    (agent as any).clientCapabilities = airCompletionCapabilities;
+    injectSession(agent, [
+      createResultMessage({
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        terminal_reason: "tool_deferred",
+        deferred_tool_use: { id: "tool-42", name: "Bash", input: { command: "npm test" } },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(completionDetailsFromResponse(response)).toEqual({
+      turnId: expect.any(String),
+      partial: true,
+      retryable: true,
+      limitKind: "tool_deferred",
+      actions: ["resume"],
+      relatedToolCallId: "tool-42",
+    });
+  });
+
+  it("omits completion details when the capability was not negotiated", async () => {
+    const agent = createMockAgent();
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createResultMessage({
+        subtype: "error_max_structured_output_retries",
+        stop_reason: null,
+        is_error: false,
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(completionDetailsFromResponse(response)).toBeUndefined();
+  });
+
+  it("keeps partial output metadata beside a same-turn quota failure", async () => {
+    const agent = createMockAgent();
+    (agent as any).clientCapabilities = airCompletionCapabilities;
+    injectSession(agent, [
+      createAssistantText("I updated the event mapper, but"),
+      createAssistantError("billing_error"),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: null,
+        is_error: true,
+        result: "private billing detail",
+        terminal_reason: "budget_exhausted",
+      }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: "quota_exhausted" }),
+    );
+    expect(completionDetailsFromResponse(response)).toEqual({
+      turnId: expect.any(String),
+      partial: true,
+      retryable: false,
+      limitKind: "budget",
+      actions: ["new_turn"],
+    });
   });
 
   it("should consume background task results and return the prompt's own result", async () => {
@@ -5230,7 +5383,7 @@ describe("logout", () => {
     expect(response.agentCapabilities?.auth?.logout).toEqual({});
   });
 
-  it("advertises canonical AIR sessionFailure support during initialize", async () => {
+  it("advertises canonical AIR completion support during initialize", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
       protocolVersion: 1,
@@ -5245,7 +5398,7 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure"],
+      capabilities: ["sessionFailure", "completionDetails"],
     });
   });
 
@@ -5258,7 +5411,7 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure"],
+      capabilities: ["sessionFailure", "completionDetails"],
     });
   });
 });

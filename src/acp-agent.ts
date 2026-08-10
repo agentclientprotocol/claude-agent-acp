@@ -924,6 +924,7 @@ const AIR_META_KEY = "air";
 const AIR_EXTENSION_VERSION_KEY = "version";
 const AIR_EXTENSION_CAPABILITIES_KEY = "capabilities";
 const AIR_SESSION_FAILURE_KEY = "sessionFailure";
+const AIR_COMPLETION_DETAILS_KEY = "completionDetails";
 const AIR_EXTENSION_VERSION = 1;
 
 function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
@@ -942,6 +943,20 @@ type AirSessionFailureCategory =
   | "rate_limited"
   | "transport_lost"
   | "worker_shutdown";
+
+type AirCompletionLimitKind =
+  "context" | "budget" | "max_turns" | "structured_output" | "tool_deferred";
+
+type AirCompletionAction = "retry" | "resume" | "new_turn" | "new_session";
+
+type AirCompletionDetails = {
+  turnId: string;
+  partial: boolean;
+  retryable: boolean;
+  limitKind?: AirCompletionLimitKind;
+  actions?: AirCompletionAction[];
+  relatedToolCallId?: string;
+};
 
 const AIR_FAILURE_PRESENTATION: Record<
   AirSessionFailureCategory,
@@ -1004,7 +1019,10 @@ const AIR_FAILURE_PRESENTATION: Record<
   },
 };
 
-function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
+function supportsAirCapability(
+  capabilities: ClientCapabilities | undefined,
+  capability: string,
+): boolean {
   const jetbrains = capabilities?._meta?.[JETBRAINS_META_KEY] as
     Record<string, unknown> | undefined;
   const air = jetbrains?.[AIR_META_KEY] as Record<string, unknown> | undefined;
@@ -1016,8 +1034,77 @@ function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean 
     Number.isInteger(version) &&
     version >= AIR_EXTENSION_VERSION &&
     Array.isArray(advertised) &&
-    advertised.some((capability) => capability === AIR_SESSION_FAILURE_KEY)
+    advertised.some((advertisedCapability) => advertisedCapability === capability)
   );
+}
+
+function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
+  return supportsAirCapability(capabilities, AIR_SESSION_FAILURE_KEY);
+}
+
+function supportsAirCompletionDetails(capabilities?: ClientCapabilities): boolean {
+  return supportsAirCapability(capabilities, AIR_COMPLETION_DETAILS_KEY);
+}
+
+function completionDetailsForResult(
+  message: Extract<SDKMessage, { type: "result" }>,
+  turnId: string | undefined,
+  deliveredAssistantText: boolean,
+): AirCompletionDetails | undefined {
+  if (!turnId) return undefined;
+
+  const details = (
+    limitKind: AirCompletionLimitKind | undefined,
+    retryable: boolean,
+    actions: AirCompletionAction[],
+    partial = deliveredAssistantText,
+    relatedToolCallId?: string,
+  ): AirCompletionDetails => ({
+    turnId,
+    partial,
+    retryable,
+    ...(limitKind ? { limitKind } : {}),
+    ...(actions.length > 0 ? { actions } : {}),
+    ...(relatedToolCallId ? { relatedToolCallId } : {}),
+  });
+
+  switch (message.terminal_reason) {
+    case "prompt_too_long":
+      return details("context", false, ["new_session"]);
+    case "budget_exhausted":
+      return details("budget", false, ["new_turn"]);
+    case "max_turns":
+      return details("max_turns", false, ["new_turn"]);
+    case "structured_output_retry_exhausted":
+      return details("structured_output", true, ["retry"]);
+    case "tool_deferred":
+      return message.subtype === "success" && message.deferred_tool_use
+        ? details("tool_deferred", true, ["resume"], true, message.deferred_tool_use.id)
+        : details("tool_deferred", false, []);
+    case "tool_deferred_unavailable":
+      return details("tool_deferred", false, []);
+    default:
+      break;
+  }
+
+  if (message.stop_reason === "max_tokens") {
+    return details(undefined, false, ["new_turn"], true);
+  }
+  switch (message.subtype) {
+    case "error_max_budget_usd":
+      return details("budget", false, ["new_turn"]);
+    case "error_max_turns":
+      return details("max_turns", false, ["new_turn"]);
+    case "error_max_structured_output_retries":
+      return details("structured_output", true, ["retry"]);
+    case "success":
+    case "error_during_execution":
+      return message.is_error && deliveredAssistantText
+        ? details(undefined, false, [], true)
+        : undefined;
+    default:
+      return undefined;
+  }
 }
 
 function providerFailureCategory(errorKind?: SDKAssistantMessageError): AirSessionFailureCategory {
@@ -1750,7 +1837,7 @@ export class ClaudeAcpAgent {
         [JETBRAINS_META_KEY]: {
           [AIR_META_KEY]: {
             [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-            [AIR_EXTENSION_CAPABILITIES_KEY]: [AIR_SESSION_FAILURE_KEY],
+            [AIR_EXTENSION_CAPABILITIES_KEY]: [AIR_SESSION_FAILURE_KEY, AIR_COMPLETION_DETAILS_KEY],
           },
         },
         steering: {
@@ -2328,27 +2415,40 @@ export class ClaudeAcpAgent {
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
 
-    const sessionFailureMeta = (failure: PublishedSessionFailure, phase: "active" | "cleared") => {
+    const sessionFailurePayload = (
+      failure: PublishedSessionFailure,
+      phase: "active" | "cleared",
+    ) => {
       const presentation = AIR_FAILURE_PRESENTATION[failure.category];
       return {
-        [JETBRAINS_META_KEY]: {
-          [AIR_META_KEY]: {
-            [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-            [AIR_SESSION_FAILURE_KEY]: {
-              id: failure.id,
-              revision: failure.revision,
-              phase,
-              category: failure.category,
-              source: "claude",
-              safeMessage: presentation.message,
-              retryable: presentation.retryable,
-              actions: presentation.actions,
-              ...(failure.turnId ? { turnId: failure.turnId } : {}),
-            },
-          },
-        },
+        id: failure.id,
+        revision: failure.revision,
+        phase,
+        category: failure.category,
+        source: "claude",
+        safeMessage: presentation.message,
+        retryable: presentation.retryable,
+        actions: presentation.actions,
+        ...(failure.turnId ? { turnId: failure.turnId } : {}),
       };
     };
+
+    const airResponseMeta = (values: Record<string, unknown>) => ({
+      [JETBRAINS_META_KEY]: {
+        [AIR_META_KEY]: {
+          [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+          ...values,
+        },
+      },
+    });
+
+    const sessionFailureMeta = (failure: PublishedSessionFailure, phase: "active" | "cleared") =>
+      airResponseMeta({
+        [AIR_SESSION_FAILURE_KEY]: sessionFailurePayload(failure, phase),
+      });
+
+    const completionDetailsMeta = (details: AirCompletionDetails) =>
+      airResponseMeta({ [AIR_COMPLETION_DETAILS_KEY]: details });
 
     const emitSessionFailure = async (
       failure: PublishedSessionFailure,
@@ -2753,6 +2853,7 @@ export class ClaudeAcpAgent {
     const failActiveWithSessionFailure = async (
       category: AirSessionFailureCategory,
       error: unknown,
+      completionDetails?: AirCompletionDetails,
     ) => {
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
         failActive(error);
@@ -2775,7 +2876,10 @@ export class ClaudeAcpAgent {
       settleActive({
         stopReason: "end_turn",
         usage: sessionUsage(session),
-        _meta: sessionFailureMeta(failure, "active"),
+        _meta: airResponseMeta({
+          [AIR_SESSION_FAILURE_KEY]: sessionFailurePayload(failure, "active"),
+          ...(completionDetails ? { [AIR_COMPLETION_DETAILS_KEY]: completionDetails } : {}),
+        }),
       });
     };
 
@@ -3699,6 +3803,13 @@ export class ClaudeAcpAgent {
               // through the early break below, which the gated `finally`
               // leaves alone).
               const deliveredAssistantText = session.emittedAssistantText;
+              const completionDetails = supportsAirCompletionDetails(this.clientCapabilities)
+                ? completionDetailsForResult(
+                    message,
+                    session.activeTurn?.promptUuid,
+                    deliveredAssistantText,
+                  )
+                : undefined;
 
               // Every user-turn result terminates a turn (settle, reject, or
               // orphan skip) and the SDK follows it with a trailing
@@ -3907,6 +4018,7 @@ export class ClaudeAcpAgent {
                     await failActiveWithSessionFailure(
                       "auth_required",
                       RequestError.authRequired(),
+                      completionDetails,
                     );
                     break;
                   }
@@ -3918,6 +4030,7 @@ export class ClaudeAcpAgent {
                     await failActiveWithSessionFailure(
                       providerFailureCategory(lastAssistantError),
                       internalErrorForClient(errorKindData(lastAssistantError), message.result),
+                      completionDetails,
                     );
                     break;
                   }
@@ -3969,6 +4082,7 @@ export class ClaudeAcpAgent {
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
+                      completionDetails,
                     );
                     break;
                   }
@@ -3983,6 +4097,7 @@ export class ClaudeAcpAgent {
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
+                      completionDetails,
                     );
                     break;
                   }
@@ -3996,6 +4111,7 @@ export class ClaudeAcpAgent {
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
+                      completionDetails,
                     );
                     break;
                   }
@@ -4009,6 +4125,7 @@ export class ClaudeAcpAgent {
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
                       ),
+                      completionDetails,
                     );
                     break;
                   }
@@ -4044,7 +4161,11 @@ export class ClaudeAcpAgent {
               // idle/abort path. settleActive is idempotent, so a duplicate
               // idle is a no-op.
               if (!session.cancelled) {
-                settleOrDefer({ stopReason, usage: sessionUsage(session) });
+                settleOrDefer({
+                  stopReason,
+                  usage: sessionUsage(session),
+                  ...(completionDetails ? { _meta: completionDetailsMeta(completionDetails) } : {}),
+                });
               }
             } finally {
               if (!isAutonomousResult) {
