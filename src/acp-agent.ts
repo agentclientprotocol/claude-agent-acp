@@ -916,6 +916,14 @@ export type ToolUpdateMeta = {
 };
 
 const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
+// This is a protocol namespace, not user-facing branding: `jetbrains` owns the
+// non-standard contract and `air` identifies the client defining its rendering
+// semantics, without affecting unrelated JetBrains ACP clients.
+const JETBRAINS_META_KEY = "jetbrains";
+const AIR_META_KEY = "air";
+const AIR_EXTENSION_VERSION_KEY = "version";
+const AIR_EXTENSION_CAPABILITIES_KEY = "capabilities";
+const AIR_SESSION_FAILURE_KEY = "sessionFailure";
 const AIR_EXTENSION_VERSION = 1;
 
 function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
@@ -997,17 +1005,18 @@ const AIR_FAILURE_PRESENTATION: Record<
 };
 
 function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
-  const jetbrains = capabilities?._meta?.["jetbrains"] as Record<string, unknown> | undefined;
-  const air = jetbrains?.["air"] as Record<string, unknown> | undefined;
-  const version = air?.["version"];
-  const advertised = air?.["capabilities"];
+  const jetbrains = capabilities?._meta?.[JETBRAINS_META_KEY] as
+    Record<string, unknown> | undefined;
+  const air = jetbrains?.[AIR_META_KEY] as Record<string, unknown> | undefined;
+  const version = air?.[AIR_EXTENSION_VERSION_KEY];
+  const advertised = air?.[AIR_EXTENSION_CAPABILITIES_KEY];
   return (
     typeof version === "number" &&
     Number.isFinite(version) &&
     Number.isInteger(version) &&
     version >= AIR_EXTENSION_VERSION &&
     Array.isArray(advertised) &&
-    advertised.some((capability) => capability === "sessionFailure")
+    advertised.some((capability) => capability === AIR_SESSION_FAILURE_KEY)
   );
 }
 
@@ -1738,10 +1747,10 @@ export class ClaudeAcpAgent {
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
       _meta: {
-        jetbrains: {
-          air: {
-            version: AIR_EXTENSION_VERSION,
-            capabilities: ["sessionFailure"],
+        [JETBRAINS_META_KEY]: {
+          [AIR_META_KEY]: {
+            [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+            [AIR_EXTENSION_CAPABILITIES_KEY]: [AIR_SESSION_FAILURE_KEY],
           },
         },
         steering: {
@@ -2322,10 +2331,10 @@ export class ClaudeAcpAgent {
     const sessionFailureMeta = (failure: PublishedSessionFailure, phase: "active" | "cleared") => {
       const presentation = AIR_FAILURE_PRESENTATION[failure.category];
       return {
-        jetbrains: {
-          air: {
-            version: AIR_EXTENSION_VERSION,
-            sessionFailure: {
+        [JETBRAINS_META_KEY]: {
+          [AIR_META_KEY]: {
+            [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+            [AIR_SESSION_FAILURE_KEY]: {
               id: failure.id,
               revision: failure.revision,
               phase,
