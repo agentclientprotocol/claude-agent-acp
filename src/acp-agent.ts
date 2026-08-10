@@ -6946,11 +6946,23 @@ export function buildConfigOptions(
       category: "model",
       type: "select",
       currentValue: models.currentModelId,
-      options: models.availableModels.map((m) => ({
-        value: m.modelId,
-        name: m.name,
-        description: m.description ?? undefined,
-      })),
+      options: models.availableModels.map((m) => {
+        if (m.modelId === "default") {
+          const defaultInfo = modelInfos.find((mi) => mi.value === "default");
+          const resolvedModel = defaultInfo?.resolvedModel;
+          if (resolvedModel) {
+            const namedMatch = modelInfos.find(
+              (mi) => mi.value !== "default" && mi.resolvedModel === resolvedModel,
+            );
+            return {
+              value: m.modelId,
+              name: m.name,
+              description: namedMatch?.displayName ?? resolvedModel,
+            };
+          }
+        }
+        return { value: m.modelId, name: m.name, description: m.description ?? undefined };
+      }),
     },
   ];
 
