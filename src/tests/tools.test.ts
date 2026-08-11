@@ -3174,3 +3174,73 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
     });
   });
 });
+
+describe("Skill tool rendering", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  describe("toolInfoFromToolUse", () => {
+    it("sets title to 'Load skill: <name>' and returns empty content", () => {
+      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_1", input: { skill: "commits" } }, false);
+      expect(info.title).toBe("Load skill: commits");
+      expect(info.kind).toBe("other");
+      expect(info.content).toEqual([]);
+    });
+
+    it("falls back to 'Load skill' when skill name is absent", () => {
+      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_2", input: {} }, false);
+      expect(info.title).toBe("Load skill");
+      expect(info.content).toEqual([]);
+    });
+
+    it("does not throw when input is undefined", () => {
+      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_3", input: undefined }, false);
+      expect(info.title).toBe("Load skill");
+      expect(info.content).toEqual([]);
+    });
+  });
+
+  describe("toolUpdateFromToolResult", () => {
+    it("suppresses the raw 'Launching skill' result text", () => {
+      const toolUse = { type: "tool_use", id: "toolu_4", name: "Skill", input: { skill: "commits" } };
+      const toolResult = {
+        type: "tool_result" as const,
+        tool_use_id: "toolu_4",
+        content: "Launching skill: commits",
+        is_error: false,
+      };
+      const update = toolUpdateFromToolResult(toolResult, toolUse, false);
+      expect(update).toEqual({});
+    });
+  });
+
+  describe("_meta.claudeCode.skill in tool_call notification", () => {
+    it("includes skill name in _meta.claudeCode when Skill tool is invoked", () => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        _meta: { claudeCode: { toolName: "Skill", skill: "commits" } },
+      });
+    });
+
+    it("omits skill from _meta.claudeCode when skill name is missing", () => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_6", name: "Skill", input: {} }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      const meta = (notifications[0]?.update as any)?._meta?.claudeCode;
+      expect(meta).toBeDefined();
+      expect(meta.skill).toBeUndefined();
+    });
+  });
+});

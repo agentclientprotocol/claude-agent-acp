@@ -7672,12 +7672,8 @@ function claudeCodeMetaFromToolUse(toolUse: {
       ? toolUse.input.description
       : undefined;
   const skillName =
-    toolUse.name === "Skill" &&
-    toolUse.input !== null &&
-    typeof toolUse.input === "object" &&
-    "skill" in toolUse.input &&
-    typeof toolUse.input.skill === "string"
-      ? toolUse.input.skill
+    toolUse.name === "Skill"
+      ? (toolUse.input as { skill?: string } | null | undefined)?.skill
       : undefined;
   return {
     toolName: toolUse.name,
