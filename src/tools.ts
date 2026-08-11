@@ -441,6 +441,16 @@ export function toolInfoFromToolUse(
       };
     }
 
+    case "Skill": {
+      const input = toolUse.input as { skill?: string; args?: string } | undefined;
+      const skillName = input?.skill;
+      return {
+        title: skillName ? `Load skill: ${skillName}` : "Load skill",
+        kind: "other",
+        content: [],
+      };
+    }
+
     case "AskUserQuestion": {
       const input = toolUse.input as Partial<AskUserQuestionInput> | undefined;
       const questions = Array.isArray(input?.questions) ? input.questions : [];
@@ -861,6 +871,10 @@ export function toolUpdateFromToolResult(
         stripAgentTrailerFromContent(toolResult.content),
         "is_error" in toolResult ? toolResult.is_error : false,
       );
+    }
+
+    case "Skill": {
+      return {};
     }
 
     case "Edit": // Edit is handled in hooks

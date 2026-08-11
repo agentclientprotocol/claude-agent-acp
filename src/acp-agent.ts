@@ -899,6 +899,9 @@ export type ToolUpdateMeta = {
        transcripts need a namespaced marker instead of inferring from
        `toolName` or the generic `think` kind. */
     subagent?: true;
+    /* For Skill tool calls: the name of the skill being loaded (e.g. "commits").
+       Lets clients render a "Load skill: <name>" block without parsing the title. */
+    skill?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -7668,10 +7671,19 @@ function claudeCodeMetaFromToolUse(toolUse: {
     typeof toolUse.input.description === "string"
       ? toolUse.input.description
       : undefined;
+  const skillName =
+    toolUse.name === "Skill" &&
+    toolUse.input !== null &&
+    typeof toolUse.input === "object" &&
+    "skill" in toolUse.input &&
+    typeof toolUse.input.skill === "string"
+      ? toolUse.input.skill
+      : undefined;
   return {
     toolName: toolUse.name,
     ...(description ? { title: description } : {}),
     ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
+    ...(skillName ? { skill: skillName } : {}),
   };
 }
 
