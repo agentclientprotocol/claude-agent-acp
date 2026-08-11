@@ -147,6 +147,26 @@ const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
 
+/** Extract plain text from a message's content, which may be a raw string or
+ *  an array of content blocks (text / image / tool_use / …). Only text blocks
+ *  are concatenated; all other block types are ignored. */
+function extractPlainText(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type: string }).type === "text" &&
+      typeof (block as { text: unknown }).text === "string"
+    ) {
+      parts.push((block as { text: string }).text);
+    }
+  }
+  return parts.length > 0 ? parts.join("\n") : null;
+}
+
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
   const sanitized = text
@@ -561,6 +581,15 @@ type Session = {
    *  and only notify the client when it actually changes. Undefined until the
    *  first title is observed. */
   lastTitle?: string;
+  /** AI-generated semantic title produced by calling the Anthropic API with
+   *  the first user message after the first turn. Preferred over the SDK's
+   *  summary (which is just the last user message) in `maybeUpdateSessionTitle`.
+   *  Undefined until generation succeeds; absent when the API key is unavailable
+   *  or the call fails. */
+  generatedTitle?: string;
+  /** True once semantic title generation has been attempted (success or failure),
+   *  so we do not retry on every subsequent turn. */
+  titleGenerationAttempted?: boolean;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1810,6 +1839,15 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
+    // Push the SDK-maintained title before replaying history so the client
+    // sees the correct title immediately. Sending it first also prevents the
+    // history-replay fallback (backfillDerivedTitleIfNeeded on the client)
+    // from overriding the authoritative title with the first user message.
+    const session = this.sessions[params.sessionId];
+    if (session) {
+      await this.maybeUpdateSessionTitle(params.sessionId, session);
+    }
+
     await this.replaySessionHistory(params.sessionId);
 
     // Send available commands after replay so it doesn't interleave with history
@@ -1838,6 +1876,67 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /** Generate a semantic title for a session by calling the Anthropic API with
+   *  the first user message. Sets `session.titleGenerationAttempted` before
+   *  returning so callers know not to retry. Only works when `ANTHROPIC_API_KEY`
+   *  is set; silently no-ops for Bedrock/Vertex/gateway setups. */
+  private async generateSemanticTitle(
+    sessionId: string,
+    session: Session,
+  ): Promise<string | null> {
+    session.titleGenerationAttempted = true;
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return null;
+
+    let messages: Awaited<ReturnType<typeof getSessionMessages>>;
+    try {
+      messages = await getSessionMessages(sessionId);
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: could not read messages for title generation: ${error}`);
+      return null;
+    }
+
+    // Extract the first meaningful user message, excluding the IDE context block
+    // that Claude Code appends after the user's actual text.
+    let firstUserText: string | null = null;
+    for (const msg of messages) {
+      // @ts-expect-error — SDK message content is untyped
+      if (msg.message?.role !== "user") continue;
+      // @ts-expect-error — SDK message content is untyped
+      const raw: unknown = msg.message.content;
+      const text = extractPlainText(raw);
+      if (text?.trim()) {
+        // Strip the appended IDE context so the model sees only the user's intent.
+        firstUserText = text.split(/\n\n### IDE Context(?:\n|$)/)[0].trim();
+        if (firstUserText) break;
+      }
+    }
+    if (!firstUserText) return null;
+
+    try {
+      const { default: Anthropic } = await import("@anthropic-ai/sdk");
+      const client = new Anthropic({
+        apiKey,
+        ...(process.env.ANTHROPIC_BASE_URL && { baseURL: process.env.ANTHROPIC_BASE_URL }),
+      });
+      const response = await client.messages.create({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 25,
+        system:
+          "Generate a concise title (3–6 words) for this coding conversation. " +
+          "Reply with ONLY the title — no punctuation, no quotes, no explanation.",
+        messages: [{ role: "user", content: firstUserText.slice(0, 500) }],
+      });
+      const text =
+        response.content[0]?.type === "text" ? response.content[0].text.trim() : null;
+      return text ? sanitizeTitle(text) : null;
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: semantic title generation failed: ${error}`);
+      return null;
+    }
+  }
+
   /** Read the SDK-maintained title for a session and, if it changed since the
    *  last time we looked, notify the client with a `session_info_update`. The
    *  SDK has no push event for the title it auto-generates in the background, so
@@ -1851,9 +1950,8 @@ export class ClaudeAcpAgent {
       this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
       return;
     }
-    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
-    // title (or first prompt). Prefer the explicit title when present.
-    const rawTitle = info?.customTitle ?? info?.summary;
+    // Priority: user-set /rename > AI-generated semantic title > SDK summary (last user message).
+    const rawTitle = info?.customTitle ?? session.generatedTitle ?? info?.summary;
     if (!rawTitle) {
       return;
     }
@@ -3282,6 +3380,18 @@ export class ClaudeAcpAgent {
                         TURN_NO_RESULT_MESSAGE,
                       ),
                     );
+                  }
+                  // Generate a semantic title via the Anthropic API once, after
+                  // the first turn, so the tab shows a meaningful label instead
+                  // of the last user message that the SDK uses as its summary.
+                  if (!session.titleGenerationAttempted) {
+                    const generated = await this.generateSemanticTitle(
+                      params.sessionId,
+                      session,
+                    );
+                    if (generated) {
+                      session.generatedTitle = generated;
+                    }
                   }
                   // The SDK generates the session title in a background task and
                   // persists it to the session file; `idle` is the turn-over
