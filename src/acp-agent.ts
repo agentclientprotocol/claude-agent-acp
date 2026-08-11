@@ -62,7 +62,6 @@ import {
   EffortLevel,
   FastModeDisabledReason,
   FastModeState,
-  getSessionInfo,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -97,6 +96,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -175,20 +175,7 @@ export const CLAUDE_CONFIG_DIR =
 
 const execFileAsync = promisify(execFile);
 
-const MAX_TITLE_LENGTH = 256;
 const MAX_INLINE_FAILURE_TITLE_LENGTH = 256;
-
-function sanitizeTitle(text: string): string {
-  // Replace newlines and collapse whitespace
-  const sanitized = text
-    .replace(/[\r\n]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (sanitized.length <= MAX_TITLE_LENGTH) {
-    return sanitized;
-  }
-  return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
-}
 
 /**
  * Logger interface for customizing logging output
@@ -438,7 +425,7 @@ type Turn = {
   completion?: Promise<void>;
 };
 
-type Session = {
+export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -536,6 +523,8 @@ type Session = {
   /** Original ACP parameters used to recreate this query with a new provider. */
   creationParams?: NewSessionRequest;
   settingsManager: SettingsManager;
+  /** This session's title state and the turn-end logic that maintains it. */
+  titles: SessionTitles;
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
@@ -607,12 +596,6 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
-  /** Last session title we pushed to the client via `session_info_update`.
-   *  The SDK auto-generates a title in a background task and persists it to the
-   *  session file; we poll it on each turn-end (`session_state_changed: idle`)
-   *  and only notify the client when it actually changes. Undefined until the
-   *  first title is observed. */
-  lastTitle?: string;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1768,40 +1751,6 @@ export class ClaudeAcpAgent {
     };
   }
 
-  /** Read the SDK-maintained title for a session and, if it changed since the
-   *  last time we looked, notify the client with a `session_info_update`. The
-   *  SDK has no push event for the title it auto-generates in the background, so
-   *  we pull it at turn-end. A missing session file or read error is non-fatal:
-   *  the title is best-effort and another turn will retry. */
-  private async maybeUpdateSessionTitle(sessionId: string, session: Session): Promise<void> {
-    let info;
-    try {
-      info = await getSessionInfo(sessionId, { dir: session.cwd });
-    } catch (error) {
-      this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
-      return;
-    }
-    // `customTitle` is a user-set `/rename`; `summary` is the auto-generated
-    // title (or first prompt). Prefer the explicit title when present.
-    const rawTitle = info?.customTitle ?? info?.summary;
-    if (!rawTitle) {
-      return;
-    }
-    const title = sanitizeTitle(rawTitle);
-    if (title === session.lastTitle) {
-      return;
-    }
-    session.lastTitle = title;
-    await this.client.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "session_info_update",
-        title,
-        updatedAt: new Date(info!.lastModified).toISOString(),
-      },
-    });
-  }
-
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
@@ -1995,6 +1944,8 @@ export class ClaudeAcpAgent {
       session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
       fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
     }
+
+    session.titles.onPrompt(params.prompt);
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
     // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
@@ -2303,6 +2254,7 @@ export class ClaudeAcpAgent {
           { parentToolUseId?: string | null } | undefined;
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
+          session.titles.onAssistantText(update.content);
         }
       }
       await this.client.sessionUpdate(notification);
@@ -3250,11 +3202,9 @@ export class ClaudeAcpAgent {
                       TURN_NO_RESULT_MESSAGE,
                     );
                   }
-                  // The SDK generates the session title in a background task and
-                  // persists it to the session file; `idle` is the turn-over
-                  // signal, so it's the point at which a new title may have
-                  // landed. Push it to the client if it changed.
-                  await this.maybeUpdateSessionTitle(params.sessionId, session);
+                  // Turn-over is when a title may have landed or become
+                  // generatable; see SessionTitles.onTurnEnd.
+                  await session.titles.onTurnEnd(session);
                 }
                 break;
               }
@@ -4602,6 +4552,10 @@ export class ClaudeAcpAgent {
             // before any follow-up prompt can republish stale tasks.
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
+            // A reset mounts a fresh transcript (`new_conversation_id`), so our
+            // cached title no longer describes the session: drop it and
+            // re-evaluate at the next turn-end.
+            session.titles.reset();
             break;
           }
           case "tool_use_summary":
@@ -6732,6 +6686,7 @@ export class ClaudeAcpAgent {
       sessionFingerprint: computeSessionFingerprint(params),
       creationParams: params,
       settingsManager,
+      titles: new SessionTitles(this, sessionId),
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,

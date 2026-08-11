@@ -45,6 +45,7 @@ import {
   type SteerRequest,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
+import { SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
@@ -55,6 +56,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
+import { mockSessionState, userEcho, wrapQuery } from "./session-doubles.js";
 import {
   GOAL_CONTROL_METHOD,
   goalUpdateFromPrompt,
@@ -81,19 +83,6 @@ import type {
   BetaWebFetchToolResultBlockParam,
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-
-/** Build the replayed `user` message the SDK echoes back for a pushed prompt,
- *  used by mock generators to promote a turn to active. */
-function userEcho(u: any) {
-  return {
-    type: "user",
-    message: u.message,
-    parent_tool_use_id: null,
-    uuid: u.uuid,
-    session_id: "test-session",
-    isReplay: true,
-  };
-}
 
 /** A `system`/init frame advertising the msg_lifecycle_v1 capability, so the
  *  consumer latches `session.msgLifecycleV1` and cancel() routes orphan
@@ -128,57 +117,6 @@ const cancelledTurnUsage = {
   cachedWriteTokens: 0,
   totalTokens: 0,
 };
-
-/** Wrap a mock async generator with the `Query` methods the agent calls outside
- *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
- *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
-function wrapQuery(generator: AsyncGenerator<any>) {
-  return Object.assign(generator, {
-    interrupt: vi.fn(async () => {}),
-    close: vi.fn(),
-    setModel: vi.fn(async () => {}),
-  }) as any;
-}
-
-/** The common `Session` mock fields, with per-test overrides spread on top.
- *  Centralizes the boilerplate (usage accumulator, caches, controllers) so a new
- *  Session field is added in one place rather than every inline literal. */
-function mockSessionState(overrides: Record<string, any> = {}) {
-  return {
-    cancelled: false,
-    cwd: "/test",
-    sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-    modes: { currentModeId: "default", availableModes: [] },
-    models: { currentModelId: "default", availableModels: [] },
-    modelInfos: [],
-    settingsManager: { dispose: vi.fn() },
-    accumulatedUsage: {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    },
-    configOptions: [],
-    agents: [],
-    currentAgent: "default",
-    abortController: new AbortController(),
-    emitRawSDKMessages: false,
-    forwardSubagentText: false,
-    contextWindowSize: 200000,
-    contextWindowAuthoritative: false,
-    providerCacheKey: "default",
-    taskState: new Map(),
-    toolUseCache: {},
-    emittedToolCalls: new Set(),
-    liveBackgroundTasks: new Map(),
-    emittedAssistantText: false,
-    owedTrailingIdles: 0,
-    messageIdToUuid: new Map(),
-    sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-    fileChangeReportRequestIds: new Set(),
-    ...overrides,
-  } as any;
-}
 
 /** Install a mock session whose query is a caller-supplied async generator
  *  driven by the session's streaming input. Returns the input Pushable so the
@@ -4210,98 +4148,6 @@ describe("stop reason propagation", () => {
     expect(chunkTexts).toContain("between-turn background note");
   });
 
-  it("pushes a session_info_update when the SDK generates a title at turn-end", async () => {
-    const sessionUpdates: any[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        sessionUpdates.push(u);
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "Fix the flaky title test",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage } = await iter.next();
-      yield userEcho(userMessage);
-      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
-    }
-
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    const titleUpdate = sessionUpdates.find(
-      (u) => u.update?.sessionUpdate === "session_info_update",
-    );
-    expect(titleUpdate?.update).toEqual({
-      sessionUpdate: "session_info_update",
-      title: "Fix the flaky title test",
-      updatedAt: new Date(1_700_000_000_000).toISOString(),
-    });
-    expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
-  });
-
-  it("does not re-push session_info_update when the title is unchanged", async () => {
-    const sessionUpdates: any[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        sessionUpdates.push(u);
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "Stable title",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      // Two turns, each ending in idle, but the title never changes.
-      for (let i = 0; i < 2; i++) {
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: false,
-        });
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-    }
-
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "one" }] });
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "two" }] });
-    await agent.sessions["test-session"]?.consumer;
-
-    const titleUpdates = sessionUpdates.filter(
-      (u) => u.update?.sessionUpdate === "session_info_update",
-    );
-    expect(titleUpdates).toHaveLength(1);
-  });
-
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
@@ -6030,6 +5876,7 @@ describe("session/close", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
@@ -6131,6 +5978,7 @@ describe("session/delete", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -6240,6 +6088,7 @@ describe("getOrCreateSession param change detection", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd,
       sessionFingerprint: JSON.stringify({
         cwd,
@@ -9103,6 +8952,7 @@ describe("post-error recovery", () => {
       query: gen as any,
       input,
       cancelled: false,
+      titles: new SessionTitles(agent, "test-session"),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -12883,6 +12733,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       query: gen as any,
       input,
       cancelled: false,
+      titles: new SessionTitles(agent, "test-session"),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -14321,6 +14172,7 @@ describe("agent selection config option", () => {
         query: gen as any,
         input: new Pushable(),
         cancelled: false,
+        titles: new SessionTitles(agent, sessionId),
         cwd: "/test",
         sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
         modes: { currentModeId: "default", availableModes: [] },
