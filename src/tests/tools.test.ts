@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -3241,6 +3244,70 @@ describe("Skill tool rendering", () => {
       const meta = (notifications[0]?.update as any)?._meta?.claudeCode;
       expect(meta).toBeDefined();
       expect(meta.skill).toBeUndefined();
+    });
+  });
+
+  describe("_meta.claudeCode.skillPath", () => {
+    const skillMeta = (skill: string, cwd?: string) =>
+      (
+        toAcpNotifications(
+          [{ type: "tool_use", id: "toolu_skill_path", name: "Skill", input: { skill } }] as any,
+          "assistant",
+          "test-session",
+          {},
+          {} as AcpClient,
+          mockLogger,
+          cwd ? { cwd } : undefined,
+        )[0]?.update as any
+      )?._meta?.claudeCode;
+
+    let root: string;
+
+    beforeEach(() => {
+      root = mkdtempSync(path.join(tmpdir(), "acp-skill-path-"));
+    });
+
+    afterEach(() => {
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    const writeSkill = (relativeDir: string) => {
+      const dir = path.join(root, relativeDir);
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, "# skill\n");
+      return file;
+    };
+
+    it("resolves a project-level .claude/skills skill", () => {
+      const file = writeSkill(".claude/skills/commits");
+      expect(skillMeta("commits", root).skillPath).toBe(file);
+    });
+
+    it("resolves a project-level .agents/skills skill", () => {
+      const file = writeSkill(".agents/skills/commits");
+      expect(skillMeta("commits", root).skillPath).toBe(file);
+    });
+
+    it("resolves a directory-scoped skill spelled prefix:name", () => {
+      const file = writeSkill("apps/web/.claude/skills/deploy");
+      expect(skillMeta("apps/web:deploy", root).skillPath).toBe(file);
+    });
+
+    it("resolves a plugin skill spelled plugin:name", () => {
+      const file = writeSkill(".claude/plugins/reviewer/skills/audit");
+      expect(skillMeta("reviewer:audit", root).skillPath).toBe(file);
+    });
+
+    it("omits skillPath when no known layout holds the skill", () => {
+      const meta = skillMeta("nonexistent", root);
+      expect(meta.skill).toBe("nonexistent");
+      expect(meta.skillPath).toBeUndefined();
+    });
+
+    it("omits skillPath when the session has no cwd", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("commits").skillPath).toBeUndefined();
     });
   });
 });

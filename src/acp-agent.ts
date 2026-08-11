@@ -102,6 +102,7 @@ import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/re
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
+import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -902,6 +903,9 @@ export type ToolUpdateMeta = {
     /* For Skill tool calls: the name of the skill being loaded (e.g. "commits").
        Lets clients render a "Load skill: <name>" block without parsing the title. */
     skill?: string;
+    /* For Skill tool calls: absolute path of that skill's SKILL.md, when it could be
+       located on disk. Lets clients turn the rendered skill name into a link to it. */
+    skillPath?: string;
   };
   /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
   terminal_info?: {
@@ -7659,10 +7663,13 @@ function shouldEmitToolCall(toolName: string): boolean {
  *  are kept out of ACP's standard `title`, which clients may use as the shell
  *  command preview, while still giving clients access to Claude's concise
  *  human-readable title. */
-function claudeCodeMetaFromToolUse(toolUse: {
-  name: string;
-  input?: unknown;
-}): NonNullable<ToolUpdateMeta["claudeCode"]> {
+function claudeCodeMetaFromToolUse(
+  toolUse: {
+    name: string;
+    input?: unknown;
+  },
+  cwd?: string,
+): NonNullable<ToolUpdateMeta["claudeCode"]> {
   const description =
     toolUse.name === "Bash" &&
     toolUse.input !== null &&
@@ -7675,12 +7682,52 @@ function claudeCodeMetaFromToolUse(toolUse: {
     toolUse.name === "Skill"
       ? (toolUse.input as { skill?: string } | null | undefined)?.skill
       : undefined;
+  const skillPath = skillName ? resolveSkillPath(skillName, cwd) : undefined;
   return {
     toolName: toolUse.name,
     ...(description ? { title: description } : {}),
     ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
     ...(skillName ? { skill: skillName } : {}),
+    ...(skillPath ? { skillPath } : {}),
   };
+}
+
+/** Roots a skill's directory may sit under, relative to the directory the scope resolves to. */
+const SKILL_CONTAINER_DIRS = [".claude/skills", ".agents/skills"] as const;
+
+/**
+ * Absolute path of a skill's `SKILL.md`, or `undefined` when none of the known layouts holds one.
+ *
+ * The `Skill` tool reports only the skill's name, so the file has to be located by probing the layouts skills
+ * actually use: project- and user-level `.claude/skills` (plus this repo's `.agents/skills` source of truth), and
+ * for a `<prefix>:<name>` spelling either a plugin (`.claude/plugins/<prefix>/skills/<name>`) or a
+ * directory-scoped skill (`<prefix>/.claude/skills/<name>`), which share that spelling. Only a path that exists
+ * on disk is returned, so a wrong guess costs nothing and clients never render a link to a missing file.
+ */
+function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
+  if (!cwd) {
+    return undefined;
+  }
+  const colon = skillName.indexOf(":");
+  const scope = colon < 0 ? undefined : skillName.slice(0, colon);
+  const name = colon < 0 ? skillName : skillName.slice(colon + 1);
+  if (!name) {
+    return undefined;
+  }
+  const candidates: string[] = [];
+  const addCandidates = (base: string) => {
+    for (const container of SKILL_CONTAINER_DIRS) {
+      candidates.push(path.join(base, container, name, "SKILL.md"));
+    }
+  };
+  if (scope) {
+    // A `<prefix>:<name>` skill is either directory-scoped or a plugin's; both spellings look identical.
+    addCandidates(path.join(cwd, scope));
+    candidates.push(path.join(cwd, ".claude/plugins", scope, "skills", name, "SKILL.md"));
+  }
+  addCandidates(cwd);
+  addCandidates(os.homedir());
+  return candidates.find((candidate) => existsSync(candidate));
 }
 
 /** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
@@ -7699,7 +7746,7 @@ function toolCallNotification(
 ): SessionNotification["update"] {
   if (refine) {
     return {
-      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse) } satisfies ToolUpdateMeta,
+      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd) } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput,
@@ -7708,7 +7755,7 @@ function toolCallNotification(
   }
   return {
     _meta: {
-      claudeCode: claudeCodeMetaFromToolUse(toolUse),
+      claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
       ...(toolUse.name === "Bash" && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
@@ -7744,7 +7791,7 @@ function streamedInputRefinement(
   );
   return {
     _meta: {
-      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }),
+      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }, cwd),
     } satisfies ToolUpdateMeta,
     toolCallId: toolUse.id,
     sessionUpdate: "tool_call_update",
