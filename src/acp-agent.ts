@@ -1921,7 +1921,7 @@ export class ClaudeAcpAgent {
         ...(process.env.ANTHROPIC_BASE_URL && { baseURL: process.env.ANTHROPIC_BASE_URL }),
       });
       const response = await client.messages.create({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-haiku-4-5",
         max_tokens: 25,
         system:
           "Generate a concise title (3–6 words) for this coding conversation. " +
