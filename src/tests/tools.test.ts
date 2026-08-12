@@ -3183,7 +3183,10 @@ describe("Skill tool rendering", () => {
 
   describe("toolInfoFromToolUse", () => {
     it("sets title to 'Load skill: <name>' and returns empty content", () => {
-      const info = toolInfoFromToolUse({ name: "Skill", id: "toolu_1", input: { skill: "commits" } }, false);
+      const info = toolInfoFromToolUse(
+        { name: "Skill", id: "toolu_1", input: { skill: "commits" } },
+        false,
+      );
       expect(info.title).toBe("Load skill: commits");
       expect(info.kind).toBe("other");
       expect(info.content).toEqual([]);
@@ -3204,7 +3207,12 @@ describe("Skill tool rendering", () => {
 
   describe("toolUpdateFromToolResult", () => {
     it("suppresses the raw 'Launching skill' result text", () => {
-      const toolUse = { type: "tool_use", id: "toolu_4", name: "Skill", input: { skill: "commits" } };
+      const toolUse = {
+        type: "tool_use",
+        id: "toolu_4",
+        name: "Skill",
+        input: { skill: "commits" },
+      };
       const toolResult = {
         type: "tool_result" as const,
         tool_use_id: "toolu_4",
@@ -3219,7 +3227,9 @@ describe("Skill tool rendering", () => {
   describe("_meta.claudeCode.skill in tool_call notification", () => {
     it("includes skill name in _meta.claudeCode when Skill tool is invoked", () => {
       const notifications = toAcpNotifications(
-        [{ type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } }] as any,
+        [
+          { type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } },
+        ] as any,
         "assistant",
         "test-session",
         {},
