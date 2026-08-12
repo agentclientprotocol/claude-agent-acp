@@ -4996,6 +4996,54 @@ describe("model refusal fallback handling", () => {
     expect(notice.content.text).toContain("This request tripped a safety classifier.");
   });
 
+  it("publishes the model fallback as a warning advisory for AIR clients", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([refusalFallbackMessage(), successResult()]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    // The advisory replaces the transcript line; it must not be delivered as both.
+    expect(
+      updates.find(
+        (u: any) =>
+          u.sessionUpdate === "agent_message_chunk" && u.content?.text?.includes("Model fallback"),
+      ),
+    ).toBeUndefined();
+
+    const advisory = updates
+      .map((u: any) => u._meta?.jetbrains?.air?.sessionFailure)
+      .find((record: any) => record?.category === "advisory");
+    expect(advisory).toEqual(
+      expect.objectContaining({
+        category: "advisory",
+        severity: "warning",
+        phase: "active",
+        source: "claude",
+        retryable: false,
+        actions: [],
+      }),
+    );
+    // Its own wording, carried through instead of the canned per-category message.
+    expect(advisory.safeMessage).toContain("claude-fable-5");
+    expect(advisory.safeMessage).toContain("claude-opus-4-8");
+    expect(advisory.safeMessage).toContain("(cyber)");
+    // No markdown lead-in: the banner supplies the severity, so the text must not fake one.
+    expect(advisory.safeMessage).not.toContain("**");
+    // Its own id namespace, so it never collides with a turn's error record.
+    expect(advisory.id).toContain(":notice:");
+  });
+
   it("tracks the raw model id when the fallback model is not among the options", async () => {
     const { agent, sessionUpdate } = createCapturingAgent();
     injectGeneratorSession(

@@ -938,6 +938,7 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
 }
 
 type AirSessionFailureCategory =
+  | "advisory"
   | "auth_required"
   | "bad_request"
   | "budget_exhausted"
@@ -950,10 +951,23 @@ type AirSessionFailureCategory =
   | "transport_lost"
   | "worker_shutdown";
 
+/**
+ * How loudly the client renders a record. Absent on the wire means `error`, so a client that
+ * predates warning support keeps treating everything it receives as a failure.
+ */
+type AirSessionFailureSeverity = "error" | "warning";
+
 const AIR_FAILURE_PRESENTATION: Record<
   AirSessionFailureCategory,
   { message: string; retryable: boolean; actions: string[] }
 > = {
+  // A non-fatal notice whose wording comes from the adapter or the SDK, so this message is only the
+  // fallback for an advisory published without one.
+  advisory: {
+    message: "Claude reported a notice.",
+    retryable: false,
+    actions: [],
+  },
   auth_required: {
     message: "Sign in to continue using Claude.",
     retryable: false,
@@ -2328,7 +2342,11 @@ export class ClaudeAcpAgent {
       revision: number;
       category: AirSessionFailureCategory;
       turnId?: string;
+      severity?: AirSessionFailureSeverity;
+      /** Set when the notice carries its own wording instead of the canned per-category message. */
+      safeMessage?: string;
     };
+    const isAdvisory = (failure: PublishedSessionFailure) => failure.severity === "warning";
     const failureRevisions = new Map<string, number>();
     const sessionFailureEpoch = randomUUID();
     const activeSessionFailures = new Map<string, PublishedSessionFailure>();
@@ -2347,10 +2365,11 @@ export class ClaudeAcpAgent {
               phase,
               category: failure.category,
               source: "claude",
-              safeMessage: presentation.message,
+              safeMessage: failure.safeMessage ?? presentation.message,
               retryable: presentation.retryable,
               actions: presentation.actions,
               ...(failure.turnId ? { turnId: failure.turnId } : {}),
+              ...(failure.severity ? { severity: failure.severity } : {}),
             },
           },
         },
@@ -2403,16 +2422,29 @@ export class ClaudeAcpAgent {
 
     const createSessionFailure = async (
       category: AirSessionFailureCategory,
-      options: { turnScoped?: boolean } = {},
+      options: { turnScoped?: boolean; safeMessage?: string } = {},
     ): Promise<PublishedSessionFailure | undefined> => {
       if (!supportsAirSessionFailures(this.clientCapabilities) || !isCurrentConsumer()) {
         return undefined;
+      }
+      // An advisory is not a failure of the turn: it keeps its own id namespace and its own slot, so
+      // it neither clears an actionable error nor is cleared by one. Only the newest advisory
+      // matters, so they all share one id and bump its revision.
+      if (category === "advisory") {
+        const id = `${params.sessionId}:notice:${sessionFailureEpoch}`;
+        return {
+          id,
+          revision: (failureRevisions.get(id) ?? 0) + 1,
+          category,
+          severity: "warning",
+          ...(options.safeMessage ? { safeMessage: options.safeMessage } : {}),
+        };
       }
       const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
       const id = turnId
         ? `${turnId}:error`
         : `${params.sessionId}:session-error:${sessionFailureEpoch}`;
-      await clearSessionFailure((failure) => failure.id !== id);
+      await clearSessionFailure((failure) => failure.id !== id && !isAdvisory(failure));
       return {
         id,
         revision: (failureRevisions.get(id) ?? 0) + 1,
@@ -2423,7 +2455,7 @@ export class ClaudeAcpAgent {
 
     const publishSessionFailure = async (
       category: AirSessionFailureCategory,
-      options: { turnScoped?: boolean } = {},
+      options: { turnScoped?: boolean; safeMessage?: string } = {},
     ) => {
       const failure = await createSessionFailure(category, options);
       if (!failure) return;
@@ -2435,7 +2467,11 @@ export class ClaudeAcpAgent {
 
     const clearFailuresFromEarlierTurns = async () => {
       const activeTurnId = session.activeTurn?.promptUuid;
-      await clearSessionFailure((failure) => failure.turnId !== activeTurnId);
+      // Advisories carry no turnId, so without the guard every turn boundary would sweep them away.
+      // They are session-scoped and stay until superseded or dismissed by the user.
+      await clearSessionFailure(
+        (failure) => failure.turnId !== activeTurnId && !isAdvisory(failure),
+      );
     };
 
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>
@@ -3549,16 +3585,26 @@ export class ClaudeAcpAgent {
                 const outcome = persistent
                   ? `The session will continue on ${message.fallback_model}.`
                   : `The session stays on ${message.original_model}.`;
-                await sendUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: {
-                      type: "text",
-                      text: `**Model fallback:** ${message.original_model} declined this request${category}; retried with ${message.fallback_model}. ${outcome}${explanation}`,
+                const fallbackNotice =
+                  `${message.original_model} declined this request${category}; ` +
+                  `retried with ${message.fallback_model}. ${outcome}${explanation}`;
+                // A silent model swap is a session-level advisory, not something the model said.
+                // Clients that negotiated typed records get it as one; the rest keep the bold-label
+                // transcript line, which was the only way to flag it before.
+                if (supportsAirSessionFailures(this.clientCapabilities)) {
+                  await publishSessionFailure("advisory", { safeMessage: fallbackNotice });
+                } else {
+                  await sendUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "agent_message_chunk",
+                      content: {
+                        type: "text",
+                        text: `**Model fallback:** ${fallbackNotice}`,
+                      },
                     },
-                  },
-                });
+                  });
+                }
                 if (persistent) {
                   await this.syncModelAfterRefusalFallback(
                     params.sessionId,
