@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { resolvePermissionMode, type Logger } from "../acp-agent.js";
 
+const CAN_USE_BYPASS_PERMISSIONS = process.getuid?.() !== 0 || !!process.env.IS_SANDBOX;
+const EXPECTED_BYPASS_MODE = CAN_USE_BYPASS_PERMISSIONS ? "bypassPermissions" : "default";
+
 function mockLogger() {
   const error = vi.fn<(...args: any[]) => void>();
   const log = vi.fn<(...args: any[]) => void>();
@@ -19,14 +22,26 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("acceptEdits")).toBe("acceptEdits");
     expect(resolvePermissionMode("dontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("plan")).toBe("plan");
-    expect(resolvePermissionMode("bypassPermissions")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypassPermissions")).toBe(EXPECTED_BYPASS_MODE);
   });
 
   it("resolves case-insensitive aliases", () => {
     expect(resolvePermissionMode("DontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("DONTASK")).toBe("dontAsk");
     expect(resolvePermissionMode("AcceptEdits")).toBe("acceptEdits");
-    expect(resolvePermissionMode("bypass")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypass")).toBe(EXPECTED_BYPASS_MODE);
+  });
+
+  it("falls back to 'default' for bypassPermissions when running as root outside a sandbox", () => {
+    if (CAN_USE_BYPASS_PERMISSIONS) {
+      return;
+    }
+
+    const { logger, error } = mockLogger();
+    expect(resolvePermissionMode("bypassPermissions", logger)).toBe("default");
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("bypassPermissions is not available when running as root"),
+    );
   });
 
   it("resolves 'manual' as an alias for 'default'", () => {
