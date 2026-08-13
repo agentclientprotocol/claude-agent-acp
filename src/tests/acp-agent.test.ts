@@ -173,6 +173,9 @@ function mockSessionState(overrides: Record<string, any> = {}) {
     emittedAssistantText: false,
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
+    sessionFailureEpoch: randomUUID(),
+    sessionFailureRevisions: new Map(),
+    activeSessionFailures: new Map(),
     ...overrides,
   } as any;
 }
@@ -1801,6 +1804,153 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(true);
     // …but the TUI-specific "/login" instruction never reaches the client.
     expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+});
+
+describe("usage-limit failure replay", () => {
+  const usageLimitMessage = {
+    type: "assistant" as const,
+    uuid: "usage-limit-message",
+    session_id: "s1",
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+    message: {
+      id: "api-usage-limit-message",
+      model: "<synthetic>",
+      role: "assistant",
+      type: "message",
+      stop_reason: "stop_sequence",
+      content: [
+        {
+          type: "text",
+          text: "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit",
+        },
+      ],
+    },
+  };
+  const airCapabilities = {
+    _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+  };
+  const successfulResult = () => ({
+    type: "result" as const,
+    subtype: "success" as const,
+    stop_reason: "end_turn",
+    is_error: false,
+    result: "",
+    errors: [],
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 1,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: randomUUID(),
+    session_id: "s1",
+  });
+
+  async function replay(messages: Awaited<ReturnType<typeof getSessionMessages>>, capable = true) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = capable ? airCapabilities : {};
+    agent.sessions.s1 = mockSessionState();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(messages);
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return { agent, updates };
+  }
+
+  it("restores the latest synthetic usage limit as a typed failure", async () => {
+    const { agent, updates } = await replay([
+      usageLimitMessage,
+      {
+        ...usageLimitMessage,
+        uuid: "local-command-result",
+        message: {
+          ...usageLimitMessage.message,
+          id: "api-local-command-result",
+          content: [{ type: "text", text: "No response requested." }],
+        },
+      },
+    ]);
+
+    const failure = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    expect(failure).toEqual(
+      expect.objectContaining({
+        phase: "active",
+        category: "quota_exhausted",
+        retryable: false,
+        revision: 1,
+      }),
+    );
+    expect(JSON.stringify(updates)).not.toContain("individual spend limit");
+    expect(agent.sessions.s1.activeSessionFailures.get(failure.id)).toEqual(
+      expect.objectContaining({ category: "quota_exhausted", revision: 1 }),
+    );
+  });
+
+  it("keeps historical text when a later real answer proves recovery", async () => {
+    const { updates } = await replay([
+      usageLimitMessage,
+      {
+        ...usageLimitMessage,
+        uuid: "recovered-answer",
+        message: {
+          ...usageLimitMessage.message,
+          id: "api-recovered-answer",
+          model: "claude-sonnet-4-6",
+          content: [{ type: "text", text: "Recovered" }],
+        },
+      },
+    ]);
+
+    expect(JSON.stringify(updates)).toContain("individual spend limit");
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it("preserves the standard transcript for clients without the extension", async () => {
+    const { updates } = await replay([usageLimitMessage], false);
+
+    expect(JSON.stringify(updates)).toContain("individual spend limit");
+    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+  });
+
+  it("clears the replayed failure after a successful follow-up", async () => {
+    const { agent, updates } = await replay([usageLimitMessage]);
+    const session = agent.sessions.s1;
+    const input = new Pushable<any>();
+    async function* messages() {
+      const iterator = input[Symbol.asyncIterator]();
+      const user = await iterator.next();
+      yield userEcho(user.value);
+      yield successfulResult();
+    }
+    session.query = wrapQuery(messages());
+    session.input = input;
+
+    await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "try again" }] });
+
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    expect(failures).toHaveLength(2);
+    expect(failures[1]).toEqual(
+      expect.objectContaining({ id: failures[0].id, phase: "cleared", revision: 2 }),
+    );
+    expect(session.activeSessionFailures.size).toBe(0);
   });
 });
 
@@ -5521,6 +5671,9 @@ describe("session/close", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -5614,6 +5767,9 @@ describe("session/delete", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -5724,6 +5880,9 @@ describe("getOrCreateSession param change detection", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -8582,6 +8741,9 @@ describe("post-error recovery", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
     return { interrupt };
   }
@@ -12360,6 +12522,9 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
     return { interrupt };
   }
@@ -13796,6 +13961,9 @@ describe("agent selection config option", () => {
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: new Map(),
+        sessionFailureEpoch: randomUUID(),
+        sessionFailureRevisions: new Map(),
+        activeSessionFailures: new Map(),
       };
       return { session: agent.sessions[sessionId]!, applyFlagSettings };
     }

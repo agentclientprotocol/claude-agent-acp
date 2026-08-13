@@ -84,6 +84,7 @@ import {
   SDKUserMessage,
   SlashCommand,
   ThinkingConfig,
+  USAGE_LIMIT_ERROR_PREFIXES,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   GOAL_ACTIONS,
@@ -709,6 +710,12 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+  /** Durable-for-this-consumer failure state shared with session/load replay.
+   *  Keeping it on the Session lets replay seed a failure that the persistent
+   *  consumer can later clear with the same id and a higher revision. */
+  sessionFailureEpoch: string;
+  sessionFailureRevisions: Map<string, number>;
+  activeSessionFailures: Map<string, PublishedSessionFailure>;
 };
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
@@ -955,6 +962,16 @@ type AirSessionFailureCategory =
  */
 type AirSessionFailureSeverity = "error" | "warning";
 
+type PublishedSessionFailure = {
+  id: string;
+  revision: number;
+  category: AirSessionFailureCategory;
+  turnId?: string;
+  severity?: AirSessionFailureSeverity;
+  /** Set when the notice carries its own wording instead of the canned per-category message. */
+  safeMessage?: string;
+};
+
 const AIR_FAILURE_PRESENTATION: Record<
   AirSessionFailureCategory,
   { message: string; retryable: boolean; actions: string[] }
@@ -1022,6 +1039,52 @@ const AIR_FAILURE_PRESENTATION: Record<
     actions: ["new_session"],
   },
 };
+
+function sessionFailureMeta(failure: PublishedSessionFailure, phase: "active" | "cleared") {
+  const presentation = AIR_FAILURE_PRESENTATION[failure.category];
+  return {
+    [JETBRAINS_META_KEY]: {
+      [AIR_META_KEY]: {
+        [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
+        [AIR_SESSION_FAILURE_KEY]: {
+          id: failure.id,
+          revision: failure.revision,
+          phase,
+          category: failure.category,
+          source: "claude",
+          safeMessage: failure.safeMessage ?? presentation.message,
+          retryable: presentation.retryable,
+          actions: presentation.actions,
+          ...(failure.turnId ? { turnId: failure.turnId } : {}),
+          ...(failure.severity ? { severity: failure.severity } : {}),
+        },
+      },
+    },
+  };
+}
+
+/** `getSessionMessages` deliberately exposes only the API message and strips
+ *  transcript-level `error` / `isApiErrorMessage` fields. The SDK exports the
+ *  exact stable prefixes used by its synthetic usage-limit errors, so replay
+ *  can recover this one typed failure without matching arbitrary model prose. */
+function isSyntheticUsageLimitMessage(apiMessage: unknown): boolean {
+  if (!apiMessage || typeof apiMessage !== "object") return false;
+  const { model, content } = apiMessage as { model?: unknown; content?: unknown };
+  if (model !== "<synthetic>" || !Array.isArray(content)) return false;
+  const text = content
+    .map((block) =>
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      block.type === "text" &&
+      "text" in block &&
+      typeof block.text === "string"
+        ? block.text
+        : "",
+    )
+    .join("");
+  return USAGE_LIMIT_ERROR_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
 
 function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
   const jetbrains = capabilities?._meta?.[JETBRAINS_META_KEY] as
@@ -2339,44 +2402,12 @@ export class ClaudeAcpAgent {
       await this.client.sessionUpdate(notification);
     };
 
-    type PublishedSessionFailure = {
-      id: string;
-      revision: number;
-      category: AirSessionFailureCategory;
-      turnId?: string;
-      severity?: AirSessionFailureSeverity;
-      /** Set when the notice carries its own wording instead of the canned per-category message. */
-      safeMessage?: string;
-    };
     const isAdvisory = (failure: PublishedSessionFailure) => failure.severity === "warning";
-    const failureRevisions = new Map<string, number>();
-    const sessionFailureEpoch = randomUUID();
-    const activeSessionFailures = new Map<string, PublishedSessionFailure>();
+    const failureRevisions = session.sessionFailureRevisions;
+    const sessionFailureEpoch = session.sessionFailureEpoch;
+    const activeSessionFailures = session.activeSessionFailures;
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
-
-    const sessionFailureMeta = (failure: PublishedSessionFailure, phase: "active" | "cleared") => {
-      const presentation = AIR_FAILURE_PRESENTATION[failure.category];
-      return {
-        [JETBRAINS_META_KEY]: {
-          [AIR_META_KEY]: {
-            [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-            [AIR_SESSION_FAILURE_KEY]: {
-              id: failure.id,
-              revision: failure.revision,
-              phase,
-              category: failure.category,
-              source: "claude",
-              safeMessage: failure.safeMessage ?? presentation.message,
-              retryable: presentation.retryable,
-              actions: presentation.actions,
-              ...(failure.turnId ? { turnId: failure.turnId } : {}),
-              ...(failure.severity ? { severity: failure.severity } : {}),
-            },
-          },
-        },
-      };
-    };
 
     const emitSessionFailure = async (
       failure: PublishedSessionFailure,
@@ -5199,9 +5230,31 @@ export class ClaudeAcpAgent {
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
+    const session = this.sessions[sessionId];
     const forwardSubagentText =
-      this.sessions[sessionId]?.forwardSubagentText ??
-      supportsSubagentTranscript(this.clientCapabilities);
+      session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
+    const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
+    let activeUsageLimitMessageUuid: string | undefined;
+
+    if (supportsTypedFailures) {
+      for (const message of messages) {
+        if (message.type !== "assistant" || message.parent_tool_use_id !== null) continue;
+        if (isSyntheticUsageLimitMessage(message.message)) {
+          activeUsageLimitMessageUuid = message.uuid;
+          continue;
+        }
+        const model =
+          message.message && typeof message.message === "object" && "model" in message.message
+            ? message.message.model
+            : undefined;
+        // A later real model answer proves the account recovered. Synthetic
+        // local-command/interruption messages do not: they can be appended
+        // while the provider remains unavailable.
+        if (model !== undefined && model !== "<synthetic>") {
+          activeUsageLimitMessageUuid = undefined;
+        }
+      }
+    }
 
     for (const message of messages) {
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
@@ -5218,6 +5271,12 @@ export class ClaudeAcpAgent {
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
+        continue;
+      }
+
+      // The still-active usage-limit message is represented by the typed
+      // failure below, not duplicated as ordinary assistant prose.
+      if (message.uuid === activeUsageLimitMessageUuid) {
         continue;
       }
 
@@ -5253,6 +5312,27 @@ export class ClaudeAcpAgent {
       )) {
         await this.client.sessionUpdate(notification);
       }
+    }
+
+    if (session && activeUsageLimitMessageUuid) {
+      const id = `${sessionId}:history-error:${activeUsageLimitMessageUuid}`;
+      const failure: PublishedSessionFailure = {
+        id,
+        revision: (session.sessionFailureRevisions.get(id) ?? 0) + 1,
+        category: "quota_exhausted",
+      };
+      session.sessionFailureRevisions.set(id, failure.revision);
+      for (const [activeId, active] of session.activeSessionFailures) {
+        if (active.severity !== "warning") session.activeSessionFailures.delete(activeId);
+      }
+      session.activeSessionFailures.set(id, failure);
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: sessionFailureMeta(failure, "active"),
+        },
+      });
     }
   }
 
@@ -6599,6 +6679,9 @@ export class ClaudeAcpAgent {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
+      sessionFailureEpoch: randomUUID(),
+      sessionFailureRevisions: new Map(),
+      activeSessionFailures: new Map(),
     };
 
     return {
