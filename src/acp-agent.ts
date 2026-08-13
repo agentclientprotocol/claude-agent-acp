@@ -713,9 +713,7 @@ type Session = {
   /** Durable-for-this-consumer failure state shared with session/load replay.
    *  Keeping it on the Session lets replay seed a failure that the persistent
    *  consumer can later clear with the same id and a higher revision. */
-  sessionFailureEpoch: string;
-  sessionFailureRevisions: Map<string, number>;
-  activeSessionFailures: Map<string, PublishedSessionFailure>;
+  sessionFailureState: SessionFailureState;
 };
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
@@ -972,6 +970,20 @@ type PublishedSessionFailure = {
   safeMessage?: string;
 };
 
+type SessionFailureState = {
+  epoch: string;
+  revisions: Map<string, number>;
+  active: Map<string, PublishedSessionFailure>;
+};
+
+function createSessionFailureState(): SessionFailureState {
+  return {
+    epoch: randomUUID(),
+    revisions: new Map(),
+    active: new Map(),
+  };
+}
+
 const AIR_FAILURE_PRESENTATION: Record<
   AirSessionFailureCategory,
   { message: string; retryable: boolean; actions: string[] }
@@ -1086,6 +1098,28 @@ function isSyntheticUsageLimitMessage(apiMessage: unknown): boolean {
   return USAGE_LIMIT_ERROR_PREFIXES.some((prefix) => text.startsWith(prefix));
 }
 
+function activeUsageLimitMessageUuid(
+  messages: Awaited<ReturnType<typeof getSessionMessages>>,
+): string | undefined {
+  let activeUuid: string | undefined;
+  for (const message of messages) {
+    if (message.type !== "assistant" || message.parent_tool_use_id !== null) continue;
+    if (isSyntheticUsageLimitMessage(message.message)) {
+      activeUuid = message.uuid;
+      continue;
+    }
+    const model =
+      message.message && typeof message.message === "object" && "model" in message.message
+        ? message.message.model
+        : undefined;
+    // A later real model answer proves the account recovered. Synthetic
+    // local-command/interruption messages do not: they can be appended while
+    // the provider remains unavailable.
+    if (model !== undefined && model !== "<synthetic>") activeUuid = undefined;
+  }
+  return activeUuid;
+}
+
 function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean {
   const jetbrains = capabilities?._meta?.[JETBRAINS_META_KEY] as
     Record<string, unknown> | undefined;
@@ -1102,7 +1136,126 @@ function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean 
   );
 }
 
-function providerFailureCategory(errorKind?: SDKAssistantMessageError): AirSessionFailureCategory {
+/** Owns the AIR failure lifecycle for both the live consumer and history replay,
+ *  so revisions and active state change only after their wire update succeeds. */
+function createSessionFailureController(options: {
+  sessionId: string;
+  state: SessionFailureState;
+  capabilities?: ClientCapabilities;
+  isCurrent: () => boolean;
+  sendUpdate: (notification: SessionNotification) => Promise<void>;
+  logger: Logger;
+}) {
+  const { sessionId, state, capabilities, isCurrent, sendUpdate, logger } = options;
+  const isAdvisory = (failure: PublishedSessionFailure) => failure.severity === "warning";
+  const isSupported = () => supportsAirSessionFailures(capabilities);
+
+  const emit = async (
+    failure: PublishedSessionFailure,
+    phase: "active" | "cleared",
+  ): Promise<boolean> => {
+    if (!isCurrent()) {
+      logger.error(`Session ${sessionId}: ignored AIR session failure from a stale consumer`);
+      return false;
+    }
+    try {
+      await sendUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: sessionFailureMeta(failure, phase),
+        },
+      });
+      return true;
+    } catch (error) {
+      logger.error(`Session ${sessionId}: failed to publish AIR session failure: ${error}`);
+      return false;
+    }
+  };
+
+  const recordActive = (failure: PublishedSessionFailure) => {
+    state.revisions.set(failure.id, failure.revision);
+    state.active.set(failure.id, failure);
+  };
+
+  const clear = async (
+    shouldClear: (failure: PublishedSessionFailure) => boolean = () => true,
+  ): Promise<boolean> => {
+    if (!isSupported()) return true;
+    let allCleared = true;
+    for (const failure of [...state.active.values()]) {
+      if (!shouldClear(failure)) continue;
+      const cleared = { ...failure, revision: failure.revision + 1 };
+      if (await emit(cleared, "cleared")) {
+        state.revisions.set(cleared.id, cleared.revision);
+        state.active.delete(cleared.id);
+      } else {
+        allCleared = false;
+      }
+    }
+    return allCleared;
+  };
+
+  const prepare = async (
+    category: AirSessionFailureCategory,
+    failureOptions: { turnId?: string; sessionScoped?: boolean; safeMessage?: string } = {},
+  ): Promise<PublishedSessionFailure | undefined> => {
+    if (!isSupported() || !isCurrent()) return undefined;
+    if (category === "advisory") {
+      const id = `${sessionId}:notice:${state.epoch}`;
+      return {
+        id,
+        revision: (state.revisions.get(id) ?? 0) + 1,
+        category,
+        severity: "warning",
+        ...(failureOptions.safeMessage ? { safeMessage: failureOptions.safeMessage } : {}),
+      };
+    }
+    const id =
+      failureOptions.turnId && !failureOptions.sessionScoped
+        ? `${failureOptions.turnId}:error`
+        : `${sessionId}:session-error:${state.epoch}`;
+    if (!(await clear((failure) => failure.id !== id && !isAdvisory(failure)))) return undefined;
+    return {
+      id,
+      revision: (state.revisions.get(id) ?? 0) + 1,
+      category,
+      ...(failureOptions.turnId && !failureOptions.sessionScoped
+        ? { turnId: failureOptions.turnId }
+        : {}),
+    };
+  };
+
+  const publish = async (
+    category: AirSessionFailureCategory,
+    failureOptions: { turnId?: string; sessionScoped?: boolean; safeMessage?: string } = {},
+  ) => {
+    const failure = await prepare(category, failureOptions);
+    if (!failure) return;
+    if (await emit(failure, "active")) recordActive(failure);
+  };
+
+  const restore = async (id: string, category: AirSessionFailureCategory): Promise<boolean> => {
+    if (!isSupported() || !isCurrent()) return false;
+    if (!(await clear((failure) => failure.id !== id && !isAdvisory(failure)))) return false;
+    const failure: PublishedSessionFailure = {
+      id,
+      revision: (state.revisions.get(id) ?? 0) + 1,
+      category,
+    };
+    if (!(await emit(failure, "active"))) return false;
+    recordActive(failure);
+    return true;
+  };
+
+  return { clear, prepare, publish, recordActive, restore, isAdvisory };
+}
+
+function providerFailureCategory(
+  errorKind?: SDKAssistantMessageError,
+  isUsageLimit = false,
+): AirSessionFailureCategory {
+  if (isUsageLimit) return "quota_exhausted";
   switch (errorKind) {
     case "authentication_failed":
     case "oauth_org_not_allowed":
@@ -2347,6 +2500,7 @@ export class ClaudeAcpAgent {
     // it here so the subsequent `RequestError.internalError` can forward it to
     // clients as structured `data`, sparing them from pattern-matching on text.
     let lastAssistantError: SDKAssistantMessageError | undefined;
+    let lastAssistantWasUsageLimit = false;
     // When a streaming classifier refuses a turn, the assistant message carries
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
@@ -2402,100 +2556,40 @@ export class ClaudeAcpAgent {
       await this.client.sessionUpdate(notification);
     };
 
-    const isAdvisory = (failure: PublishedSessionFailure) => failure.severity === "warning";
-    const failureRevisions = session.sessionFailureRevisions;
-    const sessionFailureEpoch = session.sessionFailureEpoch;
-    const activeSessionFailures = session.activeSessionFailures;
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
-
-    const emitSessionFailure = async (
-      failure: PublishedSessionFailure,
-      phase: "active" | "cleared",
-    ): Promise<boolean> => {
-      if (!isCurrentConsumer()) {
-        this.logger.error(
-          `Session ${params.sessionId}: ignored AIR session failure from a stale query consumer`,
-        );
-        return false;
-      }
-      try {
-        await sendUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "session_info_update",
-            _meta: sessionFailureMeta(failure, phase),
-          },
-        });
-        return true;
-      } catch (error) {
-        this.logger.error(
-          `Session ${params.sessionId}: failed to publish AIR session failure: ${error}`,
-        );
-        return false;
-      }
-    };
-
-    const clearSessionFailure = async (
-      shouldClear: (failure: PublishedSessionFailure) => boolean = () => true,
-    ) => {
-      if (!supportsAirSessionFailures(this.clientCapabilities)) return;
-      for (const failure of [...activeSessionFailures.values()]) {
-        if (!shouldClear(failure)) continue;
-        const cleared = {
-          ...failure,
-          revision: failure.revision + 1,
-        };
-        if (await emitSessionFailure(cleared, "cleared")) {
-          failureRevisions.set(cleared.id, cleared.revision);
-          activeSessionFailures.delete(cleared.id);
-        }
-      }
-    };
+    const sessionFailures = createSessionFailureController({
+      sessionId: params.sessionId,
+      state: session.sessionFailureState,
+      capabilities: this.clientCapabilities,
+      isCurrent: isCurrentConsumer,
+      sendUpdate,
+      logger: this.logger,
+    });
+    const clearSessionFailure = sessionFailures.clear;
 
     const createSessionFailure = async (
       category: AirSessionFailureCategory,
       options: { turnScoped?: boolean; safeMessage?: string } = {},
     ): Promise<PublishedSessionFailure | undefined> => {
-      if (!supportsAirSessionFailures(this.clientCapabilities) || !isCurrentConsumer()) {
-        return undefined;
-      }
-      // An advisory is not a failure of the turn: it keeps its own id namespace and its own slot, so
-      // it neither clears an actionable error nor is cleared by one. Only the newest advisory
-      // matters, so they all share one id and bump its revision.
-      if (category === "advisory") {
-        const id = `${params.sessionId}:notice:${sessionFailureEpoch}`;
-        return {
-          id,
-          revision: (failureRevisions.get(id) ?? 0) + 1,
-          category,
-          severity: "warning",
-          ...(options.safeMessage ? { safeMessage: options.safeMessage } : {}),
-        };
-      }
       const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
-      const id = turnId
-        ? `${turnId}:error`
-        : `${params.sessionId}:session-error:${sessionFailureEpoch}`;
-      await clearSessionFailure((failure) => failure.id !== id && !isAdvisory(failure));
-      return {
-        id,
-        revision: (failureRevisions.get(id) ?? 0) + 1,
-        category,
-        ...(turnId ? { turnId } : {}),
-      };
+      return sessionFailures.prepare(category, {
+        turnId,
+        sessionScoped: options.turnScoped === false,
+        safeMessage: options.safeMessage,
+      });
     };
 
     const publishSessionFailure = async (
       category: AirSessionFailureCategory,
       options: { turnScoped?: boolean; safeMessage?: string } = {},
     ) => {
-      const failure = await createSessionFailure(category, options);
-      if (!failure) return;
-      if (await emitSessionFailure(failure, "active")) {
-        failureRevisions.set(failure.id, failure.revision);
-        activeSessionFailures.set(failure.id, failure);
-      }
+      const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
+      await sessionFailures.publish(category, {
+        turnId,
+        sessionScoped: options.turnScoped === false,
+        safeMessage: options.safeMessage,
+      });
     };
 
     const clearFailuresFromEarlierTurns = async () => {
@@ -2503,7 +2597,7 @@ export class ClaudeAcpAgent {
       // Advisories carry no turnId, so without the guard every turn boundary would sweep them away.
       // They are session-scoped and stay until superseded or dismissed by the user.
       await clearSessionFailure(
-        (failure) => failure.turnId !== activeTurnId && !isAdvisory(failure),
+        (failure) => failure.turnId !== activeTurnId && !sessionFailures.isAdvisory(failure),
       );
     };
 
@@ -2518,6 +2612,7 @@ export class ClaudeAcpAgent {
       lastAssistantUsage = null;
       lastAssistantModel = null;
       lastAssistantError = undefined;
+      lastAssistantWasUsageLimit = false;
       lastRefusalExplanation = null;
       compactionInProgress = false;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
@@ -2846,8 +2941,7 @@ export class ClaudeAcpAgent {
         failActive(error);
         return;
       }
-      failureRevisions.set(failure.id, failure.revision);
-      activeSessionFailures.set(failure.id, failure);
+      sessionFailures.recordActive(failure);
       settleActive({
         stopReason: "end_turn",
         usage: sessionUsage(session),
@@ -4033,7 +4127,7 @@ export class ClaudeAcpAgent {
                   }
                   if (message.is_error) {
                     await failActiveWithSessionFailure(
-                      providerFailureCategory(lastAssistantError),
+                      providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
                       internalErrorForClient(errorKindData(lastAssistantError), message.result),
                     );
                     break;
@@ -4081,7 +4175,7 @@ export class ClaudeAcpAgent {
                   }
                   if (message.is_error) {
                     await failActiveWithSessionFailure(
-                      providerFailureCategory(lastAssistantError),
+                      providerFailureCategory(lastAssistantError, lastAssistantWasUsageLimit),
                       internalErrorForClient(
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
@@ -4416,6 +4510,7 @@ export class ClaudeAcpAgent {
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
+              lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.message.model && message.message.model !== "<synthetic>") {
                 lastAssistantModel = message.message.model;
               }
@@ -4491,6 +4586,19 @@ export class ClaudeAcpAgent {
 
             if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
               await failActiveWithSessionFailure("auth_required", RequestError.authRequired());
+              break;
+            }
+
+            // AIR receives this provider condition on the terminal prompt
+            // response as a typed failure. Do not also expose the CLI-specific
+            // usage text as ordinary assistant prose; legacy clients retain
+            // the historical transcript behavior.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              isSyntheticUsageLimitMessage(message.message) &&
+              supportsAirSessionFailures(this.clientCapabilities)
+            ) {
               break;
             }
 
@@ -5234,27 +5342,9 @@ export class ClaudeAcpAgent {
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
-    let activeUsageLimitMessageUuid: string | undefined;
-
-    if (supportsTypedFailures) {
-      for (const message of messages) {
-        if (message.type !== "assistant" || message.parent_tool_use_id !== null) continue;
-        if (isSyntheticUsageLimitMessage(message.message)) {
-          activeUsageLimitMessageUuid = message.uuid;
-          continue;
-        }
-        const model =
-          message.message && typeof message.message === "object" && "model" in message.message
-            ? message.message.model
-            : undefined;
-        // A later real model answer proves the account recovered. Synthetic
-        // local-command/interruption messages do not: they can be appended
-        // while the provider remains unavailable.
-        if (model !== undefined && model !== "<synthetic>") {
-          activeUsageLimitMessageUuid = undefined;
-        }
-      }
-    }
+    const activeUsageLimitUuid = supportsTypedFailures
+      ? activeUsageLimitMessageUuid(messages)
+      : undefined;
 
     for (const message of messages) {
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
@@ -5276,7 +5366,7 @@ export class ClaudeAcpAgent {
 
       // The still-active usage-limit message is represented by the typed
       // failure below, not duplicated as ordinary assistant prose.
-      if (message.uuid === activeUsageLimitMessageUuid) {
+      if (message.uuid === activeUsageLimitUuid) {
         continue;
       }
 
@@ -5314,25 +5404,19 @@ export class ClaudeAcpAgent {
       }
     }
 
-    if (session && activeUsageLimitMessageUuid) {
-      const id = `${sessionId}:history-error:${activeUsageLimitMessageUuid}`;
-      const failure: PublishedSessionFailure = {
-        id,
-        revision: (session.sessionFailureRevisions.get(id) ?? 0) + 1,
-        category: "quota_exhausted",
-      };
-      session.sessionFailureRevisions.set(id, failure.revision);
-      for (const [activeId, active] of session.activeSessionFailures) {
-        if (active.severity !== "warning") session.activeSessionFailures.delete(activeId);
-      }
-      session.activeSessionFailures.set(id, failure);
-      await this.client.sessionUpdate({
+    if (session && activeUsageLimitUuid) {
+      const sessionFailures = createSessionFailureController({
         sessionId,
-        update: {
-          sessionUpdate: "session_info_update",
-          _meta: sessionFailureMeta(failure, "active"),
-        },
+        state: session.sessionFailureState,
+        capabilities: this.clientCapabilities,
+        isCurrent: () => this.sessions[sessionId] === session,
+        sendUpdate: (notification) => this.client.sessionUpdate(notification),
+        logger: this.logger,
       });
+      await sessionFailures.restore(
+        `${sessionId}:history-error:${activeUsageLimitUuid}`,
+        "quota_exhausted",
+      );
     }
   }
 
@@ -6679,9 +6763,7 @@ export class ClaudeAcpAgent {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
-      sessionFailureEpoch: randomUUID(),
-      sessionFailureRevisions: new Map(),
-      activeSessionFailures: new Map(),
+      sessionFailureState: createSessionFailureState(),
     };
 
     return {
