@@ -59,7 +59,7 @@ describe("providers", () => {
     expect(response.agentCapabilities?.providers).toEqual({});
   });
 
-  it("lists a single optional 'main' provider, unconfigured by default", async () => {
+  it("lists one mutually exclusive provider slot with native routing", async () => {
     const [agent] = await createAgentMock();
     const response = await agent.unstable_listProviders({});
     expect(response.providers).toEqual([
@@ -67,7 +67,7 @@ describe("providers", () => {
         providerId: "main",
         supported: ["anthropic", "bedrock", "vertex"],
         required: false,
-        current: null,
+        current: { apiType: "anthropic", baseUrl: "https://api.anthropic.com" },
       },
     ]);
   });
@@ -126,7 +126,7 @@ describe("providers", () => {
     ).rejects.toMatchObject({ code: -32602 });
   });
 
-  it("disables the 'main' provider by clearing config and reporting current: null", async () => {
+  it("restores native routing after the last override is disabled", async () => {
     const [agent] = await createAgentMock();
     await agent.unstable_setProvider({
       providerId: "main",
@@ -137,7 +137,36 @@ describe("providers", () => {
 
     await expect(agent.unstable_disableProvider({ providerId: "main" })).resolves.toEqual({});
 
-    expect((await agent.unstable_listProviders({})).providers[0].current).toBeNull();
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
+  });
+
+  it("replaces the active api type when the single slot is set again", async () => {
+    const [agent] = await createAgentMock();
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://anthropic.example",
+    });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "bedrock",
+      baseUrl: "https://bedrock.example",
+    });
+
+    const overridden = await agent.unstable_listProviders({});
+    expect(overridden.providers[0].current).toEqual({
+      apiType: "bedrock",
+      baseUrl: "https://bedrock.example",
+    });
+
+    await agent.unstable_disableProvider({ providerId: "main" });
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
   });
 
   it("treats disabling an unknown provider as an idempotent no-op", async () => {
@@ -298,6 +327,9 @@ describe("providers", () => {
 
     await agent.logout({});
 
-    expect((await agent.unstable_listProviders({})).providers[0].current).toBeNull();
+    expect((await agent.unstable_listProviders({})).providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+    });
   });
 });

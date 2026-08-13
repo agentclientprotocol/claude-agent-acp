@@ -827,18 +827,9 @@ type GatewayAuthMeta = {
 
 type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
 
-/**
- * The single provider ID this agent exposes via `providers/*`. Claude Code has
- * one LLM backend selected by protocol (anthropic / bedrock / vertex), so there
- * is exactly one configurable provider.
- */
-const PROVIDER_ID = "main";
-
-/**
- * Protocols the `main` provider can be configured with. These mirror the
- * env-var mappings understood by {@link createEnvForProvider}.
- */
 const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
+const PROVIDER_ID = "main";
+const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 
 /**
  * Vertex needs project + region that the standard `providers/set` payload
@@ -1597,9 +1588,7 @@ export class ClaudeAcpAgent {
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
   gatewayAuthRequest?: GatewayAuthRequest;
-  /** Client-managed LLM routing set via `providers/set`. Process-scoped and
-   *  never persisted to disk (see the Configurable LLM Providers RFD). When
-   *  set, it takes precedence over {@link gatewayAuthRequest}. */
+  /** Set while ACP overrides the agent's native provider configuration. */
   providerConfig?: ProviderConfig;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
@@ -1901,21 +1890,13 @@ export class ClaudeAcpAgent {
     throw new Error("Method not implemented.");
   }
 
-  /**
-   * `providers/list` — returns the single client-configurable custom gateway
-   * provider (`main`). `current` carries only non-secret routing (never headers,
-   * which may hold secrets); only `apiType`/`baseUrl` are surfaced for UI
-   * display, and is `null` when the provider is not configured/disabled. The
-   * provider is optional (`required: false`): while disabled/unconfigured the
-   * agent falls back to its own default routing (normal Claude login).
-   */
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
-    const config = this.resolveProviderConfig();
+    const config = this.providerConfig ?? this.defaultProviderConfig();
     const provider: ProviderInfo = {
       providerId: PROVIDER_ID,
       supported: SUPPORTED_PROTOCOLS,
       required: false,
-      current: config ? { apiType: config.apiType, baseUrl: config.baseUrl } : null,
+      current: { apiType: config.apiType, baseUrl: config.baseUrl },
     };
     return { providers: [provider] };
   }
@@ -1976,31 +1957,45 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * `providers/disable` — disabling the `main` provider clears any client-managed
-   * routing (both a `providers/set` config and the legacy gateway auth request),
-   * so the agent reverts to its own default routing and `providers/list` reports
-   * `current: null`. Disabling any other (unknown) ID is treated as a successful
-   * no-op per the RFD's idempotency rule.
+   * `providers/disable` ends ACP ownership of the single mutually exclusive
+   * backend slot and restores the agent's native routing state.
    */
   async unstable_disableProvider(params: DisableProviderRequest): Promise<DisableProviderResponse> {
     if (params.providerId === PROVIDER_ID) {
       this.providerConfig = undefined;
-      this.gatewayAuthRequest = undefined;
     }
     // Unknown provider: idempotent success.
     return {};
   }
 
-  /**
-   * Resolve the effective client-managed routing config. `providers/set` takes
-   * precedence; otherwise fall back to the legacy gateway auth request. Returns
-   * `null` when neither is configured.
-   */
   resolveProviderConfig(): ProviderConfig | null {
-    if (this.providerConfig) {
-      return this.providerConfig;
+    return this.providerConfig ?? gatewayRequestToProviderConfig(this.gatewayAuthRequest);
+  }
+
+  private defaultProviderConfig(): ProviderConfig {
+    const gatewayConfig = gatewayRequestToProviderConfig(this.gatewayAuthRequest);
+    if (gatewayConfig) {
+      return gatewayConfig;
     }
-    return gatewayRequestToProviderConfig(this.gatewayAuthRequest);
+    if (process.env.CLAUDE_CODE_USE_BEDROCK) {
+      return {
+        apiType: "bedrock",
+        baseUrl: process.env.ANTHROPIC_BEDROCK_BASE_URL ?? "https://bedrock-runtime.amazonaws.com",
+        headers: {},
+      };
+    }
+    if (process.env.CLAUDE_CODE_USE_VERTEX) {
+      return {
+        apiType: "vertex",
+        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? "https://aiplatform.googleapis.com",
+        headers: {},
+      };
+    }
+    return {
+      apiType: "anthropic",
+      baseUrl: process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
+      headers: {},
+    };
   }
 
   async logout(_params: LogoutRequest): Promise<void> {
