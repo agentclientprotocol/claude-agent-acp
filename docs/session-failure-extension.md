@@ -72,12 +72,14 @@ and persistence time come from the receiving ACP event.
 - The same `id` with a higher `revision` updates that entry in place without moving it.
 - The same or a lower revision is idempotently ignored by the client.
 - A later independent occurrence uses a new `id`, even when its category and text are identical.
-- Consecutive duplicate notices may reuse one id and increment its revision.
+- Consecutive updates for the same notice may reuse one id and increment its revision.
 - Different ids are never deduplicated by comparing title or category.
 
 Live turn failures use `<turnId>:error`. Session-scoped incidents use an adapter-session epoch plus an
-incident sequence. Notices have their own `:notice:` namespace. A restored usage-limit message uses
-`<sessionId>:history-error:<messageUuid>`, which is stable across replay.
+incident sequence. Notices have their own `:notice:` namespace. Replayed usage-limit failures recover
+the persisted user-message UUID used as the live turn id, so the same occurrence keeps the same id.
+Malformed history without a preceding user message falls back to
+`<sessionId>:history-error:<messageUuid>`.
 
 Resolved records remain in transcript history. Recovery removes only the adapter's internal active
 state; it does not publish a clear tombstone and does not delete or rewrite the historical entry. A
@@ -114,7 +116,7 @@ Claude SDK conditions map to these groups:
 | `billing_error`, `rate_limit`, `max_output_tokens`, usage/spend limit, budget/turn limit | `limit`                            |
 | `invalid_request`, `model_not_found`                                                     | `request`                          |
 | `overloaded`, `server_error`, unknown provider error, adapter internal error             | `service`                          |
-| query transport loss, worker shutdown                                                    | `connection`                       |
+| API retry without an HTTP response, query transport loss, worker shutdown                | `connection`                       |
 | model fallback notice                                                                    | `unknown` with `severity: warning` |
 
 Unknown SDK error kinds degrade to `service`; they never become success. Category does not determine
@@ -123,7 +125,8 @@ message text or client behavior beyond presentation.
 ## Severity
 
 - `warning` means the operation may still succeed and normally has no actions while recovery is in
-  progress. It does not terminate the turn.
+  progress. It does not terminate the turn. SDK `api_retry` progress reuses the active turn failure id;
+  a later terminal failure updates that record with a higher revision.
 - `error` means the operation cannot continue without user action or another request.
 
 Severity is always explicit.
@@ -185,12 +188,13 @@ older one recovered.
 ## History replay
 
 `session/load` scans top-level assistant history for SDK synthetic usage-limit messages. It recognizes
-only `<synthetic>` messages beginning with SDK-owned stable prefixes, not arbitrary model prose. The
-latest matching message stays active until a later real-model answer proves recovery.
+only `<synthetic>` messages beginning with SDK-owned stable prefixes, not arbitrary model prose. Every
+recognized occurrence is replayed as a typed record at its original transcript position. The latest
+matching message stays active until a later real-model answer proves recovery; older and recovered
+records remain historical typed entries.
 
-For a capable client, replay suppresses the duplicate assistant prose and restores one typed error
-using the exact stored Claude text as `title`. Legacy clients receive the original transcript and no
-typed record.
+For a capable client, replay suppresses duplicate assistant prose and restores typed errors using the
+exact stored Claude text as `title`. Legacy clients receive the original transcript and no typed record.
 
 ## Verification
 

@@ -60,6 +60,14 @@ export type PublishedSessionFailure = {
   recoveryPolicy: SessionFailureRecoveryPolicy;
 };
 
+type SessionFailureOptions = {
+  turnId?: string;
+  sessionScoped?: boolean;
+  title?: string;
+  details?: string;
+  severity?: AirSessionFailureSeverity;
+};
+
 export type SessionFailureState = {
   epoch: string;
   revisions: Map<string, number>;
@@ -315,7 +323,7 @@ export function createSessionFailureController(options: {
 
   const prepare = async (
     kind: ClaudeFailureKind,
-    failureOptions: { turnId?: string; sessionScoped?: boolean; title?: string } = {},
+    failureOptions: SessionFailureOptions = {},
   ): Promise<PublishedSessionFailure | undefined> => {
     if (!isSupported() || !isCurrent()) return undefined;
     const policy = AIR_FAILURE_POLICY[kind];
@@ -333,6 +341,7 @@ export function createSessionFailureController(options: {
         category: policy.category,
         severity: "warning",
         title,
+        ...(failureOptions.details ? { details: failureOptions.details } : {}),
         actions: policy.actions,
         recoveryPolicy: sessionFailureRecoveryPolicy(kind),
       };
@@ -349,9 +358,10 @@ export function createSessionFailureController(options: {
       revision: (state.revisions.get(id) ?? 0) + 1,
       kind,
       category: policy.category,
-      severity: "error",
+      severity: failureOptions.severity ?? "error",
       title,
-      actions: policy.actions,
+      ...(failureOptions.details ? { details: failureOptions.details } : {}),
+      actions: failureOptions.severity === "warning" ? [] : policy.actions,
       recoveryPolicy: sessionFailureRecoveryPolicy(
         kind,
         failureOptions.turnId && !failureOptions.sessionScoped ? failureOptions.turnId : undefined,
@@ -362,16 +372,18 @@ export function createSessionFailureController(options: {
     };
   };
 
-  const publish = async (
-    kind: ClaudeFailureKind,
-    failureOptions: { turnId?: string; sessionScoped?: boolean; title?: string } = {},
-  ) => {
+  const publish = async (kind: ClaudeFailureKind, failureOptions: SessionFailureOptions = {}) => {
     const failure = await prepare(kind, failureOptions);
     if (!failure) return;
     if (await emit(failure)) recordActive(failure);
   };
 
-  const restore = async (id: string, kind: ClaudeFailureKind, title: string): Promise<boolean> => {
+  const restore = async (
+    id: string,
+    kind: ClaudeFailureKind,
+    title: string,
+    active = true,
+  ): Promise<boolean> => {
     if (!isSupported() || !isCurrent()) return false;
     const policy = AIR_FAILURE_POLICY[kind];
     const failure: PublishedSessionFailure = {
@@ -385,7 +397,12 @@ export function createSessionFailureController(options: {
       recoveryPolicy: sessionFailureRecoveryPolicy(kind),
     };
     if (!(await emit(failure))) return false;
-    recordActive(failure);
+    state.revisions.set(failure.id, failure.revision);
+    if (active) {
+      state.active.set(failure.id, failure);
+    } else {
+      state.active.delete(failure.id);
+    }
     return true;
   };
 

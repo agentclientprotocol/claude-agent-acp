@@ -161,6 +161,7 @@ export const CLAUDE_CONFIG_DIR =
 const execFileAsync = promisify(execFile);
 
 const MAX_TITLE_LENGTH = 256;
+const MAX_INLINE_FAILURE_TITLE_LENGTH = 256;
 
 function sanitizeTitle(text: string): string {
   // Replace newlines and collapse whitespace
@@ -2230,25 +2231,39 @@ export class ClaudeAcpAgent {
 
     const createSessionFailure = async (
       kind: ClaudeFailureKind,
-      options: { turnScoped?: boolean; title?: string } = {},
+      options: {
+        turnScoped?: boolean;
+        title?: string;
+        details?: string;
+        severity?: "warning" | "error";
+      } = {},
     ): Promise<PublishedSessionFailure | undefined> => {
       const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
       return sessionFailures.prepare(kind, {
         turnId,
         sessionScoped: options.turnScoped === false,
         title: options.title,
+        details: options.details,
+        severity: options.severity,
       });
     };
 
     const publishSessionFailure = async (
       kind: ClaudeFailureKind,
-      options: { turnScoped?: boolean; title?: string } = {},
+      options: {
+        turnScoped?: boolean;
+        title?: string;
+        details?: string;
+        severity?: "warning" | "error";
+      } = {},
     ) => {
       const turnId = options.turnScoped === false ? undefined : session.activeTurn?.promptUuid;
       await sessionFailures.publish(kind, {
         turnId,
         sessionScoped: options.turnScoped === false,
         title: options.title,
+        details: options.details,
+        severity: options.severity,
       });
     };
 
@@ -3369,10 +3384,25 @@ export class ClaudeAcpAgent {
               }
               case "plugin_install":
               case "notification":
-              case "api_retry":
               case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "api_retry": {
+                const title =
+                  message.error_status === null
+                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.`
+                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.`;
+                await publishSessionFailure(
+                  message.error_status === null
+                    ? "transport_lost"
+                    : providerFailureCategory(message.error),
+                  {
+                    title,
+                    severity: "warning",
+                  },
+                );
+                break;
+              }
               case "model_refusal_fallback": {
                 // The SDK retried a refused turn on the fallback model and made
                 // the swap persistent for the session. Without a notice the
@@ -3398,22 +3428,30 @@ export class ClaudeAcpAgent {
                 const category = message.api_refusal_category
                   ? ` (${message.api_refusal_category})`
                   : "";
-                const explanation = message.api_refusal_explanation
-                  ? `\n\n${message.api_refusal_explanation}`
-                  : "";
                 const outcome = persistent
                   ? `The session will continue on ${message.fallback_model}.`
                   : local
                     ? `Only that response came from ${message.fallback_model}; the session stays on ${message.original_model}.`
                     : `The session stays on ${message.original_model}.`;
-                const fallbackNotice =
+                const fallbackSummary =
                   `${message.original_model} declined this request${category}; ` +
-                  `retried with ${message.fallback_model}. ${outcome}${explanation}`;
+                  `retried with ${message.fallback_model}. ${outcome}`;
+                const explanation = message.api_refusal_explanation || undefined;
+                const fallbackNotice = explanation
+                  ? `${fallbackSummary}\n\n${explanation}`
+                  : fallbackSummary;
                 // A silent model swap is a session-level advisory, not something the model said.
                 // Clients that negotiated typed records get it as one; the rest keep the bold-label
                 // transcript line, which was the only way to flag it before.
                 if (supportsAirSessionFailures(this.clientCapabilities)) {
-                  await publishSessionFailure("advisory", { title: fallbackNotice });
+                  const useDetails =
+                    explanation !== undefined &&
+                    fallbackSummary.length + 2 + explanation.length >
+                      MAX_INLINE_FAILURE_TITLE_LENGTH;
+                  await publishSessionFailure("advisory", {
+                    title: useDetails ? fallbackSummary : fallbackNotice,
+                    ...(useDetails ? { details: explanation } : {}),
+                  });
                 } else {
                   await sendUpdate({
                     sessionId: message.session_id,
@@ -3772,8 +3810,11 @@ export class ClaudeAcpAgent {
               }
 
               if (!message.is_error && lastAssistantModel !== null) {
+                const activeTurnId = session.activeTurn?.promptUuid;
                 await clearSessionFailure(
-                  (failure) => failure.recoveryPolicy === "real_model_success",
+                  (failure) =>
+                    failure.recoveryPolicy === "real_model_success" ||
+                    (failure.severity === "warning" && failure.turnId === activeTurnId),
                 );
               }
 
@@ -3871,7 +3912,7 @@ export class ClaudeAcpAgent {
                 case "error_max_turns":
                   if (message.is_error) {
                     await failActiveWithSessionFailure(
-                      "provider_error",
+                      "context_exhausted",
                       internalErrorForClient(
                         errorKindData(lastAssistantError),
                         message.errors.join(", ") || message.subtype,
@@ -5022,8 +5063,28 @@ export class ClaudeAcpAgent {
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
+    const sessionFailures =
+      session && supportsTypedFailures
+        ? createSessionFailureController({
+            sessionId,
+            state: session.sessionFailureState,
+            capabilities: this.clientCapabilities,
+            isCurrent: () => this.sessions[sessionId] === session,
+            sendUpdate: (notification) => this.client.sessionUpdate(notification),
+            logger: this.logger,
+          })
+        : undefined;
+    let replayTurnId: string | undefined;
 
     for (const message of messages) {
+      if (
+        message.type === "user" &&
+        message.parent_tool_use_id === null &&
+        typeof message.uuid === "string" &&
+        message.uuid.length > 0
+      ) {
+        replayTurnId = message.uuid;
+      }
       // Backfill the ACP messageId -> SDK uuid mapping for messages we didn't
       // observe live (resumed/loaded sessions), so rewind/resume can translate
       // a client-supplied id without an extra getSessionMessages read. Not read
@@ -5041,9 +5102,26 @@ export class ClaudeAcpAgent {
         continue;
       }
 
-      // The still-active usage-limit message is represented by the typed
-      // failure below, not duplicated as ordinary assistant prose.
-      if (message.uuid === activeUsageLimit?.uuid) {
+      // Capable clients saw every synthetic usage-limit message as a typed
+      // failure live, so replay it at the same transcript position. The
+      // preceding persisted user uuid is the live prompt uuid and therefore
+      // recreates the same incident identity. Only the latest limit not
+      // followed by a real model answer remains active internally.
+      if (
+        sessionFailures &&
+        message.type === "assistant" &&
+        message.parent_tool_use_id === null &&
+        isSyntheticUsageLimitMessage(message.message)
+      ) {
+        const title = assistantMessageText(message.message);
+        if (title) {
+          await sessionFailures.restore(
+            replayTurnId ? `${replayTurnId}:error` : `${sessionId}:history-error:${message.uuid}`,
+            "quota_exhausted",
+            title,
+            message.uuid === activeUsageLimit?.uuid,
+          );
+        }
         continue;
       }
 
@@ -5079,22 +5157,6 @@ export class ClaudeAcpAgent {
       )) {
         await this.client.sessionUpdate(notification);
       }
-    }
-
-    if (session && activeUsageLimit) {
-      const sessionFailures = createSessionFailureController({
-        sessionId,
-        state: session.sessionFailureState,
-        capabilities: this.clientCapabilities,
-        isCurrent: () => this.sessions[sessionId] === session,
-        sendUpdate: (notification) => this.client.sessionUpdate(notification),
-        logger: this.logger,
-      });
-      await sessionFailures.restore(
-        `${sessionId}:history-error:${activeUsageLimit.uuid}`,
-        "quota_exhausted",
-        activeUsageLimit.title,
-      );
     }
   }
 

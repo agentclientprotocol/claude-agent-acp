@@ -1910,7 +1910,7 @@ describe("usage-limit failure replay", () => {
     );
   });
 
-  it("keeps historical text when a later real answer proves recovery", async () => {
+  it("keeps a recovered historical failure as a typed transcript record", async () => {
     const { updates } = await replay([
       usageLimitMessage,
       {
@@ -1925,8 +1925,24 @@ describe("usage-limit failure replay", () => {
       },
     ]);
 
-    expect(JSON.stringify(updates)).toContain("individual spend limit");
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    expect(failures).toEqual([
+      expect.objectContaining({
+        id: "s1:history-error:usage-limit-message",
+        category: "limit",
+        severity: "error",
+      }),
+    ]);
+    expect(
+      updates.some(
+        (update) =>
+          update.update.sessionUpdate === "agent_message_chunk" &&
+          update.update.content.type === "text" &&
+          update.update.content.text.includes("individual spend limit"),
+      ),
+    ).toBe(false);
   });
 
   it("preserves the standard transcript for clients without the extension", async () => {
@@ -2026,8 +2042,7 @@ describe("usage-limit failure replay", () => {
     expect(session.sessionFailureState.active.has(quotaFailure.id)).toBe(true);
   });
 
-  it("keeps the restored quota active while activating a newer quota failure", async () => {
-    const { agent, updates } = await replay([usageLimitMessage]);
+  it("replays every quota failure with its persisted turn id and keeps only the latest active", async () => {
     const newerUsageLimitMessage = {
       ...usageLimitMessage,
       uuid: "newer-usage-limit-message",
@@ -2037,27 +2052,29 @@ describe("usage-limit failure replay", () => {
         content: [{ type: "text", text: "You've reached your account usage limit" }],
       },
     };
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+    const userMessage = (uuid: string) => ({
+      type: "user" as const,
+      uuid,
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: { role: "user", content: [{ type: "text", text: "try" }] },
+    });
+    const { agent, updates } = await replay([
+      userMessage("turn-one"),
       usageLimitMessage,
+      userMessage("turn-two"),
       newerUsageLimitMessage,
     ]);
-
-    await (
-      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-    ).replaySessionHistory("s1");
 
     const failures = updates
       .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
       .filter(Boolean);
     expect(failures).toEqual([
-      expect.objectContaining({ severity: "error", revision: 1 }),
-      expect.objectContaining({ severity: "error", revision: 1 }),
+      expect.objectContaining({ id: "turn-one:error", severity: "error", revision: 1 }),
+      expect.objectContaining({ id: "turn-two:error", severity: "error", revision: 1 }),
     ]);
-    expect(failures[1].id).not.toBe(failures[0].id);
-    expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual([
-      failures[0].id,
-      failures[1].id,
-    ]);
+    expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual(["turn-two:error"]);
   });
 
   it("does not record a restored failure when publishing it fails", async () => {
@@ -4357,6 +4374,115 @@ describe("stop reason propagation", () => {
     },
   );
 
+  it("updates an api retry warning into the terminal failure", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 1,
+        max_retries: 5,
+        retry_delay_ms: 100,
+        error_status: 429,
+        error: "rate_limit",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createAssistantError("rate_limit", "Rate limit reached."),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Rate limit reached.",
+      }),
+    ]);
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const warning = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    const terminal = sessionFailureFromResponse(response);
+
+    expect(warning).toEqual(
+      expect.objectContaining({
+        category: "limit",
+        severity: "warning",
+        revision: 1,
+        title: "Retrying Claude, attempt 1 of 5.",
+        actions: [],
+      }),
+    );
+    expect(terminal).toEqual(
+      expect.objectContaining({
+        id: warning.id,
+        category: "limit",
+        severity: "error",
+        revision: 2,
+        title: "Rate limit reached.",
+        actions: ["retry"],
+      }),
+    );
+  });
+
+  it("clears a connection retry warning internally after the turn succeeds", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 2,
+        max_retries: 5,
+        retry_delay_ms: 100,
+        error_status: null,
+        error: "unknown",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createAssistantError(undefined, "Recovered."),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "Recovered.",
+      }),
+    ]);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    const warning = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+
+    expect(warning).toEqual(
+      expect.objectContaining({
+        category: "connection",
+        severity: "warning",
+        title: "Reconnecting to Claude, attempt 2 of 5.",
+        actions: [],
+      }),
+    );
+    expect(agent.sessions["test-session"].sessionFailureState.active.has(warning.id)).toBe(false);
+  });
+
   it.each([
     ["missing envelope", {}],
     ["missing capability", { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } }],
@@ -4519,7 +4645,7 @@ describe("stop reason propagation", () => {
 
   it.each([
     ["error_max_budget_usd", "limit"],
-    ["error_max_turns", "service"],
+    ["error_max_turns", "limit"],
     ["error_max_structured_output_retries", "service"],
   ] as const)("maps terminal subtype %s to %s", async (subtype, expectedCategory) => {
     const updates: SessionNotification[] = [];
@@ -5430,6 +5556,34 @@ describe("model refusal fallback handling", () => {
         .map((u: any) => u._meta?.jetbrains?.air?.sessionFailure)
         .filter((record: any) => record?.id === advisory.id),
     ).toEqual([advisory]);
+  });
+
+  it("puts only a genuinely long model fallback explanation in details", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+      },
+    });
+    const explanation = "Long provider explanation. ".repeat(20);
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ api_refusal_explanation: explanation }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const advisory = sessionUpdate.mock.calls
+      .map((call: any[]) => (call[0] as { update: any }).update)
+      .map((update: any) => update._meta?.jetbrains?.air?.sessionFailure)
+      .find((record: any) => record?.severity === "warning");
+    expect(advisory.title).not.toContain(explanation);
+    expect(advisory.details).toBe(explanation);
   });
 
   it("tracks the raw model id when the fallback model is not among the options", async () => {
