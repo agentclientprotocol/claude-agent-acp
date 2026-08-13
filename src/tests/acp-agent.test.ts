@@ -1930,17 +1930,40 @@ describe("usage-limit failure replay", () => {
   it("clears the replayed failure after a successful follow-up", async () => {
     const { agent, updates } = await replay([usageLimitMessage]);
     const session = agent.sessions.s1;
+    expect([...session.sessionFailureState.active.values()]).toEqual([
+      expect.objectContaining({ recoveryPolicy: "real_model_success" }),
+    ]);
     const input = new Pushable<any>();
     async function* messages() {
       const iterator = input[Symbol.asyncIterator]();
       const user = await iterator.next();
       yield userEcho(user.value);
+      yield {
+        ...usageLimitMessage,
+        uuid: "recovered-model-answer",
+        message: {
+          ...usageLimitMessage.message,
+          id: "api-recovered-model-answer",
+          model: "claude-sonnet-4-6",
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          content: [{ type: "text", text: "Recovered" }],
+        },
+      };
       yield successfulResult();
+      await iterator.next();
     }
     session.query = wrapQuery(messages());
     session.input = input;
 
     await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "try again" }] });
+    await vi.waitFor(() => {
+      expect(session.sessionFailureState.active.size).toBe(0);
+    });
 
     const failures = updates
       .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
@@ -1949,10 +1972,58 @@ describe("usage-limit failure replay", () => {
     expect(failures[1]).toEqual(
       expect.objectContaining({ id: failures[0].id, phase: "cleared", revision: 2 }),
     );
-    expect(session.sessionFailureState.active.size).toBe(0);
+    expect(session.sessionFailureState.active.has(failures[0].id)).toBe(false);
   });
 
-  it("clears the previous restored failure before activating a newer one", async () => {
+  it("does not clear restored quota after a successful local command", async () => {
+    const { agent, updates } = await replay([usageLimitMessage]);
+    const session = agent.sessions.s1;
+    expect([...session.sessionFailureState.active.values()]).toEqual([
+      expect.objectContaining({ recoveryPolicy: "real_model_success" }),
+    ]);
+    const input = new Pushable<any>();
+    async function* messages() {
+      const iterator = input[Symbol.asyncIterator]();
+      const user = await iterator.next();
+      yield userEcho(user.value);
+      yield {
+        ...usageLimitMessage,
+        uuid: "local-command-result",
+        message: {
+          ...usageLimitMessage.message,
+          id: "api-local-command-result",
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          content: [{ type: "text", text: "No response requested." }],
+        },
+      };
+      yield successfulResult();
+      await iterator.next();
+    }
+    session.query = wrapQuery(messages());
+    session.input = input;
+
+    await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "/usage" }] });
+    await vi.waitFor(() => {
+      expect(updates.some((update) => update.update.sessionUpdate === "usage_update")).toBe(true);
+    });
+
+    const failures = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .filter(Boolean);
+    const quotaFailure = failures.find((failure) => failure.category === "quota_exhausted");
+    expect(quotaFailure).toEqual(expect.objectContaining({ phase: "active" }));
+    expect(
+      failures.find((failure) => failure.id === quotaFailure.id && failure.phase === "cleared"),
+    ).toBeUndefined();
+    expect(session.sessionFailureState.active.has(quotaFailure.id)).toBe(true);
+  });
+
+  it("keeps the restored quota active while activating a newer quota failure", async () => {
     const { agent, updates } = await replay([usageLimitMessage]);
     const newerUsageLimitMessage = {
       ...usageLimitMessage,
@@ -1977,11 +2048,13 @@ describe("usage-limit failure replay", () => {
       .filter(Boolean);
     expect(failures).toEqual([
       expect.objectContaining({ phase: "active", revision: 1 }),
-      expect.objectContaining({ id: failures[0].id, phase: "cleared", revision: 2 }),
       expect.objectContaining({ phase: "active", revision: 1 }),
     ]);
-    expect(failures[2].id).not.toBe(failures[0].id);
-    expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual([failures[2].id]);
+    expect(failures[1].id).not.toBe(failures[0].id);
+    expect([...agent.sessions.s1.sessionFailureState.active.keys()]).toEqual([
+      failures[0].id,
+      failures[1].id,
+    ]);
   });
 
   it("does not record a restored failure when publishing it fails", async () => {
@@ -4332,6 +4405,7 @@ describe("stop reason propagation", () => {
   it.each([
     ["authentication_failed", "auth_required", false],
     ["billing_error", "quota_exhausted", false],
+    ["rate_limit", "rate_limited", true],
     ["overloaded", "overloaded", true],
     ["invalid_request", "bad_request", false],
     ["max_output_tokens", "context_exhausted", false],
@@ -4363,6 +4437,11 @@ describe("stop reason propagation", () => {
     expect(sessionFailureFromResponse(response)).toEqual(
       expect.objectContaining({ category: expectedCategory, retryable }),
     );
+    if (expectedCategory === "rate_limited") {
+      expect(sessionFailureFromResponse(response)).toEqual(
+        expect.objectContaining({ retryAfterMs: 30_000 }),
+      );
+    }
     expect(JSON.stringify(updates)).not.toContain("sessionFailure");
   });
 
@@ -4391,7 +4470,11 @@ describe("stop reason propagation", () => {
     });
 
     expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({ category: "quota_exhausted", retryable: false }),
+      expect.objectContaining({
+        category: "quota_exhausted",
+        retryable: false,
+        actions: [],
+      }),
     );
     expect(JSON.stringify(updates)).not.toContain("individual spend limit");
   });
@@ -5339,6 +5422,11 @@ describe("model refusal fallback handling", () => {
     expect(advisory.safeMessage).not.toContain("**");
     // Its own id namespace, so it never collides with a turn's error record.
     expect(advisory.id).toContain(":notice:");
+    expect(
+      updates
+        .map((u: any) => u._meta?.jetbrains?.air?.sessionFailure)
+        .filter((record: any) => record?.id === advisory.id),
+    ).toEqual([advisory]);
   });
 
   it("tracks the raw model id when the fallback model is not among the options", async () => {

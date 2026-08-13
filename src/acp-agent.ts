@@ -960,12 +960,17 @@ type AirSessionFailureCategory =
  */
 type AirSessionFailureSeverity = "error" | "warning";
 
+type SessionFailureRecoveryPolicy =
+  "never" | "next_attempt" | "real_model_success" | "auth_status" | "runtime_rebind";
+
 type PublishedSessionFailure = {
   id: string;
   revision: number;
   category: AirSessionFailureCategory;
   turnId?: string;
   severity?: AirSessionFailureSeverity;
+  recoveryPolicy: SessionFailureRecoveryPolicy;
+  retryAfterMs?: number;
   /** Set when the notice carries its own wording instead of the canned per-category message. */
   safeMessage?: string;
 };
@@ -986,7 +991,7 @@ function createSessionFailureState(): SessionFailureState {
 
 const AIR_FAILURE_PRESENTATION: Record<
   AirSessionFailureCategory,
-  { message: string; retryable: boolean; actions: string[] }
+  { message: string; retryable: boolean; actions: string[]; retryAfterMs?: number }
 > = {
   // A non-fatal notice whose wording comes from the adapter or the SDK, so this message is only the
   // fallback for an advisory published without one.
@@ -1033,12 +1038,15 @@ const AIR_FAILURE_PRESENTATION: Record<
   quota_exhausted: {
     message: "The Claude account has no available quota.",
     retryable: false,
-    actions: ["new_session"],
+    actions: [],
   },
   rate_limited: {
     message: "Claude is temporarily rate limited.",
     retryable: true,
     actions: ["retry"],
+    // The SDK exposes the category but not the provider's Retry-After header.
+    // Use a conservative floor so the UI cannot immediately hammer Retry.
+    retryAfterMs: 30_000,
   },
   transport_lost: {
     message: "The connection to Claude was lost.",
@@ -1067,6 +1075,9 @@ function sessionFailureMeta(failure: PublishedSessionFailure, phase: "active" | 
           safeMessage: failure.safeMessage ?? presentation.message,
           retryable: presentation.retryable,
           actions: presentation.actions,
+          ...((failure.retryAfterMs ?? presentation.retryAfterMs)
+            ? { retryAfterMs: failure.retryAfterMs ?? presentation.retryAfterMs }
+            : {}),
           ...(failure.turnId ? { turnId: failure.turnId } : {}),
           ...(failure.severity ? { severity: failure.severity } : {}),
         },
@@ -1136,6 +1147,25 @@ function supportsAirSessionFailures(capabilities?: ClientCapabilities): boolean 
   );
 }
 
+function sessionFailureRecoveryPolicy(
+  category: AirSessionFailureCategory,
+  turnId?: string,
+): SessionFailureRecoveryPolicy {
+  switch (category) {
+    case "advisory":
+      return "never";
+    case "auth_required":
+      return "auth_status";
+    case "transport_lost":
+    case "worker_shutdown":
+      return "runtime_rebind";
+    case "quota_exhausted":
+      return "real_model_success";
+    default:
+      return turnId ? "next_attempt" : "real_model_success";
+  }
+}
+
 /** Owns the AIR failure lifecycle for both the live consumer and history replay,
  *  so revisions and active state change only after their wire update succeeds. */
 function createSessionFailureController(options: {
@@ -1147,7 +1177,6 @@ function createSessionFailureController(options: {
   logger: Logger;
 }) {
   const { sessionId, state, capabilities, isCurrent, sendUpdate, logger } = options;
-  const isAdvisory = (failure: PublishedSessionFailure) => failure.severity === "warning";
   const isSupported = () => supportsAirSessionFailures(capabilities);
 
   const emit = async (
@@ -1208,6 +1237,7 @@ function createSessionFailureController(options: {
         revision: (state.revisions.get(id) ?? 0) + 1,
         category,
         severity: "warning",
+        recoveryPolicy: sessionFailureRecoveryPolicy(category),
         ...(failureOptions.safeMessage ? { safeMessage: failureOptions.safeMessage } : {}),
       };
     }
@@ -1215,11 +1245,14 @@ function createSessionFailureController(options: {
       failureOptions.turnId && !failureOptions.sessionScoped
         ? `${failureOptions.turnId}:error`
         : `${sessionId}:session-error:${state.epoch}`;
-    if (!(await clear((failure) => failure.id !== id && !isAdvisory(failure)))) return undefined;
     return {
       id,
       revision: (state.revisions.get(id) ?? 0) + 1,
       category,
+      recoveryPolicy: sessionFailureRecoveryPolicy(
+        category,
+        failureOptions.turnId && !failureOptions.sessionScoped ? failureOptions.turnId : undefined,
+      ),
       ...(failureOptions.turnId && !failureOptions.sessionScoped
         ? { turnId: failureOptions.turnId }
         : {}),
@@ -1237,18 +1270,18 @@ function createSessionFailureController(options: {
 
   const restore = async (id: string, category: AirSessionFailureCategory): Promise<boolean> => {
     if (!isSupported() || !isCurrent()) return false;
-    if (!(await clear((failure) => failure.id !== id && !isAdvisory(failure)))) return false;
     const failure: PublishedSessionFailure = {
       id,
       revision: (state.revisions.get(id) ?? 0) + 1,
       category,
+      recoveryPolicy: sessionFailureRecoveryPolicy(category),
     };
     if (!(await emit(failure, "active"))) return false;
     recordActive(failure);
     return true;
   };
 
-  return { clear, prepare, publish, recordActive, restore, isAdvisory };
+  return { clear, prepare, publish, recordActive, restore };
 }
 
 function providerFailureCategory(
@@ -2597,7 +2630,7 @@ export class ClaudeAcpAgent {
       // Advisories carry no turnId, so without the guard every turn boundary would sweep them away.
       // They are session-scoped and stay until superseded or dismissed by the user.
       await clearSessionFailure(
-        (failure) => failure.turnId !== activeTurnId && !sessionFailures.isAdvisory(failure),
+        (failure) => failure.recoveryPolicy === "next_attempt" && failure.turnId !== activeTurnId,
       );
     };
 
@@ -4108,8 +4141,10 @@ export class ClaudeAcpAgent {
                 break;
               }
 
-              if (!message.is_error) {
-                await clearSessionFailure();
+              if (!message.is_error && lastAssistantModel !== null) {
+                await clearSessionFailure(
+                  (failure) => failure.recoveryPolicy === "real_model_success",
+                );
               }
 
               switch (message.subtype) {
