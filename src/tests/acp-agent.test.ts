@@ -12119,6 +12119,139 @@ describe("turn steering (_session/steering)", () => {
   });
 });
 
+describe("stop background tasks (_session/stop_tasks)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  /** Install a session whose `query.stopTask` is a spy, seeded with the given
+   *  live background task records (keyed by task id). Returns the spy so tests
+   *  can assert which task ids the SDK was asked to stop. */
+  function seedSession(
+    agent: ClaudeAcpAgent,
+    records: Record<string, { parentToolUseId?: string; isSubagent: boolean }>,
+    stopTask: (taskId: string) => Promise<void> = async () => {},
+  ) {
+    const spy = vi.fn(stopTask);
+    const liveBackgroundTasks = new Map(Object.entries(records));
+    agent.sessions["test-session"] = mockSessionState({
+      liveBackgroundTasks,
+      query: { stopTask: spy },
+    });
+    return spy;
+  }
+
+  it("rejects when the session is unknown", async () => {
+    const agent = createMockAgent();
+    await expect(agent.stopBackgroundTasks({ sessionId: "missing" })).rejects.toThrow(
+      "Session not found",
+    );
+  });
+
+  it("rejects when the query stream has already closed", async () => {
+    const agent = createMockAgent();
+    seedSession(agent, {});
+    agent.sessions["test-session"]!.queryClosed = true;
+    await expect(agent.stopBackgroundTasks({ sessionId: "test-session" })).rejects.toThrow();
+  });
+
+  it("stops the tasks named by explicit toolUseIds and returns them in `stopped`", async () => {
+    const agent = createMockAgent();
+    const spy = seedSession(agent, {
+      "agent-1": { parentToolUseId: "toolu_1", isSubagent: true },
+      "agent-2": { parentToolUseId: "toolu_2", isSubagent: true },
+    });
+
+    const res = await agent.stopBackgroundTasks({
+      sessionId: "test-session",
+      toolUseIds: ["toolu_1"],
+    });
+
+    // Only the requested task is stopped; its parent tool_use id is reported.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("agent-1");
+    expect(res.stopped).toEqual(["toolu_1"]);
+    expect(res.notFound).toEqual([]);
+  });
+
+  it("reports an unmatched explicit toolUseId in `notFound`", async () => {
+    const agent = createMockAgent();
+    const spy = seedSession(agent, {
+      "agent-1": { parentToolUseId: "toolu_1", isSubagent: true },
+    });
+
+    const res = await agent.stopBackgroundTasks({
+      sessionId: "test-session",
+      toolUseIds: ["toolu_1", "toolu_absent"],
+    });
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(res.stopped).toEqual(["toolu_1"]);
+    expect(res.notFound).toEqual(["toolu_absent"]);
+  });
+
+  it("without toolUseIds stops every live sub-agent and spares background Bash", async () => {
+    const agent = createMockAgent();
+    const spy = seedSession(agent, {
+      "agent-1": { parentToolUseId: "toolu_agent", isSubagent: true },
+      "bash-1": { parentToolUseId: "toolu_bash", isSubagent: false },
+    });
+
+    const res = await agent.stopBackgroundTasks({ sessionId: "test-session" });
+
+    // The sub-agent is stopped; the background Bash task is untouched.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("agent-1");
+    expect(spy).not.toHaveBeenCalledWith("bash-1");
+    expect(res.stopped).toEqual(["toolu_agent"]);
+    // notFound is empty in the "stop all sub-agents" mode (no explicit ids).
+    expect(res.notFound).toEqual([]);
+  });
+
+  it("a stopTask that throws lands the id in `notFound` and does not fail the batch", async () => {
+    const agent = createMockAgent();
+    // agent-1 rejects; agent-2 succeeds. The batch must still stop agent-2.
+    const spy = seedSession(
+      agent,
+      {
+        "agent-1": { parentToolUseId: "toolu_1", isSubagent: true },
+        "agent-2": { parentToolUseId: "toolu_2", isSubagent: true },
+      },
+      async (taskId: string) => {
+        if (taskId === "agent-1") {
+          throw new Error("task already settled");
+        }
+      },
+    );
+
+    const res = await agent.stopBackgroundTasks({
+      sessionId: "test-session",
+      toolUseIds: ["toolu_1", "toolu_2"],
+    });
+
+    // Both were attempted; the failure did not abort the batch.
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(res.stopped).toEqual(["toolu_2"]);
+    expect(res.notFound).toEqual(["toolu_1"]);
+  });
+
+  it("advertises the stopTasks capability at initialize", async () => {
+    const agent = createMockAgent();
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    // Top-level _meta (sibling of agentCapabilities), mirroring the steering
+    // extension contract.
+    expect((response._meta as any)?.stopTasks).toEqual({
+      supported: true,
+    });
+  });
+});
+
 describe("session/cancel wedge recovery (issue #680)", () => {
   function createMockAgent() {
     const mockClient = {
