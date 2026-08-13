@@ -1,9 +1,8 @@
 # Session failure extension
 
-This document defines the provider-neutral experimental session-failure extension implemented by
-`claude-agent-acp`. It lets a capable ACP client render failures and non-fatal notices as durable,
-structured session state instead of guessing from provider prose in the assistant transcript or a
-JSON-RPC error message.
+This document defines the provider-neutral experimental `sessionFailure` extension implemented by
+`claude-agent-acp`. Warnings and errors are durable transcript entries shown in order beside user,
+agent, and tool messages. They are not assistant-authored text and not ephemeral chat banners.
 
 ## Capability negotiation
 
@@ -25,17 +24,11 @@ The extension is opt-in. A client advertises it in `initialize`:
 ```
 
 The adapter enables the extension only when `version` is a finite integer greater than or equal to
-`1` and `capabilities` is an array containing `sessionFailure`. Missing, fractional, string, zero,
-negative, or non-finite versions do not enable it. This strict check prevents a partially understood
-failure contract from changing prompt settlement.
-
-Clients that do not advertise the capability retain the legacy behavior: prompt failures reject the
-ACP request through the normal JSON-RPC error path, and provider text that was historically part of
-the transcript remains there.
+`1` and `capabilities` contains `sessionFailure`. Otherwise it preserves the legacy ACP behavior.
 
 ## Wire record
 
-The adapter publishes a record under `_meta.jetbrains.air.sessionFailure`:
+The record is placed under `_meta.jetbrains.air.sessionFailure`:
 
 ```json
 {
@@ -46,14 +39,10 @@ The adapter publishes a record under `_meta.jetbrains.air.sessionFailure`:
         "sessionFailure": {
           "id": "prompt-uuid:error",
           "revision": 1,
-          "phase": "active",
-          "category": "rate_limited",
-          "source": "claude",
-          "safeMessage": "Claude is temporarily rate limited.",
-          "retryable": true,
-          "retryAfterMs": 30000,
-          "actions": ["retry"],
-          "turnId": "prompt-uuid"
+          "category": "limit",
+          "severity": "error",
+          "title": "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit",
+          "actions": []
         }
       }
     }
@@ -61,165 +50,152 @@ The adapter publishes a record under `_meta.jetbrains.air.sessionFailure`:
 }
 ```
 
-Fields have the following contract:
+| Field      | Required | Type                 | Meaning                                                                 |
+| ---------- | -------: | -------------------- | ----------------------------------------------------------------------- |
+| `id`       |      yes | non-empty string     | Stable identity of one logical incident.                                |
+| `revision` |      yes | positive integer     | Monotonically increasing version of that incident.                      |
+| `category` |      yes | category enum        | Broad machine-readable visual group.                                    |
+| `severity` |      yes | `warning` or `error` | Inline warning or error presentation.                                   |
+| `title`    |      yes | string               | Complete normal user-facing presentation.                               |
+| `details`  |       no | string               | Long explanation used only when required text is too large for `title`. |
+| `actions`  |      yes | ordered string array | Recovery actions recommended by the adapter.                            |
 
-- `id` is the stable identity of one failure lineage.
-- `revision` is a positive, monotonically increasing integer within that identity.
-- `phase` is `active` or `cleared`. A clear is a tombstone with the same `id` and a higher revision.
-- `category` is one of the categories in the table below.
-- `source` is `claude`.
-- `safeMessage` is safe, adapter-owned user-facing text, except for `advisory`, whose text is the
-  sanitized notice supplied by the runtime.
-- `retryable` describes whether repeating the failed request can help.
-- `actions` is an ordered list of suggested client actions. A client still applies its own capability
-  checks before rendering an action.
-- `retryAfterMs`, when present, is the minimum delay before Retry should become available.
-- `turnId`, when present, associates the record with one prompt turn.
-- `severity` is `warning` for a non-fatal advisory. It is omitted for errors so older clients retain
-  their historical error default.
+There are no `phase`, `source`, `safeMessage`, `retryable`, `retryAfterMs`, `turnId`, retry-counter,
+or provider-code fields. Retry progress belongs in `title` when Claude supplies it. Transcript order
+and persistence time come from the receiving ACP event.
 
-Unknown fields must be ignored. Clients should retain the latest revision for every `id`, including
-cleared tombstones, so stale or replayed updates cannot reactivate an older revision. Multiple active
-identities may coexist; for example, a warning must not erase an actionable error merely because it
-arrived later.
+## Identity, revisions, and history
+
+`id` identifies one occurrence, not an error type.
+
+- The first record for an incident creates one transcript entry at the current stream position.
+- The same `id` with a higher `revision` updates that entry in place without moving it.
+- The same or a lower revision is idempotently ignored by the client.
+- A later independent occurrence uses a new `id`, even when its category and text are identical.
+- Consecutive duplicate notices may reuse one id and increment its revision.
+- Different ids are never deduplicated by comparing title or category.
+
+Live turn failures use `<turnId>:error`. Session-scoped incidents use an adapter-session epoch plus an
+incident sequence. Notices have their own `:notice:` namespace. A restored usage-limit message uses
+`<sessionId>:history-error:<messageUuid>`, which is stable across replay.
+
+Resolved records remain in transcript history. Recovery removes only the adapter's internal active
+state; it does not publish a clear tombstone and does not delete or rewrite the historical entry. A
+producer may publish a higher revision only when it has a real new user-facing status to show.
 
 ## Delivery surfaces
 
-A turn-terminal failure for a negotiated client is attached to the successful ACP `PromptResponse`
-in `_meta`. The turn settles with `stopReason: end_turn` instead of rejecting the JSON-RPC request;
-the structured record is the authoritative failure result.
+A turn-terminal failure is attached to the successful ACP `PromptResponse` in `_meta`; the response
+uses `stopReason: end_turn`. Session-scoped, replay-restored, warning, and background incidents use a
+`session_info_update`. The schema is identical on both carriers.
 
-Session-scoped, replay-restored, warning, background, and cleared records are sent in a
-`session_info_update`. If a terminal failure occurs without a live unsettled turn, it is downgraded to
-that session-scoped carrier rather than being lost.
+A warning does not end a turn. An error record does not independently invent ACP lifecycle state;
+the prompt response or transport lifecycle remains authoritative. If no capable client negotiated
+the extension, existing JSON-RPC errors and transcript text remain unchanged.
 
-State changes are transactional with delivery: the adapter records a revision as active or cleared
-only after the corresponding update is sent successfully. A failed clear remains active and can be
-retried at the next qualifying recovery boundary. Updates from a stale query consumer are rejected
-and logged rather than mutating the replacement consumer's state.
+## Categories
 
-## Categories and presentation
+Categories are deliberately broad and drive only iconography and generic accessibility labels.
 
-| Category            | Meaning                                               | Retryable | Suggested actions | Default recovery                        |
-| ------------------- | ----------------------------------------------------- | --------: | ----------------- | --------------------------------------- |
-| `advisory`          | Non-fatal runtime notice                              |        no | none              | Never auto-clear                        |
-| `auth_required`     | Authentication is absent or rejected                  |        no | `login`           | Successful `auth_status`                |
-| `bad_request`       | Invalid request or model not found                    |        no | `new_turn`        | Next confirmed attempt when turn-scoped |
-| `budget_exhausted`  | Configured session budget reached                     |        no | `new_session`     | Next confirmed attempt when turn-scoped |
-| `context_exhausted` | Turn/output limit reached                             |        no | `new_turn`        | Next confirmed attempt when turn-scoped |
-| `internal_error`    | Adapter/runtime internal error                        |       yes | `retry`           | Next confirmed attempt when turn-scoped |
-| `overloaded`        | Provider temporarily overloaded                       |       yes | `retry`           | Next confirmed attempt when turn-scoped |
-| `provider_error`    | Unclassified provider failure                         |       yes | `retry`           | Next confirmed attempt when turn-scoped |
-| `quota_exhausted`   | Claude account has no available quota                 |        no | none              | Real model answer                       |
-| `rate_limited`      | Provider rate limit                                   |       yes | `retry`           | Next confirmed attempt when turn-scoped |
-| `transport_lost`    | Query transport ended exceptionally                   |        no | `new_session`     | New runtime binding                     |
-| `worker_shutdown`   | Claude worker announced shutdown and the stream ended |        no | `new_session`     | New runtime binding                     |
+| Category     | Covers                                                                |
+| ------------ | --------------------------------------------------------------------- |
+| `connection` | Lost transport, stopped or shutting-down worker, unavailable runtime. |
+| `access`     | Authentication required, rejected credentials, denied access.         |
+| `limit`      | Rate, quota, token, context, turn, or configured budget limit.        |
+| `request`    | Invalid input, unsupported model or operation, rejected request.      |
+| `service`    | Provider overload, provider failure, adapter/internal failure.        |
+| `unknown`    | A warning or failure that does not fit another group.                 |
 
-The SDK exposes a rate-limit category but not the provider's `Retry-After` header. The adapter
-therefore publishes a conservative `retryAfterMs: 30000` floor. This value is a client-throttling
-guard, not a claim about the provider's exact reset time.
+Claude SDK conditions map to these groups:
 
-Account quota deliberately has no `new_session` action: starting another conversation does not
-replenish account spend. A client may show administrative guidance from its own product context, but
-must not infer that a fresh ACP session repairs the condition.
+| Claude condition                                                                         | Category                           |
+| ---------------------------------------------------------------------------------------- | ---------------------------------- |
+| `authentication_failed`, `oauth_org_not_allowed`, synthetic login message                | `access`                           |
+| `billing_error`, `rate_limit`, `max_output_tokens`, usage/spend limit, budget/turn limit | `limit`                            |
+| `invalid_request`, `model_not_found`                                                     | `request`                          |
+| `overloaded`, `server_error`, unknown provider error, adapter internal error             | `service`                          |
+| query transport loss, worker shutdown                                                    | `connection`                       |
+| model fallback notice                                                                    | `unknown` with `severity: warning` |
 
-## Claude SDK mapping
+Unknown SDK error kinds degrade to `service`; they never become success. Category does not determine
+message text or client behavior beyond presentation.
 
-Assistant-message `error` values map as follows:
+## Severity
 
-| Claude SDK error                                    | Session failure category |
-| --------------------------------------------------- | ------------------------ |
-| `authentication_failed`, `oauth_org_not_allowed`    | `auth_required`          |
-| `billing_error`                                     | `quota_exhausted`        |
-| `rate_limit`                                        | `rate_limited`           |
-| `overloaded`                                        | `overloaded`             |
-| `invalid_request`, `model_not_found`                | `bad_request`            |
-| `max_output_tokens`                                 | `context_exhausted`      |
-| `server_error`, `unknown`, missing, or unrecognized | `provider_error`         |
+- `warning` means the operation may still succeed and normally has no actions while recovery is in
+  progress. It does not terminate the turn.
+- `error` means the operation cannot continue without user action or another request.
 
-Additional terminal mappings are:
+Severity is always explicit.
 
-- Claude's synthetic spend/usage-limit assistant message maps to `quota_exhausted`, even when the SDK
-  omits an `error` field.
-- `error_max_budget_usd` maps to `budget_exhausted`.
-- `error_max_turns` and `error_max_structured_output_retries` map to `provider_error` when terminally
-  error-shaped.
-- A successful result containing `Please run /login` maps to `auth_required`.
-- A pending worker-shutdown notification followed by query EOF maps to `worker_shutdown`.
-- An exception from the query iterator maps to `transport_lost`; process-death signatures also evict
-  the dead adapter session after its in-flight turns are settled.
+## Title and details
 
-Classifier refusal is not a session failure. It uses ACP's `refusal` stop reason and preserves the
-explanation as assistant output when available. User cancellation similarly uses `cancelled` rather
-than manufacturing a failure record.
+`title` is the complete normal presentation: what happened, retry progress when present, and a short
+next step. The adapter must not replace a real Claude message with category-specific canned wording.
 
-## Recovery state machine
+For Claude SDK failures the title is copied from the user-facing text Claude already emitted:
 
-Recovery is a property of the active record, not a blanket consequence of any successful result:
+- top-level assistant error text, including synthetic usage-limit and login messages;
+- otherwise the terminal SDK result or error text;
+- the exact model-fallback notice for warning records.
 
-The recovery policy is adapter/client behavior, not an additional wire field in version 1.
+Adapter-authored fallback text is allowed only when no Claude user-facing message exists, such as a
+query iterator throwing, worker-shutdown EOF, or an internal missing-result invariant. Raw thrown
+exceptions, stack traces, transport URLs, tokens, headers, environment values, and private paths are
+never used as titles.
 
-- `advisory` is never cleared by the adapter's success paths. The client may durably dismiss the exact
-  `(id, revision)` in its own session projection; a higher advisory revision must appear again.
-- `quota_exhausted` clears only after a non-error result that was preceded by a real top-level model
-  message. Claude's `<synthetic>` local-command messages, including `/usage` output and `No response
-requested.`, do not prove quota recovery.
-- `auth_required` clears only after `auth_status` reports that authentication has finished without an
-  error.
-- `transport_lost` and `worker_shutdown` are not cleared by a later result from the dead query. Their
-  recovery belongs to replacement of the runtime/session binding.
-- Other turn-scoped failures clear when a later turn reaches a confirmed result boundary. If that
-  attempt also fails, its new active identity remains visible.
-- Other session-scoped failures require a real model success rather than a local command.
+`details` is reserved exclusively for required explanations too large to fit reasonably in `title`.
+If the complete message fits in `title`, `details` must be omitted. It is not a place for status text,
+retry counters, provider payloads, or diagnostics.
 
-Publishing another failure is not evidence of recovery and does not clear older active identities.
-This matters when a restored quota record and a live turn record overlap: both remain replay-safe
-until their own recovery condition is satisfied.
+## Actions
 
-## Identity and revision rules
+Version 1 defines only:
 
-Live turn failures use `<turnId>:error`. Session-scoped errors use
-`<sessionId>:session-error:<queryEpoch>`, advisories use `<sessionId>:notice:<queryEpoch>`, and a
-restored usage-limit message uses `<sessionId>:history-error:<messageUuid>`.
+| Action        | Meaning                                            |
+| ------------- | -------------------------------------------------- |
+| `retry`       | Retry the operation associated with this incident. |
+| `login`       | Start authentication.                              |
+| `new_session` | Start a fresh agent session/runtime.               |
 
-The random query epoch prevents a late update from a replaced query consumer from colliding with the
-new runtime's session-scoped state. Re-publishing the same identity increments its revision. Clearing
-also increments the revision and removes the identity from the adapter's active set only after
-delivery succeeds.
+The adapter supplies action ordering. The client filters actions it cannot safely execute and ignores
+unknown or duplicate values. The client must not infer actions from category.
+
+Current Claude policies are:
+
+- authentication: `login`;
+- provider overload/error and recoverable internal error: `retry`;
+- transport loss or worker shutdown: `new_session`;
+- context or configured session-budget exhaustion: `new_session`;
+- account quota and invalid request: no action.
+
+## Internal recovery
+
+Recovery policy is internal adapter state and is not serialized:
+
+- restored quota remains active until a real model answer;
+- authentication remains active until successful `auth_status`;
+- transport loss and worker shutdown remain active until runtime replacement;
+- other turn-scoped failures stop being active at a later confirmed attempt boundary;
+- notices are not cleared merely by generic success.
+
+Recovery never removes the transcript record. Publishing another incident is not evidence that an
+older one recovered.
 
 ## History replay
 
-`session/load` scans top-level assistant history for the SDK's synthetic usage-limit messages. It
-recognizes only messages whose model is `<synthetic>` and whose text starts with one of the SDK's
-stable usage-limit prefixes; arbitrary model prose is never classified by fuzzy matching.
+`session/load` scans top-level assistant history for SDK synthetic usage-limit messages. It recognizes
+only `<synthetic>` messages beginning with SDK-owned stable prefixes, not arbitrary model prose. The
+latest matching message stays active until a later real-model answer proves recovery.
 
-The latest matching message remains active until a later assistant message with a real model id
-proves recovery. Local-command and interruption messages with model `<synthetic>` do not. For a
-capable client, the active historical condition is restored as `quota_exhausted` after transcript
-replay and the raw spend-limit prose is suppressed. A legacy client receives the original transcript
-and no structured record.
-
-## Safety and compatibility invariants
-
-- Provider error strings are not copied into the structured `safeMessage` field.
-- Extension-aware JSON-RPC errors omit raw provider detail when the structured record is the carrier.
-- A malformed capability declaration never changes legacy prompt semantics.
-- Warning severity is explicit; all omitted or unknown severity values are treated by clients as
-  errors.
-- A send failure cannot silently advance active state or a recovery revision.
-- A stale consumer cannot publish into a replacement session.
-- Background/autonomous results cannot clear or replace the active user turn's failure.
-- Unknown SDK error kinds degrade to `provider_error`, never to success.
+For a capable client, replay suppresses the duplicate assistant prose and restores one typed error
+using the exact stored Claude text as `title`. Legacy clients receive the original transcript and no
+typed record.
 
 ## Verification
 
-The executable contract lives primarily in `src/tests/acp-agent.test.ts`, under:
-
-- `usage-limit failure replay`
-- `stop reason propagation`
-- `model refusal fallback handling`
-
-Repository validation is:
+The executable contract lives primarily in `src/tests/acp-agent.test.ts`, under `usage-limit failure
+replay`, `stop reason propagation`, and `model refusal fallback handling`.
 
 ```sh
 npm run build
