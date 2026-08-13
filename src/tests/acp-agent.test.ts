@@ -3151,6 +3151,129 @@ describe("stop reason propagation", () => {
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
 
+  it("announces an idle autonomous turn's end via _session/turn_ended", async () => {
+    // A background-task wake streams a turn no prompt started; its result has
+    // no `session/prompt` response to ride, so the client can only guess at
+    // the boundary from silence. The adapter announces it instead.
+    const extNotifications: { method: string; params: any }[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+    const autonomousResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+    };
+
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      // Background-task wake, well after the prompt settled: the autonomous
+      // cycle's own result arrives with NO turn active or queued.
+      yield autonomousResult;
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      cwd: "/tmp/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+
+    // The consumer keeps draining after the prompt settles; the autonomous
+    // result must announce its turn-end out-of-turn.
+    await vi.waitFor(() => {
+      expect(extNotifications.some((n) => n.method === "_session/turn_ended")).toBe(true);
+    });
+    const ended = extNotifications.find((n) => n.method === "_session/turn_ended")!;
+    expect(ended.params.sessionId).toBe("test-session");
+    expect(ended.params.stopReason).toBe("end_turn");
+    expect(ended.params._meta["_claude/origin"]).toEqual({ kind: "task-notification" });
+  });
+
+  it("does not announce a background result consumed during a live prompt", async () => {
+    // Same shape as the consume-background-results test above, with the
+    // extension captured: a background result that lands while the user's
+    // turn is in flight (queued or active) must NOT announce — that client's
+    // turn-end rides the prompt response.
+    const extNotifications: { method: string; params: any }[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      extNotification: async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+
+    const input = new Pushable<any>();
+    const backgroundTaskResult = {
+      ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+      origin: { kind: "task-notification" },
+    };
+    const promptResult = createResultMessage({
+      subtype: "success",
+      stop_reason: null,
+      is_error: false,
+    });
+
+    async function* messageGenerator() {
+      yield { type: "system", subtype: "init", session_id: "test-session" };
+      yield backgroundTaskResult;
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield promptResult;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+      cwd: "/tmp/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
+    expect(extNotifications.filter((n) => n.method === "_session/turn_ended")).toEqual([]);
+  });
+
   it("only reconciles Fast mode from user-driven results, not task-notification followups", async () => {
     const updates: any[] = [];
     const mockClient = {

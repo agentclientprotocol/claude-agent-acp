@@ -3522,6 +3522,35 @@ export class ClaudeAcpAgent {
                 // the duplicate direction the flag's doc forbids.
                 if (!session.activeTurn && !firstUnsettledQueuedTurn()) {
                   session.emittedAssistantText = false;
+                  // Tell the client the autonomous cycle's turn is over.
+                  // Its output streamed as out-of-turn session/update
+                  // frames, but its turn-end has no `session/prompt`
+                  // response to ride, so without this the client can only
+                  // guess at the boundary from silence (a status shown as
+                  // "working" for minutes after the agent finished, until
+                  // some client-side watchdog gives up). `_`-prefixed
+                  // extension notification per the ACP conventions —
+                  // clients that don't know it ignore it. Only sent when
+                  // no user turn is active or queued: a live turn's end
+                  // rides its own prompt response.
+                  // Best-effort: a client that can't take the extension
+                  // must never kill the consumer loop. The message's own
+                  // stop reason — the accumulated `stopReason` belongs to
+                  // the user-turn lifecycle and may still hold the PREVIOUS
+                  // turn's value here.
+                  try {
+                    await this.client.extNotification?.("_session/turn_ended", {
+                      sessionId: params.sessionId,
+                      stopReason: message.stop_reason ?? "end_turn",
+                      ...(message.origin && {
+                        _meta: { "_claude/origin": message.origin },
+                      }),
+                    });
+                  } catch (error) {
+                    this.logger.error(
+                      `Session ${params.sessionId}: _session/turn_ended notification failed: ${error}`,
+                    );
+                  }
                 }
                 break;
               }
