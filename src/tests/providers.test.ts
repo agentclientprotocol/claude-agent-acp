@@ -11,6 +11,10 @@ const mockQuery = vi.hoisted(() =>
     setModel: vi.fn(),
     setPermissionMode: vi.fn(),
     supportedCommands: vi.fn().mockResolvedValue([]),
+    close: vi.fn(),
+    interrupt: vi.fn().mockResolvedValue(undefined),
+    getContextUsage: vi.fn().mockResolvedValue({ totalTokens: 0, rawMaxTokens: 200000 }),
+    [Symbol.asyncIterator]: async function* () {},
   })),
 );
 
@@ -190,13 +194,178 @@ describe("providers", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: " ",
+            ANTHROPIC_AUTH_TOKEN: "acp-proxy",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
           }),
         }),
       }),
     );
+  });
+
+  it("keeps native session creation unchanged when the providers API is unused", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledOnce();
+    expect(mockQuery.mock.calls[0][0].options.resume).toBeUndefined();
+    expect(mockQuery.mock.results[0].value.close).not.toHaveBeenCalled();
+  });
+
+  it("recreates loaded sessions with the new provider between turns", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+
+    expect(originalQuery.close).toHaveBeenCalledOnce();
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(mockQuery.mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          resume: first.sessionId,
+          env: expect.objectContaining({ ANTHROPIC_BASE_URL: "https://gateway.example" }),
+          settings: expect.objectContaining({
+            apiKeyHelper: "",
+            env: expect.objectContaining({
+              ANTHROPIC_BASE_URL: "https://gateway.example",
+              ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+              CLAUDE_CODE_OAUTH_TOKEN: "",
+            }),
+          }),
+        }),
+      }),
+    );
+
+    await agent.unstable_disableProvider({ providerId: "main" });
+
+    expect(mockQuery).toHaveBeenCalledTimes(3);
+    expect(mockQuery.mock.calls[2][0]).toEqual(
+      expect.objectContaining({
+        options: expect.objectContaining({ resume: first.sessionId }),
+      }),
+    );
+    expect(mockQuery.mock.calls[2][0].options.env.ANTHROPIC_BASE_URL).toBe(
+      process.env.ANTHROPIC_BASE_URL,
+    );
+  });
+
+  it("switches every loaded session through proxy replacements and back to native routing", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const first = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const second = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://first-gateway.example",
+    });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://second-gateway.example",
+    });
+    await agent.unstable_disableProvider({ providerId: "main" });
+
+    expect(mockQuery).toHaveBeenCalledTimes(8);
+    const resumedCalls = mockQuery.mock.calls.slice(2);
+    for (let update = 0; update < 3; update += 1) {
+      expect(
+        resumedCalls.slice(update * 2, update * 2 + 2).map(([request]) => request.options.resume),
+      ).toEqual([first.sessionId, second.sessionId]);
+    }
+    expect(
+      resumedCalls.slice(0, 2).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual(["https://first-gateway.example", "https://first-gateway.example"]);
+    expect(
+      resumedCalls.slice(2, 4).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual(["https://second-gateway.example", "https://second-gateway.example"]);
+    expect(
+      resumedCalls.slice(4).map(([request]) => request.options.env.ANTHROPIC_BASE_URL),
+    ).toEqual([process.env.ANTHROPIC_BASE_URL, process.env.ANTHROPIC_BASE_URL]);
+    for (const result of mockQuery.mock.results.slice(0, 6)) {
+      expect(result.value.close).toHaveBeenCalledOnce();
+    }
+    for (const result of mockQuery.mock.results.slice(6)) {
+      expect(result.value.close).not.toHaveBeenCalled();
+    }
+  });
+
+  it("overrides user routing settings while preserving unrelated settings", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            settings: {
+              apiKeyHelper: "unsafe-helper",
+              env: {
+                ANTHROPIC_BASE_URL: "https://user-gateway.example",
+                ANTHROPIC_API_KEY: "user-secret",
+                UNRELATED_SETTING: "preserved",
+              },
+              model: "claude-sonnet-4-6",
+            },
+          },
+        },
+      },
+    });
+
+    expect(mockQuery.mock.calls[0][0].options.settings).toEqual(
+      expect.objectContaining({
+        apiKeyHelper: "",
+        model: "claude-sonnet-4-6",
+        env: expect.objectContaining({
+          ANTHROPIC_BASE_URL: "https://gateway.example",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "acp-proxy",
+          UNRELATED_SETTING: "preserved",
+        }),
+      }),
+    );
+  });
+
+  it("waits for an active turn before recreating its session", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    const created = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+    let finishTurn!: () => void;
+    const completion = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    (agent.sessions[created.sessionId] as any).turnQueue = [{ completion }];
+
+    const update = agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(originalQuery.close).not.toHaveBeenCalled();
+    finishTurn();
+    await update;
+    expect(originalQuery.close).toHaveBeenCalledOnce();
   });
 
   it("routes bedrock provider config into session env", async () => {
@@ -216,7 +385,7 @@ describe("providers", () => {
         options: expect.objectContaining({
           env: expect.objectContaining({
             CLAUDE_CODE_USE_BEDROCK: "1",
-            AWS_BEARER_TOKEN_BEDROCK: " ",
+            AWS_BEARER_TOKEN_BEDROCK: "acp-proxy",
             ANTHROPIC_BEDROCK_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "custom-header: test",
           }),

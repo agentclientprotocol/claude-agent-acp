@@ -415,6 +415,8 @@ type Turn = {
   steeredSettle?: PromptResponse;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
+  /** Settles after the ACP prompt request completes, regardless of outcome. */
+  completion?: Promise<void>;
 };
 
 type Session = {
@@ -504,6 +506,8 @@ type Session = {
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
+  /** Original ACP parameters used to recreate this query with a new provider. */
+  creationParams?: NewSessionRequest;
   settingsManager: SettingsManager;
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
@@ -1478,6 +1482,8 @@ export class ClaudeAcpAgent {
   gatewayAuthRequest?: GatewayAuthRequest;
   /** Set while ACP overrides the agent's native provider configuration. */
   providerConfig?: ProviderConfig;
+  /** Serializes provider changes while every open query is recreated between turns. */
+  private providerUpdate: Promise<void> | null = null;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1659,6 +1665,7 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
@@ -1671,6 +1678,7 @@ export class ClaudeAcpAgent {
   }
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -1691,6 +1699,7 @@ export class ClaudeAcpAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
     // Needs to happen after we return the session
@@ -1701,6 +1710,7 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
     await this.replaySessionHistory(params.sessionId);
@@ -1775,6 +1785,9 @@ export class ClaudeAcpAgent {
 
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
     const config = this.providerConfig ?? this.defaultProviderConfig();
+    this.logger.log(
+      `[providers/list] apiType=${config.apiType} baseUrl=${config.baseUrl} overridden=${this.providerConfig !== undefined}`,
+    );
     const provider: ProviderInfo = {
       providerId: PROVIDER_ID,
       supported: SUPPORTED_PROTOCOLS,
@@ -1835,7 +1848,10 @@ export class ClaudeAcpAgent {
       config.vertex = { projectId: vertex.projectId, region: vertex.region };
     }
 
-    this.providerConfig = config;
+    this.logger.log(
+      `[providers/set] apiType=${config.apiType} baseUrl=${config.baseUrl} sessions=${Object.keys(this.sessions).length}`,
+    );
+    await this.enqueueProviderUpdate(config);
     return {};
   }
 
@@ -1845,7 +1861,8 @@ export class ClaudeAcpAgent {
    */
   async unstable_disableProvider(params: DisableProviderRequest): Promise<DisableProviderResponse> {
     if (params.providerId === PROVIDER_ID) {
-      this.providerConfig = undefined;
+      this.logger.log(`[providers/disable] sessions=${Object.keys(this.sessions).length}`);
+      await this.enqueueProviderUpdate(undefined);
     }
     // Unknown provider: idempotent success.
     return {};
@@ -1914,6 +1931,7 @@ export class ClaudeAcpAgent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
     const session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -1950,9 +1968,19 @@ export class ClaudeAcpAgent {
       resolve: () => {},
       reject: () => {},
     };
+    let completeTurn!: () => void;
+    turn.completion = new Promise<void>((resolve) => {
+      completeTurn = resolve;
+    });
     const response = new Promise<PromptResponse>((resolve, reject) => {
-      turn.resolve = resolve;
-      turn.reject = reject;
+      turn.resolve = (result) => {
+        resolve(result);
+        completeTurn();
+      };
+      turn.reject = (error) => {
+        reject(error);
+        completeTurn();
+      };
     });
 
     session.turnQueue ??= [];
@@ -6116,13 +6144,40 @@ export class ClaudeAcpAgent {
     // config concurrently, so re-resolving it after any of the awaits between
     // here and the session registration could disagree with the env baked
     // into the query.
+    const resolvedProvider = this.resolveProviderConfig();
+    const providerEnv = createEnvForProvider(resolvedProvider);
+    const configuredSettings =
+      userProvidedOptions?.settings ??
+      (modelConfig
+        ? {
+            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
+            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
+          }
+        : undefined);
+    // Claude Code applies env from settings.json after the subprocess env. Put
+    // an active ACP route in the programmatic settings tier too so user/project
+    // settings cannot silently restore a different ANTHROPIC_BASE_URL.
+    let settings = configuredSettings;
+    if (resolvedProvider) {
+      const baseSettings =
+        typeof configuredSettings === "string"
+          ? (JSON.parse(
+              await fs.readFile(path.resolve(params.cwd, configuredSettings), "utf8"),
+            ) as Exclude<Options["settings"], string | undefined>)
+          : configuredSettings;
+      settings = {
+        ...baseSettings,
+        apiKeyHelper: "",
+        env: { ...baseSettings?.env, ...providerEnv },
+      };
+    }
     const env = {
       ...process.env,
       ...userProvidedOptions?.env,
       // Client-managed LLM routing: `providers/set` config wins, else the
-      // legacy gateway auth request. Baked into the query at creation, so it
-      // only affects sessions started after the change (matching the RFD).
-      ...createEnvForProvider(this.resolveProviderConfig()),
+      // legacy gateway auth request. Routing is baked into the query at
+      // creation; provider updates recreate loaded queries between turns.
+      ...providerEnv,
       // Opt-in to session state events like when the agent is idle
       CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1",
     };
@@ -6131,23 +6186,16 @@ export class ClaudeAcpAgent {
     // SDK, so per-session `_meta` env routing and ambient process-env routing
     // are distinguished exactly as the CLI will see them.
     const providerCacheKey = providerCacheKeyFor(env);
+    this.logger.log(
+      `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${resolvedProvider?.baseUrl ?? "native"}`,
+    );
 
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
-      // CLAUDE_MODEL_CONFIG env var is a fallback for model
-      // configuration (e.g. Bedrock model ID overrides). When the caller
-      // provides settings via _meta, we intentionally ignore the env var —
-      // the caller is assumed to have full control over model configuration.
-      ...(!userProvidedOptions?.settings &&
-        modelConfig && {
-          settings: {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          },
-        }),
+      ...(settings && { settings }),
       env,
       // Override certain fields that must be controlled by ACP
       cwd: params.cwd,
@@ -6473,6 +6521,7 @@ export class ClaudeAcpAgent {
       cancelled: false,
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
+      creationParams: params,
       settingsManager,
       accumulatedUsage: {
         inputTokens: 0,
@@ -6509,6 +6558,46 @@ export class ClaudeAcpAgent {
       modes,
       configOptions,
     };
+  }
+
+  /**
+   * Provider routing is baked into the environment of each SDK Query. Wait for
+   * all submitted turns to settle, close every query, then resume each Claude
+   * session with the same ID so subsequent turns inherit the new environment.
+   */
+  private async enqueueProviderUpdate(config: ProviderConfig | undefined): Promise<void> {
+    const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
+    const update = previous.then(async () => {
+      const sessions = Object.entries(this.sessions);
+      const activeTurns = sessions.flatMap(([, session]) =>
+        (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      );
+      if (activeTurns.length > 0) {
+        this.logger.log(
+          `Waiting for ${activeTurns.length} active Claude turn(s) before provider update`,
+        );
+        await Promise.all(activeTurns);
+      }
+
+      this.providerConfig = config;
+      for (const [sessionId, session] of sessions) {
+        if (this.sessions[sessionId] !== session || !session.creationParams) {
+          continue;
+        }
+        this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
+        this.closeQueryStream(session);
+        delete this.sessions[sessionId];
+        await this.createSession(session.creationParams, { resume: sessionId });
+      }
+    });
+    this.providerUpdate = update;
+    try {
+      await update;
+    } finally {
+      if (this.providerUpdate === update) {
+        this.providerUpdate = null;
+      }
+    }
   }
 }
 
@@ -6623,14 +6712,28 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   if (!config) {
     return {};
   }
+  const resetRouting = {
+    ANTHROPIC_BASE_URL: "",
+    ANTHROPIC_BEDROCK_BASE_URL: "",
+    ANTHROPIC_VERTEX_BASE_URL: "",
+    CLAUDE_CODE_USE_BEDROCK: "0",
+    CLAUDE_CODE_USE_VERTEX: "0",
+    ANTHROPIC_VERTEX_PROJECT_ID: "",
+    CLOUD_ML_REGION: "",
+    AWS_REGION: "",
+    ANTHROPIC_API_KEY: "",
+    ANTHROPIC_AUTH_TOKEN: "",
+    CLAUDE_CODE_OAUTH_TOKEN: "",
+  };
   const customHeaders = Object.entries(config.headers)
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");
 
   if (config.apiType === "bedrock") {
     return {
+      ...resetRouting,
       CLAUDE_CODE_USE_BEDROCK: "1",
-      AWS_BEARER_TOKEN_BEDROCK: " ", // Must be non-empty to bypass pass configuration check
+      AWS_BEARER_TOKEN_BEDROCK: "acp-proxy", // Bypass local AWS credential checks
       ANTHROPIC_BEDROCK_BASE_URL: config.baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
     };
@@ -6640,6 +6743,7 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
     // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
     // validation; fall back to empty strings defensively.
     return {
+      ...resetRouting,
       CLAUDE_CODE_USE_VERTEX: "1",
       ANTHROPIC_VERTEX_BASE_URL: config.baseUrl,
       ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
@@ -6649,9 +6753,10 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   }
 
   return {
+    ...resetRouting,
     ANTHROPIC_BASE_URL: config.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
+    ANTHROPIC_AUTH_TOKEN: "acp-proxy", // Bypass local Claude login checks
   };
 }
 
@@ -8441,7 +8546,7 @@ export async function runPromptWithCancellation(
   }
 }
 
-export function runAcp() {
+export function runAcp(logger?: Logger) {
   const input = nodeToWebWritable(process.stdout);
   const output = nodeToWebReadable(process.stdin);
 
@@ -8487,7 +8592,7 @@ export function runAcp() {
     )
     .connect(stream);
 
-  agent = new ClaudeAcpAgent(new ClientConnection(connection.client));
+  agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
   return { connection, agent };
 }
 
@@ -8585,6 +8690,7 @@ const PROVIDER_ROUTING_ENV_VARS = [
   "ANTHROPIC_CUSTOM_HEADERS",
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  "CLAUDE_CODE_OAUTH_TOKEN",
 ] as const;
 
 /** Stable identifier for the LLM backend a session's query is created against,
