@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.68.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.67.0...v0.68.0) (2026-08-14)
+
+
+### Features
+
+* align typed session failures with AIR protocol ([#992](https://github.com/agentclientprotocol/claude-agent-acp/issues/992)) ([0581b9c](https://github.com/agentclientprotocol/claude-agent-acp/commit/0581b9cf397ffd88f2830db721c2d8e3689045e4))
+
 ## [0.67.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.66.0...v0.67.0) (2026-08-14)
 
 
