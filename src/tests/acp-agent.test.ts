@@ -1727,6 +1727,12 @@ describe("synthetic login message (issue #863)", () => {
     type: "message",
     stop_reason: "stop_sequence",
     content: [{ type: "text", text: "Not logged in · Please run /login" }],
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
   };
 
   it("isSyntheticLoginMessage matches the CLI auth-error message", () => {
@@ -1801,6 +1807,70 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(true);
     // …but the TUI-specific "/login" instruction never reaches the client.
     expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+
+  it("fails a queued prompt when synthetic auth arrives before its user echo", async () => {
+    const client = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    let markAuthHandled!: () => void;
+    const authHandled = new Promise<void>((resolve) => (markAuthHandled = resolve));
+    let finishGenerator!: () => void;
+    const generatorFinished = new Promise<void>((resolve) => (finishGenerator = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        await input[Symbol.asyncIterator]().next();
+        yield {
+          type: "assistant",
+          uuid: "synthetic-auth",
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: syntheticLoginApiMessage,
+        };
+        // Reaching this line proves the consumer handled the yielded auth frame
+        // and requested the next one. No clock or production credentials needed.
+        markAuthHandled();
+        await generatorFinished;
+      }
+      return messageGenerator();
+    });
+
+    type Outcome =
+      { kind: "resolved"; value: PromptResponse } | { kind: "rejected"; error: unknown };
+    let outcome: Outcome | undefined;
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "hello" }],
+    });
+    const terminal = prompt.then(
+      (value): Outcome => (outcome = { kind: "resolved", value }),
+      (error): Outcome => (outcome = { kind: "rejected", error }),
+    );
+
+    await authHandled;
+    await Promise.resolve();
+    const outcomeBeforeCancel = outcome;
+
+    // Always clean up the intentionally paused stream. On the regression path
+    // cancel settles the still-queued prompt, but must not leave orphan debt.
+    const cancelling = agent.cancel({ sessionId: "test-session" });
+    finishGenerator();
+    await cancelling;
+    const finalOutcome = await terminal;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(outcomeBeforeCancel).toMatchObject({
+      kind: "rejected",
+      error: { code: -32000 },
+    });
+    expect(finalOutcome).toMatchObject({ kind: "rejected", error: { code: -32000 } });
+    expect(agent.sessions["test-session"].activeTurn ?? null).toBeNull();
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+    expect(agent.sessions["test-session"].pendingOrphanResults ?? 0).toBe(0);
+    expect(agent.sessions["test-session"].orphanCommands?.size ?? 0).toBe(0);
   });
 });
 

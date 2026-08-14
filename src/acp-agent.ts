@@ -4464,6 +4464,14 @@ export class ClaudeAcpAgent {
             }
 
             if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
+              // The SDK can emit this terminal auth frame before replaying the
+              // queued prompt's user echo. Bind the queue head here so the
+              // failure settles that prompt instead of becoming session-only
+              // while its Promise remains pending forever.
+              const queued = firstUnsettledQueuedTurn();
+              if (!session.activeTurn && queued) {
+                activateTurn(queued);
+              }
               await failActiveWithSessionFailure("auth_required", RequestError.authRequired());
               break;
             }
