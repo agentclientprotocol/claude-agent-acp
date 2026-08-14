@@ -126,11 +126,11 @@ import {
   airSessionFailureCapabilityMeta,
   assistantMessageText,
   type ClaudeFailureKind,
-  createSessionFailureController,
   createSessionFailureState,
   isSyntheticUsageLimitMessage,
   type PublishedSessionFailure,
   providerFailureCategory,
+  SessionFailureController,
   type SessionFailureState,
   sessionFailureMeta,
   supportsAirSessionFailures,
@@ -2219,7 +2219,7 @@ export class ClaudeAcpAgent {
 
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
-    const sessionFailures = createSessionFailureController({
+    const sessionFailures = new SessionFailureController({
       sessionId: params.sessionId,
       state: session.sessionFailureState,
       capabilities: this.clientCapabilities,
@@ -2227,8 +2227,6 @@ export class ClaudeAcpAgent {
       sendUpdate,
       logger: this.logger,
     });
-    const clearSessionFailure = sessionFailures.clear;
-
     const createSessionFailure = async (
       kind: ClaudeFailureKind,
       options: {
@@ -2271,7 +2269,7 @@ export class ClaudeAcpAgent {
       const activeTurnId = session.activeTurn?.promptUuid;
       // Advisories carry no turnId, so without the guard every turn boundary would sweep them away.
       // They are session-scoped and stay until superseded or dismissed by the user.
-      await clearSessionFailure(
+      await sessionFailures.clear(
         (failure) => failure.recoveryPolicy === "next_attempt" && failure.turnId !== activeTurnId,
       );
     };
@@ -3811,7 +3809,7 @@ export class ClaudeAcpAgent {
 
               if (!message.is_error && lastAssistantModel !== null) {
                 const activeTurnId = session.activeTurn?.promptUuid;
-                await clearSessionFailure(
+                await sessionFailures.clear(
                   (failure) =>
                     failure.recoveryPolicy === "real_model_success" ||
                     (failure.severity === "warning" && failure.turnId === activeTurnId),
@@ -4508,7 +4506,7 @@ export class ClaudeAcpAgent {
             break;
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {
-              await clearSessionFailure((failure) => failure.kind === "auth_required");
+              await sessionFailures.clear((failure) => failure.kind === "auth_required");
             }
             break;
           default:
@@ -5065,7 +5063,7 @@ export class ClaudeAcpAgent {
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =
       session && supportsTypedFailures
-        ? createSessionFailureController({
+        ? new SessionFailureController({
             sessionId,
             state: session.sessionFailureState,
             capabilities: this.clientCapabilities,

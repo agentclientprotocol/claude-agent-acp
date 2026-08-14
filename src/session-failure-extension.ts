@@ -271,25 +271,44 @@ function sessionFailureRecoveryPolicy(
 /** Owns the AIR failure lifecycle for both the live consumer and history replay.
  *  Published revisions become active only after delivery succeeds; recovery only
  *  removes internal active state because transcript records are historical. */
-export function createSessionFailureController(options: {
-  sessionId: string;
-  state: SessionFailureState;
-  capabilities?: ClientCapabilities;
-  isCurrent: () => boolean;
-  sendUpdate: (notification: SessionNotification) => Promise<void>;
-  logger: Logger;
-}) {
-  const { sessionId, state, capabilities, isCurrent, sendUpdate, logger } = options;
-  const isSupported = () => supportsAirSessionFailures(capabilities);
+export class SessionFailureController {
+  private readonly sessionId: string;
+  private readonly state: SessionFailureState;
+  private readonly capabilities?: ClientCapabilities;
+  private readonly isCurrent: () => boolean;
+  private readonly sendUpdate: (notification: SessionNotification) => Promise<void>;
+  private readonly logger: Logger;
 
-  const emit = async (failure: PublishedSessionFailure): Promise<boolean> => {
-    if (!isCurrent()) {
-      logger.error(`Session ${sessionId}: ignored AIR session failure from a stale consumer`);
+  constructor(options: {
+    sessionId: string;
+    state: SessionFailureState;
+    capabilities?: ClientCapabilities;
+    isCurrent: () => boolean;
+    sendUpdate: (notification: SessionNotification) => Promise<void>;
+    logger: Logger;
+  }) {
+    this.sessionId = options.sessionId;
+    this.state = options.state;
+    this.capabilities = options.capabilities;
+    this.isCurrent = options.isCurrent;
+    this.sendUpdate = options.sendUpdate;
+    this.logger = options.logger;
+  }
+
+  private isSupported(): boolean {
+    return supportsAirSessionFailures(this.capabilities);
+  }
+
+  private async emit(failure: PublishedSessionFailure): Promise<boolean> {
+    if (!this.isCurrent()) {
+      this.logger.error(
+        `Session ${this.sessionId}: ignored AIR session failure from a stale consumer`,
+      );
       return false;
     }
     try {
-      await sendUpdate({
-        sessionId,
+      await this.sendUpdate({
+        sessionId: this.sessionId,
         update: {
           sessionUpdate: "session_info_update",
           _meta: sessionFailureMeta(failure),
@@ -297,46 +316,50 @@ export function createSessionFailureController(options: {
       });
       return true;
     } catch (error) {
-      logger.error(`Session ${sessionId}: failed to publish AIR session failure: ${error}`);
+      this.logger.error(
+        `Session ${this.sessionId}: failed to publish AIR session failure: ${error}`,
+      );
       return false;
     }
-  };
+  }
 
-  const recordActive = (failure: PublishedSessionFailure) => {
-    state.revisions.set(failure.id, failure.revision);
-    state.active.set(failure.id, failure);
-    state.lastNotice =
+  recordActive(failure: PublishedSessionFailure): void {
+    this.state.revisions.set(failure.id, failure.revision);
+    this.state.active.set(failure.id, failure);
+    this.state.lastNotice =
       failure.kind === "advisory" ? { title: failure.title, id: failure.id } : undefined;
-  };
+  }
 
-  const clear = async (
+  async clear(
     shouldClear: (failure: PublishedSessionFailure) => boolean = () => true,
-  ): Promise<boolean> => {
-    if (!isSupported()) return true;
-    state.lastNotice = undefined;
-    for (const failure of [...state.active.values()]) {
+  ): Promise<boolean> {
+    if (!this.isSupported()) return true;
+    this.state.lastNotice = undefined;
+    for (const failure of [...this.state.active.values()]) {
       if (!shouldClear(failure)) continue;
-      state.active.delete(failure.id);
+      this.state.active.delete(failure.id);
     }
     return true;
-  };
+  }
 
-  const prepare = async (
+  async prepare(
     kind: ClaudeFailureKind,
     failureOptions: SessionFailureOptions = {},
-  ): Promise<PublishedSessionFailure | undefined> => {
-    if (!isSupported() || !isCurrent()) return undefined;
+  ): Promise<PublishedSessionFailure | undefined> {
+    if (!this.isSupported() || !this.isCurrent()) return undefined;
     const policy = AIR_FAILURE_POLICY[kind];
     const title = failureOptions.title || policy.fallbackTitle;
     if (kind === "advisory") {
       const id =
-        state.lastNotice?.title === title
-          ? state.lastNotice.id
-          : `${sessionId}:notice:${state.epoch}:${state.nextIncident ?? 1}`;
-      if (state.lastNotice?.title !== title) state.nextIncident = (state.nextIncident ?? 1) + 1;
+        this.state.lastNotice?.title === title
+          ? this.state.lastNotice.id
+          : `${this.sessionId}:notice:${this.state.epoch}:${this.state.nextIncident ?? 1}`;
+      if (this.state.lastNotice?.title !== title) {
+        this.state.nextIncident = (this.state.nextIncident ?? 1) + 1;
+      }
       return {
         id,
-        revision: (state.revisions.get(id) ?? 0) + 1,
+        revision: (this.state.revisions.get(id) ?? 0) + 1,
         kind,
         category: policy.category,
         severity: "warning",
@@ -349,13 +372,13 @@ export function createSessionFailureController(options: {
     const id =
       failureOptions.turnId && !failureOptions.sessionScoped
         ? `${failureOptions.turnId}:error`
-        : `${sessionId}:session-error:${state.epoch}:${state.nextIncident ?? 1}`;
+        : `${this.sessionId}:session-error:${this.state.epoch}:${this.state.nextIncident ?? 1}`;
     if (!failureOptions.turnId || failureOptions.sessionScoped) {
-      state.nextIncident = (state.nextIncident ?? 1) + 1;
+      this.state.nextIncident = (this.state.nextIncident ?? 1) + 1;
     }
     return {
       id,
-      revision: (state.revisions.get(id) ?? 0) + 1,
+      revision: (this.state.revisions.get(id) ?? 0) + 1,
       kind,
       category: policy.category,
       severity: failureOptions.severity ?? "error",
@@ -370,25 +393,28 @@ export function createSessionFailureController(options: {
         ? { turnId: failureOptions.turnId }
         : {}),
     };
-  };
+  }
 
-  const publish = async (kind: ClaudeFailureKind, failureOptions: SessionFailureOptions = {}) => {
-    const failure = await prepare(kind, failureOptions);
+  async publish(
+    kind: ClaudeFailureKind,
+    failureOptions: SessionFailureOptions = {},
+  ): Promise<void> {
+    const failure = await this.prepare(kind, failureOptions);
     if (!failure) return;
-    if (await emit(failure)) recordActive(failure);
-  };
+    if (await this.emit(failure)) this.recordActive(failure);
+  }
 
-  const restore = async (
+  async restore(
     id: string,
     kind: ClaudeFailureKind,
     title: string,
     active = true,
-  ): Promise<boolean> => {
-    if (!isSupported() || !isCurrent()) return false;
+  ): Promise<boolean> {
+    if (!this.isSupported() || !this.isCurrent()) return false;
     const policy = AIR_FAILURE_POLICY[kind];
     const failure: PublishedSessionFailure = {
       id,
-      revision: (state.revisions.get(id) ?? 0) + 1,
+      revision: (this.state.revisions.get(id) ?? 0) + 1,
       kind,
       category: policy.category,
       severity: "error",
@@ -396,17 +422,15 @@ export function createSessionFailureController(options: {
       actions: policy.actions,
       recoveryPolicy: sessionFailureRecoveryPolicy(kind),
     };
-    if (!(await emit(failure))) return false;
-    state.revisions.set(failure.id, failure.revision);
+    if (!(await this.emit(failure))) return false;
+    this.state.revisions.set(failure.id, failure.revision);
     if (active) {
-      state.active.set(failure.id, failure);
+      this.state.active.set(failure.id, failure);
     } else {
-      state.active.delete(failure.id);
+      this.state.active.delete(failure.id);
     }
     return true;
-  };
-
-  return { clear, prepare, publish, recordActive, restore };
+  }
 }
 
 export function providerFailureCategory(
