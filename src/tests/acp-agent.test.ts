@@ -5139,6 +5139,30 @@ describe("model refusal fallback handling", () => {
     expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
   });
 
+  it("does not swap the session model for a local-scope fallback", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    injectGeneratorSession(
+      agent,
+      makeGenerator([refusalFallbackMessage({ scope: "local" }), successResult()]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const session = agent.sessions["test-session"];
+    // scope "local" (CLI 2.1.232+): only a subagent / side-question response
+    // came from the fallback model — the session model is unchanged, so a
+    // picker sync would advertise a model the session isn't running.
+    expect(session.models.currentModelId).toBe("claude-fable-5");
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find(
+      (u) => u.sessionUpdate === "agent_message_chunk" && u.content.text.includes("Model fallback"),
+    );
+    expect(notice.content.text).toContain("Only that response came from claude-opus-4-8");
+    expect(notice.content.text).toContain("the session stays on claude-fable-5");
+    expect(updates.some((u) => u.sessionUpdate === "config_option_update")).toBe(false);
+  });
+
   it("keeps the current permission modes when the fallback model is unknown", async () => {
     const { agent, sessionUpdate } = createCapturingAgent();
     injectGeneratorSession(
@@ -5258,6 +5282,142 @@ describe("model refusal fallback handling", () => {
           u.content.text.includes("Background task declined."),
       ),
     ).toBe(false);
+  });
+});
+
+describe("terminal slash command filtering", () => {
+  it("latches init's terminal_slash_commands and re-advertises without them", async () => {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // CLI 2.1.232+ tags terminal-bound commands on init.
+      yield {
+        type: "system",
+        subtype: "init",
+        session_id: "test-session",
+        terminal_slash_commands: ["doctor", "color"],
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator);
+    const supportedCommands = vi.fn(async () => [
+      { name: "doctor", description: "Diagnose your setup" },
+      { name: "color", description: "Change the theme" },
+      { name: "compact", description: "Compact the conversation" },
+    ]);
+    Object.assign(agent.sessions["test-session"].query, { supportedCommands });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(agent.sessions["test-session"].terminalSlashCommands).toEqual(["doctor", "color"]);
+    // The latch re-publishes the list (the session/new advertisement ran
+    // before any init frame existed) with the terminal-bound entries dropped.
+    expect(supportedCommands).toHaveBeenCalled();
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const commandsUpdate = updates.find((u) => u.sessionUpdate === "available_commands_update");
+    expect(commandsUpdate).toBeDefined();
+    expect(commandsUpdate.availableCommands.map((c: { name: string }) => c.name)).toEqual([
+      "compact",
+    ]);
+  });
+
+  it("does not re-advertise when a later init repeats the same latch", async () => {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      // init re-emits per turn with an unchanged tag set — only the first
+      // latch should trigger a re-advertisement.
+      yield {
+        type: "system",
+        subtype: "init",
+        session_id: "test-session",
+        terminal_slash_commands: ["doctor"],
+      };
+      yield {
+        type: "system",
+        subtype: "init",
+        session_id: "test-session",
+        terminal_slash_commands: ["doctor"],
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator);
+    const supportedCommands = vi.fn(async () => [{ name: "compact", description: "" }]);
+    Object.assign(agent.sessions["test-session"].query, { supportedCommands });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(supportedCommands).toHaveBeenCalledTimes(1);
   });
 });
 
