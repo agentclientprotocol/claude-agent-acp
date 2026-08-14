@@ -4,6 +4,7 @@ import {
   type McpSdkServerConfigWithInstance,
   type SdkMcpToolDefinition,
 } from "@anthropic-ai/claude-agent-sdk";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 
@@ -325,11 +326,11 @@ function normalizeWorkspace(
   cwd: string,
   additionalDirectories: string[],
 ): FileChangeAuditWorkspace {
-  const normalizedCwd = path.resolve(cwd);
+  const normalizedCwd = canonicalizeWorkspaceRoot(path.resolve(cwd));
   const seen = new Set([pathKey(normalizedCwd)]);
   const normalizedAdditionalDirectories: string[] = [];
   for (const directory of additionalDirectories) {
-    const normalized = path.resolve(normalizedCwd, directory);
+    const normalized = canonicalizeWorkspaceRoot(path.resolve(normalizedCwd, directory));
     const key = pathKey(normalized);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -361,7 +362,7 @@ function normalizeReportedPaths(
     }
     let normalized: string;
     try {
-      normalized = path.resolve(workspace.cwd, reportedPath);
+      normalized = canonicalizeReportedPath(path.resolve(workspace.cwd, reportedPath));
     } catch {
       truncated = true;
       continue;
@@ -423,6 +424,49 @@ function fitReportedAgentFileChangeReport(
 function isWithinRoot(candidate: string, root: string): boolean {
   const relative = path.relative(root, candidate);
   return !path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..";
+}
+
+/**
+ * Resolve filesystem aliases in a workspace root, including macOS' /tmp ->
+ * /private/tmp alias. For a root that does not exist yet, resolve its nearest
+ * existing ancestor and retain the missing suffix.
+ */
+function canonicalizeWorkspaceRoot(value: string): string {
+  return canonicalizeFromExistingAncestor(value);
+}
+
+/**
+ * Canonicalize the parent but not the leaf itself. A changed path may be
+ * deleted, or it may be a symlink whose node (rather than target) changed.
+ */
+function canonicalizeReportedPath(value: string): string {
+  const parent = canonicalizeFromExistingAncestor(path.dirname(value));
+  return path.resolve(parent, path.basename(value));
+}
+
+function canonicalizeFromExistingAncestor(value: string): string {
+  const original = path.resolve(value);
+  let current = original;
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      const canonical = fs.realpathSync.native(current);
+      return path.resolve(canonical, ...missingSegments.reverse());
+    } catch (error) {
+      if (!isMissingPathError(error)) return original;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) return original;
+    missingSegments.push(path.basename(current));
+    current = parent;
+  }
+}
+
+function isMissingPathError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  return error.code === "ENOENT" || error.code === "ENOTDIR";
 }
 
 function pathKey(value: string): string {

@@ -1,4 +1,5 @@
 import type { HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -168,6 +169,9 @@ describe("agent file-change audit", () => {
   it("normalizes roots, drops invalid paths, and deduplicates without truncation", async () => {
     const cwd = path.join(os.tmpdir(), "file-audit-project");
     const additionalRoot = path.join(os.tmpdir(), "file-audit-shared");
+    const canonicalTempRoot = fs.realpathSync.native(os.tmpdir());
+    const canonicalCwd = path.join(canonicalTempRoot, "file-audit-project");
+    const canonicalAdditionalRoot = path.join(canonicalTempRoot, "file-audit-shared");
     const outside = path.join(os.tmpdir(), "file-audit-outside", "outside.txt");
     const state = createFileChangeAuditTurnState("request-2");
     state.phase = "collecting";
@@ -206,7 +210,10 @@ describe("agent file-change audit", () => {
         version: 1,
         requestId: "request-2",
         status: "reported",
-        paths: [path.join(cwd, "src/a.ts"), path.join(additionalRoot, "generated.ts")],
+        paths: [
+          path.join(canonicalCwd, "src/a.ts"),
+          path.join(canonicalAdditionalRoot, "generated.ts"),
+        ],
         declaredComplete: false,
         truncated: true,
         uncertainty: "Generated files may be missing",
@@ -232,8 +239,43 @@ describe("agent file-change audit", () => {
     expect(duplicateOnlyReports[0]).toMatchObject({
       declaredComplete: true,
       truncated: false,
-      paths: [path.join(cwd, "src/a.ts")],
+      paths: [path.join(canonicalCwd, "src/a.ts")],
     });
+  });
+
+  it("accepts canonical paths under a symlinked workspace root", async () => {
+    if (process.platform === "win32") return;
+
+    const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "file-audit-real-"));
+    const linkedRoot = `${realRoot}-link`;
+    fs.symlinkSync(realRoot, linkedRoot, "dir");
+    try {
+      const state = createFileChangeAuditTurnState("request-symlink-root");
+      state.phase = "collecting";
+      const reports: AgentFileChangeReportResult[] = [];
+      const tool = auditToolHandler(
+        createSupport({
+          state,
+          cwd: linkedRoot,
+          publish: async (report) => void reports.push(report),
+        }),
+      );
+      const canonicalPath = path.join(fs.realpathSync.native(realRoot), "generated.ts");
+
+      await tool.handler({
+        paths: [canonicalPath, path.join(linkedRoot, "generated.ts")],
+        complete: true,
+      });
+
+      expect(reports[0]).toMatchObject({
+        paths: [canonicalPath],
+        declaredComplete: true,
+        truncated: false,
+      });
+    } finally {
+      fs.unlinkSync(linkedRoot);
+      fs.rmSync(realRoot, { recursive: true, force: true });
+    }
   });
 
   it("caps path count and total UTF-8 bytes", async () => {
