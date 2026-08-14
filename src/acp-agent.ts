@@ -4042,7 +4042,6 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 session.lastSessionState = message.state;
                 if (message.state === "idle") {
-                  compaction.reset();
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -4073,6 +4072,7 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
+                    compaction.reset();
                     settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
@@ -4133,6 +4133,7 @@ export class ClaudeAcpAgent {
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
+                    compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -5150,7 +5151,11 @@ export class ClaudeAcpAgent {
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
-                compaction.clearDeliveredOutput();
+                // A result closes this compaction lifecycle. Reset here rather
+                // than at idle: an owed idle from this turn can arrive after
+                // the next turn has already started and must not erase that
+                // turn's compaction state.
+                compaction.reset();
               }
             }
             break;

@@ -18,8 +18,9 @@ type SendUpdate = (notification: SessionNotification) => Promise<void>;
  * Translates Claude's compaction signals into one idempotent ACP tool lifecycle.
  *
  * The SDK can duplicate terminal compact_result messages and can omit the
- * opening status on replay. State therefore lives for the whole session stream
- * until idle (or a new compacting status).
+ * opening status on replay. State therefore lives until the owning turn's
+ * result (or abort), while a new compacting status after a terminal outcome
+ * starts a fresh lifecycle.
  */
 export class ContextCompactionLifecycle {
   private activeCompaction: CompactionState | undefined;
@@ -29,10 +30,6 @@ export class ContextCompactionLifecycle {
 
   get hasDeliveredOutput(): boolean {
     return this.outputDelivered;
-  }
-
-  clearDeliveredOutput(): void {
-    this.outputDelivered = false;
   }
 
   reset(): void {

@@ -10586,6 +10586,60 @@ describe("assembled assistant text fallback", () => {
     expect(JSON.stringify(updates)).not.toContain("internal summary");
   });
 
+  it("does not let a previous turn's lagging idle reset the active compaction", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSessionTwoTurns(
+      agent,
+      [result()],
+      [
+        {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          uuid: "second-compact-start",
+          session_id: "test-session",
+        },
+        // This is turn 1's owed trailer, delivered after turn 2 started.
+        idle,
+        {
+          type: "system",
+          subtype: "status",
+          status: null,
+          compact_result: "failed",
+          compact_error: "summary rejected",
+          uuid: "second-compact-failed",
+          session_id: "test-session",
+        },
+        result(),
+        idle,
+      ],
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "first" }] });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+
+    const toolUpdates = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
+      );
+    expect(toolUpdates).toHaveLength(2);
+    expect(toolUpdates[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "second-compact-start",
+      status: "in_progress",
+    });
+    expect(toolUpdates[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "second-compact-start",
+      status: "failed",
+    });
+  });
+
   // Like injectSession, but serves two prompts: each turn's echo is yielded
   // when its prompt arrives, followed by that turn's scripted messages.
   function injectSessionTwoTurns(agent: ClaudeAcpAgent, first: any[], second: any[]) {
