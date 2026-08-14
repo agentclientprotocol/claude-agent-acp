@@ -161,6 +161,7 @@ import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
+import { ContextCompactionMetadata } from "./context-compaction-meta.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -203,9 +204,9 @@ import {
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
 import {
-  ContextCompactionMetadata,
-  createContextCompactionMeta,
-} from "./context-compaction-meta.js";
+  ContextCompactionLifecycle,
+  contextCompactionMetadataFromBoundary,
+} from "./context-compaction.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -3030,19 +3031,6 @@ export class ClaudeAcpAgent {
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
-    type CompactionState = {
-      toolCallId: string;
-      terminalStatus?: "completed" | "failed";
-      heartbeatSent: boolean;
-    };
-    // The SDK can duplicate terminal compact_result messages and can omit the
-    // opening status on replay. Keep one lifecycle per session stream until
-    // idle (or a new compacting status) so both shapes remain idempotent.
-    let activeCompaction: CompactionState | undefined;
-    // A compaction tool call is visible output even though it is not assistant
-    // text. Preserve that fact across echo-less /compact promotion so the
-    // result-only fallback does not expose the generated summary as prose.
-    let compactionOutputDelivered = false;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -3171,113 +3159,7 @@ export class ClaudeAcpAgent {
       ]);
     };
 
-    const compactionToolMeta = (
-      metadata: Omit<ContextCompactionMetadata, "version"> = {},
-    ): ToolUpdateMeta => ({
-      ...createContextCompactionMeta(metadata),
-      claudeCode: { toolName: "compact" },
-    });
-
-    const startCompaction = async (sessionId: string, toolCallId: string) => {
-      if (activeCompaction && !activeCompaction.terminalStatus) return activeCompaction;
-      activeCompaction = { toolCallId, heartbeatSent: false };
-      compactionOutputDelivered = true;
-      await sendUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call",
-          toolCallId,
-          title: "Compact conversation",
-          kind: "think",
-          status: "in_progress",
-          _meta: compactionToolMeta(),
-        },
-      });
-      return activeCompaction;
-    };
-
-    const compactionHeartbeat = async (sessionId: string, fallbackId: string) => {
-      const state = activeCompaction ?? (await startCompaction(sessionId, fallbackId));
-      if (state.terminalStatus || state.heartbeatSent) return;
-      state.heartbeatSent = true;
-      await sendUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: state.toolCallId,
-          status: "in_progress",
-          _meta: compactionToolMeta(),
-        },
-      });
-    };
-
-    const finishCompaction = async (
-      sessionId: string,
-      fallbackId: string,
-      status: "completed" | "failed",
-      metadata: Omit<ContextCompactionMetadata, "version"> = {},
-      enrichTerminal = false,
-    ) => {
-      const rawOutput = Object.keys(metadata).length > 0 ? metadata : undefined;
-      if (!activeCompaction) {
-        activeCompaction = { toolCallId: fallbackId, heartbeatSent: false, terminalStatus: status };
-        compactionOutputDelivered = true;
-        await sendUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "tool_call",
-            toolCallId: fallbackId,
-            title: "Compact conversation",
-            kind: "think",
-            status,
-            ...(status === "failed" && metadata.error
-              ? {
-                  content: [
-                    {
-                      type: "content" as const,
-                      content: {
-                        type: "text" as const,
-                        text: `Compaction failed: ${metadata.error}`,
-                      },
-                    },
-                  ],
-                }
-              : {}),
-            ...(rawOutput ? { rawOutput } : {}),
-            _meta: compactionToolMeta(metadata),
-          },
-        });
-        return;
-      }
-
-      const state = activeCompaction;
-      if (state.terminalStatus && !enrichTerminal) return;
-      const firstTerminal = state.terminalStatus === undefined;
-      if (firstTerminal) state.terminalStatus = status;
-      await sendUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "tool_call_update",
-          toolCallId: state.toolCallId,
-          ...(firstTerminal ? { status } : {}),
-          ...(status === "failed" && metadata.error
-            ? {
-                content: [
-                  {
-                    type: "content" as const,
-                    content: {
-                      type: "text" as const,
-                      text: `Compaction failed: ${metadata.error}`,
-                    },
-                  },
-                ],
-              }
-            : {}),
-          ...(rawOutput ? { rawOutput } : {}),
-          _meta: compactionToolMeta(metadata),
-        },
-      });
-    };
+    const compaction = new ContextCompactionLifecycle(sendUpdate);
 
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
@@ -4096,11 +3978,11 @@ export class ClaudeAcpAgent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
-                  await startCompaction(message.session_id, message.uuid);
+                  await compaction.start(message.session_id, message.uuid);
                 } else if (message.compact_result === "success") {
-                  await finishCompaction(message.session_id, message.uuid, "completed");
+                  await compaction.finish(message.session_id, message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
-                  await finishCompaction(message.session_id, message.uuid, "failed", {
+                  await compaction.finish(message.session_id, message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
@@ -4126,22 +4008,11 @@ export class ClaudeAcpAgent {
                 // window.
                 //
                 const compactMetadata = message.compact_metadata;
-                await finishCompaction(
+                await compaction.finish(
                   message.session_id,
                   message.uuid,
                   "completed",
-                  compactMetadata
-                    ? {
-                        trigger: compactMetadata.trigger === "auto" ? "automatic" : "manual",
-                        preTokens: compactMetadata.pre_tokens,
-                        ...(compactMetadata.post_tokens !== undefined
-                          ? { postTokens: compactMetadata.post_tokens }
-                          : {}),
-                        ...(compactMetadata.duration_ms !== undefined
-                          ? { durationMs: compactMetadata.duration_ms }
-                          : {}),
-                      }
-                    : {},
+                  compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
                   true,
                 );
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
@@ -4171,8 +4042,7 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 session.lastSessionState = message.state;
                 if (message.state === "idle") {
-                  activeCompaction = undefined;
-                  compactionOutputDelivered = false;
+                  compaction.reset();
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -4804,7 +4674,7 @@ export class ClaudeAcpAgent {
               // through the early break below, which the gated `finally`
               // leaves alone).
               const deliveredAssistantText = session.emittedAssistantText;
-              const deliveredCompactionOutput = compactionOutputDelivered;
+              const deliveredCompactionOutput = compaction.hasDeliveredOutput;
 
               // Every user-turn result terminates a turn (settle, reject, or
               // orphan skip) and the SDK follows it with a trailing
@@ -5280,7 +5150,7 @@ export class ClaudeAcpAgent {
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
-                compactionOutputDelivered = false;
+                compaction.clearDeliveredOutput();
               }
             }
             break;
@@ -5292,7 +5162,7 @@ export class ClaudeAcpAgent {
               (message.event.type === "content_block_delta" &&
                 message.event.delta.type === "compaction_delta");
             if (isCompactionProgress) {
-              await compactionHeartbeat(message.session_id, message.uuid);
+              await compaction.heartbeat(message.session_id, message.uuid);
             }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
