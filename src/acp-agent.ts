@@ -470,6 +470,11 @@ type Session = {
    *  cancel() routes orphan accounting to `orphanCommands` (exact, per-uuid)
    *  instead of `pendingOrphanResults` (count, coalescing-blind). */
   msgLifecycleV1?: boolean;
+  /** Latched from `system`/init `terminal_slash_commands` (CLI 2.1.232+):
+   *  names of advertised slash commands whose UX is bound to the CLI's own
+   *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
+   *  these are filtered out of `available_commands_update` payloads. */
+  terminalSlashCommands?: string[];
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -717,11 +722,13 @@ type Session = {
  *  result is the turn's real terminal.
  *
  *  Deliberately fail-OPEN: an unknown future kind defaults to the user
- *  lane. Misrouting a USER result into the autonomous lane hangs the
- *  prompt un-detectably (the result is skipped, its trailing idle absorbed
- *  as owed, so the #825 detector can't fire); misrouting an autonomous
- *  result into the user lane is the bounded misattribution class this set
- *  exists to reduce. */
+ *  lane — including `unclassified` (SDK 0.3.232+), the CLI's own "couldn't
+ *  attribute this" marker, which gets the same safe default. Misrouting a
+ *  USER result into the autonomous lane hangs the prompt un-detectably
+ *  (the result is skipped, its trailing idle absorbed as owed, so the
+ *  #825 detector can't fire); misrouting an autonomous result into the
+ *  user lane is the bounded misattribution class this set exists to
+ *  reduce. */
 const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
   "task-notification",
   "peer",
@@ -3123,6 +3130,24 @@ export class ClaudeAcpAgent {
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
                 );
+                // Terminal-bound slash commands (absent when none, and on
+                // older CLIs). The session/new advertisement runs before any
+                // init frame can be observed, so the first latch (or a
+                // genuine change) re-publishes the now-filtered list.
+                if (
+                  message.terminal_slash_commands &&
+                  JSON.stringify(message.terminal_slash_commands) !==
+                    JSON.stringify(session.terminalSlashCommands)
+                ) {
+                  session.terminalSlashCommands = message.terminal_slash_commands;
+                  try {
+                    await this.sendAvailableCommandsUpdate(message.session_id);
+                  } catch (error) {
+                    // Advisory reconcile only — the client keeps its current
+                    // (unfiltered) list; never fail the turn over it.
+                    this.logger.error(`Failed to re-advertise slash commands: ${error}`);
+                  }
+                }
                 break;
               case "status": {
                 // These banners count as delivered text (via sendUpdate), so
@@ -3380,7 +3405,10 @@ export class ClaudeAcpAgent {
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "available_commands_update",
-                    availableCommands: getAvailableSlashCommands(message.commands),
+                    availableCommands: getAvailableSlashCommands(
+                      message.commands,
+                      session.terminalSlashCommands,
+                    ),
                   },
                 });
                 break;
@@ -3570,7 +3598,15 @@ export class ClaudeAcpAgent {
                 // CLIs, where "revert" marked a turn-only fallback — for that
                 // direction the session stays on the original model, so skip
                 // the persistent-swap claim and the state sync.
-                const persistent = message.direction !== "revert";
+                //
+                // `scope` (CLI 2.1.232+) marks WHERE the fallback happened:
+                // "local" means a subagent / side-question / background fork
+                // response fell back and the session model is unchanged, so
+                // syncing the picker would advertise a model the session
+                // isn't running. Absent scope means an older CLI, where every
+                // retry was a session-level swap — treat as "session".
+                const local = message.scope === "local";
+                const persistent = message.direction !== "revert" && !local;
                 const category = message.api_refusal_category
                   ? ` (${message.api_refusal_category})`
                   : "";
@@ -3579,7 +3615,9 @@ export class ClaudeAcpAgent {
                   : "";
                 const outcome = persistent
                   ? `The session will continue on ${message.fallback_model}.`
-                  : `The session stays on ${message.original_model}.`;
+                  : local
+                    ? `Only that response came from ${message.fallback_model}; the session stays on ${message.original_model}.`
+                    : `The session stays on ${message.original_model}.`;
                 const fallbackNotice =
                   `${message.original_model} declined this request${category}; ` +
                   `retried with ${message.fallback_model}. ${outcome}${explanation}`;
@@ -5662,7 +5700,7 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands),
+        availableCommands: getAvailableSlashCommands(commands, session.terminalSlashCommands),
       },
     });
   }
@@ -7506,7 +7544,13 @@ async function getAvailableModels(
   };
 }
 
-function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[] {
+function getAvailableSlashCommands(
+  commands: SlashCommand[],
+  // Names the CLI tagged terminal-bound on `system`/init (their UX lives in
+  // the CLI's own terminal, which ACP clients aren't) — filtered alongside
+  // the static list. Raw CLI names, matched before the MCP rename.
+  terminalCommands?: readonly string[],
+): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "clear",
     "cost",
@@ -7519,6 +7563,7 @@ function getAvailableSlashCommands(commands: SlashCommand[]): AvailableCommand[]
   ];
 
   return commands
+    .filter((command) => !terminalCommands?.includes(command.name))
     .map((command) => {
       const input = command.argumentHint
         ? {

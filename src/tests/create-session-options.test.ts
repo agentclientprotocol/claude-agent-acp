@@ -795,7 +795,7 @@ describe("createSession options merging", () => {
       return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
     }
 
-    const signal = () => ({ signal: new AbortController().signal });
+    const signal = () => ({ signal: new AbortController().signal, requestId: "1" });
 
     it("renders the prompt as a form elicitation and maps the retry choice", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
