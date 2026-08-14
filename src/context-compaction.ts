@@ -25,6 +25,7 @@ type SendUpdate = (notification: SessionNotification) => Promise<void>;
 export class ContextCompactionLifecycle {
   private activeCompaction: CompactionState | undefined;
   private outputDelivered = false;
+  private duplicateErrorOutput: string | undefined;
 
   constructor(private readonly sendUpdate: SendUpdate) {}
 
@@ -35,6 +36,23 @@ export class ContextCompactionLifecycle {
   reset(): void {
     this.activeCompaction = undefined;
     this.outputDelivered = false;
+    this.duplicateErrorOutput = undefined;
+  }
+
+  /**
+   * Claude also emits a failed manual compaction's error as local-command
+   * stdout. Consume that one duplicate after the tool lifecycle carried it,
+   * without hiding unrelated command output.
+   */
+  consumeDuplicateErrorOutput(content: string): boolean {
+    if (
+      this.duplicateErrorOutput === undefined ||
+      content.trim() !== this.duplicateErrorOutput.trim()
+    ) {
+      return false;
+    }
+    this.duplicateErrorOutput = undefined;
+    return true;
   }
 
   async start(sessionId: string, toolCallId: string): Promise<CompactionState> {
@@ -89,6 +107,9 @@ export class ContextCompactionLifecycle {
         terminalStatus: status,
       };
       this.outputDelivered = true;
+      if (status === "failed" && metadata.error) {
+        this.duplicateErrorOutput = metadata.error;
+      }
       await this.sendUpdate({
         sessionId,
         update: {
@@ -112,6 +133,9 @@ export class ContextCompactionLifecycle {
 
     const firstTerminal = state.terminalStatus === undefined;
     if (firstTerminal) state.terminalStatus = status;
+    if (status === "failed" && metadata.error) {
+      this.duplicateErrorOutput = metadata.error;
+    }
     await this.sendUpdate({
       sessionId,
       update: {

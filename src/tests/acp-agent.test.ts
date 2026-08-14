@@ -10488,7 +10488,21 @@ describe("assembled assistant text fallback", () => {
         uuid: "compact-failed-2",
         session_id: "test-session",
       },
-      result(),
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "summary rejected",
+        uuid: "compact-local-output",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "additional diagnostic",
+        uuid: "compact-distinct-local-output",
+        session_id: "test-session",
+      },
+      replayedResult("summary rejected"),
       idle,
     ]);
 
@@ -10511,6 +10525,126 @@ describe("assembled assistant text fallback", () => {
         claudeCode: { toolName: "compact" },
       },
     });
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+  });
+
+  it("does not repeat a failed compaction error delivered as an assistant message", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "failed",
+        compact_error: "Not enough messages to compact.",
+        uuid: "compact-failed",
+        session_id: "test-session",
+      },
+      assistantMessage("compact-error", [
+        { type: "text", text: "Not enough messages to compact." },
+      ]),
+      replayedResult("Not enough messages to compact."),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual(
+      expect.objectContaining({
+        sessionUpdate: "tool_call_update",
+        status: "failed",
+        rawOutput: { error: "Not enough messages to compact." },
+      }),
+    );
+  });
+
+  it("does not replay stale local-command output after a successful compaction", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const staleCommandOutput = assistantMessage("stale-command-output", [
+      { type: "text", text: "Not enough messages to compact." },
+    ]);
+    staleCommandOutput.message.model = "<synthetic>";
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed",
+        session_id: "test-session",
+      },
+      staleCommandOutput,
+      replayedResult("Not enough messages to compact."),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual(
+      expect.objectContaining({
+        sessionUpdate: "tool_call_update",
+        status: "completed",
+      }),
+    );
+  });
+
+  it("preserves the model response after multiple compactions in one turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start-1",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed-1",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start-2",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed-2",
+        session_id: "test-session",
+      },
+      assistantMessage("answer-after-compactions", [{ type: "text", text: "final answer" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["final answer"]);
   });
 
   it("emits a completed compaction tool call for a terminal-only result", async () => {

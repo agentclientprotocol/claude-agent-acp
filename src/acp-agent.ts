@@ -3078,6 +3078,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
     ));
 
+    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
@@ -3114,6 +3115,13 @@ export class ClaudeAcpAgent {
         return;
       }
       if (update.sessionUpdate === "agent_message_chunk") {
+        if (
+          !claudeMeta?.parentToolUseId &&
+          update.content.type === "text" &&
+          compaction.consumeDuplicateErrorOutput(update.content.text)
+        ) {
+          return;
+        }
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
           session.titles.onAssistantText(update.content);
@@ -3158,8 +3166,6 @@ export class ClaudeAcpAgent {
           ),
       ]);
     };
-
-    const compaction = new ContextCompactionLifecycle(sendUpdate);
 
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
@@ -4030,6 +4036,9 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                if (compaction.consumeDuplicateErrorOutput(message.content)) {
+                  break;
+                }
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -5405,6 +5414,21 @@ export class ClaudeAcpAgent {
             }
 
             if (session.cancelled) {
+              break;
+            }
+
+            // Synthetic assistant frames carry the CLI's local-command output.
+            // On resume the SDK can replay a stale frame from an earlier compact
+            // attempt after a later compaction completed. Scope suppression to
+            // the compaction lifecycle and the synthetic frame itself rather
+            // than to the owning turn: one model turn may compact more than once,
+            // and its real assistant response must still be delivered.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>" &&
+              compaction.hasDeliveredOutput
+            ) {
               break;
             }
 
