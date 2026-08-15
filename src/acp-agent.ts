@@ -297,6 +297,54 @@ function parseSteerRequest(params: unknown): SteerRequest {
   };
 }
 
+/** Custom (extension) request method a client uses to stop the background
+ *  tasks (sub-agents) a session has dispatched. `session/cancel` aborts the
+ *  turn, but the SDK's background tasks survive it by design — and in the
+ *  settled-dispatch shape there is no turn to cancel at all, so a client's stop
+ *  button is otherwise a no-op while the sub-agents run on invisibly. Same
+ *  ext-method conventions as {@link STEER_METHOD} above; advertised to clients
+ *  via `InitializeResponse._meta.stopTasks.supported`. */
+const STOP_TASKS_METHOD = "_session/stop_tasks";
+
+/** Params of a {@link STOP_TASKS_METHOD} request. With `toolUseIds`, stop the
+ *  live tasks whose spawning Agent/Task tool_use id matches (the card ids a
+ *  client already renders); without it, stop every live `isSubagent` task.
+ *  Background Bash jobs are deliberately spared in the latter case, matching
+ *  the sub-agent discriminator the rest of the registry uses. */
+export type StopTasksRequest = {
+  sessionId: string;
+  toolUseIds?: string[];
+};
+
+/** Result of a {@link STOP_TASKS_METHOD} request, in parent tool_use ids: the
+ *  calls whose task the SDK accepted a stop for (`stopped`) and, when explicit
+ *  `toolUseIds` were requested, those that matched no live task (`notFound`).
+ *  A per-task `stopTask()` failure degrades to `notFound` rather than failing
+ *  the batch. */
+export type StopTasksResponse = {
+  stopped: string[];
+  notFound: string[];
+};
+
+/** Validate raw JSON-RPC params into a {@link StopTasksRequest}. `sessionId` is
+ *  required; `toolUseIds`, if present, must be an array of non-empty strings. */
+function parseStopTasksRequest(params: unknown): StopTasksRequest {
+  if (!params || typeof params !== "object") {
+    throw RequestError.invalidParams(undefined, "stop_tasks params must be an object");
+  }
+  const { sessionId, toolUseIds } = params as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId.length === 0) {
+    throw RequestError.invalidParams(undefined, "stop_tasks params require a non-empty sessionId");
+  }
+  if (
+    toolUseIds !== undefined &&
+    (!Array.isArray(toolUseIds) || toolUseIds.some((t) => typeof t !== "string" || t.length === 0))
+  ) {
+    throw RequestError.invalidParams(undefined, "toolUseIds must be an array of non-empty strings");
+  }
+  return { sessionId, toolUseIds: toolUseIds as string[] | undefined };
+}
+
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
  *  `SessionConfigOption` (category "model"). Retained internally to track the
@@ -1649,6 +1697,12 @@ export class ClaudeAcpAgent {
         steering: {
           supported: true,
         },
+        // Advertises the `_session/stop_tasks` request so clients know they may
+        // stop the background sub-agents a session dispatched (see
+        // STOP_TASKS_METHOD).
+        stopTasks: {
+          supported: true,
+        },
         goal: {
           version: GOAL_EXTENSION_VERSION,
           controlMethod: GOAL_CONTROL_METHOD,
@@ -2123,6 +2177,56 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  /** Stop the background tasks (sub-agents) a session dispatched. See
+   *  {@link parseStopTasksRequest} for the request shape.
+   *
+   *  Reading `liveBackgroundTasks` is safe here: a stoppable task has not
+   *  settled, so its entry is live by definition (the settle paths that would
+   *  delete an entry all fire at settle time). A task that finishes in the
+   *  window between snapshot and stop simply lands in `notFound` — the honest
+   *  answer. The `stopped` notification the SDK emits flows through the normal
+   *  `task_notification` path, so the existing terminal handling closes the
+   *  card. */
+  async stopBackgroundTasks(params: StopTasksRequest): Promise<StopTasksResponse> {
+    const session = this.sessions[params.sessionId];
+    if (!session) {
+      throw new Error("Session not found");
+    }
+    if (session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    // With explicit ids, target the live tasks whose spawning call matches;
+    // without, target every live sub-agent (background Bash is spared — it is
+    // not `isSubagent`, matching the discriminator used across the registry).
+    const only =
+      params.toolUseIds && params.toolUseIds.length > 0 ? new Set(params.toolUseIds) : null;
+    const targets: Array<[string, string]> = [];
+    for (const [taskId, record] of session.liveBackgroundTasks) {
+      const parentId = typeof record.parentToolUseId === "string" ? record.parentToolUseId : "";
+      if (only ? parentId.length > 0 && only.has(parentId) : record.isSubagent) {
+        targets.push([taskId, parentId]);
+      }
+    }
+    const stopped: string[] = [];
+    const matched = new Set<string>();
+    for (const [taskId, parentId] of targets) {
+      try {
+        await session.query.stopTask(taskId);
+        stopped.push(parentId || taskId);
+        if (parentId) {
+          matched.add(parentId);
+        }
+      } catch (error) {
+        // Most likely the task settled between snapshot and stop; the SDK also
+        // rejects unknown ids. Either way it is not stopped BY US — report
+        // rather than fail the batch.
+        this.logger.error(`Session ${params.sessionId}: stopTask(${taskId}) failed: ${error}`);
+      }
+    }
+    const notFound = only ? [...only].filter((id) => !matched.has(id)) : [];
+    return { stopped, notFound };
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
@@ -8479,6 +8583,11 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<StopTasksRequest, StopTasksResponse>(
+      STOP_TASKS_METHOD,
+      { parse: parseStopTasksRequest },
+      (ctx) => agent.stopBackgroundTasks(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,
