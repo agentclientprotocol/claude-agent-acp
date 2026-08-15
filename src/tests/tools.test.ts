@@ -2050,16 +2050,29 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
   it("parses the human-readable TaskList format used in session history", () => {
     expect(
       parseTaskListOutput(
-        "#1 [in_progress] Run tests\n#2 [pending] Write release notes [blocked by #1]",
+        "#1 [in_progress] Run tests (runner)\n#2 [pending] Write release notes [blocked by #1, #3]",
       ),
     ).toEqual({
       tasks: [
-        { id: "1", subject: "Run tests", status: "in_progress", blockedBy: [] },
-        { id: "2", subject: "Write release notes", status: "pending", blockedBy: ["1"] },
+        { id: "1", subject: "Run tests", status: "in_progress", owner: "runner", blockedBy: [] },
+        {
+          id: "2",
+          subject: "Write release notes",
+          status: "pending",
+          blockedBy: ["1", "3"],
+        },
       ],
     });
 
     expect(parseTaskListOutput("No tasks found")).toEqual({ tasks: [] });
+  });
+
+  it("handles adversarial TaskList output in linear time", () => {
+    const subject = `${"work [blocked by #1, ".repeat(20000)}work`;
+
+    expect(parseTaskListOutput(`#1 [pending] ${subject}`)).toEqual({
+      tasks: [{ id: "1", subject, status: "pending", blockedBy: [] }],
+    });
   });
 });
 

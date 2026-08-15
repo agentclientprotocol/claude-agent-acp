@@ -1168,20 +1168,49 @@ export function parseTaskListOutput(content: unknown): TaskListOutput | undefine
     const tasks: TaskListOutput["tasks"] = [];
     const lines = text.trim().split("\n");
     for (const line of lines) {
-      const match =
-        /^#(\S+) \[(pending|in_progress|completed)\] (.+?)(?: \(([^()]*)\))?(?: \[blocked by ((?:#[^,\]]+(?:, )?)+)\])?$/.exec(
-          line,
-        );
+      const match = /^#(\S+) \[(pending|in_progress|completed)\] (.+)$/.exec(line);
       if (!match) {
         tasks.length = 0;
         break;
       }
+
+      let subject = match[3];
+      let owner: string | undefined;
+      let blockedBy: string[] = [];
+
+      const blockedMarker = " [blocked by ";
+      const blockedStart = subject.lastIndexOf(blockedMarker);
+      if (blockedStart > 0 && subject.endsWith("]")) {
+        const dependencies = subject.slice(blockedStart + blockedMarker.length, -1).split(", ");
+        if (
+          dependencies.every(
+            (dependency) =>
+              dependency.length > 1 &&
+              dependency.startsWith("#") &&
+              !dependency.includes(",") &&
+              !dependency.includes("]"),
+          )
+        ) {
+          subject = subject.slice(0, blockedStart);
+          blockedBy = dependencies.map((dependency) => dependency.slice(1));
+        }
+      }
+
+      const ownerStart = subject.lastIndexOf(" (");
+      if (ownerStart > 0 && subject.endsWith(")")) {
+        const candidate = subject.slice(ownerStart + 2, -1);
+        if (!candidate.includes("(") && !candidate.includes(")")) {
+          subject = subject.slice(0, ownerStart);
+          owner = candidate || undefined;
+        }
+      }
+
       tasks.push({
         id: match[1],
-        subject: match[3],
+        subject,
         status: match[2] as TaskListOutput["tasks"][number]["status"],
-        ...(match[4] ? { owner: match[4] } : {}),
-        blockedBy: match[5] ? match[5].split(", ").map((id) => id.slice(1)) : [],
+        ...(owner ? { owner } : {}),
+        blockedBy,
       });
     }
     if (tasks.length > 0) return { tasks };
