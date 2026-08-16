@@ -887,4 +887,77 @@ describe("createSession options merging", () => {
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("client exploded"));
     });
   });
+
+  describe("_meta.sessionTitle", () => {
+    function createSessionWith(_meta: unknown, creationOpts?: object) {
+      return (
+        agent as unknown as {
+          createSession: (params: object, opts?: object) => Promise<{ sessionId: string }>;
+        }
+      ).createSession({ cwd: process.cwd(), mcpServers: [], _meta }, creationOpts);
+    }
+
+    it("forwards a client-supplied session title to the SDK, sanitized", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { sessionTitle: "  Fix\nthe   login   bug  " },
+      });
+
+      expect(capturedOptions!.title).toBe("Fix the login bug");
+    });
+
+    it("truncates an over-long session title to the adapter's title limit", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { sessionTitle: "x".repeat(300) },
+      });
+
+      expect(capturedOptions!.title).toBe("x".repeat(255) + "…");
+    });
+
+    it.each([
+      ["absent", {}],
+      ["null", { sessionTitle: null }],
+      ["a number", { sessionTitle: 42 }],
+      ["an object", { sessionTitle: { text: "nope" } }],
+      ["blank", { sessionTitle: "   \n  " }],
+    ])("omits the title when sessionTitle is %s", async (_label, _meta) => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [], _meta });
+
+      expect(capturedOptions!.title).toBeUndefined();
+    });
+
+    it("lets the SDK-shaped claudeCode.options.title win over sessionTitle", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          sessionTitle: "harness-neutral title",
+          claudeCode: { options: { title: "sdk-shaped title" } },
+        },
+      });
+
+      expect(capturedOptions!.title).toBe("sdk-shaped title");
+    });
+
+    it("omits the title when resuming an existing session", async () => {
+      await createSessionWith(
+        { sessionTitle: "Resumed title" },
+        { resume: "session-title-resume" },
+      );
+
+      expect(capturedOptions!.title).toBeUndefined();
+    });
+
+    it("forwards the title when forking, which creates a new session", async () => {
+      await createSessionWith(
+        { sessionTitle: "Forked title" },
+        { resume: "session-title-fork", forkSession: true },
+      );
+
+      expect(capturedOptions!.title).toBe("Forked title");
+    });
+  });
 });
