@@ -6614,10 +6614,20 @@ function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderC
 }
 
 /**
+ * Placeholder credential used when a gateway supplies the real one through
+ * `ANTHROPIC_CUSTOM_HEADERS`. Some value must be present so the CLI skips its
+ * normal login check, and it must not be blank: Claude Code trims the token
+ * before testing it for emptiness (since claude-agent-sdk 0.3.221), so a
+ * whitespace-only placeholder counts as "no credential" and the CLI falls back
+ * to its own OAuth flow, which the client then retries forever.
+ */
+const GATEWAY_PLACEHOLDER_TOKEN = "gateway-placeholder";
+
+/**
  * Map a resolved provider config into the Claude Code env vars that redirect API
  * traffic and inject headers. Returns an empty object when routing is
- * unconfigured. The token/bypass placeholders (`" "`) are required so the CLI
- * skips its normal login/credential checks when a gateway is in use.
+ * unconfigured. The token/bypass placeholders are required so the CLI skips its
+ * normal login/credential checks when a gateway is in use.
  */
 function createEnvForProvider(config: ProviderConfig | null): Record<string, string> {
   if (!config) {
@@ -6651,7 +6661,7 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   return {
     ANTHROPIC_BASE_URL: config.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: " ", // Must be specified to bypass claude login requirement
+    ANTHROPIC_AUTH_TOKEN: GATEWAY_PLACEHOLDER_TOKEN, // Must be non-blank to bypass claude login requirement
   };
 }
 

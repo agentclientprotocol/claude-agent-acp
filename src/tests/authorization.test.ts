@@ -125,7 +125,7 @@ describe("authorization", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: " ",
+            ANTHROPIC_AUTH_TOKEN: "gateway-placeholder",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
             userEnv: "userEnv",
@@ -133,6 +133,29 @@ describe("authorization", () => {
         }),
       }),
     );
+  });
+
+  it("uses a non-blank placeholder token for the gateway", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        auth: { terminal: true, _meta: { gateway: true } },
+      } as any,
+    });
+
+    await agent.authenticate({
+      methodId: "gateway",
+      _meta: { gateway: { baseUrl: "https://gateway.example", headers: { "x-api-key": "test" } } },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    // A whitespace-only token is trimmed away by the CLI, which then falls back
+    // to its own login flow instead of the gateway.
+    const env = mockQuery.mock.calls[0][0].options.env;
+    expect(env.ANTHROPIC_AUTH_TOKEN.trim()).not.toBe("");
   });
 
   it("uses gateway env after gateway auth", async () => {
