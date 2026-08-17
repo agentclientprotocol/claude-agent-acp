@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.70.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.69.0...v0.70.0) (2026-08-17)
+
+
+### Features
+
+* switch providers for loaded Claude sessions ([#1002](https://github.com/agentclientprotocol/claude-agent-acp/issues/1002)) ([50a9543](https://github.com/agentclientprotocol/claude-agent-acp/commit/50a95434e94318456f2d07c3d21aaf3595c3407d))
+
 ## [0.69.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.68.0...v0.69.0) (2026-08-16)
 
 
