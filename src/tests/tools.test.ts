@@ -939,6 +939,7 @@ describe("Bash terminal output", () => {
       // terminal_info and terminal_output should NOT be on the exit notification
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_info");
       expect((exitUpdate as any)._meta).not.toHaveProperty("terminal_output");
+      expect(exitUpdate).not.toHaveProperty("rawOutput");
     });
 
     it("should not include terminal _meta when client does not declare terminal_output support", () => {
@@ -961,6 +962,7 @@ describe("Bash terminal output", () => {
       expect((update as any)._meta).not.toHaveProperty("terminal_info");
       expect((update as any)._meta).not.toHaveProperty("terminal_output");
       expect((update as any)._meta).not.toHaveProperty("terminal_exit");
+      expect(update).toHaveProperty("rawOutput", bashResult);
     });
 
     it("should not include terminal _meta when _meta.terminal_output is false", () => {
@@ -1683,7 +1685,7 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     const info = toolInfoFromToolUse(toolUse, false);
 
     expect(info.kind).toBe("switch_mode");
-    expect(info.title).toBe("Ready to code?");
+    expect(info.title).toBe("Plan");
     expect(info.content).toHaveLength(1);
     expect(info.content![0]).toEqual({
       type: "content",
@@ -1730,6 +1732,16 @@ describe("toolInfoFromToolUse - undefined input regression", () => {
     const toolUse = { name: "WebSearch", id: "toolu_ws_undef", input: undefined };
     const info = toolInfoFromToolUse(toolUse, false);
     expect(info.title).toBe("Web search");
+  });
+
+  it("shows a WebSearch query in the tool title", () => {
+    const toolUse = {
+      name: "WebSearch",
+      id: "toolu_ws_query",
+      input: { query: "Agent Client Protocol ACP specification subagents v2" },
+    };
+    const info = toolInfoFromToolUse(toolUse, false);
+    expect(info.title).toBe('Search "Agent Client Protocol ACP specification subagents v2"');
   });
 
   it("TodoWrite with undefined input should not throw", () => {
@@ -2733,6 +2745,62 @@ describe("tool_result_meta non-execution stamping", () => {
     is_error: true,
     content: "The user doesn't want to proceed with this tool use.",
   };
+
+  it("removes Claude's outer fence from a rejected ExitPlanMode explanation only", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_plan: {
+        type: "tool_use",
+        id: "toolu_plan",
+        name: "ExitPlanMode",
+        input: { plan: "Implement it" },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          is_error: true,
+          content: "```\nThe user chose to keep planning.\n```",
+        },
+      ] as any,
+      "user",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { toolResultMeta: [{ id: "toolu_plan", non_execution_kind: "user-rejected" }] },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_plan",
+      status: "failed",
+      rawOutput: "The user chose to keep planning.",
+    });
+  });
+
+  it("preserves fenced output from tools other than ExitPlanMode", () => {
+    const fenced = "```text\ncommand output\n```";
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bash",
+          content: fenced,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_bash: bashToolUse },
+      mockClient,
+      mockLogger,
+    );
+
+    expect(notifications[0].update).toMatchObject({ rawOutput: fenced });
+  });
 
   it("stamps nonExecutionKind and userFeedback on the failed tool_call_update", () => {
     const toolUseCache: ToolUseCache = { toolu_bash: bashToolUse };

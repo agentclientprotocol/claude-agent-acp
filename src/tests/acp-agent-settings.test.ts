@@ -94,7 +94,7 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(getCapturedOptions().permissionMode).toBe("dontAsk");
     expect(getCapturedOptions().settingSources).toEqual(["user", "project", "local"]);
-    expect(response.modes.currentModeId).toBe("dontAsk");
+    expect(response.modes.currentModeId).toBe("default");
   });
 
   it("supports acceptEdits mode defaults", async () => {
@@ -277,9 +277,8 @@ describe("ClaudeAcpAgent settings", () => {
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
       expect(modeIds).not.toContain("auto");
-      expect(modeIds).toEqual(
-        expect.arrayContaining(["default", "acceptEdits", "plan", "dontAsk"]),
-      );
+      expect(modeIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan"]));
+      expect(modeIds).not.toContain("dontAsk");
     });
 
     it("includes `auto` when the resolved model has supportsAutoMode: true", async () => {
@@ -305,7 +304,37 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
-      expect(modeIds).toContain("auto");
+      expect(response.modes.availableModes.slice(0, 4)).toEqual([
+        {
+          id: "default",
+          name: "Manual",
+          description: "Always ask before making changes",
+        },
+        {
+          id: "acceptEdits",
+          name: "Accept edits",
+          description: "Automatically accept all file edits",
+        },
+        {
+          id: "plan",
+          name: "Plan",
+          description: "Create a plan before making changes",
+        },
+        {
+          id: "auto",
+          name: "Auto",
+          description: "Claude handles permission decisions",
+        },
+      ]);
+      const bypass = response.modes.availableModes[4];
+      if (bypass) {
+        expect(bypass).toEqual({
+          id: "bypassPermissions",
+          name: "Bypass permissions",
+          description: "Accepts all permissions",
+        });
+      }
+      expect(modeIds).not.toContain("dontAsk");
     });
 
     it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {

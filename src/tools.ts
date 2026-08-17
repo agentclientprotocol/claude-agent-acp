@@ -349,18 +349,9 @@ export function toolInfoFromToolUse(
 
     case "WebSearch": {
       const input = toolUse.input as WebSearchInput | undefined;
-      let label = input?.query ? `"${input.query}"` : "Web search";
-
-      if (input?.allowed_domains && input.allowed_domains.length > 0) {
-        label += ` (allowed: ${input.allowed_domains.join(", ")})`;
-      }
-
-      if (input?.blocked_domains && input.blocked_domains.length > 0) {
-        label += ` (blocked: ${input.blocked_domains.join(", ")})`;
-      }
 
       return {
-        title: label,
+        title: input?.query ? `Search "${input.query}"` : "Web search",
         kind: "fetch",
         content: [],
       };
@@ -433,7 +424,7 @@ export function toolInfoFromToolUse(
     case "ExitPlanMode": {
       const planInput = toolUse.input as { plan?: string } | undefined;
       return {
-        title: "Ready to code?",
+        title: "Plan",
         kind: "switch_mode",
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]
