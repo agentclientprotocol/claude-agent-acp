@@ -76,7 +76,6 @@ if (process.argv.includes("--cli")) {
         };
         return {
           log: (...args: unknown[]) => {
-            console.error(...args);
             const first = args[0];
             if (
               typeof first === "string" &&
