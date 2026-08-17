@@ -136,6 +136,21 @@ import {
   supportsAirSessionFailures,
 } from "./session-failure-extension.js";
 import {
+  AGENT_FILE_CHANGE_REPORT_CAPABILITY,
+  agentFileChangeReportMeta,
+  agentFileChangeReportRequestId,
+  containsFileChangeAuditMarker,
+  createFileChangeAuditSupport,
+  createFileChangeAuditTurnState,
+  FILE_CHANGE_AUDIT_SERVER_NAME,
+  type FileChangeAuditSupport,
+  type FileChangeAuditTurnState,
+  type FileChangeReportUnavailableReason,
+  isFileChangeAuditReportPhase,
+  isFileChangeAuditTool,
+  supportsAgentFileChangeReport,
+} from "./file-change-audit.js";
+import {
   applyTaskCreate,
   applyTaskList,
   applyTaskUpdate,
@@ -319,6 +334,10 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Optional hidden, model-authored file-change audit requested by the ACP
+   *  client for this turn. The state is turn-owned so a late tool call can
+   *  never be rebound to a newer prompt. */
+  fileChangeAudit?: FileChangeAuditTurnState;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
@@ -427,6 +446,14 @@ type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
+  /** Request ids already accepted for hidden agent file-change reports. Kept
+   *  for the session lifetime so a redelivered prompt cannot publish the same
+   *  audit twice or bind a late report to another turn. */
+  fileChangeReportRequestIds: Set<string>;
+  /** Session-owned publisher for negotiated file-change audits. Turn state
+   *  stays on each Turn; this controller supplies the single idempotent
+   *  unavailable terminal used by every non-report settlement path. */
+  fileChangeAuditSupport?: FileChangeAuditSupport;
   /** Optimistic goal state published for a submitted `/goal` command whose
    *  matching runtime update has not arrived yet. Runtime updates for the old
    *  goal are suppressed until this command is echoed or completes, otherwise
@@ -1645,7 +1672,7 @@ export class ClaudeAcpAgent {
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
       _meta: {
-        ...airSessionFailureCapabilityMeta(),
+        ...airSessionFailureCapabilityMeta(AGENT_FILE_CHANGE_REPORT_CAPABILITY),
         steering: {
           supported: true,
         },
@@ -1939,6 +1966,18 @@ export class ClaudeAcpAgent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
+    const fileChangeReportRequestId = supportsAgentFileChangeReport(this.clientCapabilities)
+      ? agentFileChangeReportRequestId(params._meta)
+      : undefined;
+    let fileChangeAudit: FileChangeAuditTurnState | undefined;
+    if (
+      fileChangeReportRequestId &&
+      !session.fileChangeReportRequestIds.has(fileChangeReportRequestId)
+    ) {
+      session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
+      fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
+    }
+
     // Each prompt is a Turn whose deferred the persistent consumer settles once
     // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
     // turn, pushes the user message onto the streaming input, makes sure the
@@ -1946,6 +1985,7 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
+      ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
       resolve: () => {},
       reject: () => {},
@@ -2125,6 +2165,19 @@ export class ClaudeAcpAgent {
     return { outcome: "injected" };
   }
 
+  /** Publish the audit terminal for every turn path that did not reach the
+   *  report tool. The support flips the turn state synchronously before its
+   *  transport await, so callers can stay fail-open and settle the ACP prompt
+   *  immediately without allowing a racing lifecycle path to publish twice. */
+  private finishFileChangeAudit(
+    session: Session,
+    turn: Turn,
+    reason: FileChangeReportUnavailableReason,
+  ): void {
+    if (!turn.fileChangeAudit || !session.fileChangeAuditSupport) return;
+    void session.fileChangeAuditSupport.finishUnavailable(turn.fileChangeAudit, reason);
+  }
+
   /** Lazily start the per-session consumer that drains the SDK query stream for
    *  the session's whole life. Idempotent: only the first `prompt()` starts it. */
   private ensureConsumer(session: Session, sessionId: string): void {
@@ -2207,6 +2260,16 @@ export class ClaudeAcpAgent {
      *  as the turn's answer. */
     const sendUpdate = async (notification: SessionNotification) => {
       const { update } = notification;
+      if (
+        isFileChangeAuditReportPhase(session.activeTurn?.fileChangeAudit) &&
+        (update.sessionUpdate === "agent_message_chunk" ||
+          update.sessionUpdate === "agent_thought_chunk" ||
+          update.sessionUpdate === "user_message_chunk" ||
+          update.sessionUpdate === "tool_call" ||
+          update.sessionUpdate === "tool_call_update")
+      ) {
+        return;
+      }
       if (update.sessionUpdate === "agent_message_chunk") {
         const claudeMeta = update._meta?.claudeCode as
           { parentToolUseId?: string | null } | undefined;
@@ -2539,11 +2602,17 @@ export class ClaudeAcpAgent {
 
     /** Settle the active turn's deferred exactly once, disarm the force-cancel
      *  backstop (the turn is over), and drop it from the queue. */
-    const settleActive = (result: PromptResponse) => {
+    const settleActive = (
+      result: PromptResponse,
+      auditReason: FileChangeReportUnavailableReason = result.stopReason === "cancelled"
+        ? "cancelled"
+        : "notReported",
+    ) => {
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
         return;
       }
+      this.finishFileChangeAudit(session, turn, auditReason);
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
@@ -2580,6 +2649,7 @@ export class ClaudeAcpAgent {
         );
         return;
       }
+      this.finishFileChangeAudit(session, turn, "providerError");
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -2617,11 +2687,14 @@ export class ClaudeAcpAgent {
         return;
       }
       sessionFailures.recordActive(failure);
-      settleActive({
-        stopReason: "end_turn",
-        usage: sessionUsage(session),
-        _meta: sessionFailureMeta(failure),
-      });
+      settleActive(
+        {
+          stopReason: "end_turn",
+          usage: sessionUsage(session),
+          _meta: sessionFailureMeta(failure),
+        },
+        "providerError",
+      );
     };
 
     /** Reject every in-flight turn — used when the stream dies. */
@@ -2634,6 +2707,7 @@ export class ClaudeAcpAgent {
       session.turnQueue = [];
       for (const turn of turns) {
         if (!turn.settled) {
+          this.finishFileChangeAudit(session, turn, "providerError");
           const wasHeld = isHeldOpen(turn);
           turn.settled = true;
           if (wasHeld) {
@@ -2789,6 +2863,7 @@ export class ClaudeAcpAgent {
           // still here was enqueued afterward and was not part of the cancel.)
           for (const queued of [...(session.turnQueue ?? [])]) {
             if (!queued.settled) {
+              this.finishFileChangeAudit(session, queued, "providerError");
               queued.settled = true;
               queued.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
             }
@@ -4634,6 +4709,7 @@ export class ClaudeAcpAgent {
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
+          this.finishFileChangeAudit(session, turn, "cancelled");
           turn.settled = true;
           // Deliberately no `usage`: a queued turn never ran, so the session
           // accumulator (the active turn's tally) is not its spend.
@@ -4702,6 +4778,7 @@ export class ClaudeAcpAgent {
     {
       const active = session.activeTurn;
       if (isHeldOpen(active)) {
+        this.finishFileChangeAudit(session, active, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -5073,6 +5150,13 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
+    // Stop-hook additionalContext is persisted as an internal user message.
+    // Once that marker (or the internal tool itself) appears, suppress the
+    // whole audit exchange until its tool result. This also hides a disobedient
+    // model's separate prose message, while an ordinary next user prompt safely
+    // ends an incomplete audit lane.
+    let replayingFileChangeAudit = false;
+    const replayFileChangeAuditToolUseIds = new Set<string>();
 
     for (const message of messages) {
       if (
@@ -5133,6 +5217,66 @@ export class ClaudeAcpAgent {
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
         if (content === null) continue;
+      }
+
+      const auditBlocks = Array.isArray(content)
+        ? content.filter(
+            (block): block is Record<string, unknown> =>
+              typeof block === "object" && block !== null,
+          )
+        : [];
+      const hasFileChangeAuditMarker =
+        (typeof content === "string" && containsFileChangeAuditMarker(content)) ||
+        auditBlocks.some(
+          (block) => typeof block.text === "string" && containsFileChangeAuditMarker(block.text),
+        );
+      const fileChangeAuditToolUseIds = auditBlocks.flatMap((block) =>
+        (block.type === "tool_use" ||
+          block.type === "server_tool_use" ||
+          block.type === "mcp_tool_use") &&
+        typeof block.name === "string" &&
+        isFileChangeAuditTool(block.name) &&
+        typeof block.id === "string"
+          ? [block.id]
+          : [],
+      );
+      const replayMessageRole = (message as unknown as { message?: { role?: unknown } }).message
+        ?.role;
+      if (hasFileChangeAuditMarker || fileChangeAuditToolUseIds.length > 0) {
+        replayingFileChangeAudit = true;
+        for (const toolUseId of fileChangeAuditToolUseIds) {
+          replayFileChangeAuditToolUseIds.add(toolUseId);
+        }
+        continue;
+      }
+      if (replayingFileChangeAudit) {
+        const toolResultIds = auditBlocks.flatMap((block) =>
+          (block.type === "tool_result" || block.type === "mcp_tool_result") &&
+          typeof block.tool_use_id === "string"
+            ? [block.tool_use_id]
+            : [],
+        );
+        let completedReport = false;
+        for (const toolUseId of toolResultIds) {
+          if (replayFileChangeAuditToolUseIds.delete(toolUseId)) completedReport = true;
+        }
+        if (completedReport && replayFileChangeAuditToolUseIds.size === 0) {
+          replayingFileChangeAudit = false;
+          continue;
+        }
+        // A denied attempt to call another tool is still part of the hidden
+        // lane. Its result must not end replay suppression before the report.
+        if (toolResultIds.length > 0) {
+          continue;
+        }
+        // The next real user prompt is already represented by the client and
+        // starts a new turn; do not let a missing audit result hide it or the
+        // rest of the replay.
+        if (replayMessageRole === "user") {
+          replayingFileChangeAudit = false;
+        } else {
+          continue;
+        }
       }
 
       for (const notification of toAcpNotifications(
@@ -5262,6 +5406,27 @@ export class ClaudeAcpAgent {
         return {
           behavior: "deny",
           message: "Session not found",
+        };
+      }
+
+      const fileChangeAudit = session.activeTurn?.fileChangeAudit;
+      if (isFileChangeAuditReportPhase(fileChangeAudit)) {
+        // The hidden continuation is an audit-only lane: it may submit the
+        // wrapper-owned report, but it must not run another command after the
+        // user-visible answer has already completed.
+        if (isFileChangeAuditTool(toolName) && fileChangeAudit?.phase === "collecting") {
+          return { behavior: "allow", updatedInput: toolInput };
+        }
+        return {
+          behavior: "deny",
+          message: "Only the internal file-change report is allowed during the audit.",
+        };
+      }
+      // The tool is intentionally unusable outside a negotiated audit turn.
+      if (isFileChangeAuditTool(toolName)) {
+        return {
+          behavior: "deny",
+          message: "No file-change report was requested for this turn.",
         };
       }
 
@@ -6109,6 +6274,33 @@ export class ClaudeAcpAgent {
     // the same Map that the streaming message handler will read from.
     const taskState: TaskState = new Map();
 
+    // Resolve every workspace root once. The hidden report tool uses this same
+    // set for lexical path validation, and the SDK receives it below.
+    const acpAdditionalDirectories =
+      params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
+    const additionalDirectories = [
+      ...(userProvidedOptions?.additionalDirectories ?? []),
+      ...acpAdditionalDirectories,
+    ];
+
+    const fileChangeAuditSupport = supportsAgentFileChangeReport(this.clientCapabilities)
+      ? createFileChangeAuditSupport({
+          cwd: params.cwd,
+          additionalDirectories,
+          getActiveState: () => this.sessions[sessionId]?.activeTurn?.fileChangeAudit,
+          publish: async (result) => {
+            await this.client.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "session_info_update",
+                _meta: agentFileChangeReportMeta(result),
+              },
+            });
+          },
+          logError: (message) => this.logger.error(message),
+        })
+      : undefined;
+
     // The exact env the query will be created with. Built (and the provider
     // cache key derived from it, below) in one place so the key always
     // describes the backend this query actually talks to: `providers/set`,
@@ -6153,7 +6345,13 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       includePartialMessages: true,
       forwardSubagentText,
-      mcpServers: { ...(userProvidedOptions?.mcpServers || {}), ...mcpServers },
+      mcpServers: {
+        ...(userProvidedOptions?.mcpServers || {}),
+        ...mcpServers,
+        ...(fileChangeAuditSupport
+          ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
+          : {}),
+      },
       // If we want bypassPermissions to be an option, we have to allow it here.
       // But it doesn't work in root mode, so we only activate it if it will work.
       allowDangerouslySkipPermissions: ALLOW_BYPASS,
@@ -6187,6 +6385,14 @@ export class ClaudeAcpAgent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
+        ...(fileChangeAuditSupport
+          ? {
+              PreToolUse: [
+                ...(userProvidedOptions?.hooks?.PreToolUse || []),
+                { hooks: [fileChangeAuditSupport.preToolUseHook] },
+              ],
+            }
+          : {}),
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -6206,6 +6412,14 @@ export class ClaudeAcpAgent {
             ],
           },
         ],
+        ...(fileChangeAuditSupport
+          ? {
+              Stop: [
+                ...(userProvidedOptions?.hooks?.Stop || []),
+                { hooks: [fileChangeAuditSupport.stopHook] },
+              ],
+            }
+          : {}),
         TaskCreated: [
           ...(userProvidedOptions?.hooks?.TaskCreated || []),
           {
@@ -6237,12 +6451,7 @@ export class ClaudeAcpAgent {
     // legacy `_meta.additionalRoots` extension for clients that haven't been
     // updated yet. Either source is merged with directories supplied via
     // `_meta.claudeCode.options.additionalDirectories` (SDK pass-through).
-    const acpAdditionalDirectories =
-      params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
-    options.additionalDirectories = [
-      ...(userProvidedOptions?.additionalDirectories ?? []),
-      ...acpAdditionalDirectories,
-    ];
+    options.additionalDirectories = additionalDirectories;
 
     if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
       // Set our own session id if not resuming an existing session.
@@ -6502,6 +6711,8 @@ export class ClaudeAcpAgent {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: createSessionFailureState(),
+      fileChangeReportRequestIds: new Set(),
+      fileChangeAuditSupport,
     };
 
     return {
@@ -7657,7 +7868,7 @@ function isTaskTool(toolName: string): boolean {
  *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
-  return toolName !== "TodoWrite" && !isTaskTool(toolName);
+  return toolName !== "TodoWrite" && !isTaskTool(toolName) && !isFileChangeAuditTool(toolName);
 }
 
 /** Build the Claude Code-specific metadata for a tool call. Bash descriptions
@@ -7878,7 +8089,7 @@ export function toAcpNotifications(
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
-    if (content.length === 0) {
+    if (content.length === 0 || containsFileChangeAuditMarker(content)) {
       return [];
     }
     const update: SessionNotification["update"] = {
@@ -7917,6 +8128,16 @@ export function toAcpNotifications(
   // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
   // messages need no single-block guard.
   const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
+  // A report-phase assistant message may contain a short text preface and the
+  // internal tool call in the same content array. Hide the whole message, not
+  // only the tool block, so it stays absent on session replay as well as live.
+  const containsFileChangeAuditToolUse = content.some(
+    (chunk) =>
+      (chunk.type === "tool_use" ||
+        chunk.type === "server_tool_use" ||
+        chunk.type === "mcp_tool_use") &&
+      isFileChangeAuditTool(chunk.name),
+  );
 
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
@@ -7925,7 +8146,11 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta": {
-        if (chunk.text) {
+        if (
+          chunk.text &&
+          !containsFileChangeAuditToolUse &&
+          !containsFileChangeAuditMarker(chunk.text)
+        ) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
@@ -7937,21 +8162,22 @@ export function toAcpNotifications(
         break;
       }
       case "image":
-        update = {
-          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-          content: {
-            type: "image",
-            data: chunk.source.type === "base64" ? chunk.source.data : "",
-            mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
-            uri: chunk.source.type === "url" ? chunk.source.url : undefined,
-          },
-        };
+        if (!containsFileChangeAuditToolUse)
+          update = {
+            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+            content: {
+              type: "image",
+              data: chunk.source.type === "base64" ? chunk.source.data : "",
+              mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
+              uri: chunk.source.type === "url" ? chunk.source.url : undefined,
+            },
+          };
         break;
       case "thinking":
       case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking) {
+        if (chunk.thinking && !containsFileChangeAuditToolUse) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
@@ -7967,7 +8193,10 @@ export function toAcpNotifications(
       case "mcp_tool_use": {
         const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
-        if (chunk.name === "TodoWrite") {
+        if (isFileChangeAuditTool(chunk.name)) {
+          // Wrapper-owned audit protocol: never surface or register generic
+          // PostToolUse callbacks for the internal tool.
+        } else if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
             update = {
@@ -8099,6 +8328,11 @@ export function toAcpNotifications(
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
+          break;
+        }
+
+        if (isFileChangeAuditTool(toolUse.name)) {
+          delete toolUseCache[chunk.tool_use_id];
           break;
         }
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.69.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.68.0...v0.69.0) (2026-08-16)
+
+
+### Features
+
+* report changed files to AIR ([#1001](https://github.com/agentclientprotocol/claude-agent-acp/issues/1001)) ([450d6b1](https://github.com/agentclientprotocol/claude-agent-acp/commit/450d6b19dc46a041128356a6fa3cfa3ce6a5a382))
+
 ## [0.68.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.67.0...v0.68.0) (2026-08-14)
 
 
