@@ -76,7 +76,10 @@ if (process.argv.includes("--cli")) {
         };
         return {
           log: writeLog,
-          error: (...args: unknown[]) => console.error(...args),
+          error: (...args: unknown[]) => {
+            console.error(...args);
+            writeLog(...args);
+          },
         };
       })()
     : undefined;
