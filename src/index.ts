@@ -68,26 +68,14 @@ if (process.argv.includes("--cli")) {
     ? (() => {
         mkdirSync(logDirectory, { recursive: true });
         const logFile = join(logDirectory, "agent.log");
-        const writeRoute = (...args: unknown[]) => {
+        const writeLog = (...args: unknown[]) => {
           const rendered = args
             .map((arg) => (arg instanceof Error ? (arg.stack ?? arg.message) : String(arg)))
             .join(" ");
           appendFileSync(logFile, `${new Date().toISOString()} pid=${process.pid} ${rendered}\n`);
         };
         return {
-          log: (...args: unknown[]) => {
-            const first = args[0];
-            if (
-              typeof first === "string" &&
-              (first === "Claude ACP started" ||
-                first.startsWith("[providers/") ||
-                first.startsWith("[session/query]") ||
-                first.startsWith("Waiting for ") ||
-                first.startsWith("Recreating Claude session "))
-            ) {
-              writeRoute(...args);
-            }
-          },
+          log: writeLog,
           error: (...args: unknown[]) => console.error(...args),
         };
       })()
