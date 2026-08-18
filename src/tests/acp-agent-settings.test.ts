@@ -253,7 +253,7 @@ describe("ClaudeAcpAgent settings", () => {
       };
     }
 
-    it("omits `auto` from availableModes when the resolved model lacks supportsAutoMode", async () => {
+    it("advertises `auto` when the resolved model lacks supportsAutoMode", async () => {
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
 
@@ -276,8 +276,7 @@ describe("ClaudeAcpAgent settings", () => {
       });
 
       const modeIds: string[] = response.modes.availableModes.map((m: any) => m.id);
-      expect(modeIds).not.toContain("auto");
-      expect(modeIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan"]));
+      expect(modeIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]));
       expect(modeIds).not.toContain("dontAsk");
     });
 
@@ -309,21 +308,25 @@ describe("ClaudeAcpAgent settings", () => {
           id: "default",
           name: "Manual",
           description: "Always ask before making changes",
+          _meta: { kind: "standard" },
         },
         {
           id: "acceptEdits",
           name: "Accept edits",
           description: "Automatically accept all file edits",
+          _meta: { kind: "standard" },
         },
         {
           id: "plan",
           name: "Plan",
           description: "Create a plan before making changes",
+          _meta: { kind: "plan" },
         },
         {
           id: "auto",
           name: "Auto",
           description: "Claude handles permission decisions",
+          _meta: { kind: "auto_review" },
         },
       ]);
       const bypass = response.modes.availableModes[4];
@@ -332,12 +335,13 @@ describe("ClaudeAcpAgent settings", () => {
           id: "bypassPermissions",
           name: "Bypass permissions",
           description: "Accepts all permissions",
+          _meta: { kind: "full_access" },
         });
       }
       expect(modeIds).not.toContain("dontAsk");
     });
 
-    it("clamps permissions.defaultMode='auto' to 'default' on a model that lacks supportsAutoMode", async () => {
+    it("falls back permissions.defaultMode='auto' to Accept edits on an unsupported model", async () => {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
         JSON.stringify({ permissions: { defaultMode: "auto" } }),
@@ -371,9 +375,11 @@ describe("ClaudeAcpAgent settings", () => {
         // carries the user-typed value; the SDK was synced via
         // setPermissionMode after we discovered the model can't honor it.
         expect(getCapturedOptions().permissionMode).toBe("auto");
-        expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
-        expect(response.modes.currentModeId).toBe("default");
-        expect(response.modes.availableModes.map((m: any) => m.id)).not.toContain("auto");
+        expect(setPermissionModeSpy).toHaveBeenCalledWith("acceptEdits");
+        expect(response.modes.currentModeId).toBe("acceptEdits");
+        expect(response.modes.availableModes.map((m: any) => m.id)).toContain("auto");
+        const session = (agent as any).sessions[response.sessionId];
+        expect(session.autoModeFallbackWarningPending).toBe(true);
 
         // A descriptive warning was logged so operators see the clamp.
         const messages = errorSpy.mock.calls.map((c) => c.join(" "));
