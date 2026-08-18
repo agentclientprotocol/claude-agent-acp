@@ -130,6 +130,14 @@ export function buildFallbackPermissionOptions(
   context: PermissionOptionContext,
 ): PermissionOption[] {
   const toolLabel = plainString(context.displayName) ?? context.toolName;
+  if (context.toolName.startsWith("mcp__")) {
+    const changeSet =
+      context.allowPersistentOptions === false ? undefined : context.durableChangeSet;
+    return withOptionalUpdate(
+      changeSet,
+      changeSet ? `Yes, and don't ask again for ${toolLabel} commands` : undefined,
+    );
+  }
   if (context.allowPersistentOptions !== false) {
     return withGeneratedUpdate(`Yes, and don't ask again for ${toolLabel} commands`);
   }
@@ -167,8 +175,9 @@ export function buildComputerUseMcpPermissionOptions(
   context: PermissionOptionContext,
 ): PermissionOption[] {
   const toolLabel = plainString(context.displayName) ?? context.toolName;
-  if (context.allowPersistentOptions !== false) {
-    return withGeneratedUpdate(`Yes, and don't ask again for ${toolLabel}`);
-  }
-  return [allowOnce(), reject("No")];
+  const changeSet = context.allowPersistentOptions === false ? undefined : context.durableChangeSet;
+  return withOptionalUpdate(
+    changeSet,
+    changeSet ? `Yes, and don't ask again for ${toolLabel}` : undefined,
+  );
 }

@@ -150,6 +150,8 @@ describe("Claude permission options and response mapping", () => {
     "Grep",
     "WebFetch",
     "SandboxNetworkAccess",
+    "mcp__example__write_tool",
+    "mcp__computer-use__click",
   ])("offers only one-time allow and reject for %s without a representable update", (toolName) => {
     expect(build(toolName).map((option) => option.name)).toEqual(["Yes", "No"]);
   });
@@ -162,9 +164,33 @@ describe("Claude permission options and response mapping", () => {
     expect(build("WebFetch", bashChangeSet, { url: "https://example.com" })[1]?.name).toBe(
       "Yes, and don't ask again for example.com",
     );
-    expect(build("mcp__demo__deploy", bashChangeSet)[1]?.name).toBe(
-      "Yes, and don't ask again for mcp__demo__deploy commands",
+  });
+
+  it("preserves an MCP tool's exact provider suggestion", () => {
+    const toolName = "mcp__example__write_tool";
+    const changeSet = normalizeDurablePermissionChangeSet([
+      {
+        type: "addRules",
+        rules: [{ toolName }],
+        behavior: "allow",
+        destination: "localSettings",
+      },
+    ]);
+    const offered = build(toolName, changeSet, {}, "Write tool");
+    expect(offered.map((option) => option.name)).toEqual([
+      "Yes",
+      "Yes, and don't ask again for Write tool commands",
+      "No",
+    ]);
+    const result = mapClaudePermissionResponse(
+      { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowWithUpdates } },
+      toolName,
+      { value: "new" },
+      "tool-mcp-write",
+      offered,
+      changeSet,
     );
+    expect(result.behavior === "allow" && result.updatedPermissions).toEqual(changeSet?.updates);
   });
 
   it.each([

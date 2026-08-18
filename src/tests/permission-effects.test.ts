@@ -47,7 +47,7 @@ describe("Claude permission response effects", () => {
     ]);
   });
 
-  it("applies generated WebFetch and fallback durable effects", () => {
+  it("applies a generated WebFetch effect and an exact MCP provider effect", () => {
     const webInput = { url: "https://example.com/path" };
     const web = mapClaudePermissionResponse(
       {
@@ -70,6 +70,14 @@ describe("Claude permission response effects", () => {
       },
     ]);
 
+    const mcpChangeSet = normalizeDurablePermissionChangeSet([
+      {
+        type: "addRules",
+        rules: [{ toolName: "mcp__demo__deploy" }],
+        behavior: "allow",
+        destination: "localSettings",
+      },
+    ]);
     const fallback = mapClaudePermissionResponse(
       {
         outcome: {
@@ -80,16 +88,12 @@ describe("Claude permission response effects", () => {
       "mcp__demo__deploy",
       { target: "staging" },
       "tool-mcp",
-      build("mcp__demo__deploy"),
+      build("mcp__demo__deploy", mcpChangeSet),
+      mcpChangeSet,
     );
-    expect(fallback.behavior === "allow" && fallback.updatedPermissions).toEqual([
-      {
-        type: "addRules",
-        rules: [{ toolName: "mcp__demo__deploy" }],
-        behavior: "allow",
-        destination: "localSettings",
-      },
-    ]);
+    expect(fallback.behavior === "allow" && fallback.updatedPermissions).toEqual(
+      mcpChangeSet?.updates,
+    );
   });
 
   it.each([

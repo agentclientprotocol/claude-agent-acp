@@ -226,6 +226,9 @@ export function applyClaudePermissionSelection(
     case "SandboxNetworkAccess":
       return applyCommonSelection(selection, context);
     default:
+      if (context.toolName.startsWith("mcp__")) {
+        return applyCommonSelection(selection, context);
+      }
       return applyGeneratedDurableSelection(selection, context, () =>
         wholeToolPermissionUpdate(context.toolName),
       );
