@@ -174,12 +174,13 @@ import {
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
-  containsToolResultFor,
   ExitPlanCoordinator,
   executionDiagnostic,
   exitPlanModeRawOutput,
+  observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import { parseToolResultMeta } from "./tool-result-meta.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
@@ -1392,7 +1393,7 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
-  private readonly exitPlan = new ExitPlanCoordinator<Session, Turn>();
+  private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1402,6 +1403,33 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+    this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
+      currentSession: (id) => this.sessions[id],
+      closeQueryStream: (session) => this.closeQueryStream(session),
+      restartSession: async (params, options) => {
+        await this.createSession(params, options);
+        const session = this.sessions[options.publicSessionId];
+        if (!session) throw new Error("Fresh Claude context was not created");
+        return session;
+      },
+      applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
+      sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+      logError: (message, error) => this.logger.error(message, error),
+      destroyReplacement: (id, session) => {
+        disarmForceCancel(session);
+        session.cancelController?.abort();
+        this.closeQueryStream(session);
+        session.abortController.abort();
+        if (this.sessions[id] === session) delete this.sessions[id];
+      },
+      settleCancelledTurn: (original, session, turn) => {
+        disarmForceCancel(session);
+        this.finishFileChangeAudit(session, turn, "cancelled");
+        turn.settled = true;
+        turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
+      },
+    });
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -3777,7 +3805,7 @@ export class ClaudeAcpAgent {
                   pendingExitPlanContextReset.toolUseId ===
                     pendingExitPlanModeInterruption.toolUseId
                 ) {
-                  await this.restartAcceptedPlan(
+                  await this.exitPlan.restart(
                     params.sessionId,
                     session,
                     pendingExitPlanContextReset,
@@ -4429,42 +4457,7 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
-            const rawToolResultMeta =
-              message.type === "user"
-                ? (message as { tool_result_meta?: unknown }).tool_result_meta
-                : undefined;
-            const rejectedExitPlanModeToolUseId =
-              message.type === "user"
-                ? findRejectedExitPlanModeToolUseId(
-                    content,
-                    session.toolUseCache,
-                    rawToolResultMeta,
-                  )
-                : undefined;
-            if (rejectedExitPlanModeToolUseId) {
-              // The SDK stream is authoritative here. A resumed query can lose
-              // the short-lived marker installed by canUseTool, while its
-              // user-rejected tool_result still carries both the tool id/name
-              // and the non-execution reason needed for exact correlation.
-              session.pendingExitPlanModeInterruption = {
-                toolUseId: rejectedExitPlanModeToolUseId,
-                toolResultSeen: true,
-              };
-            }
-            const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
-            if (
-              message.type === "user" &&
-              pendingExitPlanModeInterruption &&
-              containsToolResultFor(content, pendingExitPlanModeInterruption.toolUseId)
-            ) {
-              pendingExitPlanModeInterruption.toolResultSeen = true;
-            }
-            const acceptedPlanToolUseId =
-              message.type === "user" &&
-              session.pendingExitPlanContextReset &&
-              containsToolResultFor(content, session.pendingExitPlanContextReset.toolUseId)
-                ? session.pendingExitPlanContextReset.toolUseId
-                : undefined;
+            const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
 
             for (const notification of toAcpNotifications(
               content,
@@ -4483,7 +4476,10 @@ export class ClaudeAcpAgent {
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
                 // type, hence the cast. Validated by parseToolResultMeta.
-                toolResultMeta: rawToolResultMeta,
+                toolResultMeta:
+                  message.type === "user"
+                    ? (message as { tool_result_meta?: unknown }).tool_result_meta
+                    : undefined,
               },
             )) {
               // sendUpdate records delivery. Subagent text/thinking is
@@ -4917,59 +4913,6 @@ export class ClaudeAcpAgent {
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
-  }
-
-  /** Adapt the agent's session operations to the focused clear-context
-   * coordinator. */
-  private async restartAcceptedPlan(
-    sessionId: string,
-    oldSession: Session,
-    reset: NonNullable<Session["pendingExitPlanContextReset"]>,
-  ): Promise<void> {
-    await this.exitPlan.restart(sessionId, oldSession, reset, {
-      currentSession: (id) => this.sessions[id],
-      closeQueryStream: (session) => this.closeQueryStream(session),
-      restartSession: async (params, options) => {
-        await this.createSession(params, options);
-        const session = this.sessions[sessionId];
-        if (!session) throw new Error("Fresh Claude context was not created");
-        return session;
-      },
-      applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
-      publishSessionState: async (id, mode, configOptions) => {
-        await this.client.sessionUpdate({
-          sessionId: id,
-          update: { sessionUpdate: "current_mode_update", currentModeId: mode },
-        });
-        await this.client.sessionUpdate({
-          sessionId: id,
-          update: { sessionUpdate: "config_option_update", configOptions },
-        });
-      },
-      continuationMessage: (id, plan, promptUuid) => {
-        const continuation = promptToClaude({
-          sessionId: id,
-          prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
-        });
-        continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
-        return continuation;
-      },
-      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
-      logError: (message, error) => this.logger.error(message, error),
-      destroyReplacement: (id, session) => {
-        disarmForceCancel(session);
-        session.cancelController?.abort();
-        this.closeQueryStream(session);
-        session.abortController.abort();
-        if (this.sessions[id] === session) delete this.sessions[id];
-      },
-      settleCancelledTurn: (original, session, turn) => {
-        disarmForceCancel(session);
-        this.finishFileChangeAudit(session, turn, "cancelled");
-        turn.settled = true;
-        turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
-      },
-    });
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -8081,66 +8024,6 @@ function streamedInputRefinement(
     kind,
     ...(locations ? { locations } : {}),
   };
-}
-
-/** Validates the SDK user message's `tool_result_meta` sidecar (emitted on the
- *  wire by CLI ≥ 2.1.216 but absent from sdk.d.ts, hence unknown-typed) into a
- *  by-tool_use_id lookup. Each entry explains why an is_error tool_result
- *  carries harness prose instead of the tool's own output — "user-rejected",
- *  "permission-rule", "interrupted", "cancelled", … (open set: new kinds ship
- *  on the wire ahead of schema updates, so no enum check). Malformed entries
- *  are skipped rather than failing the message. */
-function parseToolResultMeta(
-  raw: unknown,
-): Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined {
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-  let byToolUseId: Map<string, { nonExecutionKind: string; userFeedback?: string }> | undefined;
-  for (const entry of raw) {
-    if (typeof entry !== "object" || entry === null) {
-      continue;
-    }
-    const { id, non_execution_kind, user_feedback } = entry as Record<string, unknown>;
-    if (typeof id !== "string" || typeof non_execution_kind !== "string") {
-      continue;
-    }
-    (byToolUseId ??= new Map()).set(id, {
-      nonExecutionKind: non_execution_kind,
-      ...(typeof user_feedback === "string" ? { userFeedback: user_feedback } : {}),
-    });
-  }
-  return byToolUseId;
-}
-
-function findRejectedExitPlanModeToolUseId(
-  content: unknown,
-  toolUseCache: ToolUseCache,
-  rawToolResultMeta: unknown,
-): string | undefined {
-  if (!Array.isArray(content)) {
-    return undefined;
-  }
-  const toolResultMeta = parseToolResultMeta(rawToolResultMeta);
-  if (!toolResultMeta) {
-    return undefined;
-  }
-  for (const block of content) {
-    if (typeof block !== "object" || block === null) {
-      continue;
-    }
-    const { type, tool_use_id: toolUseId, is_error: isError } = block as Record<string, unknown>;
-    if (
-      type === "tool_result" &&
-      typeof toolUseId === "string" &&
-      isError === true &&
-      toolUseCache[toolUseId]?.name === "ExitPlanMode" &&
-      toolResultMeta.get(toolUseId)?.nonExecutionKind === "user-rejected"
-    ) {
-      return toolUseId;
-    }
-  }
-  return undefined;
 }
 
 /**

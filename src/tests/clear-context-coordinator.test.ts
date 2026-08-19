@@ -5,7 +5,7 @@ import {
   ClearContextTurn,
   continuePlanInFreshContext,
 } from "../clear-context-coordinator.js";
-import { ExitPlanCoordinator } from "../exit-plan.js";
+import { ExitPlanCoordinator, observeExitPlanToolResults } from "../exit-plan.js";
 
 type TestSession = ClearContextSession<ClearContextTurn>;
 
@@ -280,15 +280,19 @@ describe("ExitPlanCoordinator", () => {
           };
         }),
     );
-    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>();
-    const host = { ...baseHost, destroyReplacement, settleCancelledTurn };
+    const host = {
+      ...baseHost,
+      sessionUpdate: vi.fn(async () => {}),
+      destroyReplacement,
+      settleCancelledTurn,
+    };
+    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>(host);
 
-    const restart = coordinator.restart(
-      "public-session",
-      oldSession,
-      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
-      host,
-    );
+    const restart = coordinator.restart("public-session", oldSession, {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    });
     await vi.waitFor(() => expect(baseHost.restartSession).toHaveBeenCalled());
     coordinator.cancel("public-session");
     finishRestart();
@@ -300,5 +304,47 @@ describe("ExitPlanCoordinator", () => {
     expect(oldSession.turnQueue).toEqual([]);
     expect(freshSession.input.push).not.toHaveBeenCalled();
     expect(baseHost.ensureConsumer).not.toHaveBeenCalled();
+  });
+});
+
+describe("observeExitPlanToolResults", () => {
+  it("restores a rejected ExitPlanMode marker from authoritative stream metadata", () => {
+    const state = {
+      toolUseCache: { "tool-plan": { name: "ExitPlanMode" } },
+    };
+
+    const accepted = observeExitPlanToolResults(
+      {
+        type: "user",
+        tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+      },
+      [{ type: "tool_result", tool_use_id: "tool-plan", is_error: true }],
+      state,
+    );
+
+    expect(accepted).toBeUndefined();
+    expect(state).toEqual({
+      toolUseCache: { "tool-plan": { name: "ExitPlanMode" } },
+      pendingExitPlanModeInterruption: { toolUseId: "tool-plan", toolResultSeen: true },
+    });
+  });
+
+  it("correlates an accepted plan result with its pending context reset", () => {
+    const state = {
+      toolUseCache: { "tool-plan": { name: "ExitPlanMode" } },
+      pendingExitPlanContextReset: {
+        toolUseId: "tool-plan",
+        plan: "Ship it",
+        mode: "auto" as const,
+      },
+    };
+
+    expect(
+      observeExitPlanToolResults(
+        { type: "user" },
+        [{ type: "tool_result", tool_use_id: "tool-plan", is_error: true }],
+        state,
+      ),
+    ).toBe("tool-plan");
   });
 });

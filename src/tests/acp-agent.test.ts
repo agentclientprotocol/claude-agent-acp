@@ -13171,7 +13171,7 @@ describe("turn steering (_session/steering)", () => {
         }),
     );
 
-    const restart = (agent as any).restartAcceptedPlan("test-session", oldSession, {
+    const restart = (agent as any).exitPlan.restart("test-session", oldSession, {
       toolUseId: "tool-plan",
       plan: "Ship it",
       mode: "auto",
