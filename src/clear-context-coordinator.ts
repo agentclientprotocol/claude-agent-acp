@@ -54,7 +54,7 @@ export type ClearContextCoordinatorHost<
     params: NewSessionRequest,
     options: { publicSessionId: string; permissionMode: PermissionMode },
   ): Promise<Session>;
-  applyFastMode(session: Session, enabled: true): Promise<void>;
+  applyFastMode(session: Session, enabled: boolean): Promise<void>;
   publishSessionState(
     sessionId: string,
     mode: PermissionMode,
@@ -110,7 +110,14 @@ export async function continuePlanInFreshContext<
   oldSession: Session,
   reset: ClearContextReset,
   host: ClearContextCoordinatorHost<Session, Turn>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  const assertRestartActive = (session?: Session): void => {
+    if (signal?.aborted || (session && host.currentSession(sessionId) !== session)) {
+      throw new Error("Clear-context restart aborted");
+    }
+  };
+  assertRestartActive();
   const turn = oldSession.activeTurn;
   if (!turn || turn.settled || host.currentSession(sessionId) !== oldSession) {
     throw new Error("Cannot clear context without an active ACP turn");
@@ -125,12 +132,14 @@ export async function continuePlanInFreshContext<
     publicSessionId: sessionId,
     permissionMode: reset.mode,
   });
-  if (oldSession.fastModeEnabled && !freshSession.fastModeEnabled) {
+  assertRestartActive(freshSession);
+  if (oldSession.fastModeEnabled !== freshSession.fastModeEnabled) {
     try {
-      await host.applyFastMode(freshSession, true);
+      await host.applyFastMode(freshSession, oldSession.fastModeEnabled);
     } catch (error) {
       host.logError("Failed to restore Fast mode after clearing context:", error);
     }
+    assertRestartActive(freshSession);
   }
 
   oldSession.activeTurn = null;
@@ -143,7 +152,9 @@ export async function continuePlanInFreshContext<
   } catch (error) {
     host.logError("Failed to publish clear-context session state:", error);
   }
+  assertRestartActive(freshSession);
 
   freshSession.input.push(host.continuationMessage(sessionId, reset.plan, turn.promptUuid));
+  assertRestartActive(freshSession);
   host.ensureConsumer(freshSession, sessionId);
 }

@@ -1368,6 +1368,31 @@ class ClientConnection implements AcpClient {
   }
 }
 
+function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("Tool use aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    void operation.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -1380,6 +1405,10 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
+  /** Abort controllers for clear-context session replacements. Cancellation or
+   * teardown invalidates the lease so an async createSession cannot resurrect
+   * a closed public session or attach its turn to a newer replacement. */
+  private clearContextRestarts = new Map<string, AbortController>();
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -3702,6 +3731,7 @@ export class ClaudeAcpAgent {
 
               if (session.cancelled) {
                 session.pendingExitPlanModeInterruption = undefined;
+                session.pendingExitPlanContextReset = undefined;
                 if (!isAutonomousResult) {
                   await clearFailuresFromEarlierTurns();
                   stopReason = "cancelled";
@@ -4650,10 +4680,14 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    this.clearContextRestarts.get(params.sessionId)?.abort();
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
     }
+    session.cancelled = true;
+    session.pendingExitPlanModeInterruption = undefined;
+    session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
     // settled when it closed, and there is no live query to interrupt. Calling
     // query.interrupt() on a finished iterator could reject and surface from
@@ -4661,7 +4695,6 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       return;
     }
-    session.cancelled = true;
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
@@ -4909,37 +4942,90 @@ export class ClaudeAcpAgent {
     oldSession: Session,
     reset: NonNullable<Session["pendingExitPlanContextReset"]>,
   ): Promise<void> {
-    await continuePlanInFreshContext(sessionId, oldSession, reset, {
-      currentSession: (id) => this.sessions[id],
-      closeQueryStream: (session) => this.closeQueryStream(session),
-      restartSession: async (params, options) => {
-        await this.createSession(params, options);
-        const session = this.sessions[sessionId];
-        if (!session) throw new Error("Fresh Claude context was not created");
-        return session;
-      },
-      applyFastMode: (session) => this.applyFastMode(session, true),
-      publishSessionState: async (id, mode, configOptions) => {
-        await this.client.sessionUpdate({
-          sessionId: id,
-          update: { sessionUpdate: "current_mode_update", currentModeId: mode },
-        });
-        await this.client.sessionUpdate({
-          sessionId: id,
-          update: { sessionUpdate: "config_option_update", configOptions },
-        });
-      },
-      continuationMessage: (id, plan, promptUuid) => {
-        const continuation = promptToClaude({
-          sessionId: id,
-          prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
-        });
-        continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
-        return continuation;
-      },
-      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
-      logError: (message, error) => this.logger.error(message, error),
-    });
+    this.clearContextRestarts.get(sessionId)?.abort();
+    const controller = new AbortController();
+    this.clearContextRestarts.set(sessionId, controller);
+    let restartedSession: Session | undefined;
+    try {
+      await continuePlanInFreshContext(
+        sessionId,
+        oldSession,
+        reset,
+        {
+          currentSession: (id) => this.sessions[id],
+          closeQueryStream: (session) => this.closeQueryStream(session),
+          restartSession: async (params, options) => {
+            await this.createSession(params, options);
+            const session = this.sessions[sessionId];
+            if (!session) throw new Error("Fresh Claude context was not created");
+            restartedSession = session;
+            return session;
+          },
+          applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
+          publishSessionState: async (id, mode, configOptions) => {
+            await this.client.sessionUpdate({
+              sessionId: id,
+              update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+            });
+            await this.client.sessionUpdate({
+              sessionId: id,
+              update: { sessionUpdate: "config_option_update", configOptions },
+            });
+          },
+          continuationMessage: (id, plan, promptUuid) => {
+            const continuation = promptToClaude({
+              sessionId: id,
+              prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
+            });
+            continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
+            return continuation;
+          },
+          ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+          logError: (message, error) => this.logger.error(message, error),
+        },
+        controller.signal,
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        const replacement =
+          restartedSession ??
+          (this.sessions[sessionId] && this.sessions[sessionId] !== oldSession
+            ? this.sessions[sessionId]
+            : undefined);
+        if (replacement && this.sessions[sessionId] === replacement) {
+          disarmForceCancel(replacement);
+          replacement.cancelController?.abort();
+          this.closeQueryStream(replacement);
+          replacement.abortController.abort();
+          delete this.sessions[sessionId];
+        }
+        // The old consumer is returning immediately after this helper. Settle
+        // the carried turn here; rethrowing the coordinator's abort would make
+        // an ordinary session/cancel surface as an internal stream failure.
+        const turn = replacement?.activeTurn ?? oldSession.activeTurn;
+        if (turn && !turn.settled) {
+          const turnSession = replacement?.activeTurn === turn ? replacement : oldSession;
+          disarmForceCancel(turnSession);
+          this.finishFileChangeAudit(turnSession, turn, "cancelled");
+          turn.settled = true;
+          oldSession.activeTurn = null;
+          oldSession.turnQueue = (oldSession.turnQueue ?? []).filter((queued) => queued !== turn);
+          if (replacement) {
+            replacement.activeTurn = null;
+            replacement.turnQueue = (replacement.turnQueue ?? []).filter(
+              (queued) => queued !== turn,
+            );
+          }
+          turn.resolve({ stopReason: "cancelled", usage: sessionUsage(oldSession) });
+        }
+        return;
+      }
+      throw error;
+    } finally {
+      if (this.clearContextRestarts.get(sessionId) === controller) {
+        this.clearContextRestarts.delete(sessionId);
+      }
+    }
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -5353,6 +5439,7 @@ export class ClaudeAcpAgent {
       params.toolCall.toolCallId,
       params.toolCall.rawInput,
       parentToolUseId,
+      signal,
     );
     if (signal.aborted) throw new Error("Tool use aborted");
 
@@ -5360,16 +5447,7 @@ export class ClaudeAcpAgent {
     // cancellation signal. The local race guarantees that Claude's tool call
     // is released even when an older or broken client ignores $/cancel_request.
     try {
-      return await new Promise<RequestPermissionResponse>((resolve, reject) => {
-        const onAbort = () => reject(new Error("Tool use aborted"));
-        signal.addEventListener("abort", onAbort, { once: true });
-        void this.client
-          .requestPermission(params, signal)
-          .then(resolve, reject)
-          .finally(() => {
-            signal.removeEventListener("abort", onAbort);
-          });
-      });
+      return await raceWithAbort(this.client.requestPermission(params, signal), signal);
     } catch (error) {
       if (signal.aborted) {
         throw new Error("Tool use aborted", { cause: error });
@@ -5396,6 +5474,7 @@ export class ClaudeAcpAgent {
     toolCallId: string,
     toolInput: unknown,
     parentToolUseId?: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
@@ -5422,7 +5501,8 @@ export class ClaudeAcpAgent {
       };
     }
     try {
-      await this.client.sessionUpdate({ sessionId, update });
+      const emission = this.client.sessionUpdate({ sessionId, update });
+      await (signal ? raceWithAbort(emission, signal) : emission);
     } catch (error) {
       // The set is also the de-duplication guard for the later streamed
       // tool_use. Keep it truthful: if emission failed, that path must still
@@ -5512,6 +5592,7 @@ export class ClaudeAcpAgent {
           toolUseID,
           toolInput,
           parentToolUseId,
+          signal,
         );
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }

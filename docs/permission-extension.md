@@ -59,8 +59,9 @@ The request-level record is placed under `RequestPermissionRequest._meta.permiss
 | `title`       |      yes | non-empty string | The standard tool-call operation title.   |
 | `description` |       no | string           | Temporary diagnostic SDK decision reason. |
 
-The permission title deliberately duplicates `toolCall.title`: one operation has one heading across
-the tool card and approval UI. Commands, paths, URLs, and other structured details also remain in
+The permission title normally duplicates `toolCall.title`: one operation has one heading across the
+tool card and approval UI. `ExitPlanMode` is the deliberate exception and uses the action-oriented
+permission heading `Ready to code?`. Commands, paths, URLs, and other structured details remain in
 `rawInput`, `content`, and `locations`.
 
 `description` temporarily carries the SDK's non-blank `decisionReason` for diagnostics, prefixed

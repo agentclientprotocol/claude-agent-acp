@@ -2592,6 +2592,51 @@ describe("permission request cancellation", () => {
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
 
+  it("does not wait for an eager tool-call update that ignores cancellation", async () => {
+    const requestPermission = vi.fn();
+    const mockClient = {
+      sessionUpdate: () => new Promise<void>(() => {}),
+      requestPermission,
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    const controller = new AbortController();
+
+    const pending = agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: controller.signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+    } as any);
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("Tool use aborted");
+    expect(requestPermission).not.toHaveBeenCalled();
+    expect(session.emittedToolCalls.has("tool-1")).toBe(false);
+  });
+
+  it("clears pending ExitPlanMode state even after the query has closed", async () => {
+    const mockClient = { sessionUpdate: vi.fn() } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.queryClosed = true;
+    session.pendingExitPlanModeInterruption = {
+      toolUseId: "tool-plan",
+      toolResultSeen: false,
+    };
+    session.pendingExitPlanContextReset = {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    };
+
+    await agent.cancel({ sessionId: "session-1" });
+
+    expect(session.cancelled).toBe(true);
+    expect(session.pendingExitPlanModeInterruption).toBeUndefined();
+    expect(session.pendingExitPlanContextReset).toBeUndefined();
+  });
+
   it("does not emit or request permission for a pre-aborted tool call", async () => {
     const sessionUpdate = vi.fn();
     const requestPermission = vi.fn();
@@ -13077,6 +13122,71 @@ describe("turn steering (_session/steering)", () => {
     await expect(
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] }),
     ).rejects.toThrow("restart failed");
+  });
+
+  it("does not resurrect a clear-context session closed while its replacement is created", async () => {
+    const agent = createMockAgent();
+    const resolveTurn = vi.fn();
+    const rejectTurn = vi.fn();
+    const turn = {
+      promptUuid: randomUUID(),
+      isLocalOnlyCommand: false,
+      settled: false,
+      resolve: resolveTurn,
+      reject: rejectTurn,
+    };
+    const oldSession = mockSessionState({
+      query: wrapQuery(
+        (async function* () {
+          yield await new Promise<never>(() => {});
+        })(),
+      ),
+      input: new Pushable(),
+      activeTurn: turn,
+      turnQueue: [turn],
+      creationParams: { cwd: "/test", mcpServers: [] },
+    });
+    agent.sessions["test-session"] = oldSession;
+    let finishCreation!: () => void;
+    let freshSession: ReturnType<typeof mockSessionState> | undefined;
+    let freshInputPush: ReturnType<typeof vi.fn> | undefined;
+    vi.spyOn(agent as any, "createSession").mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishCreation = () => {
+            const freshInput = new Pushable();
+            freshInputPush = vi.spyOn(freshInput, "push");
+            freshSession = mockSessionState({
+              query: wrapQuery(
+                (async function* () {
+                  yield await new Promise<never>(() => {});
+                })(),
+              ),
+              input: freshInput,
+              modes: { currentModeId: "auto", availableModes: [] },
+            });
+            agent.sessions["test-session"] = freshSession;
+            resolve();
+          };
+        }),
+    );
+
+    const restart = (agent as any).restartAcceptedPlan("test-session", oldSession, {
+      toolUseId: "tool-plan",
+      plan: "Ship it",
+      mode: "auto",
+    });
+    await vi.waitFor(() => expect(oldSession.query.close).toHaveBeenCalled());
+
+    await agent.closeSession({ sessionId: "test-session" });
+    finishCreation();
+    await expect(restart).resolves.toBeUndefined();
+
+    expect(agent.sessions["test-session"]).toBeUndefined();
+    expect(freshSession?.query.close).toHaveBeenCalled();
+    expect(freshInputPush).not.toHaveBeenCalled();
+    expect(resolveTurn).toHaveBeenCalledWith(expect.objectContaining({ stopReason: "cancelled" }));
+    expect(rejectTurn).not.toHaveBeenCalled();
   });
 
   it("does not hide a diagnostic before the rejected ExitPlanMode tool result", async () => {

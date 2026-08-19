@@ -30,10 +30,14 @@ function testHost(
   oldSession: TestSession,
   freshSession: TestSession,
 ): ClearContextCoordinatorHost<TestSession, ClearContextTurn> {
+  let currentSession = oldSession;
   return {
-    currentSession: vi.fn(() => oldSession),
+    currentSession: vi.fn(() => currentSession),
     closeQueryStream: vi.fn(),
-    restartSession: vi.fn(async () => freshSession),
+    restartSession: vi.fn(async () => {
+      currentSession = freshSession;
+      return freshSession;
+    }),
     applyFastMode: vi.fn(async () => {}),
     publishSessionState: vi.fn(async () => {}),
     continuationMessage: vi.fn((sessionId, plan, promptUuid) => ({
@@ -174,6 +178,59 @@ describe("continuePlanInFreshContext", () => {
     expect(restartParams?._meta).toEqual({
       claudeCode: { options: { env: { PRESERVED: "yes" } } },
     });
+  });
+
+  it("restores disabled Fast mode when a fresh session starts with it enabled", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({ activeTurn: turn, fastModeEnabled: false });
+    const freshSession = testSession({ fastModeEnabled: true });
+    const host = testHost(oldSession, freshSession);
+
+    await continuePlanInFreshContext(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
+      host,
+    );
+
+    expect(host.applyFastMode).toHaveBeenCalledWith(freshSession, false);
+  });
+
+  it("does not publish or continue a restart cancelled while creating the fresh session", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({ activeTurn: turn });
+    const freshSession = testSession();
+    const host = testHost(oldSession, freshSession);
+    let finishRestart!: () => void;
+    vi.mocked(host.restartSession).mockImplementation(
+      () =>
+        new Promise<TestSession>((resolve) => {
+          finishRestart = () => resolve(freshSession);
+        }),
+    );
+    const controller = new AbortController();
+
+    const restart = continuePlanInFreshContext(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
+      host,
+      controller.signal,
+    );
+    await vi.waitFor(() => expect(host.restartSession).toHaveBeenCalled());
+    controller.abort();
+    finishRestart();
+
+    await expect(restart).rejects.toThrow("Clear-context restart aborted");
+    expect(host.publishSessionState).not.toHaveBeenCalled();
+    expect(freshSession.input.push).not.toHaveBeenCalled();
+    expect(host.ensureConsumer).not.toHaveBeenCalled();
   });
 
   it("rejects a stale session before closing its query", async () => {
