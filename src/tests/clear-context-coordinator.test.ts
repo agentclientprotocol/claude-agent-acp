@@ -5,6 +5,7 @@ import {
   ClearContextTurn,
   continuePlanInFreshContext,
 } from "../clear-context-coordinator.js";
+import { ExitPlanCoordinator } from "../exit-plan.js";
 
 type TestSession = ClearContextSession<ClearContextTurn>;
 
@@ -253,5 +254,51 @@ describe("continuePlanInFreshContext", () => {
 
     expect(host.closeQueryStream).not.toHaveBeenCalled();
     expect(host.restartSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("ExitPlanCoordinator", () => {
+  it("owns cancellation cleanup for a replacement created after close", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({ activeTurn: turn, turnQueue: [turn] });
+    const freshSession = testSession();
+    const baseHost = testHost(oldSession, freshSession);
+    const destroyReplacement = vi.fn();
+    const settleCancelledTurn = vi.fn((_old, _owner, cancelledTurn: ClearContextTurn) => {
+      cancelledTurn.settled = true;
+    });
+    let finishRestart!: () => void;
+    vi.mocked(baseHost.restartSession).mockImplementation(
+      () =>
+        new Promise<TestSession>((resolve) => {
+          finishRestart = () => {
+            vi.mocked(baseHost.currentSession).mockReturnValue(freshSession);
+            resolve(freshSession);
+          };
+        }),
+    );
+    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>();
+    const host = { ...baseHost, destroyReplacement, settleCancelledTurn };
+
+    const restart = coordinator.restart(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
+      host,
+    );
+    await vi.waitFor(() => expect(baseHost.restartSession).toHaveBeenCalled());
+    coordinator.cancel("public-session");
+    finishRestart();
+    await restart;
+
+    expect(destroyReplacement).toHaveBeenCalledWith("public-session", freshSession);
+    expect(settleCancelledTurn).toHaveBeenCalledWith(oldSession, oldSession, turn);
+    expect(oldSession.activeTurn).toBeNull();
+    expect(oldSession.turnQueue).toEqual([]);
+    expect(freshSession.input.push).not.toHaveBeenCalled();
+    expect(baseHost.ensureConsumer).not.toHaveBeenCalled();
   });
 });

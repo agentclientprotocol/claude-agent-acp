@@ -79,7 +79,6 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
-  SDKResultMessage,
   SDKUserMessage,
   SlashCommand,
   ThinkingConfig,
@@ -173,7 +172,13 @@ import {
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
-import { continuePlanInFreshContext } from "./clear-context-coordinator.js";
+import {
+  acceptedPlanToolResult,
+  containsToolResultFor,
+  ExitPlanCoordinator,
+  executionDiagnostic,
+  exitPlanModeRawOutput,
+} from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -196,24 +201,6 @@ function sanitizeTitle(text: string): string {
     return sanitized;
   }
   return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
-}
-
-function acceptedPlanToolResult(
-  notification: SessionNotification,
-  toolUseId: string | undefined,
-): SessionNotification {
-  const update = notification.update;
-  if (
-    !toolUseId ||
-    update.sessionUpdate !== "tool_call_update" ||
-    update.toolCallId !== toolUseId
-  ) {
-    return notification;
-  }
-  const completed = { ...update };
-  delete completed.rawOutput;
-  delete completed.content;
-  return { ...notification, update: { ...completed, status: "completed" } };
 }
 
 /**
@@ -1405,10 +1392,7 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
-  /** Abort controllers for clear-context session replacements. Cancellation or
-   * teardown invalidates the lease so an async createSession cannot resurrect
-   * a closed public session or attach its turn to a newer replacement. */
-  private clearContextRestarts = new Map<string, AbortController>();
+  private readonly exitPlan = new ExitPlanCoordinator<Session, Turn>();
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -4680,7 +4664,7 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
-    this.clearContextRestarts.get(params.sessionId)?.abort();
+    this.exitPlan.cancel(params.sessionId);
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
@@ -4942,90 +4926,50 @@ export class ClaudeAcpAgent {
     oldSession: Session,
     reset: NonNullable<Session["pendingExitPlanContextReset"]>,
   ): Promise<void> {
-    this.clearContextRestarts.get(sessionId)?.abort();
-    const controller = new AbortController();
-    this.clearContextRestarts.set(sessionId, controller);
-    let restartedSession: Session | undefined;
-    try {
-      await continuePlanInFreshContext(
-        sessionId,
-        oldSession,
-        reset,
-        {
-          currentSession: (id) => this.sessions[id],
-          closeQueryStream: (session) => this.closeQueryStream(session),
-          restartSession: async (params, options) => {
-            await this.createSession(params, options);
-            const session = this.sessions[sessionId];
-            if (!session) throw new Error("Fresh Claude context was not created");
-            restartedSession = session;
-            return session;
-          },
-          applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
-          publishSessionState: async (id, mode, configOptions) => {
-            await this.client.sessionUpdate({
-              sessionId: id,
-              update: { sessionUpdate: "current_mode_update", currentModeId: mode },
-            });
-            await this.client.sessionUpdate({
-              sessionId: id,
-              update: { sessionUpdate: "config_option_update", configOptions },
-            });
-          },
-          continuationMessage: (id, plan, promptUuid) => {
-            const continuation = promptToClaude({
-              sessionId: id,
-              prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
-            });
-            continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
-            return continuation;
-          },
-          ensureConsumer: (session, id) => this.ensureConsumer(session, id),
-          logError: (message, error) => this.logger.error(message, error),
-        },
-        controller.signal,
-      );
-    } catch (error) {
-      if (controller.signal.aborted) {
-        const replacement =
-          restartedSession ??
-          (this.sessions[sessionId] && this.sessions[sessionId] !== oldSession
-            ? this.sessions[sessionId]
-            : undefined);
-        if (replacement && this.sessions[sessionId] === replacement) {
-          disarmForceCancel(replacement);
-          replacement.cancelController?.abort();
-          this.closeQueryStream(replacement);
-          replacement.abortController.abort();
-          delete this.sessions[sessionId];
-        }
-        // The old consumer is returning immediately after this helper. Settle
-        // the carried turn here; rethrowing the coordinator's abort would make
-        // an ordinary session/cancel surface as an internal stream failure.
-        const turn = replacement?.activeTurn ?? oldSession.activeTurn;
-        if (turn && !turn.settled) {
-          const turnSession = replacement?.activeTurn === turn ? replacement : oldSession;
-          disarmForceCancel(turnSession);
-          this.finishFileChangeAudit(turnSession, turn, "cancelled");
-          turn.settled = true;
-          oldSession.activeTurn = null;
-          oldSession.turnQueue = (oldSession.turnQueue ?? []).filter((queued) => queued !== turn);
-          if (replacement) {
-            replacement.activeTurn = null;
-            replacement.turnQueue = (replacement.turnQueue ?? []).filter(
-              (queued) => queued !== turn,
-            );
-          }
-          turn.resolve({ stopReason: "cancelled", usage: sessionUsage(oldSession) });
-        }
-        return;
-      }
-      throw error;
-    } finally {
-      if (this.clearContextRestarts.get(sessionId) === controller) {
-        this.clearContextRestarts.delete(sessionId);
-      }
-    }
+    await this.exitPlan.restart(sessionId, oldSession, reset, {
+      currentSession: (id) => this.sessions[id],
+      closeQueryStream: (session) => this.closeQueryStream(session),
+      restartSession: async (params, options) => {
+        await this.createSession(params, options);
+        const session = this.sessions[sessionId];
+        if (!session) throw new Error("Fresh Claude context was not created");
+        return session;
+      },
+      applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
+      publishSessionState: async (id, mode, configOptions) => {
+        await this.client.sessionUpdate({
+          sessionId: id,
+          update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+        });
+        await this.client.sessionUpdate({
+          sessionId: id,
+          update: { sessionUpdate: "config_option_update", configOptions },
+        });
+      },
+      continuationMessage: (id, plan, promptUuid) => {
+        const continuation = promptToClaude({
+          sessionId: id,
+          prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
+        });
+        continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
+        return continuation;
+      },
+      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+      logError: (message, error) => this.logger.error(message, error),
+      destroyReplacement: (id, session) => {
+        disarmForceCancel(session);
+        session.cancelController?.abort();
+        this.closeQueryStream(session);
+        session.abortController.abort();
+        if (this.sessions[id] === session) delete this.sessions[id];
+      },
+      settleCancelledTurn: (original, session, turn) => {
+        disarmForceCancel(session);
+        this.finishFileChangeAudit(session, turn, "cancelled");
+        turn.settled = true;
+        turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
+      },
+    });
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -8169,26 +8113,6 @@ function parseToolResultMeta(
   return byToolUseId;
 }
 
-function containsToolResultFor(content: unknown, toolUseId: string): boolean {
-  return (
-    Array.isArray(content) &&
-    content.some(
-      (block) =>
-        typeof block === "object" &&
-        block !== null &&
-        (block as { type?: unknown }).type === "tool_result" &&
-        (block as { tool_use_id?: unknown }).tool_use_id === toolUseId,
-    )
-  );
-}
-
-function executionDiagnostic(message: SDKResultMessage): string | undefined {
-  if (message.subtype === "success") {
-    return message.result.startsWith("[ede_diagnostic]") ? message.result : undefined;
-  }
-  return message.errors.find((error) => error.startsWith("[ede_diagnostic]"));
-}
-
 function findRejectedExitPlanModeToolUseId(
   content: unknown,
   toolUseCache: ToolUseCache,
@@ -8217,17 +8141,6 @@ function findRejectedExitPlanModeToolUseId(
     }
   }
   return undefined;
-}
-
-/** Claude wraps a rejected ExitPlanMode explanation in a Markdown code fence,
- *  even though it is prose. Strip exactly one complete outer fence for that
- *  tool only; arbitrary tool output must remain byte-for-byte unchanged. */
-function exitPlanModeRawOutput(toolName: string, content: unknown): unknown {
-  if (toolName !== "ExitPlanMode" || typeof content !== "string") {
-    return content;
-  }
-  const fenced = /^\s*```[^\r\n]*\r?\n([\s\S]*?)\r?\n```\s*$/.exec(content);
-  return fenced?.[1] ?? content;
 }
 
 /**
