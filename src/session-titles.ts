@@ -99,7 +99,7 @@ export class SessionTitles {
       .flatMap((chunk) => (chunk.type === "text" ? [chunk.text] : []))
       .join("\n");
 
-      this.context = appendTitleContext(this.context, `\n${promptText}\n`);
+    this.context = appendTitleContext(this.context, `\n${promptText}\n`);
   }
 
   /** Collect the assistant's own answer for the title. Chunks are appended
