@@ -424,7 +424,7 @@ export function toolInfoFromToolUse(
     case "ExitPlanMode": {
       const planInput = toolUse.input as { plan?: string } | undefined;
       return {
-        title: "Plan",
+        title: "Approve Plan",
         kind: "switch_mode",
         content: planInput?.plan
           ? [{ type: "content" as const, content: { type: "text" as const, text: planInput.plan } }]

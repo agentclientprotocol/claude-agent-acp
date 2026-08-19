@@ -90,14 +90,14 @@ describe("Claude permission suggestion normalization", () => {
 });
 
 describe("Claude permission ACP v1 presentation", () => {
-  it("uses Plan as the ExitPlanMode tool title and keeps the question in permission metadata", () => {
+  it("uses Approve Plan as the tool title and keeps the question in permission metadata", () => {
     const presentation = buildClaudePermissionPresentation({
       toolName: "ExitPlanMode",
       input: { plan: "Implement the change" },
       toolUseID: "tool-plan",
     });
 
-    expect(presentation.toolCall.title).toBe("Plan");
+    expect(presentation.toolCall.title).toBe("Approve Plan");
     expect(presentation._meta).toEqual({
       permission: { version: 1, title: "Ready to code?" },
     });

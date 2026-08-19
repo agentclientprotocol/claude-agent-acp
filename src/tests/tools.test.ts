@@ -1685,7 +1685,7 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
     const info = toolInfoFromToolUse(toolUse, false);
 
     expect(info.kind).toBe("switch_mode");
-    expect(info.title).toBe("Plan");
+    expect(info.title).toBe("Approve Plan");
     expect(info.content).toHaveLength(1);
     expect(info.content![0]).toEqual({
       type: "content",
