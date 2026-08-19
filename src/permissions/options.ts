@@ -14,12 +14,9 @@ import {
   buildEnterPlanModePermissionOptions,
   buildExitPlanModePermissionOptions,
   buildFallbackPermissionOptions,
-  buildMonitorPermissionOptions,
-  buildReviewArtifactPermissionOptions,
   buildSandboxNetworkPermissionOptions,
   buildSkillPermissionOptions,
   buildWebFetchPermissionOptions,
-  buildWorkflowPermissionOptions,
   isComputerUseMcpTool,
 } from "./options/tools.js";
 
@@ -66,12 +63,6 @@ function buildUnsortedClaudePermissionOptions(
       return buildExitPlanModePermissionOptions(context);
     case "SandboxNetworkAccess":
       return buildSandboxNetworkPermissionOptions(context);
-    case "ReviewArtifact":
-      return buildReviewArtifactPermissionOptions(context);
-    case "Workflow":
-      return buildWorkflowPermissionOptions(context);
-    case "Monitor":
-      return buildMonitorPermissionOptions(context);
     case "WebSearch":
     case "Agent":
     case "Task":

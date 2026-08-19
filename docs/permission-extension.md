@@ -1,8 +1,5 @@
 # Permission extension
 
-For a user-facing summary of the changes in Russian, see
-[`permission-changes-ru.md`](permission-changes-ru.md).
-
 This document defines the experimental permission presentation extension implemented by
 `claude-agent-acp`. The adapter uses standard ACP permission requests and responses, while `_meta`
 adds compact request presentation text.
@@ -133,23 +130,24 @@ continue asking; accepting a generated allow rule that cannot override it would 
 
 ## Tool-specific behavior
 
-| Tool family                    | Permission choices and effects                                                                                     |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| Bash / PowerShell              | One-time allow; exact representable SDK bundle with its complete effect in the option label; reject.               |
-| Read / Glob / Grep             | One-time allow; matching session-scoped read grant; reject.                                                        |
-| Edit / Write / NotebookEdit    | One-time allow; matching session edit grant, including `.claude` handling; reject.                                 |
-| WebFetch                       | One-time allow; generated `domain:<hostname>` local rule; reject.                                                  |
-| Skill                          | One-time allow; exact skill and optional `prefix:*` local rules; reject.                                           |
-| EnterPlanMode                  | Enter plan mode once, or reject and continue implementing.                                                         |
-| ExitPlanMode                   | One keep-context and one clear-context elevated mode (`auto` > bypass > accept edits), manual approval, or reject. |
-| SandboxNetworkAccess           | One-time allow; exact SDK host rule when representable; reject.                                                    |
-| Computer Use MCP               | One-time allow; generated exact whole-tool local rule; reject.                                                     |
-| WebSearch / Agent / Task / MCP | One-time allow; generated whole-tool local rule; reject.                                                           |
-| ReviewArtifact / Workflow      | Named fallback builders until SDK renderer state is available.                                                     |
-| Monitor / unknown tools        | Named or generic fallback behavior.                                                                                |
+| Tool family                 | Permission choices and effects                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Bash / PowerShell           | One-time allow; exact representable SDK bundle with its complete effect in the option label; reject.               |
+| Read / Glob / Grep          | One-time allow; matching session-scoped read grant; reject.                                                        |
+| Edit / Write / NotebookEdit | One-time allow; matching session edit grant, including `.claude` handling; reject.                                 |
+| WebFetch                    | One-time allow; generated `domain:<hostname>` local rule; reject.                                                  |
+| Skill                       | One-time allow; exact skill and optional `prefix:*` local rules; reject.                                           |
+| EnterPlanMode               | Enter plan mode once, or reject and continue implementing.                                                         |
+| ExitPlanMode                | One keep-context and one clear-context elevated mode (`auto` > bypass > accept edits), manual approval, or reject. |
+| SandboxNetworkAccess        | One-time allow; exact SDK host rule when representable; reject.                                                    |
+| Computer Use MCP            | One-time allow; exact representable SDK allow suggestion; reject.                                                  |
+| MCP                         | One-time allow; exact representable SDK allow suggestion for that tool; reject.                                    |
+| WebSearch / Agent / Task    | One-time allow; generated whole-tool local rule; reject.                                                           |
+| ReviewArtifact / Workflow   | Generic fallback behavior until SDK renderer state is available.                                                   |
+| Monitor / unknown tools     | Generic fallback behavior.                                                                                         |
 
-Generated WebFetch, Skill, Computer Use, and fallback effects use `localSettings`. Filesystem grants
-are offered only when the SDK bundle is session-scoped and covers the current path. Shell labels may
+Generated WebFetch, Skill, and non-MCP fallback effects use `localSettings`. Filesystem grants are
+offered only when the SDK bundle is session-scoped and covers the current path. Shell labels may
 describe command rules, read paths, additional directories, or a representable combination.
 
 `AskUserQuestion` is not a permission dialog. With ACP form elicitation support it is routed through

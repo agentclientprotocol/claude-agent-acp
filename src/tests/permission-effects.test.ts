@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
 import { normalizeDurablePermissionChangeSet } from "../permissions/normalization.js";
 import { buildClaudePermissionOptions, PERMISSION_OPTION_ID } from "../permissions/options.js";
-import { mapClaudePermissionResponse } from "../permissions/response.js";
+import { decodeClaudePermissionResponse } from "../permissions/response.js";
+
+const permissionResult = (...args: Parameters<typeof decodeClaudePermissionResponse>) =>
+  decodeClaudePermissionResponse(...args).permissionResult;
 
 const rule = { toolName: "Bash", ruleContent: "npm test:*" };
 
@@ -30,7 +33,7 @@ describe("Claude permission response effects", () => {
     [PERMISSION_OPTION_ID.allowSkillPrefix, "deploy:*"],
   ])("applies the native Skill effect for %s", (optionId, ruleContent) => {
     const input = { skill: "deploy prod" };
-    const result = mapClaudePermissionResponse(
+    const result = permissionResult(
       { outcome: { outcome: "selected", optionId } },
       "Skill",
       input,
@@ -49,7 +52,7 @@ describe("Claude permission response effects", () => {
 
   it("applies a generated WebFetch effect and an exact MCP provider effect", () => {
     const webInput = { url: "https://example.com/path" };
-    const web = mapClaudePermissionResponse(
+    const web = permissionResult(
       {
         outcome: {
           outcome: "selected",
@@ -78,7 +81,7 @@ describe("Claude permission response effects", () => {
         destination: "localSettings",
       },
     ]);
-    const fallback = mapClaudePermissionResponse(
+    const fallback = permissionResult(
       {
         outcome: {
           outcome: "selected",
@@ -114,7 +117,7 @@ describe("Claude permission response effects", () => {
           destination: "session",
         },
       ])!;
-      const result = mapClaudePermissionResponse(
+      const result = permissionResult(
         {
           outcome: {
             outcome: "selected",
@@ -140,7 +143,7 @@ describe("Claude permission response effects", () => {
 
   it("allows EnterPlanMode temporarily without changing mode before the tool runs", () => {
     expect(
-      mapClaudePermissionResponse(
+      permissionResult(
         { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowOnce } },
         "EnterPlanMode",
         {},
@@ -162,7 +165,7 @@ describe("Claude permission response effects", () => {
       "default",
       "acceptEdits",
     ]);
-    const approved = mapClaudePermissionResponse(
+    const approved = permissionResult(
       {
         outcome: {
           outcome: "selected",
@@ -182,7 +185,7 @@ describe("Claude permission response effects", () => {
       "default",
       "acceptEdits",
     ]);
-    const acceptEdits = mapClaudePermissionResponse(
+    const acceptEdits = permissionResult(
       {
         outcome: {
           outcome: "selected",
@@ -198,7 +201,7 @@ describe("Claude permission response effects", () => {
       { type: "setMode", mode: "acceptEdits", destination: "session" },
     ]);
 
-    const rejected = mapClaudePermissionResponse(
+    const rejected = permissionResult(
       {
         outcome: {
           outcome: "selected",
@@ -222,7 +225,7 @@ describe("Claude permission response effects", () => {
     const input = { plan: "Implement it" };
     const offered = build("ExitPlanMode", undefined, input, undefined, true, ["auto"]);
     expect(
-      mapClaudePermissionResponse(
+      permissionResult(
         {
           outcome: {
             outcome: "selected",
@@ -243,9 +246,28 @@ describe("Claude permission response effects", () => {
     });
   });
 
+  it("returns clear-context semantics with the decoded permission decision", () => {
+    const input = { plan: "Implement it" };
+    const offered = build("ExitPlanMode", undefined, input, undefined, true, ["auto"]);
+    const decision = decodeClaudePermissionResponse(
+      {
+        outcome: {
+          outcome: "selected",
+          optionId: PERMISSION_OPTION_ID.exitPlanClearAuto,
+        },
+      },
+      "ExitPlanMode",
+      input,
+      "tool-plan",
+      offered,
+    );
+    expect(decision.contextResetMode).toBe("auto");
+    expect(decision.permissionResult).toMatchObject({ behavior: "deny", interrupt: true });
+  });
+
   it("maps one-time allow without remembered updates", () => {
     expect(
-      mapClaudePermissionResponse(
+      permissionResult(
         { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowOnce } },
         "Bash",
         { command: "pwd" },
@@ -265,7 +287,7 @@ describe("Claude permission response effects", () => {
       { type: "addRules", rules: [rule], behavior: "allow", destination: "session" },
     ];
     const changeSet = normalizeDurablePermissionChangeSet(suggestions);
-    const result = mapClaudePermissionResponse(
+    const result = permissionResult(
       { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowWithUpdates } },
       "Bash",
       { command: "npm test" },
@@ -284,7 +306,7 @@ describe("Claude permission response effects", () => {
 
   it("distinguishes explicit reject from cancellation", () => {
     expect(
-      mapClaudePermissionResponse(
+      permissionResult(
         { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.reject } },
         "Bash",
         {},
@@ -298,19 +320,13 @@ describe("Claude permission response effects", () => {
       decisionClassification: "user_reject",
     });
     expect(() =>
-      mapClaudePermissionResponse(
-        { outcome: { outcome: "cancelled" } },
-        "Bash",
-        {},
-        "tool-3",
-        build("Bash"),
-      ),
+      permissionResult({ outcome: { outcome: "cancelled" } }, "Bash", {}, "tool-3", build("Bash")),
     ).toThrow("Tool use aborted");
   });
 
   it("fails closed for an unavailable or unknown selection", () => {
     expect(() =>
-      mapClaudePermissionResponse(
+      permissionResult(
         { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowWithUpdates } },
         "Bash",
         {},
@@ -319,7 +335,7 @@ describe("Claude permission response effects", () => {
       ),
     ).toThrow("Permission option was not offered");
     expect(() =>
-      mapClaudePermissionResponse(
+      permissionResult(
         { outcome: { outcome: "selected", optionId: "future" } },
         "Bash",
         {},

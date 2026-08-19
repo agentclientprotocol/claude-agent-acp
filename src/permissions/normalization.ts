@@ -104,16 +104,16 @@ export function normalizeDurablePermissionChangeSet(
   suggestions: unknown,
   forcedAsk = false,
 ): DurablePermissionChangeSet | undefined {
-  if (
-    !Array.isArray(suggestions) ||
-    suggestions.length === 0 ||
-    suggestions.length > MAX_UPDATES ||
-    !suggestions.every(isKnownUpdate)
-  ) {
-    return undefined;
-  }
   if (forcedAsk) return undefined;
   try {
+    if (
+      !Array.isArray(suggestions) ||
+      suggestions.length === 0 ||
+      suggestions.length > MAX_UPDATES ||
+      !suggestions.every(isKnownUpdate)
+    ) {
+      return undefined;
+    }
     return {
       // The ACP prompt may stay open for an arbitrary amount of time. Snapshot the
       // provider payload so the label the user approved and the effect returned to
@@ -122,8 +122,9 @@ export function normalizeDurablePermissionChangeSet(
     };
   } catch {
     // SDK data is expected to be plain structured-cloneable input. Treat an
-    // accessor, function, proxy, or other non-wire value as an invalid bundle
-    // instead of failing the whole permission callback before a safe prompt.
+    // accessor, function, proxy, or other non-wire value as an invalid bundle.
+    // Validation belongs in this boundary too because merely reading one of those
+    // values can throw before structuredClone gets a chance to reject it.
     return undefined;
   }
 }

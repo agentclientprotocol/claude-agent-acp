@@ -2,6 +2,7 @@ import type { PermissionOption } from "@agentclientprotocol/sdk";
 import {
   allowOnce,
   exactLocalAllowRule,
+  isMcpAllowChangeSet,
   PERMISSION_OPTION_ID,
   plainString,
   type PermissionOptionContext,
@@ -132,7 +133,10 @@ export function buildFallbackPermissionOptions(
   const toolLabel = plainString(context.displayName) ?? context.toolName;
   if (context.toolName.startsWith("mcp__")) {
     const changeSet =
-      context.allowPersistentOptions === false ? undefined : context.durableChangeSet;
+      context.allowPersistentOptions !== false &&
+      isMcpAllowChangeSet(context.durableChangeSet, context.toolName)
+        ? context.durableChangeSet
+        : undefined;
     return withOptionalUpdate(
       changeSet,
       changeSet ? `Yes, and don't ask again for ${toolLabel} commands` : undefined,
@@ -142,27 +146,6 @@ export function buildFallbackPermissionOptions(
     return withGeneratedUpdate(`Yes, and don't ask again for ${toolLabel} commands`);
   }
   return [allowOnce(), reject("No")];
-}
-
-// These named builders intentionally remain separate. Claude Code gives these
-// feature-gated tools dedicated dialogs; the SDK callback does not expose the
-// renderer-specific state needed to reproduce them over ACP v1 yet.
-export function buildReviewArtifactPermissionOptions(
-  context: PermissionOptionContext,
-): PermissionOption[] {
-  return buildFallbackPermissionOptions(context);
-}
-
-export function buildWorkflowPermissionOptions(
-  context: PermissionOptionContext,
-): PermissionOption[] {
-  return buildFallbackPermissionOptions(context);
-}
-
-export function buildMonitorPermissionOptions(
-  context: PermissionOptionContext,
-): PermissionOption[] {
-  return buildFallbackPermissionOptions(context);
 }
 
 const COMPUTER_USE_MCP_TOOL_PREFIX = "mcp__computer-use__";
@@ -175,7 +158,11 @@ export function buildComputerUseMcpPermissionOptions(
   context: PermissionOptionContext,
 ): PermissionOption[] {
   const toolLabel = plainString(context.displayName) ?? context.toolName;
-  const changeSet = context.allowPersistentOptions === false ? undefined : context.durableChangeSet;
+  const changeSet =
+    context.allowPersistentOptions !== false &&
+    isMcpAllowChangeSet(context.durableChangeSet, context.toolName)
+      ? context.durableChangeSet
+      : undefined;
   return withOptionalUpdate(
     changeSet,
     changeSet ? `Yes, and don't ask again for ${toolLabel}` : undefined,

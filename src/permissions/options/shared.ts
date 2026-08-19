@@ -79,6 +79,27 @@ export function exactLocalAllowRule(
   );
 }
 
+/**
+ * An MCP "don't ask again" option is only truthful when every provider update
+ * adds an unrestricted allow rule for the tool currently being prompted.
+ */
+export function isMcpAllowChangeSet(
+  changeSet: DurablePermissionChangeSet | undefined,
+  toolName: string,
+): boolean {
+  return (
+    !!changeSet &&
+    changeSet.updates.length > 0 &&
+    changeSet.updates.every(
+      (update) =>
+        update.type === "addRules" &&
+        update.behavior === "allow" &&
+        update.rules.length > 0 &&
+        update.rules.every((rule) => rule.toolName === toolName && rule.ruleContent === undefined),
+    )
+  );
+}
+
 export function withGeneratedUpdate(name: string, rejectName = "No"): PermissionOption[] {
   return [allowOnce(), allowWithUpdates(name), reject(rejectName)];
 }

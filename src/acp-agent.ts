@@ -120,11 +120,10 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
-import { exitPlanClearContextMode } from "./permissions/effects.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
-import { mapClaudePermissionResponse } from "./permissions/response.js";
+import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
 import {
   activeUsageLimitMessage,
@@ -174,6 +173,10 @@ import {
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import { continuePlanInFreshContext } from "./clear-context-coordinator.js";
+import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+
+export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -3760,7 +3763,7 @@ export class ClaudeAcpAgent {
                   pendingExitPlanContextReset.toolUseId ===
                     pendingExitPlanModeInterruption.toolUseId
                 ) {
-                  await this.continuePlanInFreshContext(
+                  await this.restartAcceptedPlan(
                     params.sessionId,
                     session,
                     pendingExitPlanContextReset,
@@ -4899,88 +4902,44 @@ export class ClaudeAcpAgent {
     session.query.close();
   }
 
-  /** Continue an accepted plan on a new private Claude conversation while the
-   * public ACP session and its pending turn stay unchanged. */
-  private async continuePlanInFreshContext(
+  /** Adapt the agent's session operations to the focused clear-context
+   * coordinator. */
+  private async restartAcceptedPlan(
     sessionId: string,
     oldSession: Session,
     reset: NonNullable<Session["pendingExitPlanContextReset"]>,
   ): Promise<void> {
-    const turn = oldSession.activeTurn;
-    if (!turn || turn.settled || this.sessions[sessionId] !== oldSession) {
-      throw new Error("Cannot clear context without an active ACP turn");
-    }
-
-    const originalParams = oldSession.creationParams ?? { cwd: oldSession.cwd, mcpServers: [] };
-    const currentEffort = oldSession.configOptions.find(
-      (option) => option.id === EFFORT_CONFIG_ID,
-    )?.currentValue;
-    const originalMeta = originalParams._meta as NewSessionMeta | undefined;
-    const originalOptions = originalMeta?.claudeCode?.options;
-    const restartMeta: NewSessionMeta = {
-      ...(originalMeta ?? {}),
-      claudeCode: {
-        ...(originalMeta?.claudeCode ?? {}),
-        options: {
-          ...originalOptions,
-          ...(oldSession.models.currentModelId !== "default"
-            ? { model: oldSession.models.currentModelId }
-            : {}),
-          ...(oldSession.currentAgent !== DEFAULT_AGENT_ID
-            ? { agent: oldSession.currentAgent }
-            : {}),
-          ...(typeof currentEffort === "string" && currentEffort !== "default"
-            ? { effort: currentEffort as EffortLevel }
-            : {}),
-        },
+    await continuePlanInFreshContext(sessionId, oldSession, reset, {
+      currentSession: (id) => this.sessions[id],
+      closeQueryStream: (session) => this.closeQueryStream(session),
+      restartSession: async (params, options) => {
+        await this.createSession(params, options);
+        const session = this.sessions[sessionId];
+        if (!session) throw new Error("Fresh Claude context was not created");
+        return session;
       },
-    };
-
-    turn.carriedUsage = { ...oldSession.accumulatedUsage };
-    oldSession.pendingExitPlanContextReset = undefined;
-    this.closeQueryStream(oldSession);
-
-    await this.createSession(
-      { ...originalParams, _meta: restartMeta },
-      { publicSessionId: sessionId, permissionMode: reset.mode },
-    );
-    const freshSession = this.sessions[sessionId];
-    if (!freshSession) throw new Error("Fresh Claude context was not created");
-    if (oldSession.fastModeEnabled && !freshSession.fastModeEnabled) {
-      try {
-        await this.applyFastMode(freshSession, true);
-      } catch (error) {
-        this.logger.error("Failed to restore Fast mode after clearing context:", error);
-      }
-    }
-    oldSession.activeTurn = null;
-    oldSession.turnQueue = [];
-
-    const continuation = promptToClaude({
-      sessionId,
-      prompt: [{ type: "text", text: `Implement the following plan:\n\n${reset.plan}` }],
+      applyFastMode: (session) => this.applyFastMode(session, true),
+      publishSessionState: async (id, mode, configOptions) => {
+        await this.client.sessionUpdate({
+          sessionId: id,
+          update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+        });
+        await this.client.sessionUpdate({
+          sessionId: id,
+          update: { sessionUpdate: "config_option_update", configOptions },
+        });
+      },
+      continuationMessage: (id, plan, promptUuid) => {
+        const continuation = promptToClaude({
+          sessionId: id,
+          prompt: [{ type: "text", text: `Implement the following plan:\n\n${plan}` }],
+        });
+        continuation.uuid = promptUuid as ReturnType<typeof randomUUID>;
+        return continuation;
+      },
+      ensureConsumer: (session, id) => this.ensureConsumer(session, id),
+      logError: (message, error) => this.logger.error(message, error),
     });
-    continuation.uuid = turn.promptUuid as ReturnType<typeof randomUUID>;
-    freshSession.turnQueue = [turn];
-    freshSession.contextUsedTokens = 0;
-
-    try {
-      await this.client.sessionUpdate({
-        sessionId,
-        update: { sessionUpdate: "current_mode_update", currentModeId: reset.mode },
-      });
-      await this.client.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "config_option_update",
-          configOptions: freshSession.configOptions,
-        },
-      });
-    } catch (error) {
-      this.logger.error("Failed to publish clear-context session state:", error);
-    }
-    freshSession.input.push(continuation);
-    this.ensureConsumer(freshSession, sessionId);
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
@@ -5618,19 +5577,15 @@ export class ClaudeAcpAgent {
         parentToolUseId,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
-      const permissionResult = mapClaudePermissionResponse(
-        response,
-        toolName,
-        toolInput,
-        toolUseID,
-        permissionOptions,
-        durableChangeSet,
-      );
-      const selectedOptionId =
-        response.outcome?.outcome === "selected" ? response.outcome.optionId : undefined;
-      const clearContextMode = selectedOptionId
-        ? exitPlanClearContextMode(selectedOptionId)
-        : undefined;
+      const { permissionResult, contextResetMode: clearContextMode } =
+        decodeClaudePermissionResponse(
+          response,
+          toolName,
+          toolInput,
+          toolUseID,
+          permissionOptions,
+          durableChangeSet,
+        );
       if (toolName === "ExitPlanMode" && clearContextMode) {
         const plan = typeof toolInput.plan === "string" ? toolInput.plan.trim() : "";
         if (!plan) throw new Error("ExitPlanMode clear-context selection requires a plan");
@@ -7060,8 +7015,6 @@ export const BUILTIN_AGENT_NAMES = new Set([
 // reserved sentinel: a custom agent named exactly this would collide with it
 // (two options sharing the value, selection silently routing to `null`), so we
 // exclude that name from discovery.
-export const DEFAULT_AGENT_ID = "default";
-
 /** Discover user/plugin/project-configured main-thread agents, excluding the
  *  built-in subagents and the reserved "default" sentinel. Returns an empty
  *  list if discovery fails so a flaky control request never blocks session
@@ -7081,7 +7034,6 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  same identifiers and can't drift apart. */
 export const MODE_CONFIG_ID = "mode";
 export const MODEL_CONFIG_ID = "model";
-export const EFFORT_CONFIG_ID = "effort";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
 

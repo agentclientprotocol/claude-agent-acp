@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import { normalizeDurablePermissionChangeSet } from "../permissions/normalization.js";
 import { buildClaudePermissionOptions, PERMISSION_OPTION_ID } from "../permissions/options.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
-import { mapClaudePermissionResponse } from "../permissions/response.js";
+import { decodeClaudePermissionResponse } from "../permissions/response.js";
+
+const permissionResult = (...args: Parameters<typeof decodeClaudePermissionResponse>) =>
+  decodeClaudePermissionResponse(...args).permissionResult;
 
 const rule = { toolName: "Bash", ruleContent: "npm test:*" };
 describe("Claude permission options and response mapping", () => {
@@ -182,7 +185,7 @@ describe("Claude permission options and response mapping", () => {
       "Yes, and don't ask again for Write tool commands",
       "No",
     ]);
-    const result = mapClaudePermissionResponse(
+    const result = permissionResult(
       { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowWithUpdates } },
       toolName,
       { value: "new" },
@@ -192,6 +195,94 @@ describe("Claude permission options and response mapping", () => {
     );
     expect(result.behavior === "allow" && result.updatedPermissions).toEqual(changeSet?.updates);
   });
+
+  it.each(["mcp__example__write_tool", "mcp__computer-use__click"])(
+    "offers no misleading durable option for unrepresentable %s suggestions",
+    (toolName) => {
+      const cases = [
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName }],
+            behavior: "deny",
+            destination: "localSettings",
+          },
+        ],
+        [{ type: "setMode", mode: "bypassPermissions", destination: "session" }],
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName: "mcp__other__tool" }],
+            behavior: "allow",
+            destination: "localSettings",
+          },
+        ],
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName }],
+            behavior: "allow",
+            destination: "localSettings",
+          },
+          {
+            type: "addRules",
+            rules: [{ toolName: "mcp__other__tool" }],
+            behavior: "allow",
+            destination: "localSettings",
+          },
+        ],
+        [
+          {
+            type: "addRules",
+            rules: [{ toolName, ruleContent: "target:staging" }],
+            behavior: "allow",
+            destination: "localSettings",
+          },
+        ],
+      ] as const;
+
+      for (const suggestions of cases) {
+        const changeSet = normalizeDurablePermissionChangeSet(suggestions);
+        expect(build(toolName, changeSet).map((option) => option.optionId)).toEqual([
+          PERMISSION_OPTION_ID.allowOnce,
+          PERMISSION_OPTION_ID.reject,
+        ]);
+      }
+    },
+  );
+
+  it.each(["mcp__example__write_tool", "mcp__computer-use__click"])(
+    "preserves the complete representable provider bundle for %s",
+    (toolName) => {
+      const changeSet = normalizeDurablePermissionChangeSet([
+        {
+          type: "addRules",
+          rules: [{ toolName }, { toolName }],
+          behavior: "allow",
+          destination: "session",
+        },
+        {
+          type: "addRules",
+          rules: [{ toolName }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ]);
+      const offered = build(toolName, changeSet);
+      expect(offered.map((option) => option.optionId)).toContain(
+        PERMISSION_OPTION_ID.allowWithUpdates,
+      );
+      const result = permissionResult(
+        { outcome: { outcome: "selected", optionId: PERMISSION_OPTION_ID.allowWithUpdates } },
+        toolName,
+        {},
+        `tool-${toolName}`,
+        offered,
+        changeSet,
+      );
+      expect(result.behavior === "allow" && result.updatedPermissions).toEqual(changeSet?.updates);
+    },
+  );
 
   it.each([
     ["Read", { file_path: "/workspace/a.ts" }, "Yes, during this session"],
@@ -454,7 +545,7 @@ describe("Claude permission options and response mapping", () => {
       "Yes, and don't ask again for Click",
       "No",
     ]);
-    const result = mapClaudePermissionResponse(
+    const result = permissionResult(
       {
         outcome: {
           outcome: "selected",

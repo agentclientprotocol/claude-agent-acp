@@ -9,6 +9,7 @@ import { PERMISSION_OPTION_ID } from "./options.js";
 
 export interface ClaudePermissionSelection {
   optionId: string;
+  contextResetMode?: PermissionMode;
 }
 
 export interface ClaudePermissionEffectContext {
@@ -21,9 +22,13 @@ export interface ClaudePermissionEffectContext {
 /** Parse the ACP envelope once before dispatching to a tool-specific effect. */
 export function parseClaudePermissionSelection(
   response: RequestPermissionResponse,
+  toolName: string,
 ): ClaudePermissionSelection {
   if (response.outcome?.outcome !== "selected") throw new Error("Tool use aborted");
-  return { optionId: response.outcome.optionId };
+  const optionId = response.outcome.optionId;
+  const contextResetMode =
+    toolName === "ExitPlanMode" ? exitPlanClearContextMode(optionId) : undefined;
+  return { optionId, ...(contextResetMode ? { contextResetMode } : {}) };
 }
 
 function allow(
@@ -60,22 +65,11 @@ function skillName(input: Record<string, unknown>): string {
   return value;
 }
 
-function skillPermissionUpdate(ruleContent: string): PermissionUpdate[] {
+function localAllowRuleUpdate(toolName: string, ruleContent?: string): PermissionUpdate[] {
   return [
     {
       type: "addRules",
-      rules: [{ toolName: "Skill", ruleContent }],
-      behavior: "allow",
-      destination: "localSettings",
-    },
-  ];
-}
-
-function wholeToolPermissionUpdate(toolName: string): PermissionUpdate[] {
-  return [
-    {
-      type: "addRules",
-      rules: [{ toolName }],
+      rules: [{ toolName, ...(ruleContent === undefined ? {} : { ruleContent }) }],
       behavior: "allow",
       destination: "localSettings",
     },
@@ -91,14 +85,7 @@ function webFetchPermissionUpdate(input: Record<string, unknown>): PermissionUpd
     throw new Error("Invalid WebFetch permission input");
   }
   if (!hostname) throw new Error("Invalid WebFetch permission input");
-  return [
-    {
-      type: "addRules",
-      rules: [{ toolName: "WebFetch", ruleContent: `domain:${hostname}` }],
-      behavior: "allow",
-      destination: "localSettings",
-    },
-  ];
+  return localAllowRuleUpdate("WebFetch", `domain:${hostname}`);
 }
 
 function applySkillSelection(
@@ -107,13 +94,13 @@ function applySkillSelection(
 ): PermissionResult {
   switch (selection.optionId) {
     case PERMISSION_OPTION_ID.allowSkillExact: {
-      return allow(context, skillPermissionUpdate(skillName(context.input)), true);
+      return allow(context, localAllowRuleUpdate("Skill", skillName(context.input)), true);
     }
     case PERMISSION_OPTION_ID.allowSkillPrefix: {
       const skill = skillName(context.input);
       const spaceIndex = skill.indexOf(" ");
       if (spaceIndex <= 0) throw new Error("Skill prefix permission requires arguments");
-      return allow(context, skillPermissionUpdate(`${skill.slice(0, spaceIndex)}:*`), true);
+      return allow(context, localAllowRuleUpdate("Skill", `${skill.slice(0, spaceIndex)}:*`), true);
     }
     default:
       return applyCommonSelection(selection, context);
@@ -152,7 +139,7 @@ function applyExitPlanModeSelection(
   selection: ClaudePermissionSelection,
   context: ClaudePermissionEffectContext,
 ): PermissionResult {
-  if (exitPlanClearContextMode(selection.optionId)) {
+  if (selection.contextResetMode) {
     // The adapter consumes this interrupt and continues the same ACP turn on a
     // fresh Claude query. Returning allow here would execute ExitPlanMode in
     // the old context before the handoff.
@@ -230,7 +217,7 @@ export function applyClaudePermissionSelection(
         return applyCommonSelection(selection, context);
       }
       return applyGeneratedDurableSelection(selection, context, () =>
-        wholeToolPermissionUpdate(context.toolName),
+        localAllowRuleUpdate(context.toolName),
       );
   }
 }
