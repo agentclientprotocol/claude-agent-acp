@@ -280,7 +280,7 @@ describe("session titles at turn-end", () => {
     expect(titles()).toEqual([LONG_PROMPT]);
   });
 
-  it("skips slash-command and bash openers when building the title context", async () => {
+  it("skips argument-less slash commands and bash openers when building the title context", async () => {
     const { client } = titleRecorder();
     const agent = newAgent(client);
 
@@ -296,10 +296,43 @@ describe("session titles at turn-end", () => {
 
     await agent.prompt({
       sessionId: "test-session",
-      prompt: [{ type: "text", text: "/compact keep the design discussion" }],
+      prompt: [{ type: "text", text: "/compact" }],
     });
     await agent.sessions["test-session"]?.consumer;
 
     expect(generateSessionTitle).not.toHaveBeenCalled();
+  });
+
+  it("includes slash-command arguments in the title context", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: "/investigate-alert kafka lag on prod-3",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    const { query, generateSessionTitle } = wrapTitleQuery(
+      oneTurn(input),
+      "Investigate Kafka lag alert on prod-3",
+    );
+    agent.sessions["test-session"] = mockSessionState({ query, input }, agent);
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/investigate-alert kafka lag on prod-3" }],
+    });
+    await agent.sessions["test-session"]?.consumer;
+
+    await vi.waitFor(() => {
+      expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+    });
+    expect(generateSessionTitle).toHaveBeenCalledWith(
+      expect.stringContaining("/investigate-alert kafka lag on prod-3"),
+      { persist: true },
+    );
+    expect(titles()).toEqual(["Investigate Kafka lag alert on prod-3"]);
   });
 });

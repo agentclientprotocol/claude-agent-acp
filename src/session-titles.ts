@@ -61,14 +61,6 @@ export function appendTitleContext(previous: string | undefined, text: string): 
   return next.length > MAX_TITLE_CONTEXT_LENGTH ? next.slice(-MAX_TITLE_CONTEXT_LENGTH) : next;
 }
 
-/** Whether a prompt is worth titling a session after. The CLI's own auto-title
- *  path skips slash commands, `!bash` lines and tagged system text; match it, or
- *  sessions end up named "/compact". */
-function isTitleWorthyPrompt(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length > 0 && !/^[/!<]/.test(trimmed);
-}
-
 /** Whether this SDK still offers on-demand title generation. */
 function supportsTitleGeneration(query: Query): boolean {
   return typeof (query as TitleCapableQuery).generateSessionTitle === "function";
@@ -107,9 +99,7 @@ export class SessionTitles {
       .flatMap((chunk) => (chunk.type === "text" ? [chunk.text] : []))
       .join("\n");
 
-    if (isTitleWorthyPrompt(promptText)) {
       this.context = appendTitleContext(this.context, `\n${promptText}\n`);
-    }
   }
 
   /** Collect the assistant's own answer for the title. Chunks are appended
