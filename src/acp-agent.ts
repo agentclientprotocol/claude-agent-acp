@@ -100,8 +100,12 @@ import {
   asSdkSessionNotification,
   clientSupportsSubagents,
   SubagentAwareSessionCapabilities,
-  SubagentState,
 } from "./acp-subagents.js";
+import {
+  finishNativeSubagents,
+  NativeSubagent,
+  NativeSubagentRuntime,
+} from "./native-subagents.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -454,20 +458,6 @@ type Turn = {
   /** Settles after the ACP prompt request completes, regardless of outcome. */
   completion?: Promise<void>;
 };
-
-type NativeSubagent = {
-  sessionId: string;
-  parentSessionId: string;
-  parentToolUseId?: string;
-  name: string;
-  task: string;
-  announced?: boolean;
-  terminalState?: SubagentState;
-};
-
-const MAX_PENDING_NATIVE_SUBAGENT_PARENTS = 64;
-const MAX_PENDING_NATIVE_SUBAGENT_UPDATES = 256;
-const MAX_PENDING_NATIVE_SUBAGENT_UPDATES_PER_PARENT = 32;
 
 export type Session = {
   query: Query;
@@ -1037,33 +1027,6 @@ export type ToolUpdateMeta = {
     signal: string | null;
   };
 };
-
-function nativeSubagentState(status: unknown): SubagentState | undefined {
-  switch (status) {
-    case "completed":
-      return "completed";
-    case "failed":
-      return "failed";
-    case "killed":
-    case "stopped":
-    case "cancelled":
-      return "cancelled";
-    default:
-      return undefined;
-  }
-}
-
-function subagentDisplayName(type: unknown, taskId: string): string {
-  if (typeof type === "string" && type.trim().length > 0) return type.trim();
-  const suffix = taskId.length > 8 ? taskId.slice(-8) : taskId;
-  return `Agent ${suffix}`;
-}
-
-function subagentTask(description: unknown): string {
-  return typeof description === "string" && description.trim().length > 0
-    ? description.trim()
-    : "Delegated task";
-}
 
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
@@ -2239,105 +2202,20 @@ export class ClaudeAcpAgent {
      *  recognizable by the `parentToolUseId` meta that toAcpNotifications
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
-    const nativeSubagentsEnabled = clientSupportsSubagents(this.clientCapabilities);
-    const nativeSubagents = (session.nativeSubagentsByTaskId ??= new Map());
-    const nativeSubagentTaskByToolUse = (session.nativeSubagentTaskIdByToolUseId ??= new Map());
-    const nativeSubagentParentByToolUse = (session.nativeSubagentParentByToolUseId ??= new Map());
-    const pendingNativeSubagentUpdates = new Map<string, AcpSessionNotification[]>();
-    let pendingNativeSubagentUpdateCount = 0;
-
-    const takePendingNativeSubagentUpdates = (parentToolUseId: string) => {
-      const pending = pendingNativeSubagentUpdates.get(parentToolUseId) ?? [];
-      if (pending.length > 0) {
-        pendingNativeSubagentUpdates.delete(parentToolUseId);
-        pendingNativeSubagentUpdateCount -= pending.length;
-      }
-      return pending;
-    };
-
-    const bufferNativeSubagentUpdate = (
-      parentToolUseId: string,
-      notification: AcpSessionNotification,
-    ) => {
-      const pending = pendingNativeSubagentUpdates.get(parentToolUseId);
-      if (
-        pendingNativeSubagentUpdateCount >= MAX_PENDING_NATIVE_SUBAGENT_UPDATES ||
-        (pending === undefined &&
-          pendingNativeSubagentUpdates.size >= MAX_PENDING_NATIVE_SUBAGENT_PARENTS) ||
-        (pending?.length ?? 0) >= MAX_PENDING_NATIVE_SUBAGENT_UPDATES_PER_PARENT
-      ) {
-        this.logger.log(
-          `Session ${params.sessionId}: dropping unattributed subagent update for ${parentToolUseId}; pending buffer limit reached`,
-        );
-        return;
-      }
-      if (pending) {
-        pending.push(notification);
-      } else {
-        pendingNativeSubagentUpdates.set(parentToolUseId, [notification]);
-      }
-      pendingNativeSubagentUpdateCount++;
-    };
+    const subagents = new NativeSubagentRuntime(
+      clientSupportsSubagents(this.clientCapabilities),
+      params.sessionId,
+      session,
+      async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
+      this.logger,
+    );
 
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
         { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
-      const isSubagentControl =
-        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-        (claudeMeta?.subagent === true ||
-          claudeMeta?.toolName === "Agent" ||
-          claudeMeta?.toolName === "Task");
-
-      if (!nativeSubagentsEnabled && (isSubagentControl || claudeMeta?.parentToolUseId)) {
-        // Child sessions are a bilateral capability. Without negotiation, do
-        // not fall back to provider-specific Agent/Task tools or nested output.
-        // Permission requests bypass this notification path and remain rooted.
-        return;
-      }
-
-      if (nativeSubagentsEnabled && isSubagentControl) {
-        const parentTaskId = claudeMeta.parentToolUseId
-          ? nativeSubagentTaskByToolUse.get(claudeMeta.parentToolUseId)
-          : undefined;
-        const parentSessionId = parentTaskId
-          ? nativeSubagents.get(parentTaskId)?.sessionId
-          : params.sessionId;
-        nativeSubagentParentByToolUse.set(update.toolCallId, parentSessionId ?? params.sessionId);
-        // `task_started` and the assistant frame containing its Agent/Task
-        // tool_use are separate SDK events with no ordering guarantee. If the
-        // start arrived first, it was deliberately left unannounced until this
-        // frame supplied the immediate parent for a nested child.
-        for (const child of nativeSubagents.values()) {
-          if (child.parentToolUseId !== update.toolCallId || child.announced) continue;
-          child.parentSessionId = parentSessionId ?? params.sessionId;
-          await this.announceNativeSubagent(child);
-          for (const pending of takePendingNativeSubagentUpdates(update.toolCallId)) {
-            await sendUpdate(pending);
-          }
-        }
-        // Native clients receive a dedicated subagent session and timeline
-        // lifecycle. Emitting the legacy Agent/Task tool call as well would
-        // create a duplicate representation of the same worker.
-        return;
-      }
-
-      let routedNotification = notification;
-      if (nativeSubagentsEnabled && claudeMeta?.parentToolUseId) {
-        const taskId = nativeSubagentTaskByToolUse.get(claudeMeta.parentToolUseId);
-        const child = taskId ? nativeSubagents.get(taskId) : undefined;
-        if (!child || !child.announced) {
-          bufferNativeSubagentUpdate(claudeMeta.parentToolUseId, notification);
-          return;
-        }
-        if (child.terminalState !== undefined) {
-          this.logger.log(
-            `Session ${params.sessionId}: ignoring late update for terminal subagent ${child.sessionId}`,
-          );
-          return;
-        }
-        routedNotification = { ...notification, sessionId: child.sessionId };
-      }
+      const routedNotification = await subagents.route(notification, sendUpdate);
+      if (!routedNotification) return;
       if (
         isFileChangeAuditReportPhase(session.activeTurn?.fileChangeAudit) &&
         (update.sessionUpdate === "agent_message_chunk" ||
@@ -2360,31 +2238,6 @@ export class ClaudeAcpAgent {
     // the client passed to it. Keep those later updates on the same child-aware
     // routing path as the immediate notifications.
     const routedNotificationClient = { sessionUpdate: sendUpdate } as unknown as AcpClient;
-
-    const finishNativeSubagent = async (taskId: string, status: unknown): Promise<void> => {
-      if (!nativeSubagentsEnabled) return;
-      const state = nativeSubagentState(status);
-      const child = nativeSubagents.get(taskId);
-      if (!state || !child || child.terminalState !== undefined) return;
-      // A provider may omit or reorder the assistant Agent/Task frame. The
-      // lifecycle must still be well-formed, so fall back to the root parent
-      // only when the task is already terminal and no lineage frame arrived.
-      await this.announceNativeSubagent(child);
-      if (child.parentToolUseId) {
-        for (const pending of takePendingNativeSubagentUpdates(child.parentToolUseId)) {
-          await sendUpdate(pending);
-        }
-      }
-      await this.finishNativeSubagent(session, taskId, state);
-    };
-
-    const finishNativeSubagents = async (state: SubagentState): Promise<void> => {
-      for (const taskId of [...nativeSubagents.keys()].reverse()) {
-        await finishNativeSubagent(taskId, state);
-      }
-      pendingNativeSubagentUpdates.clear();
-      pendingNativeSubagentUpdateCount = 0;
-    };
 
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
@@ -2959,7 +2812,7 @@ export class ClaudeAcpAgent {
           // a deferred turn's stored outcome (followup results never mutate
           // it), but the stored one is the authoritative source.
           const inFlight = session.activeTurn;
-          await finishNativeSubagents(session.cancelled ? "cancelled" : "failed");
+          await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
           settleActive(
             session.cancelled
               ? turnOutcome(session, "cancelled")
@@ -3525,41 +3378,15 @@ export class ClaudeAcpAgent {
                   parentToolUseId: message.tool_use_id,
                   isSubagent: !!message.subagent_type,
                 });
-                if (nativeSubagentsEnabled && message.subagent_type) {
-                  const existing = nativeSubagents.get(message.task_id);
-                  if (!existing) {
-                    const knownParentSessionId = message.tool_use_id
-                      ? nativeSubagentParentByToolUse.get(message.tool_use_id)
-                      : undefined;
-                    const child: NativeSubagent = {
-                      sessionId: message.task_id,
-                      parentSessionId: knownParentSessionId ?? params.sessionId,
-                      parentToolUseId: message.tool_use_id,
-                      name: subagentDisplayName(message.subagent_type, message.task_id),
-                      task: subagentTask(message.description),
-                    };
-                    nativeSubagents.set(message.task_id, child);
-                    if (message.tool_use_id) {
-                      nativeSubagentTaskByToolUse.set(message.tool_use_id, message.task_id);
-                    }
-                    // If the spawning tool frame has already supplied lineage,
-                    // announce immediately. Otherwise wait for that frame so a
-                    // nested child is not incorrectly attached to the root.
-                    if (knownParentSessionId || !message.tool_use_id) {
-                      await this.announceNativeSubagent(child);
-                      for (const notification of message.tool_use_id
-                        ? takePendingNativeSubagentUpdates(message.tool_use_id)
-                        : []) {
-                        await sendUpdate(notification);
-                      }
-                    }
-                  }
-                } else if (nativeSubagentsEnabled && message.tool_use_id) {
-                  // Early output carrying this id cannot belong to a native
-                  // subagent once task_started identifies it as another kind
-                  // of background task.
-                  takePendingNativeSubagentUpdates(message.tool_use_id);
-                }
+                await subagents.taskStarted(
+                  {
+                    taskId: message.task_id,
+                    toolUseId: message.tool_use_id,
+                    subagentType: message.subagent_type,
+                    description: message.description,
+                  },
+                  sendUpdate,
+                );
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
@@ -3567,10 +3394,8 @@ export class ClaudeAcpAgent {
               case "task_notification":
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
-                await finishNativeSubagent(message.task_id, message.status);
-                if (nativeSubagentsEnabled && message.tool_use_id) {
-                  takePendingNativeSubagentUpdates(message.tool_use_id);
-                }
+                await subagents.finishTask(message.task_id, message.status, sendUpdate);
+                if (message.tool_use_id) subagents.discardPending(message.tool_use_id);
                 session.liveBackgroundTasks.delete(message.task_id);
                 break;
               case "task_updated":
@@ -3584,7 +3409,7 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  await finishNativeSubagent(message.task_id, message.patch.status);
+                  await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
                   session.liveBackgroundTasks.delete(message.task_id);
                 }
                 break;
@@ -4802,10 +4627,8 @@ export class ClaudeAcpAgent {
             // and task store are independent of the previous transcript.
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
-            await finishNativeSubagents("failed");
-            nativeSubagents.clear();
-            nativeSubagentTaskByToolUse.clear();
-            nativeSubagentParentByToolUse.clear();
+            await subagents.finishAll("failed", sendUpdate);
+            subagents.clear();
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
@@ -4842,7 +4665,7 @@ export class ClaudeAcpAgent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
-      await finishNativeSubagents(session.cancelled ? "cancelled" : "failed");
+      await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -4881,47 +4704,6 @@ export class ClaudeAcpAgent {
         );
         this.closeQueryStream(session);
       }
-    }
-  }
-
-  private async announceNativeSubagent(child: NativeSubagent): Promise<void> {
-    if (child.announced) return;
-    await this.client.sessionUpdate({
-      sessionId: child.parentSessionId,
-      update: {
-        sessionUpdate: "subagent_spawned",
-        subagentSessionId: child.sessionId,
-        name: child.name,
-        task: child.task,
-        capabilities: {},
-      },
-    });
-    child.announced = true;
-  }
-
-  private async finishNativeSubagent(
-    session: Session,
-    taskId: string,
-    state: SubagentState,
-  ): Promise<void> {
-    const child = session.nativeSubagentsByTaskId?.get(taskId);
-    if (!child || child.terminalState !== undefined) return;
-    await this.announceNativeSubagent(child);
-    child.terminalState = state;
-    await this.client.sessionUpdate({
-      sessionId: child.parentSessionId,
-      update: {
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: child.sessionId,
-        state,
-      },
-    });
-  }
-
-  private async finishNativeSubagents(session: Session, state: SubagentState): Promise<void> {
-    const taskIds = [...(session.nativeSubagentsByTaskId?.keys() ?? [])].reverse();
-    for (const taskId of taskIds) {
-      await this.finishNativeSubagent(session, taskId, state);
     }
   }
 
@@ -4969,7 +4751,9 @@ export class ClaudeAcpAgent {
     if (session.queryClosed) {
       return;
     }
-    await this.finishNativeSubagents(session, "cancelled");
+    await finishNativeSubagents(session, "cancelled", async (notification) =>
+      this.client.sessionUpdate(asSdkSessionNotification(notification)),
+    );
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
