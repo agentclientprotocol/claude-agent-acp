@@ -3050,12 +3050,36 @@ export class ClaudeAcpAgent {
 
     /** Complete a negotiated terminal failure on the prompt response itself,
      *  which is the canonical AIR carrier. Legacy clients keep the historical
-     *  JSON-RPC rejection path. */
+     *  JSON-RPC rejection path.
+     *
+     *  `auth_required` is the exception: ACP defines its JSON-RPC error as the
+     *  signal that starts the client's own auth flow (AIR parks the refused
+     *  prompt, shows its method chooser, and resumes the prompt after sign-in),
+     *  so replacing it with a successful `end_turn` would disable that flow.
+     *  Every client keeps the rejection; capable clients additionally receive
+     *  the signed-out *state* as one session-scoped failure whose `login`
+     *  action remains the way back in after the client's auth prompt is
+     *  dismissed. Its title stays the policy's client-neutral fallback — the
+     *  CLI's own text ("… Please run /login") is TUI advice, meaningless in an
+     *  ACP client, so it travels as expandable details instead. */
     const failActiveWithSessionFailure = async (
       kind: ClaudeFailureKind,
       error: unknown,
       title?: string,
     ) => {
+      if (kind === "auth_required") {
+        // One sign-out arrives twice — the synthetic login assistant message
+        // and the turn's error-shaped result repeat the same text — and the
+        // signed-out state does not change in between: publish once, and skip
+        // republishing while the previous sign-out is still active. A retry
+        // warning of the same kind is not a sign-out and must not suppress it.
+        if (!sessionFailures.hasActiveSessionError(kind)) {
+          await publishSessionFailure(kind, { turnScoped: false, details: title });
+        }
+        // Preserve legacy codes: only explicit `/login` signals trigger ACP's auth flow.
+        failActive(error);
+        return;
+      }
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
         failActive(error);
         return;

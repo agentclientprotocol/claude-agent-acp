@@ -296,6 +296,18 @@ export class SessionFailureController {
     }
   }
 
+  /** Whether a session-scoped error of `kind` is active. A turn-scoped
+   *  warning of the same kind (an `api_retry` notice) does not count: it
+   *  reports a retry in progress, not the state the error would publish. */
+  hasActiveSessionError(kind: ClaudeFailureKind): boolean {
+    for (const failure of this.state.active.values()) {
+      if (failure.kind === kind && failure.severity === "error" && failure.turnId === undefined) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   recordActive(failure: PublishedSessionFailure): void {
     this.state.revisions.set(failure.id, failure.revision);
     this.state.active.set(failure.id, failure);

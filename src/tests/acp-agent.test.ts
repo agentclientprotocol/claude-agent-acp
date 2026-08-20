@@ -6255,7 +6255,6 @@ describe("stop reason propagation", () => {
   });
 
   it.each([
-    ["authentication_failed", "access"],
     ["billing_error", "limit"],
     ["account_on_hold", "limit"],
     ["rate_limit", "limit"],
@@ -6392,6 +6391,52 @@ describe("stop reason propagation", () => {
     expect(JSON.stringify(updates)).not.toContain("sessionFailure");
   });
 
+  const sessionFailuresFromUpdates = (updates: SessionNotification[]) =>
+    updates.map((u) => (u.update as any)?._meta?.jetbrains?.air?.sessionFailure).filter(Boolean);
+
+  it("rejects authentication_failed and publishes a session-scoped access failure", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createAssistantError("authentication_failed", "Claude request failed."),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Claude request failed.",
+      }),
+    ]);
+
+    // The auth flow hangs off the JSON-RPC rejection (the client parks the
+    // prompt and runs its own sign-in), so the turn is rejected even for
+    // capable clients; the signed-out state travels separately as one
+    // session-scoped failure with a client-neutral title.
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
+    await agent.sessions["test-session"]?.consumer;
+    const failures = sessionFailuresFromUpdates(updates);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
+      expect.objectContaining({
+        category: "access",
+        severity: "error",
+        title: "Sign in to continue using Claude.",
+        details: "Claude request failed.",
+        actions: ["login"],
+      }),
+    );
+    expect(failures[0].id).toContain("session-error");
+  });
+
   it("recovers auth_required internally after a successful auth_status", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6420,22 +6465,23 @@ describe("stop reason propagation", () => {
       },
     ]);
 
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
-    const active = sessionFailureFromResponse(response);
-    expect(active).toEqual(
+    const failures = sessionFailuresFromUpdates(updates);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
       expect.objectContaining({
         category: "access",
         revision: 1,
-        title: "Authentication required.",
+        details: "Authentication required.",
       }),
     );
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-    expect(agent.sessions["test-session"].sessionFailureState.active.has(active.id)).toBe(false);
-    expect(JSON.stringify({ response, updates })).not.toContain("private login token");
+    expect(agent.sessions["test-session"].sessionFailureState.active.has(failures[0].id)).toBe(
+      false,
+    );
+    expect(JSON.stringify(updates)).not.toContain("private login token");
   });
 
   it("keeps auth_required active when auth_status reports an error", async () => {
@@ -6467,17 +6513,118 @@ describe("stop reason propagation", () => {
       },
     ]);
 
-    const response = await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
-    expect(sessionFailureFromResponse(response)).toEqual(
-      expect.objectContaining({ category: "access", severity: "error" }),
+    const failures = sessionFailuresFromUpdates(updates);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(expect.objectContaining({ category: "access", severity: "error" }));
+    expect(agent.sessions["test-session"].sessionFailureState.active.has(failures[0].id)).toBe(
+      true,
     );
-    expect(JSON.stringify(updates)).not.toContain("sessionFailure");
-    expect(JSON.stringify({ response, updates })).not.toContain("private login token");
-    expect(JSON.stringify({ response, updates })).not.toContain("private login error");
+    expect(JSON.stringify(updates)).not.toContain("private login token");
+    expect(JSON.stringify(updates)).not.toContain("private login error");
+  });
+
+  it("does not republish auth_required when the result repeats the login text", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    // The CLI reports one signed-out turn twice: the synthetic login assistant
+    // message rejects the turn, then the result repeats the same text. One
+    // session-scoped failure covers both; its title is the client-neutral
+    // fallback while the CLI's TUI advice travels as details.
+    const syntheticLogin = createAssistantError("authentication_failed");
+    syntheticLogin.message.model = "<synthetic>";
+    syntheticLogin.message.content = [
+      { type: "text", text: "Not logged in · Please run /login", citations: null },
+    ] as any;
+    injectSession(agent, [
+      syntheticLogin,
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Not logged in · Please run /login",
+      }),
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
+    await agent.sessions["test-session"]?.consumer;
+    const failures = sessionFailuresFromUpdates(updates);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
+      expect.objectContaining({
+        category: "access",
+        severity: "error",
+        title: "Sign in to continue using Claude.",
+        details: "Not logged in · Please run /login",
+      }),
+    );
+    expect([...agent.sessions["test-session"].sessionFailureState.active.keys()]).toEqual([
+      failures[0].id,
+    ]);
+  });
+
+  it("publishes the sign-out after an authentication_failed retry warning", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    // The retry notice is a turn-scoped `auth_required` warning. It reports a
+    // retry, not the signed-out state, so it must not suppress the
+    // session-scoped error that carries the `login` action.
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 1,
+        max_retries: 5,
+        retry_delay_ms: 100,
+        error_status: 401,
+        error: "authentication_failed",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createAssistantError("authentication_failed", "Claude request failed."),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "Claude request failed.",
+      }),
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).rejects.toThrow();
+    await agent.sessions["test-session"]?.consumer;
+    const failures = sessionFailuresFromUpdates(updates);
+    expect(failures.map((f) => f.severity)).toEqual(["warning", "error"]);
+    expect(failures[1]).toEqual(
+      expect.objectContaining({
+        category: "access",
+        title: "Sign in to continue using Claude.",
+        actions: ["login"],
+      }),
+    );
+    expect(failures[1].id).toContain("session-error");
   });
 
   it("keeps the historical failure record unchanged after recovery", async () => {
