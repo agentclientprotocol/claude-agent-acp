@@ -1070,17 +1070,6 @@ function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | 
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
 }
 
-function stripSubagentTextAndThinking(content: unknown): unknown {
-  if (!Array.isArray(content)) return content;
-  return content.filter(
-    (item) =>
-      !item ||
-      typeof item !== "object" ||
-      !("type" in item) ||
-      (item.type !== "text" && item.type !== "thinking"),
-  );
-}
-
 export type ToolUseCache = {
   [key: string]: {
     type: "tool_use" | "server_tool_use" | "mcp_tool_use";
@@ -3450,6 +3439,12 @@ export class ClaudeAcpAgent {
                 const parentToolUseId = message.agent_id
                   ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
                   : undefined;
+                if (message.agent_id && !parentToolUseId) {
+                  // An agent-scoped denial with missing lineage cannot safely
+                  // be presented in the root transcript. The matching hidden
+                  // child tool call was not announced there.
+                  break;
+                }
                 const reason = message.decision_reason ?? message.message;
                 await sendUpdate({
                   sessionId: message.session_id,
@@ -4749,6 +4744,13 @@ export class ClaudeAcpAgent {
             if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
               break;
             }
+            const subagentParentToolUseId = message.parent_tool_use_id
+              ? [...session.liveBackgroundTasks.values()].some(
+                  (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
+                )
+                ? message.parent_tool_use_id
+                : undefined
+              : undefined;
             await sendUpdate({
               sessionId: message.session_id,
               update: {
@@ -4758,6 +4760,9 @@ export class ClaudeAcpAgent {
                 _meta: {
                   claudeCode: {
                     toolName: message.tool_name,
+                    ...(subagentParentToolUseId
+                      ? { parentToolUseId: subagentParentToolUseId }
+                      : {}),
                     toolResponse: {
                       elapsedTimeSeconds: message.elapsed_time_seconds,
                       // For Agent/Task calls: the subagent's type, and — when
@@ -5370,7 +5375,6 @@ export class ClaudeAcpAgent {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
     const session = this.sessions[sessionId];
-    const forwardSubagentText = clientSupportsSubagents(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =
@@ -5445,8 +5449,14 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
-      if (message.type === "assistant" && parentToolUseId && !forwardSubagentText) {
-        content = stripSubagentTextAndThinking(content);
+      if (parentToolUseId) {
+        // Persisted SDK sidechains do not contain the authoritative
+        // task_started/task_updated lifecycle needed to reconstruct a native
+        // child session. Never replay them into the root transcript: an
+        // unsupported client must not see a legacy child representation, and
+        // a capable client must not receive child output without a preceding
+        // subagent_spawned event.
+        continue;
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {

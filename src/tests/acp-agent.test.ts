@@ -2148,50 +2148,14 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
-  it("preserves nested text and child tool attribution for capable clients", async () => {
+  it("does not replay child output without authoritative native lifecycle", async () => {
     const updates = await replay(true);
-    expect(updates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "nested report" },
-            _meta: expect.objectContaining({
-              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
-            }),
-          }),
-        }),
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: "tool_call",
-            toolCallId: "child-tool",
-            _meta: expect.objectContaining({
-              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
-            }),
-          }),
-        }),
-      ]),
-    );
+    expect(updates).toEqual([]);
   });
 
-  it("keeps legacy text filtering without losing child tool attribution", async () => {
+  it("does not create a legacy child representation for unsupported clients", async () => {
     const updates = await replay(false);
-    expect(updates.some(({ update }) => update.sessionUpdate === "agent_message_chunk")).toBe(
-      false,
-    );
-    expect(updates).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          update: expect.objectContaining({
-            sessionUpdate: "tool_call",
-            toolCallId: "child-tool",
-            _meta: expect.objectContaining({
-              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
-            }),
-          }),
-        }),
-      ]),
-    );
+    expect(updates).toEqual([]);
   });
 });
 
@@ -16091,6 +16055,26 @@ describe("tool_progress heartbeats", () => {
 
     expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_inner"]);
   });
+
+  it("hides a child tool beat without native negotiation", async () => {
+    const sent = await run(
+      [
+        {
+          type: "system",
+          subtype: "task_started",
+          task_id: "agent-1",
+          tool_use_id: "toolu_task",
+          subagent_type: "general-purpose",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        beat("toolu_inner", "toolu_task", { heartbeat: undefined }),
+      ],
+      ["toolu_task", "toolu_inner"],
+    );
+
+    expect(sent).toEqual([]);
+  });
 });
 
 describe("permission_denied", () => {
@@ -16309,17 +16293,12 @@ describe("permission_denied", () => {
     expect(denials(updates)).toEqual([]);
   });
 
-  // The attribution rests on `task_started` having been seen for the agent id.
-  // If it wasn't, the denial still resolves the call — unattributed beats
-  // dropped.
-  it("still resolves a subagent denial when the parent is unknown", async () => {
+  it("drops an agent-scoped denial when the parent is unknown", async () => {
     const updates = await run([
       toolUse("toolu_inner", "toolu_agent"),
       denial("toolu_inner", { agent_id: "agent-unknown" }),
     ]);
 
-    const sent = denials(updates);
-    expect(sent).toHaveLength(1);
-    expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
+    expect(denials(updates)).toEqual([]);
   });
 });
