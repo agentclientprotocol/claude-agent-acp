@@ -19,8 +19,17 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/session-failure-extension.md)
 - Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/permission-extension.md)
+- Color-coded tool category metadata for richer client rendering
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+
+### Tool category tags
+
+Each `tool_call` and input-refinement `tool_call_update` includes a compact presentation hint in
+`_meta.claudeCode.tags`. A tag has a user-visible `label` and a CSS-compatible `color`, for example
+`[{ "label": "Execute", "color": "#D97706" }]` for Bash. Built-in tools are grouped as Execute,
+Edit, Search, Delegate, Plan, or Skill; unknown tools receive a neutral Tool tag. This namespaced
+metadata is optional for clients: ignoring it preserves normal ACP tool-call rendering.
 
 ### Subagent sessions
 

@@ -751,7 +751,13 @@ describe("tool conversions", () => {
 
       expect(notifications[0]?.update).toMatchObject({
         sessionUpdate: "tool_call",
-        _meta: { claudeCode: { toolName: name, subagent: true } },
+        _meta: {
+          claudeCode: {
+            toolName: name,
+            subagent: true,
+            tags: [{ label: "Delegate", color: "#059669" }],
+          },
+        },
       });
     }
 
@@ -781,6 +787,32 @@ describe("tool conversions", () => {
         },
       },
     });
+  });
+
+  it("adds stable colored category tags to tool calls", () => {
+    const cases = [
+      ["Bash", "Execute", "#D97706"],
+      ["Edit", "Edit", "#2563EB"],
+      ["Grep", "Search", "#7C3AED"],
+      ["Skill", "Skill", "#DB2777"],
+      ["CustomTool", "Tool", "#6B7280"],
+    ] as const;
+
+    for (const [name, label, color] of cases) {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: `toolu_${name}`, name, input: {} }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        console,
+      );
+
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        _meta: { claudeCode: { toolName: name, tags: [{ label, color }] } },
+      });
+    }
   });
 
   it("should handle Grep tool calls", () => {
