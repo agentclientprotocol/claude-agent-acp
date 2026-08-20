@@ -1038,12 +1038,6 @@ export type ToolUpdateMeta = {
   };
 };
 
-const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
-
-function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
-  return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
-}
-
 function nativeSubagentState(status: unknown): SubagentState | undefined {
   switch (status) {
     case "completed":
@@ -2300,14 +2294,20 @@ export class ClaudeAcpAgent {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
         { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
-
-      if (
-        nativeSubagentsEnabled &&
+      const isSubagentControl =
         (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
         (claudeMeta?.subagent === true ||
           claudeMeta?.toolName === "Agent" ||
-          claudeMeta?.toolName === "Task")
-      ) {
+          claudeMeta?.toolName === "Task");
+
+      if (!nativeSubagentsEnabled && (isSubagentControl || claudeMeta?.parentToolUseId)) {
+        // Child sessions are a bilateral capability. Without negotiation, do
+        // not fall back to provider-specific Agent/Task tools or nested output.
+        // Permission requests bypass this notification path and remain rooted.
+        return;
+      }
+
+      if (nativeSubagentsEnabled && isSubagentControl) {
         const parentTaskId = claudeMeta.parentToolUseId
           ? nativeSubagentTaskByToolUse.get(claudeMeta.parentToolUseId)
           : undefined;
@@ -4685,13 +4685,10 @@ export class ClaudeAcpAgent {
               streamedBlocks.length = 0;
             } else if (
               message.type === "assistant" &&
-              !(session.forwardSubagentText || supportsSubagentTranscript(this.clientCapabilities))
+              !clientSupportsSubagents(this.clientCapabilities)
             ) {
-              // Legacy clients don't understand nested transcripts. Keep the
-              // historical behavior for them: subagent text/thinking remains
-              // internal to the tool call instead of leaking into the top-level
-              // feed. Capable clients opt into the branch above unchanged, with
-              // `parentToolUseId` stamped by toAcpNotifications.
+              // Child content has no visible fallback. Only bilaterally
+              // negotiated native sessions can receive it.
               content = message.message.content.filter(
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
@@ -5373,8 +5370,7 @@ export class ClaudeAcpAgent {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
     const session = this.sessions[sessionId];
-    const forwardSubagentText =
-      session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
+    const forwardSubagentText = clientSupportsSubagents(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =
@@ -5586,15 +5582,17 @@ export class ClaudeAcpAgent {
     // so emit it now if it hasn't been sent yet. The streamed tool_use chunk
     // later refines it with a `tool_call_update` rather than emitting a
     // duplicate (see `emittedToolCalls` in `toAcpNotifications`).
-    await this.ensureToolCallEmitted(
-      ownerSessionId,
-      toolName,
-      params.toolCall.toolCallId,
-      params.toolCall.rawInput,
-      parentToolUseId,
-      signal,
-      params.sessionId,
-    );
+    if (!parentToolUseId || clientSupportsSubagents(this.clientCapabilities)) {
+      await this.ensureToolCallEmitted(
+        ownerSessionId,
+        toolName,
+        params.toolCall.toolCallId,
+        params.toolCall.rawInput,
+        parentToolUseId,
+        signal,
+        params.sessionId,
+      );
+    }
     if (signal.aborted) throw new Error("Tool use aborted");
 
     // Do not rely on every ACP client settling requestPermission after the
@@ -5752,6 +5750,17 @@ export class ClaudeAcpAgent {
       // routes it through canUseTool whenever a callback is registered, rather
       // than the interactive dialog). Present it as an ACP form elicitation and
       // feed the answers back as updatedInput for the tool's own call() to read.
+      if (
+        toolName === "AskUserQuestion" &&
+        parentToolUseId &&
+        !clientSupportsSubagents(this.clientCapabilities)
+      ) {
+        return {
+          behavior: "deny",
+          message:
+            "Subagent input is unavailable because native subagent sessions were not negotiated.",
+        };
+      }
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
         // Like permission requests, the elicitation references this toolUseID, so
         // make sure the tool_call has surfaced to the client before we send it.
@@ -6433,9 +6442,7 @@ export class ClaudeAcpAgent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
-    const forwardSubagentText =
-      supportsSubagentTranscript(this.clientCapabilities) ||
-      userProvidedOptions?.forwardSubagentText === true;
+    const forwardSubagentText = clientSupportsSubagents(this.clientCapabilities);
 
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);

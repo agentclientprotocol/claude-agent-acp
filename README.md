@@ -22,16 +22,12 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-### Nested subagent transcripts
+### Subagent sessions
 
-ACP 1.2 has no standard subagent tool kind or nested-message relationship. Clients that can render
-nested transcripts can opt in with `clientCapabilities._meta["subagent-transcript"] = true`.
-The agent then forwards subagent text, thinking, and tool calls, relating nested updates to the
-launching Agent/Task call through `_meta.claudeCode.parentToolUseId`. Agent/Task calls are marked
-with `_meta.claudeCode.subagent = true`.
-
-Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
-the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
+Subagents are exposed only when the client advertises native ACP `subagents` support and the agent
+returns the matching session capability. Without bilateral negotiation, Agent/Task lifecycle,
+child output, and child elicitations remain hidden; child permission requests are still forwarded
+on the root session. There is no legacy tool-shaped subagent fallback.
 
 ## Contribution Policy
 

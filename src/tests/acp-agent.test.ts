@@ -2139,7 +2139,7 @@ describe("subagent transcript replay", () => {
       sessionUpdate: async (update: SessionNotification) => updates.push(update),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = capable ? { _meta: { "subagent-transcript": true } } : {};
+    (agent as any).clientCapabilities = capable ? { subagents: {} } : {};
     vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
 
     await (
@@ -3428,7 +3428,7 @@ describe("subagent permission attribution (issue #851)", () => {
     return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
   }
 
-  it("attributes a subagent tool's eager tool_call and permission request to the spawning tool call", async () => {
+  it("forwards only the permission when native subagents were not negotiated", async () => {
     const { agent, updates, requests, session } = setup();
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
@@ -3442,15 +3442,31 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-42",
     } as any);
 
-    expect(updates[0].update).toMatchObject({
-      sessionUpdate: "tool_call",
-      toolCallId: "toolu_sub",
-      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
-    });
-    // Keep the stable claudeCode metadata shape while adding the parent link.
-    expect(requests[0].toolCall._meta).toEqual({
+    expect(updates).toEqual([]);
+    expect(requests[0].sessionId).toBe("session-1");
+    expect(requests[0].toolCall._meta).toMatchObject({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
+  });
+
+  it("does not forward child elicitation when only permissions are allowed", async () => {
+    const { agent, updates, requests, session } = setup();
+    (agent as any).clientCapabilities = { elicitation: { form: {} } };
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+
+    const result = await agent.canUseTool("session-1")("AskUserQuestion", { questions: [] }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_question",
+      agentID: "agent-42",
+    } as any);
+
+    expect(result).toMatchObject({ behavior: "deny" });
+    expect(updates).toEqual([]);
+    expect(requests).toEqual([]);
   });
 
   it("omits the attribution (and logs the miss) when the agent id has no recorded parent", async () => {
@@ -3714,6 +3730,74 @@ describe("subagent permission attribution (issue #851)", () => {
     const map = agent.sessions["test-session"]!.liveBackgroundTasks;
     expect(map.has("agent-42")).toBe(false);
     expect(map.get("agent-43")?.parentToolUseId).toBe("toolu_parent_2");
+  });
+
+  it("hides legacy subagent lifecycle and child output without capability negotiation", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: randomUUID(),
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_parent",
+                name: "Agent",
+                input: { description: "Investigate", subagent_type: "Explore" },
+              },
+            ],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        {
+          ...taskStarted("agent-42", "toolu_parent"),
+          subagent_type: "Explore",
+        },
+        {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_parent",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "hidden child output" },
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_spawned" ||
+          update.sessionUpdate === "subagent_state_update" ||
+          JSON.stringify(update).includes("hidden child output") ||
+          JSON.stringify(update).includes("toolu_parent"),
+      ),
+    ).toBe(false);
   });
 
   it("emits native subagent lifecycle when both peers advertise support", async () => {
@@ -8891,7 +8975,7 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual([]);
   });
 
-  it("forwards subagent text and thinking as nested chunks for capable clients", async () => {
+  it("does not treat the legacy transcript extension as native subagent negotiation", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
     injectSession(agent, [
@@ -8914,14 +8998,7 @@ describe("assembled assistant text fallback", () => {
         update.sessionUpdate === "agent_message_chunk" ||
         update.sessionUpdate === "agent_thought_chunk",
     );
-    expect(nestedUpdates).toHaveLength(2);
-    for (const { update } of nestedUpdates) {
-      expect(update._meta).toMatchObject({
-        claudeCode: { parentToolUseId: "tool_use_1" },
-      });
-    }
-    expect(messageChunkTexts(updates)).toContain("nested report");
-    expect(thoughtChunkTexts(updates)).toContain("checking");
+    expect(nestedUpdates).toEqual([]);
   });
 
   it("forwards distinct blocks that a gateway splits across same-id messages", async () => {
@@ -15975,7 +16052,7 @@ describe("tool_progress heartbeats", () => {
   // report under `agent_<assistant_message_id>`, with the retrying Agent call's
   // real id in `parent_tool_use_id`. Resolving via the suffix alone dropped
   // them, leaving a stalled spawn with no explanation.
-  it("reports a subagent retry beat against the Agent call that is retrying", async () => {
+  it("hides a subagent retry beat without native negotiation", async () => {
     const sent = await run(
       [
         {
@@ -16000,14 +16077,7 @@ describe("tool_progress heartbeats", () => {
       ["toolu_task"],
     );
 
-    expect(sent[0].toolCallId).toBe("toolu_task");
-    expect((sent[0]._meta as any).claudeCode).toMatchObject({
-      toolName: "Task",
-      toolResponse: {
-        subagentType: "code-reviewer",
-        subagentRetry: { attempt: 2, max_retries: 5, error_status: 529 },
-      },
-    });
+    expect(sent).toEqual([]);
   });
 
   // A subagent's own `bash_progress` reports the inner tool's real id, with the
@@ -16221,7 +16291,7 @@ describe("permission_denied", () => {
   // call that spawned it, so without the `liveBackgroundTasks` lookup the update
   // lands at the top level while the tool_call it resolves sits in the
   // subagent's transcript.
-  it("attributes a subagent denial to the Agent call that spawned it", async () => {
+  it("hides a subagent denial tool update without native negotiation", async () => {
     const updates = await run([
       {
         type: "system",
@@ -16236,10 +16306,7 @@ describe("permission_denied", () => {
       denial("toolu_inner", { agent_id: "agent-1" }),
     ]);
 
-    expect((denials(updates)[0]._meta as any).claudeCode).toMatchObject({
-      toolName: "Write",
-      parentToolUseId: "toolu_agent",
-    });
+    expect(denials(updates)).toEqual([]);
   });
 
   // The attribution rests on `task_started` having been seen for the agent id.
