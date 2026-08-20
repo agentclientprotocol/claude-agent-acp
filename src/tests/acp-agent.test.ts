@@ -3790,6 +3790,43 @@ describe("stop reason propagation", () => {
     expect(errors.filter((e) => e.includes("Unexpected case"))).toEqual([]);
   });
 
+  it("treats the command_lifecycle 'refused' state (2.1.238+) as terminal, not unknown", async () => {
+    // A cross-session peer message declined by the session's receive-side
+    // policy gets a terminal `refused` frame instead of no frames at all.
+    // Its uuid is never one of our prompt uuids, but the frame still flows
+    // down the same stream — it must drain silently, not log as an unknown
+    // v1 state.
+    const errors: string[] = [];
+    const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, {
+      log: () => {},
+      error: (msg: unknown) => errors.push(String(msg)),
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield lifecycleFrame(randomUUID(), "refused");
+        yield lifecycleFrame(userMessage.uuid, "queued");
+        yield lifecycleFrame(userMessage.uuid, "started");
+        yield userEcho(userMessage);
+        yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
+        yield lifecycleFrame(userMessage.uuid, "completed");
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(errors.filter((e) => e.includes("unknown command_lifecycle state"))).toEqual([]);
+  });
+
   it("publishes active_goal as provider-neutral session state without changing turn settlement", async () => {
     const updates: any[] = [];
     const mockClient = {
@@ -4391,6 +4428,7 @@ describe("stop reason propagation", () => {
   it.each([
     ["authentication_failed", "access"],
     ["billing_error", "limit"],
+    ["account_on_hold", "limit"],
     ["rate_limit", "limit"],
     ["overloaded", "service"],
     ["invalid_request", "request"],

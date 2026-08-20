@@ -337,11 +337,11 @@ type Turn = {
    *  uuid while the turn is still queued (msg_lifecycle_v1 CLIs). The command
    *  is already finished SDK-side, so a later cancel() must not seed an
    *  orphan entry for it — no terminal frame will ever come to drain it.
-   *  "completed"/"discarded" leave nothing outstanding; "cancelled" after a
-   *  dispatch means the dead turn's result may still arrive (seeded as a
-   *  zombie) unless it already passed (`commandResultSeen`), and without a
-   *  dispatch means dropped (nothing coming). */
-  commandFinished?: "completed" | "discarded" | "cancelled";
+   *  "completed"/"discarded"/"refused" leave nothing outstanding; "cancelled"
+   *  after a dispatch means the dead turn's result may still arrive (seeded
+   *  as a zombie) unless it already passed (`commandResultSeen`), and without
+   *  a dispatch means dropped (nothing coming). */
+  commandFinished?: "completed" | "discarded" | "cancelled" | "refused";
   /** Set when a user-turn result arrives while this command is known
    *  dispatched (`commandStarted`) with no terminal frame yet. Turns run
    *  sequentially and frames arrive in stream order, so the turn this command
@@ -2751,7 +2751,11 @@ export class ClaudeAcpAgent {
             // spent would never drain (it would swallow an unrelated later
             // echo-less result instead).
             const active = session.activeTurn;
-            if (active.commandFinished === "completed" || active.commandFinished === "discarded") {
+            if (
+              active.commandFinished === "completed" ||
+              active.commandFinished === "discarded" ||
+              active.commandFinished === "refused"
+            ) {
               // Finished SDK-side; any result already passed. Nothing to
               // track.
             } else if (active.commandFinished === "cancelled") {
@@ -2869,7 +2873,7 @@ export class ClaudeAcpAgent {
 
         // CLIs 2.1.206+ (capability msg_lifecycle_v1) report the fate of every
         // uuid-stamped queued command (queued/started/completed/cancelled/
-        // discarded) as `command_lifecycle` frames — 2-3 per prompt, since
+        // discarded/refused) as `command_lifecycle` frames — 2-3 per prompt, since
         // prompt() stamps a uuid on every message. The frame is @internal and
         // absent from the SDKMessage union, so handle it BEFORE the exhaustive
         // switch: it must not reach `unreachable`'s error log, and a `case`
@@ -2905,6 +2909,7 @@ export class ClaudeAcpAgent {
             }
             case "completed":
             case "discarded":
+            case "refused":
             case "cancelled": {
               // Terminal frames. Latch the fate on a still-queued turn so a
               // later cancel() doesn't seed an orphan entry for a command
@@ -2912,7 +2917,7 @@ export class ClaudeAcpAgent {
               // (nothing would ever drain that entry).
               const queued = findUnsettledTurn(frame.command_uuid);
               if (queued) {
-                queued.commandFinished = frame.state as "completed" | "discarded" | "cancelled";
+                queued.commandFinished = frame.state as NonNullable<Turn["commandFinished"]>;
               }
               if (frame.state === "cancelled") {
                 // Ambiguous by design (dup-over-loss): dropped before
@@ -2937,6 +2942,9 @@ export class ClaudeAcpAgent {
               // command folded into another turn whose result is attributed
               // elsewhere — either way no echo-less result remains to skip.
               // "discarded" = session ended with it still queued; no result.
+              // "refused" (2.1.238+) = a cross-session peer message declined
+              // by receive-side policy before dispatch; never a prompt-lane
+              // command of ours, and no result will ever come.
               session.orphanCommands?.delete(frame.command_uuid);
               break;
             }
@@ -4711,7 +4719,11 @@ export class ClaudeAcpAgent {
       // never see lifecycle frames, so commandStarted/commandFinished stay
       // unset and every turn takes the plain-seed path below).
       for (const turn of orphanedTurns) {
-        if (turn.commandFinished === "completed" || turn.commandFinished === "discarded") {
+        if (
+          turn.commandFinished === "completed" ||
+          turn.commandFinished === "discarded" ||
+          turn.commandFinished === "refused"
+        ) {
           // The command already finished SDK-side and its terminal frame was
           // consumed while the turn sat queued — nothing is left to skip, and
           // a seeded entry would never drain.
@@ -8533,7 +8545,6 @@ export function toAcpNotifications(
       case "compaction":
       case "compaction_delta":
       case "advisor_tool_result":
-      case "mid_conv_system":
       case "fallback":
         break;
 

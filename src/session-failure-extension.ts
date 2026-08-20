@@ -443,6 +443,7 @@ export function providerFailureCategory(
     case "oauth_org_not_allowed":
       return "auth_required";
     case "billing_error":
+    case "account_on_hold":
       return "quota_exhausted";
     case "rate_limit":
       return "rate_limited";
