@@ -2812,7 +2812,14 @@ export class ClaudeAcpAgent {
           // a deferred turn's stored outcome (followup results never mutate
           // it), but the stored one is the authoritative source.
           const inFlight = session.activeTurn;
-          await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+          try {
+            await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+          } catch (error) {
+            this.logger.error(
+              `Session ${params.sessionId}: failed to publish terminal subagent state`,
+              error,
+            );
+          }
           settleActive(
             session.cancelled
               ? turnOutcome(session, "cancelled")
@@ -4627,7 +4634,14 @@ export class ClaudeAcpAgent {
             // and task store are independent of the previous transcript.
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
-            await subagents.finishAll("failed", sendUpdate);
+            try {
+              await subagents.finishAll("failed", sendUpdate);
+            } catch (error) {
+              this.logger.error(
+                `Session ${params.sessionId}: failed to publish reset subagent state`,
+                error,
+              );
+            }
             subagents.clear();
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
@@ -4665,7 +4679,14 @@ export class ClaudeAcpAgent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
-      await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+      try {
+        await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+      } catch (finishError) {
+        this.logger.error(
+          `Session ${params.sessionId}: failed to publish terminal subagent state after stream error`,
+          finishError,
+        );
+      }
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -5012,7 +5033,11 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
-    await this.cancel({ sessionId });
+    try {
+      await this.cancel({ sessionId });
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: cancellation failed during teardown`, error);
+    }
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
     // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
     // below doesn't touch it. Since we're tearing the session down anyway, wake
@@ -5368,6 +5393,7 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
     parentToolUseId?: string,
     ownerSessionId: string = params.sessionId,
+    originatesFromSubagent: boolean = false,
   ): Promise<RequestPermissionResponse> {
     if (signal.aborted) throw new Error("Tool use aborted");
     // The SDK may invoke `canUseTool` (and therefore this permission request)
@@ -5376,7 +5402,10 @@ export class ClaudeAcpAgent {
     // so emit it now if it hasn't been sent yet. The streamed tool_use chunk
     // later refines it with a `tool_call_update` rather than emitting a
     // duplicate (see `emittedToolCalls` in `toAcpNotifications`).
-    if (!parentToolUseId || clientSupportsSubagents(this.clientCapabilities)) {
+    if (
+      (!originatesFromSubagent && !parentToolUseId) ||
+      clientSupportsSubagents(this.clientCapabilities)
+    ) {
       await this.ensureToolCallEmitted(
         ownerSessionId,
         toolName,
@@ -5544,17 +5573,6 @@ export class ClaudeAcpAgent {
       // routes it through canUseTool whenever a callback is registered, rather
       // than the interactive dialog). Present it as an ACP form elicitation and
       // feed the answers back as updatedInput for the tool's own call() to read.
-      if (
-        toolName === "AskUserQuestion" &&
-        parentToolUseId &&
-        !clientSupportsSubagents(this.clientCapabilities)
-      ) {
-        return {
-          behavior: "deny",
-          message:
-            "Subagent input is unavailable because native subagent sessions were not negotiated.",
-        };
-      }
       if (toolName === "AskUserQuestion" && this.clientCapabilities?.elicitation?.form) {
         // Like permission requests, the elicitation references this toolUseID, so
         // make sure the tool_call has surfaced to the client before we send it.
@@ -5629,6 +5647,7 @@ export class ClaudeAcpAgent {
         signal,
         parentToolUseId,
         sessionId,
+        agentID !== undefined,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
       const decodedPermission = decodeClaudePermissionResponse(

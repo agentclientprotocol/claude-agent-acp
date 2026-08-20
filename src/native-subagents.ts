@@ -226,7 +226,6 @@ export async function finishNativeSubagent(
   const child = session.nativeSubagentsByTaskId?.get(taskId);
   if (!child || child.terminalState !== undefined) return;
   await announceNativeSubagent(child, publish);
-  child.terminalState = state;
   await publish({
     sessionId: child.parentSessionId,
     update: {
@@ -235,6 +234,7 @@ export async function finishNativeSubagent(
       state,
     },
   });
+  child.terminalState = state;
 }
 
 export async function finishNativeSubagents(

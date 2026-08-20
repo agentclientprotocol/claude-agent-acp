@@ -3386,6 +3386,10 @@ describe("subagent permission attribution (issue #851)", () => {
         requests.push(params);
         return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
+      unstable_createElicitation: async () => ({
+        action: "accept",
+        content: { question_0: "Fast", question_0_custom: "" },
+      }),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log, error: () => {} });
     agent.sessions["session-1"] = mockSessionState();
@@ -3413,7 +3417,7 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
-  it("does not forward child elicitation when only permissions are allowed", async () => {
+  it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
     const { agent, updates, requests, session } = setup();
     (agent as any).clientCapabilities = { elicitation: { form: {} } };
     session.liveBackgroundTasks.set("agent-42", {
@@ -3421,15 +3425,32 @@ describe("subagent permission attribution (issue #851)", () => {
       isSubagent: true,
     });
 
-    const result = await agent.canUseTool("session-1")("AskUserQuestion", { questions: [] }, {
-      signal: new AbortController().signal,
-      suggestions: [],
-      toolUseID: "toolu_question",
-      agentID: "agent-42",
-    } as any);
+    const result = await agent.canUseTool("session-1")(
+      "AskUserQuestion",
+      {
+        questions: [
+          {
+            question: "Which mode?",
+            header: "Mode",
+            options: [
+              { label: "Fast", description: "Fast mode" },
+              { label: "Safe", description: "Safe mode" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        agentID: "agent-42",
+      } as any,
+    );
 
-    expect(result).toMatchObject({ behavior: "deny" });
-    expect(updates).toEqual([]);
+    expect(result).toMatchObject({ behavior: "allow" });
+    expect(updates).toHaveLength(1);
+    expect(updates[0].sessionId).toBe("session-1");
     expect(requests).toEqual([]);
   });
 
@@ -3443,8 +3464,7 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-unknown",
     } as any);
 
-    const meta = updates[0].update._meta as { claudeCode?: { parentToolUseId?: string } };
-    expect(meta.claudeCode?.parentToolUseId).toBeUndefined();
+    expect(updates).toEqual([]);
     expect(requests[0].toolCall._meta).toBeUndefined();
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
