@@ -51,6 +51,8 @@ import {
   deleteSession,
   getSessionInfo,
   getSessionMessages,
+  getSubagentMessages,
+  listSubagents,
   query,
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -74,6 +76,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
     getSessionMessages: vi.fn(actual.getSessionMessages),
+    getSubagentMessages: vi.fn(actual.getSubagentMessages),
+    listSubagents: vi.fn(actual.listSubagents),
   };
 });
 import type {
@@ -2100,6 +2104,60 @@ describe("subagent transcript replay", () => {
     ).replaySessionHistory("s1");
     return updates;
   }
+
+  it("loads persisted subagent transcripts before replaying child tools", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (update: SessionNotification) => updates.push(update),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "parent-message",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "parent-agent-call",
+              name: "Agent",
+              input: { description: "Inspect project", prompt: "List files" },
+            },
+          ],
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+    vi.mocked(listSubagents).mockResolvedValueOnce(["agent-1"]);
+    vi.mocked(getSubagentMessages).mockResolvedValueOnce(replayHistory);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(
+      updates
+        .map(({ update }) => (update.sessionUpdate === "tool_call" ? update.toolCallId : undefined))
+        .filter(Boolean),
+    ).toEqual(["parent-agent-call", "child-tool"]);
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool",
+            _meta: expect.objectContaining({
+              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
+            }),
+          }),
+        }),
+      ]),
+    );
+  });
 
   it("preserves nested text and child tool attribution for capable clients", async () => {
     const updates = await replay(true);

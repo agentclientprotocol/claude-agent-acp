@@ -63,6 +63,8 @@ import {
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
+  getSubagentMessages,
+  listSubagents,
   listSessions,
   McpServerConfig,
   ModelInfo,
@@ -962,6 +964,63 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+type SessionHistoryMessage = Awaited<ReturnType<typeof getSessionMessages>>[number];
+
+function toolUseIdsOf(message: SessionHistoryMessage): string[] {
+  if (message.type !== "assistant") return [];
+  const content = (message as unknown as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return [];
+
+  const ids: string[] = [];
+  for (const block of content) {
+    if (
+      block &&
+      typeof block === "object" &&
+      "type" in block &&
+      block.type === "tool_use" &&
+      "id" in block &&
+      typeof block.id === "string"
+    ) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+function interleaveSubagentHistories(
+  messages: SessionHistoryMessage[],
+  subagentHistories: SessionHistoryMessage[][],
+): SessionHistoryMessage[] {
+  const historiesByParent = new Map<string, SessionHistoryMessage[]>();
+  for (const history of subagentHistories) {
+    const parentToolUseId = history.map(parentToolUseIdOf).find((id) => id !== null);
+    if (parentToolUseId) {
+      historiesByParent.set(parentToolUseId, [
+        ...(historiesByParent.get(parentToolUseId) ?? []),
+        ...history,
+      ]);
+    }
+  }
+
+  const inserted = new Set<string>();
+  const interleave = (history: SessionHistoryMessage[]): SessionHistoryMessage[] => {
+    const result: SessionHistoryMessage[] = [];
+    for (const message of history) {
+      result.push(message);
+      for (const toolUseId of toolUseIdsOf(message)) {
+        const childHistory = historiesByParent.get(toolUseId);
+        if (childHistory && !inserted.has(toolUseId)) {
+          inserted.add(toolUseId);
+          result.push(...interleave(childHistory));
+        }
+      }
+    }
+    return result;
+  };
+
+  return interleave(messages);
 }
 
 function stripSubagentTextAndThinking(content: unknown): unknown {
@@ -5126,7 +5185,12 @@ export class ClaudeAcpAgent {
 
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const mainHistory = await getSessionMessages(sessionId);
+    const subagentIds = await listSubagents(sessionId);
+    const subagentHistories = await Promise.all(
+      subagentIds.map((agentId) => getSubagentMessages(sessionId, agentId)),
+    );
+    const messages = interleaveSubagentHistories(mainHistory, subagentHistories);
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
