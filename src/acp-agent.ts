@@ -96,6 +96,7 @@ import {
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
+  AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
   asSdkSessionNotification,
   clientSupportsSubagents,
@@ -1629,7 +1630,10 @@ export class ClaudeAcpAgent {
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
       _meta: {
-        ...airSessionFailureCapabilityMeta(AGENT_FILE_CHANGE_REPORT_CAPABILITY),
+        ...airSessionFailureCapabilityMeta(
+          AGENT_FILE_CHANGE_REPORT_CAPABILITY,
+          AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+        ),
         steering: {
           supported: true,
         },
@@ -3401,6 +3405,7 @@ export class ClaudeAcpAgent {
                     toolUseId: message.tool_use_id,
                     subagentType: message.subagent_type,
                     description: message.description,
+                    prompt: message.prompt,
                   },
                   sendUpdate,
                 );

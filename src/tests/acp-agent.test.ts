@@ -3861,7 +3861,7 @@ describe("subagent permission attribution (issue #851)", () => {
         {
           sessionUpdate: "subagent_spawned",
           subagentSessionId: "agent-42",
-          name: "Explore",
+          name: "Investigate",
           task: "Investigate",
           capabilities: {},
         },
@@ -3978,7 +3978,18 @@ describe("subagent permission attribution (issue #851)", () => {
         id: randomUUID(),
         role: "assistant" as const,
         model: "claude-sonnet-4-20250514",
-        content: [{ type: "tool_use" as const, id, name: "Agent", input: { prompt: "work" } }],
+        content: [
+          {
+            type: "tool_use" as const,
+            id,
+            name: "Agent",
+            input: {
+              name: `${id}-name`,
+              description: `${id} description`,
+              prompt: `${id} full prompt`,
+            },
+          },
+        ],
         usage: SUBAGENT_TEST_USAGE,
       },
     });
@@ -4019,6 +4030,19 @@ describe("subagent permission attribution (issue #851)", () => {
         update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-inner",
     );
     expect(nestedSpawn?.sessionId).toBe("agent-outer");
+    expect(nestedSpawn?.update).toMatchObject({
+      name: "toolu_inner-name",
+      task: "toolu_inner full prompt",
+    });
+    expect(
+      updates.find(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-outer",
+      )?.update,
+    ).toMatchObject({
+      name: "toolu_outer-name",
+      task: "toolu_outer full prompt",
+    });
     expect(
       updates.filter(
         ({ update }) =>
@@ -4150,7 +4174,7 @@ describe("subagent permission attribution (issue #851)", () => {
       {
         sessionUpdate: "subagent_spawned",
         subagentSessionId: "agent-42",
-        name: "Explore",
+        name: "Investigate",
         task: "Investigate",
         capabilities: {},
       },
@@ -6788,6 +6812,24 @@ describe("logout", () => {
     ).toEqual({});
   });
 
+  it("negotiates subagents through AIR metadata when the SDK strips the draft field", async () => {
+    const agent = createMockAgent();
+    const supported = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: {
+          jetbrains: {
+            air: { version: 1, capabilities: ["nativeSubagentSessions"] },
+          },
+        },
+      },
+    });
+
+    expect(
+      (supported.agentCapabilities?.sessionCapabilities as { subagents?: unknown }).subagents,
+    ).toEqual({});
+  });
+
   it("advertises canonical AIR sessionFailure support during initialize", async () => {
     const agent = createMockAgent();
     const response = await agent.initialize({
@@ -6803,7 +6845,7 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport"],
+      capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
     });
   });
 
@@ -6816,7 +6858,7 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport"],
+      capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
     });
   });
 });
