@@ -168,9 +168,10 @@ const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
  *
  * Each question is followed by its own optional free-text "custom answer" field
  * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
- * user can type their own answer instead of picking an option, scoped to that
- * specific question. Nothing is marked required, so the user can also just skip
- * — matching the built-in tool, which always offers Skip + a free-text box.
+ * user can type their own answer instead of (or, for a multi-select question,
+ * as well as) picking an option, scoped to that specific question. Nothing is
+ * marked required, so the user can also just skip — matching the built-in tool,
+ * which always offers Skip + a free-text box.
  */
 export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
@@ -211,7 +212,8 @@ export function askUserQuestionsToCreateRequest(
     properties[questionCustomFieldKey(index)] = {
       type: "string",
       title: "Other",
-      description: "Type your own answer instead of choosing an option above (optional).",
+      description:
+        "Type your own answer: added to your selection above, or used instead of it for single-choice questions (optional).",
       _meta: {
         [CUSTOM_ANSWER_META_KEY]: {
           questionId: questionFieldKey(index),
@@ -247,11 +249,13 @@ export type AskUserQuestionOutcome =
  * Selected labels are read back from the indexed form fields and written into
  * `answers` as a `{ [questionText]: label }` map (comma-joining multi-selects)
  * — the key shape the tool's own `call()` reads. A non-empty per-question
- * custom-answer field (`question_<n>_custom`) takes precedence over that
- * question's selection, since the user typed their own answer instead of
- * picking one. Decline yields empty answers (the model is told the user skipped
- * rather than the turn aborting); cancel — and any custom/future action we
- * don't understand — aborts the tool call.
+ * custom-answer field (`question_<n>_custom`) replaces the selection of a
+ * single-select question, since the user typed their own answer instead of
+ * picking one, and joins the selection of a multi-select question, since there
+ * the two fields are independent and filling both means both. Decline yields
+ * empty answers (the model is told the user skipped rather than the turn
+ * aborting); cancel — and any custom/future action we don't understand —
+ * aborts the tool call.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
@@ -271,19 +275,30 @@ export function applyAskElicitationResponse(
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
   questions.forEach((question, index) => {
-    // A typed custom answer wins over the selection: the user chose to write
-    // their own answer for this question instead of picking an option.
     const custom = content[questionCustomFieldKey(index)];
-    if (typeof custom === "string" && custom.trim() !== "") {
-      answers[question.question] = custom.trim();
+    const customText = typeof custom === "string" ? custom.trim() : "";
+
+    // A single-select question is answered by exactly one thing, so a typed
+    // custom answer replaces the pick: the user wrote their own answer instead
+    // of choosing an option.
+    if (customText !== "" && !question.multiSelect) {
+      answers[question.question] = customText;
       return;
     }
 
     const value = content[questionFieldKey(index)];
-    if (value === undefined || value === null) {
-      return;
-    }
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
+    const selection =
+      value === undefined || value === null
+        ? ""
+        : Array.isArray(value)
+          ? value.join(", ")
+          : String(value);
+
+    // A multi-select is additive, and the form offers the selection and the
+    // custom box as independent fields — a user who fills both means both, so
+    // the typed answer joins the checked options instead of replacing them.
+    const text =
+      selection === "" ? customText : customText === "" ? selection : `${selection}, ${customText}`;
     if (text === "") {
       return;
     }
