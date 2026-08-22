@@ -1972,6 +1972,28 @@ describe("usage-limit failure replay", () => {
     );
   });
 
+  it("suppresses completed task notifications without summaries", async () => {
+    const notification = {
+      type: "user" as const,
+      uuid: "completed-task-notification",
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      origin: { kind: "task-notification" as const },
+      message: {
+        role: "user" as const,
+        content:
+          "<task-notification><task-id>agent-42</task-id><status>completed</status></task-notification>",
+      },
+    };
+
+    const { updates } = await replay([notification] as Awaited<
+      ReturnType<typeof getSessionMessages>
+    >);
+
+    expect(updates).toEqual([]);
+  });
+
   it("keeps task-notification messages for clients without typed failures", async () => {
     const notification = {
       type: "user" as const,

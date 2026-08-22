@@ -63,7 +63,7 @@ export type PublishedSessionFailure = {
 export type TaskNotification = {
   taskIds: string[];
   status: "completed" | "failed" | "stopped";
-  summary: string;
+  summary?: string;
 };
 
 type SessionFailureOptions = {
@@ -222,8 +222,11 @@ export function parseTaskNotification(message: unknown): TaskNotification | unde
   const status = singleTaskNotificationTag(envelope, "status");
   if (status !== "completed" && status !== "failed" && status !== "stopped") return undefined;
   const summary = singleTaskNotificationTag(envelope, "summary");
-  if (!summary) return undefined;
-  return { taskIds, status, summary: decodeXmlEntities(summary) };
+  return {
+    taskIds,
+    status,
+    ...(summary ? { summary: decodeXmlEntities(summary) } : {}),
+  };
 }
 
 function singleTaskNotificationTag(envelope: string, tag: string): string | undefined {
@@ -469,7 +472,12 @@ export class SessionFailureController {
   }
 
   async publishTaskNotification(notification: TaskNotification): Promise<void> {
-    if (notification.status === "completed" || !this.isSupported() || !this.isCurrent()) {
+    if (
+      notification.status === "completed" ||
+      !notification.summary ||
+      !this.isSupported() ||
+      !this.isCurrent()
+    ) {
       return;
     }
     const identity = createHash("sha256")
