@@ -14,9 +14,13 @@ function displayList(values: string[]): string {
   return `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`;
 }
 
+/** Shorten paths only as much as needed to distinguish them in prompt text. */
 function displayPaths(paths: string[]): string {
   const normalizedPaths = [...new Set(paths.map((value) => path.normalize(value)))];
   const segments = normalizedPaths.map((value) => value.split(path.sep).filter(Boolean));
+
+  // Compare equally deep suffixes so duplicate basenames gain the smallest
+  // useful parent prefix (for example, codex-acp/src/ vs claude-acp/src/).
   const suffix = (index: number, depth: number): string =>
     segments[index]!.slice(-depth).join(path.sep) || normalizedPaths[index]!;
   const names = normalizedPaths.map((value, index) => {
@@ -34,6 +38,8 @@ function displayPaths(paths: string[]): string {
     }
     return name.endsWith(path.sep) ? name : `${name}${path.sep}`;
   });
+
+  // Native Claude labels enumerate two paths and summarize larger sets.
   if (names.length <= 2) return displayList(names);
   return `${names[0]}, ${names[1]} and ${names.length - 2} more`;
 }

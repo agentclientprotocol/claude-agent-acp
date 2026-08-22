@@ -1366,7 +1366,6 @@ function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) {
       onAbort();
-      return;
     }
     void operation.then(
       (value) => {
@@ -1428,6 +1427,12 @@ export class ClaudeAcpAgent {
         this.finishFileChangeAudit(session, turn, "cancelled");
         turn.settled = true;
         turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
+      },
+      settleFailedTurn: (session, turn, error) => {
+        disarmForceCancel(session);
+        this.finishFileChangeAudit(session, turn, "providerError");
+        turn.settled = true;
+        turn.reject(error);
       },
     });
   }
@@ -5510,7 +5515,7 @@ export class ClaudeAcpAgent {
 
       if (parentToolUseId) {
         presentation.toolCall._meta = {
-          claudeCode: { parentToolUseId },
+          claudeCode: { toolName, parentToolUseId },
         };
       }
 

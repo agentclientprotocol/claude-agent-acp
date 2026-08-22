@@ -2592,6 +2592,32 @@ describe("permission request cancellation", () => {
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
 
+  it("observes a client rejection when the signal aborts during request creation", async () => {
+    const controller = new AbortController();
+    const clientOperation = Promise.reject(new Error("Request cancelled"));
+    const then = vi.spyOn(clientOperation, "then");
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: () => {
+        controller.abort();
+        return clientOperation;
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: controller.signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).rejects.toThrow("Tool use aborted");
+
+    expect(then).toHaveBeenCalledOnce();
+  });
+
   it("does not wait for an eager tool-call update that ignores cancellation", async () => {
     const requestPermission = vi.fn();
     const mockClient = {
@@ -3431,10 +3457,9 @@ describe("subagent permission attribution (issue #851)", () => {
       toolCallId: "toolu_sub",
       _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
     });
-    // The permission snapshot carries only the provider-specific parent link;
-    // the standard toolCall.name already identifies the tool.
+    // Keep the stable claudeCode metadata shape while adding the parent link.
     expect(requests[0].toolCall._meta).toEqual({
-      claudeCode: { parentToolUseId: "toolu_parent" },
+      claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
   });
 

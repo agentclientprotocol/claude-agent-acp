@@ -22,4 +22,17 @@ describe("durable permission normalization safety", () => {
 
     expect(normalizeDurablePermissionChangeSet(suggestions)).toBeUndefined();
   });
+
+  it("rejects strings whose untrimmed value exceeds the wire limit", () => {
+    expect(
+      normalizeDurablePermissionChangeSet([
+        {
+          type: "addRules",
+          destination: "session",
+          behavior: "allow",
+          rules: [{ toolName: `${" ".repeat(512)}Bash` }],
+        },
+      ]),
+    ).toBeUndefined();
+  });
 });

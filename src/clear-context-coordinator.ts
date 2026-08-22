@@ -124,8 +124,6 @@ export async function continuePlanInFreshContext<
   }
 
   const params = restartParams(oldSession);
-  turn.carriedUsage = { ...oldSession.accumulatedUsage };
-  oldSession.pendingExitPlanContextReset = undefined;
   host.closeQueryStream(oldSession);
 
   const freshSession = await host.restartSession(params, {
@@ -133,6 +131,11 @@ export async function continuePlanInFreshContext<
     permissionMode: reset.mode,
   });
   assertRestartActive(freshSession);
+
+  // Do not consume the reset or mutate the turn until a replacement exists.
+  // A failed restart must remain distinguishable from a lost query transport.
+  turn.carriedUsage = { ...oldSession.accumulatedUsage };
+  oldSession.pendingExitPlanContextReset = undefined;
   if (oldSession.fastModeEnabled !== freshSession.fastModeEnabled) {
     try {
       await host.applyFastMode(freshSession, oldSession.fastModeEnabled);

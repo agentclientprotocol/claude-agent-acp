@@ -131,6 +131,7 @@ export type ExitPlanRestartHost<
   sessionUpdate(notification: SessionNotification): Promise<void>;
   destroyReplacement(sessionId: string, session: Session): void;
   settleCancelledTurn(oldSession: Session, turnSession: Session, turn: Turn): void;
+  settleFailedTurn(turnSession: Session, turn: Turn, error: unknown): void;
 };
 
 /** Owns the lifetime of accepted-plan context replacements. In particular, a
@@ -185,8 +186,6 @@ export class ExitPlanCoordinator<
         controller.signal,
       );
     } catch (error) {
-      if (!controller.signal.aborted) throw error;
-
       const currentSession = this.host.currentSession(sessionId);
       const replacement = currentSession !== oldSession ? currentSession : undefined;
       if (replacement) this.host.destroyReplacement(sessionId, replacement);
@@ -194,7 +193,13 @@ export class ExitPlanCoordinator<
       const turn = replacement?.activeTurn ?? oldSession.activeTurn;
       if (turn && !turn.settled) {
         const turnSession = replacement?.activeTurn === turn ? replacement : oldSession;
-        this.host.settleCancelledTurn(oldSession, turnSession, turn);
+        if (controller.signal.aborted) {
+          this.host.settleCancelledTurn(oldSession, turnSession, turn);
+        } else {
+          // A provider/session-creation failure is turn-scoped. Settling it
+          // here keeps it out of the query consumer's transport-loss catch.
+          this.host.settleFailedTurn(turnSession, turn, error);
+        }
         oldSession.activeTurn = null;
         oldSession.turnQueue = (oldSession.turnQueue ?? []).filter((queued) => queued !== turn);
         if (replacement) {
@@ -202,6 +207,7 @@ export class ExitPlanCoordinator<
           replacement.turnQueue = (replacement.turnQueue ?? []).filter((queued) => queued !== turn);
         }
       }
+      oldSession.pendingExitPlanContextReset = undefined;
     } finally {
       if (this.restarts.get(sessionId) === controller) {
         this.restarts.delete(sessionId);

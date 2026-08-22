@@ -285,6 +285,7 @@ describe("ExitPlanCoordinator", () => {
       sessionUpdate: vi.fn(async () => {}),
       destroyReplacement,
       settleCancelledTurn,
+      settleFailedTurn: vi.fn(),
     };
     const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>(host);
 
@@ -304,6 +305,41 @@ describe("ExitPlanCoordinator", () => {
     expect(oldSession.turnQueue).toEqual([]);
     expect(freshSession.input.push).not.toHaveBeenCalled();
     expect(baseHost.ensureConsumer).not.toHaveBeenCalled();
+  });
+
+  it("settles a restart failure without classifying it as a query transport loss", async () => {
+    const error = new Error("restart failed");
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const reset = { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" as const };
+    const oldSession = testSession({
+      activeTurn: turn,
+      turnQueue: [turn],
+      pendingExitPlanContextReset: reset,
+    });
+    const baseHost = testHost(oldSession, testSession());
+    vi.mocked(baseHost.restartSession).mockRejectedValue(error);
+    const settleFailedTurn = vi.fn((_owner, failedTurn: ClearContextTurn) => {
+      failedTurn.settled = true;
+    });
+    const host = {
+      ...baseHost,
+      sessionUpdate: vi.fn(async () => {}),
+      destroyReplacement: vi.fn(),
+      settleCancelledTurn: vi.fn(),
+      settleFailedTurn,
+    };
+    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>(host);
+
+    await coordinator.restart("public-session", oldSession, reset);
+
+    expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
+    expect(turn.carriedUsage).toBeUndefined();
+    expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
+    expect(oldSession.activeTurn).toBeNull();
+    expect(oldSession.turnQueue).toEqual([]);
   });
 });
 

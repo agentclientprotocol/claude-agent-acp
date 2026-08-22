@@ -9,6 +9,8 @@ const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 export const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
+  // Settings use user-facing, case-insensitive spellings while the SDK uses
+  // camel-cased wire values. Keep legacy shorthand accepted by Claude Code too.
   auto: "auto",
   default: "default",
   // Claude Code 2.1.200 renamed the "default" mode to "Manual" and accepts

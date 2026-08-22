@@ -46,7 +46,7 @@ function safePlainString(value: unknown, maxLength: number): value is string {
   const normalized = value.trim();
   return (
     normalized.length > 0 &&
-    normalized.length <= maxLength &&
+    value.length <= maxLength &&
     !Array.from(normalized).some((character) => {
       const code = character.charCodeAt(0);
       return (
