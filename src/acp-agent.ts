@@ -131,6 +131,7 @@ import {
   type ClaudeFailureKind,
   createSessionFailureState,
   isSyntheticUsageLimitMessage,
+  parseTaskNotification,
   type PublishedSessionFailure,
   providerFailureCategory,
   SessionFailureController,
@@ -3318,6 +3319,11 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 session.liveBackgroundTasks.delete(message.task_id);
+                await sessionFailures.publishTaskNotification({
+                  taskIds: [message.task_id],
+                  status: message.status,
+                  summary: message.summary,
+                });
                 break;
               case "task_updated":
                 // terminal-status task_updated patch and a (deduplicated)
@@ -5175,6 +5181,11 @@ export class ClaudeAcpAgent {
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
+        const taskNotification = parseTaskNotification(message);
+        if (taskNotification && sessionFailures) {
+          await sessionFailures.publishTaskNotification(taskNotification);
+          continue;
+        }
         content = stripLocalCommandMetadata(content);
         if (content === null) continue;
       }

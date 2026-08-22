@@ -4,7 +4,7 @@ import {
   type SDKAssistantMessageError,
   USAGE_LIMIT_ERROR_PREFIXES,
 } from "@anthropic-ai/claude-agent-sdk";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const JETBRAINS_META_KEY = "jetbrains";
 const AIR_META_KEY = "air";
@@ -58,6 +58,12 @@ export type PublishedSessionFailure = {
   details?: string;
   actions: AirSessionFailureAction[];
   recoveryPolicy: SessionFailureRecoveryPolicy;
+};
+
+export type TaskNotification = {
+  taskIds: string[];
+  status: "completed" | "failed" | "stopped";
+  summary: string;
 };
 
 type SessionFailureOptions = {
@@ -175,6 +181,64 @@ export function sessionFailureMeta(failure: PublishedSessionFailure) {
       },
     },
   };
+}
+
+export function parseTaskNotification(message: unknown): TaskNotification | undefined {
+  if (typeof message !== "object" || message === null) return undefined;
+  const candidate = message as {
+    type?: unknown;
+    origin?: { kind?: unknown };
+    message?: { content?: unknown };
+  };
+  if (candidate.type !== "user" || candidate.origin?.kind !== "task-notification") {
+    return undefined;
+  }
+  const content = candidate.message?.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content) &&
+          content.length === 1 &&
+          typeof content[0] === "object" &&
+          content[0] !== null &&
+          "type" in content[0] &&
+          content[0].type === "text" &&
+          "text" in content[0] &&
+          typeof content[0].text === "string"
+        ? content[0].text
+        : undefined;
+  if (!text) return undefined;
+  const envelope = /^<task-notification>\s*([\s\S]*?)\s*<\/task-notification>$/.exec(
+    text.trim(),
+  )?.[1];
+  if (!envelope) return undefined;
+
+  const taskIds = [...envelope.matchAll(/<task-id>\s*([\s\S]*?)\s*<\/task-id>/g)].map((match) =>
+    match[1].trim(),
+  );
+  if (taskIds.length === 0 || taskIds.some((taskId) => !/^[A-Za-z0-9._:-]{1,200}$/.test(taskId))) {
+    return undefined;
+  }
+  const status = singleTaskNotificationTag(envelope, "status");
+  if (status !== "completed" && status !== "failed" && status !== "stopped") return undefined;
+  const summary = singleTaskNotificationTag(envelope, "summary");
+  if (!summary) return undefined;
+  return { taskIds, status, summary: decodeXmlEntities(summary) };
+}
+
+function singleTaskNotificationTag(envelope: string, tag: string): string | undefined {
+  const matches = [...envelope.matchAll(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*</${tag}>`, "g"))];
+  if (matches.length !== 1) return undefined;
+  return matches[0][1].trim() || undefined;
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
 }
 
 /** `getSessionMessages` deliberately exposes only the API message and strips
@@ -402,6 +466,28 @@ export class SessionFailureController {
     const failure = await this.prepare(kind, failureOptions);
     if (!failure) return;
     if (await this.emit(failure)) this.recordActive(failure);
+  }
+
+  async publishTaskNotification(notification: TaskNotification): Promise<void> {
+    if (notification.status === "completed" || !this.isSupported() || !this.isCurrent()) {
+      return;
+    }
+    const identity = createHash("sha256")
+      .update([...new Set(notification.taskIds)].sort().join("\0"))
+      .digest("hex")
+      .slice(0, 32);
+    const id = `${this.sessionId}:task-notification:${identity}`;
+    const failure: PublishedSessionFailure = {
+      id,
+      revision: (this.state.revisions.get(id) ?? 0) + 1,
+      kind: "advisory",
+      category: "unknown",
+      severity: notification.status === "failed" ? "error" : "warning",
+      title: notification.summary,
+      actions: [],
+      recoveryPolicy: "never",
+    };
+    if (await this.emit(failure)) this.state.revisions.set(id, failure.revision);
   }
 
   async restore(
