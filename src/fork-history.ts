@@ -12,6 +12,15 @@ export type ForkLineage = {
 };
 
 /**
+ * The Claude session to resume when creating a fork. A newborn fork has no
+ * Claude transcript of its own yet, so its id cannot be resumed directly.
+ */
+export type ForkResumeTarget = {
+  sessionId: string;
+  branchPoint?: string;
+};
+
+/**
  * Stores one file per fork. Separate files make concurrent ACP processes safe:
  * a new fork never needs to rewrite another process's lineage record.
  */
@@ -78,6 +87,19 @@ export async function forkedSessionHistory<Message>(
   return historyFor(sessionId, store, readMessages, messageId, new Set());
 }
 
+/**
+ * Resolves an empty fork back to the closest session Claude can actually
+ * resume. The returned boundary keeps the model context identical to the
+ * inherited display transcript, including through several empty forks.
+ */
+export async function forkResumeTarget<Message>(
+  sessionId: string,
+  store: ForkHistoryStore,
+  readMessages: (sessionId: string) => Promise<Message[]>,
+): Promise<ForkResumeTarget> {
+  return resumeTargetFor(sessionId, store, readMessages, new Set());
+}
+
 async function historyFor<Message>(
   sessionId: string,
   store: ForkHistoryStore,
@@ -107,6 +129,31 @@ async function historyFor<Message>(
       ? inheritedThrough(inherited, lineage.branchPoint, messageId, sessionId)
       : inherited;
     return [...prefix, ...ownMessages];
+  } finally {
+    visiting.delete(sessionId);
+  }
+}
+
+async function resumeTargetFor<Message>(
+  sessionId: string,
+  store: ForkHistoryStore,
+  readMessages: (sessionId: string) => Promise<Message[]>,
+  visiting: Set<string>,
+): Promise<ForkResumeTarget> {
+  if (visiting.has(sessionId)) {
+    throw new Error(`Fork lineage contains a cycle at session ${sessionId}`);
+  }
+  visiting.add(sessionId);
+  try {
+    const [lineage, ownMessages] = await Promise.all([
+      store.read(sessionId),
+      readMessages(sessionId),
+    ]);
+
+    if (!lineage || ownMessages.length > 0) return { sessionId };
+
+    const inherited = await resumeTargetFor(lineage.parentSessionId, store, readMessages, visiting);
+    return lineage.branchPoint ? { ...inherited, branchPoint: lineage.branchPoint } : inherited;
   } finally {
     visiting.delete(sessionId);
   }

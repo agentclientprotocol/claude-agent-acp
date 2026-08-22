@@ -150,7 +150,7 @@ import {
   isFileChangeAuditTool,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
-import { ForkHistoryStore, forkedSessionHistory } from "./fork-history.js";
+import { ForkHistoryStore, forkedSessionHistory, forkResumeTarget } from "./fork-history.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -873,6 +873,24 @@ function forkBranchPoint(params: ForkSessionRequest): string | undefined {
   const branchPoint = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options
     ?.resumeSessionAt;
   return typeof branchPoint === "string" && branchPoint.length > 0 ? branchPoint : undefined;
+}
+
+function forkMeta(
+  params: ForkSessionRequest,
+  branchPoint: string | undefined,
+): ForkSessionRequest["_meta"] {
+  if (!branchPoint) return params._meta;
+  const meta = params._meta as NewSessionMeta | undefined;
+  return {
+    ...meta,
+    claudeCode: {
+      ...meta?.claudeCode,
+      options: {
+        ...meta?.claudeCode?.options,
+        resumeSessionAt: branchPoint,
+      },
+    },
+  };
 }
 
 /**
@@ -1717,15 +1735,21 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    const branchPoint = forkBranchPoint(params);
+    const resumeTarget = await forkResumeTarget(
+      params.sessionId,
+      this.forkHistory,
+      getSessionMessages,
+    );
     const response = await this.createSession(
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
         additionalDirectories: params.additionalDirectories,
-        _meta: params._meta,
+        _meta: forkMeta(params, branchPoint ?? resumeTarget.branchPoint),
       },
       {
-        resume: params.sessionId,
+        resume: resumeTarget.sessionId,
         forkSession: true,
       },
     );
@@ -1733,7 +1757,7 @@ export class ClaudeAcpAgent {
       await this.forkHistory.record({
         sessionId: response.sessionId,
         parentSessionId: params.sessionId,
-        branchPoint: forkBranchPoint(params),
+        branchPoint,
       });
     } catch (error) {
       // A fork without its lineage would execute with the right model context but

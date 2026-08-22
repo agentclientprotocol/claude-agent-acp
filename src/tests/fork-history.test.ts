@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ForkHistoryStore, forkedSessionHistory } from "../fork-history.js";
+import { ForkHistoryStore, forkedSessionHistory, forkResumeTarget } from "../fork-history.js";
 
 type Message = { id: string; text: string };
 
@@ -34,6 +34,14 @@ async function history(
     async (id) => transcripts[id] ?? [],
     (message) => message.id,
   );
+}
+
+async function resumeTarget(
+  sessionId: string,
+  lineages: ForkHistoryStore,
+  transcripts: Record<string, Message[]>,
+) {
+  return forkResumeTarget(sessionId, lineages, async (id) => transcripts[id] ?? []);
 }
 
 describe("fork history", () => {
@@ -103,6 +111,54 @@ describe("fork history", () => {
       { id: "u2", text: "fork prompt" },
       { id: "a3", text: "second fork answer" },
     ]);
+  });
+
+  it("resumes an empty nested fork through its nearest persisted ancestor", async () => {
+    const lineages = await store();
+    await lineages.record({
+      sessionId: "first-fork",
+      parentSessionId: "root",
+      branchPoint: "a1",
+    });
+    await lineages.record({ sessionId: "second-fork", parentSessionId: "first-fork" });
+
+    await expect(
+      resumeTarget("second-fork", lineages, {
+        root: [
+          { id: "u1", text: "root prompt" },
+          { id: "a1", text: "root answer" },
+        ],
+        "first-fork": [],
+        "second-fork": [],
+      }),
+    ).resolves.toEqual({ sessionId: "root", branchPoint: "a1" });
+  });
+
+  it("uses a new nested point instead of the inherited boundary", async () => {
+    const lineages = await store();
+    await lineages.record({
+      sessionId: "first-fork",
+      parentSessionId: "root",
+      branchPoint: "a2",
+    });
+    await lineages.record({
+      sessionId: "second-fork",
+      parentSessionId: "first-fork",
+      branchPoint: "a1",
+    });
+
+    await expect(
+      resumeTarget("second-fork", lineages, {
+        root: [
+          { id: "u1", text: "root prompt" },
+          { id: "a1", text: "first answer" },
+          { id: "u2", text: "second prompt" },
+          { id: "a2", text: "second answer" },
+        ],
+        "first-fork": [],
+        "second-fork": [],
+      }),
+    ).resolves.toEqual({ sessionId: "root", branchPoint: "a1" });
   });
 
   it("persists the lineage across agent processes", async () => {
