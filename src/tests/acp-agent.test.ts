@@ -6845,7 +6845,12 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
+      capabilities: [
+        "sessionFailure",
+        "agentFileChangeReport",
+        "nativeSubagentSessions",
+        "asyncTasks",
+      ],
     });
   });
 
@@ -6858,7 +6863,12 @@ describe("logout", () => {
 
     expect((response._meta as any)?.jetbrains?.air).toEqual({
       version: 1,
-      capabilities: ["sessionFailure", "agentFileChangeReport", "nativeSubagentSessions"],
+      capabilities: [
+        "sessionFailure",
+        "agentFileChangeReport",
+        "nativeSubagentSessions",
+        "asyncTasks",
+      ],
     });
   });
 });

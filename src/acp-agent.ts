@@ -107,6 +107,8 @@ import {
   NativeSubagent,
   NativeSubagentRuntime,
 } from "./native-subagents.js";
+import { AIR_ASYNC_TASKS_CAPABILITY } from "./air-extension.js";
+import { AsyncTaskRuntime, clientSupportsAsyncTasks } from "./async-tasks.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -1633,6 +1635,7 @@ export class ClaudeAcpAgent {
         ...airSessionFailureCapabilityMeta(
           AGENT_FILE_CHANGE_REPORT_CAPABILITY,
           AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+          AIR_ASYNC_TASKS_CAPABILITY,
         ),
         steering: {
           supported: true,
@@ -2222,6 +2225,11 @@ export class ClaudeAcpAgent {
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
+    );
+    const asyncTasks = new AsyncTaskRuntime(
+      clientSupportsAsyncTasks(this.clientCapabilities),
+      params.sessionId,
+      async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
     );
 
     const sendUpdate = async (notification: AcpSessionNotification) => {
@@ -2828,6 +2836,7 @@ export class ClaudeAcpAgent {
           const inFlight = session.activeTurn;
           try {
             await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+            await asyncTasks.finishAll(session.cancelled ? "stopped" : "failed");
           } catch (error) {
             this.logger.error(
               `Session ${params.sessionId}: failed to publish terminal subagent state`,
@@ -3374,7 +3383,15 @@ export class ClaudeAcpAgent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
+                break;
               case "task_progress":
+                await asyncTasks.taskProgress({
+                  taskId: message.task_id,
+                  description: message.description,
+                  summary: message.summary,
+                  lastToolName: message.last_tool_name,
+                  usage: message.usage,
+                });
                 break;
               case "task_started":
                 // For subagent tasks `task_id` is the subagent's agent id (the
@@ -3409,6 +3426,14 @@ export class ClaudeAcpAgent {
                   },
                   sendUpdate,
                 );
+                await asyncTasks.taskStarted({
+                  taskId: message.task_id,
+                  taskType: message.task_type,
+                  description: message.description,
+                  subagentType: message.subagent_type,
+                  workflowName: message.workflow_name,
+                  skipTranscript: message.skip_transcript,
+                });
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
                 }
@@ -3417,10 +3442,12 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(message.task_id, message.status, sendUpdate);
+                await asyncTasks.taskNotification(message.task_id, message.status, message.summary);
                 if (message.tool_use_id) subagents.discardPending(message.tool_use_id);
                 session.liveBackgroundTasks.delete(message.task_id);
                 break;
               case "task_updated":
+                await asyncTasks.taskUpdated(message.task_id, message.patch);
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
                 // guaranteed per transition — prune on it too so the registry
@@ -4651,6 +4678,7 @@ export class ClaudeAcpAgent {
             // before any follow-up prompt can republish stale tasks.
             try {
               await subagents.finishAll("failed", sendUpdate);
+              await asyncTasks.finishAll("failed");
             } catch (error) {
               this.logger.error(
                 `Session ${params.sessionId}: failed to publish reset subagent state`,
@@ -4658,6 +4686,7 @@ export class ClaudeAcpAgent {
               );
             }
             subagents.clear();
+            asyncTasks.clear();
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
@@ -4696,6 +4725,7 @@ export class ClaudeAcpAgent {
           message.includes("Failed to write to process stdin"));
       try {
         await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
+        await asyncTasks.finishAll(session.cancelled ? "stopped" : "failed");
       } catch (finishError) {
         this.logger.error(
           `Session ${params.sessionId}: failed to publish terminal subagent state after stream error`,
