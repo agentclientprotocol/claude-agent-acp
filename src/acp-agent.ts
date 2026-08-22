@@ -150,7 +150,12 @@ import {
   isFileChangeAuditTool,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
-import { ForkHistoryStore, forkedSessionHistory, forkResumeTarget } from "./fork-history.js";
+import {
+  ForkHistoryStore,
+  forkedSessionHistory,
+  forkPointResumeTarget,
+  forkResumeTarget,
+} from "./fork-history.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -755,8 +760,9 @@ type Session = {
    *  naturally yields the turn-boundary uuid when one `msg_…` spans several
    *  content-block messages.
    *
-   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
-   *  fork/rewind. */
+   *  Point forks also need to identify the persisted session that owns an
+   *  inherited message, so they use the durable fork lineage rather than this
+   *  per-process cache. */
   messageIdToUuid: Map<string, string>;
   /** Durable-for-this-consumer failure state shared with session/load replay.
    *  Keeping it on the Session lets replay seed a failure that the persistent
@@ -1735,21 +1741,36 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    const branchPoint = forkBranchPoint(params);
+    // Keep the ACP message id as the durable display boundary. Claude's SDK
+    // accepts only its own message uuid in resumeSessionAt, so resolve that
+    // separately (and through inherited fork history when necessary).
+    const displayBranchPoint = forkBranchPoint(params);
     const resumeTarget = await forkResumeTarget(
       params.sessionId,
       this.forkHistory,
       getSessionMessages,
     );
+    const requestedPoint = displayBranchPoint ?? resumeTarget.branchPoint;
+    const pointResumeTarget = requestedPoint
+      ? await forkPointResumeTarget(
+          params.sessionId,
+          requestedPoint,
+          this.forkHistory,
+          getSessionMessages,
+          messageIdForGrouping,
+          (message) =>
+            typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined,
+        )
+      : undefined;
     const response = await this.createSession(
       {
         cwd: params.cwd,
         mcpServers: params.mcpServers ?? [],
         additionalDirectories: params.additionalDirectories,
-        _meta: forkMeta(params, branchPoint ?? resumeTarget.branchPoint),
+        _meta: forkMeta(params, pointResumeTarget?.messageUuid),
       },
       {
-        resume: resumeTarget.sessionId,
+        resume: pointResumeTarget?.sessionId ?? resumeTarget.sessionId,
         forkSession: true,
       },
     );
@@ -1757,7 +1778,7 @@ export class ClaudeAcpAgent {
       await this.forkHistory.record({
         sessionId: response.sessionId,
         parentSessionId: params.sessionId,
-        branchPoint,
+        branchPoint: displayBranchPoint,
       });
     } catch (error) {
       // A fork without its lineage would execute with the right model context but

@@ -21,6 +21,16 @@ export type ForkResumeTarget = {
 };
 
 /**
+ * The persisted Claude session and SDK message uuid to use for a point fork.
+ * `branchPoint` itself remains the client-visible message id so the display
+ * transcript can still be reconstructed independently of Claude's SDK ids.
+ */
+export type ForkPointResumeTarget = {
+  sessionId: string;
+  messageUuid: string;
+};
+
+/**
  * Stores one file per fork. Separate files make concurrent ACP processes safe:
  * a new fork never needs to rewrite another process's lineage record.
  */
@@ -100,6 +110,31 @@ export async function forkResumeTarget<Message>(
   return resumeTargetFor(sessionId, store, readMessages, new Set());
 }
 
+/**
+ * Resolves a client-visible fork boundary to the session which owns it and to
+ * the SDK uuid Claude expects in `resumeSessionAt`. A visible fork transcript
+ * can contain inherited messages, so looking only in the immediate session is
+ * insufficient: Claude cannot resume that session at a parent message id.
+ */
+export async function forkPointResumeTarget<Message>(
+  sessionId: string,
+  branchPoint: string,
+  store: ForkHistoryStore,
+  readMessages: (sessionId: string) => Promise<Message[]>,
+  messageId: (message: Message) => string | undefined,
+  messageUuid: (message: Message) => string | undefined,
+): Promise<ForkPointResumeTarget> {
+  return pointResumeTargetFor(
+    sessionId,
+    branchPoint,
+    store,
+    readMessages,
+    messageId,
+    messageUuid,
+    new Set(),
+  );
+}
+
 async function historyFor<Message>(
   sessionId: string,
   store: ForkHistoryStore,
@@ -154,6 +189,61 @@ async function resumeTargetFor<Message>(
 
     const inherited = await resumeTargetFor(lineage.parentSessionId, store, readMessages, visiting);
     return lineage.branchPoint ? { ...inherited, branchPoint: lineage.branchPoint } : inherited;
+  } finally {
+    visiting.delete(sessionId);
+  }
+}
+
+async function pointResumeTargetFor<Message>(
+  sessionId: string,
+  branchPoint: string,
+  store: ForkHistoryStore,
+  readMessages: (sessionId: string) => Promise<Message[]>,
+  messageId: (message: Message) => string | undefined,
+  messageUuid: (message: Message) => string | undefined,
+  visiting: Set<string>,
+): Promise<ForkPointResumeTarget> {
+  if (visiting.has(sessionId)) {
+    throw new Error(`Fork lineage contains a cycle at session ${sessionId}`);
+  }
+  visiting.add(sessionId);
+  try {
+    const [lineage, ownMessages] = await Promise.all([
+      store.read(sessionId),
+      readMessages(sessionId),
+    ]);
+
+    // A single Claude turn can yield several persisted records with the same
+    // ACP grouping id. Last-write-wins matches the adapter's live/replay map
+    // and selects the final, resumable record for that turn.
+    let matchingMessage: Message | undefined;
+    for (const message of ownMessages) {
+      if (messageId(message) === branchPoint) matchingMessage = message;
+    }
+    if (matchingMessage) {
+      const uuid = messageUuid(matchingMessage);
+      if (!uuid) {
+        throw new Error(
+          `Fork boundary ${branchPoint} in session ${sessionId} has no SDK message uuid`,
+        );
+      }
+      return { sessionId, messageUuid: uuid };
+    }
+
+    if (!lineage) {
+      throw new Error(
+        `Fork boundary ${branchPoint} is absent from session ${sessionId} and its ancestors`,
+      );
+    }
+    return pointResumeTargetFor(
+      lineage.parentSessionId,
+      branchPoint,
+      store,
+      readMessages,
+      messageId,
+      messageUuid,
+      visiting,
+    );
   } finally {
     visiting.delete(sessionId);
   }

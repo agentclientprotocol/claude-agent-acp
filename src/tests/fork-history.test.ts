@@ -3,9 +3,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ForkHistoryStore, forkedSessionHistory, forkResumeTarget } from "../fork-history.js";
+import {
+  ForkHistoryStore,
+  forkedSessionHistory,
+  forkPointResumeTarget,
+  forkResumeTarget,
+} from "../fork-history.js";
 
-type Message = { id: string; text: string };
+type Message = { id: string; text: string; uuid?: string };
 
 const temporaryDirectories: string[] = [];
 
@@ -42,6 +47,22 @@ async function resumeTarget(
   transcripts: Record<string, Message[]>,
 ) {
   return forkResumeTarget(sessionId, lineages, async (id) => transcripts[id] ?? []);
+}
+
+async function pointResumeTarget(
+  sessionId: string,
+  branchPoint: string,
+  lineages: ForkHistoryStore,
+  transcripts: Record<string, Message[]>,
+) {
+  return forkPointResumeTarget(
+    sessionId,
+    branchPoint,
+    lineages,
+    async (id) => transcripts[id] ?? [],
+    (message) => message.id,
+    (message) => message.uuid,
+  );
 }
 
 describe("fork history", () => {
@@ -159,6 +180,61 @@ describe("fork history", () => {
         "second-fork": [],
       }),
     ).resolves.toEqual({ sessionId: "root", branchPoint: "a1" });
+  });
+
+  it("resolves an ACP assistant id to the final SDK uuid in its owning session", async () => {
+    const lineages = await store();
+
+    await expect(
+      pointResumeTarget("parent", "msg_answer", lineages, {
+        parent: [
+          { id: "msg_answer", uuid: "thinking-uuid", text: "thinking" },
+          { id: "msg_answer", uuid: "answer-uuid", text: "answer" },
+        ],
+      }),
+    ).resolves.toEqual({ sessionId: "parent", messageUuid: "answer-uuid" });
+  });
+
+  it("finds the owning parent when point-forking an inherited response", async () => {
+    const lineages = await store();
+    await lineages.record({ sessionId: "fork", parentSessionId: "parent" });
+
+    await expect(
+      pointResumeTarget("fork", "msg_parent_answer", lineages, {
+        parent: [{ id: "msg_parent_answer", uuid: "parent-answer-uuid", text: "answer" }],
+        fork: [{ id: "msg_fork_answer", uuid: "fork-answer-uuid", text: "new answer" }],
+      }),
+    ).resolves.toEqual({ sessionId: "parent", messageUuid: "parent-answer-uuid" });
+  });
+
+  it("finds an inherited boundary through empty nested forks", async () => {
+    const lineages = await store();
+    await lineages.record({
+      sessionId: "first-fork",
+      parentSessionId: "root",
+      branchPoint: "msg_root_answer",
+    });
+    await lineages.record({ sessionId: "second-fork", parentSessionId: "first-fork" });
+
+    await expect(
+      pointResumeTarget("second-fork", "msg_root_answer", lineages, {
+        root: [{ id: "msg_root_answer", uuid: "root-answer-uuid", text: "root answer" }],
+        "first-fork": [],
+        "second-fork": [],
+      }),
+    ).resolves.toEqual({ sessionId: "root", messageUuid: "root-answer-uuid" });
+  });
+
+  it("rejects a point absent from the complete fork lineage", async () => {
+    const lineages = await store();
+    await lineages.record({ sessionId: "fork", parentSessionId: "parent" });
+
+    await expect(
+      pointResumeTarget("fork", "msg_missing", lineages, {
+        parent: [{ id: "msg_parent", uuid: "parent-uuid", text: "answer" }],
+        fork: [],
+      }),
+    ).rejects.toThrow("Fork boundary msg_missing is absent from session parent and its ancestors");
   });
 
   it("persists the lineage across agent processes", async () => {
