@@ -107,6 +107,32 @@ describe("fork history", () => {
     ]);
   });
 
+  it("keeps every persisted record belonging to the selected assistant turn", async () => {
+    const lineages = await store();
+    await lineages.record({
+      sessionId: "fork",
+      parentSessionId: "parent",
+      branchPoint: "msg_answer",
+    });
+
+    await expect(
+      history("fork", lineages, {
+        parent: [
+          { id: "u1", text: "question" },
+          { id: "msg_answer", text: "tool call" },
+          { id: "msg_answer", text: "final answer" },
+          { id: "u2", text: "later prompt not inherited" },
+        ],
+        fork: [{ id: "u3", text: "alternative prompt" }],
+      }),
+    ).resolves.toEqual([
+      { id: "u1", text: "question" },
+      { id: "msg_answer", text: "tool call" },
+      { id: "msg_answer", text: "final answer" },
+      { id: "u3", text: "alternative prompt" },
+    ]);
+  });
+
   it("resolves a point fork from a previously forked session", async () => {
     const lineages = await store();
     await lineages.record({ sessionId: "first-fork", parentSessionId: "root" });

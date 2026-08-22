@@ -255,7 +255,14 @@ function inheritedThrough<Message>(
   messageId: (message: Message) => string | undefined,
   sessionId: string,
 ): Message[] {
-  const boundary = messages.findIndex((message) => messageId(message) === branchPoint);
+  // One completed assistant turn can be persisted as several records sharing
+  // its ACP grouping id (thinking, tool calls, then its final text). The fork
+  // boundary is after that turn, so retain every matching record rather than
+  // stopping at the first one.
+  let boundary = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    if (messageId(messages[index]) === branchPoint) boundary = index;
+  }
   if (boundary < 0) {
     throw new Error(
       `Fork ${sessionId} refers to message ${branchPoint}, which is absent from its parent history`,
