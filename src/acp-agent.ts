@@ -150,6 +150,7 @@ import {
   isFileChangeAuditTool,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
+import { ForkHistoryStore, forkedSessionHistory } from "./fork-history.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -172,6 +173,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+
+const FORK_HISTORY_DIRECTORY = path.join(CLAUDE_CONFIG_DIR, "acp-forks");
 
 const execFileAsync = promisify(execFile);
 
@@ -866,6 +869,12 @@ export type NewSessionMeta = {
   additionalRoots?: string[];
 };
 
+function forkBranchPoint(params: ForkSessionRequest): string | undefined {
+  const branchPoint = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options
+    ?.resumeSessionAt;
+  return typeof branchPoint === "string" && branchPoint.length > 0 ? branchPoint : undefined;
+}
+
 /**
  * Extra metadata for 'gateway' authentication requests.
  */
@@ -1511,6 +1520,8 @@ export class ClaudeAcpAgent {
   providerConfig?: ProviderConfig;
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
+  /** Durable fork-to-parent links used to reconstruct forked transcripts on load. */
+  private readonly forkHistory = new ForkHistoryStore(FORK_HISTORY_DIRECTORY);
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1718,6 +1729,20 @@ export class ClaudeAcpAgent {
         forkSession: true,
       },
     );
+    try {
+      await this.forkHistory.record({
+        sessionId: response.sessionId,
+        parentSessionId: params.sessionId,
+        branchPoint: forkBranchPoint(params),
+      });
+    } catch (error) {
+      // A fork without its lineage would execute with the right model context but
+      // reopen as an empty transcript. Do not return a session we cannot reload
+      // faithfully; clean up the newly-created SDK session before surfacing the error.
+      await this.teardownSession(response.sessionId);
+      await deleteSession(response.sessionId).catch(() => {});
+      throw error;
+    }
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
@@ -5000,6 +5025,7 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
     await deleteSession(params.sessionId);
+    await this.forkHistory.remove(params.sessionId);
     return {};
   }
 
@@ -5160,7 +5186,12 @@ export class ClaudeAcpAgent {
 
   private async replaySessionHistory(sessionId: string): Promise<void> {
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const messages = await forkedSessionHistory(
+      sessionId,
+      this.forkHistory,
+      getSessionMessages,
+      messageIdForGrouping,
+    );
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
