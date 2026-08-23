@@ -78,7 +78,7 @@ export class NativeSubagentRuntime {
         claudeMeta?.toolName === "Agent" ||
         claudeMeta?.toolName === "Task");
 
-    if (!this.enabled && (isControl || claudeMeta?.parentToolUseId)) return null;
+    if (!this.enabled) return notification;
 
     if (this.enabled && isControl) {
       const identity = subagentIdentity(update.rawInput);

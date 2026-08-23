@@ -1041,9 +1041,26 @@ export type ToolUpdateMeta = {
   };
 };
 
+const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
+
+function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): boolean {
+  return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
+}
+
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+function stripSubagentTextAndThinking(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.filter(
+    (item) =>
+      !item ||
+      typeof item !== "object" ||
+      !("type" in item) ||
+      (item.type !== "text" && item.type !== "thinking"),
+  );
 }
 
 export type ToolUseCache = {
@@ -3322,7 +3339,11 @@ export class ClaudeAcpAgent {
                 const parentToolUseId = message.agent_id
                   ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
                   : undefined;
-                if (message.agent_id && !parentToolUseId) {
+                if (
+                  message.agent_id &&
+                  !parentToolUseId &&
+                  clientSupportsSubagents(this.clientCapabilities)
+                ) {
                   // An agent-scoped denial with missing lineage cannot safely
                   // be presented in the root transcript. The matching hidden
                   // child tool call was not announced there.
@@ -4554,10 +4575,11 @@ export class ClaudeAcpAgent {
               streamedBlocks.length = 0;
             } else if (
               message.type === "assistant" &&
-              !clientSupportsSubagents(this.clientCapabilities)
+              !(session.forwardSubagentText || supportsSubagentTranscript(this.clientCapabilities))
             ) {
-              // Child content has no visible fallback. Only bilaterally
-              // negotiated native sessions can receive it.
+              // Legacy clients keep the flattened tool-call representation,
+              // but nested text/thinking stays internal unless explicitly
+              // requested through the historical transcript extension.
               content = message.message.content.filter(
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
@@ -5229,6 +5251,8 @@ export class ClaudeAcpAgent {
     const toolUseCache: ToolUseCache = {};
     const messages = await getSessionMessages(sessionId);
     const session = this.sessions[sessionId];
+    const forwardSubagentText =
+      session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =
@@ -5303,7 +5327,7 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
-      if (parentToolUseId) {
+      if (parentToolUseId && clientSupportsSubagents(this.clientCapabilities)) {
         // Persisted SDK sidechains do not contain the authoritative
         // task_started/task_updated lifecycle needed to reconstruct a native
         // child session. Never replay them into the root transcript: an
@@ -5311,6 +5335,9 @@ export class ClaudeAcpAgent {
         // a capable client must not receive child output without a preceding
         // subagent_spawned event.
         continue;
+      }
+      if (message.type === "assistant" && parentToolUseId && !forwardSubagentText) {
+        content = stripSubagentTextAndThinking(content);
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
@@ -5438,7 +5465,6 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
     parentToolUseId?: string,
     ownerSessionId: string = params.sessionId,
-    originatesFromSubagent: boolean = false,
   ): Promise<RequestPermissionResponse> {
     if (signal.aborted) throw new Error("Tool use aborted");
     // The SDK may invoke `canUseTool` (and therefore this permission request)
@@ -5447,20 +5473,15 @@ export class ClaudeAcpAgent {
     // so emit it now if it hasn't been sent yet. The streamed tool_use chunk
     // later refines it with a `tool_call_update` rather than emitting a
     // duplicate (see `emittedToolCalls` in `toAcpNotifications`).
-    if (
-      (!originatesFromSubagent && !parentToolUseId) ||
-      clientSupportsSubagents(this.clientCapabilities)
-    ) {
-      await this.ensureToolCallEmitted(
-        ownerSessionId,
-        toolName,
-        params.toolCall.toolCallId,
-        params.toolCall.rawInput,
-        parentToolUseId,
-        signal,
-        params.sessionId,
-      );
-    }
+    await this.ensureToolCallEmitted(
+      ownerSessionId,
+      toolName,
+      params.toolCall.toolCallId,
+      params.toolCall.rawInput,
+      parentToolUseId,
+      signal,
+      params.sessionId,
+    );
     if (signal.aborted) throw new Error("Tool use aborted");
 
     // Do not rely on every ACP client settling requestPermission after the
@@ -5692,7 +5713,6 @@ export class ClaudeAcpAgent {
         signal,
         parentToolUseId,
         sessionId,
-        agentID !== undefined,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
       const decodedPermission = decodeClaudePermissionResponse(
@@ -6300,7 +6320,10 @@ export class ClaudeAcpAgent {
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options;
-    const forwardSubagentText = clientSupportsSubagents(this.clientCapabilities);
+    const forwardSubagentText =
+      clientSupportsSubagents(this.clientCapabilities) ||
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      userProvidedOptions?.forwardSubagentText === true;
 
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);

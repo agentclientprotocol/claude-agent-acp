@@ -271,17 +271,17 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.forwardSubagentText).toBe(false);
     });
 
-    it("ignores caller forwarding without native ACP negotiation", async () => {
+    it("preserves caller-provided legacy transcript forwarding", async () => {
       await agent.newSession({
         cwd: process.cwd(),
         mcpServers: [],
         _meta: { claudeCode: { options: { forwardSubagentText: true } } },
       });
 
-      expect(capturedOptions!.forwardSubagentText).toBe(false);
+      expect(capturedOptions!.forwardSubagentText).toBe(true);
     });
 
-    it("does not accept the legacy transcript extension", async () => {
+    it("accepts the legacy transcript extension", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: { _meta: { "subagent-transcript": true } },
@@ -292,7 +292,7 @@ describe("createSession options merging", () => {
         _meta: { claudeCode: { options: { forwardSubagentText: false } } },
       });
 
-      expect(capturedOptions!.forwardSubagentText).toBe(false);
+      expect(capturedOptions!.forwardSubagentText).toBe(true);
     });
 
     it("enables SDK forwarding after native ACP negotiation", async () => {

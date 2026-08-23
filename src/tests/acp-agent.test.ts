@@ -2165,13 +2165,18 @@ describe("subagent transcript replay", () => {
     },
   ] as Awaited<ReturnType<typeof getSessionMessages>>;
 
-  async function replay(capable: boolean): Promise<SessionNotification[]> {
+  async function replay(capability: "native" | "legacy" | false): Promise<SessionNotification[]> {
     const updates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (update: SessionNotification) => updates.push(update),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = capable ? { subagents: {} } : {};
+    (agent as any).clientCapabilities =
+      capability === "native"
+        ? { subagents: {} }
+        : capability === "legacy"
+          ? { _meta: { "subagent-transcript": true } }
+          : {};
     vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
 
     await (
@@ -2181,13 +2186,45 @@ describe("subagent transcript replay", () => {
   }
 
   it("does not replay child output without authoritative native lifecycle", async () => {
-    const updates = await replay(true);
+    const updates = await replay("native");
     expect(updates).toEqual([]);
   });
 
-  it("does not create a legacy child representation for unsupported clients", async () => {
+  it("keeps legacy text filtering without losing child tool attribution", async () => {
     const updates = await replay(false);
-    expect(updates).toEqual([]);
+    expect(updates.some(({ update }) => update.sessionUpdate === "agent_message_chunk")).toBe(
+      false,
+    );
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "tool_call",
+            toolCallId: "child-tool",
+            _meta: expect.objectContaining({
+              claudeCode: expect.objectContaining({ parentToolUseId: "parent-agent-call" }),
+            }),
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("replays the flattened transcript for the legacy opt-in", async () => {
+    const updates = await replay("legacy");
+    expect(updates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "nested report" },
+          }),
+        }),
+        expect.objectContaining({
+          update: expect.objectContaining({ sessionUpdate: "tool_call", toolCallId: "child-tool" }),
+        }),
+      ]),
+    );
   });
 });
 
@@ -3428,7 +3465,7 @@ describe("subagent permission attribution (issue #851)", () => {
     return { agent, updates, requests, log, session: agent.sessions["session-1"]! };
   }
 
-  it("forwards only the permission when native subagents were not negotiated", async () => {
+  it("keeps the legacy child tool call before its root permission request", async () => {
     const { agent, updates, requests, session } = setup();
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
@@ -3442,7 +3479,11 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-42",
     } as any);
 
-    expect(updates).toEqual([]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_sub",
+      _meta: { claudeCode: { parentToolUseId: "toolu_parent" } },
+    });
     expect(requests[0].sessionId).toBe("session-1");
     expect(requests[0].toolCall._meta).toMatchObject({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
@@ -3496,7 +3537,10 @@ describe("subagent permission attribution (issue #851)", () => {
       agentID: "agent-unknown",
     } as any);
 
-    expect(updates).toEqual([]);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_sub",
+    });
     expect(requests[0].toolCall._meta).toBeUndefined();
     // The task_id === agentID invariant is undocumented SDK behavior; a miss
     // must be observable so an SDK bump that breaks it doesn't regress silently.
@@ -3748,7 +3792,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(map.get("agent-43")?.parentToolUseId).toBe("toolu_parent_2");
   });
 
-  it("hides legacy subagent lifecycle and child output without capability negotiation", async () => {
+  it("keeps legacy Agent lifecycle and flattened child output without capability negotiation", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -3809,11 +3853,19 @@ describe("subagent permission attribution (issue #851)", () => {
       updates.some(
         ({ update }) =>
           update.sessionUpdate === "subagent_spawned" ||
-          update.sessionUpdate === "subagent_state_update" ||
-          JSON.stringify(update).includes("hidden child output") ||
-          JSON.stringify(update).includes("toolu_parent"),
+          update.sessionUpdate === "subagent_state_update",
       ),
     ).toBe(false);
+    expect(
+      updates.some(({ update }) => JSON.stringify(update).includes("hidden child output")),
+    ).toBe(true);
+    expect(
+      updates.some(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId === "toolu_parent",
+      ),
+    ).toBe(true);
   });
 
   it("emits native subagent lifecycle when both peers advertise support", async () => {
@@ -9043,7 +9095,7 @@ describe("assembled assistant text fallback", () => {
     expect(thoughtChunkTexts(updates)).toEqual([]);
   });
 
-  it("does not treat the legacy transcript extension as native subagent negotiation", async () => {
+  it("forwards subagent text and thinking through the legacy transcript extension", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
     injectSession(agent, [
@@ -9066,7 +9118,12 @@ describe("assembled assistant text fallback", () => {
         update.sessionUpdate === "agent_message_chunk" ||
         update.sessionUpdate === "agent_thought_chunk",
     );
-    expect(nestedUpdates).toEqual([]);
+    expect(nestedUpdates).toHaveLength(2);
+    for (const { update } of nestedUpdates) {
+      expect(update._meta).toMatchObject({ claudeCode: { parentToolUseId: "tool_use_1" } });
+    }
+    expect(messageChunkTexts(updates)).toContain("nested report");
+    expect(thoughtChunkTexts(updates)).toContain("checking");
   });
 
   it("forwards distinct blocks that a gateway splits across same-id messages", async () => {
@@ -16120,7 +16177,7 @@ describe("tool_progress heartbeats", () => {
   // report under `agent_<assistant_message_id>`, with the retrying Agent call's
   // real id in `parent_tool_use_id`. Resolving via the suffix alone dropped
   // them, leaving a stalled spawn with no explanation.
-  it("hides a subagent retry beat without native negotiation", async () => {
+  it("reports a subagent retry beat against the Agent call without native negotiation", async () => {
     const sent = await run(
       [
         {
@@ -16145,7 +16202,14 @@ describe("tool_progress heartbeats", () => {
       ["toolu_task"],
     );
 
-    expect(sent).toEqual([]);
+    expect(sent[0].toolCallId).toBe("toolu_task");
+    expect((sent[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Task",
+      toolResponse: {
+        subagentType: "code-reviewer",
+        subagentRetry: { attempt: 2, max_retries: 5, error_status: 529 },
+      },
+    });
   });
 
   // A subagent's own `bash_progress` reports the inner tool's real id, with the
@@ -16160,7 +16224,7 @@ describe("tool_progress heartbeats", () => {
     expect(sent.map((u) => u.toolCallId)).toEqual(["toolu_inner"]);
   });
 
-  it("hides a child tool beat without native negotiation", async () => {
+  it("keeps a child tool beat in the legacy flattened transcript", async () => {
     const sent = await run(
       [
         {
@@ -16177,7 +16241,7 @@ describe("tool_progress heartbeats", () => {
       ["toolu_task", "toolu_inner"],
     );
 
-    expect(sent).toEqual([]);
+    expect(sent.map((update) => update.toolCallId)).toEqual(["toolu_inner"]);
   });
 });
 
@@ -16379,7 +16443,7 @@ describe("permission_denied", () => {
   // call that spawned it, so without the `liveBackgroundTasks` lookup the update
   // lands at the top level while the tool_call it resolves sits in the
   // subagent's transcript.
-  it("hides a subagent denial tool update without native negotiation", async () => {
+  it("attributes a legacy subagent denial to the Agent call that spawned it", async () => {
     const updates = await run([
       {
         type: "system",
@@ -16394,15 +16458,20 @@ describe("permission_denied", () => {
       denial("toolu_inner", { agent_id: "agent-1" }),
     ]);
 
-    expect(denials(updates)).toEqual([]);
+    expect((denials(updates)[0]._meta as any).claudeCode).toMatchObject({
+      toolName: "Write",
+      parentToolUseId: "toolu_agent",
+    });
   });
 
-  it("drops an agent-scoped denial when the parent is unknown", async () => {
+  it("still resolves a legacy subagent denial when the parent is unknown", async () => {
     const updates = await run([
       toolUse("toolu_inner", "toolu_agent"),
       denial("toolu_inner", { agent_id: "agent-unknown" }),
     ]);
 
-    expect(denials(updates)).toEqual([]);
+    const sent = denials(updates);
+    expect(sent).toHaveLength(1);
+    expect((sent[0]._meta as any).claudeCode).not.toHaveProperty("parentToolUseId");
   });
 });

@@ -37,9 +37,10 @@ Subagents are exposed only after bilateral capability negotiation. Until the rel
 preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
 `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
 in its initialize response. The canonical field remains supported and takes precedence once it is
-available. Without either client signal, Agent/Task lifecycle, child output, and child elicitations
-remain hidden; child permission requests are still forwarded on the root session. There is no
-legacy tool-shaped subagent fallback.
+available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
+tool-call representation and child interactions stay on the root session. Clients that use the
+historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
+the flattened child transcript behavior.
 
 ## Contribution Policy
 
