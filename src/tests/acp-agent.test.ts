@@ -6783,6 +6783,48 @@ describe("usage_update computation", () => {
     expect(usageUpdates[1].update.cost).toBeDefined();
   });
 
+  it("includes the effective model id on usage_update notifications", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-sonnet-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 200,
+          cache_creation_input_tokens: 100,
+        },
+      }),
+      createStreamEvent("message_delta", {
+        usage: { output_tokens: 500 },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-sonnet-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(3);
+    for (const { update } of usageUpdates) {
+      expect(update.model).toBe("claude-sonnet-4-20250514");
+      expect(update._meta?.["_claude/model"]).toBe("claude-sonnet-4-20250514");
+    }
+  });
+
   it("stream_event message_delta patches previous snapshot", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -8967,13 +9009,13 @@ describe("result origin handling", () => {
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update._meta).toEqual({
       "_claude/origin": { kind: "channel", server: "acp" },
+      "_claude/model": "claude-sonnet-4-6",
     });
   });
 
-  it("omits _meta when origin is absent", async () => {
+  it("omits _meta when origin and assistant model are absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
-      createAssistantMessage(),
       createResult(),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
@@ -8981,8 +9023,7 @@ describe("result origin handling", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate).toBeDefined();
-    expect(usageUpdate.update._meta).toBeUndefined();
+    expect(usageUpdate).toBeUndefined();
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
