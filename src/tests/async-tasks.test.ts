@@ -1,8 +1,74 @@
 import { describe, expect, it } from "vitest";
 import type { AcpSessionNotification } from "../acp-subagents.js";
-import { AsyncTaskRuntime, clientSupportsAsyncTasks } from "../async-tasks.js";
+import {
+  AsyncTaskRuntime,
+  backgroundBashTaskFromToolResult,
+  clientSupportsAsyncTasks,
+} from "../async-tasks.js";
 
 describe("AsyncTaskRuntime", () => {
+  it("recovers a background Bash task from its structured tool result", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "root", async (notification) => {
+      updates.push(notification);
+    });
+    const task = backgroundBashTaskFromToolResult(
+      [{ type: "tool_result", tool_use_id: "bash-tool", content: "running" }],
+      { backgroundTaskId: "bpux8xmfg", stdout: "", stderr: "" },
+      {
+        "bash-tool": {
+          name: "Bash",
+          input: { command: "npm run build", run_in_background: true },
+        },
+      },
+    );
+
+    expect(task).toEqual({
+      taskId: "bpux8xmfg",
+      taskType: "local_bash",
+      description: "npm run build",
+      isBackgrounded: true,
+    });
+    await runtime.taskStarted(task!);
+    await runtime.taskNotification("bpux8xmfg", "completed", "Build finished");
+
+    expect(updates.map((notification) => notification.update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+    expect(updates[0].update).toMatchObject({
+      asyncTaskId: "bpux8xmfg",
+      name: "npm run build",
+      taskType: "shell",
+      description: "npm run build",
+      showInTranscript: true,
+    });
+  });
+
+  it("does not infer a background task without one unambiguous Bash result", () => {
+    const toolUseResult = { backgroundTaskId: "task-1" };
+    const bash = { bash: { name: "Bash", input: { command: "npm run build" } } };
+
+    expect(backgroundBashTaskFromToolResult([], toolUseResult, bash)).toBeUndefined();
+    expect(
+      backgroundBashTaskFromToolResult(
+        [
+          { type: "tool_result", tool_use_id: "bash" },
+          { type: "tool_result", tool_use_id: "other" },
+        ],
+        toolUseResult,
+        bash,
+      ),
+    ).toBeUndefined();
+    expect(
+      backgroundBashTaskFromToolResult(
+        [{ type: "tool_result", tool_use_id: "read" }],
+        toolUseResult,
+        { read: { name: "Read", input: {} } },
+      ),
+    ).toBeUndefined();
+  });
+
   it("detects the negotiated AIR capability", () => {
     expect(
       clientSupportsAsyncTasks({

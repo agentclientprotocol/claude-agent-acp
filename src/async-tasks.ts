@@ -14,7 +14,7 @@ type AsyncTask = {
   state: AsyncTaskState;
 };
 
-type TaskStarted = {
+export type AsyncTaskStarted = {
   taskId: string;
   taskType?: unknown;
   description?: unknown;
@@ -46,7 +46,7 @@ export class AsyncTaskRuntime {
     private readonly publish: Publish,
   ) {}
 
-  async taskStarted(message: TaskStarted): Promise<void> {
+  async taskStarted(message: AsyncTaskStarted): Promise<void> {
     if (!this.enabled || message.subagentType || this.tasks.has(message.taskId)) return;
     const taskType = friendlyTaskType(message.taskType);
     const description = nonBlankString(message.description) ?? defaultDescription(taskType);
@@ -168,6 +168,42 @@ export class AsyncTaskRuntime {
   }
 }
 
+/**
+ * Recovers the lifecycle edge that current Claude CLI versions expose only on
+ * the Bash tool result. Background Bash does not consistently emit the SDK's
+ * task_started/task_updated system messages, but its structured result carries
+ * the stable task id after the process has actually been backgrounded.
+ */
+export function backgroundBashTaskFromToolResult(
+  content: unknown,
+  toolUseResult: unknown,
+  toolUses: Record<string, { name: string; input: unknown }>,
+): AsyncTaskStarted | undefined {
+  if (!Array.isArray(content) || !isRecord(toolUseResult)) return undefined;
+  const taskId = nonBlankString(toolUseResult.backgroundTaskId);
+  if (!taskId) return undefined;
+
+  const toolResults = content.filter(
+    (item): item is { type: "tool_result"; tool_use_id: string } =>
+      isRecord(item) &&
+      item.type === "tool_result" &&
+      typeof item.tool_use_id === "string" &&
+      item.tool_use_id.length > 0,
+  );
+  if (toolResults.length !== 1) return undefined;
+
+  const toolUse = toolUses[toolResults[0].tool_use_id];
+  if (toolUse?.name !== "Bash") return undefined;
+  const input = isRecord(toolUse.input) ? toolUse.input : undefined;
+  const description = nonBlankString(input?.command);
+  return {
+    taskId,
+    taskType: "local_bash",
+    description,
+    isBackgrounded: true,
+  };
+}
+
 function friendlyTaskType(value: unknown): string {
   if (value === "local_bash") return "shell";
   if (value === "local_workflow") return "workflow";
@@ -218,4 +254,8 @@ function taskUsage(
 
 function nonBlankString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
