@@ -10,6 +10,7 @@ type AsyncTask = {
   taskType: string;
   description: string;
   showInTranscript: boolean;
+  outputFilePath?: string;
   announced: boolean;
   state: AsyncTaskState;
 };
@@ -22,6 +23,7 @@ export type AsyncTaskStarted = {
   isBackgrounded?: unknown;
   workflowName?: unknown;
   skipTranscript?: unknown;
+  outputFilePath?: unknown;
 };
 
 type TaskProgress = {
@@ -56,6 +58,7 @@ export class AsyncTaskRuntime {
       taskType,
       description,
       showInTranscript: message.skipTranscript !== true,
+      outputFilePath: nonBlankString(message.outputFilePath),
       announced: false,
       state: "running",
     };
@@ -75,6 +78,8 @@ export class AsyncTaskRuntime {
       existing.description = description;
       existing.name = nonBlankString(message.workflowName) ?? description;
     }
+    const outputFilePath = nonBlankString(message.outputFilePath);
+    if (outputFilePath) existing.outputFilePath = outputFilePath;
     await this.announce(existing);
   }
 
@@ -151,6 +156,7 @@ export class AsyncTaskRuntime {
         taskType: task.taskType,
         description: task.description,
         showInTranscript: task.showInTranscript,
+        ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
       },
     });
     task.announced = true;
@@ -199,7 +205,7 @@ export function backgroundBashTaskFromToolResult(
   if (!taskId) return undefined;
 
   const toolResults = content.filter(
-    (item): item is { type: "tool_result"; tool_use_id: string } =>
+    (item): item is { type: "tool_result"; tool_use_id: string; content?: unknown } =>
       isRecord(item) &&
       item.type === "tool_result" &&
       typeof item.tool_use_id === "string" &&
@@ -211,12 +217,30 @@ export function backgroundBashTaskFromToolResult(
   if (toolUse?.name !== "Bash") return undefined;
   const input = isRecord(toolUse.input) ? toolUse.input : undefined;
   const description = nonBlankString(input?.command);
+  const outputFilePath = asyncTaskOutputFilePath(toolResults[0].content, taskId);
   return {
     taskId,
     taskType: "local_bash",
     description,
     isBackgrounded: true,
+    outputFilePath,
   };
+}
+
+function asyncTaskOutputFilePath(content: unknown, taskId: string): string | undefined {
+  if (typeof content !== "string") return undefined;
+  const marker = "Output is being written to: ";
+  const start = content.indexOf(marker);
+  if (start < 0) return undefined;
+  const valueStart = start + marker.length;
+  const valueEnd = content.indexOf(". You will be notified", valueStart);
+  if (valueEnd < 0) return undefined;
+  const path = content.slice(valueStart, valueEnd).trim();
+  const expectedPosixSuffix = `/tasks/${taskId}.output`;
+  const expectedWindowsSuffix = `\\tasks\\${taskId}.output`;
+  return path.endsWith(expectedPosixSuffix) || path.endsWith(expectedWindowsSuffix)
+    ? path
+    : undefined;
 }
 
 function friendlyTaskType(value: unknown): string {

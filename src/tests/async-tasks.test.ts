@@ -13,7 +13,14 @@ describe("AsyncTaskRuntime", () => {
       updates.push(notification);
     });
     const task = backgroundBashTaskFromToolResult(
-      [{ type: "tool_result", tool_use_id: "bash-tool", content: "running" }],
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "bash-tool",
+          content:
+            "Command running in background with ID: bpux8xmfg. Output is being written to: /private/tmp/claude/tasks/bpux8xmfg.output. You will be notified when it completes.",
+        },
+      ],
       { backgroundTaskId: "bpux8xmfg", stdout: "", stderr: "" },
       {
         "bash-tool": {
@@ -28,6 +35,7 @@ describe("AsyncTaskRuntime", () => {
       taskType: "local_bash",
       description: "npm run build",
       isBackgrounded: true,
+      outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
     });
     // The SDK can report local_bash before the Bash result proves that it was
     // backgrounded. The structured result must promote that existing task.
@@ -49,6 +57,7 @@ describe("AsyncTaskRuntime", () => {
       taskType: "shell",
       description: "npm run build",
       showInTranscript: true,
+      outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
     });
   });
 
@@ -73,6 +82,20 @@ describe("AsyncTaskRuntime", () => {
         toolUseResult,
         { read: { name: "Read", input: {} } },
       ),
+    ).toBeUndefined();
+    expect(
+      backgroundBashTaskFromToolResult(
+        [
+          {
+            type: "tool_result",
+            tool_use_id: "bash",
+            content:
+              "Output is being written to: /private/tmp/claude/tasks/not-task-1.output. You will be notified",
+          },
+        ],
+        toolUseResult,
+        bash,
+      )?.outputFilePath,
     ).toBeUndefined();
   });
 
