@@ -206,6 +206,10 @@ type AccumulatedUsage = {
   cachedWriteTokens: number;
 };
 
+/** Per-model token tallies keyed by the model id the SDK reported them under
+ *  (its resolved spelling, e.g. "claude-opus-5[1m]"). */
+type ModelTokenTally = Record<string, AccumulatedUsage>;
+
 type UsageSnapshot = {
   input_tokens: number;
   output_tokens: number;
@@ -434,6 +438,9 @@ type Turn = {
    *  of its latest result, so its usage covers every cycle the turn ran. */
   steeredSettle?: PromptResponse;
   carriedUsage?: AccumulatedUsage;
+  /** `carriedUsage`'s per-model counterpart, so a turn that survives a
+   *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
+  carriedModelUsage?: ModelTokenTally;
   resolve: (response: PromptResponse) => void;
   reject: (error: unknown) => void;
   /** Settles after the ACP prompt request completes, regardless of outcome. */
@@ -541,6 +548,15 @@ export type Session = {
   /** This session's title state and the turn-end logic that maintains it. */
   titles: SessionTitles;
   accumulatedUsage: AccumulatedUsage;
+  /** The active turn's spend broken out per model — the breakdown behind
+   *  `accumulatedUsage`, reported as `_meta.quota.model_usage` on the prompt
+   *  response. Accumulated and reset in lockstep with it. */
+  accumulatedModelUsage?: ModelTokenTally;
+  /** The last per-model reading seen on this query, autonomous cycles included.
+   *  `result.modelUsage` is a running total for the whole query() call rather
+   *  than a per-result figure, so consecutive readings are what a result's own
+   *  spend is derived from — this is not itself a turn tally. */
+  lastModelUsageReading?: ModelTokenTally;
   modes: SessionModeState;
   models: SessionModelState;
   modelInfos: ModelInfo[];
@@ -2262,7 +2278,11 @@ export class ClaudeAcpAgent {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       };
-      if (session.activeTurn) session.activeTurn.carriedUsage = undefined;
+      session.accumulatedModelUsage = session.activeTurn?.carriedModelUsage ?? {};
+      if (session.activeTurn) {
+        session.activeTurn.carriedUsage = undefined;
+        session.activeTurn.carriedModelUsage = undefined;
+      }
     };
 
     /** Promote a queued turn to active: it becomes the one output is attributed
@@ -2583,14 +2603,7 @@ export class ClaudeAcpAgent {
         return;
       }
       sessionFailures.recordActive(failure);
-      settleActive(
-        {
-          stopReason: "end_turn",
-          usage: sessionUsage(session),
-          _meta: sessionFailureMeta(failure),
-        },
-        "providerError",
-      );
+      settleActive(turnOutcome(session, "end_turn", sessionFailureMeta(failure)), "providerError");
     };
 
     /** Reject every in-flight turn — used when the stream dies. */
@@ -2693,7 +2706,7 @@ export class ClaudeAcpAgent {
               this.trackOrphanCommand(session, active.promptUuid, "started");
             }
           }
-          settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
+          settleActive(turnOutcome(session, "cancelled"));
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
           // streamed text can't suppress the next turn's issue-#453 fallback.
@@ -2753,8 +2766,8 @@ export class ClaudeAcpAgent {
           const inFlight = session.activeTurn;
           settleActive(
             session.cancelled
-              ? { stopReason: "cancelled", usage: sessionUsage(session) }
-              : (inFlight?.deferredSettle ?? { stopReason, usage: sessionUsage(session) }),
+              ? turnOutcome(session, "cancelled")
+              : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
           );
           // Queued turns the SDK never started never ran, so reject them rather
           // than reporting a success (end_turn) — or a misleading "cancelled" —
@@ -3046,7 +3059,7 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
+                    settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
                     // delivery stretch here: idle is the SDK's authoritative
@@ -3643,6 +3656,25 @@ export class ClaudeAcpAgent {
                   message.usage.cache_creation_input_tokens;
               }
 
+              // The same tally split by model, for `_meta.quota.model_usage`.
+              // `modelUsage` is a running total for the whole query() call, so
+              // this result's own spend is what it added to the previous
+              // reading. Advance the reading even for an autonomous result — it
+              // is part of the running total the NEXT increment is measured
+              // from — but leave the turn tally alone, exactly as above.
+              const modelUsageReading = normalizeModelUsage(message.modelUsage);
+              const resultModelUsage = modelUsageIncrement(
+                modelUsageReading,
+                session.lastModelUsageReading ?? {},
+              );
+              session.lastModelUsageReading = modelUsageReading;
+              if (!isAutonomousResult) {
+                session.accumulatedModelUsage = addModelUsage(
+                  session.accumulatedModelUsage ?? {},
+                  resultModelUsage,
+                );
+              }
+
               const matchingModelUsage = lastAssistantModel
                 ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
                 : null;
@@ -3776,7 +3808,7 @@ export class ClaudeAcpAgent {
                   return;
                 }
                 stopReason = "cancelled";
-                settleOrDefer({ stopReason: "cancelled", usage: sessionUsage(session) });
+                settleOrDefer(turnOutcome(session, "cancelled"));
                 break;
               }
               if (pendingExitPlanModeInterruption) {
@@ -3809,7 +3841,7 @@ export class ClaudeAcpAgent {
                 // settling it out from under them would strand their output
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
-                settleOrDefer({ stopReason: "refusal", usage: sessionUsage(session) });
+                settleOrDefer(turnOutcome(session, "refusal"));
                 break;
               }
 
@@ -3823,7 +3855,7 @@ export class ClaudeAcpAgent {
                 isSteering(session.activeTurn) &&
                 session.activeTurn.steeredEchoes.size > 0
               ) {
-                settleOrDefer({ stopReason: "end_turn", usage: sessionUsage(session) });
+                settleOrDefer(turnOutcome(session, "end_turn"));
                 break;
               }
 
@@ -3985,7 +4017,7 @@ export class ClaudeAcpAgent {
               // idle/abort path. settleActive is idempotent, so a duplicate
               // idle is a no-op.
               if (!session.cancelled) {
-                settleOrDefer({ stopReason, usage: sessionUsage(session) });
+                settleOrDefer(turnOutcome(session, stopReason));
               }
             } finally {
               if (!isAutonomousResult) {
@@ -4175,7 +4207,7 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles++;
                       // Before activateTurn resets the accumulator, so the
                       // usage still belongs to the cancelled turn.
-                      settleActive({ stopReason: "cancelled", usage: sessionUsage(session) });
+                      settleActive(turnOutcome(session, "cancelled"));
                     } else if (isHeldOpen(session.activeTurn)) {
                       // A turn held open for its background subagents (see
                       // Turn.deferredSettle) hands off with the real outcome
@@ -4203,7 +4235,7 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles++;
                       settleActive(session.activeTurn.steeredSettle);
                     } else {
-                      settleActive({ stopReason: "end_turn", usage: sessionUsage(session) });
+                      settleActive(turnOutcome(session, "end_turn"));
                     }
                   }
                   // Unlike the no-result teardown lanes, this hand-off must
@@ -4771,7 +4803,14 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve({ stopReason: "cancelled", usage: active.deferredSettle.usage });
+        // Carries the held outcome's `_meta` too: a deferred outcome's only
+        // metadata is its quota breakdown, the counterpart of the usage taken
+        // from it here.
+        active.resolve({
+          stopReason: "cancelled",
+          usage: active.deferredSettle.usage,
+          ...(active.deferredSettle._meta ? { _meta: active.deferredSettle._meta } : {}),
+        });
       }
     }
 
@@ -6627,6 +6666,8 @@ export class ClaudeAcpAgent {
         cachedReadTokens: 0,
         cachedWriteTokens: 0,
       },
+      accumulatedModelUsage: {},
+      lastModelUsageReading: {},
       modes,
       models,
       modelInfos,
@@ -6721,12 +6762,136 @@ function sessionUsage(session: Session) {
     outputTokens: session.accumulatedUsage.outputTokens,
     cachedReadTokens: session.accumulatedUsage.cachedReadTokens,
     cachedWriteTokens: session.accumulatedUsage.cachedWriteTokens,
-    totalTokens:
-      session.accumulatedUsage.inputTokens +
-      session.accumulatedUsage.outputTokens +
-      session.accumulatedUsage.cachedReadTokens +
-      session.accumulatedUsage.cachedWriteTokens,
+    totalTokens: tallyTotal(session.accumulatedUsage),
   };
+}
+
+/** The prompt response for a turn ending in `stopReason`: its usage and the
+ *  `_meta.quota` breakdown, both read off the session accumulators in the same
+ *  breath so a stored outcome (see Turn.deferredSettle / Turn.steeredSettle)
+ *  can't carry a usage and a quota from different moments. `extraMeta` merges
+ *  in alongside quota — a terminal session failure, today. */
+function turnOutcome(
+  session: Session,
+  stopReason: StopReason,
+  extraMeta?: Record<string, unknown>,
+): PromptResponse {
+  return {
+    stopReason,
+    usage: sessionUsage(session),
+    _meta: { ...turnQuotaMeta(session), ...extraMeta },
+  };
+}
+
+/** `_meta.quota` for a prompt response: what the turn spent, shaped like
+ *  codex-acp's (snake_case container keys, camelCase counters) so a client
+ *  reads one shape from either agent.
+ *
+ *  The two halves have different scopes, and by design don't have to add up.
+ *  `token_count` mirrors the response's own `usage`, which the SDK reports for
+ *  the MAIN AGENT LOOP only. The `model_usage` rows come from
+ *  `result.modelUsage`, which also counts Task subagents, sidechains and
+ *  internal calls such as compaction — the accounting-grade figure per the SDK,
+ *  so the rows can total more than `token_count`. They are the fuller picture,
+ *  not a decomposition of it. */
+function turnQuotaMeta(session: Session) {
+  return {
+    quota: {
+      token_count: quotaTokenCount(session.accumulatedUsage),
+      model_usage: Object.entries(session.accumulatedModelUsage ?? {}).map(([model, usage]) => ({
+        model,
+        token_count: quotaTokenCount(usage),
+      })),
+    },
+  };
+}
+
+/** One `token_count` object. `cachedInputTokens` is cache reads, matching
+ *  codex's field; Claude also reports cache writes, which codex has no slot
+ *  for, so those ride along in an extra sibling (the same name the ACP `usage`
+ *  field already uses) and are counted in `totalTokens`. `reasoningOutputTokens`
+ *  is always 0: Claude bills thinking inside its output tokens and never breaks
+ *  it out — the key is kept so the shape stays uniform across agents. */
+function quotaTokenCount(usage: AccumulatedUsage) {
+  return {
+    totalTokens: tallyTotal(usage),
+    inputTokens: usage.inputTokens,
+    cachedInputTokens: usage.cachedReadTokens,
+    cachedWriteTokens: usage.cachedWriteTokens,
+    outputTokens: usage.outputTokens,
+    reasoningOutputTokens: 0,
+  };
+}
+
+/** Sum a tally's four counters. Per the Anthropic API `inputTokens` excludes
+ *  the cache counters, so this is not double-counting (see `totalTokens`). */
+function tallyTotal(usage: AccumulatedUsage): number {
+  return usage.inputTokens + usage.outputTokens + usage.cachedReadTokens + usage.cachedWriteTokens;
+}
+
+/** Project `result.modelUsage` into our tally shape. Counters are coerced the
+ *  way `snapshotFromUsage` coerces the stream's: third-party backends have been
+ *  observed omitting fields, and a missing or NaN counter must not reach the
+ *  wire as NaN (which `JSON.stringify` writes as `null`). */
+function normalizeModelUsage(modelUsage: Record<string, ModelUsage> | undefined): ModelTokenTally {
+  const tally: ModelTokenTally = {};
+  for (const [model, usage] of Object.entries(modelUsage ?? {})) {
+    tally[model] = {
+      inputTokens: finiteCount(usage?.inputTokens),
+      outputTokens: finiteCount(usage?.outputTokens),
+      cachedReadTokens: finiteCount(usage?.cacheReadInputTokens),
+      cachedWriteTokens: finiteCount(usage?.cacheCreationInputTokens),
+    };
+  }
+  return tally;
+}
+
+function finiteCount(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/** `current - previous` per model, dropping models with nothing to report so a
+ *  turn only lists the models it actually ran on. A reading that fell BELOW the
+ *  previous one means the running total restarted under us (a mid-session
+ *  /clear, a resumed session starting fresh, a zeroed crash result): there is no
+ *  usable reference left to subtract, so the reading itself is the increment. */
+function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally): ModelTokenTally {
+  const increment: ModelTokenTally = {};
+  for (const [model, usage] of Object.entries(current)) {
+    const base = previous[model];
+    const subtracted: AccumulatedUsage = base
+      ? {
+          inputTokens: usage.inputTokens - base.inputTokens,
+          outputTokens: usage.outputTokens - base.outputTokens,
+          cachedReadTokens: usage.cachedReadTokens - base.cachedReadTokens,
+          cachedWriteTokens: usage.cachedWriteTokens - base.cachedWriteTokens,
+        }
+      : usage;
+    const rewound = Object.values(subtracted).some((count) => count < 0);
+    const resolved = rewound ? usage : subtracted;
+    if (tallyTotal(resolved) > 0) {
+      increment[model] = resolved;
+    }
+  }
+  return increment;
+}
+
+/** Fold `increment` into `base` per model — the per-model counterpart of the
+ *  `+=` the turn's flat accumulator uses. */
+function addModelUsage(base: ModelTokenTally, increment: ModelTokenTally): ModelTokenTally {
+  const merged: ModelTokenTally = { ...base };
+  for (const [model, usage] of Object.entries(increment)) {
+    const existing = merged[model];
+    merged[model] = existing
+      ? {
+          inputTokens: existing.inputTokens + usage.inputTokens,
+          outputTokens: existing.outputTokens + usage.outputTokens,
+          cachedReadTokens: existing.cachedReadTokens + usage.cachedReadTokens,
+          cachedWriteTokens: existing.cachedWriteTokens + usage.cachedWriteTokens,
+        }
+      : usage;
+  }
+  return merged;
 }
 
 /** Sum all four fields as a proxy for post-turn context occupancy: the current

@@ -57,7 +57,12 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
-import { mockSessionState, userEcho, wrapQuery } from "./session-doubles.js";
+import {
+  mockSessionState,
+  successfulResultMessage,
+  userEcho,
+  wrapQuery,
+} from "./session-doubles.js";
 import {
   GOAL_CONTROL_METHOD,
   goalUpdateFromPrompt,
@@ -118,6 +123,45 @@ const cancelledTurnUsage = {
   cachedWriteTokens: 0,
   totalTokens: 0,
 };
+
+type TokenCounts = {
+  inputTokens: number;
+  outputTokens: number;
+  cachedReadTokens: number;
+  cachedWriteTokens: number;
+};
+
+/** One `token_count` object as the prompt response's `_meta.quota` spells it —
+ *  codex-acp's shape, where cache reads are `cachedInputTokens` and
+ *  `reasoningOutputTokens` is always 0 for Claude. */
+function expectedTokenCount(usage: TokenCounts) {
+  return {
+    totalTokens:
+      usage.inputTokens + usage.outputTokens + usage.cachedReadTokens + usage.cachedWriteTokens,
+    inputTokens: usage.inputTokens,
+    cachedInputTokens: usage.cachedReadTokens,
+    cachedWriteTokens: usage.cachedWriteTokens,
+    outputTokens: usage.outputTokens,
+    reasoningOutputTokens: 0,
+  };
+}
+
+/** The whole `_meta` a settled turn carries: its totals plus one `model_usage`
+ *  row per model it ran on (none when no result was accounted for it). */
+function expectedQuotaMeta(usage: TokenCounts, modelUsage: Array<[string, TokenCounts]> = []) {
+  return {
+    quota: {
+      token_count: expectedTokenCount(usage),
+      model_usage: modelUsage.map(([model, tokens]) => ({
+        model,
+        token_count: expectedTokenCount(tokens),
+      })),
+    },
+  };
+}
+
+/** The `_meta` companion of {@link cancelledTurnUsage}. */
+const cancelledTurnQuotaMeta = expectedQuotaMeta(cancelledTurnUsage);
 
 /** Install a mock session whose query is a caller-supplied async generator
  *  driven by the session's streaming input. Returns the input Pushable so the
@@ -8315,6 +8359,7 @@ describe("assembled assistant text fallback", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "second" }] });
@@ -9516,6 +9561,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
@@ -9559,6 +9605,12 @@ describe("post-error recovery", () => {
         cachedWriteTokens: 0,
         totalTokens: 15,
       },
+      _meta: expectedQuotaMeta({
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      }),
     });
   });
 
@@ -9663,6 +9715,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).rejects.toThrow(/start a new session/);
   });
@@ -9707,6 +9760,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
 
     // session.cancelled is still true here (turn 1 settled, nothing re-activated).
@@ -9775,6 +9829,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const thirdResult = await third;
@@ -9846,6 +9901,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -9913,6 +9969,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -9985,6 +10042,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10074,6 +10132,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     await expect(third).resolves.toEqual({ stopReason: "cancelled" });
@@ -10137,6 +10196,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10207,6 +10267,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10274,6 +10335,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10345,6 +10407,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10425,6 +10488,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     await expect(third).resolves.toEqual({ stopReason: "cancelled" });
@@ -10499,6 +10563,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10571,6 +10636,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const compactResult = await compact;
@@ -10642,6 +10708,7 @@ describe("post-error recovery", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     // The orphan's headless result must have drained its own entry — this
@@ -11223,6 +11290,11 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: expect.objectContaining({ totalTokens: 15 }),
+      _meta: expect.objectContaining({
+        quota: expect.objectContaining({
+          token_count: expect.objectContaining({ totalTokens: 15 }),
+        }),
+      }),
     });
     releaseAfterCancel();
     await agent.sessions["test-session"]?.consumer;
@@ -13509,6 +13581,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
     await expect(promptPromise).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
   });
 
@@ -13531,8 +13604,265 @@ describe("session/cancel wedge recovery (issue #680)", () => {
     await expect(promptPromise).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     expect(agent.sessions["test-session"]).toBeUndefined();
+  });
+});
+
+describe("prompt response quota metadata (_meta.quota)", () => {
+  function createAgent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  const idle = () => ({
+    type: "system",
+    subtype: "session_state_changed",
+    state: "idle",
+    uuid: randomUUID(),
+    session_id: "test-session",
+  });
+
+  /** One `result.modelUsage` row; the counters a test doesn't care about stay 0. */
+  const modelRow = (overrides: Record<string, number> = {}) => ({
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    webSearchRequests: 0,
+    costUSD: 0,
+    contextWindow: 200000,
+    maxOutputTokens: 8192,
+    ...overrides,
+  });
+
+  const promptOnce = (agent: ClaudeAcpAgent, text: string) =>
+    agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text }] });
+
+  it("breaks a turn's spend down per model", async () => {
+    const agent = createAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 2,
+          },
+          // The main loop ran on Opus; a Task subagent ran on Haiku. Both are
+          // in modelUsage, only the main loop is in `usage`.
+          modelUsage: {
+            "claude-opus-5[1m]": modelRow({
+              inputTokens: 10,
+              outputTokens: 5,
+              cacheReadInputTokens: 3,
+              cacheCreationInputTokens: 2,
+            }),
+            "claude-haiku-4-5": modelRow({ inputTokens: 4, outputTokens: 1 }),
+          },
+        });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await promptOnce(agent, "explore");
+
+    expect(response._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 10, outputTokens: 5, cachedReadTokens: 3, cachedWriteTokens: 2 },
+        [
+          [
+            "claude-opus-5[1m]",
+            { inputTokens: 10, outputTokens: 5, cachedReadTokens: 3, cachedWriteTokens: 2 },
+          ],
+          [
+            "claude-haiku-4-5",
+            { inputTokens: 4, outputTokens: 1, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("reports each turn's own share of the running per-model total", async () => {
+    // `result.modelUsage` is cumulative for the whole query, so a second turn
+    // must report the increment — not the running total it reads.
+    const agent = createAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 10, outputTokens: 5 }) },
+        });
+        yield idle();
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 15,
+            output_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 25, outputTokens: 12 }) },
+        });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await promptOnce(agent, "first");
+    const second = await promptOnce(agent, "second");
+
+    expect(second._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5",
+            { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("keeps an autonomous cycle's spend out of the next turn", async () => {
+    // A task-notification followup's cost is real but is not any user turn's —
+    // its increment must not resurface on the turn that follows it.
+    const agent = createAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 10, outputTokens: 5 }) },
+        });
+        yield idle();
+        // The followup: +4/+1 on the running total, its own trailing idle.
+        yield successfulResultMessage({
+          origin: { kind: "task-notification" },
+          usage: {
+            input_tokens: 4,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 14, outputTokens: 6 }) },
+        });
+        yield idle();
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 6,
+            output_tokens: 3,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 20, outputTokens: 9 }) },
+        });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await promptOnce(agent, "first");
+    const second = await promptOnce(agent, "second");
+
+    expect(second._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 6, outputTokens: 3, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5",
+            { inputTokens: 6, outputTokens: 3, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("treats a rewound running total as the turn's own spend", async () => {
+    // A mid-session /clear (or a resume) restarts modelUsage from zero. With no
+    // older reference left to subtract, the reading itself is the increment —
+    // never a negative row.
+    const agent = createAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 30,
+            output_tokens: 9,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 30, outputTokens: 9 }) },
+        });
+        yield idle();
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield successfulResultMessage({
+          usage: {
+            input_tokens: 8,
+            output_tokens: 2,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: { "claude-opus-5": modelRow({ inputTokens: 8, outputTokens: 2 }) },
+        });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    await promptOnce(agent, "first");
+    const second = await promptOnce(agent, "second");
+
+    expect(second._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 8, outputTokens: 2, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5",
+            { inputTokens: 8, outputTokens: 2, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
   });
 });
 
@@ -13652,6 +13982,7 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     const secondResult = await second;
     expect(secondResult.stopReason).toBe("end_turn");
@@ -13701,6 +14032,7 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     const third = await agent.prompt({
@@ -13749,6 +14081,7 @@ describe("turn abandoned by the SDK (issue #825)", () => {
     await expect(first).resolves.toEqual({
       stopReason: "cancelled",
       usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
     });
 
     // Queue turn 2 BEFORE the SDK recovers, so the stale result races it.

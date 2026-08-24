@@ -18,6 +18,14 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
       cachedReadTokens: 30,
       cachedWriteTokens: 40,
     },
+    accumulatedModelUsage: {
+      "claude-sonnet-5": {
+        inputTokens: 10,
+        outputTokens: 20,
+        cachedReadTokens: 30,
+        cachedWriteTokens: 40,
+      },
+    },
     models: { currentModelId: "default" },
     configOptions: [],
     currentAgent: "default",
@@ -110,6 +118,10 @@ describe("continuePlanInFreshContext", () => {
     );
     expect(turn.carriedUsage).toEqual(oldSession.accumulatedUsage);
     expect(turn.carriedUsage).not.toBe(oldSession.accumulatedUsage);
+    // The per-model breakdown rides along, so the turn's `_meta.quota` rows
+    // still cover what it spent before the restart.
+    expect(turn.carriedModelUsage).toEqual(oldSession.accumulatedModelUsage);
+    expect(turn.carriedModelUsage).not.toBe(oldSession.accumulatedModelUsage);
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);
@@ -337,6 +349,7 @@ describe("ExitPlanCoordinator", () => {
 
     expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
     expect(turn.carriedUsage).toBeUndefined();
+    expect(turn.carriedModelUsage).toBeUndefined();
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);

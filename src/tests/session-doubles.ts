@@ -70,6 +70,8 @@ export function mockSessionState(
       cachedReadTokens: 0,
       cachedWriteTokens: 0,
     },
+    accumulatedModelUsage: {},
+    lastModelUsageReading: {},
     configOptions: [],
     agents: [],
     currentAgent: "default",
