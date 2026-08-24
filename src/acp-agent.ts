@@ -1149,6 +1149,17 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
 
+// Commands whose marker-only transcript records are ACP/client-local UI noise,
+// not model-visible user prompts. Marker-only custom slash skills are not in
+// this list, so replay can reconstruct them from `<command-name>`/`<command-args>`.
+const REPLAY_HIDDEN_COMMANDS = new Set([
+  ...LOCAL_ONLY_COMMANDS,
+  "/compact",
+  "/model",
+  "/status",
+  "/usage",
+]);
+
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
 // payload in these XML-like markers that the CLI uses for its own display.
@@ -1192,6 +1203,38 @@ function stripMarkerTags(text: string): string {
   return result + text.slice(copiedUpTo);
 }
 
+function markerTagText(text: string, tag: string): string | undefined {
+  const open = `<${tag}>`;
+  const close = `</${tag}>`;
+  const start = text.indexOf(open);
+  if (start === -1) return undefined;
+  const end = text.indexOf(close, start + open.length);
+  if (end === -1) return undefined;
+  return text.slice(start + open.length, end);
+}
+
+function hasMarkerTag(text: string, tag: string): boolean {
+  return markerTagText(text, tag) !== undefined;
+}
+
+function commandInvocationFromMarkerOnlyText(text: string): string | null {
+  if (hasMarkerTag(text, "local-command-stdout") || hasMarkerTag(text, "local-command-stderr")) {
+    return null;
+  }
+  const commandName = markerTagText(text, "command-name")?.trim();
+  if (!commandName?.startsWith("/")) return null;
+  if (REPLAY_HIDDEN_COMMANDS.has(commandName.split(" ", 1)[0])) return null;
+
+  const commandArgs = markerTagText(text, "command-args")?.trim();
+  return commandArgs ? `${commandName} ${commandArgs}` : commandName;
+}
+
+function stripLocalCommandMetadataText(text: string): string | null {
+  const stripped = stripMarkerTags(text);
+  if (stripped.trim() !== "") return stripped;
+  return commandInvocationFromMarkerOnlyText(text);
+}
+
 /**
  * Return user-message content with local-command marker tags removed, or
  * `null` if nothing meaningful remains (caller should skip the message).
@@ -1200,8 +1243,7 @@ function stripMarkerTags(text: string): string {
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {
-    const stripped = stripMarkerTags(content);
-    return stripped.trim() === "" ? null : stripped;
+    return stripLocalCommandMetadataText(content);
   }
   if (!Array.isArray(content)) return content;
 
@@ -1215,8 +1257,8 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
       "text" in block &&
       typeof (block as { text: unknown }).text === "string"
     ) {
-      const stripped = stripMarkerTags((block as { text: string }).text);
-      if (stripped.trim() === "") continue;
+      const stripped = stripLocalCommandMetadataText((block as { text: string }).text);
+      if (stripped === null) continue;
       kept.push({ ...(block as object), text: stripped });
     } else {
       kept.push(block);
