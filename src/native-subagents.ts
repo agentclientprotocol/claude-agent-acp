@@ -5,7 +5,7 @@ export type NativeSubagent = {
   parentSessionId: string;
   parentToolUseId?: string;
   name: string;
-  task: string;
+  description: string;
   announced?: boolean;
   terminalState?: SubagentState;
 };
@@ -147,7 +147,7 @@ export class NativeSubagentRuntime {
         identity?.subagentType ?? task.subagentType,
         task.taskId,
       ),
-      task: subagentTask(
+      description: subagentDescription(
         identity?.prompt ?? task.prompt,
         identity?.description ?? task.description,
       ),
@@ -238,7 +238,7 @@ export async function announceNativeSubagent(
       sessionUpdate: "subagent_spawned",
       subagentSessionId: child.sessionId,
       name: child.name,
-      task: child.task,
+      description: child.description,
       capabilities: {},
     },
   });
@@ -295,7 +295,7 @@ function subagentDisplayName(
   return `Agent ${suffix}`;
 }
 
-function subagentTask(prompt: unknown, description: unknown): string {
+function subagentDescription(prompt: unknown, description: unknown): string {
   for (const value of [prompt, description]) {
     if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
@@ -340,7 +340,7 @@ function applySubagentIdentity(
     );
   }
   if (identity.prompt || identity.description) {
-    child.task = subagentTask(identity.prompt, identity.description);
+    child.description = subagentDescription(identity.prompt, identity.description);
   }
 }
 

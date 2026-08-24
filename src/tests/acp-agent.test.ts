@@ -3594,7 +3594,7 @@ describe("subagent permission attribution (issue #851)", () => {
           parentSessionId: "session-1",
           parentToolUseId: "toolu_parent",
           name: "Explore",
-          task: "Investigate",
+          description: "Investigate",
           announced: true,
         },
       ],
@@ -3631,7 +3631,7 @@ describe("subagent permission attribution (issue #851)", () => {
           parentSessionId: "session-1",
           parentToolUseId: "toolu_parent",
           name: "Explore",
-          task: "Investigate",
+          description: "Investigate",
         },
       ],
     ]);
@@ -3914,7 +3914,7 @@ describe("subagent permission attribution (issue #851)", () => {
           sessionUpdate: "subagent_spawned",
           subagentSessionId: "agent-42",
           name: "Investigate",
-          task: "Investigate",
+          description: "Investigate",
           capabilities: {},
         },
         {
@@ -4084,7 +4084,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(nestedSpawn?.sessionId).toBe("agent-outer");
     expect(nestedSpawn?.update).toMatchObject({
       name: "toolu_inner-name",
-      task: "toolu_inner full prompt",
+      description: "toolu_inner full prompt",
     });
     expect(
       updates.find(
@@ -4093,7 +4093,7 @@ describe("subagent permission attribution (issue #851)", () => {
       )?.update,
     ).toMatchObject({
       name: "toolu_outer-name",
-      task: "toolu_outer full prompt",
+      description: "toolu_outer full prompt",
     });
     expect(
       updates.filter(
@@ -4227,7 +4227,7 @@ describe("subagent permission attribution (issue #851)", () => {
         sessionUpdate: "subagent_spawned",
         subagentSessionId: "agent-42",
         name: "Investigate",
-        task: "Investigate",
+        description: "Investigate",
         capabilities: {},
       },
       {

@@ -28,7 +28,7 @@ export type SubagentSpawnedUpdate = {
   sessionUpdate: "subagent_spawned";
   subagentSessionId: string;
   name: string;
-  task: string;
+  description: string;
   capabilities: SubagentSessionCapabilities;
   _meta?: Record<string, unknown> | null;
 };
