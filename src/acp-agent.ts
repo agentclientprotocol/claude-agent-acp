@@ -4591,15 +4591,15 @@ export class ClaudeAcpAgent {
               content = message.message.content;
             }
 
-      const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
-      if (message.type === "user") {
-        const backgroundBashTask = backgroundBashTaskFromToolResult(
-          content,
-          message.tool_use_result,
-          session.toolUseCache,
-        );
-        if (backgroundBashTask) await asyncTasks.taskStarted(backgroundBashTask);
-      }
+            const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
+            if (message.type === "user") {
+              const backgroundBashTask = backgroundBashTaskFromToolResult(
+                content,
+                message.tool_use_result,
+                session.toolUseCache,
+              );
+              if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+            }
 
             for (const notification of toAcpNotifications(
               content,

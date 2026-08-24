@@ -29,7 +29,14 @@ describe("AsyncTaskRuntime", () => {
       description: "npm run build",
       isBackgrounded: true,
     });
-    await runtime.taskStarted(task!);
+    // The SDK can report local_bash before the Bash result proves that it was
+    // backgrounded. The structured result must promote that existing task.
+    await runtime.taskStarted({
+      taskId: "bpux8xmfg",
+      taskType: "local_bash",
+      description: "Shell",
+    });
+    await runtime.taskBackgrounded(task!);
     await runtime.taskNotification("bpux8xmfg", "completed", "Build finished");
 
     expect(updates.map((notification) => notification.update.sessionUpdate)).toEqual([

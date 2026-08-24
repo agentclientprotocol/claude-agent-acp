@@ -63,6 +63,21 @@ export class AsyncTaskRuntime {
     if (isBackgroundTask(message.isBackgrounded, message.taskType)) await this.announce(task);
   }
 
+  async taskBackgrounded(message: AsyncTaskStarted): Promise<void> {
+    if (!this.enabled || message.subagentType) return;
+    const existing = this.tasks.get(message.taskId);
+    if (!existing) {
+      await this.taskStarted({ ...message, isBackgrounded: true });
+      return;
+    }
+    const description = nonBlankString(message.description);
+    if (description) {
+      existing.description = description;
+      existing.name = nonBlankString(message.workflowName) ?? description;
+    }
+    await this.announce(existing);
+  }
+
   async taskUpdated(
     taskId: string,
     patch: { status?: unknown; description?: unknown; isBackgrounded?: unknown; error?: unknown },
