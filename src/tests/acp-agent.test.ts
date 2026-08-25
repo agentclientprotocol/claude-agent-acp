@@ -12614,6 +12614,111 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  it.each([
+    {
+      name: "a permission request",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        agent.canUseTool("test-session")("Bash", { command: "npm test" }, {
+          signal,
+          suggestions: [],
+          toolUseID: "tool-permission",
+        } as any),
+      response: { outcome: { outcome: "selected", optionId: "allow-once" } },
+    },
+    {
+      name: "an AskUserQuestion elicitation",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        (agent as any).clientCapabilities = { elicitation: { form: true, url: true } };
+        return agent.canUseTool("test-session")(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Pick a color",
+                header: "Color",
+                options: [{ label: "Blue", description: "Use blue" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          { signal, suggestions: [], toolUseID: "tool-question" } as any,
+        );
+      },
+      response: { action: "accept", content: { question_0: "Blue" } },
+    },
+    {
+      name: "an MCP elicitation",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleMcpElicitation("test-session", { form: true, url: true })(
+          {
+            mode: "form",
+            message: "Choose",
+            requestedSchema: { type: "object", properties: {} },
+          },
+          { signal },
+        ),
+      response: { action: "accept", content: {} },
+    },
+    {
+      name: "a refusal-fallback user dialog",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleUserDialog("test-session")(
+          {
+            dialogKind: "refusal_fallback_prompt",
+            payload: {
+              originalModel: "claude-fable-5",
+              fallbackModel: "claude-opus-4-8",
+              apiRefusalCategory: "cyber",
+            },
+          },
+          { signal },
+        ),
+      response: { action: "accept", content: { choice: "retry_fallback" } },
+    },
+  ])("uses priority:'later' while $name is pending", async ({ start, response }) => {
+    let resolveUserInput!: (response: any) => void;
+    const userInputResponse = new Promise<any>((resolve) => (resolveUserInput = resolve));
+    const userInputRequest = vi.fn(() => userInputResponse);
+    const input = new Pushable<any>();
+    const inputPush = vi.spyOn(input, "push");
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async () => {},
+        requestPermission: userInputRequest,
+        unstable_createElicitation: userInputRequest,
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    agent.sessions["test-session"] = mockSessionState({
+      input,
+      turnQueue: [
+        {
+          promptUuid: "running",
+          isLocalOnlyCommand: false,
+          settled: false,
+          resolve: () => {},
+          reject: () => {},
+        },
+      ],
+    });
+
+    const pending = start(agent, new AbortController().signal);
+    await waitFor(() => userInputRequest.mock.calls.length === 1);
+
+    await expect(
+      agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle this" }],
+      }),
+    ).resolves.toEqual({ outcome: "injected" });
+    expect(inputPush).toHaveBeenCalledTimes(1);
+    expect(inputPush.mock.calls[0][0].priority).toBe("later");
+
+    resolveUserInput(response);
+    await pending;
+    expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
+  });
+
   it("publishes an optimistic goal update for a steered goal replacement", async () => {
     const updates: any[] = [];
     const agent = new ClaudeAcpAgent(
