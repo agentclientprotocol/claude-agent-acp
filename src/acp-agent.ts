@@ -183,6 +183,7 @@ import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -560,6 +561,10 @@ export type Session = {
   modes: SessionModeState;
   models: SessionModelState;
   modelInfos: ModelInfo[];
+  /** Prevents the model-specific Auto fallback from spamming the transcript. */
+  autoModeFallbackWarningShown?: boolean;
+  /** Initial mode fallback is reported after session/new, on the first prompt. */
+  autoModeFallbackWarningPending?: boolean;
   configOptions: SessionConfigOption[];
   /** Custom main-thread agent personas the user (or a plugin/project) has
    *  configured, discovered via `supportedAgents()` with Claude Code's built-in
@@ -1386,6 +1391,7 @@ export class ClaudeAcpAgent {
   client: AcpClient;
   clientCapabilities?: ClientCapabilities;
   logger: Logger;
+  private readonly sessionModes: SessionModeManager<Session>;
   gatewayAuthRequest?: GatewayAuthRequest;
   /** Set while ACP overrides the agent's native provider configuration. */
   providerConfig?: ProviderConfig;
@@ -1433,6 +1439,14 @@ export class ClaudeAcpAgent {
         turn.settled = true;
         turn.reject(error);
       },
+    });
+    this.sessionModes = new SessionModeManager({
+      getSession: (sessionId) => this.sessions[sessionId],
+      sessionEndedMessage: SESSION_ENDED_MESSAGE,
+      updateConfigOption: (sessionId, configId, value) =>
+        this.updateConfigOption(sessionId, configId, value),
+      sessionUpdate: (params: SessionNotification) => this.client.sessionUpdate(params),
+      logError: (...args: unknown[]) => this.logger.error(...args),
     });
   }
 
@@ -1848,6 +1862,10 @@ export class ClaudeAcpAgent {
     // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+
+    if (session.autoModeFallbackWarningPending) {
+      await this.sessionModes.publishFallbackWarning(params.sessionId, session);
     }
 
     if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
@@ -4975,20 +4993,7 @@ export class ClaudeAcpAgent {
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    // The SDK query stream already ended (see closeQueryStream); the session is
-    // a husk and `query.setPermissionMode` below would act on a closed query.
-    // Fail with the same clear message prompt()/cancel() give for a dead stream.
-    if (session.queryClosed) {
-      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
-    }
-
-    await this.applySessionMode(params.sessionId, params.modeId);
-    await this.updateConfigOption(params.sessionId, MODE_CONFIG_ID, params.modeId);
-    return {};
+    return this.sessionModes.setSessionMode(params);
   }
 
   async setSessionConfigOption(
@@ -5072,15 +5077,10 @@ export class ClaudeAcpAgent {
     // model ID rather than the caller-supplied alias.
     const resolvedValue = validValue.value;
 
+    let effectiveValue = resolvedValue;
     if (params.configId === MODE_CONFIG_ID) {
-      await this.applySessionMode(params.sessionId, resolvedValue);
-      await this.client.sessionUpdate({
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "current_mode_update",
-          currentModeId: resolvedValue,
-        },
-      });
+      effectiveValue = await this.sessionModes.selectMode(params.sessionId, resolvedValue);
+      await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
     }
@@ -5088,45 +5088,9 @@ export class ClaudeAcpAgent {
     // effort changes and effort changes induced by a model switch go through
     // the same path.
 
-    await this.applyConfigOptionValue(params.sessionId, session, params.configId, resolvedValue);
+    await this.applyConfigOptionValue(params.sessionId, session, params.configId, effectiveValue);
 
     return { configOptions: session.configOptions };
-  }
-
-  private async applySessionMode(sessionId: string, modeId: string): Promise<void> {
-    switch (modeId) {
-      case "auto":
-      case "default":
-      case "acceptEdits":
-      case "bypassPermissions":
-      case "dontAsk":
-      case "plan":
-        break;
-      default:
-        throw new Error("Invalid Mode");
-    }
-
-    const session = this.sessions[sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    if (!session.modes.availableModes.some((mode) => mode.id === modeId)) {
-      throw new Error(`Mode ${modeId} is not available in this session`);
-    }
-
-    try {
-      await session.query.setPermissionMode(modeId);
-    } catch (error) {
-      if (error instanceof Error) {
-        if (!error.message) {
-          error.message = "Invalid Mode";
-        }
-        throw error;
-      } else {
-        // eslint-disable-next-line preserve-caught-error
-        throw new Error("Invalid Mode");
-      }
-    }
   }
 
   private async replaySessionHistory(sessionId: string): Promise<void> {
@@ -5531,7 +5495,7 @@ export class ClaudeAcpAgent {
         cwd: session.cwd,
         durableChangeSet,
         allowPersistentOptions: matchedAskRule === undefined,
-        availableModes: session.modes.availableModes.map((mode) => mode.id),
+        availableModes: this.sessionModes.availableModeIds(session.modes),
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined
@@ -5555,15 +5519,23 @@ export class ClaudeAcpAgent {
         parentToolUseId,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
-      const { permissionResult, contextResetMode: clearContextMode } =
-        decodeClaudePermissionResponse(
-          response,
-          toolName,
-          toolInput,
-          toolUseID,
-          permissionOptions,
-          durableChangeSet,
-        );
+      const decodedPermission = decodeClaudePermissionResponse(
+        response,
+        toolName,
+        toolInput,
+        toolUseID,
+        permissionOptions,
+        durableChangeSet,
+      );
+      let permissionResult = decodedPermission.permissionResult;
+      const autoFallback = this.sessionModes.applyPermissionFallback(session, permissionResult);
+      permissionResult = autoFallback.permissionResult;
+      if (autoFallback.fallbackApplied) {
+        await this.sessionModes.publishFallbackWarning(sessionId, session);
+      }
+      const clearContextMode = decodedPermission.contextResetMode
+        ? this.sessionModes.effectiveMode(session, decodedPermission.contextResetMode)
+        : undefined;
       if (toolName === "ExitPlanMode" && clearContextMode) {
         const plan = typeof toolInput.plan === "string" ? toolInput.plan.trim() : "";
         if (!plan) throw new Error("ExitPlanMode clear-context selection requires a plan");
@@ -5744,13 +5716,10 @@ export class ClaudeAcpAgent {
     value: string,
   ): Promise<void> {
     if (configId === MODE_CONFIG_ID) {
-      session.modes = { ...session.modes, currentModeId: value };
-      session.configOptions = session.configOptions.map((o) =>
-        o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
-      );
+      this.sessionModes.syncConfig(session, value);
     } else if (configId === MODEL_CONFIG_ID) {
-      // `ModelInfo.supportsAutoMode` is the canonical SDK signal for clamping
-      // modes below; its `displayName`/`description` also let us infer the
+      // `ModelInfo.supportsAutoMode` is the canonical SDK signal for applying
+      // the Auto fallback below; its `displayName`/`description` also let us infer the
       // context window for semantic aliases (e.g. `default`) whose ID alone
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
@@ -5773,42 +5742,7 @@ export class ClaudeAcpAgent {
       }
       session.models = { ...session.models, currentModelId: value };
 
-      // Recompute availableModes for the new model and clamp the current
-      // mode if the SDK no longer offers it (today: "auto" on Haiku). An
-      // unknown model (an SDK-initiated refusal fallback to a model outside
-      // the user's `availableModels` allowlist — user-driven switches are
-      // validated against the options first) tells us nothing about its
-      // capabilities, so keep the current modes rather than spuriously
-      // downgrading (e.g. kicking the user out of "auto" for a model that
-      // does support it).
-      const newAvailableModes = newModelInfo
-        ? buildAvailableModes(newModelInfo)
-        : session.modes.availableModes;
-      // Capture BEFORE mutating session.modes so the log message reflects
-      // the invalidated mode rather than "default".
-      const previousModeId = session.modes.currentModeId;
-      let modeDowngraded = false;
-      if (!newAvailableModes.some((m) => m.id === previousModeId)) {
-        session.modes = {
-          availableModes: newAvailableModes,
-          currentModeId: "default",
-        };
-        try {
-          await session.query.setPermissionMode("default");
-        } catch (err) {
-          // Failing the entire model switch over a bookkeeping sync error is
-          // worse UX than logging and continuing; the user explicitly asked
-          // to change models. The next setPermissionMode from the user will
-          // either succeed or surface a fresh error.
-          this.logger.error(
-            `Failed to sync permissionMode to "default" after model switch invalidated "${previousModeId}":`,
-            err,
-          );
-        }
-        modeDowngraded = true;
-      } else {
-        session.modes = { ...session.modes, availableModes: newAvailableModes };
-      }
+      const modeDowngraded = await this.sessionModes.reconcileForModel(session, newModelInfo);
 
       // `model_not_allowed` described the model we just left, so it must not
       // follow us onto the new one; the remaining reasons are account- or
@@ -5857,13 +5791,7 @@ export class ClaudeAcpAgent {
       // still precedes the caller's config_option_update so order-sensitive
       // clients update currentModeId before re-rendering the option list.
       if (modeDowngraded) {
-        await this.client.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "current_mode_update",
-            currentModeId: "default",
-          },
-        });
+        await this.sessionModes.publishFallbackState(sessionId, session);
       }
     } else if (configId === AGENT_CONFIG_ID) {
       // Live agent switch — no subprocess restart needed. Apply the SDK flag
@@ -6373,13 +6301,7 @@ export class ClaudeAcpAgent {
             hooks: [
               createPostToolUseHook({
                 onEnterPlanMode: async () => {
-                  await this.client.sessionUpdate({
-                    sessionId,
-                    update: {
-                      sessionUpdate: "current_mode_update",
-                      currentModeId: "plan",
-                    },
-                  });
+                  await this.sessionModes.publishCurrent(sessionId, "plan");
                   await this.updateConfigOption(sessionId, MODE_CONFIG_ID, "plan");
                 },
               }),
@@ -6493,8 +6415,8 @@ export class ClaudeAcpAgent {
       creationOpts.resume !== undefined,
     );
 
-    // Gate `auto` (and future model-specific modes) on the resolved model's
-    // `ModelInfo`. See `buildAvailableModes` for the canonical SDK signal.
+    // Resolve the current model's capabilities separately from the stable
+    // permission-mode catalog advertised to ACP clients.
     // A resumed session can be running a model outside the `availableModels`
     // allowlist (currentModelId is then the verbatim live id, see
     // `matchResumedModel`); its capabilities are still known to the SDK's
@@ -6528,42 +6450,12 @@ export class ClaudeAcpAgent {
           },
         ]
       : allowedModels;
-    const availableModes = buildAvailableModes(currentModelInfo);
-
-    // Clamp `permissionMode` if the resolved session does not offer it. The
-    // common case is `permissions.defaultMode: "auto"` resolving to a model
-    // that does not support auto mode (e.g. Haiku); without this clamp the
-    // SDK would later throw `"auto mode unavailable for this model"` from
-    // `setPermissionMode`. Keep `permissionMode` as the resolved user intent
-    // (matches what was passed into `options.permissionMode` above) and use
-    // `effectiveMode` for the post-clamp value the session actually runs in.
-    let effectiveMode: PermissionMode = initialPermissionMode;
-    if (!availableModes.some((m) => m.id === effectiveMode)) {
-      if (effectiveMode === "auto") {
-        this.logger.error(
-          `permissions.defaultMode "auto" is not available for model ` +
-            `"${models.currentModelId}"; falling back to "default".`,
-        );
-      } else {
-        this.logger.error(
-          `permissions.defaultMode "${effectiveMode}" is not available in ` +
-            `this session; falling back to "default".`,
-        );
-      }
-      effectiveMode = "default";
-      // Sync the SDK so it doesn't keep "auto" cached internally. Wrapped in
-      // try/catch since failing here would abort session creation entirely.
-      try {
-        await q.setPermissionMode("default");
-      } catch (err) {
-        this.logger.error("Failed to sync clamped permissionMode to SDK:", err);
-      }
-    }
-
-    const modes = {
-      currentModeId: effectiveMode,
-      availableModes,
-    };
+    const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
+      query: q,
+      requestedMode: initialPermissionMode,
+      currentModelInfo,
+      currentModelId: models.currentModelId,
+    });
 
     const agents = await discoverCustomAgents(q);
     // Only adopt the requested agent as the selected value if it's one we
@@ -6671,6 +6563,8 @@ export class ClaudeAcpAgent {
       modes,
       models,
       modelInfos,
+      autoModeFallbackWarningShown: false,
+      autoModeFallbackWarningPending,
       configOptions,
       agents,
       currentAgent,
@@ -7041,53 +6935,6 @@ function isValidBaseUrl(baseUrl: string): boolean {
   return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
-/**
- * Build the list of permission modes the agent will advertise for the given
- * model. `auto` is gated by `ModelInfo.supportsAutoMode === true`, which is
- * the SDK's model-level availability signal. `undefined`/`false` both exclude
- * `auto`. `bypassPermissions` is still gated by `ALLOW_BYPASS`.
- */
-function buildAvailableModes(modelInfo: ModelInfo | undefined): SessionModeState["availableModes"] {
-  const modes: SessionModeState["availableModes"] = [
-    {
-      // Claude Code 2.1.200 renamed this mode to "Manual" across its surfaces;
-      // the wire id stays "default" ("manual" is only an accepted input alias).
-      id: "default",
-      name: "Manual",
-      description: "Always ask before making changes",
-    },
-    {
-      id: "acceptEdits",
-      name: "Accept edits",
-      description: "Automatically accept all file edits",
-    },
-    {
-      id: "plan",
-      name: "Plan",
-      description: "Create a plan before making changes",
-    },
-  ];
-
-  // Only advertise "auto" when the SDK reports the model supports it.
-  if (modelInfo?.supportsAutoMode === true) {
-    modes.push({
-      id: "auto",
-      name: "Auto",
-      description: "Claude handles permission decisions",
-    });
-  }
-
-  if (ALLOW_BYPASS) {
-    modes.push({
-      id: "bypassPermissions",
-      name: "Bypass permissions",
-      description: "Accepts all permissions",
-    });
-  }
-
-  return modes;
-}
-
 // Translate a UI effort value into the flag-layer payload. The SDK
 // shallow-merges `applyFlagSettings`, drops `undefined` during JSON transport,
 // and only clears a key when an explicit `null` is sent — see
@@ -7137,7 +6984,7 @@ export async function discoverCustomAgents(q: Query): Promise<AgentInfo[]> {
  *  Centralized so the option declarations in `buildConfigOptions` and the
  *  handlers in `setSessionConfigOption`/`applyConfigOptionValue` reference the
  *  same identifiers and can't drift apart. */
-export const MODE_CONFIG_ID = "mode";
+export { MODE_CONFIG_ID };
 export const MODEL_CONFIG_ID = "model";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
@@ -7275,19 +7122,7 @@ export function buildConfigOptions(
   fastMode?: FastModeOptionState,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
-    {
-      id: MODE_CONFIG_ID,
-      name: "Mode",
-      description: "Session permission mode",
-      category: "mode",
-      type: "select",
-      currentValue: modes.currentModeId,
-      options: modes.availableModes.map((m) => ({
-        value: m.id,
-        name: m.name,
-        description: m.description,
-      })),
-    },
+    SessionModeManager.configOption(modes),
     {
       id: MODEL_CONFIG_ID,
       name: "Model",
