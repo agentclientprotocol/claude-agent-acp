@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.70.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.69.0...v0.70.0) (2026-08-17)
+
+
+### Features
+
+* switch providers for loaded Claude sessions ([#1002](https://github.com/agentclientprotocol/claude-agent-acp/issues/1002)) ([50a9543](https://github.com/agentclientprotocol/claude-agent-acp/commit/50a95434e94318456f2d07c3d21aaf3595c3407d))
+
+## [0.69.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.68.0...v0.69.0) (2026-08-16)
+
+
+### Features
+
+* report changed files to AIR ([#1001](https://github.com/agentclientprotocol/claude-agent-acp/issues/1001)) ([450d6b1](https://github.com/agentclientprotocol/claude-agent-acp/commit/450d6b19dc46a041128356a6fa3cfa3ce6a5a382))
+
+## [0.68.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.67.0...v0.68.0) (2026-08-14)
+
+
+### Features
+
+* align typed session failures with AIR protocol ([#992](https://github.com/agentclientprotocol/claude-agent-acp/issues/992)) ([0581b9c](https://github.com/agentclientprotocol/claude-agent-acp/commit/0581b9cf397ffd88f2830db721c2d8e3689045e4))
+
+## [0.67.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.66.0...v0.67.0) (2026-08-14)
+
+
+### Features
+
+* **deps:** Update to @anthropic-ai/claude-agent-sdk v0.3.232 ([#993](https://github.com/agentclientprotocol/claude-agent-acp/issues/993)) ([de0d0e2](https://github.com/agentclientprotocol/claude-agent-acp/commit/de0d0e2b7d185c521c3d1ac7b86e4312c919abfe))
+* expose typed session failures for AIR ([#979](https://github.com/agentclientprotocol/claude-agent-acp/issues/979)) ([8157ee1](https://github.com/agentclientprotocol/claude-agent-acp/commit/8157ee113e705750be4eb6cc787bdd12f1db84ff))
+* publish the model fallback as a warning advisory ([#990](https://github.com/agentclientprotocol/claude-agent-acp/issues/990)) ([35aaddb](https://github.com/agentclientprotocol/claude-agent-acp/commit/35aaddb3d5b14eca316582ab285af8a660150dae))
+* surface resolved model name in default model option description ([#982](https://github.com/agentclientprotocol/claude-agent-acp/issues/982)) ([ec73cd8](https://github.com/agentclientprotocol/claude-agent-acp/commit/ec73cd8560be7d5e8b9741e404d7d45e17336996))
+* surface Skill tool calls with name and kind in _meta ([#986](https://github.com/agentclientprotocol/claude-agent-acp/issues/986)) ([1f09e9a](https://github.com/agentclientprotocol/claude-agent-acp/commit/1f09e9a3cae787b0effdfae0e7205ef7fe22b9dc))
+
+
+### Bug Fixes
+
+* preserve task plans across prompts ([#974](https://github.com/agentclientprotocol/claude-agent-acp/issues/974)) ([1afa940](https://github.com/agentclientprotocol/claude-agent-acp/commit/1afa940a2c8c0f4c610f4f64d30c0961642907b0))
+* show a pending title while Claude prepares a file ([#978](https://github.com/agentclientprotocol/claude-agent-acp/issues/978)) ([3df1ede](https://github.com/agentclientprotocol/claude-agent-acp/commit/3df1ede89f217312bc237124dc1eccc10c860f99))
+
+## [0.66.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.65.0...v0.66.0) (2026-08-07)
+
+
+### Features
+
+* **deps-dev:** Bump globals from 17.8.0 to 17.9.0 in the minor group ([#960](https://github.com/agentclientprotocol/claude-agent-acp/issues/960)) ([7f27c47](https://github.com/agentclientprotocol/claude-agent-acp/commit/7f27c47c5c7c49e65014e9f7dc55cba17352d33b))
+* expose provider-neutral ACP goal extension ([#964](https://github.com/agentclientprotocol/claude-agent-acp/issues/964)) ([8b31dea](https://github.com/agentclientprotocol/claude-agent-acp/commit/8b31dea11bed54f86c41217759159c415611346c))
+
+
+### Bug Fixes
+
+* publish and replace Claude goals reliably ([#967](https://github.com/agentclientprotocol/claude-agent-acp/issues/967)) ([f8fd3ab](https://github.com/agentclientprotocol/claude-agent-acp/commit/f8fd3ab8224420f8ced570e974cde09612939d6b))
+
 ## [0.65.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.64.2...v0.65.0) (2026-08-05)
 
 

@@ -125,7 +125,7 @@ describe("authorization", () => {
       expect.objectContaining({
         options: expect.objectContaining({
           env: expect.objectContaining({
-            ANTHROPIC_AUTH_TOKEN: " ",
+            ANTHROPIC_AUTH_TOKEN: "acp-proxy",
             ANTHROPIC_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
             userEnv: "userEnv",
@@ -162,7 +162,7 @@ describe("authorization", () => {
         options: expect.objectContaining({
           env: expect.objectContaining({
             CLAUDE_CODE_USE_BEDROCK: "1",
-            AWS_BEARER_TOKEN_BEDROCK: " ",
+            AWS_BEARER_TOKEN_BEDROCK: "acp-proxy",
             ANTHROPIC_BEDROCK_BASE_URL: "https://gateway.example",
             ANTHROPIC_CUSTOM_HEADERS: "custom-header: test",
           }),
