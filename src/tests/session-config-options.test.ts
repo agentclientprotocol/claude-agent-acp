@@ -358,50 +358,6 @@ describe("session config options", () => {
     });
   });
 
-  describe("setSessionMode sends config_option_update", () => {
-    beforeEach(() => {
-      populateSession();
-    });
-
-    it("sends config_option_update when mode is changed via setSessionMode", async () => {
-      await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "acceptEdits" });
-
-      const configUpdate = sessionUpdates.find(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdate).toBeDefined();
-      expect(configUpdate?.update).toMatchObject({
-        sessionUpdate: "config_option_update",
-        configOptions: expect.arrayContaining([
-          expect.objectContaining({ id: "mode", currentValue: "acceptEdits" }),
-        ]),
-      });
-    });
-
-    it("updates stored configOptions currentValue when mode changes", async () => {
-      await agent.setSessionMode({ sessionId: SESSION_ID, modeId: "plan" });
-
-      const session = (
-        agent as unknown as {
-          sessions: Record<string, { configOptions: typeof MOCK_CONFIG_OPTIONS }>;
-        }
-      ).sessions[SESSION_ID];
-      const modeOption = session.configOptions.find((o) => o.id === "mode");
-      expect(modeOption?.currentValue).toBe("plan");
-    });
-
-    it("does not send config_option_update for an invalid mode", async () => {
-      await expect(
-        agent.setSessionMode({ sessionId: SESSION_ID, modeId: "not-a-mode" as any }),
-      ).rejects.toThrow("Invalid Mode");
-
-      const configUpdate = sessionUpdates.find(
-        (n) => n.update.sessionUpdate === "config_option_update",
-      );
-      expect(configUpdate).toBeUndefined();
-    });
-  });
-
   describe("setSessionConfigOption(model) returns updated configOptions", () => {
     beforeEach(() => {
       populateSession();
@@ -1053,25 +1009,24 @@ describe("session config options", () => {
         currentModeId,
         availableModes: [
           {
-            id: "auto",
-            name: "Auto",
-            description: "Use a model classifier to approve/deny permission prompts",
-          },
-          {
             id: "default",
-            name: "Default",
-            description: "Standard behavior, prompts for dangerous operations",
+            name: "Manual",
+            description: "Always ask before making changes",
           },
           {
             id: "acceptEdits",
-            name: "Accept Edits",
-            description: "Auto-accept file edit operations",
+            name: "Accept edits",
+            description: "Automatically accept all file edits",
           },
-          { id: "plan", name: "Plan Mode", description: "Planning mode" },
           {
-            id: "dontAsk",
-            name: "Don't Ask",
-            description: "Don't prompt for permissions, deny if not pre-approved",
+            id: "plan",
+            name: "Plan",
+            description: "Create a plan before making changes",
+          },
+          {
+            id: "auto",
+            name: "Auto",
+            description: "Claude handles permission decisions",
           },
         ],
       };
@@ -1111,7 +1066,7 @@ describe("session config options", () => {
       populateSession();
     });
 
-    it("drops `auto` from available modes when switching to Haiku", async () => {
+    it("keeps the stable mode catalog when switching to Haiku", async () => {
       setupHaikuOpusSession("default");
 
       const response = await agent.setSessionConfigOption({
@@ -1123,25 +1078,16 @@ describe("session config options", () => {
       const modeOption = response.configOptions.find((o) => o.id === "mode");
       expect(modeOption).toBeDefined();
       const modeValues = (modeOption as any).options.map((o: any) => o.value);
-      expect(modeValues).not.toContain("auto");
       expect(modeValues).toEqual(
-        expect.arrayContaining(["default", "acceptEdits", "plan", "dontAsk"]),
+        expect.arrayContaining(["default", "acceptEdits", "plan", "auto"]),
       );
+      expect(modeValues).not.toContain("dontAsk");
     });
 
-    it("re-adds `auto` when switching from Haiku back to Opus", async () => {
+    it("keeps the same mode catalog when switching from Haiku back to Opus", async () => {
       const session = setupHaikuOpusSession("default");
-      // Pretend Haiku is the current model with no `auto`.
+      // Pretend Haiku is the current model; its catalog still advertises Auto.
       session.models.currentModelId = "claude-haiku-4-5";
-      session.modes.availableModes = session.modes.availableModes.filter(
-        (m: any) => m.id !== "auto",
-      );
-      const modeOpt = session.configOptions.find((o: any) => o.id === "mode");
-      modeOpt.options = session.modes.availableModes.map((m: any) => ({
-        value: m.id,
-        name: m.name,
-        description: m.description,
-      }));
 
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -1183,8 +1129,8 @@ describe("session config options", () => {
       expect((modeOption as any).currentValue).toBe("plan");
     });
 
-    it("clamps mode and emits current_mode_update via setSessionConfigOption(model)", async () => {
-      // Switching Opus(auto) → Haiku clamps the mode to "default". The
+    it("falls back to Accept edits and emits current_mode_update on a Haiku switch", async () => {
+      // Switching Opus(auto) → Haiku changes only the effective mode. The
       // `current_mode_update` side effect must fire so clients learn about the
       // clamp even though the request/response API returns the new
       // configOptions rather than emitting a config_option_update.
@@ -1196,13 +1142,13 @@ describe("session config options", () => {
         value: "claude-haiku-4-5",
       });
 
-      expect(setPermissionModeSpy).toHaveBeenCalledWith("default");
+      expect(setPermissionModeSpy).toHaveBeenCalledWith("acceptEdits");
 
       const modeUpdates = sessionUpdates.filter(
         (n) => n.update.sessionUpdate === "current_mode_update",
       );
       expect(modeUpdates).toHaveLength(1);
-      expect((modeUpdates[0].update as any).currentModeId).toBe("default");
+      expect((modeUpdates[0].update as any).currentModeId).toBe("acceptEdits");
 
       // setSessionConfigOption is a request/response API: it returns the new
       // configOptions in the response rather than emitting a
@@ -1214,148 +1160,16 @@ describe("session config options", () => {
 
       const modeOption = response.configOptions.find((o: any) => o.id === "mode");
       expect(modeOption).toBeDefined();
-      expect((modeOption as any).currentValue).toBe("default");
-      expect((modeOption as any).options.map((o: any) => o.value)).not.toContain("auto");
-    });
-
-    it("rejects direct setSessionMode to `auto` when the active model does not offer it", async () => {
-      const session = setupHaikuOpusSession("default");
-      session.models.currentModelId = "claude-haiku-4-5";
-      session.modes.availableModes = session.modes.availableModes.filter(
-        (mode: any) => mode.id !== "auto",
-      );
-
-      await expect(agent.setSessionMode({ sessionId: SESSION_ID, modeId: "auto" })).rejects.toThrow(
-        "Mode auto is not available in this session",
-      );
-
-      expect(setPermissionModeSpy).not.toHaveBeenCalledWith("auto");
-      expect(sessionUpdates).toHaveLength(0);
-    });
-  });
-
-  describe("ExitPlanMode permission options filtered by availableModes", () => {
-    let capturedPermissionRequest: any;
-    let permissionResponse: any;
-
-    beforeEach(() => {
-      capturedPermissionRequest = null;
-      permissionResponse = { outcome: { outcome: "cancelled" } };
-      // Replace the default mock client with one that captures the
-      // requestPermission call so we can assert on the offered options.
-      (agent as any).client = {
-        sessionUpdate: async (notification: SessionNotification) => {
-          sessionUpdates.push(notification);
-        },
-        requestPermission: async (params: any) => {
-          capturedPermissionRequest = params;
-          return permissionResponse;
-        },
-        readTextFile: async () => ({ content: "" }),
-        writeTextFile: async () => ({}),
-      };
-      populateSession();
-    });
-
-    it("omits the `auto` option on a model without supportsAutoMode", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      // Haiku-shaped session: availableModes does NOT include `auto`.
-      session.modes = {
-        currentModeId: "plan",
-        availableModes: [
-          { id: "default", name: "Default", description: "Standard" },
-          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
-          { id: "plan", name: "Plan Mode", description: "Planning mode" },
-          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
-        ],
-      };
-
-      // The tool_call was already surfaced (by the streamed tool_use chunk), so
-      // the permission request won't re-emit one — keep this focused on options.
-      session.emittedToolCalls.add("toolu_1");
-
-      const canUseTool = (agent as any).canUseTool(SESSION_ID);
-      const signal = new AbortController().signal;
-      try {
-        await canUseTool(
-          "ExitPlanMode",
-          { plan: "do stuff" },
-          { signal, suggestions: undefined, toolUseID: "toolu_1" },
-        );
-      } catch {
-        // The mock client returns `cancelled`, which makes canUseTool throw.
-        // We only care about the captured requestPermission options.
-      }
-
-      expect(capturedPermissionRequest).not.toBeNull();
-      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
-      expect(optionIds).not.toContain("auto");
-      expect(optionIds).toEqual(expect.arrayContaining(["default", "acceptEdits", "plan"]));
-    });
-
-    it("denies a selected `auto` option if the client did not receive that option", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modes = {
-        currentModeId: "plan",
-        availableModes: [
-          { id: "default", name: "Default", description: "Standard" },
-          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
-          { id: "plan", name: "Plan Mode", description: "Planning mode" },
-          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
-        ],
-      };
-      permissionResponse = { outcome: { outcome: "selected", optionId: "auto" } };
-      // The tool_call was already surfaced (by the streamed tool_use chunk), so
-      // the permission request won't re-emit one — the deny path below should
-      // produce no session updates at all.
-      session.emittedToolCalls.add("toolu_2");
-
-      const canUseTool = (agent as any).canUseTool(SESSION_ID);
-      const result = await canUseTool(
-        "ExitPlanMode",
-        { plan: "do stuff" },
-        { signal: new AbortController().signal, suggestions: undefined, toolUseID: "toolu_2" },
-      );
-
-      expect(capturedPermissionRequest).not.toBeNull();
-      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
-      expect(optionIds).not.toContain("auto");
-      expect(result.behavior).toBe("deny");
-      expect(sessionUpdates).toHaveLength(0);
-    });
-
-    it("includes the `auto` option on a model with supportsAutoMode", async () => {
-      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      session.modes = {
-        currentModeId: "plan",
-        availableModes: [
-          { id: "auto", name: "Auto", description: "Use a model classifier" },
-          { id: "default", name: "Default", description: "Standard" },
-          { id: "acceptEdits", name: "Accept Edits", description: "Auto-accept edits" },
-          { id: "plan", name: "Plan Mode", description: "Planning mode" },
-          { id: "dontAsk", name: "Don't Ask", description: "Deny if not pre-approved" },
-        ],
-      };
-
-      // The tool_call was already surfaced (by the streamed tool_use chunk), so
-      // the permission request won't re-emit one — keep this focused on options.
-      session.emittedToolCalls.add("toolu_3");
-
-      const canUseTool = (agent as any).canUseTool(SESSION_ID);
-      const signal = new AbortController().signal;
-      try {
-        await canUseTool(
-          "ExitPlanMode",
-          { plan: "do stuff" },
-          { signal, suggestions: undefined, toolUseID: "toolu_3" },
-        );
-      } catch {
-        // mock returns cancelled
-      }
-
-      expect(capturedPermissionRequest).not.toBeNull();
-      const optionIds = capturedPermissionRequest.options.map((o: any) => o.optionId);
-      expect(optionIds).toContain("auto");
+      expect((modeOption as any).currentValue).toBe("acceptEdits");
+      expect((modeOption as any).options.map((o: any) => o.value)).toContain("auto");
+      expect(
+        sessionUpdates.filter(
+          (n) =>
+            n.update.sessionUpdate === "agent_message_chunk" &&
+            n.update.content.type === "text" &&
+            n.update.content.text.includes("Auto mode unavailable"),
+        ),
+      ).toHaveLength(1);
     });
   });
 });

@@ -39,7 +39,11 @@ jobs:
         id: release
         with:
           token: ${{ steps.generate-token.outputs.token }}
-          release-type: node
+          # Do not add release-type here. The action ignores config-file whenever
+          # release-type is set, which silently disables the pre-1.0 versioning
+          # rules in release-please-config.json and lets a breaking change jump
+          # straight to 1.0.0. The node release type is declared in that config
+          # instead, so nothing is lost by leaving this out.
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
     outputs:
