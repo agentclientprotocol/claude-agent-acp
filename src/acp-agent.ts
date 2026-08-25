@@ -984,25 +984,12 @@ type ProviderConfig = {
   };
 };
 
-/**
- * Extra metadata that the agent provides for each tool_call / tool_update update.
- */
-export type ToolTag = {
-  /** Short, user-visible category name. */
-  label: string;
-  /** CSS-compatible color suggested to clients that render the tag. */
-  color: string;
-};
-
 export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
     /* A human-readable title supplied by Claude Code for the tool call. */
     title?: string;
-    /* Presentation hints for compact, color-coded tool categories. Clients may
-       ignore these without affecting the standard ACP tool-call rendering. */
-    tags?: ToolTag[];
     /* The structured output provided by Claude Code. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
@@ -8074,29 +8061,6 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName) && !isFileChangeAuditTool(toolName);
 }
 
-const TOOL_TAGS = {
-  execute: { label: "Execute", color: "#D97706" },
-  edit: { label: "Edit", color: "#2563EB" },
-  search: { label: "Search", color: "#7C3AED" },
-  delegate: { label: "Delegate", color: "#059669" },
-  plan: { label: "Plan", color: "#0891B2" },
-  skill: { label: "Skill", color: "#DB2777" },
-  other: { label: "Tool", color: "#6B7280" },
-} as const satisfies Record<string, ToolTag>;
-
-/** Return the stable presentation tag for a Claude Code tool. */
-function toolTagForToolName(toolName: string): ToolTag {
-  if (toolName === "Bash") return TOOL_TAGS.execute;
-  if (["Edit", "MultiEdit", "NotebookEdit", "Write"].includes(toolName)) return TOOL_TAGS.edit;
-  if (["Glob", "Grep", "Read", "WebFetch", "WebSearch"].includes(toolName)) {
-    return TOOL_TAGS.search;
-  }
-  if (toolName === "Agent" || toolName === "Task") return TOOL_TAGS.delegate;
-  if (toolName === "TodoWrite" || isTaskTool(toolName)) return TOOL_TAGS.plan;
-  if (toolName === "Skill") return TOOL_TAGS.skill;
-  return TOOL_TAGS.other;
-}
-
 /** Build the Claude Code-specific metadata for a tool call. Bash descriptions
  *  are kept out of ACP's standard `title`, which clients may use as the shell
  *  command preview, while still giving clients access to Claude's concise
@@ -8123,7 +8087,6 @@ function claudeCodeMetaFromToolUse(
   const skillPath = skillName ? resolveSkillPath(skillName, cwd) : undefined;
   return {
     toolName: toolUse.name,
-    tags: [toolTagForToolName(toolUse.name)],
     ...(description ? { title: description } : {}),
     ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
     ...(skillName ? { skill: skillName } : {}),
