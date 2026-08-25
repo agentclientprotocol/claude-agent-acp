@@ -58,8 +58,38 @@ describe("AsyncTaskRuntime", () => {
       taskType: "shell",
       description: "npm run build",
       showInTranscript: true,
+      canStop: true,
       outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
       toolCallId: "bash-tool",
+    });
+  });
+
+  it("publishes a stopped terminal after a task-specific stop", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      taskId: "task-1",
+      taskType: "local_workflow",
+      description: "Build generated assets",
+    });
+    expect(runtime.canStop("task-1")).toBe(true);
+    expect(runtime.claimStop("task-1")).toBe(true);
+    expect(runtime.claimStop("task-1")).toBe(false);
+
+    await runtime.taskStopped("task-1");
+    await runtime.taskStopped("task-1");
+
+    expect(runtime.canStop("task-1")).toBe(false);
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+    expect(published.at(-1)?.update).toMatchObject({
+      asyncTaskId: "task-1",
+      state: "stopped",
     });
   });
 

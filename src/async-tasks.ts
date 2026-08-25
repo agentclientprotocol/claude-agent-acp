@@ -17,6 +17,7 @@ type AsyncTask = {
   ignored: boolean;
   startedObserved: boolean;
   panelOnlyRecovery: boolean;
+  stopping: boolean;
   state: AsyncTaskState;
   terminalSummary?: string;
   terminalSource?: TerminalSource;
@@ -329,6 +330,28 @@ export class AsyncTaskRuntime {
     if (errors.length > 1) throw new AggregateError(errors, "Failed to finish async tasks");
   }
 
+  canStop(taskId: string): boolean {
+    const task = this.tasks.get(taskId);
+    return task?.announced === true && !task.ignored && !task.stopping && !isTerminal(task.state);
+  }
+
+  claimStop(taskId: string): boolean {
+    if (!this.canStop(taskId)) return false;
+    this.tasks.get(taskId)!.stopping = true;
+    return true;
+  }
+
+  releaseStop(taskId: string): void {
+    const task = this.tasks.get(taskId);
+    if (task && !isTerminal(task.state)) task.stopping = false;
+  }
+
+  async taskStopped(taskId: string): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task || !task.announced || task.ignored) return;
+    await this.finish(task, "stopped", undefined, "event");
+  }
+
   clear(): void {
     this.tasks.clear();
   }
@@ -346,6 +369,7 @@ export class AsyncTaskRuntime {
       ignored: false,
       startedObserved: false,
       panelOnlyRecovery: false,
+      stopping: false,
       state: "running",
     };
     this.tasks.set(taskId, task);
@@ -413,6 +437,7 @@ export class AsyncTaskRuntime {
         taskType: task.taskType,
         description: task.description,
         showInTranscript: task.showInTranscript,
+        canStop: true,
         ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
         ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
       },

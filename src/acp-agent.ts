@@ -294,6 +294,40 @@ const TURN_NO_RESULT_MESSAGE =
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
 
+/** Stops one Claude background task without cancelling the parent prompt turn. */
+const ASYNC_TASK_STOP_METHOD = "_session/async_task/stop";
+
+type AsyncTaskStopRequest = {
+  sessionId: string;
+  asyncTaskId: string;
+};
+
+type AsyncTaskStopResponse = {
+  stopped: boolean;
+};
+
+function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw RequestError.invalidParams(undefined, "async task stop params must be an object");
+  }
+  const params = value as Record<string, unknown>;
+  const sessionId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+  const asyncTaskId = typeof params.asyncTaskId === "string" ? params.asyncTaskId.trim() : "";
+  if (!sessionId) {
+    throw RequestError.invalidParams(
+      undefined,
+      "async task stop params require a non-empty sessionId",
+    );
+  }
+  if (!asyncTaskId) {
+    throw RequestError.invalidParams(
+      undefined,
+      "async task stop params require a non-empty asyncTaskId",
+    );
+  }
+  return { sessionId, asyncTaskId };
+}
+
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
  *  contract. `now` pre-empts the current generation, while `later` waits for a
@@ -2196,6 +2230,21 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
+    const session = this.sessions[params.sessionId];
+    const asyncTasks = session?.asyncTaskRuntime;
+    if (!session || !asyncTasks?.claimStop(params.asyncTaskId)) return { stopped: false };
+
+    try {
+      await session.query.stopTask(params.asyncTaskId);
+      await asyncTasks.taskStopped(params.asyncTaskId);
+      return { stopped: true };
+    } catch (error) {
+      asyncTasks.releaseStop(params.asyncTaskId);
+      throw error;
+    }
   }
 
   /** Publish the audit terminal for every turn path that did not reach the
@@ -9242,6 +9291,11 @@ export function runAcp(logger?: Logger) {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<AsyncTaskStopRequest, AsyncTaskStopResponse>(
+      ASYNC_TASK_STOP_METHOD,
+      { parse: parseAsyncTaskStopRequest },
+      (ctx) => agent.stopAsyncTask(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,

@@ -4557,6 +4557,62 @@ describe("subagent permission attribution (issue #851)", () => {
     );
   });
 
+  it("stops one advertised async task through the SDK without cancelling the prompt", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          ...taskStarted("workflow-1", "toolu_workflow"),
+          task_type: "local_workflow",
+          is_backgrounded: true,
+        },
+        successResult(),
+      ]),
+    );
+    const query = agent.sessions["test-session"].query as any;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+    query.stopTask.mockRejectedValueOnce(new Error("SDK stop failed"));
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
+    ).rejects.toThrow("SDK stop failed");
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "workflow-1" }),
+    ).resolves.toEqual({ stopped: true });
+
+    expect(query.stopTask).toHaveBeenCalledTimes(2);
+    expect(query.stopTask).toHaveBeenNthCalledWith(1, "workflow-1");
+    expect(query.stopTask).toHaveBeenNthCalledWith(2, "workflow-1");
+    expect(query.interrupt).not.toHaveBeenCalled();
+    expect(updates.map(({ update }) => update)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "workflow-1",
+          canStop: true,
+        }),
+        expect.objectContaining({
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "workflow-1",
+          state: "stopped",
+        }),
+      ]),
+    );
+  });
+
   it("attaches a Bash tool id discovered after async_task_spawned", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
