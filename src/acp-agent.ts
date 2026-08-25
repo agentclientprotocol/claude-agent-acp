@@ -1167,6 +1167,19 @@ const LOCAL_COMMAND_MARKERS = [
   "local-command-stderr",
 ].map((tag) => ({ open: `<${tag}>`, close: `</${tag}>` }));
 
+// Context the CLI injects into a user turn to steer the model, appended to
+// whatever the user typed. Nobody wrote it and no client sees it live — the
+// prompt loop's user-message skip covers the whole message — but it is
+// persisted alongside that prose, so replay would hand the client a prompt
+// with instructions in it the user never gave.
+const INJECTED_CONTEXT_MARKERS = ["system-reminder"].map((tag) => ({
+  open: `<${tag}>`,
+  close: `</${tag}>`,
+}));
+
+// Everything a replayed user message may be wrapped in that is not speech.
+const TRANSCRIPT_MARKERS = [...LOCAL_COMMAND_MARKERS, ...INJECTED_CONTEXT_MARKERS];
+
 // Single-pass scanner that removes each `<tag>…</tag>` marker (matching the
 // nearest closing tag of the same name, like a lazy regex would).
 function stripMarkerTags(text: string): string {
@@ -1176,7 +1189,7 @@ function stripMarkerTags(text: string): string {
   let i = 0;
   while (i < text.length) {
     if (text[i] === "<") {
-      const marker = LOCAL_COMMAND_MARKERS.find(
+      const marker = TRANSCRIPT_MARKERS.find(
         (m) => !dead.has(m.open) && text.startsWith(m.open, i),
       );
       if (marker) {
@@ -1198,10 +1211,11 @@ function stripMarkerTags(text: string): string {
 }
 
 /**
- * Return user-message content with local-command marker tags removed, or
- * `null` if nothing meaningful remains (caller should skip the message).
- * Preserves real prose that's mixed in alongside the markers — e.g. a
- * message like `<command-name>…</command-name>hi` becomes `hi`.
+ * Return user-message content with local-command and injected-context marker
+ * tags removed, or `null` if nothing meaningful remains (caller should skip
+ * the message). Preserves real prose that's mixed in alongside the markers —
+ * e.g. a message like `<command-name>…</command-name>hi` becomes `hi`, and
+ * `hi<system-reminder>…</system-reminder>` becomes `hi`.
  */
 export function stripLocalCommandMetadata(content: unknown): unknown | null {
   if (typeof content === "string") {

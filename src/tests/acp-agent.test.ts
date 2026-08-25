@@ -1594,6 +1594,26 @@ describe("stripLocalCommandMetadata", () => {
     expect((stripped as string).trimEnd()).toMatch(/hi$/);
   });
 
+  // A reminder the CLI appends to the user's own turn: never typed, never
+  // shown live, but persisted next to the prose it was appended to.
+  it("strips injected system reminders, keeping what the user typed", () => {
+    expect(
+      stripLocalCommandMetadata("is that right?<system-reminder>be nice</system-reminder>"),
+    ).toBe("is that right?");
+    expect(
+      stripLocalCommandMetadata("<system-reminder>do not mention this</system-reminder>"),
+    ).toBeNull();
+  });
+
+  it("drops reminder-only blocks from mixed arrays, keeping real blocks", () => {
+    expect(
+      stripLocalCommandMetadata([
+        { type: "text", text: "is that right?" },
+        { type: "text", text: "<system-reminder>be nice</system-reminder>" },
+      ]),
+    ).toEqual([{ type: "text", text: "is that right?" }]);
+  });
+
   it("drops marker-only blocks from mixed arrays, keeping real blocks", () => {
     const result = stripLocalCommandMetadata([
       { type: "text", text: "<command-name>/model</command-name>" },
@@ -1698,6 +1718,47 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(false);
     expect(isSyntheticLoginMessage(undefined)).toBe(false);
     expect(isSyntheticLoginMessage("Not logged in · Please run /login")).toBe(false);
+  });
+
+  it("loadSession replay hands the client the prompt without the reminder appended to it", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content:
+            "is that right?<system-reminder>Do not mention this reminder to the user.</system-reminder>",
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    // What the user typed still replays…
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text === "is that right?",
+      ),
+    ).toBe(true);
+    // …without the instruction the CLI appended to it.
+    expect(JSON.stringify(updates)).not.toContain("system-reminder");
   });
 
   it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
