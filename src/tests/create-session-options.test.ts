@@ -740,6 +740,7 @@ describe("createSession options merging", () => {
         headers: {},
       });
       const plain = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const plainProviderCacheKey = sessionFor(plain.sessionId).providerCacheKey;
 
       await agent.unstable_setProvider({
         providerId: "main",
@@ -749,9 +750,7 @@ describe("createSession options merging", () => {
       });
       const beta = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(sessionFor(beta.sessionId).providerCacheKey).not.toBe(
-        sessionFor(plain.sessionId).providerCacheKey,
-      );
+      expect(sessionFor(beta.sessionId).providerCacheKey).not.toBe(plainProviderCacheKey);
     });
   });
 
@@ -795,7 +794,7 @@ describe("createSession options merging", () => {
       return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
     }
 
-    const signal = () => ({ signal: new AbortController().signal });
+    const signal = () => ({ signal: new AbortController().signal, requestId: "1" });
 
     it("renders the prompt as a form elicitation and maps the retry choice", async () => {
       const { onUserDialog, createElicitation } = await setupDialog();
