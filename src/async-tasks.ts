@@ -315,11 +315,18 @@ export class AsyncTaskRuntime {
   }
 
   async finishAll(state: Extract<AsyncTaskState, "failed" | "stopped">): Promise<void> {
+    const errors: unknown[] = [];
     for (const task of this.tasks.values()) {
       if (task.announced && !task.ignored && !isTerminal(task.state)) {
-        await this.finish(task, state, undefined, "shutdown");
+        try {
+          await this.finish(task, state, undefined, "shutdown");
+        } catch (error) {
+          errors.push(error);
+        }
       }
     }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Failed to finish async tasks");
   }
 
   clear(): void {
@@ -428,10 +435,22 @@ export class AsyncTaskRuntime {
       // best-effort stopped state if that edge later arrives.
       if (task.terminalSource !== "level" || source !== "event") return;
     }
+    const previous = {
+      state: task.state,
+      terminalSummary: task.terminalSummary,
+      terminalSource: task.terminalSource,
+    };
     task.state = state;
     task.terminalSummary = summary;
     task.terminalSource = source;
-    if (task.announced) await this.publishState(task, state, summary);
+    try {
+      if (task.announced) await this.publishState(task, state, summary);
+    } catch (error) {
+      task.state = previous.state;
+      task.terminalSummary = previous.terminalSummary;
+      task.terminalSource = previous.terminalSource;
+      throw error;
+    }
   }
 
   private async publishMetadata(task: AsyncTask): Promise<void> {

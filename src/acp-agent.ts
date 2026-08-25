@@ -103,7 +103,8 @@ import {
   SubagentAwareSessionCapabilities,
 } from "./acp-subagents.js";
 import {
-  finishNativeSubagents,
+  isNativeSubagentControlTool,
+  isNativeSubagentControlUpdate,
   NativeSubagent,
   NativeSubagentRuntime,
 } from "./native-subagents.js";
@@ -176,6 +177,8 @@ import {
   applyTaskList,
   applyTaskUpdate,
   ClaudePlanEntry,
+  clearHookCallbacks,
+  completeHookCallback,
   createPostToolUseHook,
   createTaskHook,
   parseTaskCreateOutput,
@@ -188,6 +191,7 @@ import {
   toolInfoFromToolUse,
   toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
+  unregisterHookCallback,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
@@ -532,9 +536,11 @@ export type Session = {
    *  lane); a count can't express command coalescing — N queued commands can
    *  fold into ONE turn emitting one result, leaving a stale skip of N-1. */
   pendingOrphanResults?: number;
-  /** Empty user-interruption diagnostics expected from prompts cancelled
-   * before their SDK echo. The next ordinary result clears stale tokens. */
-  pendingEmptyInterruptionDiagnostics?: number;
+  /** UUIDs of cancelled-before-echo commands that can still emit Claude's
+   * empty user-interruption diagnostic. Interrupt receipts and command
+   * lifecycle frames remove commands that were dropped before dispatch; the
+   * next ordinary result clears any stale survivors. */
+  pendingEmptyInterruptionDiagnosticCommands?: Set<string>;
   /** msg_lifecycle_v1 lane of the orphan accounting (see
    *  `pendingOrphanResults` for the count lane): the uuids of cancelled queued
    *  turns whose SDK-side command may still produce an unaccounted result,
@@ -776,6 +782,14 @@ export type Session = {
    *  supplies the immediate parent for nested `task_started` notifications,
    *  whose SDK payload has no lineage field of its own. */
   nativeSubagentParentByToolUseId?: Map<string, string>;
+  /** Session-owned lifecycle controller shared by the consumer, cancel, reset,
+   *  and teardown paths. */
+  nativeSubagentRuntime?: NativeSubagentRuntime;
+  /** Child-aware delivery closure paired with {@link nativeSubagentRuntime}. */
+  nativeSubagentDeliver?: (notification: AcpSessionNotification) => Promise<void>;
+  /** Session-owned async task controller. Prompt cancellation intentionally
+   *  does not finish it because background work may outlive a prompt. */
+  asyncTaskRuntime?: AsyncTaskRuntime;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -1065,6 +1079,28 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+function replaySubagentTerminalState(
+  block: Record<string, unknown>,
+): "completed" | "failed" | "cancelled" {
+  if (block.is_error !== true) return "completed";
+  const text = replayContentText(block.content).toLowerCase();
+  return /\b(?:cancelled|canceled|interrupted|stopped|killed)\b/.test(text)
+    ? "cancelled"
+    : "failed";
+}
+
+function replayContentText(value: unknown, seen = new Set<unknown>()): string {
+  if (typeof value === "string") return value;
+  if (typeof value !== "object" || value === null || seen.has(value)) return "";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => replayContentText(item, seen)).join(" ");
+  const record = value as Record<string, unknown>;
+  return [record.text, record.content, record.message]
+    .map((item) => replayContentText(item, seen))
+    .filter(Boolean)
+    .join(" ");
 }
 
 function stripSubagentTextAndThinking(content: unknown): unknown {
@@ -1480,6 +1516,10 @@ export class ClaudeAcpAgent {
         session.cancelController?.abort();
         this.closeQueryStream(session);
         session.abortController.abort();
+        session.eagerToolCallSessions?.clear();
+        clearHookCallbacks(id);
+        session.nativeSubagentRuntime?.clear();
+        session.asyncTaskRuntime?.clear();
         if (this.sessions[id] === session) delete this.sessions[id];
       },
       settleCancelledTurn: (original, session, turn) => {
@@ -1622,7 +1662,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
-      ...(clientSupportsSubagents(request.clientCapabilities) ? { subagents: {} } : {}),
+      subagents: {},
     };
 
     return {
@@ -2251,18 +2291,18 @@ export class ClaudeAcpAgent {
      *  recognizable by the `parentToolUseId` meta that toAcpNotifications
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
-    const subagents = new NativeSubagentRuntime(
+    const subagents = (session.nativeSubagentRuntime ??= new NativeSubagentRuntime(
       clientSupportsSubagents(this.clientCapabilities),
       params.sessionId,
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
-    );
-    const asyncTasks = new AsyncTaskRuntime(
+    ));
+    const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       params.sessionId,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
-    );
+    ));
 
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
@@ -2284,12 +2324,7 @@ export class ClaudeAcpAgent {
         // Native Agent/Task control calls are intentionally not transcript
         // tools. Do not let the mapper's pre-send de-duplication mark make a
         // later permission request believe that a suppressed call exists.
-        if (
-          toolCallId &&
-          (claudeMeta?.subagent === true ||
-            claudeMeta?.toolName === "Agent" ||
-            claudeMeta?.toolName === "Task")
-        ) {
+        if (toolCallId && isNativeSubagentControlUpdate(update)) {
           session.emittedToolCalls.delete(toolCallId);
         }
         return;
@@ -2323,6 +2358,32 @@ export class ClaudeAcpAgent {
     // the client passed to it. Keep those later updates on the same child-aware
     // routing path as the immediate notifications.
     const routedNotificationClient = { sessionUpdate: sendUpdate } as unknown as AcpClient;
+    session.nativeSubagentDeliver = sendUpdate;
+
+    const finishLifecycle = async (
+      nativeState: "completed" | "failed" | "cancelled",
+      asyncState: "failed" | "stopped",
+      context: string,
+    ): Promise<void> => {
+      await Promise.all([
+        subagents
+          .finishAll(nativeState, sendUpdate)
+          .catch((error) =>
+            this.logger.error(
+              `Session ${params.sessionId}: failed to publish terminal subagent state ${context}`,
+              error,
+            ),
+          ),
+        asyncTasks
+          .finishAll(asyncState)
+          .catch((error) =>
+            this.logger.error(
+              `Session ${params.sessionId}: failed to publish terminal async task state ${context}`,
+              error,
+            ),
+          ),
+      ]);
+    };
 
     let pendingWorkerShutdown = false;
     const isCurrentConsumer = () => this.sessions[params.sessionId] === session;
@@ -2897,15 +2958,11 @@ export class ClaudeAcpAgent {
           // a deferred turn's stored outcome (followup results never mutate
           // it), but the stored one is the authoritative source.
           const inFlight = session.activeTurn;
-          try {
-            await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
-            await asyncTasks.finishAll(session.cancelled ? "stopped" : "failed");
-          } catch (error) {
-            this.logger.error(
-              `Session ${params.sessionId}: failed to publish terminal subagent state`,
-              error,
-            );
-          }
+          await finishLifecycle(
+            session.cancelled ? "cancelled" : "failed",
+            session.cancelled ? "stopped" : "failed",
+            "at end of stream",
+          );
           settleActive(
             session.cancelled
               ? turnOutcome(session, "cancelled")
@@ -3003,6 +3060,7 @@ export class ClaudeAcpAgent {
                 const state = session.orphanCommands?.get(frame.command_uuid);
                 if (state === "pending") {
                   session.orphanCommands?.delete(frame.command_uuid);
+                  session.pendingEmptyInterruptionDiagnosticCommands?.delete(frame.command_uuid);
                 } else if (state === "started") {
                   session.orphanCommands?.set(frame.command_uuid, "zombie");
                 }
@@ -3017,6 +3075,7 @@ export class ClaudeAcpAgent {
               // by receive-side policy before dispatch; never a prompt-lane
               // command of ours, and no result will ever come.
               session.orphanCommands?.delete(frame.command_uuid);
+              session.pendingEmptyInterruptionDiagnosticCommands?.delete(frame.command_uuid);
               break;
             }
             default:
@@ -3358,6 +3417,7 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "permission_denied": {
+                unregisterHookCallback(message.tool_use_id);
                 // A tool call was auto-denied (by a rule, the classifier,
                 // dontAsk mode, etc.) before running. The tool_use block was
                 // already emitted as a `tool_call`, so mark it failed with the
@@ -3385,9 +3445,11 @@ export class ClaudeAcpAgent {
                 const parentToolUseId = message.agent_id
                   ? session.liveBackgroundTasks.get(message.agent_id)?.parentToolUseId
                   : undefined;
+                const eagerOwnerSessionId = session.eagerToolCallSessions?.get(message.tool_use_id);
                 if (
                   message.agent_id &&
                   !parentToolUseId &&
+                  !eagerOwnerSessionId &&
                   clientSupportsSubagents(this.clientCapabilities)
                 ) {
                   // An agent-scoped denial with missing lineage cannot safely
@@ -3510,7 +3572,12 @@ export class ClaudeAcpAgent {
               case "task_notification":
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
-                await subagents.finishTask(message.task_id, message.status, sendUpdate);
+                await subagents.finishTask(
+                  message.task_id,
+                  message.status,
+                  sendUpdate,
+                  message.tool_use_id,
+                );
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
                   status: message.status,
@@ -3981,16 +4048,21 @@ export class ClaudeAcpAgent {
               if (
                 message.is_error &&
                 isEmptyUserInterruptionDiagnostic(message) &&
-                (session.pendingEmptyInterruptionDiagnostics ?? 0) > 0
+                (session.pendingEmptyInterruptionDiagnosticCommands?.size ?? 0) > 0
               ) {
-                session.pendingEmptyInterruptionDiagnostics!--;
+                const commandUuid = session
+                  .pendingEmptyInterruptionDiagnosticCommands!.values()
+                  .next().value;
+                if (commandUuid) {
+                  session.pendingEmptyInterruptionDiagnosticCommands!.delete(commandUuid);
+                }
                 break;
               }
 
               // Some CLI versions omit the cancelled cycle's diagnostic. Do
               // not let an unused hand-off token swallow a later turn's real
               // interruption failure.
-              session.pendingEmptyInterruptionDiagnostics = 0;
+              session.pendingEmptyInterruptionDiagnosticCommands?.clear();
 
               await clearFailuresFromEarlierTurns();
 
@@ -4783,17 +4855,11 @@ export class ClaudeAcpAgent {
             // and task store are independent of the previous transcript.
             // Clear both the in-memory snapshot and the client's visible plan
             // before any follow-up prompt can republish stale tasks.
-            try {
-              await subagents.finishAll("failed", sendUpdate);
-              await asyncTasks.finishAll("failed");
-            } catch (error) {
-              this.logger.error(
-                `Session ${params.sessionId}: failed to publish reset subagent state`,
-                error,
-              );
-            }
+            await finishLifecycle("failed", "failed", "during conversation reset");
             subagents.clear();
             asyncTasks.clear();
+            session.eagerToolCallSessions?.clear();
+            clearHookCallbacks(params.sessionId);
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
@@ -4830,15 +4896,11 @@ export class ClaudeAcpAgent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
-      try {
-        await subagents.finishAll(session.cancelled ? "cancelled" : "failed", sendUpdate);
-        await asyncTasks.finishAll(session.cancelled ? "stopped" : "failed");
-      } catch (finishError) {
-        this.logger.error(
-          `Session ${params.sessionId}: failed to publish terminal subagent state after stream error`,
-          finishError,
-        );
-      }
+      await finishLifecycle(
+        session.cancelled ? "cancelled" : "failed",
+        session.cancelled ? "stopped" : "failed",
+        "after stream error",
+      );
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -4867,6 +4929,10 @@ export class ClaudeAcpAgent {
           ),
         );
         this.closeQueryStream(session);
+        session.eagerToolCallSessions?.clear();
+        clearHookCallbacks(params.sessionId);
+        session.nativeSubagentRuntime?.clear();
+        session.asyncTaskRuntime?.clear();
         delete this.sessions[params.sessionId];
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
@@ -4922,11 +4988,26 @@ export class ClaudeAcpAgent {
     // query.interrupt() on a finished iterator could reject and surface from
     // this fire-and-forget notification, so there is nothing to do here.
     if (session.queryClosed) {
+      session.eagerToolCallSessions?.clear();
+      clearHookCallbacks(params.sessionId);
       return;
     }
-    await finishNativeSubagents(session, "cancelled", async (notification) =>
-      this.client.sessionUpdate(asSdkSessionNotification(notification)),
-    );
+    try {
+      await session.nativeSubagentRuntime?.finishAll(
+        "cancelled",
+        session.nativeSubagentDeliver ??
+          (async (notification) =>
+            this.client.sessionUpdate(asSdkSessionNotification(notification))),
+      );
+    } catch (error) {
+      this.logger.error(
+        `Session ${params.sessionId}: failed to publish cancelled subagent state`,
+        error,
+      );
+    } finally {
+      session.eagerToolCallSessions?.clear();
+      clearHookCallbacks(params.sessionId);
+    }
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
@@ -5009,9 +5090,23 @@ export class ClaudeAcpAgent {
         (turn) => turn === session.activeTurn && !turn.settled,
       );
     }
-    if (orphanedTurns.length > 0) {
-      session.pendingEmptyInterruptionDiagnostics =
-        (session.pendingEmptyInterruptionDiagnostics ?? 0) + orphanedTurns.length;
+    const diagnosticTurns = orphanedTurns.filter((turn) => {
+      if (
+        turn.commandFinished === "completed" ||
+        turn.commandFinished === "discarded" ||
+        turn.commandFinished === "refused"
+      ) {
+        return false;
+      }
+      if (turn.commandStarted && turn.commandResultSeen) return false;
+      if (turn.commandFinished === "cancelled" && !turn.commandStarted) return false;
+      return true;
+    });
+    if (diagnosticTurns.length > 0) {
+      session.pendingEmptyInterruptionDiagnosticCommands ??= new Set();
+      for (const turn of diagnosticTurns) {
+        session.pendingEmptyInterruptionDiagnosticCommands.add(turn.promptUuid);
+      }
     }
 
     // A deferred active turn (see Turn.deferredSettle) already has its
@@ -5125,6 +5220,11 @@ export class ClaudeAcpAgent {
     // activation-time self-heal.
     if (Array.isArray(receipt?.still_queued) && orphanedTurns.length > 0) {
       const stillQueued = new Set(receipt.still_queued);
+      const droppedTurns = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid));
+      const droppedCount = droppedTurns.length;
+      for (const turn of droppedTurns) {
+        session.pendingEmptyInterruptionDiagnosticCommands?.delete(turn.promptUuid);
+      }
       if (lifecycleLane) {
         // Lifecycle lane: forget dropped orphans by uuid. Only entries still
         // "pending" — an orphan absent from `still_queued` because it was
@@ -5144,9 +5244,11 @@ export class ClaudeAcpAgent {
           }
         }
       } else {
-        const dropped = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid)).length;
-        if (dropped > 0) {
-          session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - dropped);
+        if (droppedCount > 0) {
+          session.pendingOrphanResults = Math.max(
+            0,
+            (session.pendingOrphanResults ?? 0) - droppedCount,
+          );
         }
       }
     }
@@ -5209,6 +5311,10 @@ export class ClaudeAcpAgent {
     // here the client has asked us to close the session, so signalling abort is
     // appropriate; query.close() above has already torn the subprocess down.
     session.abortController.abort();
+    session.eagerToolCallSessions?.clear();
+    clearHookCallbacks(sessionId);
+    session.nativeSubagentRuntime?.clear();
+    session.asyncTaskRuntime?.clear();
     delete this.sessions[sessionId];
   }
 
@@ -5363,6 +5469,128 @@ export class ClaudeAcpAgent {
     // ends an incomplete audit lane.
     let replayingFileChangeAudit = false;
     const replayFileChangeAuditToolUseIds = new Set<string>();
+    const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
+    const replayChildren = new Map<
+      string,
+      {
+        sessionId: string;
+        parentToolUseId?: string;
+        name: string;
+        task: string;
+        reconstructable: boolean;
+        announced: boolean;
+        terminalState?: "completed" | "failed" | "cancelled";
+      }
+    >();
+
+    if (nativeReplayEnabled) {
+      for (const message of messages) {
+        const content = (message as unknown as { message?: { content?: unknown } }).message
+          ?.content;
+        if (!Array.isArray(content)) continue;
+        const ownerToolUseId = parentToolUseIdOf(message);
+        for (const block of content) {
+          if (
+            typeof block === "object" &&
+            block !== null &&
+            "type" in block &&
+            (block.type === "tool_result" || block.type === "mcp_tool_result") &&
+            "tool_use_id" in block &&
+            typeof block.tool_use_id === "string"
+          ) {
+            replayTerminalStates.set(block.tool_use_id, replaySubagentTerminalState(block));
+          }
+          if (
+            typeof block !== "object" ||
+            block === null ||
+            !("type" in block) ||
+            !["tool_use", "server_tool_use", "mcp_tool_use"].includes(String(block.type)) ||
+            !("id" in block) ||
+            typeof block.id !== "string" ||
+            !("name" in block) ||
+            !isNativeSubagentControlTool(block.name)
+          ) {
+            continue;
+          }
+          const input =
+            "input" in block && typeof block.input === "object" && block.input !== null
+              ? (block.input as Record<string, unknown>)
+              : {};
+          const task =
+            [input.prompt, input.description]
+              .find(
+                (value): value is string => typeof value === "string" && value.trim().length > 0,
+              )
+              ?.trim() ?? "Delegated task restored from session history";
+          const name =
+            [input.name, input.description, input.subagent_type]
+              .find(
+                (value): value is string => typeof value === "string" && value.trim().length > 0,
+              )
+              ?.trim() ?? "Restored agent";
+          replayChildren.set(block.id, {
+            sessionId: `${sessionId}:replay-subagent:${block.id}`,
+            ...(ownerToolUseId ? { parentToolUseId: ownerToolUseId } : {}),
+            name,
+            task,
+            reconstructable: true,
+            announced: false,
+            terminalState: replayTerminalStates.get(block.id),
+          });
+        }
+      }
+      for (const [toolUseId, terminalState] of replayTerminalStates) {
+        const child = replayChildren.get(toolUseId);
+        if (child) child.terminalState = terminalState;
+      }
+    }
+
+    const announceReplayChild = async (
+      parentToolUseId: string,
+      ancestors = new Set<string>(),
+    ): Promise<string> => {
+      let child = replayChildren.get(parentToolUseId);
+      if (!child) {
+        child = {
+          sessionId: `${sessionId}:replay-subagent:${parentToolUseId}`,
+          name: "Disconnected agent",
+          task: "Subagent restored without persisted launch metadata",
+          reconstructable: false,
+          announced: false,
+        };
+        replayChildren.set(parentToolUseId, child);
+      }
+      if (ancestors.has(parentToolUseId)) {
+        child.reconstructable = false;
+        child.terminalState = undefined;
+        child.parentToolUseId = undefined;
+      }
+      if (child.parentToolUseId) {
+        const nextAncestors = new Set(ancestors);
+        nextAncestors.add(parentToolUseId);
+        await announceReplayChild(child.parentToolUseId, nextAncestors);
+      }
+      if (!child.announced) {
+        const parentSessionId = child.parentToolUseId
+          ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
+          : sessionId;
+        await this.client.sessionUpdate(
+          asSdkSessionNotification({
+            sessionId: parentSessionId,
+            update: {
+              sessionUpdate: "subagent_spawned",
+              subagentSessionId: child.sessionId,
+              name: child.name,
+              task: child.task,
+              capabilities: {},
+            },
+          }),
+        );
+        child.announced = true;
+      }
+      return child.sessionId;
+    };
 
     for (const message of messages) {
       if (
@@ -5416,16 +5644,16 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
-      if (parentToolUseId && clientSupportsSubagents(this.clientCapabilities)) {
-        // Persisted SDK sidechains do not contain the authoritative
-        // task_started/task_updated lifecycle needed to reconstruct a native
-        // child session. Never replay them into the root transcript: an
-        // unsupported client must not see a legacy child representation, and
-        // a capable client must not receive child output without a preceding
-        // subagent_spawned event.
-        continue;
-      }
-      if (message.type === "assistant" && parentToolUseId && !forwardSubagentText) {
+      const replayTargetSessionId =
+        nativeReplayEnabled && parentToolUseId
+          ? await announceReplayChild(parentToolUseId)
+          : sessionId;
+      if (
+        message.type === "assistant" &&
+        parentToolUseId &&
+        !nativeReplayEnabled &&
+        !forwardSubagentText
+      ) {
         content = stripSubagentTextAndThinking(content);
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
@@ -5512,7 +5740,43 @@ export class ClaudeAcpAgent {
           parentToolUseId,
         },
       )) {
-        await this.client.sessionUpdate(notification);
+        const toolName = (
+          notification.update._meta?.claudeCode as { toolName?: string } | undefined
+        )?.toolName;
+        if (
+          nativeReplayEnabled &&
+          (notification.update.sessionUpdate === "tool_call" ||
+            notification.update.sessionUpdate === "tool_call_update") &&
+          isNativeSubagentControlTool(toolName)
+        ) {
+          continue;
+        }
+        await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
+      }
+    }
+
+    if (nativeReplayEnabled) {
+      // Claude history persists sidechain messages and Agent/Task tool uses,
+      // but not task_started/task_updated lifecycle frames. Recover terminal
+      // state from the launch tool_result. Missing results and malformed or
+      // orphan lineage use the draft protocol's deterministic disconnected state.
+      for (const child of [...replayChildren.values()].reverse()) {
+        if (!child.announced) continue;
+        const parentSessionId = child.parentToolUseId
+          ? (replayChildren.get(child.parentToolUseId)?.sessionId ?? sessionId)
+          : sessionId;
+        await this.client.sessionUpdate(
+          asSdkSessionNotification({
+            sessionId: parentSessionId,
+            update: {
+              sessionUpdate: "subagent_state_update",
+              subagentSessionId: child.sessionId,
+              state: child.reconstructable
+                ? (child.terminalState ?? "disconnected")
+                : "disconnected",
+            },
+          }),
+        );
       }
     }
   }
@@ -8470,37 +8734,44 @@ export function toAcpNotifications(
             // closing over the name keeps the diff working without depending on
             // (or pinning) the cache entry's lifetime.
             const toolName = chunk.name;
-            registerHookCallback(chunk.id, {
-              onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
-                // Both `Edit` and `Write` produce a structuredPatch in their
-                // PostToolUse tool_response. For Edit the diff replaces the
-                // optimistic content built at tool_use time. For Write the
-                // optimistic content (built from `input.content` alone with
-                // `oldText: null`) shows "creation" semantics regardless of
-                // whether the file existed; the structuredPatch from the
-                // hook lets us emit the real diff for `type: "update"`. The
-                // helper returns `{}` if the response shape isn't usable.
-                const editDiff =
-                  toolName === "Edit" || toolName === "Write"
-                    ? toolUpdateFromDiffToolResponse(toolResponse)
-                    : {};
-                const update: SessionNotification["update"] = {
-                  _meta: {
-                    claudeCode: {
-                      toolResponse,
-                      toolName,
-                    },
-                  } satisfies ToolUpdateMeta,
-                  toolCallId: toolUseId,
-                  sessionUpdate: "tool_call_update",
-                  ...editDiff,
-                };
-                await client.sessionUpdate({
-                  sessionId,
-                  update,
-                });
+            registerHookCallback(
+              chunk.id,
+              {
+                onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
+                  // Both `Edit` and `Write` produce a structuredPatch in their
+                  // PostToolUse tool_response. For Edit the diff replaces the
+                  // optimistic content built at tool_use time. For Write the
+                  // optimistic content (built from `input.content` alone with
+                  // `oldText: null`) shows "creation" semantics regardless of
+                  // whether the file existed; the structuredPatch from the
+                  // hook lets us emit the real diff for `type: "update"`. The
+                  // helper returns `{}` if the response shape isn't usable.
+                  const editDiff =
+                    toolName === "Edit" || toolName === "Write"
+                      ? toolUpdateFromDiffToolResponse(toolResponse)
+                      : {};
+                  const update: SessionNotification["update"] = {
+                    _meta: {
+                      claudeCode: {
+                        toolResponse,
+                        toolName,
+                        ...(options?.parentToolUseId
+                          ? { parentToolUseId: options.parentToolUseId }
+                          : {}),
+                      },
+                    } satisfies ToolUpdateMeta,
+                    toolCallId: toolUseId,
+                    sessionUpdate: "tool_call_update",
+                    ...editDiff,
+                  };
+                  await client.sessionUpdate({
+                    sessionId,
+                    update,
+                  });
+                },
               },
-            });
+              sessionId,
+            );
           }
 
           let rawInput;
@@ -8550,6 +8821,7 @@ export function toAcpNotifications(
       case "mcp_tool_result": {
         const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
+        completeHookCallback(chunk.tool_use_id);
         // Why this is_error result carries harness prose instead of tool
         // output (user-rejected / interrupted / …), when the SDK said so.
         // Spread into the claudeCode meta of every update emitted below; the

@@ -18,6 +18,8 @@ import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
   createTaskHook,
+  clearHookCallbacks,
+  registerHookCallback,
   toolInfoFromToolUse,
   planEntries,
   applyTaskCreate,
@@ -28,6 +30,32 @@ import {
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
+
+describe("PostToolUse callback ownership", () => {
+  it("clears only callbacks owned by the cancelled session", async () => {
+    const first = vi.fn(async () => {});
+    const second = vi.fn(async () => {});
+    registerHookCallback("owned-first", { onPostToolUseHook: first }, "session-one");
+    registerHookCallback("owned-second", { onPostToolUseHook: second }, "session-two");
+
+    clearHookCallbacks("session-one");
+    const hook = createPostToolUseHook();
+    const context = { signal: new AbortController().signal };
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-first",
+      context,
+    );
+    await hook(
+      { hook_event_name: "PostToolUse", tool_input: {}, tool_response: {} } as any,
+      "owned-second",
+      context,
+    );
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledOnce();
+  });
+});
 
 describe("rawOutput in tool call updates", () => {
   const mockClient = {} as AcpClient;
@@ -1116,6 +1144,7 @@ describe("Bash terminal output", () => {
         toolUseCache,
         mockClientWithUpdate,
         mockLogger,
+        { parentToolUseId: "parent-agent-tool" },
       );
 
       // Fire PostToolUse hook with a structuredPatch in tool_response
@@ -1155,6 +1184,7 @@ describe("Bash terminal output", () => {
       expect(hookUpdates).toHaveLength(1);
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate._meta.claudeCode.toolName).toBe("Edit");
+      expect(hookUpdate._meta.claudeCode.parentToolUseId).toBe("parent-agent-tool");
       expect(hookUpdate.content).toEqual([
         {
           type: "diff",

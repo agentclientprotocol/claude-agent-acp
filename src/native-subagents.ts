@@ -5,9 +5,13 @@ export type NativeSubagent = {
   parentSessionId: string;
   parentToolUseId?: string;
   name: string;
-  description: string;
+  task: string;
   announced?: boolean;
   terminalState?: SubagentState;
+  /** Connection-local single-flight state; never serialized on the wire. */
+  announcePromise?: Promise<void>;
+  /** Connection-local single-flight state; never serialized on the wire. */
+  terminalPromise?: Promise<void>;
 };
 
 export type NativeSubagentSession = {
@@ -49,7 +53,10 @@ export class NativeSubagentRuntime {
   private readonly taskByToolUse: Map<string, string>;
   private readonly parentByToolUse: Map<string, string>;
   private readonly identityByToolUse = new Map<string, SubagentIdentity>();
-  private readonly childTaskByParentToolUse = new Map<string, string>();
+  private readonly controlByToolUse = new Map<string, AcpSessionNotification>();
+  private readonly childByParentToolUse = new Map<string, NativeSubagent>();
+  private readonly taskFinishPromises = new Map<string, Promise<void>>();
+  private readonly generationByTaskId = new Map<string, number>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
 
@@ -64,8 +71,10 @@ export class NativeSubagentRuntime {
     this.children = session.nativeSubagentsByTaskId ??= new Map();
     this.taskByToolUse = session.nativeSubagentTaskIdByToolUseId ??= new Map();
     this.parentByToolUse = session.nativeSubagentParentByToolUseId ??= new Map();
-    for (const [taskId, child] of this.children) {
-      if (child.parentToolUseId) this.childTaskByParentToolUse.set(child.parentToolUseId, taskId);
+    for (const child of this.children.values()) {
+      if (child.parentToolUseId) {
+        this.childByParentToolUse.set(child.parentToolUseId, child);
+      }
     }
   }
 
@@ -77,37 +86,42 @@ export class NativeSubagentRuntime {
     const { update } = notification;
     const claudeMeta = update._meta?.claudeCode as
       { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
-    const isControl =
-      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-      (claudeMeta?.subagent === true ||
-        claudeMeta?.toolName === "Agent" ||
-        claudeMeta?.toolName === "Task");
+    const isControl = isNativeSubagentControlUpdate(update);
 
     if (!this.enabled) return notification;
 
     if (this.enabled && isControl) {
+      const toolCallId = update.toolCallId;
+      if (update.sessionUpdate === "tool_call") {
+        this.controlByToolUse.set(toolCallId, notification);
+      }
       const identity = subagentIdentity(update.rawInput);
       if (identity) {
         this.identityByToolUse.set(
-          update.toolCallId,
-          mergeSubagentIdentity(this.identityByToolUse.get(update.toolCallId), identity),
+          toolCallId,
+          mergeSubagentIdentity(this.identityByToolUse.get(toolCallId), identity),
         );
       }
-      const parentTaskId = claudeMeta.parentToolUseId
-        ? this.taskByToolUse.get(claudeMeta.parentToolUseId)
-        : undefined;
-      const parentSessionId = parentTaskId
-        ? this.children.get(parentTaskId)?.sessionId
+      const parentSessionId = claudeMeta?.parentToolUseId
+        ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)?.sessionId
         : this.rootSessionId;
-      this.parentByToolUse.set(update.toolCallId, parentSessionId ?? this.rootSessionId);
+      this.parentByToolUse.set(toolCallId, parentSessionId ?? this.rootSessionId);
 
-      const childTaskId = this.childTaskByParentToolUse.get(update.toolCallId);
-      const child = childTaskId ? this.children.get(childTaskId) : undefined;
+      const child = this.childByParentToolUse.get(toolCallId);
       if (child && !child.announced) {
         child.parentSessionId = parentSessionId ?? this.rootSessionId;
-        applySubagentIdentity(child, this.identityByToolUse.get(update.toolCallId));
+        applySubagentIdentity(child, this.identityByToolUse.get(toolCallId));
         await announceNativeSubagent(child, this.publish);
-        for (const pending of this.takePending(update.toolCallId)) await deliver(pending);
+        for (const pending of this.takePending(toolCallId)) await deliver(pending);
+      }
+      if (!child && isFailedToolCallUpdate(update)) {
+        this.takePending(toolCallId);
+        const initial = this.controlByToolUse.get(toolCallId);
+        this.cleanupControl(toolCallId);
+        if (forcedSessionId) {
+          return { ...notification, sessionId: forcedSessionId };
+        }
+        return failedControlFallback(initial, notification, parentSessionId ?? this.rootSessionId);
       }
       return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
     }
@@ -119,13 +133,12 @@ export class NativeSubagentRuntime {
     if (forcedSessionId) return { ...notification, sessionId: forcedSessionId };
 
     if (this.enabled && claudeMeta?.parentToolUseId) {
-      const taskId = this.taskByToolUse.get(claudeMeta.parentToolUseId);
-      const child = taskId ? this.children.get(taskId) : undefined;
+      const child = this.childByParentToolUse.get(claudeMeta.parentToolUseId);
       if (!child || !child.announced) {
         this.buffer(claudeMeta.parentToolUseId, notification);
         return null;
       }
-      if (child.terminalState !== undefined) {
+      if (child.terminalState !== undefined || child.terminalPromise) {
         this.logger.log(
           `Session ${this.rootSessionId}: ignoring late update for terminal subagent ${child.sessionId}`,
         );
@@ -140,17 +153,21 @@ export class NativeSubagentRuntime {
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
     if (!this.enabled) return;
     if (!task.subagentType) {
-      if (task.toolUseId) this.takePending(task.toolUseId);
+      if (task.toolUseId) {
+        this.takePending(task.toolUseId);
+        this.cleanupControl(task.toolUseId);
+      }
       return;
     }
-    if (this.children.has(task.taskId)) return;
+    const previous = this.children.get(task.taskId);
+    if (previous && previous.terminalState === undefined) return;
 
     const knownParentSessionId = task.toolUseId
       ? this.parentByToolUse.get(task.toolUseId)
       : undefined;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
     const child: NativeSubagent = {
-      sessionId: task.taskId,
+      sessionId: this.nextChildSessionId(task.taskId, previous),
       parentSessionId: knownParentSessionId ?? this.rootSessionId,
       parentToolUseId: task.toolUseId ?? undefined,
       name: subagentDisplayName(
@@ -159,7 +176,7 @@ export class NativeSubagentRuntime {
         identity?.subagentType ?? task.subagentType,
         task.taskId,
       ),
-      description: subagentDescription(
+      task: subagentDescription(
         identity?.prompt ?? task.prompt,
         identity?.description ?? task.description,
       ),
@@ -167,7 +184,8 @@ export class NativeSubagentRuntime {
     this.children.set(task.taskId, child);
     if (task.toolUseId) {
       this.taskByToolUse.set(task.toolUseId, task.taskId);
-      this.childTaskByParentToolUse.set(task.toolUseId, task.taskId);
+      this.childByParentToolUse.set(task.toolUseId, child);
+      this.controlByToolUse.delete(task.toolUseId);
     }
 
     // A nested child must wait for the spawning Agent/Task frame to establish
@@ -180,30 +198,60 @@ export class NativeSubagentRuntime {
     }
   }
 
-  async finishTask(taskId: string, status: unknown, deliver: Publish): Promise<void> {
+  async finishTask(
+    taskId: string,
+    status: unknown,
+    deliver: Publish,
+    toolUseId?: string | null,
+  ): Promise<void> {
     if (!this.enabled) return;
     const state = nativeSubagentState(status);
-    const child = this.children.get(taskId);
+    const child = toolUseId ? this.childByParentToolUse.get(toolUseId) : this.children.get(taskId);
+    if (child && toolUseId && this.taskByToolUse.get(toolUseId) !== taskId) return;
     if (!state || !child || child.terminalState !== undefined) return;
+    const existing = this.taskFinishPromises.get(taskId);
+    if (existing) return existing;
 
-    await announceNativeSubagent(child, this.publish);
-    if (child.parentToolUseId) {
-      for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
-    }
-    await finishNativeSubagent(this.session, taskId, state, this.publish);
-    if (child.parentToolUseId) {
-      this.identityByToolUse.delete(child.parentToolUseId);
-      this.parentByToolUse.delete(child.parentToolUseId);
-      this.childTaskByParentToolUse.delete(child.parentToolUseId);
+    const finish = Promise.resolve().then(async () => {
+      try {
+        await announceNativeSubagent(child, this.publish);
+        if (child.parentToolUseId) {
+          for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
+        }
+        await finishNativeSubagent(this.session, taskId, state, this.publish);
+      } finally {
+        if (child.parentToolUseId) {
+          this.cleanupControl(child.parentToolUseId);
+        }
+      }
+    });
+    this.taskFinishPromises.set(taskId, finish);
+    try {
+      await finish;
+    } finally {
+      if (this.taskFinishPromises.get(taskId) === finish) this.taskFinishPromises.delete(taskId);
     }
   }
 
   async finishAll(state: SubagentState, deliver: Publish): Promise<void> {
-    for (const taskId of [...this.children.keys()].reverse()) {
-      await this.finishTask(taskId, state, deliver);
+    const errors: unknown[] = [];
+    try {
+      for (const taskId of [...this.children.keys()].reverse()) {
+        try {
+          await this.finishTask(taskId, state, deliver);
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } finally {
+      this.pending.clear();
+      this.pendingCount = 0;
+      this.identityByToolUse.clear();
+      this.controlByToolUse.clear();
+      this.parentByToolUse.clear();
     }
-    this.pending.clear();
-    this.pendingCount = 0;
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Failed to finish native subagents");
   }
 
   discardPending(parentToolUseId: string): void {
@@ -215,7 +263,10 @@ export class NativeSubagentRuntime {
     this.taskByToolUse.clear();
     this.parentByToolUse.clear();
     this.identityByToolUse.clear();
-    this.childTaskByParentToolUse.clear();
+    this.controlByToolUse.clear();
+    this.childByParentToolUse.clear();
+    this.taskFinishPromises.clear();
+    this.generationByTaskId.clear();
     this.pending.clear();
     this.pendingCount = 0;
   }
@@ -245,6 +296,22 @@ export class NativeSubagentRuntime {
     else this.pending.set(parentToolUseId, [notification]);
     this.pendingCount++;
   }
+
+  private cleanupControl(toolUseId: string): void {
+    this.identityByToolUse.delete(toolUseId);
+    this.controlByToolUse.delete(toolUseId);
+    this.parentByToolUse.delete(toolUseId);
+  }
+
+  private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
+    if (!previous) {
+      this.generationByTaskId.set(taskId, 1);
+      return taskId;
+    }
+    const generation = (this.generationByTaskId.get(taskId) ?? 1) + 1;
+    this.generationByTaskId.set(taskId, generation);
+    return `${taskId}:generation:${generation}`;
+  }
 }
 
 export async function announceNativeSubagent(
@@ -252,17 +319,26 @@ export async function announceNativeSubagent(
   publish: Publish,
 ): Promise<void> {
   if (child.announced) return;
-  await publish({
-    sessionId: child.parentSessionId,
-    update: {
-      sessionUpdate: "subagent_spawned",
-      subagentSessionId: child.sessionId,
-      name: child.name,
-      description: child.description,
-      capabilities: {},
-    },
+  if (child.announcePromise) return child.announcePromise;
+  const announce = Promise.resolve().then(async () => {
+    await publish({
+      sessionId: child.parentSessionId,
+      update: {
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: child.sessionId,
+        name: child.name,
+        task: child.task,
+        capabilities: {},
+      },
+    });
+    child.announced = true;
   });
-  child.announced = true;
+  child.announcePromise = announce;
+  try {
+    await announce;
+  } finally {
+    if (child.announcePromise === announce) child.announcePromise = undefined;
+  }
 }
 
 export async function finishNativeSubagent(
@@ -273,33 +349,122 @@ export async function finishNativeSubagent(
 ): Promise<void> {
   const child = session.nativeSubagentsByTaskId?.get(taskId);
   if (!child || child.terminalState !== undefined) return;
-  await announceNativeSubagent(child, publish);
-  await publish({
-    sessionId: child.parentSessionId,
-    update: {
-      sessionUpdate: "subagent_state_update",
-      subagentSessionId: child.sessionId,
-      state,
-    },
+  if (child.terminalPromise) return child.terminalPromise;
+  const finish = Promise.resolve().then(async () => {
+    await announceNativeSubagent(child, publish);
+    await publish({
+      sessionId: child.parentSessionId,
+      update: {
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: child.sessionId,
+        state,
+      },
+    });
+    child.terminalState = state;
   });
-  child.terminalState = state;
-}
-
-export async function finishNativeSubagents(
-  session: NativeSubagentSession,
-  state: SubagentState,
-  publish: Publish,
-): Promise<void> {
-  for (const taskId of [...(session.nativeSubagentsByTaskId?.keys() ?? [])].reverse()) {
-    await finishNativeSubagent(session, taskId, state, publish);
+  child.terminalPromise = finish;
+  try {
+    await finish;
+  } finally {
+    if (child.terminalPromise === finish) child.terminalPromise = undefined;
   }
 }
 
-function nativeSubagentState(status: unknown): SubagentState | undefined {
+export function nativeSubagentState(status: unknown): SubagentState | undefined {
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
+  if (status === "disconnected") return "disconnected";
   if (status === "killed" || status === "cancelled" || status === "stopped") return "cancelled";
   return undefined;
+}
+
+export function isNativeSubagentControlUpdate(
+  update: AcpSessionNotification["update"],
+): update is Extract<
+  AcpSessionNotification["update"],
+  { sessionUpdate: "tool_call" | "tool_call_update" }
+> {
+  if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+    return false;
+  }
+  const claudeMeta = update._meta?.claudeCode as { subagent?: true; toolName?: string } | undefined;
+  return claudeMeta?.subagent === true || isNativeSubagentControlTool(claudeMeta?.toolName);
+}
+
+export function isNativeSubagentControlTool(toolName: unknown): boolean {
+  return toolName === "Agent" || toolName === "Task";
+}
+
+function isFailedToolCallUpdate(update: AcpSessionNotification["update"]): boolean {
+  return (
+    (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+    update.status === "failed"
+  );
+}
+
+function failedControlFallback(
+  initial: AcpSessionNotification | undefined,
+  terminal: AcpSessionNotification,
+  sessionId: string,
+): AcpSessionNotification {
+  if (
+    terminal.update.sessionUpdate !== "tool_call" &&
+    terminal.update.sessionUpdate !== "tool_call_update"
+  ) {
+    return { ...terminal, sessionId };
+  }
+  if (!initial || initial.update.sessionUpdate !== "tool_call") {
+    const claudeMeta = terminal.update._meta?.claudeCode as { toolName?: unknown } | undefined;
+    return {
+      ...terminal,
+      sessionId,
+      update: {
+        ...terminal.update,
+        sessionUpdate: "tool_call",
+        status: "failed",
+        title:
+          typeof terminal.update.title === "string" && terminal.update.title.length > 0
+            ? terminal.update.title
+            : claudeMeta?.toolName === "Task"
+              ? "Task"
+              : "Agent",
+        _meta: ordinaryToolMeta(terminal.update._meta),
+      } as AcpSessionNotification["update"],
+    };
+  }
+  return {
+    ...initial,
+    sessionId,
+    update: {
+      ...initial.update,
+      ...terminal.update,
+      sessionUpdate: "tool_call",
+      status: "failed",
+      title:
+        typeof terminal.update.title === "string" && terminal.update.title.trim().length > 0
+          ? terminal.update.title
+          : initial.update.title,
+      _meta: {
+        ...initial.update._meta,
+        ...terminal.update._meta,
+        ...ordinaryToolMeta(initial.update._meta, terminal.update._meta),
+      },
+    } as AcpSessionNotification["update"],
+  };
+}
+
+function ordinaryToolMeta(
+  ...values: Array<Record<string, unknown> | null | undefined>
+): Record<string, unknown> {
+  const merged = Object.assign({}, ...values);
+  const claudeCode = Object.assign(
+    {},
+    ...values.map(
+      (value) => (value?.claudeCode as Record<string, unknown> | null | undefined) ?? {},
+    ),
+  );
+  delete claudeCode.subagent;
+  return { ...merged, claudeCode };
 }
 
 function subagentDisplayName(
@@ -360,7 +525,7 @@ function applySubagentIdentity(
     );
   }
   if (identity.prompt || identity.description) {
-    child.description = subagentDescription(identity.prompt, identity.description);
+    child.task = subagentDescription(identity.prompt, identity.description);
   }
 }
 

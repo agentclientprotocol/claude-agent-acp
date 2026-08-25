@@ -28,12 +28,12 @@ export type SubagentSpawnedUpdate = {
   sessionUpdate: "subagent_spawned";
   subagentSessionId: string;
   name: string;
-  description: string;
+  task: string;
   capabilities: SubagentSessionCapabilities;
   _meta?: Record<string, unknown> | null;
 };
 
-export type SubagentState = "completed" | "failed" | "cancelled";
+export type SubagentState = "completed" | "failed" | "cancelled" | "disconnected";
 
 export type SubagentStateUpdate = {
   sessionUpdate: "subagent_state_update";

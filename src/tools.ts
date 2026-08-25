@@ -1336,16 +1336,20 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   return result;
 }
 
-/* A global variable to store callbacks that should be executed when receiving hooks from Claude Code */
-const toolUseCallbacks: {
-  [toolUseId: string]: {
+/* Callbacks are keyed globally because the SDK hook is process-wide, but each
+ * entry retains its owning ACP session so cancellation/teardown can release it. */
+const toolUseCallbacks = new Map<
+  string,
+  {
+    ownerId?: string;
+    cleanupTimer?: ReturnType<typeof setTimeout>;
     onPostToolUseHook?: (
       toolUseID: string,
       toolInput: unknown,
       toolResponse: unknown,
     ) => Promise<void>;
-  };
-} = {};
+  }
+>();
 
 /* Setup callbacks that will be called when receiving hooks from Claude Code */
 export const registerHookCallback = (
@@ -1359,11 +1363,35 @@ export const registerHookCallback = (
       toolResponse: unknown,
     ) => Promise<void>;
   },
+  ownerId?: string,
 ) => {
-  toolUseCallbacks[toolUseID] = {
+  unregisterHookCallback(toolUseID);
+  toolUseCallbacks.set(toolUseID, {
+    ownerId,
     onPostToolUseHook,
-  };
+  });
 };
+
+export function unregisterHookCallback(toolUseID: string): void {
+  const callback = toolUseCallbacks.get(toolUseID);
+  if (callback?.cleanupTimer) clearTimeout(callback.cleanupTimer);
+  toolUseCallbacks.delete(toolUseID);
+}
+
+/** PostToolUse normally follows tool_result, so keep the callback for a short
+ * grace period while still bounding retention when the hook never arrives. */
+export function completeHookCallback(toolUseID: string): void {
+  const callback = toolUseCallbacks.get(toolUseID);
+  if (!callback || callback.cleanupTimer) return;
+  callback.cleanupTimer = setTimeout(() => unregisterHookCallback(toolUseID), 30_000);
+  callback.cleanupTimer.unref?.();
+}
+
+export function clearHookCallbacks(ownerId: string): void {
+  for (const [toolUseID, callback] of toolUseCallbacks) {
+    if (callback.ownerId === ownerId) unregisterHookCallback(toolUseID);
+  }
+}
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
@@ -1376,11 +1404,14 @@ export const createPostToolUseHook =
       }
 
       if (toolUseID) {
-        const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
-        if (onPostToolUseHook) {
-          await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
+        const onPostToolUseHook = toolUseCallbacks.get(toolUseID)?.onPostToolUseHook;
+        try {
+          if (onPostToolUseHook) {
+            await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
+          }
+        } finally {
+          unregisterHookCallback(toolUseID);
         }
-        delete toolUseCallbacks[toolUseID]; // Cleanup after execution
       }
     }
     return { continue: true };

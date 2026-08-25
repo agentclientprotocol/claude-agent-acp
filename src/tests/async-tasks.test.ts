@@ -538,4 +538,47 @@ describe("AsyncTaskRuntime", () => {
       showInTranscript: false,
     });
   });
+
+  it("finishes remaining tasks and can retry a task whose terminal publication failed", async () => {
+    const published: AcpSessionNotification[] = [];
+    let failFirstTask = true;
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      if (
+        failFirstTask &&
+        notification.update.sessionUpdate === "async_task_state_update" &&
+        notification.update.asyncTaskId === "first"
+      ) {
+        failFirstTask = false;
+        throw new Error("client disconnected");
+      }
+      published.push(notification);
+    });
+    for (const taskId of ["first", "second"]) {
+      await runtime.taskStarted({
+        task_id: taskId,
+        task_type: "local_bash",
+        description: taskId,
+        is_backgrounded: true,
+      });
+    }
+
+    await expect(runtime.finishAll("failed")).rejects.toThrow("client disconnected");
+    expect(published).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "async_task_state_update",
+            asyncTaskId: "second",
+            state: "failed",
+          }),
+        }),
+      ]),
+    );
+
+    await expect(runtime.finishAll("failed")).resolves.toBeUndefined();
+    const terminalIds = published.flatMap(({ update }) =>
+      update.sessionUpdate === "async_task_state_update" ? [update.asyncTaskId] : [],
+    );
+    expect(terminalIds).toEqual(["second", "first"]);
+  });
 });
