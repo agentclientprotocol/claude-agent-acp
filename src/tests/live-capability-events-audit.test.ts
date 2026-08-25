@@ -24,6 +24,11 @@ type LiveHarness = {
 const enabled = process.env.RUN_LIVE_CAPABILITY_AUDIT === "true";
 const exec = promisify(execCallback);
 
+// ScheduleWakeup stores a minute-aligned cron entry. A 60-second delay can
+// therefore take almost two minutes to fire when scheduling crosses a minute
+// boundary, plus a little time for the autonomous model turn to finish.
+const SCHEDULED_WAKEUP_TIMEOUT_MS = 135_000;
+
 function object(value: unknown): JsonObject | undefined {
   return value !== null && typeof value === "object" ? (value as JsonObject) : undefined;
 }
@@ -220,7 +225,7 @@ describe.skipIf(!enabled)("live Claude SDK to ACP capability audit", () => {
               const origin = object(message.origin);
               return origin?.kind === "auto-continuation" || origin?.kind === "task-notification";
             }) || transcriptText(harness.updates).includes("LIVE_WAKE_OK"),
-          75_000,
+          SCHEDULED_WAKEUP_TIMEOUT_MS,
         );
       } catch (error) {
         printResult("scheduled-wakeup-timeout", {
@@ -246,7 +251,7 @@ describe.skipIf(!enabled)("live Claude SDK to ACP capability audit", () => {
     } finally {
       await harness.dispose();
     }
-  }, 110_000);
+  }, 170_000);
 
   it("records whether a real refusal produces retraction or fallback messages", async () => {
     const harness = await createHarness();
