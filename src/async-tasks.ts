@@ -11,6 +11,7 @@ type AsyncTask = {
   description: string;
   showInTranscript: boolean;
   outputFilePath?: string;
+  toolCallId?: string;
   announced: boolean;
   state: AsyncTaskState;
 };
@@ -24,6 +25,7 @@ export type AsyncTaskStarted = {
   workflowName?: unknown;
   skipTranscript?: unknown;
   outputFilePath?: unknown;
+  toolCallId?: unknown;
 };
 
 type TaskProgress = {
@@ -59,6 +61,7 @@ export class AsyncTaskRuntime {
       description,
       showInTranscript: message.skipTranscript !== true,
       outputFilePath: nonBlankString(message.outputFilePath),
+      toolCallId: nonBlankString(message.toolCallId),
       announced: false,
       state: "running",
     };
@@ -80,6 +83,8 @@ export class AsyncTaskRuntime {
     }
     const outputFilePath = nonBlankString(message.outputFilePath);
     if (outputFilePath) existing.outputFilePath = outputFilePath;
+    const toolCallId = nonBlankString(message.toolCallId);
+    if (toolCallId) existing.toolCallId = toolCallId;
     await this.announce(existing);
   }
 
@@ -157,6 +162,7 @@ export class AsyncTaskRuntime {
         description: task.description,
         showInTranscript: task.showInTranscript,
         ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
+        ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
       },
     });
     task.announced = true;
@@ -224,6 +230,7 @@ export function backgroundBashTaskFromToolResult(
     description,
     isBackgrounded: true,
     outputFilePath,
+    toolCallId: toolResults[0].tool_use_id,
   };
 }
 

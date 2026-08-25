@@ -3458,6 +3458,7 @@ export class ClaudeAcpAgent {
                   subagentType: message.subagent_type,
                   workflowName: message.workflow_name,
                   skipTranscript: message.skip_transcript,
+                  toolCallId: message.tool_use_id,
                 });
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);

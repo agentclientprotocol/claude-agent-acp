@@ -36,6 +36,7 @@ describe("AsyncTaskRuntime", () => {
       description: "npm run build",
       isBackgrounded: true,
       outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
+      toolCallId: "bash-tool",
     });
     // The SDK can report local_bash before the Bash result proves that it was
     // backgrounded. The structured result must promote that existing task.
@@ -58,6 +59,7 @@ describe("AsyncTaskRuntime", () => {
       description: "npm run build",
       showInTranscript: true,
       outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
+      toolCallId: "bash-tool",
     });
   });
 

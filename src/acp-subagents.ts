@@ -52,6 +52,7 @@ export type AsyncTaskSpawnedUpdate = {
   description: string;
   showInTranscript: boolean;
   outputFilePath?: string;
+  toolCallId?: string;
   _meta?: Record<string, unknown> | null;
 };
 
