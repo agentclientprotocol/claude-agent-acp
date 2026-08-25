@@ -63,6 +63,10 @@ export type AsyncTaskProgressUpdate = {
   summary?: string;
   lastToolName?: string;
   usage?: { totalTokens: number; toolUses: number; durationMs: number };
+  /** Latest durable task log path. May arrive after spawn. */
+  outputFilePath?: string;
+  /** Originating tool call, when correlation becomes known after spawn. */
+  toolCallId?: string;
   _meta?: Record<string, unknown> | null;
 };
 
@@ -71,6 +75,10 @@ export type AsyncTaskStateUpdate = {
   asyncTaskId: string;
   state: AsyncTaskState;
   summary?: string;
+  /** Latest durable task log path, including terminal-only SDK reports. */
+  outputFilePath?: string;
+  /** Originating tool call, including terminal-only late correlation. */
+  toolCallId?: string;
   _meta?: Record<string, unknown> | null;
 };
 

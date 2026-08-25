@@ -210,6 +210,25 @@ const execFileAsync = promisify(execFile);
 
 const MAX_INLINE_FAILURE_TITLE_LENGTH = 256;
 
+/** Claude CLI emits this synthetic result when an interrupted cycle ends on
+ *  queued user input before producing any assistant content. It is a hand-off
+ *  marker, not the outcome of the replacement prompt that may already be
+ *  active by the time the SDK stream delivers it. */
+function isEmptyUserInterruptionDiagnostic(
+  message: Extract<SDKMessage, { type: "result" }>,
+): boolean {
+  const diagnostic =
+    "result" in message
+      ? message.result
+      : message.errors.find((error) => error.startsWith("[ede_diagnostic]"));
+  return (
+    diagnostic?.startsWith("[ede_diagnostic]") === true &&
+    /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
+    /(?:^|\s)last_content_type=n\/a(?:\s|$)/.test(diagnostic) &&
+    /(?:^|\s)stop_reason=null(?:\s|$)/.test(diagnostic)
+  );
+}
+
 /**
  * Logger interface for customizing logging output
  */
@@ -513,6 +532,9 @@ export type Session = {
    *  lane); a count can't express command coalescing — N queued commands can
    *  fold into ONE turn emitting one result, leaving a stale skip of N-1. */
   pendingOrphanResults?: number;
+  /** Empty user-interruption diagnostics expected from prompts cancelled
+   * before their SDK echo. The next ordinary result clears stale tokens. */
+  pendingEmptyInterruptionDiagnostics?: number;
   /** msg_lifecycle_v1 lane of the orphan accounting (see
    *  `pendingOrphanResults` for the count lane): the uuids of cancelled queued
    *  turns whose SDK-side command may still produce an unaccounted result,
@@ -670,6 +692,8 @@ export type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** ACP session affinity for calls emitted eagerly by permission handling. */
+  eagerToolCallSessions?: Map<string, string>;
   /** ExitPlanMode denial that intentionally interrupts the current Claude
    *  cycle. Correlated by tool-use id until the terminal result arrives. */
   pendingExitPlanModeInterruption?: {
@@ -2244,8 +2268,32 @@ export class ClaudeAcpAgent {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
         { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
-      const routedNotification = await subagents.route(notification, sendUpdate);
-      if (!routedNotification) return;
+      const toolCallId =
+        update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update"
+          ? update.toolCallId
+          : undefined;
+      const eagerOwnerSessionId = toolCallId
+        ? session.eagerToolCallSessions?.get(toolCallId)
+        : undefined;
+      const routedNotification = await subagents.route(
+        notification,
+        sendUpdate,
+        eagerOwnerSessionId,
+      );
+      if (!routedNotification) {
+        // Native Agent/Task control calls are intentionally not transcript
+        // tools. Do not let the mapper's pre-send de-duplication mark make a
+        // later permission request believe that a suppressed call exists.
+        if (
+          toolCallId &&
+          (claudeMeta?.subagent === true ||
+            claudeMeta?.toolName === "Agent" ||
+            claudeMeta?.toolName === "Task")
+        ) {
+          session.emittedToolCalls.delete(toolCallId);
+        }
+        return;
+      }
       if (
         isFileChangeAuditReportPhase(session.activeTurn?.fileChangeAudit) &&
         (update.sessionUpdate === "agent_message_chunk" ||
@@ -2263,6 +2311,13 @@ export class ClaudeAcpAgent {
         }
       }
       await this.client.sessionUpdate(routedNotification);
+      if (
+        toolCallId &&
+        update.sessionUpdate === "tool_call_update" &&
+        (update.status === "completed" || update.status === "failed")
+      ) {
+        session.eagerToolCallSessions?.delete(toolCallId);
+      }
     };
     // toAcpNotifications registers deferred tool hooks that publish through
     // the client passed to it. Keep those later updates on the same child-aware
@@ -3398,10 +3453,10 @@ export class ClaudeAcpAgent {
                 break;
               case "task_progress":
                 await asyncTasks.taskProgress({
-                  taskId: message.task_id,
+                  task_id: message.task_id,
                   description: message.description,
                   summary: message.summary,
-                  lastToolName: message.last_tool_name,
+                  last_tool_name: message.last_tool_name,
                   usage: message.usage,
                 });
                 break;
@@ -3439,13 +3494,14 @@ export class ClaudeAcpAgent {
                   sendUpdate,
                 );
                 await asyncTasks.taskStarted({
-                  taskId: message.task_id,
-                  taskType: message.task_type,
+                  task_id: message.task_id,
+                  task_type: message.task_type,
                   description: message.description,
-                  subagentType: message.subagent_type,
-                  workflowName: message.workflow_name,
-                  skipTranscript: message.skip_transcript,
-                  toolCallId: message.tool_use_id,
+                  subagent_type: message.subagent_type,
+                  is_backgrounded: message.is_backgrounded,
+                  workflow_name: message.workflow_name,
+                  skip_transcript: message.skip_transcript,
+                  tool_use_id: message.tool_use_id,
                 });
                 if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
                   (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
@@ -3455,7 +3511,12 @@ export class ClaudeAcpAgent {
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(message.task_id, message.status, sendUpdate);
-                await asyncTasks.taskNotification(message.task_id, message.status, message.summary);
+                await asyncTasks.taskNotification({
+                  task_id: message.task_id,
+                  status: message.status,
+                  summary: message.summary,
+                  output_file: message.output_file,
+                });
                 if (message.tool_use_id) subagents.discardPending(message.tool_use_id);
                 session.liveBackgroundTasks.delete(message.task_id);
                 break;
@@ -3615,6 +3676,7 @@ export class ClaudeAcpAgent {
               case "control_request_progress":
                 break;
               case "background_tasks_changed":
+                await asyncTasks.backgroundTasksChanged(message.tasks);
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
                 // reconcile `liveBackgroundTasks` — dropping (or, for
@@ -3906,6 +3968,29 @@ export class ClaudeAcpAgent {
                 }
                 break;
               }
+
+              // A cancel can race startup before the original prompt's echo.
+              // The CLI then replays the cancelled prompt, its interruption
+              // marker, and the replacement prompt before yielding this
+              // error-shaped diagnostic for the OLD cycle. The replacement's
+              // echo has already made it active, so treating the diagnostic as
+              // its result rejects a healthy prompt and leaves its real output
+              // arriving after session/prompt completed. Ignore only the
+              // diagnostic's exact empty-user-interruption signature; ordinary
+              // provider errors still follow the failure lanes below.
+              if (
+                message.is_error &&
+                isEmptyUserInterruptionDiagnostic(message) &&
+                (session.pendingEmptyInterruptionDiagnostics ?? 0) > 0
+              ) {
+                session.pendingEmptyInterruptionDiagnostics!--;
+                break;
+              }
+
+              // Some CLI versions omit the cancelled cycle's diagnostic. Do
+              // not let an unused hand-off token swallow a later turn's real
+              // interruption failure.
+              session.pendingEmptyInterruptionDiagnostics = 0;
 
               await clearFailuresFromEarlierTurns();
 
@@ -4924,6 +5009,10 @@ export class ClaudeAcpAgent {
         (turn) => turn === session.activeTurn && !turn.settled,
       );
     }
+    if (orphanedTurns.length > 0) {
+      session.pendingEmptyInterruptionDiagnostics =
+        (session.pendingEmptyInterruptionDiagnostics ?? 0) + orphanedTurns.length;
+    }
 
     // A deferred active turn (see Turn.deferredSettle) already has its
     // result — it is only held open for its background subagents, which the
@@ -5528,6 +5617,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
     const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
     const update = toolCallNotification(
       { id: toolCallId, name: toolName, input: toolInput },
@@ -5552,6 +5642,7 @@ export class ClaudeAcpAgent {
       // tool_use. Keep it truthful: if emission failed, that path must still
       // be allowed to publish the tool call instead of refining a phantom one.
       session.emittedToolCalls.delete(toolCallId);
+      session.eagerToolCallSessions?.delete(toolCallId);
       throw error;
     }
   }
@@ -5649,8 +5740,9 @@ export class ClaudeAcpAgent {
           toolInput,
           parentToolUseId,
           signal,
+          permissionSessionId,
         );
-        return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
+        return this.handleAskUserQuestion(permissionSessionId, toolInput, toolUseID, signal);
       }
 
       // Do not auto-allow here based on the session's advertised mode. Claude
@@ -6782,6 +6874,7 @@ export class ClaudeAcpAgent {
       taskState,
       toolUseCache: {},
       emittedToolCalls: new Set(),
+      eagerToolCallSessions: new Map(),
       liveBackgroundTasks: new Map(),
       nativeSubagentsByTaskId: new Map(),
       nativeSubagentTaskIdByToolUseId: new Map(),

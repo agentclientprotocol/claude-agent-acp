@@ -49,6 +49,7 @@ export class NativeSubagentRuntime {
   private readonly taskByToolUse: Map<string, string>;
   private readonly parentByToolUse: Map<string, string>;
   private readonly identityByToolUse = new Map<string, SubagentIdentity>();
+  private readonly childTaskByParentToolUse = new Map<string, string>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
 
@@ -63,11 +64,15 @@ export class NativeSubagentRuntime {
     this.children = session.nativeSubagentsByTaskId ??= new Map();
     this.taskByToolUse = session.nativeSubagentTaskIdByToolUseId ??= new Map();
     this.parentByToolUse = session.nativeSubagentParentByToolUseId ??= new Map();
+    for (const [taskId, child] of this.children) {
+      if (child.parentToolUseId) this.childTaskByParentToolUse.set(child.parentToolUseId, taskId);
+    }
   }
 
   async route(
     notification: AcpSessionNotification,
     deliver: Publish,
+    forcedSessionId?: string,
   ): Promise<AcpSessionNotification | null> {
     const { update } = notification;
     const claudeMeta = update._meta?.claudeCode as
@@ -96,15 +101,22 @@ export class NativeSubagentRuntime {
         : this.rootSessionId;
       this.parentByToolUse.set(update.toolCallId, parentSessionId ?? this.rootSessionId);
 
-      for (const child of this.children.values()) {
-        if (child.parentToolUseId !== update.toolCallId || child.announced) continue;
+      const childTaskId = this.childTaskByParentToolUse.get(update.toolCallId);
+      const child = childTaskId ? this.children.get(childTaskId) : undefined;
+      if (child && !child.announced) {
         child.parentSessionId = parentSessionId ?? this.rootSessionId;
         applySubagentIdentity(child, this.identityByToolUse.get(update.toolCallId));
         await announceNativeSubagent(child, this.publish);
         for (const pending of this.takePending(update.toolCallId)) await deliver(pending);
       }
-      return null;
+      return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
     }
+
+    // A permission request may have had to create the tool call before native
+    // child ownership was known. Keep every later update in that original ACP
+    // session; moving a lifecycle after its initial call creates an orphan in
+    // both transcripts.
+    if (forcedSessionId) return { ...notification, sessionId: forcedSessionId };
 
     if (this.enabled && claudeMeta?.parentToolUseId) {
       const taskId = this.taskByToolUse.get(claudeMeta.parentToolUseId);
@@ -153,7 +165,10 @@ export class NativeSubagentRuntime {
       ),
     };
     this.children.set(task.taskId, child);
-    if (task.toolUseId) this.taskByToolUse.set(task.toolUseId, task.taskId);
+    if (task.toolUseId) {
+      this.taskByToolUse.set(task.toolUseId, task.taskId);
+      this.childTaskByParentToolUse.set(task.toolUseId, task.taskId);
+    }
 
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
@@ -176,7 +191,11 @@ export class NativeSubagentRuntime {
       for (const pending of this.takePending(child.parentToolUseId)) await deliver(pending);
     }
     await finishNativeSubagent(this.session, taskId, state, this.publish);
-    if (child.parentToolUseId) this.identityByToolUse.delete(child.parentToolUseId);
+    if (child.parentToolUseId) {
+      this.identityByToolUse.delete(child.parentToolUseId);
+      this.parentByToolUse.delete(child.parentToolUseId);
+      this.childTaskByParentToolUse.delete(child.parentToolUseId);
+    }
   }
 
   async finishAll(state: SubagentState, deliver: Publish): Promise<void> {
@@ -196,6 +215,7 @@ export class NativeSubagentRuntime {
     this.taskByToolUse.clear();
     this.parentByToolUse.clear();
     this.identityByToolUse.clear();
+    this.childTaskByParentToolUse.clear();
     this.pending.clear();
     this.pendingCount = 0;
   }
