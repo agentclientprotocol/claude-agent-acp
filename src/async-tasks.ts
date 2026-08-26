@@ -18,6 +18,7 @@ type AsyncTask = {
   startedObserved: boolean;
   panelOnlyRecovery: boolean;
   stopping: boolean;
+  stopAnnounced: boolean;
   state: AsyncTaskState;
   terminalSummary?: string;
   terminalSource?: TerminalSource;
@@ -348,8 +349,31 @@ export class AsyncTaskRuntime {
 
   async taskStopped(taskId: string): Promise<void> {
     const task = this.tasks.get(taskId);
-    if (!task || !task.announced || task.ignored) return;
+    if (!task || !task.announced || task.ignored || task.stopAnnounced) return;
+    task.stopAnnounced = true;
+    // No terminal summary: a stopped task leaves the Async Tasks panel at once,
+    // so anything said there is said to nobody.
     await this.finish(task, "stopped", undefined, "event");
+    // The transcript is where the acknowledgement has to land, and it is the
+    // only one the user gets -- the SDK injects nothing into the model's
+    // context for a stopped shell task.
+    //
+    // Terminal state deliberately does not gate this. The SDK's own
+    // `task_notification` routinely wins the race against the `stopTask`
+    // response that brought us here, so by now the task is usually already
+    // terminal: gating on that would silence the very stop the user asked for.
+    // `stopAnnounced` is what keeps this to one line per task.
+    //
+    // `showInTranscript` does not gate it either: that flag decides whether the
+    // task owns a transcript *card* (a background Bash task is already drawn as
+    // its tool call), not whether the agent may answer a direct user action.
+    await this.publish({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `**Task stopped by user:** ${task.name}.` },
+      },
+    });
   }
 
   clear(): void {
@@ -370,6 +394,7 @@ export class AsyncTaskRuntime {
       startedObserved: false,
       panelOnlyRecovery: false,
       stopping: false,
+      stopAnnounced: false,
       state: "running",
     };
     this.tasks.set(taskId, task);
@@ -538,15 +563,20 @@ export function backgroundBashTaskFromToolResult(
   toolUses: Record<string, { name: string; input: unknown }>,
 ): AsyncTaskStarted | undefined {
   if (!Array.isArray(content)) return undefined;
-  const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
-  const distinctTaskIds = new Set(backgroundResults.map((result) => result.taskId));
-  if (distinctTaskIds.size !== 1) return undefined;
-  const taskId = [...distinctTaskIds][0];
-  if (!taskId) return undefined;
-
   const toolResults = content.flatMap(toolResultBlock);
   const bashResults = toolResults.filter((result) => toolUses[result.toolUseId]?.name === "Bash");
   if (bashResults.length === 0) return undefined;
+
+  const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
+  const distinctTaskIds = new Set([
+    ...backgroundResults.map((result) => result.taskId),
+    ...bashResults
+      .map((result) => backgroundTaskIdFromText(result.content))
+      .filter((taskId): taskId is string => taskId !== undefined),
+  ]);
+  if (distinctTaskIds.size !== 1) return undefined;
+  const taskId = [...distinctTaskIds][0];
+  if (!taskId) return undefined;
 
   const hintedToolUseIds = new Set(
     backgroundResults
@@ -575,6 +605,17 @@ export function backgroundBashTaskFromToolResult(
     outputFilePath: asyncTaskOutputFilePath(match.content, taskId),
     toolCallId: match.toolUseId,
   };
+}
+
+function backgroundTaskIdFromText(content: unknown): string | undefined {
+  const text = textContent(content);
+  if (!text) return undefined;
+  const marker = "Command running in background with ID: ";
+  const start = text.indexOf(marker);
+  if (start < 0) return undefined;
+  const valueStart = start + marker.length;
+  const valueEnd = text.indexOf(".", valueStart);
+  return valueEnd < 0 ? undefined : nonBlankString(text.slice(valueStart, valueEnd));
 }
 
 function structuredBackgroundResults(

@@ -7,12 +7,9 @@ import {
 import { randomUUID } from "node:crypto";
 import {
   AIR_SESSION_FAILURE_CAPABILITY,
-  AIR_META_KEY,
-  AIR_EXTENSION_VERSION,
-  AIR_EXTENSION_VERSION_KEY,
-  JETBRAINS_META_KEY,
   airCapabilityMeta,
   clientSupportsAirCapability,
+  withAirMeta,
 } from "./air-extension.js";
 
 export function airSessionFailureCapabilityMeta(...additionalCapabilities: string[]) {
@@ -154,22 +151,15 @@ const AIR_FAILURE_POLICY: Record<
 };
 
 export function sessionFailureMeta(failure: PublishedSessionFailure) {
-  return {
-    [JETBRAINS_META_KEY]: {
-      [AIR_META_KEY]: {
-        [AIR_EXTENSION_VERSION_KEY]: AIR_EXTENSION_VERSION,
-        [AIR_SESSION_FAILURE_CAPABILITY]: {
-          id: failure.id,
-          revision: failure.revision,
-          category: failure.category,
-          severity: failure.severity,
-          title: failure.title,
-          ...(failure.details ? { details: failure.details } : {}),
-          actions: failure.actions,
-        },
-      },
-    },
-  };
+  return withAirMeta(undefined, AIR_SESSION_FAILURE_CAPABILITY, {
+    id: failure.id,
+    revision: failure.revision,
+    category: failure.category,
+    severity: failure.severity,
+    title: failure.title,
+    ...(failure.details ? { details: failure.details } : {}),
+    actions: failure.actions,
+  });
 }
 
 /** `getSessionMessages` deliberately exposes only the API message and strips

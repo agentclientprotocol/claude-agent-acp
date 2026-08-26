@@ -108,12 +108,13 @@ import {
   NativeSubagent,
   NativeSubagentRuntime,
 } from "./native-subagents.js";
-import { AIR_ASYNC_TASKS_CAPABILITY } from "./air-extension.js";
+import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "./air-extension.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
   clientSupportsAsyncTasks,
 } from "./async-tasks.js";
+import type { AsyncTaskStarted } from "./async-tasks.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -4786,8 +4787,9 @@ export class ClaudeAcpAgent {
             }
 
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
+            let backgroundBashTask: AsyncTaskStarted | undefined;
             if (message.type === "user") {
-              const backgroundBashTask = backgroundBashTaskFromToolResult(
+              backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
                 message.tool_use_result,
                 session.toolUseCache,
@@ -4822,7 +4824,13 @@ export class ClaudeAcpAgent {
               // filtered out of `content` above; blocks that do pass through
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
-              await sendUpdate(acceptedPlanToolResult(notification, acceptedPlanToolUseId));
+              await sendUpdate(
+                backgroundedBashToolCall(
+                  acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                  backgroundBashTask,
+                  asyncTasks.enabled,
+                ),
+              );
             }
             break;
           }
@@ -8498,6 +8506,53 @@ function claudeCodeMetaFromToolUse(
     ...(skillName ? { skill: skillName } : {}),
     ...(skillPath ? { skillPath } : {}),
   };
+}
+
+/**
+ * Marks the Bash `tool_call_update` whose command detached into the background.
+ *
+ * A backgrounded Bash call returns as soon as the command is handed off, so the
+ * card reaches `completed` while the command itself runs on for minutes. ACP has
+ * no tool-call status for "still running elsewhere", so this marker is what lets
+ * a client render the card as backgrounded work instead of finished work. It
+ * rides the update the tool result already emits, so it costs no extra
+ * notification and cannot arrive out of order.
+ *
+ * The command's own lifecycle -- progress, completion, the stop control -- is
+ * published separately as an async task; this says only that the card has one.
+ * Hence the AIR namespace rather than `claudeCode`: to a client without the
+ * `asyncTasks` capability, which is never sent that lifecycle, the marker would
+ * promise a card state it has no way to ever resolve.
+ */
+function backgroundedBashToolCall(
+  notification: SessionNotification,
+  task: AsyncTaskStarted | undefined,
+  asyncTasksSupported: boolean,
+): SessionNotification {
+  const update = notification.update;
+  const toolCallId = task ? nonBlankTaskField(task.toolCallId ?? task.tool_use_id) : undefined;
+  if (
+    !asyncTasksSupported ||
+    !toolCallId ||
+    update.sessionUpdate !== "tool_call_update" ||
+    update.toolCallId !== toolCallId
+  ) {
+    return notification;
+  }
+  return {
+    ...notification,
+    update: {
+      ...update,
+      _meta: withAirMeta(update._meta, AIR_ASYNC_TASKS_CAPABILITY, { backgrounded: true }),
+    },
+  };
+}
+
+/** The task fields arrive as `unknown` off the wire; only non-blank strings carry a link. */
+function nonBlankTaskField(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /** Roots a skill's directory may sit under, relative to the directory the scope resolves to. */

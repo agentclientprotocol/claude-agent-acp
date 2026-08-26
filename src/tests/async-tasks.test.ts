@@ -86,10 +86,76 @@ describe("AsyncTaskRuntime", () => {
     expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
       "async_task_spawned",
       "async_task_state_update",
+      "agent_message_chunk",
     ]);
-    expect(published.at(-1)?.update).toMatchObject({
+    expect(published[1]?.update).toMatchObject({
       asyncTaskId: "task-1",
       state: "stopped",
+    });
+    // The panel drops a stopped task immediately; a summary there is unread.
+    expect(published[1]?.update).not.toHaveProperty("summary");
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "**Task stopped by user:** Build generated assets." },
+    });
+  });
+
+  it("still announces a stop whose SDK notification landed first", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      taskId: "task-1",
+      taskType: "local_bash",
+      description: "npm run build",
+      isBackgrounded: true,
+    });
+    expect(runtime.claimStop("task-1")).toBe(true);
+    // The SDK kills the process and reports it before `stopTask` resolves, so
+    // the task is already terminal by the time the stop path resumes. The
+    // acknowledgement is still owed to the user who clicked.
+    await runtime.taskNotification({ taskId: "task-1", status: "killed" });
+    await runtime.taskStopped("task-1");
+
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+      "agent_message_chunk",
+    ]);
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "**Task stopped by user:** npm run build." },
+    });
+  });
+
+  it("announces a stop for a panel-only task too", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    // A background Bash task is panel-only because its tool call already draws
+    // it in the transcript. That must not swallow the stop acknowledgement --
+    // it is the only signal the user gets that their click landed.
+    await runtime.taskStarted({
+      taskId: "task-1",
+      taskType: "local_bash",
+      description: "npm run build",
+      isBackgrounded: true,
+      skipTranscript: true,
+    });
+    expect(runtime.claimStop("task-1")).toBe(true);
+    await runtime.taskStopped("task-1");
+
+    expect(published[0]?.update).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      showInTranscript: false,
+    });
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "**Task stopped by user:** npm run build." },
     });
   });
 
@@ -117,6 +183,33 @@ describe("AsyncTaskRuntime", () => {
           },
         ],
         toolUseResult,
+        tools,
+      ),
+    ).toMatchObject({
+      taskId: "task-1",
+      toolCallId: "bash",
+      description: "npm run build",
+      outputFilePath: "/private/tmp/claude/tasks/task-1.output",
+    });
+  });
+
+  it("recovers a background Bash task when the structured result omits its id", () => {
+    const tools = {
+      bash: { name: "Bash", input: { command: "npm run build" } },
+    };
+
+    expect(
+      backgroundBashTaskFromToolResult(
+        [
+          {
+            type: "tool_result",
+            tool_use_id: "bash",
+            content:
+              "Command running in background with ID: task-1. Output is being written to: " +
+              "/private/tmp/claude/tasks/task-1.output. You will be notified when done.",
+          },
+        ],
+        undefined,
         tools,
       ),
     ).toMatchObject({

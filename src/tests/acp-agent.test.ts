@@ -4611,6 +4611,15 @@ describe("subagent permission attribution (issue #851)", () => {
         }),
       ]),
     );
+    // One transcript line for the two stop attempts: the failed one never
+    // reached a terminal state, and the retry says it once.
+    expect(
+      updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk"),
+    ).toHaveLength(1);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text" },
+    });
   });
 
   it("attaches a Bash tool id discovered after async_task_spawned", async () => {
@@ -4700,6 +4709,88 @@ describe("subagent permission attribution (issue #851)", () => {
       toolCallId: "bash-tool",
       outputFilePath: "/tmp/tasks/shell-1.output",
     });
+
+    // The Bash card completes as soon as the command detaches, so this marker is
+    // the only thing telling a client it is backgrounded work, not finished work.
+    const bashUpdate = updates
+      .map(({ update }) => update)
+      .findLast(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
+      );
+    expect(bashUpdate).toMatchObject({
+      status: "completed",
+      _meta: {
+        jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } },
+      },
+    });
+    // Agent-native tool metadata keeps its own namespace alongside it.
+    expect(bashUpdate?._meta?.claudeCode).toMatchObject({ toolName: "Bash" });
+  });
+
+  it("omits the background task link for a client without the asyncTasks capability", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "bash-tool",
+                name: "Bash",
+                input: { command: "npm run build", run_in_background: true },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { backgroundTaskId: "shell-1" },
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "bash-tool",
+                content:
+                  "Command running in background. Output is being written to: /tmp/tasks/shell-1.output. You will be notified when it completes.",
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // The id would name an `async_task_spawned` this client is never sent.
+    const bashUpdate = updates
+      .map(({ update }) => update)
+      .findLast(
+        (update) =>
+          update.sessionUpdate === "tool_call_update" && update.toolCallId === "bash-tool",
+      );
+    expect(bashUpdate).toMatchObject({ status: "completed" });
+    expect(bashUpdate?._meta).not.toHaveProperty("jetbrains");
   });
 });
 
