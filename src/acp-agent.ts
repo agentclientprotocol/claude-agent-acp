@@ -3077,7 +3077,10 @@ export class ClaudeAcpAgent {
           await publishSessionFailure(kind, { turnScoped: false, details: title });
         }
         // Preserve legacy codes: only explicit `/login` signals trigger ACP's auth flow.
-        failActive(error);
+        // The first delivery rejects the turn, so the second one finds it settled.
+        // That is the normal course here, not the lost-failure case `failActive`
+        // logs an error for.
+        if (session.activeTurn && !session.activeTurn.settled) failActive(error);
         return;
       }
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
@@ -4467,6 +4470,15 @@ export class ClaudeAcpAgent {
                 await sessionFailures.clear(
                   (failure) =>
                     failure.recoveryPolicy === "real_model_success" ||
+                    // A real model answered, so the session is signed in. The
+                    // `auth_status` message is the primary recovery signal, but
+                    // it reports a login the query process itself runs, and a
+                    // client can sign the user in out of band (AIR runs
+                    // `claude /login` in a terminal, in a separate process).
+                    // Without this a stale signed-out record would outlive the
+                    // sign-out and suppress the next one, which the
+                    // `auth_required` dedupe below reads.
+                    failure.recoveryPolicy === "auth_status" ||
                     (failure.severity === "warning" && failure.turnId === activeTurnId),
                 );
               }
