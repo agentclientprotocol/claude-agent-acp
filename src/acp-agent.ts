@@ -347,6 +347,21 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** The uuid of the latest top-level `SDKAssistantMessage` the consumer
+   *  attributed to THIS turn, which is the point `resumeSessionAt` keys on.
+   *
+   *  Turn-owned rather than session-owned, and assigned where the message is
+   *  attributed rather than read back at settle time: a session-global "last
+   *  assistant message" would hand a turn whatever the session said most
+   *  recently, which after a hand-off, a hold, or a steered second cycle is
+   *  another turn's answer. Subagent messages are excluded for the same reason
+   *  they are excluded from the usage snapshot beside it — they are not this
+   *  turn's own answer.
+   *
+   *  Not the Anthropic API message id (`msg_…`), which is a different identity
+   *  and the one the ACP `messageId` already carries; not the user prompt's
+   *  uuid; and not a streamed chunk's, which the consolidated message supersedes. */
+  latestAssistantUuid?: string;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -2577,7 +2592,32 @@ export class ClaudeAcpAgent {
         // carries its own copy.
         session.emittedAssistantText = false;
       }
-      turn.resolve(result);
+      turn.resolve(withCheckpointMeta(result, turn));
+    };
+
+    /** Say which assistant message this turn ended on, without disturbing
+     *  anything already on the response.
+     *
+     *  Merged rather than assigned: `claudeCode` is a namespace this adapter
+     *  already writes into, and a failure lane may have put its own metadata on
+     *  the response before it got here. A cancelled turn carries none — it was
+     *  interrupted rather than answered, and there is no message it ended on. */
+    const withCheckpointMeta = (result: PromptResponse, turn: Turn): PromptResponse => {
+      if (result.stopReason === "cancelled" || turn.latestAssistantUuid === undefined) {
+        return result;
+      }
+      const meta = result._meta ?? {};
+      const claudeCode = meta["claudeCode"];
+      return {
+        ...result,
+        _meta: {
+          ...meta,
+          claudeCode: {
+            ...(typeof claudeCode === "object" && claudeCode !== null ? claudeCode : {}),
+            assistantMessageUuid: turn.latestAssistantUuid,
+          },
+        },
+      };
     };
 
     /** Reject the active turn (auth required, error result, …) without tearing
@@ -4297,6 +4337,17 @@ export class ClaudeAcpAgent {
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
+              // The turn this message belongs to, as the consumer already
+              // decided: `activeTurn` is the turn whose output is being
+              // attributed right now.
+              if (
+                session.activeTurn &&
+                !session.activeTurn.settled &&
+                typeof message.uuid === "string" &&
+                message.uuid.length > 0
+              ) {
+                session.activeTurn.latestAssistantUuid = message.uuid;
+              }
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               session.contextUsedTokens = lastAssistantTotalUsage;
