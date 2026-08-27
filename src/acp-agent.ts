@@ -97,6 +97,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
+import { resolveSessionResourceLinks } from "./session-references.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
@@ -2207,7 +2208,8 @@ export class ClaudeAcpAgent {
       await this.publishTaskPlan(params.sessionId, session.taskState);
     }
 
-    const userMessage = promptToClaude(params);
+    const resolvedPrompt = await resolveSessionResourceLinks(params, session.cwd);
+    const userMessage = promptToClaude(resolvedPrompt);
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -2406,7 +2408,8 @@ export class ClaudeAcpAgent {
       sessionId,
       prompt: params.prompt,
     };
-    const userMessage = promptToClaude(promptRequest);
+    const resolvedPrompt = await resolveSessionResourceLinks(promptRequest, session.cwd);
+    const userMessage = promptToClaude(resolvedPrompt);
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
