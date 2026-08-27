@@ -49,6 +49,7 @@ import { SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
+  forkSession,
   getSessionInfo,
   getSessionMessages,
   PermissionUpdate,
@@ -75,6 +76,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   return {
     ...actual,
     deleteSession: vi.fn(),
+    forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
@@ -6252,6 +6254,55 @@ describe("session/fork", () => {
         resume: "source-id",
         forkSession: true,
       },
+    );
+  });
+
+  it("forks at an AIR message id through the current SDK", async () => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const createSession = vi.spyOn(agent as any, "createSession").mockResolvedValue({
+      sessionId: "fork-id",
+      modes: { availableModes: [], currentModeId: "default" },
+      configOptions: [],
+    });
+    vi.spyOn(agent as any, "sendAvailableCommandsUpdate").mockImplementation(() => {});
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-uuid",
+        session_id: "source-id",
+        message: { id: "msg_123", role: "assistant", content: [] },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ]);
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "sdk-fork-id" });
+
+    const meta = {
+      jetbrains: { air: { fork: { version: 1, messageId: "msg_123" } } },
+    };
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: ["/workspace/extra"],
+      mcpServers: [],
+      _meta: meta,
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(forkSession).toHaveBeenCalledWith("source-id", {
+      dir: "/workspace",
+      upToMessageId: "assistant-uuid",
+    });
+    expect(createSession).toHaveBeenCalledWith(
+      {
+        cwd: "/workspace",
+        additionalDirectories: ["/workspace/extra"],
+        mcpServers: [],
+        _meta: meta,
+      },
+      { resume: "sdk-fork-id" },
     );
   });
 });

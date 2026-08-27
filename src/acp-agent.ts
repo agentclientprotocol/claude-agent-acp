@@ -61,6 +61,7 @@ import {
   EffortLevel,
   FastModeDisabledReason,
   FastModeState,
+  forkSession as forkClaudeSession,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -269,6 +270,25 @@ type SteerMeta = {
     idleBehavior?: "promptRequired";
   };
 };
+
+type ForkSessionMeta = {
+  [key: string]: unknown;
+  jetbrains?: {
+    air?: {
+      fork?: {
+        version?: number;
+        messageId?: string;
+      };
+    };
+  };
+};
+
+function forkPointMessageId(meta: unknown): string | undefined {
+  const fork = (meta as ForkSessionMeta | null | undefined)?.jetbrains?.air?.fork;
+  if (fork?.version !== 1) return undefined;
+  const messageId = fork.messageId?.trim();
+  return messageId || undefined;
+}
 
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
@@ -1639,6 +1659,35 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    const messageId = forkPointMessageId(params._meta);
+    if (messageId) {
+      const liveUuid = this.sessions[params.sessionId]?.messageIdToUuid.get(messageId);
+      const messageUuid = liveUuid ?? (await getSessionMessages(params.sessionId, { dir: params.cwd }))
+        .find((message) => messageIdForGrouping(message) === messageId)?.uuid;
+      if (!messageUuid) {
+        throw RequestError.invalidParams(
+          { messageId },
+          `Fork point message ${messageId} was not found in session ${params.sessionId}`,
+        );
+      }
+      const forked = await forkClaudeSession(params.sessionId, {
+        dir: params.cwd,
+        upToMessageId: messageUuid,
+      });
+      const response = await this.createSession(
+        {
+          cwd: params.cwd,
+          mcpServers: params.mcpServers ?? [],
+          additionalDirectories: params.additionalDirectories,
+          _meta: params._meta,
+        },
+        { resume: forked.sessionId },
+      );
+      setTimeout(() => {
+        this.sendAvailableCommandsUpdate(response.sessionId);
+      }, 0);
+      return response;
+    }
     const response = await this.createSession(
       {
         cwd: params.cwd,
