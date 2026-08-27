@@ -290,6 +290,12 @@ function forkPointMessageId(meta: unknown): string | undefined {
   return messageId || undefined;
 }
 
+function forkPointMessageIdCandidates(messageId: string): string[] {
+  // Older AIR builds sent their visible segment id. Prefer the exact id before its ACP source id.
+  const protocolMessageId = messageId.replace(/:segment:\d+$/, "");
+  return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
+}
+
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
  *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
  *  priority is deliberately NOT exposed here — it's an internal detail the agent
@@ -1661,12 +1667,22 @@ export class ClaudeAcpAgent {
     if (this.providerUpdate) await this.providerUpdate;
     const messageId = forkPointMessageId(params._meta);
     if (messageId) {
-      const liveUuid = this.sessions[params.sessionId]?.messageIdToUuid.get(messageId);
+      const candidateIds = forkPointMessageIdCandidates(messageId);
+      const liveMappings = this.sessions[params.sessionId]?.messageIdToUuid;
+      const liveUuid = candidateIds
+        .map((candidateId) => liveMappings?.get(candidateId))
+        .find(Boolean);
+      const history = liveUuid
+        ? undefined
+        : await getSessionMessages(params.sessionId, { dir: params.cwd });
       const messageUuid =
         liveUuid ??
-        (await getSessionMessages(params.sessionId, { dir: params.cwd })).find(
-          (message) => messageIdForGrouping(message) === messageId,
-        )?.uuid;
+        candidateIds
+          .map(
+            (candidateId) =>
+              history?.find((message) => messageIdForGrouping(message) === candidateId)?.uuid,
+          )
+          .find(Boolean);
       if (!messageUuid) {
         throw RequestError.invalidParams(
           { messageId },

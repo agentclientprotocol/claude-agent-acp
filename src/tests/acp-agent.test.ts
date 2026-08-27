@@ -6279,7 +6279,7 @@ describe("session/fork", () => {
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "sdk-fork-id" });
 
     const meta = {
-      jetbrains: { air: { fork: { version: 1, messageId: "msg_123" } } },
+      jetbrains: { air: { fork: { version: 1, messageId: "msg_123:segment:0" } } },
     };
     const response = await agent.unstable_forkSession({
       sessionId: "source-id",
