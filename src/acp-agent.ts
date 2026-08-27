@@ -1662,8 +1662,11 @@ export class ClaudeAcpAgent {
     const messageId = forkPointMessageId(params._meta);
     if (messageId) {
       const liveUuid = this.sessions[params.sessionId]?.messageIdToUuid.get(messageId);
-      const messageUuid = liveUuid ?? (await getSessionMessages(params.sessionId, { dir: params.cwd }))
-        .find((message) => messageIdForGrouping(message) === messageId)?.uuid;
+      const messageUuid =
+        liveUuid ??
+        (await getSessionMessages(params.sessionId, { dir: params.cwd })).find(
+          (message) => messageIdForGrouping(message) === messageId,
+        )?.uuid;
       if (!messageUuid) {
         throw RequestError.invalidParams(
           { messageId },
