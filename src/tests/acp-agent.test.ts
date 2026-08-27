@@ -6222,6 +6222,40 @@ describe("logout", () => {
   });
 });
 
+describe("session/fork", () => {
+  it("forks the latest turn in the requested workspace", async () => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const createSession = vi.spyOn(agent as any, "createSession").mockResolvedValue({
+      sessionId: "fork-id",
+      modes: { availableModes: [], currentModeId: "default" },
+      configOptions: [],
+    });
+    vi.spyOn(agent as any, "sendAvailableCommandsUpdate").mockImplementation(() => {});
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: ["/workspace/extra"],
+      mcpServers: [],
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(createSession).toHaveBeenCalledWith(
+      {
+        cwd: "/workspace",
+        additionalDirectories: ["/workspace/extra"],
+        mcpServers: [],
+        _meta: undefined,
+      },
+      {
+        resume: "source-id",
+        forkSession: true,
+      },
+    );
+  });
+});
+
 describe("session/close", () => {
   function createMockAgent() {
     const mockClient = {
