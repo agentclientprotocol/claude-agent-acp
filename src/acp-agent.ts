@@ -1693,37 +1693,10 @@ export class ClaudeAcpAgent {
         dir: params.cwd,
         upToMessageId: messageUuid,
       });
-      const response = await this.createSession(
-        {
-          cwd: params.cwd,
-          mcpServers: params.mcpServers ?? [],
-          additionalDirectories: params.additionalDirectories,
-          _meta: params._meta,
-        },
-        { resume: forked.sessionId },
-      );
-      setTimeout(() => {
-        this.sendAvailableCommandsUpdate(response.sessionId);
-      }, 0);
-      return response;
+      return { sessionId: forked.sessionId };
     }
-    const response = await this.createSession(
-      {
-        cwd: params.cwd,
-        mcpServers: params.mcpServers ?? [],
-        additionalDirectories: params.additionalDirectories,
-        _meta: params._meta,
-      },
-      {
-        resume: params.sessionId,
-        forkSession: true,
-      },
-    );
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(response.sessionId);
-    }, 0);
-    return response;
+    const forked = await forkClaudeSession(params.sessionId, { dir: params.cwd });
+    return { sessionId: forked.sessionId };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {

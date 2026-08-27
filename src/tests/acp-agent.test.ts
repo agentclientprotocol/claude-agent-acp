@@ -6228,12 +6228,7 @@ describe("session/fork", () => {
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    const createSession = vi.spyOn(agent as any, "createSession").mockResolvedValue({
-      sessionId: "fork-id",
-      modes: { availableModes: [], currentModeId: "default" },
-      configOptions: [],
-    });
-    vi.spyOn(agent as any, "sendAvailableCommandsUpdate").mockImplementation(() => {});
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
 
     const response = await agent.unstable_forkSession({
       sessionId: "source-id",
@@ -6243,29 +6238,12 @@ describe("session/fork", () => {
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(createSession).toHaveBeenCalledWith(
-      {
-        cwd: "/workspace",
-        additionalDirectories: ["/workspace/extra"],
-        mcpServers: [],
-        _meta: undefined,
-      },
-      {
-        resume: "source-id",
-        forkSession: true,
-      },
-    );
+    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
   });
 
   it("forks at an AIR message id through the current SDK", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    const createSession = vi.spyOn(agent as any, "createSession").mockResolvedValue({
-      sessionId: "fork-id",
-      modes: { availableModes: [], currentModeId: "default" },
-      configOptions: [],
-    });
-    vi.spyOn(agent as any, "sendAvailableCommandsUpdate").mockImplementation(() => {});
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       {
         type: "assistant",
@@ -6276,8 +6254,7 @@ describe("session/fork", () => {
         parent_agent_id: null,
       },
     ]);
-    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "sdk-fork-id" });
-
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
     const meta = {
       jetbrains: { air: { fork: { version: 1, messageId: "msg_123:segment:0" } } },
     };
@@ -6295,15 +6272,6 @@ describe("session/fork", () => {
       dir: "/workspace",
       upToMessageId: "assistant-uuid",
     });
-    expect(createSession).toHaveBeenCalledWith(
-      {
-        cwd: "/workspace",
-        additionalDirectories: ["/workspace/extra"],
-        mcpServers: [],
-        _meta: meta,
-      },
-      { resume: "sdk-fork-id" },
-    );
   });
 });
 
