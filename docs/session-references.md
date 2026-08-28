@@ -34,9 +34,12 @@ matters. The model opens the reference with the session-management tools when it
 `search_session_transcripts` to find one part of it. The mention does not describe those tools;
 their own descriptions do.
 
+The rewrite happens in `promptToClaude`, in the same `resource_link` branch that already turns
+`file://` and `zed://` links into `[@name](uri)` — a session link is just one more scheme handled
+there, not a separate pass over the prompt. A string compare on the URI decides it, so ordinary
+links cost nothing extra, and block order is preserved because nothing is reordered.
+
 Resolution is local and synchronous: the adapter reads no session history itself, so a prompt
 carrying a reference cannot fail on a transcript read. If the session-management tools are not
-available in the host, the reference is a link the model cannot open.
-
-The adapter preserves the order of prompt blocks and leaves resource links with other URI schemes
-unchanged. It rejects a reference to the active Claude session.
+available in the host, the reference is a link the model cannot open. A reference to the active
+Claude session is rejected with `invalid_params`.

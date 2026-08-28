@@ -97,7 +97,7 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
-import { resolveSessionResourceLinks } from "./session-references.js";
+import { sessionMentionForLink } from "./session-references.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
@@ -2208,8 +2208,7 @@ export class ClaudeAcpAgent {
       await this.publishTaskPlan(params.sessionId, session.taskState);
     }
 
-    const resolvedPrompt = resolveSessionResourceLinks(params);
-    const userMessage = promptToClaude(resolvedPrompt);
+    const userMessage = promptToClaude(params);
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
 
@@ -2408,8 +2407,7 @@ export class ClaudeAcpAgent {
       sessionId,
       prompt: params.prompt,
     };
-    const resolvedPrompt = resolveSessionResourceLinks(promptRequest);
-    const userMessage = promptToClaude(resolvedPrompt);
+    const userMessage = promptToClaude(promptRequest);
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
@@ -8697,10 +8695,12 @@ export function promptToClaude(prompt: PromptRequest): SDKUserMessage {
         break;
       }
       case "resource_link": {
-        const formattedUri = formatUriAsLink(chunk.uri);
+        // A reference to another Claude session becomes a mention the model can
+        // act on; every other link keeps its usual `[@name](uri)` rendering.
+        const mention = sessionMentionForLink(chunk.uri, chunk.name, prompt.sessionId);
         content.push({
           type: "text",
-          text: formattedUri,
+          text: mention ?? formatUriAsLink(chunk.uri),
         });
         break;
       }

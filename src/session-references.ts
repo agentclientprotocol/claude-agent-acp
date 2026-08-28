@@ -1,8 +1,9 @@
-import { type PromptRequest, RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk";
 
 /**
- * Rewrites `acp-session://reference?sessionId=…` resource links into a short,
- * self-describing session mention.
+ * Rewrites an `acp-session://reference?sessionId=…` resource link into a short,
+ * self-describing session mention. Returns `null` for any other link, so the
+ * caller falls through to its normal resource-link handling.
  *
  * There is no standard to follow here. ACP defines `resource_link` but no
  * convention for pointing at another agent session; Codex's `codex://threads/<id>`
@@ -18,32 +19,19 @@ import { type PromptRequest, RequestError } from "@agentclientprotocol/sdk";
  * do. And `acp-session:` is the client's wire format, which means nothing to the
  * model, so it stops at this boundary.
  */
-export function resolveSessionResourceLinks(prompt: PromptRequest): PromptRequest {
-  const resolved: PromptRequest["prompt"] = [];
-  for (const block of prompt.prompt) {
-    if (block.type !== "resource_link") {
-      resolved.push(block);
-      continue;
-    }
-    const sessionId = acpSessionId(block.uri);
-    if (sessionId === null) {
-      resolved.push(block);
-      continue;
-    }
-    if (sessionId === prompt.sessionId) {
-      throw RequestError.invalidParams(undefined, "A session cannot reference itself");
-    }
-    resolved.push({
-      type: "text",
-      text: sessionMention(sessionId, block.name),
-    });
+export function sessionMentionForLink(
+  uri: string,
+  name: string,
+  activeSessionId: string,
+): string | null {
+  // A string compare first, so ordinary `file://` links never reach the parser.
+  if (!uri.startsWith("acp-session:")) return null;
+  const sessionId = acpSessionId(uri);
+  if (sessionId === null) return null;
+  if (sessionId === activeSessionId) {
+    throw RequestError.invalidParams(undefined, "A session cannot reference itself");
   }
-  return { ...prompt, prompt: resolved };
-}
-
-/** One line, in the position the link occupied. */
-function sessionMention(sessionId: string, title: string): string {
-  const label = title ? `Claude session "${title}"` : "Claude session";
+  const label = name ? `Claude session "${name}"` : "Claude session";
   return `[${label}](claude://sessions/${encodeURIComponent(sessionId)})`;
 }
 
