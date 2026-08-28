@@ -7,7 +7,7 @@ Use [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview#br
 This tool implements an ACP agent by using the official [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), supporting:
 
 - Context @-mentions
-- [Cross-session references](docs/session-references.md) resolved through the Claude Agent SDK
+- [Cross-session references](docs/session-references.md) to other Claude sessions
 - Images
 - Tool calls (with permission requests)
 - Following

@@ -2208,7 +2208,7 @@ export class ClaudeAcpAgent {
       await this.publishTaskPlan(params.sessionId, session.taskState);
     }
 
-    const resolvedPrompt = await resolveSessionResourceLinks(params, session.cwd);
+    const resolvedPrompt = resolveSessionResourceLinks(params);
     const userMessage = promptToClaude(resolvedPrompt);
     const promptUuid = randomUUID();
     userMessage.uuid = promptUuid;
@@ -2408,7 +2408,7 @@ export class ClaudeAcpAgent {
       sessionId,
       prompt: params.prompt,
     };
-    const resolvedPrompt = await resolveSessionResourceLinks(promptRequest, session.cwd);
+    const resolvedPrompt = resolveSessionResourceLinks(promptRequest);
     const userMessage = promptToClaude(resolvedPrompt);
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
