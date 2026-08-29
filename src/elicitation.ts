@@ -271,23 +271,24 @@ export function applyAskElicitationResponse(
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
   questions.forEach((question, index) => {
-    // A typed custom answer wins over the selection: the user chose to write
-    // their own answer for this question instead of picking an option.
+    const value = content[questionFieldKey(index)];
+    const selectedText = Array.isArray(value)
+      ? value.join(", ")
+      : value == null
+        ? ""
+        : String(value);
+
     const custom = content[questionCustomFieldKey(index)];
     if (typeof custom === "string" && custom.trim() !== "") {
-      answers[question.question] = custom.trim();
+      const details = custom.trim();
+      answers[question.question] = selectedText ? `${selectedText}\n\n${details}` : details;
       return;
     }
 
-    const value = content[questionFieldKey(index)];
-    if (value === undefined || value === null) {
+    if (selectedText === "") {
       return;
     }
-    const text = Array.isArray(value) ? value.join(", ") : String(value);
-    if (text === "") {
-      return;
-    }
-    answers[question.question] = text;
+    answers[question.question] = selectedText;
   });
 
   return { action: "answered", updatedInput: { ...toolInput, answers } };
