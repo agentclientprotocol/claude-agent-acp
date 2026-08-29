@@ -4543,19 +4543,30 @@ export class ClaudeAcpAgent {
                     : `**${sentenceCase(message.level)}:** ${message.content}`;
                 await sendUpdate({
                   sessionId: message.session_id,
-                  update: noticeOrTranscriptUpdate(
-                    {
-                      severity,
-                      ...splitNoticeText(
-                        message.content,
-                        severity === "warning"
-                          ? "Claude reported a warning"
-                          : "Claude reported a notice",
-                      ),
-                    },
-                    supportsNotices,
-                    transcriptText,
-                  ),
+                  update: supportsNotices
+                    ? noticeOrTranscriptUpdate(
+                        {
+                          severity,
+                          ...splitNoticeText(
+                            message.content,
+                            severity === "warning"
+                              ? "Claude reported a warning"
+                              : "Claude reported a notice",
+                          ),
+                        },
+                        true,
+                        transcriptText,
+                      )
+                    : {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text: transcriptText },
+                        _meta: {
+                          claudeCode: {
+                            kind: "informational",
+                            level: message.level,
+                          },
+                        },
+                      },
                 });
                 const noticedTurn = session.activeTurn ?? session.turnQueue?.[0];
                 if (supportsNotices && noticedTurn) {
