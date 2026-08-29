@@ -3542,6 +3542,12 @@ export class ClaudeAcpAgent {
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text },
+                    _meta: {
+                      claudeCode: {
+                        kind: "informational",
+                        level: message.level,
+                      },
+                    },
                   },
                 });
                 break;

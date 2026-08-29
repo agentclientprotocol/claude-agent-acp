@@ -10046,7 +10046,7 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
-  it("does not re-emit the result text after an informational notice delivered it", async () => {
+  it("marks informational notices with metadata", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // A hook-blocked prompt: the SDK surfaces the block reason as an
     // informational notice and then repeats it on the result with zero output
@@ -10066,7 +10066,34 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
     expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "warning" } },
+    });
+  });
+
+  it("marks info-level notices even when their text has no severity prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "plain hook detail",
+        level: "info",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
+    expect(messageChunkTexts(updates)).toEqual(["plain hook detail"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "info" } },
+    });
   });
 
   it("still forwards the result text after a turn failed without a result", async () => {
