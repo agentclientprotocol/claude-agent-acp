@@ -1027,6 +1027,11 @@ const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
 const PROVIDER_ID = "main";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 
+function normalizeSessionListDir(dir: string | undefined): string | undefined {
+  if (dir === undefined) return undefined;
+  return /^\/mnt\/[a-z](?:\/|$)/i.test(dir) ? dir.toLowerCase() : dir;
+}
+
 /**
  * Vertex needs project + region that the standard `providers/set` payload
  * (`apiType`/`baseUrl`/`headers`) does not model, so clients pass them through
@@ -1804,7 +1809,9 @@ export class ClaudeAcpAgent {
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
+    const sdk_sessions = await listSessions({
+      dir: normalizeSessionListDir(params.cwd ?? undefined),
+    });
     const sessions = [];
 
     for (const session of sdk_sessions) {
