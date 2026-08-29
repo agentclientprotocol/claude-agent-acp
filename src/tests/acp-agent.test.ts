@@ -15655,8 +15655,19 @@ describe("permission_denied", () => {
     ]);
 
     // The denial resolves the call the preceding tool_call announced, before the
-    // tool_result's own failed update lands.
-    expect(updates[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "toolu_denied" });
+    // tool_result's own failed update lands. The backend-acceptance marker the
+    // prompt's dispatch publishes is control data rather than conversation, so
+    // the order this asks about is the order of what the client is shown.
+    const shown = updates.filter(
+      (u) =>
+        !(
+          u.sessionUpdate === "session_info_update" &&
+          (u as { _meta?: Record<string, unknown> })._meta?.[
+            "executablemd.session-materialization/v1"
+          ] !== undefined
+        ),
+    );
+    expect(shown[0]).toMatchObject({ sessionUpdate: "tool_call", toolCallId: "toolu_denied" });
     const sent = denials(updates);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({

@@ -362,6 +362,12 @@ type Turn = {
    *  and the one the ACP `messageId` already carries; not the user prompt's
    *  uuid; and not a streamed chunk's, which the consolidated message supersedes. */
   latestAssistantUuid?: string;
+  /** Set once this turn has published that the SDK dispatched it (see
+   *  `SESSION_MATERIALIZATION_META`). Two facts report the same dispatch — the
+   *  `command_lifecycle` "started" frame and the replayed echo of this turn's
+   *  own uuid — and either may arrive first, or both; the flag is what makes
+   *  the publication happen exactly once for the turn. */
+  materializationPublished?: boolean;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -1189,6 +1195,13 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+/** The metadata key naming the SDK's acceptance of a queued prompt.
+ *
+ *  Versioned, because a client reads it to decide whether a conversation now
+ *  exists, and a changed meaning under an unchanged key would be read as the
+ *  old one. */
+const SESSION_MATERIALIZATION_META = "executablemd.session-materialization/v1";
 
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
@@ -2365,6 +2378,30 @@ export class ClaudeAcpAgent {
       resetTurnScratch();
     };
 
+    /** Tell the client the SDK took this queued prompt into a turn.
+     *
+     *  A client that defers durable session state until a conversation really
+     *  exists cannot learn that from what the turn produces: output, an idle,
+     *  a result and a settled response each say the turn is under way or over,
+     *  never that the SDK accepted it. This says exactly that, once per queued
+     *  prompt, from whichever dispatch fact arrives first — the
+     *  `command_lifecycle` "started" frame on CLIs that emit one, or the
+     *  replayed echo of the prompt's own uuid everywhere else. A local-only
+     *  command is never dispatched into a turn and publishes nothing. */
+    const publishSessionMaterialization = async (turn: Turn) => {
+      if (turn.isLocalOnlyCommand || turn.materializationPublished) {
+        return;
+      }
+      turn.materializationPublished = true;
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { [SESSION_MATERIALIZATION_META]: { state: "accepted" } },
+        },
+      });
+    };
+
     /** Ensure there is an active turn before a user-turn result that carries no
      *  echo to activate it, by promoting the queue head. Most turns are
      *  activated by their replayed user message before their result, but some
@@ -2885,6 +2922,7 @@ export class ClaudeAcpAgent {
               const queued = findUnsettledTurn(frame.command_uuid);
               if (queued) {
                 queued.commandStarted = true;
+                await publishSessionMaterialization(queued);
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
@@ -4313,6 +4351,7 @@ export class ClaudeAcpAgent {
                   // result re-emit the answer.
                   activateTurn(queued);
                 }
+                await publishSessionMaterialization(queued);
                 break;
               }
               if ("isReplay" in message && message.isReplay) {
