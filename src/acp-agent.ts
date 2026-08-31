@@ -64,6 +64,7 @@ import {
   getSessionMessages,
   listSessions,
   McpServerConfig,
+  McpServerStatus,
   ModelInfo,
   ModelUsage,
   OnElicitation,
@@ -280,6 +281,50 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+
+/** Claude Code keeps the OAuth callback listener open in the background after
+ *  `mcpAuthenticate` returns the authorization URL. The SDK does not expose
+ *  that listener's completion promise, so watch the server status while the
+ *  ACP client has the URL elicitation open. */
+const MCP_OAUTH_STATUS_POLL_MS = 1_000;
+const MCP_OAUTH_TIMEOUT_MS = 10 * 60_000;
+
+/** Runtime MCP OAuth control exposed by the pinned Agent SDK. It is not yet in
+ *  the public `Query` declaration, even though the method is present on the
+ *  SDK query object and backed by Claude Code's `mcp_authenticate` control. */
+type McpOAuthQuery = Query & {
+  mcpAuthenticate(
+    serverName: string,
+    redirectUri?: string,
+  ): Promise<{
+    authUrl?: string;
+    requiresUserAction: boolean;
+    callbackExpected: boolean;
+    redirectScheme?: "localhost" | "custom";
+    callbackPort?: number;
+    state?: string;
+  }>;
+};
+
+function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
+  return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
+}
+
+/** Wait for a polling interval, resolving false when the session is aborted. */
+function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /** Error surfaced when the SDK declares a turn over (`session_state_changed:
  *  idle`, its authoritative turn-over signal) without ever emitting the turn's
@@ -1511,6 +1556,159 @@ function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T
   });
 }
 
+type McpAuthenticationHost = {
+  sessions: Record<string, Session>;
+  client: AcpClient;
+  clientCapabilities?: ClientCapabilities;
+  logger: Logger;
+};
+
+/** Background OAuth work is implementation state, not part of the public
+ *  `Session` shape exposed through `ClaudeAcpAgent.sessions`. */
+const mcpAuthentications = new WeakMap<Session, Promise<void>>();
+
+/** Start OAuth for ACP-provided MCP servers that Claude reported as needing
+ *  authentication. This runs after session creation has returned so an
+ *  interactive browser flow never delays `session/new`. */
+function startMcpAuthentication(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  mcpServers: NewSessionRequest["mcpServers"],
+): void {
+  if (!host.clientCapabilities?.elicitation?.url || mcpServers.length === 0) return;
+
+  const session = host.sessions[sessionId];
+  if (!session || mcpAuthentications.has(session)) return;
+
+  const requestedServers = new Set(mcpServers.map((server) => server.name));
+  const authentication = authenticateMcpServers(host, sessionId, session.query, requestedServers)
+    .catch((error) => {
+      if (!session.abortController.signal.aborted) {
+        host.logger.error(`Failed to inspect MCP servers for OAuth: ${error}`);
+      }
+    })
+    .finally(() => {
+      if (mcpAuthentications.get(session) === authentication) {
+        mcpAuthentications.delete(session);
+      }
+    });
+  mcpAuthentications.set(session, authentication);
+}
+
+async function authenticateMcpServers(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  query: Query,
+  requestedServers: Set<string>,
+): Promise<void> {
+  if (!supportsMcpOAuth(query)) {
+    host.logger.error("The Claude Agent SDK does not expose MCP OAuth authentication.");
+    return;
+  }
+
+  const statuses = await query.mcpServerStatus();
+  for (const status of statuses) {
+    if (status.status !== "needs-auth" || !requestedServers.has(status.name)) continue;
+    try {
+      await authenticateMcpServer(host, sessionId, query, status.name);
+    } catch (error) {
+      const session = host.sessions[sessionId];
+      if (session && !session.abortController.signal.aborted) {
+        host.logger.error(`Failed to authenticate MCP server ${status.name}: ${error}`);
+      }
+    }
+  }
+}
+
+/** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
+ *  Claude opens and owns the localhost callback listener; the ACP client only
+ *  needs to present the returned authorization URL. */
+async function authenticateMcpServer(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  query: McpOAuthQuery,
+  serverName: string,
+): Promise<void> {
+  const session = host.sessions[sessionId];
+  if (!session) return;
+
+  const login = await query.mcpAuthenticate(serverName);
+  if (!login.requiresUserAction) return;
+  if (!login.authUrl) {
+    throw new Error("Claude Code requested user action without returning an authorization URL");
+  }
+
+  const elicitationId = `mcp-oauth-${randomUUID()}`;
+  const flowAbort = new AbortController();
+  const abortFlow = () => flowAbort.abort(session.abortController.signal.reason);
+  session.abortController.signal.addEventListener("abort", abortFlow, { once: true });
+  if (session.abortController.signal.aborted) abortFlow();
+
+  try {
+    const completed = waitForMcpAuthentication(
+      host.sessions,
+      sessionId,
+      query,
+      serverName,
+      flowAbort.signal,
+    );
+    const elicitation = host.client.unstable_createElicitation(
+      {
+        mode: "url",
+        sessionId,
+        message: `Authenticate with MCP server ${serverName}`,
+        url: login.authUrl,
+        elicitationId,
+      },
+      flowAbort.signal,
+    );
+    const first = await Promise.race([
+      completed.then((authenticated) => ({ type: "completed" as const, authenticated })),
+      elicitation.then((response) => ({ type: "elicitation" as const, response })),
+    ]);
+
+    if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
+      return;
+    }
+
+    if (first.type === "elicitation") {
+      await completed;
+    }
+    try {
+      await host.client.unstable_completeElicitation({ elicitationId });
+    } catch (error) {
+      if (!flowAbort.signal.aborted) {
+        host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
+      }
+    }
+  } finally {
+    flowAbort.abort();
+    session.abortController.signal.removeEventListener("abort", abortFlow);
+  }
+}
+
+async function waitForMcpAuthentication(
+  sessions: Record<string, Session>,
+  sessionId: string,
+  query: Query,
+  serverName: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  const deadline = Date.now() + MCP_OAUTH_TIMEOUT_MS;
+  while (!signal.aborted && Date.now() < deadline) {
+    const session = sessions[sessionId];
+    if (!session || session.query !== query) return false;
+
+    const status: McpServerStatus | undefined = (await query.mcpServerStatus()).find(
+      (server) => server.name === serverName,
+    );
+    if (!status || status.status === "failed" || status.status === "disabled") return false;
+    if (status.status === "connected") return true;
+    if (!(await waitUnlessAborted(MCP_OAUTH_STATUS_POLL_MS, signal))) return false;
+  }
+  return false;
+}
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -1766,6 +1964,7 @@ export class ClaudeAcpAgent {
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(response.sessionId);
+      startMcpAuthentication(this, response.sessionId, params.mcpServers);
     }, 0);
     return response;
   }
@@ -1785,6 +1984,7 @@ export class ClaudeAcpAgent {
     // Needs to happen after we return the session
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
+      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
     }, 0);
     return result;
   }
@@ -1798,6 +1998,7 @@ export class ClaudeAcpAgent {
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(params.sessionId);
+      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
     }, 0);
 
     return result;

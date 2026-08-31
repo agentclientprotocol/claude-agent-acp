@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
+import {
+  CreateElicitationRequest,
+  RequestError,
+  SessionNotification,
+} from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
@@ -9,6 +13,12 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
+let mcpAuthenticateImpl: (serverName: string) => Promise<{
+  authUrl?: string;
+  requiresUserAction: boolean;
+  callbackExpected: boolean;
+}>;
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
     "@anthropic-ai/claude-agent-sdk",
@@ -31,6 +41,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         }),
         getContextUsage: () =>
           contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        mcpServerStatus: () => mcpServerStatusResult(),
+        mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
     },
   };
@@ -60,6 +72,11 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    mcpServerStatusResult = async () => [];
+    mcpAuthenticateImpl = async () => ({
+      requiresUserAction: false,
+      callbackExpected: false,
+    });
 
     vi.resetModules();
     const acpAgent = await import("../acp-agent.js");
@@ -649,6 +666,57 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
       expect(typeof capturedOptions!.onElicitation).toBe("function");
+    });
+
+    it("starts MCP OAuth as an ACP URL elicitation and completes it after reconnect", async () => {
+      let statusCall = 0;
+      mcpServerStatusResult = async () =>
+        statusCall++ === 0
+          ? [{ name: "linear", status: "needs-auth" }]
+          : [{ name: "linear", status: "connected" }];
+      const authenticate = vi.fn(async () => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async (_request: CreateElicitationRequest) => ({
+        action: "accept" as const,
+      }));
+      const completeElicitation = vi.fn(async () => {});
+      Object.assign((agent as unknown as { client: object }).client, {
+        unstable_createElicitation: createElicitation,
+        unstable_completeElicitation: completeElicitation,
+      });
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(completeElicitation).toHaveBeenCalledOnce());
+
+      expect(authenticate).toHaveBeenCalledWith("linear");
+      expect(createElicitation).toHaveBeenCalledOnce();
+      const request = createElicitation.mock.calls[0]![0];
+      expect(request.mode).toBe("url");
+      if (request.mode !== "url") throw new Error("Expected a URL elicitation");
+      expect(request).toMatchObject({
+        mode: "url",
+        sessionId,
+        message: "Authenticate with MCP server linear",
+        url: "https://example.com/oauth/authorize",
+        elicitationId: expect.stringMatching(/^mcp-oauth-/),
+      });
+      expect(completeElicitation).toHaveBeenCalledWith({
+        elicitationId: request.elicitationId,
+      });
     });
 
     it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {
