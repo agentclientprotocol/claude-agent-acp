@@ -64,7 +64,7 @@ export function mockSessionState(
     modes: { currentModeId: "default", availableModes: [] },
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
-    settingsManager: { dispose: vi.fn() },
+    settingsManager: { dispose: vi.fn(), getSettings: () => ({}) },
     accumulatedUsage: {
       inputTokens: 0,
       outputTokens: 0,

@@ -80,6 +80,7 @@ import {
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
+  Settings,
   SlashCommand,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -705,6 +706,14 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Whether the user picked a non-default effort through the ACP picker this
+   *  session. A pin lives at the SDK's flag layer, which overrides the CLI's
+   *  persisted effort (including the per-model `modelSettings` entries), so it
+   *  follows the session across model switches; without one, the CLI resolves
+   *  effort itself and the Effort option is display-only. Cleared when the
+   *  user picks "Default" (the flag layer is cleared with it) or when a model
+   *  switch clamps the pin away. */
+  effortPinnedByUser?: boolean;
   /** Why the SDK currently can't serve Fast mode, when the reason is one worth
    *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
    *  routine states like the SDK's own opt-in requirement normalize to
@@ -2767,12 +2776,20 @@ export class ClaudeAcpAgent {
      *
      *  But an echo-less result can also be an ORPHAN: cancel() settles+removes a
      *  queued turn whose user message was already pushed, so the SDK still runs
-     *  it and emits a result with no uuid to match. Promoting the head for an
+     *  it and emits a result with no echo to match. Promoting the head for an
      *  orphan would misattribute its stop reason/usage to an unrelated later
      *  prompt. `session.pendingOrphanResults` counts exactly how many such
      *  orphans are still expected (FIFO, they arrive before any live turn's
-     *  result), so we skip those and only promote once the count is drained. */
-    const ensureActiveTurn = () => {
+     *  result), so we skip those and only promote once the count is drained.
+     *
+     *  `resultUserMessageUuid` is the result's own join key (SDK 0.3.246+
+     *  echoes the triggering send's client uuid on results; absent on older
+     *  CLIs, synthetic/meta turns, and session-scoped failures). When present
+     *  it upgrades the map lane from positional heuristics to an exact match:
+     *  a stamp naming an orphaned command consumes the result outright, and a
+     *  stamp naming anything else positively refutes "this is a dead turn's
+     *  result", so the dup-over-loss one-skip must not eat it. */
+    const ensureActiveTurn = (resultUserMessageUuid?: string) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -2824,8 +2841,13 @@ export class ClaudeAcpAgent {
       // double-consume it. The unexpected-transition logging in the frame
       // handler is the tripwire for that class of drift.
       if (session.orphanCommands?.size) {
+        const stampedOrphan =
+          resultUserMessageUuid !== undefined && session.orphanCommands.has(resultUserMessageUuid);
         let consumedOrphanResult = false;
         let oldestPending: string | undefined;
+        // The started/zombie drain applies regardless of the stamp: commands
+        // folded into the turn that emitted this result share it, and zombies'
+        // late results have already passed (or never existed).
         for (const [uuid, state] of session.orphanCommands) {
           if (state === "started" || state === "zombie") {
             consumedOrphanResult = true;
@@ -2834,17 +2856,32 @@ export class ClaudeAcpAgent {
             oldestPending ??= uuid;
           }
         }
-        if (consumedOrphanResult) {
+        if (stampedOrphan) {
+          // Exact join: the result names an orphaned command. Delete the
+          // matched entry even when it is still "pending" (its dispatch frame
+          // was lost) and consume the result — no promotion.
+          session.orphanCommands.delete(resultUserMessageUuid!);
           return;
         }
-        if (oldestPending !== undefined) {
-          // No dispatch was seen before this result, so it is very likely a
-          // live turn's — but a lost "started" frame would mean it IS the
-          // orphan's (dup-over-loss: prefer one wrong skip over
-          // misattributing a dead turn's outcome to a live prompt). Grant
-          // each pending entry exactly one skip, like the count lane did.
-          session.orphanCommands.delete(oldestPending);
-          return;
+        if (resultUserMessageUuid !== undefined) {
+          // The stamp names a send that is NOT in the orphan map, so this is
+          // a live turn's result: skip both the consumed-return (its folded
+          // orphans were drained above, but the result itself still needs a
+          // turn) and the dup-over-loss one-skip the stamp refutes, and fall
+          // through to promote the head.
+        } else {
+          if (consumedOrphanResult) {
+            return;
+          }
+          if (oldestPending !== undefined) {
+            // No dispatch was seen before this result, so it is very likely a
+            // live turn's — but a lost "started" frame would mean it IS the
+            // orphan's (dup-over-loss: prefer one wrong skip over
+            // misattributing a dead turn's outcome to a live prompt). Grant
+            // each pending entry exactly one skip, like the count lane did.
+            session.orphanCommands.delete(oldestPending);
+            return;
+          }
         }
       }
       const head = firstUnsettledQueuedTurn();
@@ -4065,7 +4102,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                ensureActiveTurn();
+                ensureActiveTurn(message.user_message_uuid);
                 // Once the submitted goal command has produced its own result,
                 // no older runtime update can still precede it in the ordered
                 // SDK stream. Stop suppressing updates even when this runtime
@@ -4289,13 +4326,28 @@ export class ClaudeAcpAgent {
                 isEmptyUserInterruptionDiagnostic(message) &&
                 (session.pendingEmptyInterruptionDiagnosticCommands?.size ?? 0) > 0
               ) {
-                const commandUuid = session
-                  .pendingEmptyInterruptionDiagnosticCommands!.values()
-                  .next().value;
-                if (commandUuid) {
-                  session.pendingEmptyInterruptionDiagnosticCommands!.delete(commandUuid);
+                const pending = session.pendingEmptyInterruptionDiagnosticCommands!;
+                const stamped = message.user_message_uuid;
+                if (stamped === undefined) {
+                  // Older producer: no join key on the result, so consume an
+                  // arbitrary hand-off token like before.
+                  const commandUuid = pending.values().next().value;
+                  if (commandUuid) {
+                    pending.delete(commandUuid);
+                  }
+                  break;
                 }
-                break;
+                if (pending.delete(stamped)) {
+                  // Exact join (SDK 0.3.246+ echoes the triggering send's
+                  // uuid on error results): the diagnostic names a cancelled
+                  // command we handed a token for — swallow it.
+                  break;
+                }
+                // Stamped but unmatched: this diagnostic belongs to a send we
+                // did NOT cancel — a live turn's real failure. Don't let a
+                // stale token eat it; fall through to the ordinary failure
+                // lanes (the clear below retires the stale tokens, same as
+                // every other non-diagnostic result path).
               }
 
               // Some CLI versions omit the cancelled cycle's diagnostic. Do
@@ -5287,8 +5339,10 @@ export class ClaudeAcpAgent {
       }
       // Each removed queued turn's user message was already pushed to the SDK,
       // which processes input FIFO and will still emit a result for it with no
-      // uuid to match. Track those so the consumer skips them (see
-      // ensureActiveTurn) rather than misattributing them to the head.
+      // user echo to match (0.3.246+ CLIs do stamp results with the
+      // triggering send's user_message_uuid, which ensureActiveTurn uses as
+      // an exact join when present). Track those so the consumer skips them
+      // (see ensureActiveTurn) rather than misattributing them to the head.
       // msg_lifecycle_v1 CLIs get per-uuid tracking drained by the command's
       // own terminal lifecycle frame — exact under command coalescing, where
       // N queued commands fold into ONE turn emitting one result and a plain
@@ -6553,15 +6607,26 @@ export class ClaudeAcpAgent {
         session.fastModeDisabledReason = undefined;
       }
 
-      // Rebuild config options since effort levels depend on the selected model
+      // Rebuild config options since effort levels depend on the selected
+      // model. The effort seed depends on who owns the choice: a user pin
+      // made through the ACP picker this session lives at the SDK's flag
+      // layer and follows the session across switches, so carry it forward.
+      // Otherwise the CLI resolves effort itself from the persisted settings
+      // — the NEW model's `modelSettings` entry first (the CLI persists
+      // /effort per model), then the legacy top-level value — so display
+      // what it will actually run instead of dragging the old model's value
+      // along.
       const effortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
       const currentEffort =
         typeof effortOpt?.currentValue === "string" ? effortOpt.currentValue : undefined;
+      const seedEffort = session.effortPinnedByUser
+        ? currentEffort
+        : settingsEffortForModel(session.settingsManager.getSettings(), newModelInfo, value);
       session.configOptions = buildConfigOptions(
         session.modes,
         session.models,
         session.modelInfos,
-        currentEffort,
+        seedEffort,
         session.agents,
         session.currentAgent,
         {
@@ -6575,14 +6640,25 @@ export class ClaudeAcpAgent {
         },
       );
 
-      // Sync effort with the SDK if it changed after the model switch
-      const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-      const newEffort =
-        typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
-      if (newEffort !== currentEffort) {
-        await session.query.applyFlagSettings({
-          effortLevel: toSdkEffortLevel(newEffort),
-        });
+      // Sync effort with the SDK only when a user pin changed across the
+      // switch — i.e. the new model clamped it away (buildConfigOptions
+      // validated the seed against the new model's levels), where the flag
+      // must be cleared too or the SDK would keep running the old pin
+      // invisibly. Settings-derived seeds are display-only: the CLI resolves
+      // persisted effort itself, and pinning it at the flag layer would
+      // shadow the per-model values on every later switch.
+      if (session.effortPinnedByUser) {
+        const newEffortOpt = session.configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
+        const newEffort =
+          typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
+        if (newEffort !== currentEffort) {
+          await session.query.applyFlagSettings({
+            effortLevel: toSdkEffortLevel(newEffort),
+          });
+          if (newEffort === undefined || newEffort === "default") {
+            session.effortPinnedByUser = false;
+          }
+        }
       }
 
       // Emit current_mode_update only after session.modes AND
@@ -6615,6 +6691,10 @@ export class ClaudeAcpAgent {
         await session.query.applyFlagSettings({
           effortLevel: toSdkEffortLevel(value),
         });
+        // "Default" clears the flag layer (toSdkEffortLevel → null), handing
+        // effort back to the CLI's persisted per-model resolution — so it
+        // un-pins; any other pick pins effort for the session.
+        session.effortPinnedByUser = value !== "default";
       }
     }
   }
@@ -7332,27 +7412,23 @@ export class ClaudeAcpAgent {
       disabledReason: fastModeDisabledReason,
     };
 
+    // The Effort picker seed mirrors what the CLI itself resolves from the
+    // persisted settings — the current model's `modelSettings` entry first
+    // (the CLI persists /effort per model), then the legacy top-level value.
+    // Display-only: no applyFlagSettings here. The CLI reads the same
+    // settings, so pinning the seed at the flag layer was always redundant —
+    // and it would override the CLI's own per-model restore on every later
+    // model switch. Only a user's explicit ACP picker choice pins the flag
+    // (see applyConfigOptionValue / Session.effortPinnedByUser).
     const configOptions = buildConfigOptions(
       modes,
       models,
       modelInfos,
-      settingsManager.getSettings().effortLevel,
+      settingsEffortForModel(settingsManager.getSettings(), currentModelInfo),
       agents,
       currentAgent,
       fastMode,
     );
-
-    // Apply the initial effort level to the SDK so it matches the UI default
-    const initialEffort = configOptions.find((o) => o.id === EFFORT_CONFIG_ID);
-    if (
-      initialEffort &&
-      typeof initialEffort.currentValue === "string" &&
-      initialEffort.currentValue !== "default"
-    ) {
-      await q.applyFlagSettings({
-        effortLevel: toSdkEffortLevel(initialEffort.currentValue),
-      });
-    }
     // Seed the context window WITHOUT any extra IPC on the session/new path.
     // On session/load, the resumed session's own `getContextUsage` report — a
     // response `getAvailableModels` already awaited to learn the live model
@@ -7792,6 +7868,32 @@ function isValidBaseUrl(baseUrl: string): boolean {
 // that the persisted Settings shape deliberately excludes.
 function toSdkEffortLevel(value: string | undefined): EffortLevel | null {
   return value === undefined || value === "default" ? null : (value as EffortLevel);
+}
+
+/** The effort level the CLI itself resolves for a model from the persisted
+ *  settings: the per-model entry (`modelSettings`, keyed by canonical model
+ *  name — the CLI persists /effort per model since 2.1.243) wins over the
+ *  legacy top-level `effortLevel`. Alias picker rows are looked up by their
+ *  resolved model id first, then the row value, then the raw config value
+ *  for models not in the picker. Exact keys only — the CLI's canonical-form
+ *  fallback matching isn't replicated, so a miss simply falls back to the
+ *  top-level value (best-effort display; `buildConfigOptions` still
+ *  validates the result against the model's supported levels). */
+export function settingsEffortForModel(
+  settings: Settings,
+  modelInfo: ModelInfo | undefined,
+  modelId?: string,
+): string | undefined {
+  const modelSettings = settings.modelSettings;
+  if (modelSettings) {
+    for (const key of [modelInfo?.resolvedModel, modelInfo?.value, modelId]) {
+      const perModel = key !== undefined ? modelSettings[key]?.effortLevel : undefined;
+      if (typeof perModel === "string") {
+        return perModel;
+      }
+    }
+  }
+  return settings.effortLevel;
 }
 
 // `supportedAgents()` always returns Claude Code's built-in subagents — the
