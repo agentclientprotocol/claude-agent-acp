@@ -690,8 +690,8 @@ describe("createSession options merging", () => {
       }));
       const completeElicitation = vi.fn(async () => {});
       Object.assign((agent as unknown as { client: object }).client, {
-        unstable_createElicitation: createElicitation,
-        unstable_completeElicitation: completeElicitation,
+        createElicitation,
+        completeElicitation,
       });
 
       await agent.initialize({
