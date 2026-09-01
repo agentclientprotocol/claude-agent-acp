@@ -1475,11 +1475,11 @@ export interface AcpClient {
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
    *  elicitation so the client can dismiss its prompt and settle our await. */
-  unstable_createElicitation(
+  createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse>;
-  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void>;
+  completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
 }
@@ -1514,7 +1514,7 @@ class ClientConnection implements AcpClient {
     return this.ctx.request(methods.client.fs.writeTextFile, params);
   }
 
-  unstable_createElicitation(
+  createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
@@ -1523,7 +1523,7 @@ class ClientConnection implements AcpClient {
     });
   }
 
-  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
     return this.ctx.notify(methods.client.elicitation.complete, params);
   }
 
@@ -1652,7 +1652,7 @@ async function authenticateMcpServer(
       serverName,
       flowAbort.signal,
     );
-    const elicitation = host.client.unstable_createElicitation(
+    const elicitation = host.client.createElicitation(
       {
         mode: "url",
         sessionId,
@@ -1675,7 +1675,7 @@ async function authenticateMcpServer(
       await completed;
     }
     try {
-      await host.client.unstable_completeElicitation({ elicitationId });
+      await host.client.completeElicitation({ elicitationId });
     } catch (error) {
       if (!flowAbort.signal.aborted) {
         host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
@@ -3858,7 +3858,7 @@ export class ClaudeAcpAgent {
                 // client supports url elicitation; ignore failures otherwise.
                 if (this.clientCapabilities?.elicitation?.url) {
                   try {
-                    await this.client.unstable_completeElicitation({
+                    await this.client.completeElicitation({
                       elicitationId: message.elicitation_id,
                     });
                   } catch (error) {
@@ -3950,7 +3950,7 @@ export class ClaudeAcpAgent {
                   });
                 }
                 if (persistent) {
-                  await this.syncModelAfterRefusalFallback(
+                  await this.syncModelAfterExternalSwitch(
                     params.sessionId,
                     session,
                     message.fallback_model,
@@ -6376,7 +6376,7 @@ export class ClaudeAcpAgent {
 
       try {
         const response = await this.withPendingUserInput(sessionId, () =>
-          this.client.unstable_createElicitation(createRequest, signal),
+          this.client.createElicitation(createRequest, signal),
         );
         if (signal.aborted) {
           return { action: "cancel" };
@@ -6414,7 +6414,7 @@ export class ClaudeAcpAgent {
     let response;
     try {
       response = await this.withPendingUserInput(sessionId, () =>
-        this.client.unstable_createElicitation(createRequest, signal),
+        this.client.createElicitation(createRequest, signal),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -6459,10 +6459,7 @@ export class ClaudeAcpAgent {
       let response: CreateElicitationResponse;
       try {
         response = await this.withPendingUserInput(sessionId, () =>
-          this.client.unstable_createElicitation(
-            refusalFallbackToCreateRequest(prompt, sessionId),
-            signal,
-          ),
+          this.client.createElicitation(refusalFallbackToCreateRequest(prompt, sessionId), signal),
         );
       } catch (error) {
         // A cancellation we requested (signal aborted) is expected teardown;
@@ -6622,38 +6619,40 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Reconcile adapter model state after the SDK persistently swapped the
-   *  session's model out from under us (refusal fallback). The SDK already
-   *  made the switch, so this must NOT call `query.setModel` — it only
-   *  updates our bookkeeping (currentModelId, context window, mode clamping,
-   *  effort/Fast-mode options) via the same `applyConfigOptionValue` path a
-   *  user-driven model change takes, then notifies the client. */
-  private async syncModelAfterRefusalFallback(
+  /** Reconcile adapter model state after the SDK switched the session's
+   *  model out from under us — a refusal fallback, or any switch reported by
+   *  the PostModelSwitch hook that the adapter didn't drive (e.g. a `/model`
+   *  command typed as a prompt). The SDK already made the switch, so this
+   *  must NOT call `query.setModel` — it only updates our bookkeeping
+   *  (currentModelId, context window, mode clamping, effort/Fast-mode
+   *  options) via the same `applyConfigOptionValue` path a user-driven model
+   *  change takes, then notifies the client. */
+  private async syncModelAfterExternalSwitch(
     sessionId: string,
     session: Session,
-    fallbackModel: string,
+    switchedModel: string,
   ): Promise<void> {
     // Map the SDK-reported model onto one of the session's model options
-    // (handles display names and `resolvedModel` ids). The fallback model may
-    // not be among the options — e.g. excluded by the user's
+    // (handles display names and `resolvedModel` ids). The switched-to model
+    // may not be among the options — e.g. excluded by the user's
     // `availableModels` allowlist — in which case we track the raw id: the
     // picker shows no selection, but the model-dependent bookkeeping and any
     // later `setModel` round-trip stay truthful to what the SDK is running.
-    const resolved = resolveModelPreference(session.modelInfos, fallbackModel);
-    const value = resolved?.value ?? fallbackModel;
+    const resolved = resolveModelPreference(session.modelInfos, switchedModel);
+    const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
 
     try {
       await this.updateConfigOption(sessionId, MODEL_CONFIG_ID, value);
     } catch (err) {
-      // This runs on the consumer loop: a throw here tears down the query
-      // stream (failAllTurns + closeQueryStream) and bricks the session —
-      // far worse than stale bookkeeping. The user-driven RPC path lets the
-      // same errors propagate to fail just that request; here we log and
-      // move on, matching the setPermissionMode containment inside
-      // applyConfigOptionValue.
+      // This runs on the consumer loop (or detached from a hook callback): a
+      // throw here tears down the query stream (failAllTurns +
+      // closeQueryStream) and bricks the session — far worse than stale
+      // bookkeeping. The user-driven RPC path lets the same errors propagate
+      // to fail just that request; here we log and move on, matching the
+      // setPermissionMode containment inside applyConfigOptionValue.
       this.logger.error(
-        `Failed to reconcile model state after refusal fallback to "${fallbackModel}":`,
+        `Failed to reconcile model state after external switch to "${switchedModel}":`,
         err,
       );
     }
@@ -7113,6 +7112,44 @@ export class ClaudeAcpAgent {
             ],
           },
         ],
+        // Mirror model switches the adapter didn't drive into the ACP picker
+        // and the model-dependent bookkeeping (context window, mode clamping,
+        // effort/Fast-mode options). Without this, a `/model <name>` command
+        // typed as a prompt — which the CLI executes as a local command —
+        // switches the session's model with no refusal-fallback frame, and
+        // the client's picker silently drifts. `source: 'sdk'` is the
+        // adapter's own setModel (applyConfigOptionValue already synced it),
+        // and 'resume' restores are read back via readResumedLiveModel, so
+        // only the remaining sources sync here (CLI 2.1.251+; older CLIs
+        // never fire the hook and keep the pre-hook behavior).
+        PostModelSwitch: [
+          ...(userProvidedOptions?.hooks?.PostModelSwitch || []),
+          {
+            hooks: [
+              async (input) => {
+                if (
+                  input.hook_event_name === "PostModelSwitch" &&
+                  input.source !== "sdk" &&
+                  input.source !== "resume"
+                ) {
+                  // Don't run the sync before answering the hook: the sync
+                  // can issue applyFlagSettings (an outgoing control request)
+                  // while the CLI is awaiting this hook's response, and SDK
+                  // control requests are serialized over one channel.
+                  // syncModelAfterExternalSwitch contains its own errors, so
+                  // the detached call can't surface an unhandled rejection.
+                  const toModel = input.to_model;
+                  setImmediate(() => {
+                    const live = this.sessions[sessionId];
+                    if (!live) return;
+                    void this.syncModelAfterExternalSwitch(sessionId, live, toModel);
+                  });
+                }
+                return { continue: true };
+              },
+            ],
+          },
+        ],
         ...(fileChangeAuditSupport
           ? {
               Stop: [
@@ -7241,7 +7278,7 @@ export class ClaudeAcpAgent {
     // (current and future); the identity fields are overridden because the
     // fuzzy-matched sibling's resolvedModel/displayName/description can
     // describe a different context lane and would poison later resolvedModel
-    // matching (syncModelAfterRefusalFallback) and context-window inference
+    // matching (syncModelAfterExternalSwitch) and context-window inference
     // (applyConfigOptionValue) if they traveled under this id.
     const modelInfos = fallbackModelInfo
       ? [
@@ -8195,7 +8232,7 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
  *  4. `resolveModelPreference` over the picker entries.
  *  5. A model with no picker counterpart (e.g. excluded by an
  *     `availableModels` allowlist) is tracked verbatim, mirroring
- *     `syncModelAfterRefusalFallback`: the picker shows no selection, but the
+ *     `syncModelAfterExternalSwitch`: the picker shows no selection, but the
  *     model-dependent bookkeeping stays truthful to what the SDK is running. */
 export function matchResumedModel(models: ModelInfo[], liveModel: string): ModelInfo {
   const live = canonicalizeModelId(liveModel);
@@ -8335,6 +8372,15 @@ export function applyAvailableModelsAllowlist(
  *  #596). Best-effort: a control-request failure is logged and returns nulls
  *  so callers keep their current choice; failing the whole session/load over
  *  an unreadable report would be worse. */
+/** Whether a rejected `setModel` was vetoed by a user-configured
+ *  PreModelSwitch hook. The CLI's rejection message is the stable,
+ *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
+ *  <reason>"); a format change makes this stop matching and the failure
+ *  falls back to the ordinary fail-loud path, no worse than before. */
+function isPreModelSwitchHookBlock(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
+}
+
 async function readResumedLiveModel(
   query: Query,
   models: ModelInfo[],
@@ -8430,11 +8476,30 @@ async function getAvailableModels(
       // containment in createSession). The SDK then stayed on the
       // transcript's model, so read that back rather than reporting the
       // pin the session isn't running.
-      if (!isResumedSession) throw error;
-      logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-      const live = await readResumedLiveModel(query, models, logger);
-      currentModel = live.model ?? currentModel;
-      resumedContextWindow = live.contextWindow;
+      //
+      // One fresh-session failure is advisory, not defining: a
+      // user-configured PreModelSwitch hook can veto the pin (CLI 2.1.251+;
+      // 'deny', or 'ask' — which headless sessions refuse), and the SDK
+      // rejects setModel with "Model switch blocked by a PreModelSwitch
+      // hook: …". Terminal Claude Code never lets a hook veto its startup
+      // model (the spawn model isn't a switch), so failing session/new here
+      // would make the same hook config fatal only over ACP. The session
+      // stays on the SDK's own default — report that. We can't read the
+      // live model back on this path: getContextUsage isn't serviced on a
+      // fresh session until the first prompt turn (issues #886/#880).
+      if (!isResumedSession) {
+        if (!isPreModelSwitchHookBlock(error)) throw error;
+        logger.error(
+          `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
+          error,
+        );
+        currentModel = models[0];
+      } else {
+        logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
+        const live = await readResumedLiveModel(query, models, logger);
+        currentModel = live.model ?? currentModel;
+        resumedContextWindow = live.contextWindow;
+      }
     }
   }
 

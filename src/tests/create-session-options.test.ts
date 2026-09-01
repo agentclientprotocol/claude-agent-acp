@@ -13,6 +13,8 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let initModels: Record<string, unknown>[] | undefined;
+let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
 let mcpAuthenticateImpl: (serverName: string) => Promise<{
   authUrl?: string;
@@ -30,7 +32,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       capturedOptions = args.options;
       return makeMockQuery({
         initializationResult: async () => ({
-          models: [
+          models: initModels ?? [
             {
               value: "claude-sonnet-4-6",
               displayName: "Claude Sonnet",
@@ -39,6 +41,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
             },
           ],
         }),
+        setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
         getContextUsage: () =>
           contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
         mcpServerStatus: () => mcpServerStatusResult(),
@@ -72,6 +75,8 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    initModels = undefined;
+    setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
     mcpAuthenticateImpl = async () => ({
       requiresUserAction: false,
@@ -685,8 +690,8 @@ describe("createSession options merging", () => {
       }));
       const completeElicitation = vi.fn(async () => {});
       Object.assign((agent as unknown as { client: object }).client, {
-        unstable_createElicitation: createElicitation,
-        unstable_completeElicitation: completeElicitation,
+        createElicitation,
+        completeElicitation,
       });
 
       await agent.initialize({
@@ -871,9 +876,8 @@ describe("createSession options merging", () => {
       });
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       const createElicitation = vi.fn();
-      (
-        agent as unknown as { client: { unstable_createElicitation: unknown } }
-      ).client.unstable_createElicitation = createElicitation;
+      (agent as unknown as { client: { createElicitation: unknown } }).client.createElicitation =
+        createElicitation;
       return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
     }
 
@@ -967,6 +971,142 @@ describe("createSession options merging", () => {
 
       expect(result).toEqual({ behavior: "cancelled" });
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("client exploded"));
+    });
+  });
+
+  describe("model switches and PreModelSwitch hooks", () => {
+    const TWO_MODELS = [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+      {
+        value: "claude-opus-4-8",
+        displayName: "Claude Opus",
+        description: "Capable",
+        supportsAutoMode: true,
+      },
+    ];
+
+    let originalAnthropicModel: string | undefined;
+    beforeEach(() => {
+      originalAnthropicModel = process.env.ANTHROPIC_MODEL;
+      delete process.env.ANTHROPIC_MODEL;
+    });
+    afterEach(() => {
+      if (originalAnthropicModel !== undefined) {
+        process.env.ANTHROPIC_MODEL = originalAnthropicModel;
+      } else {
+        delete process.env.ANTHROPIC_MODEL;
+      }
+    });
+
+    it("tolerates a PreModelSwitch hook vetoing the fresh-session model pin", async () => {
+      // CLI 2.1.251+: a user-configured PreModelSwitch hook can deny (or
+      // 'ask', which headless sessions refuse) the pin's setModel. Terminal
+      // Claude Code never lets a hook veto its startup model, so the same
+      // config must not fail session/new over ACP — the session stays on the
+      // SDK's default, and we report that.
+      initModels = TWO_MODELS;
+      process.env.ANTHROPIC_MODEL = "opus";
+      setModelImpl = () =>
+        Promise.reject(new Error("Model switch blocked by a PreModelSwitch hook: pinned by IT"));
+
+      const errorSpy = vi.fn();
+      (agent as any).logger = { log: () => {}, error: errorSpy };
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect((agent as any).sessions[response.sessionId].models.currentModelId).toBe(
+        "claude-sonnet-4-6",
+      );
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("vetoed by a PreModelSwitch hook"),
+        expect.anything(),
+      );
+    });
+
+    it("still fails session/new loudly on a non-hook setModel failure", async () => {
+      initModels = TWO_MODELS;
+      process.env.ANTHROPIC_MODEL = "opus";
+      setModelImpl = () => Promise.reject(new Error("transport exploded"));
+
+      await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toThrow(
+        "transport exploded",
+      );
+    });
+
+    it("syncs adapter model state when a PostModelSwitch hook reports an external switch", async () => {
+      // A `/model <name>` command typed as a prompt switches the session's
+      // model with no refusal-fallback frame; the registered PostModelSwitch
+      // hook is what keeps the ACP picker truthful.
+      initModels = TWO_MODELS;
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+
+      const matchers = capturedOptions!.hooks?.PostModelSwitch;
+      expect(matchers).toBeDefined();
+      const callback = (matchers!.at(-1) as any).hooks[0];
+
+      const hookInput = {
+        hook_event_name: "PostModelSwitch",
+        session_id: sessionId,
+        transcript_path: "",
+        cwd: process.cwd(),
+        from_model: "claude-sonnet-4-6",
+        to_model: "claude-opus-4-8",
+        requested_model: "opus",
+        source: "command",
+        context_tokens: 0,
+        prompt_cache_warm: false,
+        cache_ttl: "5m",
+        estimated_cache_write_usd: 0,
+        pricing: "catalog",
+      };
+      const out = await callback(hookInput, undefined, {
+        signal: new AbortController().signal,
+      });
+      expect(out).toEqual({ continue: true });
+
+      // The sync is detached from the hook response (control requests are
+      // serialized); wait for it to land.
+      await vi.waitFor(() => {
+        expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-opus-4-8");
+      });
+    });
+
+    it("ignores PostModelSwitch reports for the adapter's own setModel calls", async () => {
+      initModels = TWO_MODELS;
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+      const callback = (capturedOptions!.hooks!.PostModelSwitch!.at(-1) as any).hooks[0];
+
+      await callback(
+        {
+          hook_event_name: "PostModelSwitch",
+          session_id: sessionId,
+          transcript_path: "",
+          cwd: process.cwd(),
+          from_model: "claude-sonnet-4-6",
+          to_model: "claude-opus-4-8",
+          requested_model: "opus",
+          source: "sdk",
+          context_tokens: 0,
+          prompt_cache_warm: false,
+          cache_ttl: "5m",
+          estimated_cache_write_usd: 0,
+          pricing: "catalog",
+        },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      // Detached-sync window: give a stray sync the chance to land, then
+      // assert nothing moved.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-sonnet-4-6");
     });
   });
 });

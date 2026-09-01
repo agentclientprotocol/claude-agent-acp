@@ -2596,6 +2596,71 @@ describe("Agent/Task tool_result rendering from tool_use_result", () => {
     });
   });
 
+  const PARTIAL_NOTE =
+    "NOTE: this agent stopped at its 30-turn limit before finishing. The text below is PARTIAL output; treat it as incomplete. Send the agent a message (SendMessage) to let it continue from where it stopped.";
+  const PARTIAL_LABEL = "[Agent stopped at its turn limit — the output below is partial]";
+
+  it("replaces the maxTurns partial-output note in the structured lane", () => {
+    // A maxTurns-stopped subagent still ships status "completed", with a
+    // model-directed note block leading the report — the SendMessage
+    // instruction is meaningless over ACP, but the partial-output fact isn't.
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        { type: "text", text: PARTIAL_NOTE },
+        { type: "text", text: "The partial report." },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+      { type: "content", content: { type: "text", text: "The partial report." } },
+    ]);
+  });
+
+  it("replaces the note variant for an agent that produced no report", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [
+        {
+          type: "text",
+          text: "NOTE: this agent stopped at its 5-turn limit before finishing. It was still calling tools and had produced no report.",
+        },
+      ],
+    });
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: PARTIAL_LABEL } },
+    ]);
+  });
+
+  it("replaces the note paragraph in the raw fallback and still strips the trailer", () => {
+    const result: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_agent",
+      content: [{ type: "text", text: `${PARTIAL_NOTE}\n\nThe report.${TRAILER}` }],
+    };
+    const update = toolUpdateFromToolResult(result, agentToolUse, false);
+
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "text", text: `${PARTIAL_LABEL}\n\nThe report.` } },
+    ]);
+  });
+
+  it("leaves a report that merely mentions the note text mid-block alone", () => {
+    const update = toolUpdateFromToolResult(rawResult, agentToolUse, false, {
+      ...structured,
+      content: [{ type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` }],
+    });
+
+    expect(update.content).toEqual([
+      {
+        type: "content",
+        content: { type: "text", text: `Quoting the harness: "${PARTIAL_NOTE}"` },
+      },
+    ]);
+  });
+
   it("strips the trailer from the raw fallback when tool_use_result is absent", () => {
     // Replayed sessions and older CLIs have no structured report; the
     // tail-anchored strip is the only cleanup available there.
