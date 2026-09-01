@@ -1652,7 +1652,7 @@ async function authenticateMcpServer(
       serverName,
       flowAbort.signal,
     );
-    const elicitation = host.client.unstable_createElicitation(
+    const elicitation = host.client.createElicitation(
       {
         mode: "url",
         sessionId,
@@ -1675,7 +1675,7 @@ async function authenticateMcpServer(
       await completed;
     }
     try {
-      await host.client.unstable_completeElicitation({ elicitationId });
+      await host.client.completeElicitation({ elicitationId });
     } catch (error) {
       if (!flowAbort.signal.aborted) {
         host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
