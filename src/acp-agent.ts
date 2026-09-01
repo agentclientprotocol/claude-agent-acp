@@ -5718,6 +5718,18 @@ export class ClaudeAcpAgent {
       }
     }
 
+    if (!validValue && params.configId === MODEL_CONFIG_ID) {
+      const rawModelId = params.value.trim();
+      if (rawModelId) {
+        // The picker is a convenience list, not the complete validation
+        // boundary for Anthropic model IDs. Accept a non-empty raw model id and
+        // let the SDK/API validate it on the next turn so valid-but-unlisted
+        // IDs (new launches, retired picker entries, custom gateways) remain
+        // reachable through the standard config option path.
+        validValue = { value: rawModelId, name: rawModelId };
+      }
+    }
+
     if (!validValue) {
       throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
