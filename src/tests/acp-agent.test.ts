@@ -387,7 +387,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       return { outcome: { outcome: "selected", optionId } };
     }
 
-    async unstable_createElicitation(
+    async createElicitation(
       params: CreateElicitationRequest,
     ): Promise<CreateElicitationResponse> {
       this.elicitations.push(params);
@@ -467,7 +467,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       .onRequest(methods.client.fs.readTextFile, (c) => client.readTextFile(c.params))
       .onRequest(methods.client.fs.writeTextFile, (c) => client.writeTextFile(c.params))
       .onRequest(methods.client.elicitation.create, (c) =>
-        client.unstable_createElicitation(c.params),
+        client.createElicitation(c.params),
       )
       .connect(stream);
 
@@ -3611,7 +3611,7 @@ describe("subagent permission attribution (issue #851)", () => {
         requests.push(params);
         return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
-      unstable_createElicitation: async (request: CreateElicitationRequest) => {
+      createElicitation: async (request: CreateElicitationRequest) => {
         elicitations.push(request);
         return {
           action: "accept",
@@ -14253,7 +14253,7 @@ describe("turn steering (_session/steering)", () => {
       {
         sessionUpdate: async () => {},
         requestPermission: userInputRequest,
-        unstable_createElicitation: userInputRequest,
+        createElicitation: userInputRequest,
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );

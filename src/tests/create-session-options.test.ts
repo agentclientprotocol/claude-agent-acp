@@ -804,8 +804,8 @@ describe("createSession options merging", () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
       const createElicitation = vi.fn();
       (
-        agent as unknown as { client: { unstable_createElicitation: unknown } }
-      ).client.unstable_createElicitation = createElicitation;
+        agent as unknown as { client: { createElicitation: unknown } }
+      ).client.createElicitation = createElicitation;
       return { onUserDialog: capturedOptions!.onUserDialog!, createElicitation };
     }
 

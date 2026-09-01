@@ -1430,11 +1430,11 @@ export interface AcpClient {
   writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse>;
   /** `signal`, when aborted, sends `$/cancel_request` for the in-flight
    *  elicitation so the client can dismiss its prompt and settle our await. */
-  unstable_createElicitation(
+  createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse>;
-  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void>;
+  completeElicitation(params: CompleteElicitationNotification): Promise<void>;
   /** Send a custom (extension) notification, e.g. `_claude/sdkMessage`. */
   extNotification(method: string, params: Record<string, unknown>): Promise<void>;
 }
@@ -1469,7 +1469,7 @@ class ClientConnection implements AcpClient {
     return this.ctx.request(methods.client.fs.writeTextFile, params);
   }
 
-  unstable_createElicitation(
+  createElicitation(
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
@@ -1478,7 +1478,7 @@ class ClientConnection implements AcpClient {
     });
   }
 
-  unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
     return this.ctx.notify(methods.client.elicitation.complete, params);
   }
 
@@ -3657,7 +3657,7 @@ export class ClaudeAcpAgent {
                 // client supports url elicitation; ignore failures otherwise.
                 if (this.clientCapabilities?.elicitation?.url) {
                   try {
-                    await this.client.unstable_completeElicitation({
+                    await this.client.completeElicitation({
                       elicitationId: message.elicitation_id,
                     });
                   } catch (error) {
@@ -6175,7 +6175,7 @@ export class ClaudeAcpAgent {
 
       try {
         const response = await this.withPendingUserInput(sessionId, () =>
-          this.client.unstable_createElicitation(createRequest, signal),
+          this.client.createElicitation(createRequest, signal),
         );
         if (signal.aborted) {
           return { action: "cancel" };
@@ -6213,7 +6213,7 @@ export class ClaudeAcpAgent {
     let response;
     try {
       response = await this.withPendingUserInput(sessionId, () =>
-        this.client.unstable_createElicitation(createRequest, signal),
+        this.client.createElicitation(createRequest, signal),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -6258,7 +6258,7 @@ export class ClaudeAcpAgent {
       let response: CreateElicitationResponse;
       try {
         response = await this.withPendingUserInput(sessionId, () =>
-          this.client.unstable_createElicitation(
+          this.client.createElicitation(
             refusalFallbackToCreateRequest(prompt, sessionId),
             signal,
           ),
