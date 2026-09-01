@@ -660,6 +660,12 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Whether ultracode is currently enabled for this session. Like Fast mode,
+   *  tracked as the user's intent so it survives model switches; the toggle is
+   *  only surfaced while the selected model supports the xhigh effort level
+   *  ultracode runs at. Session-scoped in the SDK — never persisted, so an
+   *  absent value simply means off. */
+  ultracodeEnabled?: boolean;
   /** Why the SDK currently can't serve Fast mode, when the reason is one worth
    *  telling the user about (see {@link FAST_MODE_UNAVAILABLE_EXPLANATIONS} —
    *  routine states like the SDK's own opt-in requirement normalize to
@@ -5418,6 +5424,12 @@ export class ClaudeAcpAgent {
       return { configOptions: session.configOptions };
     }
 
+    // Ultracode carries the same boolean-or-"on"/"off" value shape as Fast mode.
+    if (params.configId === ULTRACODE_CONFIG_ID) {
+      await this.applyUltracode(session, resolveUltracodeEnabled(params));
+      return { configOptions: session.configOptions };
+    }
+
     if (typeof params.value !== "string") {
       throw new Error(`Invalid value for config option ${params.configId}: ${params.value}`);
     }
@@ -6375,6 +6387,14 @@ export class ClaudeAcpAgent {
           useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
           disabledReason: session.fastModeDisabledReason,
         },
+        {
+          // Same follow-the-model behaviour as Fast mode: the toggle disappears
+          // when the new model can't run xhigh and reappears, with the retained
+          // intent, when an xhigh-capable model is selected again.
+          supported: modelSupportsUltracode(newModelInfo),
+          enabled: session.ultracodeEnabled ?? false,
+          useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+        },
       );
 
       // Sync effort with the SDK if it changed after the model switch
@@ -6483,6 +6503,32 @@ export class ClaudeAcpAgent {
     await session.query.applyFlagSettings({ fastMode: enabled });
     session.fastModeEnabled = enabled;
     this.refreshFastModeOption(session, enabled);
+  }
+
+  /** Replace the ultracode option in `session.configOptions` so it reflects
+   *  `enabled` (and the client's current boolean-capability). A no-op when the
+   *  option isn't present, so callers must confirm the current model surfaces
+   *  it first. Mirrors {@link refreshFastModeOption}. */
+  private refreshUltracodeOption(session: Session, enabled: boolean): void {
+    const refreshed = createUltracodeConfigOption(
+      enabled,
+      clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    );
+    session.configOptions = session.configOptions.map((o) =>
+      o.id === ULTRACODE_CONFIG_ID ? refreshed : o,
+    );
+  }
+
+  /** Toggle ultracode for a session: push the SDK flag, record the user's
+   *  intent, and refresh the config option in place.
+   *
+   *  Order matches {@link applyFastMode}: the SDK flag goes first so a rejected
+   *  control request leaves both the session state and the config option
+   *  untouched (no UI/SDK desync). */
+  private async applyUltracode(session: Session, enabled: boolean): Promise<void> {
+    await session.query.applyFlagSettings({ ultracode: enabled });
+    session.ultracodeEnabled = enabled;
+    this.refreshUltracodeOption(session, enabled);
   }
 
   /** Reconcile the session's Fast mode toggle with an SDK-reported
@@ -7094,6 +7140,17 @@ export class ClaudeAcpAgent {
       disabledReason: fastModeDisabledReason,
     };
 
+    // Seed ultracode from the settings the session was created with (--settings
+    // or a settings.json `ultracode`). The SDK reports no ultracode state on
+    // init, and the flag is session-scoped and never persisted, so the settings
+    // value is the only signal available here.
+    const ultracodeEnabled = settingsManager.getSettings().ultracode === true;
+    const ultracode: UltracodeOptionState = {
+      supported: modelSupportsUltracode(currentModelInfo),
+      enabled: ultracodeEnabled,
+      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+    };
+
     const configOptions = buildConfigOptions(
       modes,
       models,
@@ -7102,6 +7159,7 @@ export class ClaudeAcpAgent {
       agents,
       currentAgent,
       fastMode,
+      ultracode,
     );
 
     // Apply the initial effort level to the SDK so it matches the UI default
@@ -7114,6 +7172,11 @@ export class ClaudeAcpAgent {
       await q.applyFlagSettings({
         effortLevel: toSdkEffortLevel(initialEffort.currentValue),
       });
+    }
+    // Mirror the seeded ultracode value into the SDK, but only when the model
+    // can run it — pushing it on a model without xhigh would be refused.
+    if (ultracode.supported && ultracodeEnabled) {
+      await q.applyFlagSettings({ ultracode: true });
     }
     // Seed the context window WITHOUT any extra IPC on the session/new path.
     // On session/load, the resumed session's own `getContextUsage` report — a
@@ -7173,6 +7236,7 @@ export class ClaudeAcpAgent {
       agents,
       currentAgent,
       fastModeEnabled,
+      ultracodeEnabled,
       fastModeDisabledReason,
       abortController,
       emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
@@ -7596,12 +7660,22 @@ export { MODE_CONFIG_ID };
 export const MODEL_CONFIG_ID = "model";
 export const AGENT_CONFIG_ID = "agent";
 export const FAST_MODE_CONFIG_ID = "fast";
+export const ULTRACODE_CONFIG_ID = "ultracode";
 
 /** Select-fallback values used when the client has not opted into boolean
  *  config options (see {@link createFastModeConfigOption}). */
 export const FAST_MODE_ON = "on";
 export const FAST_MODE_OFF = "off";
 const FAST_MODE_DESCRIPTION = "Faster responses on supported models";
+
+/** Select-fallback values for the ultracode toggle, mirroring Fast mode. */
+export const ULTRACODE_ON = "on";
+export const ULTRACODE_OFF = "off";
+const ULTRACODE_DESCRIPTION = "xhigh effort plus standing dynamic-workflow orchestration";
+
+/** The effort level ultracode runs at. The SDK requires an xhigh-capable model,
+ *  so the toggle is only surfaced when the current model advertises `xhigh`. */
+export const ULTRACODE_EFFORT_LEVEL = "xhigh";
 
 /** Map the SDK's tri-state `fast_mode_state` onto the boolean config toggle.
  *  `cooldown` (fast mode temporarily suspended after a rate limit, per the SDK
@@ -7708,6 +7782,76 @@ export function resolveFastModeEnabled(params: SetSessionConfigOptionRequest): b
   throw new Error(`Invalid value for config option ${FAST_MODE_CONFIG_ID}: ${value}`);
 }
 
+/** Whether a model can run ultracode. The SDK requires an xhigh-capable model,
+ *  so we gate on the model advertising the {@link ULTRACODE_EFFORT_LEVEL} effort
+ *  level rather than assuming any effort-capable model qualifies. */
+export function modelSupportsUltracode(modelInfo?: ModelInfo): boolean {
+  return (
+    (modelInfo?.supportsEffort ?? false) &&
+    (modelInfo?.supportedEffortLevels ?? []).includes(ULTRACODE_EFFORT_LEVEL)
+  );
+}
+
+/** Build the ultracode config option. Same shape as {@link
+ *  createFastModeConfigOption}: a native `type: "boolean"` toggle for Clients
+ *  that opted into boolean config options, degrading to a two-value `select`
+ *  otherwise.
+ *
+ *  Ultracode is session-scoped in the SDK and is never persisted to settings
+ *  files, so the toggle always starts from the value the session was created
+ *  with. */
+export function createUltracodeConfigOption(
+  enabled: boolean,
+  useBooleanOption: boolean,
+): SessionConfigOption {
+  const base = {
+    id: ULTRACODE_CONFIG_ID,
+    name: "Ultracode",
+    description: ULTRACODE_DESCRIPTION,
+    category: "thought_level",
+  } as const;
+
+  if (useBooleanOption) {
+    return { ...base, type: "boolean", currentValue: enabled };
+  }
+
+  return {
+    ...base,
+    type: "select",
+    currentValue: enabled ? ULTRACODE_ON : ULTRACODE_OFF,
+    options: [
+      { value: ULTRACODE_ON, name: "On" },
+      { value: ULTRACODE_OFF, name: "Off" },
+    ],
+  };
+}
+
+/** Resolve the requested ultracode value from a `session/set_config_option`
+ *  request. Accepts a native boolean or the "on"/"off" select-fallback strings. */
+export function resolveUltracodeEnabled(params: SetSessionConfigOptionRequest): boolean {
+  const value = params.value;
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (value === ULTRACODE_ON) {
+    return true;
+  }
+  if (value === ULTRACODE_OFF) {
+    return false;
+  }
+  throw new Error(`Invalid value for config option ${ULTRACODE_CONFIG_ID}: ${value}`);
+}
+
+/** Ultracode state threaded into {@link buildConfigOptions}. The option is only
+ *  surfaced when the current model supports the xhigh effort level ultracode
+ *  runs at — the SDK rejects it otherwise. */
+export type UltracodeOptionState = {
+  supported: boolean;
+  enabled: boolean;
+  /** Whether the Client opted into boolean config options. */
+  useBooleanOption: boolean;
+};
+
 /** Per-model Fast mode state threaded into {@link buildConfigOptions}. The
  *  option is only surfaced when the current model `supported`s fast mode. */
 export type FastModeOptionState = {
@@ -7728,6 +7872,7 @@ export function buildConfigOptions(
   agents: AgentInfo[] = [],
   currentAgent: string = DEFAULT_AGENT_ID,
   fastMode?: FastModeOptionState,
+  ultracode?: UltracodeOptionState,
 ): SessionConfigOption[] {
   const options: SessionConfigOption[] = [
     SessionModeManager.configOption(modes),
@@ -7802,6 +7947,13 @@ export function buildConfigOptions(
         fastMode.disabledReason,
       ),
     );
+  }
+
+  // Surface the ultracode toggle only when the current model supports the xhigh
+  // effort level it runs at — the SDK requires that, so a toggle on a
+  // lower-ceiling model would refuse to stay on.
+  if (ultracode?.supported) {
+    options.push(createUltracodeConfigOption(ultracode.enabled, ultracode.useBooleanOption));
   }
 
   // Only surface the Agent picker when there's a real choice — i.e. the user
