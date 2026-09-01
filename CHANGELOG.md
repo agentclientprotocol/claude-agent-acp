@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.72.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.71.0...v0.72.0) (2026-09-01)
+
+
+### Features
+
+* **deps:** Update to @anthropic-ai/claude-agent-sdk 0.3.252  ([#1062](https://github.com/agentclientprotocol/claude-agent-acp/issues/1062)) ([9aaf066](https://github.com/agentclientprotocol/claude-agent-acp/commit/9aaf0663bf48a4209e8e6511af395102c05e501e))
+
+
+### Bug Fixes
+
+* Adopt per-model effort settings and user_message_uuid result attribution ([#1065](https://github.com/agentclientprotocol/claude-agent-acp/issues/1065)) ([a04d354](https://github.com/agentclientprotocol/claude-agent-acp/commit/a04d35496c1f1b4c19d8f4204ee6377de45624ab))
+
 ## [0.71.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.70.0...v0.71.0) (2026-08-31)
 
 
