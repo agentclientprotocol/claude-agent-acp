@@ -11976,6 +11976,95 @@ describe("post-error recovery", () => {
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("uses a result's user_message_uuid to consume exactly the orphan it names", async () => {
+    // SDK 0.3.246+ stamps results with the triggering send's client uuid.
+    // With TWO cancelled commands pending (their dispatch frames lost), a
+    // stamped orphan result must consume the entry it NAMES — not the oldest
+    // — and the later /compact result, stamped with its own send, must not
+    // be eaten by the dup-over-loss one-skip that the leftover pending entry
+    // would otherwise trigger (which would hang the /compact prompt).
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield lifecycleInit;
+        yield userEcho(u1.value); // turn 1 active
+        await iter.next(); // turn 2 queued (cancelled below; every frame lost)
+        const u3 = await iter.next(); // turn 3 queued (cancelled below)
+        await gate;
+        yield { type: "system", subtype: "session_state_changed", state: "idle" }; // turn 1 settles cancelled
+        // Both dispatch frames are LOST; only turn 3's dead turn flushes a
+        // result, stamped with the send it answers.
+        yield {
+          ...createResultMessage({
+            subtype: "error_during_execution",
+            stop_reason: null,
+            is_error: true,
+          }),
+          user_message_uuid: u3.value.uuid,
+        };
+        const u4 = await iter.next(); // /compact's pushed message
+        yield {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: "test-session",
+        };
+        yield {
+          ...createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
+          user_message_uuid: u4.value.uuid, // a live result names its own send
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await waitFor(() => !!agent.sessions["test-session"]?.msgLifecycleV1);
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    const third = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "third" }],
+    });
+    await waitFor(() => (agent.sessions["test-session"]?.turnQueue?.length ?? 0) >= 3);
+
+    await agent.cancel({ sessionId: "test-session" });
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(2);
+    const compact = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    release();
+
+    await expect(first).resolves.toEqual({
+      stopReason: "cancelled",
+      usage: cancelledTurnUsage,
+      _meta: cancelledTurnQuotaMeta,
+    });
+    await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+    await expect(third).resolves.toEqual({ stopReason: "cancelled" });
+    // Settles on its OWN stamped result — under positional attribution the
+    // one-skip would have consumed it for turn 2 and hung this prompt.
+    const compactResult = await compact;
+    expect(compactResult.stopReason).toBe("end_turn");
+    expect(compactResult.usage?.inputTokens).toBe(10);
+    // Turn 3's entry was consumed by name; turn 2's leftover pending entry
+    // is swept by /compact's activation.
+    expect(agent.sessions["test-session"]?.orphanCommands?.size).toBe(0);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("deletes (not zombifies) an orphan whose `cancelled` frame arrives AFTER its error result", async () => {
     // The live-observed abort ordering is started → error result → cancelled.
     // The result deletes the "started" entry when it is skipped; the late
@@ -15001,6 +15090,119 @@ describe("turn steering (_session/steering)", () => {
 
     await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
     expect(JSON.stringify(updates)).not.toContain("[Request interrupted by user]");
+  });
+
+  it("swallows a stamped interruption diagnostic that names the cancelled command", async () => {
+    // Same replay ordering as above, but the diagnostic carries the SDK
+    // 0.3.246+ user_message_uuid stamp naming the cancelled first prompt —
+    // the exact-join path must consume precisely that hand-off token.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        await gate;
+        const replacement = await iter.next();
+        yield userEcho(original.value);
+        yield userEcho({
+          uuid: randomUUID(),
+          message: { role: "user", content: "[Request interrupted by user]" },
+        });
+        yield userEcho(replacement.value);
+        yield {
+          ...createResultMessage(),
+          subtype: "success",
+          is_error: true,
+          result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+          user_message_uuid: original.value.uuid,
+        };
+        yield createAssistantText("replacement answer");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(
+      () =>
+        agent.sessions["test-session"]?.turnQueue?.length === 1 &&
+        agent.sessions["test-session"]?.activeTurn == null,
+    );
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    release();
+
+    await expect(second).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(
+      agent.sessions["test-session"]?.pendingEmptyInterruptionDiagnosticCommands?.size ?? 0,
+    ).toBe(0);
+  });
+
+  it("does not let a stale hand-off token swallow a live turn's stamped interruption diagnostic", async () => {
+    // The diagnostic-shaped error is stamped with the LIVE replacement
+    // prompt's uuid — not the cancelled command the token was handed out for.
+    // The stamp positively refutes "this is the cancelled cycle's
+    // diagnostic", so it must reach the ordinary failure lanes and fail the
+    // replacement prompt instead of being silently eaten.
+    const agent = createMockAgent();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        await gate;
+        const replacement = await iter.next();
+        yield userEcho(original.value);
+        yield userEcho({
+          uuid: randomUUID(),
+          message: { role: "user", content: "[Request interrupted by user]" },
+        });
+        yield userEcho(replacement.value);
+        yield {
+          ...createResultMessage(),
+          subtype: "success",
+          is_error: true,
+          result: "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null",
+          user_message_uuid: replacement.value.uuid,
+        };
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const first = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await waitFor(
+      () =>
+        agent.sessions["test-session"]?.turnQueue?.length === 1 &&
+        agent.sessions["test-session"]?.activeTurn == null,
+    );
+    await agent.cancel({ sessionId: "test-session" });
+    await expect(first).resolves.toEqual({ stopReason: "cancelled" });
+
+    const second = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    release();
+
+    await expect(second).rejects.toThrow("[ede_diagnostic]");
   });
 
   it("does not hide an empty user-interruption diagnostic without a cancelled predecessor", async () => {
