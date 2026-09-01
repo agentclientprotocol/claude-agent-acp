@@ -387,9 +387,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       return { outcome: { outcome: "selected", optionId } };
     }
 
-    async createElicitation(
-      params: CreateElicitationRequest,
-    ): Promise<CreateElicitationResponse> {
+    async createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
       this.elicitations.push(params);
       if (!CreateElicitationRequest.isForm(params)) {
         return { action: "decline" };
@@ -466,9 +464,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       )
       .onRequest(methods.client.fs.readTextFile, (c) => client.readTextFile(c.params))
       .onRequest(methods.client.fs.writeTextFile, (c) => client.writeTextFile(c.params))
-      .onRequest(methods.client.elicitation.create, (c) =>
-        client.createElicitation(c.params),
-      )
+      .onRequest(methods.client.elicitation.create, (c) => client.createElicitation(c.params))
       .connect(stream);
 
     await ctx.request(methods.agent.initialize, {
@@ -1274,6 +1270,74 @@ describe("tool conversions", () => {
     });
   });
 
+  it("renders a compact placeholder for a document block instead of its base64 payload", () => {
+    // SDK 0.3.243 moved a PDF Read's document block inside the tool_result
+    // content; dumping it through the default JSON.stringify branch would
+    // send the entire base64 payload as a text block.
+    const toolUse = {
+      type: "tool_use",
+      id: "toolu_01PDF",
+      name: "Read",
+      input: { file_path: "/Users/test/report.pdf" },
+    };
+
+    const toolResult = {
+      content: [
+        {
+          type: "document" as const,
+          title: "Quarterly report",
+          source: {
+            type: "base64" as const,
+            media_type: "application/pdf" as const,
+            data: "A".repeat(4096),
+          },
+        },
+      ],
+      tool_use_id: "toolu_01PDF",
+      is_error: false,
+      type: "tool_result" as const,
+    };
+
+    const update = toolUpdateFromToolResult(toolResult as any, toolUse);
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: '[document "Quarterly report": application/pdf, 3.0 KB]',
+          },
+        },
+      ],
+    });
+  });
+
+  it("renders a url-sourced document block as its URL", () => {
+    const toolResult = {
+      content: [
+        {
+          type: "document" as const,
+          source: { type: "url" as const, url: "https://example.com/spec.pdf" },
+        },
+      ],
+      tool_use_id: "toolu_01PDF",
+      is_error: false,
+      type: "tool_result" as const,
+    };
+
+    const update = toolUpdateFromToolResult(toolResult as any, undefined);
+
+    expect(update).toEqual({
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "[document: https://example.com/spec.pdf]" },
+        },
+      ],
+    });
+  });
+
   it("should transform tool_reference content to valid ACP content", () => {
     const toolUse = {
       type: "tool_use",
@@ -1602,6 +1666,78 @@ describe("toolUpdateFromDiffToolResponse", () => {
     };
 
     expect(toolUpdateFromDiffToolResponse(toolResponse)).toEqual({});
+  });
+
+  it("emits a whole-file diff for a Write update whose structuredPatch is empty", () => {
+    // The empty-patch lanes (nothing changed / diff timed out) would
+    // otherwise leave Write's optimistic oldText:null "creation" content
+    // standing for an overwrite of an existing file.
+    expect(
+      toolUpdateFromDiffToolResponse({
+        filePath: "/Users/test/project/file.ts",
+        structuredPatch: [],
+        type: "update",
+        content: "new content",
+        originalFile: "old content",
+      }),
+    ).toEqual({
+      content: [
+        {
+          type: "diff",
+          path: "/Users/test/project/file.ts",
+          oldText: "old content",
+          newText: "new content",
+        },
+      ],
+      locations: [{ path: "/Users/test/project/file.ts" }],
+    });
+  });
+
+  it("emits a truthful note for a Write update whose previous content was too large to diff", () => {
+    // SDK 0.3.252 documents this lane: type "update" with an empty
+    // structuredPatch AND originalFile null.
+    expect(
+      toolUpdateFromDiffToolResponse({
+        filePath: "/Users/test/project/big.json",
+        structuredPatch: [],
+        type: "update",
+        content: "new content",
+        originalFile: null,
+      }),
+    ).toEqual({
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "Updated `/Users/test/project/big.json` (previous content too large to diff)",
+          },
+        },
+      ],
+      locations: [{ path: "/Users/test/project/big.json" }],
+    });
+  });
+
+  it("keeps the empty return for a Write create and for Edit-shaped responses", () => {
+    // A create's optimistic content already shows creation semantics.
+    expect(
+      toolUpdateFromDiffToolResponse({
+        filePath: "/Users/test/project/new.ts",
+        structuredPatch: [],
+        type: "create",
+        content: "new content",
+        originalFile: null,
+      }),
+    ).toEqual({});
+    // FileEditOutput carries no `type`; its optimistic old/new diff is
+    // truthful, so an empty patch still means "nothing to correct".
+    expect(
+      toolUpdateFromDiffToolResponse({
+        filePath: "/Users/test/project/file.ts",
+        structuredPatch: [],
+        originalFile: "old content",
+      }),
+    ).toEqual({});
   });
 });
 
