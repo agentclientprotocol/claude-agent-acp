@@ -1757,6 +1757,38 @@ describe("stripLocalCommandMetadata", () => {
     ).toBeNull();
   });
 
+  it("reconstructs marker-only model-bound slash skill prompts", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-message>example-skill</command-message>\n" +
+          "<command-name>/example-skill</command-name>\n" +
+          "<command-args>explain the startup decision</command-args>",
+      ),
+    ).toBe("/example-skill explain the startup decision");
+
+    expect(
+      stripLocalCommandMetadata([
+        {
+          type: "text",
+          text:
+            "<command-message>example-skill</command-message>\n" +
+            "<command-name>/example-skill</command-name>\n" +
+            "<command-args>explain the startup decision</command-args>",
+        },
+      ]),
+    ).toEqual([{ type: "text", text: "/example-skill explain the startup decision" }]);
+  });
+
+  it("keeps local-command stdout marker-only payloads hidden", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-name>/example-skill</command-name>" +
+          "<command-args>explain</command-args>" +
+          "<local-command-stdout>handled locally</local-command-stdout>",
+      ),
+    ).toBeNull();
+  });
+
   it("returns the string unchanged for real content", () => {
     expect(stripLocalCommandMetadata("hi")).toBe("hi");
     expect(stripLocalCommandMetadata("please run /model with args")).toBe(
