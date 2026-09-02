@@ -689,6 +689,14 @@ export type Session = {
   modes: SessionModeState;
   models: SessionModelState;
   modelInfos: ModelInfo[];
+  /** The SDK's own unfiltered model table from the initialize response.
+   *  Capability source for ids `modelInfos` doesn't cover: `modelInfos` may be
+   *  filtered by the user's `availableModels` allowlist, and an external
+   *  switch can land on an id no picker entry describes (see
+   *  {@link resolveModelCapabilityFallback}). Optional: a session built
+   *  without it simply never finds a capability donor and keeps the plain
+   *  raw-id tracking. */
+  sdkModelInfos?: ModelInfo[];
   /** Prevents the model-specific Auto fallback from spamming the transcript. */
   autoModeFallbackWarningShown?: boolean;
   /** Initial mode fallback is reported after session/new, on the first prompt. */
@@ -6577,7 +6585,32 @@ export class ClaudeAcpAgent {
       // the Auto fallback below; its `displayName`/`description` also let us infer the
       // context window for semantic aliases (e.g. `default`) whose ID alone
       // carries no "1m" token.
-      const newModelInfo = session.modelInfos.find((m) => m.value === value);
+      let newModelInfo = session.modelInfos.find((m) => m.value === value);
+      if (!newModelInfo) {
+        // No table entry covers this id — an external `/model` switch (or a
+        // raw-id round-trip) landed on a model the picker never listed, e.g.
+        // a newly shipped id or one excluded by the `availableModels`
+        // allowlist. Mirror createSession's fallback registration: borrow the
+        // closest SDK-table row's capability flags under the verbatim id,
+        // with the donor's identity fields stripped so a different-lane
+        // sibling's resolvedModel/displayName/description can't poison later
+        // resolvedModel matching or context-window inference. The rebuild
+        // below then keeps effort/Fast-mode/auto gating truthful instead of
+        // silently dropping those options (the env-pinned path seeds them
+        // for the same id). No donor: the id stays tracked raw, with no
+        // capability claims.
+        const donor = resolveModelCapabilityFallback(session.sdkModelInfos ?? [], value);
+        if (donor) {
+          newModelInfo = {
+            ...donor,
+            value,
+            displayName: value,
+            description: "",
+            resolvedModel: undefined,
+          };
+          session.modelInfos = [...session.modelInfos, newModelInfo];
+        }
+      }
       if (session.models.currentModelId !== value) {
         // Seed the new model's context window WITHOUT any IPC on the switch
         // path: cached authoritative value if we've already learned it (from a
@@ -6714,10 +6747,13 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     // Map the SDK-reported model onto one of the session's model options
     // (handles display names and `resolvedModel` ids). The switched-to model
-    // may not be among the options — e.g. excluded by the user's
-    // `availableModels` allowlist — in which case we track the raw id: the
-    // picker shows no selection, but the model-dependent bookkeeping and any
-    // later `setModel` round-trip stay truthful to what the SDK is running.
+    // may not be among the options — a newly shipped id, or one excluded by
+    // the user's `availableModels` allowlist — in which case we track the
+    // raw id: the picker shows no selection, but the model-dependent
+    // bookkeeping and any later `setModel` round-trip stay truthful to what
+    // the SDK is running. applyConfigOptionValue seeds capability flags for
+    // such ids from the closest SDK-table row, so a raw-tracked id keeps its
+    // effort/Fast-mode options whenever the family is known.
     const resolved = resolveModelPreference(session.modelInfos, switchedModel);
     const value = resolved?.value ?? switchedModel;
     if (session.models.currentModelId === value) return;
@@ -7481,6 +7517,7 @@ export class ClaudeAcpAgent {
       modes,
       models,
       modelInfos,
+      sdkModelInfos: initializationResult.models,
       autoModeFallbackWarningShown: false,
       autoModeFallbackWarningPending,
       configOptions,
@@ -8313,6 +8350,45 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
     }
   }
 
+  return bestMatch;
+}
+
+/** Resolve the model-table row that best describes the CAPABILITIES of a
+ *  model id with no row of its own — an id the SDK is running that no picker
+ *  entry covers, e.g. a newly shipped id switched to via a `/model` prompt,
+ *  or a model excluded by the `availableModels` allowlist.
+ *
+ *  The ordinary identity tiers run first, so an allowlist-excluded id still
+ *  lands on its exact unfiltered row. On a miss, the tokenized family tier
+ *  retries with the version guard relaxed: a "claude-fable-5-1" pin must
+ *  never RENDER as the "claude-fable-5" picker row — that guard protects
+ *  picker identity — but the family row is still the best available
+ *  description of what the id supports (effort levels, fast mode, auto
+ *  mode). This is the same capability-over-identity split createSession
+ *  applies when it registers a fuzzy-matched sibling's flags under a
+ *  verbatim live id; callers must likewise strip the donor's identity
+ *  fields before registering it under the new id. Returns null when the
+ *  table has no plausible family row, so genuinely unknown ids keep their
+ *  truthful raw-id tracking with no capability claims. */
+export function resolveModelCapabilityFallback(
+  models: ModelInfo[],
+  modelId: string,
+): ModelInfo | null {
+  const resolved = resolveModelPreference(models, modelId);
+  if (resolved) return resolved;
+
+  const { tokens, contextHint } = tokenizeModelPreference(modelId);
+  if (tokens.length === 0) return null;
+
+  let bestMatch: ModelInfo | null = null;
+  let bestScore = 0;
+  for (const model of models) {
+    const score = scoreModelMatch(model, tokens, contextHint);
+    if (0 < score && (!bestMatch || bestScore < score)) {
+      bestMatch = model;
+      bestScore = score;
+    }
+  }
   return bestMatch;
 }
 
