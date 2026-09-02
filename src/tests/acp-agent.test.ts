@@ -4064,6 +4064,53 @@ describe("subagent permission attribution (issue #851)", () => {
     ).toBe("toolu_parent");
   });
 
+  it("closes local command output so the model's reply is a separate block", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Goal set: ship the release",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: randomUUID(),
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [{ type: "text", text: "I'll start on that now." }],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal ship the release" }],
+    });
+
+    const text = updates
+      .filter(({ update }) => update.sessionUpdate === "agent_message_chunk")
+      .map(({ update }) => (update as { content: { text: string } }).content.text)
+      .join("");
+    expect(text).toBe("Goal set: ship the release\n\nI'll start on that now.");
+  });
+
   it("prunes the mapping when the task settles (task_notification)", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
