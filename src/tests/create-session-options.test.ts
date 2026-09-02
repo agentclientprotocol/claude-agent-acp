@@ -1108,5 +1108,146 @@ describe("createSession options merging", () => {
       await new Promise((resolve) => setImmediate(resolve));
       expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-sonnet-4-6");
     });
+
+    // A `/model` switch to an id no picker entry covers (e.g. a newly shipped
+    // model) must not silently drop the Effort option: the same id pinned via
+    // ANTHROPIC_MODEL seeds it fully, because the SDK's init table then
+    // carries a custom entry with capability flags. Mid-session there is no
+    // such entry, so capability flags are borrowed from the closest SDK-table
+    // family row and registered under the verbatim id.
+    it("seeds effort when an external switch lands on an unlisted id from a known family", async () => {
+      initModels = [
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Fast",
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-fable-5[1m]",
+          resolvedModel: "claude-fable-5",
+          displayName: "Fable",
+          description: "Capable",
+          supportsAutoMode: true,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+        },
+      ];
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+      const callback = (capturedOptions!.hooks!.PostModelSwitch!.at(-1) as any).hooks[0];
+
+      await callback(
+        {
+          hook_event_name: "PostModelSwitch",
+          session_id: sessionId,
+          transcript_path: "",
+          cwd: process.cwd(),
+          from_model: "claude-sonnet-4-6",
+          to_model: "claude-fable-5-1",
+          requested_model: "claude-fable-5-1",
+          source: "command",
+          context_tokens: 0,
+          prompt_cache_warm: false,
+          cache_ttl: "5m",
+          estimated_cache_write_usd: 0,
+          pricing: "catalog",
+        },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      await vi.waitFor(() => {
+        expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-fable-5-1");
+      });
+      const session = (agent as any).sessions[sessionId];
+
+      // The Effort option exists and lists the family row's levels.
+      const effortOption = session.configOptions.find((o: any) => o.id === "effort");
+      expect(effortOption).toBeDefined();
+      expect(effortOption.options.map((o: any) => o.value)).toEqual([
+        "default",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+
+      // Capabilities are registered under the verbatim id with the donor's
+      // identity fields stripped, and the picker itself gains no entry.
+      const registered = session.modelInfos.find((m: any) => m.value === "claude-fable-5-1");
+      expect(registered).toMatchObject({
+        displayName: "claude-fable-5-1",
+        supportsEffort: true,
+      });
+      expect(registered.resolvedModel).toBeUndefined();
+      expect(session.models.availableModels).toHaveLength(2);
+      const modelOption = session.configOptions.find((o: any) => o.id === "model");
+      expect(modelOption?.currentValue).toBe("claude-fable-5-1");
+
+      // The donor's "[1m]" spelling must not leak into context inference:
+      // the stripped identity leaves the default window for the unknown id.
+      expect(session.contextWindowSize).toBe(200000);
+    });
+
+    it("keeps truthful raw tracking, without effort, for an id from no known family", async () => {
+      initModels = [
+        {
+          value: "claude-sonnet-4-6",
+          displayName: "Claude Sonnet",
+          description: "Fast",
+          supportsAutoMode: true,
+        },
+        {
+          value: "claude-fable-5[1m]",
+          resolvedModel: "claude-fable-5",
+          displayName: "Fable",
+          description: "Capable",
+          supportsAutoMode: true,
+          supportsEffort: true,
+          supportedEffortLevels: ["low", "medium", "high", "xhigh", "max"],
+        },
+      ];
+      // Start on the effort-capable model so the raw fallback demonstrably
+      // DROPS the option rather than never having had it.
+      process.env.ANTHROPIC_MODEL = "fable";
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+      expect(
+        (agent as any).sessions[sessionId].configOptions.some((o: any) => o.id === "effort"),
+      ).toBe(true);
+      const callback = (capturedOptions!.hooks!.PostModelSwitch!.at(-1) as any).hooks[0];
+
+      await callback(
+        {
+          hook_event_name: "PostModelSwitch",
+          session_id: sessionId,
+          transcript_path: "",
+          cwd: process.cwd(),
+          from_model: "claude-fable-5",
+          to_model: "claude-vega-2",
+          requested_model: "claude-vega-2",
+          source: "command",
+          context_tokens: 0,
+          prompt_cache_warm: false,
+          cache_ttl: "5m",
+          estimated_cache_write_usd: 0,
+          pricing: "catalog",
+        },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+
+      await vi.waitFor(() => {
+        expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-vega-2");
+      });
+      const session = (agent as any).sessions[sessionId];
+
+      // No family row exists, so no capability claims are made: the id is
+      // tracked verbatim and the Effort option is dropped.
+      expect(session.configOptions.some((o: any) => o.id === "effort")).toBe(false);
+      expect(session.modelInfos.some((m: any) => m.value === "claude-vega-2")).toBe(false);
+    });
   });
 });

@@ -4,6 +4,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   resolveModelPreference,
+  resolveModelCapabilityFallback,
   applyAvailableModelsAllowlist,
   matchResumedModel,
   settingsEffortForModel,
@@ -111,6 +112,41 @@ describe("resolveModelPreference - resolvedModel matching", () => {
     expect(resolveModelPreference(models, "claude-sonnet-5-1m")?.value).toBe("sonnet[1m]");
     // Bare preferences still land on the bare row via the substring tier.
     expect(resolveModelPreference(models, "claude-sonnet-5")?.value).toBe("sonnet");
+  });
+});
+
+describe("resolveModelCapabilityFallback", () => {
+  it("keeps the identity tiers: an exact resolvedModel id lands on its own row", () => {
+    expect(
+      resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "claude-haiku-4-5-20251001")?.value,
+    ).toBe("haiku");
+  });
+
+  it("falls back to the family row for a new minor version the identity resolver refuses", () => {
+    // The identity resolver must NOT map a 5.1 id onto the 5.0 row (the
+    // picker would then claim the session runs a different model)...
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-sonnet-5-1")).toBeNull();
+    // ...but for capability description the family row is the best available
+    // source, so the fallback returns it.
+    expect(resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "claude-sonnet-5-1")?.value).toBe(
+      "sonnet",
+    );
+  });
+
+  it("describes a retired dated id via its family row even across generations", () => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "claude-sonnet-4-6")).toBeNull();
+    expect(resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "claude-sonnet-4-6")?.value).toBe(
+      "sonnet",
+    );
+  });
+
+  it("returns null for an id from no known family", () => {
+    expect(resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "claude-gpt-99")).toBeNull();
+  });
+
+  it("returns null when the id yields no usable tokens", () => {
+    expect(resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "claude-5-1")).toBeNull();
+    expect(resolveModelCapabilityFallback(LIVE_SHAPED_MODELS, "")).toBeNull();
   });
 });
 
