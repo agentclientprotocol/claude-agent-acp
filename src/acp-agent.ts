@@ -3934,19 +3934,21 @@ export class ClaudeAcpAgent {
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
               case "api_retry": {
+                const kind =
+                  message.error_status === null
+                    ? "transport_lost"
+                    : providerFailureCategory(message.error);
+                // A 401 retry is the CLI's credential re-check: it gives up on
+                // the first attempt and reports the sign-out, which is the real
+                // signal and carries the `login` action. A "Retrying" warning
+                // here would outlive the `auth_required` rejection with no
+                // action to clear it (issue #1072).
+                if (kind === "auth_required") break;
                 const title =
                   message.error_status === null
                     ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.`
                     : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.`;
-                await publishSessionFailure(
-                  message.error_status === null
-                    ? "transport_lost"
-                    : providerFailureCategory(message.error),
-                  {
-                    title,
-                    severity: "warning",
-                  },
-                );
+                await publishSessionFailure(kind, { title, severity: "warning" });
                 break;
               }
               case "model_refusal_fallback": {

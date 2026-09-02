@@ -6576,7 +6576,7 @@ describe("stop reason propagation", () => {
     ]);
   });
 
-  it("publishes the sign-out after an authentication_failed retry warning", async () => {
+  it("publishes no retry warning for an authentication_failed api_retry", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -6587,15 +6587,15 @@ describe("stop reason propagation", () => {
       { log: () => {}, error: () => {} },
     );
     (agent as any).clientCapabilities = airSessionFailureCapabilities;
-    // The retry notice is a turn-scoped `auth_required` warning. It reports a
-    // retry, not the signed-out state, so it must not suppress the
-    // session-scoped error that carries the `login` action.
+    // The 401 retry is the CLI's credential re-check. The sign-out that
+    // follows is the signal, so the retry publishes nothing and the only
+    // failure is the session-scoped error with the `login` action.
     injectSession(agent, [
       {
         type: "system",
         subtype: "api_retry",
         attempt: 1,
-        max_retries: 5,
+        max_retries: 10,
         retry_delay_ms: 100,
         error_status: 401,
         error: "authentication_failed",
@@ -6616,15 +6616,16 @@ describe("stop reason propagation", () => {
     ).rejects.toThrow();
     await agent.sessions["test-session"]?.consumer;
     const failures = sessionFailuresFromUpdates(updates);
-    expect(failures.map((f) => f.severity)).toEqual(["warning", "error"]);
-    expect(failures[1]).toEqual(
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toEqual(
       expect.objectContaining({
         category: "access",
+        severity: "error",
         title: "Sign in to continue using Claude.",
         actions: ["login"],
       }),
     );
-    expect(failures[1].id).toContain("session-error");
+    expect(failures[0].id).toContain("session-error");
   });
 
   it("keeps the historical failure record unchanged after recovery", async () => {
