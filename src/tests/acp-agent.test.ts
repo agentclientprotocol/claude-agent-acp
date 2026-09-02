@@ -12875,6 +12875,66 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("settles a steered turn whose steer aborted the followup mid-write", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        // The user turn's terminal result: the subagent is live, so the
+        // prompt holds.
+        yield resultMessage();
+        // The CLI's immediate trailing idle, absorbed mid-hold.
+        yield idle();
+        // The subagent finishes and the followup starts streaming.
+        yield taskNotification("agent-1");
+        yield assistantText("relay begins");
+        // A message steered in mid-followup — the test gates the steer on
+        // the chunk above, so the turn is held and mid-relay, the live
+        // shape. The CLI aborts the followup cycle, which ends with ITS OWN
+        // result, task-notification origin. No trailing idle of its own
+        // ever comes: the abort collapsed it into the single spanning idle
+        // at the very end.
+        const steered = await iter.next();
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        // The steered cycle: echo, answer, and the last-word result.
+        yield userEcho(steered.value);
+        yield assistantText("STEERED-ANSWER");
+        yield resultMessage();
+        // The one idle spanning the aborted followup and the steered cycle.
+        // The aborted followup's banked trailer must not swallow it, or the
+        // steered turn never settles and the prompt hangs forever.
+        yield idle();
+        // The real CLI keeps the stream open here — no end-of-stream
+        // teardown ever rescues a missed settle, so the test must not let
+        // one rescue it either.
+        await new Promise(() => {});
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    // Steer only once the followup is visibly streaming: mid-relay, held.
+    await waitFor(() => events.includes("chunk:relay begins"));
+    await expect(
+      agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "quick question" }],
+      }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    // No consumer drain: the generator above deliberately never ends, the
+    // way the live stream stays open.
+  });
+
   it("falls back to settling at an idle when no followup comes", async () => {
     const agent = createMockAgent();
 

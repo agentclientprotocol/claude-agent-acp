@@ -3560,6 +3560,30 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles--;
                     }
                     settleDeferredIfDrained();
+                  } else if (
+                    isSteering(session.activeTurn) &&
+                    session.activeTurn.steeredEchoes.size === 0 &&
+                    session.activeTurn.steeredSettle !== undefined
+                  ) {
+                    // A READY steered settle — echo consumed, outcome
+                    // recorded — takes this idle ahead of the debt lane
+                    // below. When the steer aborted an autonomous followup
+                    // mid-write, that followup's result banked a trailer
+                    // (the "keep their own trailers" rule), but the abort
+                    // collapsed its trailing idle into this one spanning
+                    // idle: absorbing it as debt starves the settle, and
+                    // with the stream still open no teardown ever rescues
+                    // the prompt — it parks forever. A steer that is not
+                    // ready still falls through to the debt lane, so an
+                    // owed idle from an earlier turn can never settle a
+                    // steered cycle that is still running; a genuinely
+                    // separate owed trailer stays banked and absorbs the
+                    // next idle instead.
+                    const steered: Turn = session.activeTurn;
+                    steered.deferredSettle = steered.steeredSettle;
+                    steered.steeredEchoes = undefined;
+                    steered.steeredSettle = undefined;
+                    settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -3572,25 +3596,12 @@ export class ClaudeAcpAgent {
                     // steered cycle is still running. Steered results owe none.
                     session.owedTrailingIdles--;
                   } else if (isSteering(session.activeTurn)) {
-                    // A steered turn settles here, not at a result: this idle is
-                    // the only signal spanning the interrupted and steered cycles
-                    // (see Turn.steeredEchoes). An idle before the steered echo,
-                    // or before any result was recorded, means the answer is
-                    // still ahead — swallow it, and never let it reach the #825
-                    // fail below, which would reject a prompt about to answer.
-                    //
-                    // Plain Turn so the fields can be cleared below; isSteering
-                    // narrows steeredEchoes to non-optional.
-                    const steered: Turn = session.activeTurn;
-                    if (steered.steeredEchoes?.size === 0 && steered.steeredSettle !== undefined) {
-                      // Via the subagent gate, not settleActive: a steered turn
-                      // can also have spawned background subagents, which own it
-                      // from here (settles now if none is live, holds otherwise).
-                      steered.deferredSettle = steered.steeredSettle;
-                      steered.steeredEchoes = undefined;
-                      steered.steeredSettle = undefined;
-                      settleDeferredIfDrained();
-                    }
+                    // A steered turn that is NOT ready yet (the ready case
+                    // settled above, before the debt lane): an idle before
+                    // the steered echo, or before any result was recorded,
+                    // means the answer is still ahead — swallow it, and
+                    // never let it reach the #825 fail below, which would
+                    // reject a prompt about to answer.
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
