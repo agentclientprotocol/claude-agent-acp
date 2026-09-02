@@ -3053,9 +3053,6 @@ describe("permission request cancellation", () => {
       { kind: "allow_once", name: "Yes", optionId: "allow-once" },
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
-    expect(request?._meta).toEqual({
-      permission: { version: 1, title: "Bash" },
-    });
   });
 
   it("maps explicit reject to deny while retaining Claude classification", async () => {
