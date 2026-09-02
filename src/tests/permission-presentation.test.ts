@@ -111,7 +111,7 @@ describe("Claude permission ACP v1 presentation", () => {
       defaultToNo: true,
     });
     expect(presentation._meta).toEqual({
-      permission: { version: 1, title: "Bash", defaultToNo: true },
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
     });
     expect(
       buildClaudePermissionPresentation({
@@ -120,10 +120,10 @@ describe("Claude permission ACP v1 presentation", () => {
         toolUseID: "tool-1",
         defaultToNo: false,
       })._meta,
-    ).toEqual({ permission: { version: 1, title: "Bash" } });
+    ).toEqual({ permission: { version: 1, title: "rm -rf build" } });
   });
 
-  it("uses the human command description as the permission title", () => {
+  it("keeps command descriptions and decision reasons in their presentation fields", () => {
     const input = { command: "npm test", description: "Run the tests" };
     const presentation = buildClaudePermissionPresentation({
       toolName: "Bash",
@@ -133,12 +133,8 @@ describe("Claude permission ACP v1 presentation", () => {
       description: "Run npm tests",
       decisionReason: "Needed to verify the change.",
     });
-    expect(presentation._meta).toEqual({
-      permission: {
-        version: 1,
-        title: "Run the tests",
-        description: "Reason: Needed to verify the change.",
-      },
+    expect(presentation._meta).toMatchObject({
+      permission: { description: "Reason: Needed to verify the change." },
     });
     expect(presentation.toolCall).toMatchObject({
       toolCallId: "tool-1",
@@ -146,28 +142,43 @@ describe("Claude permission ACP v1 presentation", () => {
       kind: "execute",
       status: "pending",
       rawInput: input,
-      title: "Run the tests",
     });
+    expect(presentation.toolCall.content).toEqual([
+      { type: "content", content: { type: "text", text: "Run the tests" } },
+    ]);
     expect(presentation.toolCall.rawInput).toBe(input);
   });
 
-  it.each(["Bash", "PowerShell"])(
-    "uses the %s tool name when no human command description is available",
-    (toolName) => {
-      const input = { command: "echo raw command" };
+  it.each([
+    ["Bash", "Terminal"],
+    ["PowerShell", "PowerShell"],
+  ])("uses the canonical %s fallback when no command is available", (toolName, title) => {
+    const input = {};
+    const presentation = buildClaudePermissionPresentation({
+      toolName,
+      input,
+      toolUseID: `tool-${toolName}`,
+    });
+
+    expect(presentation._meta).toEqual({ permission: { version: 1, title } });
+    expect(presentation.toolCall).toMatchObject({ title, rawInput: input });
+  });
+
+  it.each([
+    ["Bash", "ls -la ~/.config/zed"],
+    ["PowerShell", "Get-ChildItem $HOME\\.config\\zed"],
+  ])(
+    "shows the exact %s command instead of its model-authored description",
+    (toolName, command) => {
+      const input = { command, description: "List files in current directory" };
       const presentation = buildClaudePermissionPresentation({
         toolName,
         input,
         toolUseID: `tool-${toolName}`,
       });
 
-      expect(presentation._meta).toEqual({
-        permission: { version: 1, title: toolName },
-      });
-      expect(presentation.toolCall).toMatchObject({
-        title: toolName,
-        rawInput: input,
-      });
+      expect(presentation._meta).toMatchObject({ permission: { title: command } });
+      expect(presentation.toolCall.title).toBe(command);
     },
   );
 
