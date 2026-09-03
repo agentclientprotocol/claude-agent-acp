@@ -21,13 +21,14 @@
  *    one, because the first turn was the one that signed out, the recreation
  *    starts a fresh query under the same session id instead.
  *
- * One case is left open. The CLI re-reads its credential store on its own. A
- * file-based credential can therefore be removed and replaced by a claude.ai
- * subscription between two turns. This covers a managed Console key and a key
- * from a settings helper. No turn fails in between, so nothing ends the query,
- * and the cached account still names the key that is gone. Closing this case
- * would cost one `initialize` control request per turn. That buys too little
- * for the price.
+ * A file-based credential replaced by a subscription between two turns is seen
+ * by the CLI probe the agent fires at the START of every user prompt. That read
+ * is never awaited, so it usually lands mid-turn; all it does there is mark the
+ * session. The guard consumes the mark at the turn boundary — the next prompt
+ * recreates the query and layer 1 judges the account the new `initialize`
+ * reports — so a probe never interrupts a running turn. A swap that happens
+ * after the last probe stays unseen until the next prompt reads the store
+ * again. Closing that window would cost a blocking read per turn.
  */
 
 import { RequestError } from "@agentclientprotocol/sdk";
@@ -192,6 +193,12 @@ type GuardOptions = {
   /** Built lazily: most turns pass and never need a controller. */
   sessionFailures: () => SessionFailureController;
   logger: GuardLogger;
+  /** Display hook: called with the account the guard just read, before the
+   *  guard decides on it. It exists so a refused turn still reports which
+   *  account it was refused for. Purely observational — this module knows
+   *  nothing about what the caller does with it, and a throw from here never
+   *  changes the verdict. */
+  onAccount?: (account: AccountInfo) => void;
 };
 
 /**
@@ -240,6 +247,16 @@ async function evaluateGuard(options: GuardOptions): Promise<RequestError | unde
   const account = await readGuardAccount(options);
   if (!account) {
     return undefined;
+  }
+  // Before the decision, so the client learns the identity even when the next
+  // lines refuse the turn. A display hook must never fail a guard.
+  try {
+    options.onAccount?.(account);
+  } catch (error) {
+    options.logger.error(
+      `Session ${options.sessionId}: the guard's onAccount hook threw:`,
+      error instanceof Error ? error.message : String(error),
+    );
   }
   if (billsClaudeSubscription(account)) {
     await publishRefusal(options.sessionFailures(), {

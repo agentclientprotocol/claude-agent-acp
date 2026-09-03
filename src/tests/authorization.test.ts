@@ -32,9 +32,30 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => ({
   query: mockQuery,
 }));
 
+/** The agent probes `claude auth status --json` at the start of every user
+ *  prompt. Stub the exec so no test here spawns a real CLI: the probe is left
+ *  hanging, which reports nothing and therefore never pushes an identity of its
+ *  own. What these tests watch is the account the session and the guard
+ *  report. */
+const execFileSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("node:child_process", async () => {
+  const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  return { ...actual, execFile: execFileSpy };
+});
+
 describe("authorization", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    // Skip native-binary resolution; the exec itself is stubbed.
+    process.env.CLAUDE_CODE_EXECUTABLE = "claude";
+    execFileSpy.mockImplementation(
+      (_file: string, args: string[], cb: (...a: unknown[]) => void) => {
+        // `auth status` never answers, so the probe stays pending and silent.
+        if (args[1] === "status") return;
+        cb(null, { stdout: "", stderr: "" });
+      },
+    );
     // Set here (not in vi.fn(impl) at hoist time) so the helper import is
     // available; afterEach's resetAllMocks clears it, beforeEach re-sets it.
     mockQuery.mockImplementation(() =>
@@ -58,18 +79,31 @@ describe("authorization", () => {
     vi.runAllTimers();
     vi.useRealTimers();
 
+    delete process.env.CLAUDE_CODE_EXECUTABLE;
     vi.unstubAllGlobals();
     vi.resetAllMocks();
   });
 
-  async function createAgentMock(): Promise<[ClaudeAcpAgent, Mock]> {
+  /** Third element: the `extNotification` spy, so a test can read the
+   *  `_auth/status_update` pushes the agent sent. */
+  async function createAgentMock(): Promise<[ClaudeAcpAgent, Mock, Mock]> {
+    const extNotification = vi.fn(async () => {});
     const connectionMock = {
       sessionUpdate: async (_: any) => {},
-    } as AcpClient;
+      extNotification,
+    } as unknown as AcpClient;
 
     const agent = new ClaudeAcpAgent(connectionMock);
 
-    return [agent, mockQuery];
+    return [agent, mockQuery, extNotification];
+  }
+
+  /** The `_auth/status_update` payloads pushed through an `extNotification` spy,
+   *  in the order they were sent. */
+  function authStatusUpdates(extNotification: Mock) {
+    return extNotification.mock.calls
+      .filter((call) => call[0] === "_auth/status_update")
+      .map((call) => (call[1] as { authStatus: any }).authStatus);
   }
 
   it("gateway auth not offered without capability", async () => {
@@ -297,20 +331,22 @@ describe("authorization", () => {
     function createRecordingAgent(
       capable: boolean,
       logger?: { log: (...args: any[]) => void; error: (...args: any[]) => void; warn?: any },
-    ): [ClaudeAcpAgent, any[]] {
+    ): [ClaudeAcpAgent, any[], Mock] {
       const updates: any[] = [];
+      const extNotification = vi.fn(async () => {});
       const agent = new ClaudeAcpAgent(
         {
           sessionUpdate: async (update: any) => {
             updates.push(update);
           },
+          extNotification,
         } as unknown as AcpClient,
         logger,
       );
       if (capable) {
         (agent as any).clientCapabilities = airSessionFailureCapabilities;
       }
-      return [agent, updates];
+      return [agent, updates, extNotification];
     }
 
     function failuresIn(updates: any[]) {
@@ -516,6 +552,29 @@ describe("authorization", () => {
         await expect(agent.newSession(newSessionParams())).rejects.toMatchObject(refusal);
       });
 
+      it("reports the refused account before the refusal reaches the client", async () => {
+        const [agent, , extNotification] = await createAgentMock();
+        hideClaudeAuth();
+        mockAccount({ subscriptionType: "pro" });
+
+        // A refusal without an account behind it is unreadable in the UI, so
+        // the identity must be on the wire before `newSession` rejects.
+        const order: string[] = [];
+        extNotification.mockImplementation(async (method: string) => {
+          if (method === "_auth/status_update") order.push("update");
+        });
+
+        await agent.newSession(newSessionParams()).then(
+          () => order.push("resolved"),
+          () => order.push("rejected"),
+        );
+
+        expect(order).toEqual(["update", "rejected"]);
+        expect(authStatusUpdates(extNotification)).toEqual([
+          { kind: "account", label: "Claude Pro", account: { plan: "pro" } },
+        ]);
+      });
+
       it("rejects loadSession the same way", async () => {
         const [agent] = await createAgentMock();
         hideClaudeAuth();
@@ -643,6 +702,21 @@ describe("authorization", () => {
         expect(agent.resolveProviderConfig()).toBeNull();
       });
 
+      it("reports no identity for a gateway payload it rejected", async () => {
+        const [agent, , extNotification] = await createAgentMock();
+
+        await expect(
+          agent.authenticate({
+            methodId: "gateway",
+            _meta: { gateway: { baseUrl: "not-a-url" } },
+          } as any),
+        ).rejects.toMatchObject({ code: INVALID_PARAMS_CODE });
+        // The identity is assigned only after the payload was accepted and
+        // stored, so a refused login leaves the reported state untouched.
+        expect(authStatusUpdates(extNotification)).toEqual([]);
+        expect(agent.currentAuthStatus).toBeUndefined();
+      });
+
       it("rejects an empty baseUrl instead of disabling the guard", async () => {
         const [agent] = await createAgentMock();
         hideClaudeAuth();
@@ -678,6 +752,35 @@ describe("authorization", () => {
         expect(accountInfo).toHaveBeenCalledTimes(1);
         // Refused before anything reached the SDK: no turn was queued.
         expect(agent.sessions[sessionId].turnQueue ?? []).toHaveLength(0);
+      });
+
+      it("reports the account of a refused turn before the turn rejects", async () => {
+        const [agent, , extNotification] = await createAgentMock();
+        hideClaudeAuth();
+        // Spawn-time account passes; the store changes underneath the session.
+        mockAccount(SIGNED_IN_WITH_KEY, {
+          accountInfo: async () => ({ subscriptionType: "pro" }),
+        });
+        const { sessionId } = await agent.newSession(newSessionParams());
+
+        // Drop the create-time `api_key` push; this test is about the turn.
+        extNotification.mockClear();
+        const order: string[] = [];
+        extNotification.mockImplementation(async (method: string) => {
+          if (method === "_auth/status_update") order.push("update");
+        });
+
+        await agent.prompt(promptParams(sessionId)).then(
+          () => order.push("resolved"),
+          () => order.push("rejected"),
+        );
+
+        expect(order).toEqual(["update", "rejected"]);
+        // The session was created on a key; the guard read the subscription
+        // the store now holds, and that is what the client is told.
+        expect(authStatusUpdates(extNotification)).toEqual([
+          { kind: "account", label: "Claude Pro", account: { plan: "pro" } },
+        ]);
       });
 
       it("publishes one session-scoped access failure for capable clients", async () => {
@@ -1017,6 +1120,28 @@ describe("authorization", () => {
         expect(mockQuery).toHaveBeenCalledTimes(2);
       });
 
+      it("reports the identity the respawned session logged back in with", async () => {
+        const [agent, , extNotification] = createRecordingAgent(true);
+        hideClaudeAuth();
+        // Signed out on a key from the environment, back in on a helper key.
+        mockQueries(
+          { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
+          { account: { apiKeySource: "apiKeyHelper" }, script: [[successResult()]] },
+        );
+        const sessionId = await signOutDuringTurn(agent);
+
+        await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+          stopReason: "end_turn",
+        });
+
+        // The respawn runs a full `createSession`, which reports the new
+        // account by itself — no CLI probe is needed for the post-login state.
+        expect(authStatusUpdates(extNotification)).toEqual([
+          { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_API_KEY" },
+          { kind: "api_key", label: "Anthropic API key", detail: "apiKeyHelper" },
+        ]);
+      });
+
       it("answers a cancel during the dead state", async () => {
         const [agent] = createRecordingAgent(true);
         hideClaudeAuth();
@@ -1124,6 +1249,228 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toThrow("boom");
         // One recreate attempt, no fallback.
         expect(mockQuery).toHaveBeenCalledTimes(2);
+      });
+
+      describe("recreates when the start-of-prompt probe finds another identity", () => {
+        /** `claude auth status --json` on a claude.ai subscription. */
+        const PROBE_SUBSCRIPTION = JSON.stringify({
+          loggedIn: true,
+          authMethod: "claude.ai",
+          apiProvider: "firstParty",
+          subscriptionType: "max",
+          email: "x@y",
+        });
+        /** The same kind of identity the session was created on. */
+        const PROBE_KEY = JSON.stringify({
+          loggedIn: true,
+          apiKeySource: "ANTHROPIC_API_KEY",
+          apiProvider: "firstParty",
+        });
+        /** An OAuth token names no identity: `accountInfoHasIdentitySignal`
+         *  ignores `tokenSource`, so the session gets no `accountKind`. */
+        const SIGNED_IN_WITH_TOKEN = { tokenSource: "CLAUDE_CODE_OAUTH_TOKEN" };
+
+        /** What the fake `claude auth status --json` prints. `undefined` keeps
+         *  the outer stub, where the probe never answers at all. */
+        let probeStdout: string | undefined;
+
+        beforeEach(() => {
+          probeStdout = undefined;
+          execFileSpy.mockImplementation((...invocation: unknown[]) => {
+            const args = invocation[1] as string[];
+            const cb = invocation[invocation.length - 1] as (...a: unknown[]) => void;
+            if (args[1] === "status") {
+              if (probeStdout !== undefined) cb(null, { stdout: probeStdout, stderr: "" });
+              return;
+            }
+            cb(null, { stdout: "", stderr: "" });
+          });
+        });
+
+        /** The probe is never awaited, so let its promise chain run. */
+        async function settleProbe() {
+          for (let round = 0; round < 5; round++) await vi.advanceTimersByTimeAsync(0);
+        }
+
+        function deferred() {
+          let resolve!: () => void;
+          const promise = new Promise<void>((settle) => (resolve = settle));
+          return { promise, resolve };
+        }
+
+        /** Spawn scripting whose FIRST query hangs after echoing the prompt,
+         *  until `held` resolves. That is the window in which the probe lands:
+         *  the turn is live and producing. Later spawns are ordinary scripted
+         *  queries, so the respawn behaves as everywhere else. */
+        function mockHeldFirstTurn(
+          account: Record<string, unknown>,
+          held: Promise<void>,
+          ...later: Array<{ account: Record<string, unknown>; script: any[][] }>
+        ) {
+          let spawn = 0;
+          mockQuery.mockImplementation((args: any) => {
+            const index = spawn++;
+            if (index > 0) {
+              const next = later[Math.min(index - 1, later.length - 1)];
+              return scriptedQuery(args, next.account, next.script);
+            }
+            const input = args.prompt;
+            async function* messages() {
+              const iterator = input[Symbol.asyncIterator]();
+              for (;;) {
+                const { value, done } = await iterator.next();
+                if (done || !value) return;
+                yield {
+                  type: "user",
+                  message: value.message,
+                  parent_tool_use_id: null,
+                  uuid: value.uuid,
+                  session_id: "test-session",
+                  isReplay: true,
+                };
+                await held;
+                yield successResult();
+              }
+            }
+            const query: any = messages();
+            query.initializationResult = async () => ({ models, account });
+            query.accountInfo = async () => account;
+            query.setModel = async () => {};
+            query.setPermissionMode = async () => {};
+            query.supportedCommands = async () => [];
+            query.mcpServerStatus = async () => [];
+            query.getContextUsage = async () => DEFAULT_CONTEXT_USAGE;
+            query.close = vi.fn();
+            query.interrupt = vi.fn(async () => {});
+            query.stopTask = vi.fn(async () => {});
+            return query;
+          });
+        }
+
+        it("lets the marked turn finish and recreates at the NEXT prompt", async () => {
+          // The probe now fires at the start of the prompt, so its answer
+          // usually arrives while that very turn is still running. The mark is
+          // a flag and nothing more: the turn keeps its query to the end, and
+          // only the following prompt consumes it.
+          const [agent] = createRecordingAgent(true);
+          hideClaudeAuth();
+          probeStdout = PROBE_SUBSCRIPTION;
+          const held = deferred();
+          mockHeldFirstTurn(SIGNED_IN_WITH_KEY, held.promise, {
+            account: { subscriptionType: "pro" },
+            script: [],
+          });
+          const { sessionId } = await agent.newSession(newSessionParams());
+
+          const turn = agent.prompt(promptParams(sessionId));
+          await settleProbe();
+
+          // Marked mid-turn, but the query is untouched and no respawn ran.
+          expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+          expect(agent.sessions[sessionId].queryClosed).toBeFalsy();
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+
+          held.resolve();
+          await expect(turn).resolves.toMatchObject({ stopReason: "end_turn" });
+          // The turn completed on the query it started on.
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+
+          // Now the boundary: the next prompt recreates and the creation guard
+          // judges the subscription the CLI swapped in.
+          await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
+          expect(mockQuery).toHaveBeenCalledTimes(2);
+          expect(mockQuery.mock.calls[1][0].options).toMatchObject({ resume: sessionId });
+        });
+
+        it("marks the session when the probe kind differs from the account", async () => {
+          const [agent] = createRecordingAgent(true);
+          hideClaudeAuth();
+          probeStdout = PROBE_SUBSCRIPTION;
+          mockQueries(
+            { account: SIGNED_IN_WITH_KEY, script: [[successResult()]] },
+            { account: { subscriptionType: "pro" }, script: [] },
+          );
+          const { sessionId } = await agent.newSession(newSessionParams());
+
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          await settleProbe();
+          expect(agent.sessions[sessionId].needsSignOutRespawn).toBe(true);
+
+          // The probe refuses nothing itself: the next prompt recreates the
+          // query, and the creation guard judges the account it reports.
+          await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
+          expect(mockQuery).toHaveBeenCalledTimes(2);
+          expect(mockQuery.mock.calls[1][0].options).toMatchObject({ resume: sessionId });
+        });
+
+        it("leaves the session alone when the probe finds the same kind", async () => {
+          const [agent] = createRecordingAgent(true);
+          hideClaudeAuth();
+          probeStdout = PROBE_KEY;
+          mockQueries({
+            account: SIGNED_IN_WITH_KEY,
+            script: [[successResult()], [successResult()]],
+          });
+          const { sessionId } = await agent.newSession(newSessionParams());
+
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          await settleProbe();
+          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+        });
+
+        it("never marks a session without the flag", async () => {
+          const [agent] = createRecordingAgent(true);
+          probeStdout = PROBE_SUBSCRIPTION;
+          mockQueries({
+            account: SIGNED_IN_WITH_KEY,
+            script: [[successResult()], [successResult()]],
+          });
+          const { sessionId } = await agent.newSession(newSessionParams());
+
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          await settleProbe();
+
+          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+        });
+
+        it("never marks a session whose account named no identity", async () => {
+          const [agent] = createRecordingAgent(true);
+          hideClaudeAuth();
+          probeStdout = PROBE_SUBSCRIPTION;
+          mockQueries({
+            account: SIGNED_IN_WITH_TOKEN,
+            script: [[successResult()], [successResult()]],
+          });
+          const { sessionId } = await agent.newSession(newSessionParams());
+
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          await settleProbe();
+
+          // Nothing to compare: an absent kind is not a mismatch.
+          expect(agent.sessions[sessionId].accountKind).toBeUndefined();
+          expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
+          await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+            stopReason: "end_turn",
+          });
+          expect(mockQuery).toHaveBeenCalledTimes(1);
+        });
       });
     });
 
