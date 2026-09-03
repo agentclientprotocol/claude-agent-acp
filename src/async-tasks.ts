@@ -460,7 +460,7 @@ export class AsyncTaskRuntime {
         asyncTaskId: task.id,
         name: task.name,
         taskType: task.taskType,
-        description: task.description,
+        ...(task.description !== task.name ? { description: task.description } : {}),
         showInTranscript: task.showInTranscript,
         canStop: true,
         ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),

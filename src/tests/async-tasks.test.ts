@@ -56,12 +56,12 @@ describe("AsyncTaskRuntime", () => {
       asyncTaskId: "bpux8xmfg",
       name: "npm run build",
       taskType: "shell",
-      description: "npm run build",
       showInTranscript: true,
       canStop: true,
       outputFilePath: "/private/tmp/claude/tasks/bpux8xmfg.output",
       toolCallId: "bash-tool",
     });
+    expect(updates[0].update).not.toHaveProperty("description");
   });
 
   it("publishes a stopped terminal after a task-specific stop", async () => {
@@ -339,6 +339,7 @@ describe("AsyncTaskRuntime", () => {
       asyncTaskId: "task-1",
       name: "assets",
       taskType: "workflow",
+      description: "Build generated assets",
       showInTranscript: true,
     });
     expect(published[1]?.update).toMatchObject({
@@ -453,9 +454,10 @@ describe("AsyncTaskRuntime", () => {
       "async_task_state_update",
     ]);
     expect(published[0]?.update).toMatchObject({
-      description: "Fast build",
+      name: "Fast build",
       outputFilePath: "/tmp/tasks/fast-shell.output",
     });
+    expect(published[0]?.update).not.toHaveProperty("description");
     expect(published[1]?.update).toMatchObject({
       state: "completed",
       summary: "Already done",
@@ -630,9 +632,9 @@ describe("AsyncTaskRuntime", () => {
       sessionUpdate: "async_task_spawned",
       asyncTaskId: "lost-start",
       taskType: "shell",
-      description: "Build",
       showInTranscript: false,
     });
+    expect(published[0]?.update).not.toHaveProperty("description");
   });
 
   it("keeps level-only recovery panel-only when task_started arrives late", async () => {
