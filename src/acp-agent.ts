@@ -112,6 +112,11 @@ import {
 } from "./native-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "./air-extension.js";
 import {
+  asyncTaskCliSource,
+  type AsyncTaskReadiness,
+  type AsyncTaskReadinessMeta,
+} from "./async-task-readiness.js";
+import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
   clientSupportsAsyncTasks,
@@ -603,6 +608,10 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
+  /** Async task readiness for this session. Absent means `unconfirmed`; it
+   *  latches to `confirmed` on the first observed task lifecycle event and
+   *  never moves again, so the client is told exactly once. */
+  asyncTaskReadiness?: AsyncTaskReadiness;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -1960,6 +1969,14 @@ export class ClaudeAcpAgent {
           controlMethod: GOAL_CONTROL_METHOD,
           actions: [...GOAL_ACTIONS],
         } satisfies GoalCapability,
+        // Which binary `claudeCliPath()` resolves through is fixed for the
+        // adapter process, so async-task CLI provenance is reported once here
+        // rather than repeated on every session. A sibling of `steering` and
+        // `goal` rather than a member of the `air` object, which peers match
+        // as a closed shape.
+        asyncTaskReadiness: {
+          cli: { source: asyncTaskCliSource() },
+        } satisfies AsyncTaskReadinessMeta,
       },
     };
   }
@@ -2290,6 +2307,28 @@ export class ClaudeAcpAgent {
       update: {
         sessionUpdate: "session_info_update",
         _meta: { goal },
+      },
+    });
+  }
+
+  /** Latches async task readiness to `confirmed` on the first task lifecycle
+   *  event observed for the session, and publishes it once. Later events are
+   *  no-ops, so a session emits at most one readiness frame however much
+   *  background work it runs.
+   *
+   *  Sent directly rather than through a turn's `sendUpdate`, matching the
+   *  async-task and subagent runtimes: this is session state, so it must not
+   *  be routed to a subagent session or counted as answer delivery. */
+  private async confirmAsyncTaskReadiness(session: Session, sessionId: string): Promise<void> {
+    if (session.asyncTaskReadiness === "confirmed") return;
+    session.asyncTaskReadiness = "confirmed";
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          asyncTaskReadiness: { readiness: "confirmed" } satisfies AsyncTaskReadinessMeta,
+        },
       },
     });
   }
@@ -3821,6 +3860,20 @@ export class ClaudeAcpAgent {
                   parentToolUseId: message.tool_use_id,
                   isSubagent: !!message.subagent_type,
                 });
+                // Only for a client that negotiated the async task lifecycle:
+                // readiness describes that stream, so a client which opted out
+                // of it gains nothing from being told the stream is live.
+                //
+                // Published ahead of both runtimes on purpose. This is the
+                // session's one readiness frame, and emitting it before the
+                // handlers that stream a task's own updates keeps it out of the
+                // tail of the sequence, where consumers read a turn's outcome.
+                // It also has to run for subagent tasks, which
+                // `AsyncTaskRuntime` ignores: those prove the lifecycle is live
+                // while publishing nothing the client could infer it from.
+                if (asyncTasks.enabled) {
+                  await this.confirmAsyncTaskReadiness(session, params.sessionId);
+                }
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
