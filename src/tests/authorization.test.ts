@@ -1041,6 +1041,90 @@ describe("authorization", () => {
         expect(agent.sessions[sessionId].needsSignOutRespawn).toBeUndefined();
         expect(mockQuery).toHaveBeenCalledTimes(1);
       });
+
+      /** The CLI writes a conversation only after a turn produced something.
+       *  A session that signed out on its very first turn has none, so its
+       *  `resume` fails. `initError` is how that reaches `createSession`. */
+      function mockQuerySpawns(
+        ...spawns: Array<{
+          account?: Record<string, unknown>;
+          script?: any[][];
+          initError?: Error;
+        }>
+      ) {
+        let spawn = 0;
+        mockQuery.mockImplementation((args: any) => {
+          const current = spawns[Math.min(spawn, spawns.length - 1)];
+          spawn += 1;
+          const query = scriptedQuery(
+            args,
+            current.account ?? SIGNED_IN_WITH_KEY,
+            current.script ?? [],
+          );
+          if (current.initError) {
+            const error = current.initError;
+            query.initializationResult = async () => {
+              throw error;
+            };
+          }
+          return query;
+        });
+      }
+
+      const NO_CONVERSATION = () => new Error("No conversation found with session ID abc-123-def");
+
+      it("starts a fresh query when the conversation was never persisted", async () => {
+        const [agent] = createRecordingAgent(true);
+        hideClaudeAuth();
+        mockQuerySpawns(
+          { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
+          { initError: NO_CONVERSATION() },
+          { account: SIGNED_IN_WITH_KEY, script: [[successResult()]] },
+        );
+        const sessionId = await signOutDuringTurn(agent);
+
+        await expect(agent.prompt(promptParams(sessionId))).resolves.toMatchObject({
+          stopReason: "end_turn",
+        });
+
+        // Resume, then the fallback: a NEW conversation under the same id.
+        expect(mockQuery).toHaveBeenCalledTimes(3);
+        const fallback = mockQuery.mock.calls[2][0].options;
+        expect(fallback.sessionId).toBe(sessionId);
+        expect(fallback.resume).toBeUndefined();
+        expect(agent.sessions[sessionId]).toBeDefined();
+      });
+
+      it("refuses the fresh query when the guard rejects the new account", async () => {
+        const [agent] = createRecordingAgent(true);
+        hideClaudeAuth();
+        mockQuerySpawns(
+          { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
+          { initError: NO_CONVERSATION() },
+          { account: { subscriptionType: "pro" }, script: [] },
+        );
+        const sessionId = await signOutDuringTurn(agent);
+
+        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
+        // The husk stays addressable: the next prompt meets the guard again,
+        // not "Session not found".
+        await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
+        expect(agent.sessions[sessionId]).toBeDefined();
+      });
+
+      it("does not retry a resume that failed for another reason", async () => {
+        const [agent] = createRecordingAgent(true);
+        hideClaudeAuth();
+        mockQuerySpawns(
+          { account: SIGNED_IN_WITH_KEY, script: [[signOutResult()]] },
+          { initError: new Error("boom") },
+        );
+        const sessionId = await signOutDuringTurn(agent);
+
+        await expect(agent.prompt(promptParams(sessionId))).rejects.toThrow("boom");
+        // One recreate attempt, no fallback.
+        expect(mockQuery).toHaveBeenCalledTimes(2);
+      });
     });
 
     describe("reason-aware failure dedupe", () => {

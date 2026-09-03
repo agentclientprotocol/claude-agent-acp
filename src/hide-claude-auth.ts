@@ -17,6 +17,9 @@
  *    `providers/disable` later removed.
  * 2. A sign-out during the session ends the query. The next turn recreates it,
  *    so the next `initialize` reports the real account and layer 1 judges it.
+ *    The recreation resumes the stored conversation. When the CLI never wrote
+ *    one, because the first turn was the one that signed out, the recreation
+ *    starts a fresh query under the same session id instead.
  *
  * One case is left open. The CLI re-reads its credential store on its own. A
  * file-based credential can therefore be removed and replaced by a claude.ai

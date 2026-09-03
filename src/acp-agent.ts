@@ -2365,6 +2365,10 @@ export class ClaudeAcpAgent {
    *  the caller must go on with: the new one, or the argument when no
    *  recreation is due.
    *
+   *  When the CLI never persisted that conversation — the first turn was the
+   *  one that signed out — the resume cannot succeed, so a fresh query starts
+   *  under the same id. The session then keeps working, with an empty history.
+   *
    *  The recreation runs the full creation guard, so a subscription account is
    *  refused with the subscription reason, a still-signed-out account with the
    *  plain sign-out error, and an accepted credential proceeds. A refusal keeps
@@ -2413,6 +2417,24 @@ export class ClaudeAcpAgent {
       // the new query continues the same conversation under the same id.
       await this.createSession(creationParams, { resume: sessionId });
     } catch (error) {
+      if (error instanceof RequestError && error.code === RequestError.resourceNotFound().code) {
+        // The CLI never wrote this conversation, because the very first turn
+        // was the one that signed out. Resuming it fails for ever, so start a
+        // fresh query under the same ACP session id: an empty history is a far
+        // better answer than a session the client can never use again.
+        this.logger.log(
+          `session ${sessionId} was never persisted; starting a fresh query under the same id`,
+        );
+        try {
+          await this.createSession(creationParams, { reuseSessionId: sessionId });
+          return;
+        } catch (fallbackError) {
+          if (!this.sessions[sessionId]) {
+            this.sessions[sessionId] = session;
+          }
+          throw fallbackError;
+        }
+      }
       // Keep the husk addressable: the client answers the refusal with its own
       // auth flow and then retries this session.
       if (!this.sessions[sessionId]) {
@@ -7172,6 +7194,11 @@ export class ClaudeAcpAgent {
       forkSession?: boolean;
       publicSessionId?: string;
       permissionMode?: PermissionMode;
+      /** Start a NEW conversation, but under this id instead of a random one.
+       *  `resume` continues a stored conversation and fails when the CLI never
+       *  wrote one; this keeps the ACP session id alive with an empty history.
+       *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
+      reuseSessionId?: string;
     } = {},
   ): Promise<NewSessionResponse> {
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
@@ -7190,6 +7217,11 @@ export class ClaudeAcpAgent {
       sessionId = randomUUID();
     } else if (creationOpts.resume) {
       sessionId = creationOpts.resume;
+    } else if (creationOpts.reuseSessionId) {
+      // A new conversation that keeps the old id. `resume` stays unset, so the
+      // id below reaches the SDK as `options.sessionId` — the caller-chosen id
+      // of a fresh session.
+      sessionId = creationOpts.reuseSessionId;
     } else {
       sessionId = randomUUID();
     }
