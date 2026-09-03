@@ -162,6 +162,18 @@ import {
   supportsAirSessionFailures,
 } from "./session-failure-extension.js";
 import {
+  billsClaudeSubscription,
+  CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
+  CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
+  claudeLoginRequiredError,
+  type ClaudeSubscriptionGuardState,
+  claudeSubscriptionNotSupportedError,
+  holdsNonSubscriptionCredential,
+  refuseClaudeSubscriptionTurn,
+  shouldHideClaudeAuth,
+  warnClaudeSubscriptionGuardDegraded,
+} from "./hide-claude-auth.js";
+import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
   agentFileChangeReportRequestId,
@@ -243,6 +255,8 @@ function isEmptyUserInterruptionDiagnostic(
 export interface Logger {
   log: (...args: any[]) => void;
   error: (...args: any[]) => void;
+  /** Optional: a caller that supplies no `warn` gets its warnings on `error`. */
+  warn?: (...args: any[]) => void;
 }
 
 type AccumulatedUsage = {
@@ -952,6 +966,16 @@ export type Session = {
    *  Keeping it on the Session lets replay seed a failure that the persistent
    *  consumer can later clear with the same id and a higher revision. */
   sessionFailureState: SessionFailureState;
+  /** State of the `--hide-claude-auth` subscription guard for this session.
+   *  Built on the first guarded turn; most sessions never need it. */
+  claudeSubscriptionGuard?: ClaudeSubscriptionGuardState;
+  /** Set under `--hide-claude-auth` when the CLI reported a sign-out during
+   *  this session. The query is closed and the account it cached at
+   *  `initialize` now describes a credential that no longer works, so the next
+   *  turn recreates the query before it runs. */
+  needsSignOutRespawn?: boolean;
+  /** The in-flight recreation, so turns that arrive together share one. */
+  signOutRespawn?: Promise<void>;
 };
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
@@ -1068,14 +1092,22 @@ type GatewayAuthMeta = {
    * - Redirect API calls via baseUrl
    * - Inject custom headers
    * - Bypass the default Claude login requirement
+   *
+   * Both members are optional in the type because the payload arrives
+   * unvalidated from the client. `authenticate` rejects a request that lacks a
+   * usable `baseUrl`.
    */
-  gateway: {
-    baseUrl: string;
-    headers: Record<string, string>;
+  gateway?: {
+    baseUrl?: string;
+    headers?: Record<string, string>;
   };
 };
 
 type GatewayAuthRequest = AuthenticateRequest & { _meta?: GatewayAuthMeta };
+
+/** The JSON-RPC code ACP assigns to `authRequired`. Read from the SDK so it
+ *  cannot drift from the errors this agent throws. */
+const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
 
 const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
 const PROVIDER_ID = "main";
@@ -1336,10 +1368,6 @@ function isMuslLibc(): boolean {
   const report = process.report?.getReport() as
     { header?: { glibcVersionRuntime?: string } } | undefined;
   return !report?.header?.glibcVersionRuntime;
-}
-
-function shouldHideClaudeAuth(): boolean {
-  return process.argv.includes("--hide-claude-auth");
 }
 
 /** Returned to clients when a prompt or cancel targets a session whose SDK
@@ -2031,8 +2059,35 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /**
+   * `authenticate` — the legacy gateway methods store a provider override that
+   * every later session reads. Validate the payload here, with the same base
+   * URL rule as `providers/set`. An unchecked payload either throws a
+   * `TypeError` deep in session creation, or installs an empty base URL that
+   * silently turns the `--hide-claude-auth` subscription guard off.
+   *
+   * A call that carries no gateway payload at all keeps its historical
+   * meaning: it installs no override and succeeds. That has always been a
+   * no-op here, and a client that probes the method this way must keep
+   * working. Only a payload that IS present has to be usable.
+   */
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
+      const gateway = (_params as GatewayAuthRequest)._meta?.gateway;
+      if (gateway !== undefined && gateway !== null) {
+        if (typeof gateway !== "object" || !isValidBaseUrl(gateway.baseUrl)) {
+          throw RequestError.invalidParams(
+            { baseUrl: (gateway as { baseUrl?: unknown }).baseUrl },
+            "`_meta.gateway.baseUrl` must be a non-empty absolute http(s) URL.",
+          );
+        }
+        if (gateway.headers !== undefined && typeof gateway.headers !== "object") {
+          throw RequestError.invalidParams(
+            undefined,
+            "`_meta.gateway.headers` must be an object of header names to values.",
+          );
+        }
+      }
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
       return;
     }
@@ -2188,16 +2243,21 @@ export class ClaudeAcpAgent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    const session = this.sessions[params.sessionId];
+    let session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
     }
+    const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
+    if (signOutRespawn) session = await signOutRespawn;
     // The SDK query stream already terminated (see `queryClosed`); its iterator
     // can't be revived, so enqueueing here would hang on a deferred that never
     // settles. Fail clearly and let the client start a fresh session.
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
+
+    const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
+    if (subscriptionGuard) await subscriptionGuard;
 
     if (session.autoModeFallbackWarningPending) {
       await this.sessionModes.publishFallbackWarning(params.sessionId, session);
@@ -2264,6 +2324,135 @@ export class ClaudeAcpAgent {
     this.ensureConsumer(session, params.sessionId);
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
     return response;
+  }
+
+  /** `--hide-claude-auth` applies only to the CLI's own login. A provider
+   *  override (`providers/set` or gateway `authenticate`) routes traffic away
+   *  from it, so the subscription guard is off while one is active. */
+  private claudeSubscriptionGuardActive(): boolean {
+    return shouldHideClaudeAuth() && this.resolveProviderConfig() === null;
+  }
+
+  /** Record that the CLI signed out during this session, and end the query.
+   *
+   *  Only under `--hide-claude-auth`. The account cached at `initialize` is
+   *  this integration's source of truth, and a sign-out proves that account
+   *  wrong: the credential behind it is gone, and whatever replaces it is
+   *  invisible until a new `initialize` runs. Closing the query here makes the
+   *  next turn recreate it, so the creation guard decides on the real account.
+   *
+   *  Idempotent: one sign-out reaches this twice (the synthetic login message
+   *  and the turn's error-shaped result), and the second call must not close
+   *  a stream the first one already closed. Closing settles the queued turns
+   *  through the consumer's end-of-stream path, which rejects each one. */
+  private markSessionForSignOutRespawn(sessionId: string, session: Session): void {
+    if (!shouldHideClaudeAuth() || session.needsSignOutRespawn) {
+      return;
+    }
+    if (!session.creationParams) {
+      this.logger.error(
+        `Session ${sessionId}: signed out, but the creation params are missing; cannot recreate the query`,
+      );
+      return;
+    }
+    session.needsSignOutRespawn = true;
+    this.logger.log(`Session ${sessionId}: signed out; the query is recreated on the next turn`);
+    this.closeQueryStream(session);
+  }
+
+  /** Recreate the query of a signed-out session, keeping the ACP session id and
+   *  resuming the Claude session so the history survives. Returns the session
+   *  the caller must go on with: the new one, or the argument when no
+   *  recreation is due.
+   *
+   *  The recreation runs the full creation guard, so a subscription account is
+   *  refused with the subscription reason, a still-signed-out account with the
+   *  plain sign-out error, and an accepted credential proceeds. A refusal keeps
+   *  the old husk in the session map, so the client can sign in and retry on
+   *  the same session instead of meeting "Session not found".
+   *
+   *  Returns `undefined`, not a resolved promise, when no recreation is due:
+   *  the callers enqueue their turn in one synchronous section, and an extra
+   *  microtask there would let the caller observe a half-built turn. */
+  private respawnSignedOutSession(
+    sessionId: string,
+    session: Session,
+  ): Promise<Session> | undefined {
+    if (!session.needsSignOutRespawn) {
+      return undefined;
+    }
+    return this.awaitSignOutRespawn(sessionId, session);
+  }
+
+  private async awaitSignOutRespawn(sessionId: string, session: Session): Promise<Session> {
+    const respawn = (session.signOutRespawn ??= this.recreateSignedOutQuery(
+      sessionId,
+      session,
+    ).finally(() => {
+      session.signOutRespawn = undefined;
+    }));
+    await respawn;
+    const respawned = this.sessions[sessionId];
+    if (!respawned) {
+      throw new Error("Session not found");
+    }
+    return respawned;
+  }
+
+  private async recreateSignedOutQuery(sessionId: string, session: Session): Promise<void> {
+    const creationParams = session.creationParams;
+    if (!creationParams) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+    this.logger.log(`Recreating Claude session ${sessionId} after a sign-out`);
+    // Already closed by `markSessionForSignOutRespawn`; idempotent here so a
+    // husk that reached this by another route still releases its resources.
+    this.closeQueryStream(session);
+    try {
+      // `resume` names the Claude session, which shares the ACP session id, so
+      // the new query continues the same conversation under the same id.
+      await this.createSession(creationParams, { resume: sessionId });
+    } catch (error) {
+      // Keep the husk addressable: the client answers the refusal with its own
+      // auth flow and then retries this session.
+      if (!this.sessions[sessionId]) {
+        this.sessions[sessionId] = session;
+      }
+      throw error;
+    }
+  }
+
+  /** Run the `--hide-claude-auth` guard before a turn starts. The returned
+   *  promise rejects with the `authRequired` error when a claude.ai
+   *  subscription would pay, or when the account holds no credential this
+   *  integration accepts. Every entry point that starts a turn must await it,
+   *  so the refusal reaches the client instead of a detached promise.
+   *
+   *  Returns `undefined`, not a resolved promise, while the guard is off: the
+   *  callers run in the same synchronous section as the turn they enqueue, and
+   *  an extra microtask there would let the caller observe a half-built turn. */
+  private runClaudeSubscriptionGuard(
+    sessionId: string,
+    session: Session,
+  ): Promise<void> | undefined {
+    if (!this.claudeSubscriptionGuardActive()) {
+      return undefined;
+    }
+    return refuseClaudeSubscriptionTurn({
+      sessionId,
+      query: session.query,
+      guardState: (session.claudeSubscriptionGuard ??= {}),
+      logger: this.logger,
+      sessionFailures: () =>
+        new SessionFailureController({
+          sessionId,
+          state: session.sessionFailureState,
+          capabilities: this.clientCapabilities,
+          isCurrent: () => this.sessions[sessionId] === session,
+          sendUpdate: (notification) => this.client.sessionUpdate(notification),
+          logger: this.logger,
+        }),
+    });
   }
 
   async goal(params: GoalRequest): Promise<GoalControlResponse> {
@@ -2369,10 +2558,12 @@ export class ClaudeAcpAgent {
    *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
-    const session = this.sessions[sessionId];
+    let session = this.sessions[sessionId];
     if (!session) {
       throw new Error("Session not found");
     }
+    const signOutRespawn = this.respawnSignedOutSession(sessionId, session);
+    if (signOutRespawn) session = await signOutRespawn;
     if (session.queryClosed) {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
@@ -2393,6 +2584,13 @@ export class ClaudeAcpAgent {
         // a normal session/prompt whose lifecycle owns the continuation result.
         return { outcome: "promptRequired", reason: "noRunningTurn" };
       }
+
+      // The detached `prompt()` below swallows its own rejection, so run the
+      // `--hide-claude-auth` guard here and let it reject `steer` itself.
+      // Otherwise the refusal never reaches the client and the Host reads
+      // "startedNewTurn" for a turn that never started.
+      const subscriptionGuard = this.runClaudeSubscriptionGuard(sessionId, session);
+      if (subscriptionGuard) await subscriptionGuard;
 
       // Preserve the established default for Hosts that do not opt in. This is
       // intentionally detached for compatibility with the existing contract.
@@ -3081,6 +3279,10 @@ export class ClaudeAcpAgent {
         // That is the normal course here, not the lost-failure case `failActive`
         // logs an error for.
         if (session.activeTurn && !session.activeTurn.settled) failActive(error);
+        // The row is published and the turn is rejected. Under
+        // `--hide-claude-auth` the account cached at `initialize` is now
+        // wrong, so end the query and let the next turn recreate it.
+        this.markSessionForSignOutRespawn(params.sessionId, session);
         return;
       }
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
@@ -5592,6 +5794,21 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Release a query that was spawned but never registered as a session. */
+  private discardUnregisteredQuery(
+    q: Query,
+    input: Pushable<SDKUserMessage>,
+    settingsManager: SettingsManager,
+  ): void {
+    settingsManager.dispose();
+    input.end();
+    try {
+      q.close();
+    } catch (error) {
+      this.logger.error("Failed to close unregistered Claude query", error);
+    }
+  }
+
   /** Mark a session's SDK query stream as permanently ended and release the
    *  resources tied to it: drop the consumer handle, dispose the settings
    *  watchers, end the input stream, and close the query (which terminates the
@@ -7325,234 +7542,254 @@ export class ClaudeAcpAgent {
       options,
     });
 
-    let initializationResult;
+    // `query()` spawns the CLI at once. Any throw between here and the
+    // registration in `this.sessions` would leave that child process running
+    // with nobody holding the query, so discard it before propagating.
     try {
-      initializationResult = await q.initializationResult();
-    } catch (error) {
-      if (
-        creationOpts.resume &&
-        error instanceof Error &&
-        (error.message === "Query closed before response received" ||
-          error.message.includes("No conversation found with session ID"))
-      ) {
-        throw RequestError.resourceNotFound(sessionId);
+      let initializationResult;
+      try {
+        initializationResult = await q.initializationResult();
+      } catch (error) {
+        if (
+          creationOpts.resume &&
+          error instanceof Error &&
+          (error.message === "Query closed before response received" ||
+            error.message.includes("No conversation found with session ID"))
+        ) {
+          throw RequestError.resourceNotFound(sessionId);
+        }
+        throw error;
       }
+
+      // Shared with the per-turn guard, so "warn once" spans the whole session.
+      const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
+      if (this.claudeSubscriptionGuardActive()) {
+        if (!initializationResult.account) {
+          warnClaudeSubscriptionGuardDegraded({
+            sessionId,
+            guardState: claudeSubscriptionGuard,
+            logger: this.logger,
+            cause: "the CLI reported no account at initialize",
+          });
+        } else if (billsClaudeSubscription(initializationResult.account)) {
+          throw claudeSubscriptionNotSupportedError();
+        } else if (!holdsNonSubscriptionCredential(initializationResult.account)) {
+          // Fail closed: the account holds nothing this integration can bill.
+          // A logged-out session must never exist, because the CLI can pick up
+          // a claude.ai login by itself and AIR resumes a parked prompt on the
+          // SAME session after a sign-in. Refusing before the session exists
+          // makes every sign-in lead to a new session and a fresh `initialize`.
+          throw claudeLoginRequiredError();
+        }
+      }
+
+      // Apply user's `availableModels` allowlist from settings.json before any
+      // downstream model handling. The SDK only enforces this allowlist in its
+      // own UI, not in `initializationResult.models`, so we filter here to keep
+      // configOptions, the current-model resolver, and the stored modelInfos
+      // consistent with what the user configured.
+      const settingsAvailableModels = settingsManager.getSettings().availableModels;
+      const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
+      const allowedModels = Array.isArray(settingsAvailableModels)
+        ? applyAvailableModelsAllowlist(
+            initializationResult.models,
+            settingsAvailableModels,
+            settingsModelOverrides,
+          )
+        : initializationResult.models;
+
+      const { modelState: models, resumedContextWindow } = await getAvailableModels(
+        q,
+        allowedModels,
+        initializationResult.models,
+        settingsManager,
+        this.logger,
+        creationOpts.resume !== undefined,
+      );
+
+      // Resolve the current model's capabilities separately from the stable
+      // permission-mode catalog advertised to ACP clients.
+      // A resumed session can be running a model outside the `availableModels`
+      // allowlist (currentModelId is then the verbatim live id, see
+      // `matchResumedModel`); its capabilities are still known to the SDK's
+      // unfiltered list, so fall back to that before treating the model as
+      // unknown — otherwise auto mode would be spuriously clamped and the
+      // Fast-mode/Effort options hidden for a model that supports them.
+      const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
+      const fallbackModelInfo = allowlistedModelInfo
+        ? undefined
+        : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
+      const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
+      // Register the fallback-resolved capabilities under the verbatim live id
+      // so every modelInfos consumer (buildConfigOptions' effort lookup, later
+      // rebuilds via session.modelInfos) agrees with the gating below. The
+      // picker options themselves come from `models.availableModels`, so this
+      // adds no selectable entry. The spread keeps every capability flag
+      // (current and future); the identity fields are overridden because the
+      // fuzzy-matched sibling's resolvedModel/displayName/description can
+      // describe a different context lane and would poison later resolvedModel
+      // matching (syncModelAfterExternalSwitch) and context-window inference
+      // (applyConfigOptionValue) if they traveled under this id.
+      const modelInfos = fallbackModelInfo
+        ? [
+            ...allowedModels,
+            {
+              ...fallbackModelInfo,
+              value: models.currentModelId,
+              displayName: models.currentModelId,
+              description: "",
+              resolvedModel: undefined,
+            },
+          ]
+        : allowedModels;
+      const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
+        query: q,
+        requestedMode: initialPermissionMode,
+        currentModelInfo,
+        currentModelId: models.currentModelId,
+      });
+
+      const agents = await discoverCustomAgents(q);
+      // Only adopt the requested agent as the selected value if it's one we
+      // actually surface in the picker. A built-in (filtered out above) or
+      // otherwise-unknown name would leave the config option's `currentValue`
+      // pointing at an entry not in its own `options` list, which clients render
+      // as a blank/invalid selection.
+      const requestedAgent = userProvidedOptions?.agent;
+      const currentAgent =
+        requestedAgent && agents.some((a) => a.name === requestedAgent)
+          ? requestedAgent
+          : DEFAULT_AGENT_ID;
+
+      // Seed Fast mode from the SDK's reported state so the UI reflects reality
+      // (the CLI may start a session with fast mode already on, or force it off
+      // when `fastModePerSessionOptIn` is set). The toggle is only surfaced while
+      // the resolved model advertises `supportsFastMode`.
+      const fastModeEnabled =
+        initializationResult.fast_mode_state !== undefined &&
+        fastModeStateEnabled(initializationResult.fast_mode_state);
+      // `fast_mode_disabled_reason` reflects the post-switch model since SDK
+      // 0.3.219 (the initialize response used to answer from the spawn-time
+      // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
+      // the opt-in — which normalizes away, so only real blockers are retained.
+      const fastModeDisabledReason = fastModeEnabled
+        ? undefined
+        : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
+      const fastMode: FastModeOptionState = {
+        supported: currentModelInfo?.supportsFastMode ?? false,
+        enabled: fastModeEnabled,
+        useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
+        disabledReason: fastModeDisabledReason,
+      };
+
+      // The Effort picker seed mirrors what the CLI itself resolves from the
+      // persisted settings — the current model's `modelSettings` entry first
+      // (the CLI persists /effort per model), then the legacy top-level value.
+      // Display-only: no applyFlagSettings here. The CLI reads the same
+      // settings, so pinning the seed at the flag layer was always redundant —
+      // and it would override the CLI's own per-model restore on every later
+      // model switch. Only a user's explicit ACP picker choice pins the flag
+      // (see applyConfigOptionValue / Session.effortPinnedByUser).
+      const configOptions = buildConfigOptions(
+        modes,
+        models,
+        modelInfos,
+        settingsEffortForModel(settingsManager.getSettings(), currentModelInfo),
+        agents,
+        currentAgent,
+        fastMode,
+      );
+      // Seed the context window WITHOUT any extra IPC on the session/new path.
+      // On session/load, the resumed session's own `getContextUsage` report — a
+      // response `getAvailableModels` already awaited to learn the live model
+      // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
+      // authoritative and wins. Otherwise: the cached authoritative window if a
+      // prior turn has learned it for this model (`result.modelUsage`,
+      // cross-session), else the text heuristic, else the default. We
+      // deliberately do NOT issue a getContextUsage call here: on a fresh
+      // session that control request is not serviced until the first prompt
+      // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
+      // (issues #886/#880). The authoritative window arrives on the first
+      // `result.modelUsage` and is cached from there.
+      //
+      // Text inference alone misses aliases that resolve to extended-context
+      // models with no "1m" token anywhere in their id or description (e.g.
+      // `sonnet` → claude-sonnet-5, natively ~1M): those stream
+      // `usage_update.size: 200000` until the first result's modelUsage corrects
+      // it — but the cache means only the FIRST session to ever run a turn on such
+      // a model eats that window, not every fresh session after a process
+      // restart (issue #596; a post-restart session/load is covered by the
+      // resumed report above).
+      //
+      // The inference fallback is deliberately keyed to the allowlisted entry: a
+      // fallback-resolved sibling's resolvedModel/displayName/description can
+      // describe a different context lane than the verbatim live id (e.g. an
+      // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
+      // the id itself is a trustworthy window signal.
+      const seededWindow =
+        resumedContextWindow !== null
+          ? { size: resumedContextWindow, authoritative: true }
+          : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
+
+      this.sessions[sessionId] = {
+        query: q,
+        input: input,
+        cancelled: false,
+        cwd: params.cwd,
+        sessionFingerprint: computeSessionFingerprint(params),
+        creationParams: params,
+        settingsManager,
+        titles: new SessionTitles(this, sessionId),
+        accumulatedUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+        },
+        accumulatedModelUsage: {},
+        lastModelUsageReading: {},
+        modes,
+        models,
+        modelInfos,
+        autoModeFallbackWarningShown: false,
+        autoModeFallbackWarningPending,
+        configOptions,
+        agents,
+        currentAgent,
+        fastModeEnabled,
+        fastModeDisabledReason,
+        abortController,
+        emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
+        forwardSubagentText,
+        contextWindowSize: seededWindow.size,
+        contextWindowAuthoritative: seededWindow.authoritative,
+        providerCacheKey,
+        taskState,
+        toolUseCache: {},
+        emittedToolCalls: new Set(),
+        eagerToolCallSessions: new Map(),
+        liveBackgroundTasks: new Map(),
+        nativeSubagentsByTaskId: new Map(),
+        nativeSubagentTaskIdByToolUseId: new Map(),
+        nativeSubagentParentByToolUseId: new Map(),
+        emittedAssistantText: false,
+        owedTrailingIdles: 0,
+        messageIdToUuid: new Map(),
+        sessionFailureState: createSessionFailureState(),
+        claudeSubscriptionGuard,
+        fileChangeReportRequestIds: new Set(),
+        fileChangeAuditSupport,
+      };
+
+      return {
+        sessionId,
+        modes,
+        configOptions,
+      };
+    } catch (error) {
+      this.discardUnregisteredQuery(q, input, settingsManager);
       throw error;
     }
-
-    if (
-      shouldHideClaudeAuth() &&
-      initializationResult.account.subscriptionType &&
-      !this.gatewayAuthRequest
-    ) {
-      throw RequestError.authRequired(
-        undefined,
-        "This integration does not support using claude.ai subscriptions.",
-      );
-    }
-
-    // Apply user's `availableModels` allowlist from settings.json before any
-    // downstream model handling. The SDK only enforces this allowlist in its
-    // own UI, not in `initializationResult.models`, so we filter here to keep
-    // configOptions, the current-model resolver, and the stored modelInfos
-    // consistent with what the user configured.
-    const settingsAvailableModels = settingsManager.getSettings().availableModels;
-    const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-    const allowedModels = Array.isArray(settingsAvailableModels)
-      ? applyAvailableModelsAllowlist(
-          initializationResult.models,
-          settingsAvailableModels,
-          settingsModelOverrides,
-        )
-      : initializationResult.models;
-
-    const { modelState: models, resumedContextWindow } = await getAvailableModels(
-      q,
-      allowedModels,
-      initializationResult.models,
-      settingsManager,
-      this.logger,
-      creationOpts.resume !== undefined,
-    );
-
-    // Resolve the current model's capabilities separately from the stable
-    // permission-mode catalog advertised to ACP clients.
-    // A resumed session can be running a model outside the `availableModels`
-    // allowlist (currentModelId is then the verbatim live id, see
-    // `matchResumedModel`); its capabilities are still known to the SDK's
-    // unfiltered list, so fall back to that before treating the model as
-    // unknown — otherwise auto mode would be spuriously clamped and the
-    // Fast-mode/Effort options hidden for a model that supports them.
-    const allowlistedModelInfo = allowedModels.find((m) => m.value === models.currentModelId);
-    const fallbackModelInfo = allowlistedModelInfo
-      ? undefined
-      : (resolveModelPreference(initializationResult.models, models.currentModelId) ?? undefined);
-    const currentModelInfo = allowlistedModelInfo ?? fallbackModelInfo;
-    // Register the fallback-resolved capabilities under the verbatim live id
-    // so every modelInfos consumer (buildConfigOptions' effort lookup, later
-    // rebuilds via session.modelInfos) agrees with the gating below. The
-    // picker options themselves come from `models.availableModels`, so this
-    // adds no selectable entry. The spread keeps every capability flag
-    // (current and future); the identity fields are overridden because the
-    // fuzzy-matched sibling's resolvedModel/displayName/description can
-    // describe a different context lane and would poison later resolvedModel
-    // matching (syncModelAfterExternalSwitch) and context-window inference
-    // (applyConfigOptionValue) if they traveled under this id.
-    const modelInfos = fallbackModelInfo
-      ? [
-          ...allowedModels,
-          {
-            ...fallbackModelInfo,
-            value: models.currentModelId,
-            displayName: models.currentModelId,
-            description: "",
-            resolvedModel: undefined,
-          },
-        ]
-      : allowedModels;
-    const { modes, autoModeFallbackWarningPending } = await this.sessionModes.initialize({
-      query: q,
-      requestedMode: initialPermissionMode,
-      currentModelInfo,
-      currentModelId: models.currentModelId,
-    });
-
-    const agents = await discoverCustomAgents(q);
-    // Only adopt the requested agent as the selected value if it's one we
-    // actually surface in the picker. A built-in (filtered out above) or
-    // otherwise-unknown name would leave the config option's `currentValue`
-    // pointing at an entry not in its own `options` list, which clients render
-    // as a blank/invalid selection.
-    const requestedAgent = userProvidedOptions?.agent;
-    const currentAgent =
-      requestedAgent && agents.some((a) => a.name === requestedAgent)
-        ? requestedAgent
-        : DEFAULT_AGENT_ID;
-
-    // Seed Fast mode from the SDK's reported state so the UI reflects reality
-    // (the CLI may start a session with fast mode already on, or force it off
-    // when `fastModePerSessionOptIn` is set). The toggle is only surfaced while
-    // the resolved model advertises `supportsFastMode`.
-    const fastModeEnabled =
-      initializationResult.fast_mode_state !== undefined &&
-      fastModeStateEnabled(initializationResult.fast_mode_state);
-    // `fast_mode_disabled_reason` reflects the post-switch model since SDK
-    // 0.3.219 (the initialize response used to answer from the spawn-time
-    // model). A fresh SDK session reports `sdk_opt_in_required` — the toggle IS
-    // the opt-in — which normalizes away, so only real blockers are retained.
-    const fastModeDisabledReason = fastModeEnabled
-      ? undefined
-      : normalizeFastModeDisabledReason(initializationResult.fast_mode_disabled_reason);
-    const fastMode: FastModeOptionState = {
-      supported: currentModelInfo?.supportsFastMode ?? false,
-      enabled: fastModeEnabled,
-      useBooleanOption: clientSupportsBooleanConfigOptions(this.clientCapabilities),
-      disabledReason: fastModeDisabledReason,
-    };
-
-    // The Effort picker seed mirrors what the CLI itself resolves from the
-    // persisted settings — the current model's `modelSettings` entry first
-    // (the CLI persists /effort per model), then the legacy top-level value.
-    // Display-only: no applyFlagSettings here. The CLI reads the same
-    // settings, so pinning the seed at the flag layer was always redundant —
-    // and it would override the CLI's own per-model restore on every later
-    // model switch. Only a user's explicit ACP picker choice pins the flag
-    // (see applyConfigOptionValue / Session.effortPinnedByUser).
-    const configOptions = buildConfigOptions(
-      modes,
-      models,
-      modelInfos,
-      settingsEffortForModel(settingsManager.getSettings(), currentModelInfo),
-      agents,
-      currentAgent,
-      fastMode,
-    );
-    // Seed the context window WITHOUT any extra IPC on the session/new path.
-    // On session/load, the resumed session's own `getContextUsage` report — a
-    // response `getAvailableModels` already awaited to learn the live model
-    // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-    // authoritative and wins. Otherwise: the cached authoritative window if a
-    // prior turn has learned it for this model (`result.modelUsage`,
-    // cross-session), else the text heuristic, else the default. We
-    // deliberately do NOT issue a getContextUsage call here: on a fresh
-    // session that control request is not serviced until the first prompt
-    // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-    // (issues #886/#880). The authoritative window arrives on the first
-    // `result.modelUsage` and is cached from there.
-    //
-    // Text inference alone misses aliases that resolve to extended-context
-    // models with no "1m" token anywhere in their id or description (e.g.
-    // `sonnet` → claude-sonnet-5, natively ~1M): those stream
-    // `usage_update.size: 200000` until the first result's modelUsage corrects
-    // it — but the cache means only the FIRST session to ever run a turn on such
-    // a model eats that window, not every fresh session after a process
-    // restart (issue #596; a post-restart session/load is covered by the
-    // resumed report above).
-    //
-    // The inference fallback is deliberately keyed to the allowlisted entry: a
-    // fallback-resolved sibling's resolvedModel/displayName/description can
-    // describe a different context lane than the verbatim live id (e.g. an
-    // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
-    // the id itself is a trustworthy window signal.
-    const seededWindow =
-      resumedContextWindow !== null
-        ? { size: resumedContextWindow, authoritative: true }
-        : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
-
-    this.sessions[sessionId] = {
-      query: q,
-      input: input,
-      cancelled: false,
-      cwd: params.cwd,
-      sessionFingerprint: computeSessionFingerprint(params),
-      creationParams: params,
-      settingsManager,
-      titles: new SessionTitles(this, sessionId),
-      accumulatedUsage: {
-        inputTokens: 0,
-        outputTokens: 0,
-        cachedReadTokens: 0,
-        cachedWriteTokens: 0,
-      },
-      accumulatedModelUsage: {},
-      lastModelUsageReading: {},
-      modes,
-      models,
-      modelInfos,
-      autoModeFallbackWarningShown: false,
-      autoModeFallbackWarningPending,
-      configOptions,
-      agents,
-      currentAgent,
-      fastModeEnabled,
-      fastModeDisabledReason,
-      abortController,
-      emitRawSDKMessages: sessionMeta?.claudeCode?.emitRawSDKMessages ?? false,
-      forwardSubagentText,
-      contextWindowSize: seededWindow.size,
-      contextWindowAuthoritative: seededWindow.authoritative,
-      providerCacheKey,
-      taskState,
-      toolUseCache: {},
-      emittedToolCalls: new Set(),
-      eagerToolCallSessions: new Map(),
-      liveBackgroundTasks: new Map(),
-      nativeSubagentsByTaskId: new Map(),
-      nativeSubagentTaskIdByToolUseId: new Map(),
-      nativeSubagentParentByToolUseId: new Map(),
-      emittedAssistantText: false,
-      owedTrailingIdles: 0,
-      messageIdToUuid: new Map(),
-      sessionFailureState: createSessionFailureState(),
-      fileChangeReportRequestIds: new Set(),
-      fileChangeAuditSupport,
-    };
-
-    return {
-      sessionId,
-      modes,
-      configOptions,
-    };
   }
 
   /**
@@ -7582,17 +7819,82 @@ export class ClaudeAcpAgent {
         this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
         this.closeQueryStream(session);
         delete this.sessions[sessionId];
-        await this.createSession(session.creationParams, { resume: sessionId });
+        try {
+          await this.createSession(session.creationParams, { resume: sessionId });
+        } catch (error) {
+          // One session that cannot come back must not abort the switch. The
+          // `--hide-claude-auth` guard makes this a normal outcome of
+          // `providers/disable`: the override kept a subscription account
+          // usable, and creation refuses without it. The session is already
+          // gone, so tell the client why and go on to the next one.
+          this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+        }
       }
     });
-    this.providerUpdate = update;
+    // Sessions and prompts await `providerUpdate` before they run. A rejected
+    // promise stored here would reject every one of them, and would surface as
+    // an unhandled rejection once this call returned. Keep the failure for the
+    // caller of `providers/set` and `providers/disable` only.
+    const waitable = update.catch((error) => {
+      this.logger.error(`Provider update failed: ${error}`);
+    });
+    this.providerUpdate = waitable;
     try {
       await update;
     } finally {
-      if (this.providerUpdate === update) {
+      if (this.providerUpdate === waitable) {
         this.providerUpdate = null;
       }
     }
+  }
+
+  /** Tell a capable client that a session died during a provider switch. The
+   *  session is already removed, so the failure is published on the state it
+   *  left behind, with the refusal reason when the error carries one. */
+  private reportSessionLostOnProviderUpdate(
+    sessionId: string,
+    session: Session,
+    error: unknown,
+  ): void {
+    this.logger.error(
+      `Session ${sessionId}: could not be recreated for the provider update: ${error}`,
+    );
+    const isAuthRequired = error instanceof RequestError && error.code === AUTH_REQUIRED_CODE;
+    const reason =
+      error instanceof RequestError &&
+      typeof error.data === "object" &&
+      error.data !== null &&
+      "reason" in error.data &&
+      typeof error.data.reason === "string"
+        ? error.data.reason
+        : undefined;
+    const details =
+      reason === CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON
+        ? CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    const controller = new SessionFailureController({
+      sessionId,
+      state: session.sessionFailureState,
+      capabilities: this.clientCapabilities,
+      // The session is gone from `this.sessions` by now, so the usual
+      // identity check would call this publisher stale and drop the row.
+      isCurrent: () => true,
+      sendUpdate: (notification) => this.client.sessionUpdate(notification),
+      logger: this.logger,
+    });
+    void controller
+      .publish(isAuthRequired ? "auth_required" : "internal_error", {
+        sessionScoped: true,
+        details,
+        ...(reason ? { reason } : {}),
+      })
+      .catch((publishError) => {
+        this.logger.error(
+          `Session ${sessionId}: could not publish the provider-update failure: ${publishError}`,
+        );
+      });
   }
 }
 
@@ -7811,13 +8113,18 @@ function snapshotFromUsage(usage: {
  * otherwise anthropic.
  */
 function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderConfig | null {
-  if (!request?._meta) {
+  // `authenticate` validates the payload before it stores one, so a stored
+  // request always carries a usable gateway. Re-check the shape here anyway:
+  // this function decides whether a provider override is active, and the
+  // `--hide-claude-auth` guard is off while one is.
+  const gateway = request?._meta?.gateway;
+  if (!gateway || !isValidBaseUrl(gateway.baseUrl)) {
     return null;
   }
   return {
-    apiType: request.methodId === "gateway-bedrock" ? "bedrock" : "anthropic",
-    baseUrl: request._meta.gateway.baseUrl,
-    headers: request._meta.gateway.headers,
+    apiType: request?.methodId === "gateway-bedrock" ? "bedrock" : "anthropic",
+    baseUrl: gateway.baseUrl,
+    headers: gateway.headers ?? {},
   };
 }
 
@@ -7882,7 +8189,7 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
 /**
  * Validate a provider base URL: must be a non-empty absolute http(s) URL.
  */
-function isValidBaseUrl(baseUrl: string): boolean {
+function isValidBaseUrl(baseUrl: string | undefined): baseUrl is string {
   if (typeof baseUrl !== "string" || baseUrl.trim() === "") {
     return false;
   }
