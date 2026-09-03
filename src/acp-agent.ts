@@ -3494,11 +3494,18 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                // A command's output is a complete message, but the model's
+                // reply to the same turn streams in as further
+                // `agent_message_chunk`s, which by protocol concatenate onto
+                // this one. Close it with a blank line so the two render as
+                // separate blocks: without it `/goal ship the release` reads
+                // as "Goal set: ship the releaseI'll start on that now."
+                const output = message.content.replace(/\s+$/, "");
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
+                    content: { type: "text", text: output ? `${output}\n\n` : output },
                   },
                 });
                 break;
