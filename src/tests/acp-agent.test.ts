@@ -1919,6 +1919,28 @@ describe("usage Markdown", () => {
     expect(formatted).toContain("| ccd\\_session\\_mgmt | `███░░░░░░░░░░░░░░░░░` 13% |");
   });
 
+  it("escapes and limits MCP contribution rows", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      behaviors: {
+        ...usageResponse.behaviors,
+        day: {
+          ...usageResponse.behaviors.day,
+          mcp_servers: [
+            { name: "lowest", pct: 1 },
+            { name: "pipe|name", pct: 40 },
+            { name: "second", pct: 30 },
+            { name: "third", pct: 20 },
+          ],
+        },
+      },
+    });
+    expect(formatted).toContain("pipe\\|name");
+    expect(formatted).toContain("second");
+    expect(formatted).toContain("third");
+    expect(formatted).not.toContain("lowest");
+  });
+
   it("recognizes only exact local usage commands", () => {
     expect(isUsageCommandText(" /usage ")).toBe(true);
     expect(isUsageCommandText("/cost")).toBe(true);
@@ -1927,7 +1949,7 @@ describe("usage Markdown", () => {
     expect(isUsageCommandText("/usage now")).toBe(false);
   });
 
-  it("handles /usage through the structured SDK control API without prompting Claude", async () => {
+  it("replaces the exact SDK /usage turn output with structured Markdown", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -1935,10 +1957,33 @@ describe("usage Markdown", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    let queryConsumed = false;
-    injectGeneratorSession(agent, () => {
+    let forwardedPrompt = "";
+    const raw = "Raw Claude Code usage output";
+    injectGeneratorSession(agent, (input) => {
       async function* messages() {
-        queryConsumed = true;
+        const user = await input[Symbol.asyncIterator]().next();
+        forwardedPrompt = user.value.message.content[0].text;
+        yield userEcho(user.value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "usage-command-result",
+            type: "message",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text: raw }],
+            stop_reason: "stop_sequence",
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
         yield successfulResultMessage();
       }
       return messages();
@@ -1958,12 +2003,17 @@ describe("usage Markdown", () => {
       .join("");
     expect(response.stopReason).toBe("end_turn");
     expect(getUsage).toHaveBeenCalledOnce();
-    expect(queryConsumed).toBe(false);
+    expect(forwardedPrompt).toBe("/usage");
     expect(text).toContain("## Usage");
     expect(text).toContain("### This session");
+    expect(text).not.toContain(raw);
   });
 
-  it("runs the original command and preserves its raw output when structured usage is invalid", async () => {
+  it.each([
+    ["the response is invalid", vi.fn(async () => ({ broken: true }))],
+    ["the request rejects", vi.fn(async () => Promise.reject(new Error("unsupported")))],
+    ["the runtime method is missing", undefined],
+  ])("runs the original command and preserves its raw output when %s", async (_case, getUsage) => {
     const raw = "Original Claude Code usage output";
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -1989,8 +2039,11 @@ describe("usage Markdown", () => {
       }
       return messages();
     });
-    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
-      vi.fn(async () => ({ broken: true }) as any);
+    (
+      agent.sessions["test-session"].query as unknown as {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: typeof getUsage;
+      }
+    ).usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = getUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
 
@@ -2000,6 +2053,54 @@ describe("usage Markdown", () => {
       .join("");
     expect(forwardedPrompt).toBe("/usage");
     expect(text).toBe(raw);
+  });
+
+  it("cancels a turn while structured usage is pending without publishing fallback output", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "raw output after cancellation",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messages();
+    });
+    let usageStarted!: () => void;
+    const started = new Promise<void>((resolve) => (usageStarted = resolve));
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      vi.fn(
+        () =>
+          new Promise<SDKControlGetUsageResponse>(() => {
+            usageStarted();
+          }),
+      );
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/usage" }],
+    });
+    await started;
+    await agent.cancel({ sessionId: "test-session" });
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(updates).not.toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({ sessionUpdate: "agent_message_chunk" }),
+      }),
+    );
   });
 });
 

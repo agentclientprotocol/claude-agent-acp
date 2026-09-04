@@ -316,6 +316,56 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
+
+/** Best-effort structured presentation for a local `/usage` turn. The command
+ * itself always runs through Claude Code; null tells the consumer to forward
+ * its original output unchanged. The timeout prevents an unstable control
+ * request from holding an otherwise-completed local command indefinitely. */
+async function structuredUsageMarkdown(
+  query: Query,
+  signal: AbortSignal,
+  logger: Logger,
+): Promise<string | null> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const response = await Promise.race([
+      // Keeping the deliberately unstable method name visible makes an SDK
+      // upgrade fail at compile time if Anthropic removes or renames it.
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), STRUCTURED_USAGE_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+      new Promise<null>((resolve) => {
+        onAbort = () => resolve(null);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+    if (response === null) {
+      if (!signal.aborted) {
+        logger.error("Structured /usage timed out; preserving Claude Code output");
+      }
+      return null;
+    }
+    const usage = parseUsageResponse(response);
+    if (!usage) {
+      logger.error(
+        "Structured /usage returned an incompatible response; preserving Claude Code output",
+      );
+      return null;
+    }
+    return formatUsageResponse(usage);
+  } catch (error) {
+    logger.error(`Structured /usage failed; preserving Claude Code output: ${error}`);
+    return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
 
 /** Claude Code keeps the OAuth callback listener open in the background after
  *  `mcpAuthenticate` returns the authorization URL. The SDK does not expose
@@ -497,6 +547,15 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Structured presentation for an exact /usage command. The command still
+   * runs through the normal SDK turn so ordering, cancellation, persistence,
+   * and replay remain unchanged. Null means the experimental API failed and
+   * every output path must preserve Claude Code's original text. */
+  usageMarkdown?: Promise<string | null>;
+  usageMarkdownAbort?: AbortController;
+  /** The SDK can expose a local command through more than one message shape;
+   * publish the structured replacement at most once. */
+  usageMarkdownDelivered?: boolean;
   /** Optional hidden, model-authored file-change audit requested by the ACP
    *  client for this turn. The state is turn-owned so a late tool call can
    *  never be rebound to a newer prompt. */
@@ -2570,42 +2629,16 @@ export class ClaudeAcpAgent {
       fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
     }
 
-    session.titles.onPrompt(params.prompt);
-
-    // `/usage` is a local Claude Code command, not a model prompt. Prefer the
-    // SDK's structured control response so presentation does not depend on
-    // parsing human-readable CLI output. The API is explicitly experimental:
-    // validate it at runtime and fall through to the original command on any
-    // incompatibility. A busy query also takes the normal FIFO path so this
-    // fast path can never reorder output around another turn.
     const isUsageCommand =
       params.prompt.length === 1 &&
       params.prompt[0]?.type === "text" &&
       isUsageCommandText(params.prompt[0].text);
-    if (isUsageCommand && session.activeTurn == null && (session.turnQueue?.length ?? 0) === 0) {
-      try {
-        // Keeping the deliberately unstable method name visible here makes an
-        // SDK upgrade fail at compile time if Anthropic removes or renames it.
-        const rawUsage =
-          await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
-        const usage = parseUsageResponse(rawUsage);
-        if (!usage) throw new Error("SDK returned an incompatible usage response");
-        await this.client.sessionUpdate({
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: formatUsageResponse(usage) },
-            messageId: promptUuid,
-          },
-        });
-        if (fileChangeAudit && session.fileChangeAuditSupport) {
-          await session.fileChangeAuditSupport.finishUnavailable(fileChangeAudit, "notReported");
-        }
-        return { stopReason: "end_turn" };
-      } catch (error) {
-        this.logger.error(`Structured /usage failed; falling back to Claude Code: ${error}`);
-      }
-    }
+    const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+    const usageMarkdown = usageMarkdownAbort
+      ? structuredUsageMarkdown(session.query, usageMarkdownAbort.signal, this.logger)
+      : undefined;
+
+    session.titles.onPrompt(params.prompt);
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
     // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
@@ -2614,6 +2647,8 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
+      ...(usageMarkdown ? { usageMarkdown } : {}),
+      ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
       ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
       resolve: () => {},
@@ -3496,6 +3531,20 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Claim the structured replacement for the turn currently producing a
+     * local-command output. Undefined means this is not a structured usage
+     * turn (or its request failed), null means another SDK message shape
+     * already delivered it, and string is the one replacement to publish. */
+    const takeUsageMarkdown = async (): Promise<string | null | undefined> => {
+      const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
+      if (!turn?.usageMarkdown) return undefined;
+      const markdown = await turn.usageMarkdown;
+      if (markdown === null) return undefined;
+      if (turn.usageMarkdownDelivered) return null;
+      turn.usageMarkdownDelivered = true;
+      return markdown;
+    };
+
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
@@ -3571,6 +3620,7 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
+      turn.usageMarkdownAbort?.abort();
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -4075,11 +4125,14 @@ export class ClaudeAcpAgent {
                 if (compaction.consumeDuplicateErrorOutput(message.content)) {
                   break;
                 }
+                const usageMarkdown = await takeUsageMarkdown();
+                if (session.cancelled) break;
+                if (usageMarkdown === null) break;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
+                    content: { type: "text", text: usageMarkdown ?? message.content },
                   },
                 });
                 break;
@@ -5081,14 +5134,17 @@ export class ClaudeAcpAgent {
                   // the fallback there. (Autonomous results never get here —
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
+                  const usageMarkdown = await takeUsageMarkdown();
                   if (
-                    session.activeTurn?.isLocalOnlyCommand ||
-                    (!deliveredAssistantText &&
-                      !deliveredCompactionOutput &&
-                      (message.usage.output_tokens ?? 0) === 0)
+                    usageMarkdown !== null &&
+                    (usageMarkdown !== undefined ||
+                      session.activeTurn?.isLocalOnlyCommand ||
+                      (!deliveredAssistantText &&
+                        !deliveredCompactionOutput &&
+                        (message.usage.output_tokens ?? 0) === 0))
                   ) {
                     for (const notification of toAcpNotifications(
-                      message.result,
+                      usageMarkdown ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -5497,6 +5553,35 @@ export class ClaudeAcpAgent {
               }
             }
 
+            // Depending on the Claude Code build, a local command can arrive
+            // as the dedicated system message above or as a synthetic
+            // assistant message. Replace only the output owned by the exact
+            // /usage turn; no content signatures or text parsing are involved.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>"
+            ) {
+              const usageMarkdown = await takeUsageMarkdown();
+              if (session.cancelled) break;
+              if (usageMarkdown !== undefined) {
+                if (usageMarkdown !== null) {
+                  for (const notification of toAcpNotifications(
+                    usageMarkdown,
+                    "assistant",
+                    params.sessionId,
+                    session.toolUseCache,
+                    routedNotificationClient,
+                    this.logger,
+                    { messageId: messageIdForGrouping(message) },
+                  )) {
+                    await sendUpdate(notification);
+                  }
+                }
+                break;
+              }
+            }
+
             const stringContent =
               typeof message.message.content === "string" ? message.message.content : undefined;
             if (
@@ -5900,6 +5985,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    for (const turn of session.turnQueue ?? []) turn.usageMarkdownAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was

@@ -1,19 +1,21 @@
 import type { SDKControlGetUsageResponse } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
+const countSchema = z.number().finite().nonnegative();
+const percentSchema = countSchema.max(100);
 const usageWindowSchema = z
-  .object({ utilization: z.number().nullable(), resets_at: z.string().nullable() })
+  .object({ utilization: percentSchema.nullable(), resets_at: z.string().nullable() })
   .nullable()
   .optional();
-const contributionSchema = z.object({ name: z.string(), pct: z.number() });
+const contributionSchema = z.object({ name: z.string(), pct: percentSchema });
 const behaviorPeriodSchema = z.object({
-  request_count: z.number(),
-  session_count: z.number(),
+  request_count: countSchema,
+  session_count: countSchema,
   behaviors: z.array(
     z.object({
       key: z.enum(["cache_miss", "long_context", "subagent_heavy", "high_parallel", "cron"]),
-      pct: z.number(),
-      count: z.number(),
+      pct: percentSchema,
+      count: countSchema,
     }),
   ),
   agents: z.array(contributionSchema),
@@ -22,15 +24,15 @@ const behaviorPeriodSchema = z.object({
   mcp_servers: z.array(contributionSchema),
 });
 const modelUsageSchema = z.object({
-  inputTokens: z.number(),
-  outputTokens: z.number(),
-  thinkingTokens: z.number().optional(),
-  cacheReadInputTokens: z.number(),
-  cacheCreationInputTokens: z.number(),
-  webSearchRequests: z.number(),
-  costUSD: z.number(),
-  contextWindow: z.number(),
-  maxOutputTokens: z.number(),
+  inputTokens: countSchema,
+  outputTokens: countSchema,
+  thinkingTokens: countSchema.optional(),
+  cacheReadInputTokens: countSchema,
+  cacheCreationInputTokens: countSchema,
+  webSearchRequests: countSchema,
+  costUSD: countSchema,
+  contextWindow: countSchema,
+  maxOutputTokens: countSchema,
   canonicalModel: z.string().optional(),
   provider: z.string().optional(),
   costBasis: z.enum(["list", "managed", "unknown"]).optional(),
@@ -38,11 +40,11 @@ const modelUsageSchema = z.object({
 
 const usageResponseSchema = z.object({
   session: z.object({
-    total_cost_usd: z.number(),
-    total_api_duration_ms: z.number(),
-    total_duration_ms: z.number(),
-    total_lines_added: z.number(),
-    total_lines_removed: z.number(),
+    total_cost_usd: countSchema,
+    total_api_duration_ms: countSchema,
+    total_duration_ms: countSchema,
+    total_lines_added: countSchema,
+    total_lines_removed: countSchema,
     model_usage: z.record(z.string(), modelUsageSchema),
   }),
   subscription_type: z.string().nullable(),
@@ -58,7 +60,7 @@ const usageResponseSchema = z.object({
         .array(
           z.object({
             display_name: z.string(),
-            utilization: z.number().nullable(),
+            utilization: percentSchema.nullable(),
             resets_at: z.string().nullable(),
           }),
         )
@@ -66,9 +68,9 @@ const usageResponseSchema = z.object({
       extra_usage: z
         .object({
           is_enabled: z.boolean(),
-          monthly_limit: z.number().nullable(),
-          used_credits: z.number().nullable(),
-          utilization: z.number().nullable(),
+          monthly_limit: countSchema.nullable(),
+          used_credits: countSchema.nullable(),
+          utilization: percentSchema.nullable(),
           currency: z.string().nullable().optional(),
         })
         .nullable()
@@ -155,7 +157,7 @@ function appendContributions(
   );
   if (period.mcp_servers.length === 0) return;
   lines.push("", "| MCP server | Usage |", "|:--|--:|");
-  for (const server of period.mcp_servers) {
+  for (const server of [...period.mcp_servers].sort((a, b) => b.pct - a.pct).slice(0, 3)) {
     lines.push(`| ${escapeMarkdown(server.name)} | \`${usageBar(server.pct)}\` ${server.pct}% |`);
   }
 }
