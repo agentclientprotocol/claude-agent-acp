@@ -7006,8 +7006,12 @@ export class ClaudeAcpAgent {
       supportsSubagentTranscript(this.clientCapabilities) ||
       userProvidedOptions?.forwardSubagentText === true;
 
-    // Configure thinking behavior from environment variable
-    const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
+    // Configure thinking behavior from environment variables
+    const thinking = resolveThinkingConfig(
+      process.env.MAX_THINKING_TOKENS,
+      process.env.CLAUDE_CODE_THINKING_DISPLAY,
+      this.logger,
+    );
 
     // Parse model configuration from environment (e.g. Bedrock model overrides)
     const modelConfig = parseModelConfig(process.env.CLAUDE_MODEL_CONFIG);
@@ -9872,23 +9876,45 @@ function immediateContextWindow(
   };
 }
 
-/** Translate the legacy `MAX_THINKING_TOKENS` env var into the SDK's `thinking`
- *  option. The `maxThinkingTokens` option it used to feed is deprecated and
- *  reduced to on/off on current models, so map the value to explicit thinking
- *  config instead: unset → `undefined` (SDK default, adaptive on models that
- *  support it); `0` → disabled; a positive integer → a fixed token budget.
- *  Anything else is ignored with a warning. */
+/** Translate the legacy `MAX_THINKING_TOKENS` env var, plus the optional
+ *  `CLAUDE_CODE_THINKING_DISPLAY` env var, into the SDK's `thinking` option.
+ *  The `maxThinkingTokens` option it used to feed is deprecated and reduced
+ *  to on/off on current models, so map the value to explicit thinking config
+ *  instead: unset → `undefined` (SDK default, adaptive on models that support
+ *  it) unless a display mode is requested, in which case it becomes explicit
+ *  `adaptive`; `0` → disabled; a positive integer → a fixed token budget.
+ *  Anything else is ignored with a warning. `CLAUDE_CODE_THINKING_DISPLAY`
+ *  must be `summarized` or `omitted`; it has no effect when thinking is
+ *  disabled. */
 function resolveThinkingConfig(
-  raw: string | undefined,
+  rawTokens: string | undefined,
+  rawDisplay: string | undefined,
   logger: Logger,
 ): ThinkingConfig | undefined {
-  if (raw === undefined) return undefined;
-  const parsed = Number.parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 0) {
-    logger.error(`Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${raw}'.`);
-    return undefined;
+  let display: "summarized" | "omitted" | undefined;
+  if (rawDisplay !== undefined) {
+    if (rawDisplay === "summarized" || rawDisplay === "omitted") {
+      display = rawDisplay;
+    } else {
+      logger.error(
+        `Ignoring CLAUDE_CODE_THINKING_DISPLAY: expected 'summarized' or 'omitted', got '${rawDisplay}'.`,
+      );
+    }
   }
-  return parsed === 0 ? { type: "disabled" } : { type: "enabled", budgetTokens: parsed };
+
+  if (rawTokens === undefined) {
+    return display ? { type: "adaptive", display } : undefined;
+  }
+  const parsed = Number.parseInt(rawTokens, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    logger.error(
+      `Ignoring MAX_THINKING_TOKENS: expected a non-negative integer, got '${rawTokens}'.`,
+    );
+    return display ? { type: "adaptive", display } : undefined;
+  }
+  return parsed === 0
+    ? { type: "disabled" }
+    : { type: "enabled", budgetTokens: parsed, ...(display && { display }) };
 }
 
 function parseModelConfig(
