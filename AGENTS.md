@@ -41,8 +41,8 @@ The preflight is the guard-list as code; if it exits non-zero, follow what it
 prints rather than merging.
 
 Every _other_ push to `main` publishes a preview to npm — `0.73.1-preview.4` and
-so on — under the `preview` dist-tag, and tags the commit it came from. `latest`
-only ever moves on a real release, and previews never reach the agent registry.
-So anything merged to `main` is published within minutes; there is no staging
-branch. Full runbook, including how to recover a stalled release:
+so on — under the `preview` dist-tag, tags the commit it came from, and updates
+the agent registry the same way a release does. Only `latest` is reserved for
+real releases. So anything merged to `main` is published within minutes; there is
+no staging branch. Full runbook, including how to recover a stalled release:
 [`docs/RELEASES.md`](docs/RELEASES.md).

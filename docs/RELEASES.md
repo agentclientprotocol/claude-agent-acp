@@ -48,9 +48,26 @@ npm view "@agentclientprotocol/claude-agent-acp@<version>"
 ## Preview releases
 
 Every push to `main` that is not a release merge publishes a preview from the
-`publish-preview` job in the same workflow. There is no GitHub release and no
-registry update — only an npm publish under the `preview` dist-tag and a
-`v<version>` tag on the commit it came from.
+same workflow. There is no GitHub release — only an npm publish under the
+`preview` dist-tag, a `v<version>` tag on the commit it came from, and the same
+agent registry update a stable release dispatches, since the registry has its own
+handling for preview versions.
+
+Those are three jobs, in that order: `publish-npm-preview` mirrors `publish-npm`
+and does nothing but publish; `publish-tag-preview` creates the tag; and
+`trigger-registry-update` is shared with the stable path. The tag is a separate
+job so that a tag failure can be retried on its own with **Re-run failed jobs**
+— re-running the publish is not an option, because npm versions are immutable and
+publishing the same one twice fails outright.
+
+Both downstream jobs are gated on a `published` output that the publish step
+sets, not on whether the publish job went green. That keeps the two concerns
+apart — `published` means "npm has this version" and nothing else — and it means
+a rehearsal run that only passes `--dry-run` neither tags nor dispatches.
+
+A stable and a preview dispatch can never collide — a release merge publishes
+stable and skips the preview, every other push does the reverse — so the registry
+sees exactly one dispatch per published version.
 
 ```sh
 npm install @agentclientprotocol/claude-agent-acp@preview
@@ -186,15 +203,28 @@ and only re-dispatches the registry update.
 
 ### A preview published but the commit was not tagged
 
-The publish and the tag are separate steps and only the publish is irreversible.
-Nothing is broken — the next preview still picks the right `N` once the registry
-CDN catches up — but the tag is how that number is known immediately. Add it by
-hand:
+Only the publish is irreversible, so re-run just the tag job:
+
+```sh
+gh run rerun <run-id> --failed
+```
+
+Or **Re-run failed jobs** on the run in the web or mobile UI. This re-runs
+`publish-tag-preview` alone and leaves the successful publish untouched, which
+matters because re-publishing an immutable npm version would fail.
+
+If the re-run reports that it received no version or commit, the run's carried
+over job outputs are gone and it cannot tag anything safely. Do it by hand
+instead, taking the version from the publish job's log:
 
 ```sh
 gh api "repos/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/git/refs" \
   -f ref="refs/tags/v<version>" -f sha="<commit-sha>"
 ```
+
+Either way nothing is broken in the meantime: the next preview still picks the
+right `N` once the registry CDN catches up. The tag is how that number is known
+immediately.
 
 ## Credentials
 
