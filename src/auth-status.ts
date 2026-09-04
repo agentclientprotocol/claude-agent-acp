@@ -251,7 +251,7 @@ function mapAuthFields(fields: {
     if (organization) account.organization = organization;
     return {
       kind: "account",
-      label: `Claude ${capitalize(subscriptionType)}`,
+      label: planLabel(subscriptionType),
       // No detail: the client falls back to `account.email` for line 2.
       account,
     };
@@ -259,10 +259,12 @@ function mapAuthFields(fields: {
   return notLoggedInAuthStatus();
 }
 
-/** Title-cases the vendor plan string for the label ("max" → "Max"). Left alone
- *  when it already carries capitals ("Max", "Team Premium"). */
-function capitalize(value: string): string {
-  return value.charAt(0).toUpperCase() + value.slice(1);
+/** Names the plan with exactly one "Claude". A newer CLI already reports
+ *  "Claude Max", an older one reports "max", and both must read "Claude Max".
+ *  Each word is title-cased; a word that already carries capitals is kept. */
+function planLabel(plan: string): string {
+  const titled = plan.replace(/\S+/g, (word) => word.charAt(0).toUpperCase() + word.slice(1));
+  return /^claude(\s|$)/i.test(plan) ? titled : `Claude ${titled}`;
 }
 
 /**

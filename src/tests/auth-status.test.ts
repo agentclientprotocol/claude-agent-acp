@@ -157,6 +157,21 @@ describe("auth status mappers", () => {
     });
   });
 
+  it.each([
+    ["max", "Claude Max"],
+    ["Claude Max", "Claude Max"],
+    ["claude max", "Claude Max"],
+    ["Team Premium", "Claude Team Premium"],
+  ])("names the plan %j once, as %j", (subscriptionType, label) => {
+    // Regression: a newer CLI reports the plan already prefixed, and the label
+    // read "Claude Claude Max". The plan itself stays the raw vendor string.
+    expect(fromAccountInfo({ apiProvider: "firstParty", subscriptionType })).toEqual({
+      kind: "account",
+      label,
+      account: { plan: subscriptionType },
+    });
+  });
+
   it("maps an API key source", () => {
     expect(
       fromAccountInfo({ apiProvider: "firstParty", apiKeySource: "ANTHROPIC_API_KEY" }),
