@@ -358,6 +358,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   class TestClient {
     files: Map<string, string> = new Map();
     receivedText: string = "";
+    updates: SessionNotification[] = [];
     // Records for the AskUserQuestion elicitation test.
     elicitations: CreateElicitationRequest[] = [];
     permissionToolInputs: unknown[] = [];
@@ -412,6 +413,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
 
     async sessionUpdate(params: SessionNotification): Promise<void> {
       console.error("RECEIVED", JSON.stringify(params, null, 4));
+      this.updates.push(params);
 
       switch (params.update.sessionUpdate) {
         case "agent_message_chunk": {
@@ -582,7 +584,26 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       sessionId: newSessionResponse.sessionId,
     });
 
-    expect(client.takeReceivedText()).toContain("Compacting...\n\nCompacting completed.");
+    expect(client.takeReceivedText()).toBe("");
+    const compactionUpdates = client.updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update._meta?.contextCompaction,
+      );
+    expect(compactionUpdates[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      title: "Compact conversation",
+      kind: "think",
+      status: "in_progress",
+      _meta: { contextCompaction: { version: 1 } },
+    });
+    expect(compactionUpdates.at(-1)).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: "completed",
+      _meta: { contextCompaction: { version: 1 } },
+    });
   }, 60000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
@@ -9391,7 +9412,18 @@ describe("usage_update computation", () => {
     // abandoned (issue #825), and a real compaction turn always produces a
     // result. Here the stream simply ends, settling the prompt end_turn.
     injectSession(agent, [
-      { type: "system", subtype: "compact_boundary", session_id: "test-session" },
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "compact-boundary",
+        session_id: "test-session",
+        compact_metadata: {
+          trigger: "auto",
+          pre_tokens: 180000,
+          post_tokens: 12345,
+          duration_ms: 2500,
+        },
+      },
     ]);
     const session = agent.sessions["test-session"];
     // A 1M window learned earlier (e.g. from modelUsage) must survive
@@ -9410,6 +9442,29 @@ describe("usage_update computation", () => {
     // size stays at the session's learned window, NOT getContextUsage's value.
     expect(usageUpdate.update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
+    expect(updates.map((notification) => notification.update)).toContainEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "compact-boundary",
+      title: "Compact conversation",
+      kind: "think",
+      status: "completed",
+      rawOutput: {
+        trigger: "automatic",
+        preTokens: 180000,
+        postTokens: 12345,
+        durationMs: 2500,
+      },
+      _meta: {
+        contextCompaction: {
+          version: 1,
+          trigger: "automatic",
+          preTokens: 180000,
+          postTokens: 12345,
+          durationMs: 2500,
+        },
+        claudeCode: { toolName: "compact" },
+      },
+    });
   });
 
   it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
@@ -10371,20 +10426,352 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual([]);
   });
 
-  it("does not forward the result text of a turn that only emitted status text", async () => {
+  it("does not forward the result text of a turn that only emitted compaction output", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // `/compact` carries no echo, so it is promoted at its own result, and its
-    // status text is emitted directly rather than through the forwarding loops.
-    // That text still counts as delivered, so the result must not follow it.
+    // synthetic tool call is emitted directly rather than through the assistant
+    // forwarding loops. It still counts as visible output, so the result must
+    // not expose the generated summary afterward.
     injectSession(agent, [
-      { type: "system", subtype: "status", status: "compacting", session_id: "test-session" },
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
       replayedResult("conversation summarized"),
       idle,
     ]);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
 
-    expect(messageChunkTexts(updates)).toEqual(["Compacting..."]);
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "compact-start",
+      title: "Compact conversation",
+      kind: "think",
+      status: "in_progress",
+      _meta: {
+        contextCompaction: { version: 1 },
+        claudeCode: { toolName: "compact" },
+      },
+    });
+  });
+
+  it("emits one compaction tool lifecycle and ignores duplicate terminal status", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "failed",
+        compact_error: "summary rejected",
+        uuid: "compact-failed-1",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "failed",
+        compact_error: "summary rejected",
+        uuid: "compact-failed-2",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "summary rejected",
+        uuid: "compact-local-output",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "additional diagnostic",
+        uuid: "compact-distinct-local-output",
+        session_id: "test-session",
+      },
+      replayedResult("summary rejected"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    const toolUpdates = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
+      );
+    expect(toolUpdates).toHaveLength(2);
+    expect(toolUpdates[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "compact-start",
+      status: "failed",
+      rawOutput: { error: "summary rejected" },
+      _meta: {
+        contextCompaction: { version: 1, error: "summary rejected" },
+        claudeCode: { toolName: "compact" },
+      },
+    });
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+  });
+
+  it("does not repeat a failed compaction error delivered as an assistant message", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "failed",
+        compact_error: "Not enough messages to compact.",
+        uuid: "compact-failed",
+        session_id: "test-session",
+      },
+      assistantMessage("compact-error", [
+        { type: "text", text: "Not enough messages to compact." },
+      ]),
+      replayedResult("Not enough messages to compact."),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual(
+      expect.objectContaining({
+        sessionUpdate: "tool_call_update",
+        status: "failed",
+        rawOutput: { error: "Not enough messages to compact." },
+      }),
+    );
+  });
+
+  it("does not replay stale local-command output after a successful compaction", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const staleCommandOutput = assistantMessage("stale-command-output", [
+      { type: "text", text: "Not enough messages to compact." },
+    ]);
+    staleCommandOutput.message.model = "<synthetic>";
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed",
+        session_id: "test-session",
+      },
+      staleCommandOutput,
+      replayedResult("Not enough messages to compact."),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((notification) => notification.update)).toContainEqual(
+      expect.objectContaining({
+        sessionUpdate: "tool_call_update",
+        status: "completed",
+      }),
+    );
+  });
+
+  it("preserves the model response after multiple compactions in one turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start-1",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed-1",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: "compact-start-2",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-completed-2",
+        session_id: "test-session",
+      },
+      assistantMessage("answer-after-compactions", [{ type: "text", text: "final answer" }]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "continue" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["final answer"]);
+  });
+
+  it("emits a completed compaction tool call for a terminal-only result", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: "compact-result",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(updates.map((notification) => notification.update)).toContainEqual({
+      sessionUpdate: "tool_call",
+      toolCallId: "compact-result",
+      title: "Compact conversation",
+      kind: "think",
+      status: "completed",
+      _meta: {
+        contextCompaction: { version: 1 },
+        claudeCode: { toolName: "compact" },
+      },
+    });
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("uses compaction deltas as a single heartbeat without exposing the summary", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const compactionDelta = (uuid: string, content: string) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: null,
+      uuid,
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "compaction_delta" as const, content, encrypted_content: null },
+      },
+    });
+    injectSession(agent, [
+      compactionDelta("compact-delta-1", "internal "),
+      compactionDelta("compact-delta-2", "summary"),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const toolUpdates = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
+      );
+    expect(toolUpdates).toHaveLength(2);
+    expect(toolUpdates[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "compact-delta-1",
+      status: "in_progress",
+    });
+    expect(toolUpdates[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "compact-delta-1",
+      status: "in_progress",
+    });
+    expect(JSON.stringify(updates)).not.toContain("internal summary");
+  });
+
+  it("does not let a previous turn's lagging idle reset the active compaction", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSessionTwoTurns(
+      agent,
+      [result()],
+      [
+        {
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          uuid: "second-compact-start",
+          session_id: "test-session",
+        },
+        // This is turn 1's owed trailer, delivered after turn 2 started.
+        idle,
+        {
+          type: "system",
+          subtype: "status",
+          status: null,
+          compact_result: "failed",
+          compact_error: "summary rejected",
+          uuid: "second-compact-failed",
+          session_id: "test-session",
+        },
+        result(),
+        idle,
+      ],
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "first" }] });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+
+    const toolUpdates = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
+      );
+    expect(toolUpdates).toHaveLength(2);
+    expect(toolUpdates[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "second-compact-start",
+      status: "in_progress",
+    });
+    expect(toolUpdates[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "second-compact-start",
+      status: "failed",
+    });
   });
 
   // Like injectSession, but serves two prompts: each turn's echo is yielded

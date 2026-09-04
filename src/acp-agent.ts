@@ -161,6 +161,7 @@ import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
+import { ContextCompactionMetadata } from "./context-compaction-meta.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -202,6 +203,10 @@ import {
   isFileChangeAuditTool,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
+import {
+  ContextCompactionLifecycle,
+  contextCompactionMetadataFromBoundary,
+} from "./context-compaction.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -1164,6 +1169,7 @@ type ProviderConfig = {
 };
 
 export type ToolUpdateMeta = {
+  contextCompaction?: ContextCompactionMetadata;
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. */
     toolName: string;
@@ -3025,11 +3031,6 @@ export class ClaudeAcpAgent {
     // stop_reason "refusal" and structured stop_details. We capture the
     // human-readable explanation so the terminal `result` can surface it.
     let lastRefusalExplanation: string | null = null;
-    // Tracks whether we're inside a compaction. The SDK emits the terminal
-    // `status` (compact_result success/failed) twice for a single failed
-    // compaction, and the two messages are indistinguishable — so we report the
-    // outcome only while a compaction is in progress, then clear this.
-    let compactionInProgress = false;
     // Anthropic API message id of the assistant message currently being
     // streamed, captured from `message_start` so the streamed chunks that follow
     // (whose delta events don't carry it) can all be tagged with the same,
@@ -3077,6 +3078,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
     ));
 
+    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
@@ -3113,6 +3115,13 @@ export class ClaudeAcpAgent {
         return;
       }
       if (update.sessionUpdate === "agent_message_chunk") {
+        if (
+          !claudeMeta?.parentToolUseId &&
+          update.content.type === "text" &&
+          compaction.consumeDuplicateErrorOutput(update.content.text)
+        ) {
+          return;
+        }
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
           session.titles.onAssistantText(update.content);
@@ -3229,7 +3238,6 @@ export class ClaudeAcpAgent {
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
-      compactionInProgress = false;
       // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
@@ -3975,40 +3983,13 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "status": {
-                // These banners count as delivered text (via sendUpdate), so
-                // an echo-less turn that only ever emits them (e.g. `/compact`,
-                // promoted at its own result) doesn't have its result text
-                // re-emitted by the issue-#453 fallback.
                 if (message.status === "compacting") {
-                  compactionInProgress = true;
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "Compacting..." },
-                    },
-                  });
-                } else if (message.compact_result === "success" && compactionInProgress) {
-                  // The SDK signals manual `/compact` completion with a status
-                  // message carrying `compact_result`, not the `compact_boundary`
-                  // message (which only fires when there's content to compact).
-                  compactionInProgress = false;
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: "\n\nCompacting completed." },
-                    },
-                  });
-                } else if (message.compact_result === "failed" && compactionInProgress) {
-                  compactionInProgress = false;
-                  const reason = message.compact_error ? `: ${message.compact_error}` : ".";
-                  await sendUpdate({
-                    sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: { type: "text", text: `\n\nCompacting failed${reason}` },
-                    },
+                  await compaction.start(message.session_id, message.uuid);
+                } else if (message.compact_result === "success") {
+                  await compaction.finish(message.session_id, message.uuid, "completed");
+                } else if (message.compact_result === "failed") {
+                  await compaction.finish(message.session_id, message.uuid, "failed", {
+                    ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
                 break;
@@ -4032,9 +4013,14 @@ export class ClaudeAcpAgent {
                 // compaction frees occupancy, it doesn't change the model's
                 // window.
                 //
-                // The "Compacting completed." text is emitted from the `status`
-                // handler (keyed on `compact_result`), not here, so the failure
-                // path gets a message too.
+                const compactMetadata = message.compact_metadata;
+                await compaction.finish(
+                  message.session_id,
+                  message.uuid,
+                  "completed",
+                  compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
+                  true,
+                );
                 const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
                 lastAssistantUsage = null;
                 lastAssistantTotalUsage = usedTokens ?? 0;
@@ -4050,6 +4036,9 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "local_command_output": {
+                if (compaction.consumeDuplicateErrorOutput(message.content)) {
+                  break;
+                }
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -4092,6 +4081,7 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
+                    compaction.reset();
                     settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
@@ -4152,6 +4142,7 @@ export class ClaudeAcpAgent {
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
+                    compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -4693,6 +4684,7 @@ export class ClaudeAcpAgent {
               // through the early break below, which the gated `finally`
               // leaves alone).
               const deliveredAssistantText = session.emittedAssistantText;
+              const deliveredCompactionOutput = compaction.hasDeliveredOutput;
 
               // Every user-turn result terminates a turn (settle, reject, or
               // orphan skip) and the SDK follows it with a trailing
@@ -5055,7 +5047,9 @@ export class ClaudeAcpAgent {
                   // prose can be injected into the feed.)
                   if (
                     session.activeTurn?.isLocalOnlyCommand ||
-                    (!deliveredAssistantText && (message.usage.output_tokens ?? 0) === 0)
+                    (!deliveredAssistantText &&
+                      !deliveredCompactionOutput &&
+                      (message.usage.output_tokens ?? 0) === 0)
                   ) {
                     for (const notification of toAcpNotifications(
                       message.result,
@@ -5166,11 +5160,24 @@ export class ClaudeAcpAgent {
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
+                // A result closes this compaction lifecycle. Reset here rather
+                // than at idle: an owed idle from this turn can arrive after
+                // the next turn has already started and must not erase that
+                // turn's compaction state.
+                compaction.reset();
               }
             }
             break;
           }
           case "stream_event": {
+            const isCompactionProgress =
+              (message.event.type === "content_block_start" &&
+                message.event.content_block.type === "compaction") ||
+              (message.event.type === "content_block_delta" &&
+                message.event.delta.type === "compaction_delta");
+            if (isCompactionProgress) {
+              await compaction.heartbeat(message.session_id, message.uuid);
+            }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
             // it) can all be tagged with the same, replay-stable id.
@@ -5407,6 +5414,21 @@ export class ClaudeAcpAgent {
             }
 
             if (session.cancelled) {
+              break;
+            }
+
+            // Synthetic assistant frames carry the CLI's local-command output.
+            // On resume the SDK can replay a stale frame from an earlier compact
+            // attempt after a later compaction completed. Scope suppression to
+            // the compaction lifecycle and the synthetic frame itself rather
+            // than to the owning turn: one model turn may compact more than once,
+            // and its real assistant response must still be delivered.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>" &&
+              compaction.hasDeliveredOutput
+            ) {
               break;
             }
 
