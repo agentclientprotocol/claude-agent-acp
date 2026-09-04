@@ -55,6 +55,7 @@ import {
   StopReason,
 } from "@agentclientprotocol/sdk";
 import {
+  AccountInfo,
   AgentInfo,
   CanUseTool,
   deleteSession,
@@ -117,6 +118,19 @@ import {
   clientSupportsAsyncTasks,
 } from "./async-tasks.js";
 import type { AsyncTaskStarted } from "./async-tasks.js";
+import {
+  AUTH_STATUS_PROBE_TIMEOUT_MS,
+  AUTH_STATUS_UPDATE_METHOD,
+  type AuthStatus,
+  type AuthStatusKind,
+  authStatusCapability,
+  fromAccountInfo,
+  fromCliStatus,
+  gatewayAuthStatus,
+  mergeAuthStatus,
+  notLoggedInAuthStatus,
+  sameAuthStatus,
+} from "./auth-status.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -969,6 +983,11 @@ export type Session = {
   /** State of the `--hide-claude-auth` subscription guard for this session.
    *  Built on the first guarded turn; most sessions never need it. */
   claudeSubscriptionGuard?: ClaudeSubscriptionGuardState;
+  /** Identity kind of the account this session was created on. The CLI probe
+   *  compares its own read against it to notice that the credential behind the
+   *  cached account was swapped. Undefined when the account carried no
+   *  identity signal, which is "nothing to compare", not a match. */
+  accountKind?: AuthStatusKind;
   /** Set under `--hide-claude-auth` when the CLI reported a sign-out during
    *  this session. The query is closed and the account it cached at
    *  `initialize` now describes a credential that no longer works, so the next
@@ -1760,6 +1779,25 @@ export class ClaudeAcpAgent {
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
   private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
+  /** Last auth identity reported to the client, connection-scoped like
+   *  `authenticate`/`logout`. Undefined means "not determined yet". */
+  currentAuthStatus?: AuthStatus;
+  /** In-flight `claude auth status --json` probe, shared by every caller so
+   *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
+   *  processes. */
+  private cliAuthProbe: Promise<AuthStatus | undefined> | null = null;
+  /** Counts auth-affecting events (`authenticate`, `logout`) on this
+   *  connection. A probe records it at start and publishes only if it has not
+   *  moved, so a slow read can never overwrite a newer login or logout. */
+  private authEpoch = 0;
+  /** Keeps the "session account told us nothing" note to one line per process
+   *  instead of one per session. */
+  private loggedUninformativeAccount = false;
+  /** Same, for the "client provider override active" note. */
+  private loggedOverriddenAccount = false;
+  /** Same, for the "the CLI probe timed out" warning: a wedged CLI stays wedged
+   *  and would otherwise warn once per probe, i.e. once per user prompt. */
+  private loggedProbeTimeout = false;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1818,6 +1856,13 @@ export class ClaudeAcpAgent {
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
+
+    // Learn the auth identity in the background: `initialize` never waits on
+    // the CLI probe, and no snapshot rides in its response. When the probe
+    // lands it calls `setAuthStatus`, which pushes `_auth/status_update` — the
+    // connection's first push, and unconditional, because nothing was reported
+    // before it. It is therefore sent after this response, never before it.
+    void this.probeCliAuthStatus();
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
@@ -1943,6 +1988,11 @@ export class ClaudeAcpAgent {
           claudeCode: {
             promptQueueing: true,
           },
+          // Capability marker for the `authStatus` extension: presence means
+          // "this agent pushes its identity" and the object stays empty — it is
+          // never a status payload. The state itself travels on
+          // `_auth/status_update`; there is nothing for a client to ask for.
+          authStatus: authStatusCapability(),
         },
         promptCapabilities: {
           image: true,
@@ -2089,9 +2139,212 @@ export class ClaudeAcpAgent {
         }
       }
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
+      // The gateway holds the credentials from here on, so it replaces
+      // whatever the CLI store reported. Bumping the epoch discards any probe
+      // that started before this login: its answer is now stale.
+      this.authEpoch += 1;
+      this.setAuthStatus(
+        gatewayAuthStatus(gatewayRequestToProviderConfig(this.gatewayAuthRequest)?.baseUrl),
+      );
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  /**
+   * Stores `next` and pushes it to the client.
+   *
+   * A push goes out only when the payload changed. The identity is read on many
+   * occasions — each session create, each guarded turn, the start of each user
+   * prompt — and almost all of them see the same login. Clients replace their
+   * whole state on each update and tolerate duplicates, so a repeat is
+   * harmless, but it is also pure noise; {@link sameAuthStatus} drops it.
+   *
+   * What the agent owes is truth — a stale or uninformative source must not
+   * reach here at all (see the epoch check in the probe and the guards at
+   * session create).
+   */
+  setAuthStatus(next: AuthStatus | undefined): void {
+    if (!next) {
+      return;
+    }
+    if (sameAuthStatus(this.currentAuthStatus, next)) {
+      return;
+    }
+    this.currentAuthStatus = next;
+    // ACP notifications get no reply, and clients that do not know the method
+    // drop it silently — send unconditionally and never fail a caller on it.
+    void Promise.resolve()
+      .then(() => this.client.extNotification(AUTH_STATUS_UPDATE_METHOD, { authStatus: next }))
+      .catch((error) => {
+        this.logger.error("Failed to send _auth/status_update:", error);
+      });
+  }
+
+  /**
+   * Report the identity behind a session's `AccountInfo`.
+   *
+   * `AccountInfo` is richer than the CLI probe (it is what the live query
+   * actually authenticates with). Called before the `--hide-claude-auth` guard
+   * may refuse the session or the turn: that flag blocks the *use* of a
+   * subscription, it does not make the state secret, and a refusal is when the
+   * client most needs to know the account it was refused for.
+   *
+   * Two cases skip it:
+   *
+   * - ACP gateway *authentication* (`gatewayAuthRequest`): the gateway, not
+   *   this account, is the agent-owned identity — already reported as
+   *   `kind: "gateway"` by `authenticate`.
+   * - A client-driven provider override (`providers/set`): the session then
+   *   routes through the client's endpoint and `AccountInfo` describes that
+   *   route (e.g. `apiProvider: "gateway"`), which is NOT agent-owned state.
+   *   `authStatus` reports the agent's own login only, so the CLI probe —
+   *   which reads the credential store the override never touches — stays
+   *   authoritative.
+   *
+   * An account with no identity signal (e.g. `{apiProvider: "firstParty"}`
+   * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
+   * what the CLI probe already established instead of overwriting it.
+   */
+  private publishSessionAccountIdentity(account: AccountInfo | undefined): void {
+    if (this.providerConfig) {
+      if (!this.loggedOverriddenAccount) {
+        this.loggedOverriddenAccount = true;
+        this.logger.log(
+          "[authStatus] client provider override active; keeping agent-owned probe state",
+        );
+      }
+      return;
+    }
+    if (this.gatewayAuthRequest) {
+      return;
+    }
+    const fromSession = fromAccountInfo(account);
+    if (fromSession) {
+      this.setAuthStatus(fromSession);
+    } else if (!this.loggedUninformativeAccount) {
+      this.loggedUninformativeAccount = true;
+      this.logger.log("[authStatus] session account carries no identity signal; keeping probe");
+    }
+  }
+
+  /** Shares one in-flight `claude auth status --json` run between callers. The
+   *  promise is released once settled so a later call re-probes instead of
+   *  replaying a stale verdict. `fresh` forces a new run even when one is in
+   *  flight — `logout` needs a read that started after the credentials were
+   *  cleared. */
+  private probeCliAuthStatus(options?: { fresh?: boolean }): Promise<AuthStatus | undefined> {
+    if (!options?.fresh && this.cliAuthProbe) {
+      return this.cliAuthProbe;
+    }
+    const probe = this.runCliAuthProbe();
+    this.cliAuthProbe = probe;
+    void probe.finally(() => {
+      if (this.cliAuthProbe === probe) {
+        this.cliAuthProbe = null;
+      }
+    });
+    return probe;
+  }
+
+  /** Never rejects: an unavailable CLI means "not reported", not an error. */
+  private async runCliAuthProbe(): Promise<AuthStatus | undefined> {
+    // Monotonicity: a read that started before the connection's latest
+    // auth-affecting event describes a world that no longer exists. Remember
+    // which one this read belongs to and drop the answer if it moved on.
+    const epoch = this.authEpoch;
+    // ACP gateway auth bypasses the CLI credential store entirely, so the
+    // probe would report an identity that is not the one being used. A mere
+    // client provider override (`providers/set`) does NOT skip the probe: it
+    // reroutes traffic without touching the credential store, and the store is
+    // exactly the agent-owned login `authStatus` reports.
+    if (this.gatewayAuthRequest) {
+      return this.currentAuthStatus;
+    }
+    let stdout: string;
+    try {
+      const cliPath = await claudeCliPath();
+      ({ stdout } = await execFileAsync(cliPath, ["auth", "status", "--json"], {
+        timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
+      }));
+    } catch (error) {
+      const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
+      // Node killed the child on the timeout. Whatever it printed so far is a
+      // truncated fragment, never valid JSON: report nothing and keep the last
+      // known state, so nothing regresses and no push goes out.
+      if (failed?.killed === true && failed.signal) {
+        if (!this.loggedProbeTimeout) {
+          this.loggedProbeTimeout = true;
+          this.logger.error(
+            "claude auth status did not answer within 5 s; the identity is not refreshed",
+          );
+        }
+        return this.currentAuthStatus;
+      }
+      // The logged-out case exits 1 while still printing valid JSON, so the
+      // stdout of a failed exec is parsed just like a successful one.
+      if (typeof failed?.stdout !== "string" || failed.stdout.trim().length === 0) {
+        this.logger.error(
+          "claude auth status failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+        return undefined;
+      }
+      stdout = failed.stdout;
+    }
+    const status = fromCliStatus(stdout);
+    if (!status) {
+      this.logger.error("claude auth status returned unparseable output");
+      return undefined;
+    }
+    if (epoch !== this.authEpoch) {
+      // An `authenticate` or `logout` landed while this probe was running; the
+      // newer state wins and this answer is discarded, never published.
+      this.logger.log("[authStatus] discarding a probe that predates the latest auth change");
+      return this.currentAuthStatus;
+    }
+    // The CLI probe can be poorer than the session `AccountInfo` for the very
+    // same login (no organization, say). Keep those extra fields rather than
+    // regressing the payload; a different identity replaces it wholesale.
+    const merged = mergeAuthStatus(this.currentAuthStatus, status);
+    this.setAuthStatus(merged);
+    this.markSessionsWhoseAccountKindChanged(status.kind);
+    return merged;
+  }
+
+  /**
+   * Feed the completed probe to the `--hide-claude-auth` guard.
+   *
+   * The account cached at `initialize` is the guard's fact, and the CLI can
+   * swap the credential behind it between two turns (a Console key removed and
+   * a claude.ai login put in its place) without any turn failing. A read that
+   * reports a different kind of identity than the session was created on
+   * proves that fact stale.
+   *
+   * The probe decides nothing, and it interrupts nothing. Since the read is
+   * fired at the start of every user prompt, it usually lands in the middle of
+   * the turn it belongs to; all it may do there is set a flag. The turn runs to
+   * its end on the query it started on, the NEXT prompt consumes the flag and
+   * recreates the query, the new `initialize` reports the real account, and the
+   * creation guard judges it. So a probe can never refuse or abort a turn, and
+   * a wrong read costs one query recreation, not a false refusal.
+   */
+  private markSessionsWhoseAccountKindChanged(kind: AuthStatusKind): void {
+    if (!this.claudeSubscriptionGuardActive()) {
+      return;
+    }
+    for (const [sessionId, session] of Object.entries(this.sessions)) {
+      // No kind: the account said nothing about the identity, so there is
+      // nothing this read can contradict.
+      if (!session.accountKind || session.queryClosed || session.needsSignOutRespawn) {
+        continue;
+      }
+      if (kind !== session.accountKind) {
+        // `endQuery: false` is the whole turn-boundary contract: the flag is
+        // set now, the query dies at the recreation the next prompt runs.
+        this.markSessionForSignOutRespawn(sessionId, session, { endQuery: false });
+      }
+    }
   }
 
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
@@ -2216,6 +2469,9 @@ export class ClaudeAcpAgent {
     // those paths.
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
+    // Any probe already running read the pre-logout world; the bump makes its
+    // answer unpublishable so it cannot resurrect the identity being cleared.
+    this.authEpoch += 1;
     // Learned context windows are per-account state too: 1M-context
     // entitlement is gated per org/tier, and an OAuth re-login is invisible to
     // the env-derived provider cache key, so windows learned under the old
@@ -2239,6 +2495,15 @@ export class ClaudeAcpAgent {
         `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+
+    // Re-read the store rather than assuming "none": an API key from the env
+    // or a key helper survives `auth logout`. The read must start after the
+    // credentials were cleared, so it never joins a probe that is already in
+    // flight. If it can't be read, the logout still happened — drop the
+    // now-stale identity instead of reporting it further.
+    if (!(await this.probeCliAuthStatus({ fresh: true }))) {
+      this.setAuthStatus(notLoggedInAuthStatus());
+    }
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -2247,6 +2512,15 @@ export class ClaudeAcpAgent {
     if (!session) {
       throw new Error("Session not found");
     }
+    // The one re-read per user prompt, fired here and never awaited: a prompt
+    // must not wait on a CLI process, and its result is pushed on change
+    // whenever it lands, mid-turn included. It runs BEFORE the guard on
+    // purpose — a refused prompt is exactly the one whose retry follows a
+    // sign-in in the terminal, and that retry is a new prompt, so the read
+    // that finds the new credential must not be the one the refusal skipped.
+    // The guard itself consumes the result only at the next turn boundary (see
+    // `markSessionsWhoseAccountKindChanged`).
+    void this.probeCliAuthStatus();
     const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
     if (signOutRespawn) session = await signOutRespawn;
     // The SDK query stream already terminated (see `queryClosed`); its iterator
@@ -2333,31 +2607,49 @@ export class ClaudeAcpAgent {
     return shouldHideClaudeAuth() && this.resolveProviderConfig() === null;
   }
 
-  /** Record that the CLI signed out during this session, and end the query.
+  /** Record that the account cached at `initialize` is wrong, and — unless the
+   *  caller defers it — end the query.
    *
-   *  Only under `--hide-claude-auth`. The account cached at `initialize` is
-   *  this integration's source of truth, and a sign-out proves that account
-   *  wrong: the credential behind it is gone, and whatever replaces it is
-   *  invisible until a new `initialize` runs. Closing the query here makes the
-   *  next turn recreate it, so the creation guard decides on the real account.
+   *  Only under `--hide-claude-auth`. That cached account is this
+   *  integration's source of truth, and two things prove it wrong: a sign-out
+   *  during the session, and a CLI probe that finds a different identity. In
+   *  both cases the credential behind the cached account is gone, and whatever
+   *  replaces it is invisible until a new `initialize` runs. The flag makes
+   *  the next prompt recreate the query, so the creation guard decides on the
+   *  real account.
+   *
+   *  `endQuery` says whether the query dies now. A sign-out has already killed
+   *  the turn, so its stream is closed at once. A probe has killed nothing: it
+   *  runs beside a turn that is still producing output, and closing there would
+   *  abort a turn the user is watching. It therefore leaves the stream alone
+   *  and lets the recreation at the next prompt close it (`recreateSignedOutQuery`
+   *  closes it too, and both are idempotent).
    *
    *  Idempotent: one sign-out reaches this twice (the synthetic login message
    *  and the turn's error-shaped result), and the second call must not close
    *  a stream the first one already closed. Closing settles the queued turns
    *  through the consumer's end-of-stream path, which rejects each one. */
-  private markSessionForSignOutRespawn(sessionId: string, session: Session): void {
+  private markSessionForSignOutRespawn(
+    sessionId: string,
+    session: Session,
+    options?: { endQuery?: boolean },
+  ): void {
     if (!shouldHideClaudeAuth() || session.needsSignOutRespawn) {
       return;
     }
     if (!session.creationParams) {
       this.logger.error(
-        `Session ${sessionId}: signed out, but the creation params are missing; cannot recreate the query`,
+        `Session ${sessionId}: the identity behind the cached account changed, but the creation params are missing; cannot recreate the query`,
       );
       return;
     }
     session.needsSignOutRespawn = true;
-    this.logger.log(`Session ${sessionId}: signed out; the query is recreated on the next turn`);
-    this.closeQueryStream(session);
+    this.logger.log(
+      `Session ${sessionId}: the identity behind the cached account changed (sign-out, or a probe that found a different login); the query is recreated on the next turn`,
+    );
+    if (options?.endQuery !== false) {
+      this.closeQueryStream(session);
+    }
   }
 
   /** Recreate the query of a signed-out session, keeping the ACP session id and
@@ -2377,12 +2669,22 @@ export class ClaudeAcpAgent {
    *
    *  Returns `undefined`, not a resolved promise, when no recreation is due:
    *  the callers enqueue their turn in one synchronous section, and an extra
-   *  microtask there would let the caller observe a half-built turn. */
+   *  microtask there would let the caller observe a half-built turn.
+   *
+   *  A live turn also postpones it. A probe marks the session without ending
+   *  the query, so a turn can still be running when the mark is read — by a
+   *  `steer` injecting into it, say. Recreating there would close the stream
+   *  under the turn and kill output the user is watching, so the flag waits for
+   *  the next turn boundary. A sign-out is not affected: it closed the stream
+   *  when it marked the session, and a closed stream recreates immediately. */
   private respawnSignedOutSession(
     sessionId: string,
     session: Session,
   ): Promise<Session> | undefined {
     if (!session.needsSignOutRespawn) {
+      return undefined;
+    }
+    if (!session.queryClosed && (session.turnQueue ?? []).some((turn) => !turn.settled)) {
       return undefined;
     }
     return this.awaitSignOutRespawn(sessionId, session);
@@ -2465,6 +2767,9 @@ export class ClaudeAcpAgent {
       query: session.query,
       guardState: (session.claudeSubscriptionGuard ??= {}),
       logger: this.logger,
+      // The guard reads the account anyway; reuse that read to keep the
+      // reported identity current, refusal or not.
+      onAccount: (account) => this.publishSessionAccountIdentity(account),
       sessionFailures: () =>
         new SessionFailureController({
           sessionId,
@@ -7593,6 +7898,11 @@ export class ClaudeAcpAgent {
         throw error;
       }
 
+      // Publish the identity BEFORE the guard can refuse this session. A
+      // refusal is exactly when the client most needs to know which account it
+      // was refused for.
+      this.publishSessionAccountIdentity(initializationResult.account);
+
       // Shared with the per-turn guard, so "warn once" spans the whole session.
       const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
       if (this.claudeSubscriptionGuardActive()) {
@@ -7809,6 +8119,7 @@ export class ClaudeAcpAgent {
         messageIdToUuid: new Map(),
         sessionFailureState: createSessionFailureState(),
         claudeSubscriptionGuard,
+        accountKind: fromAccountInfo(initializationResult.account)?.kind,
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
       };
