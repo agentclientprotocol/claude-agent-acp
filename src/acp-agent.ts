@@ -5462,20 +5462,27 @@ export class ClaudeAcpAgent {
               }
             }
 
-            // Strip <command-*>/<local-command-stdout> markers and render any
-            // remaining prose. Skill bodies and built-in slash commands (e.g.
-            // /usage, /status, /model) arrive wrapped in these tags; pure-marker
-            // payloads (e.g. /compact's malformed output) strip to null and are
-            // skipped. Mirrors the replay path at replaySessionHistory.
+            // Render /usage as Markdown whether the SDK sends wrapped stdout or
+            // already-unwrapped plain text. Other local commands retain their
+            // marker-stripping behavior. Pure-marker payloads (e.g. /compact's
+            // malformed output) strip to null and are skipped. Mirrors the
+            // replay path at replaySessionHistory.
+            const stringContent =
+              message.message.role !== "system" && typeof message.message.content === "string"
+                ? message.message.content
+                : undefined;
+            const usageMarkdown =
+              stringContent === undefined
+                ? undefined
+                : formatUsageLocalCommandMessage(stringContent);
             if (
               message.message.role !== "system" &&
-              typeof message.message.content === "string" &&
-              message.message.content.includes("<local-command-stdout>")
+              stringContent !== undefined &&
+              (stringContent.includes("<local-command-stdout>") || usageMarkdown !== undefined)
             ) {
-              const usageMarkdown = formatUsageLocalCommandMessage(message.message.content);
               const stripped =
                 usageMarkdown === undefined
-                  ? stripLocalCommandMetadata(message.message.content)
+                  ? stripLocalCommandMetadata(stringContent)
                   : usageMarkdown;
               if (typeof stripped === "string") {
                 for (const notification of toAcpNotifications(

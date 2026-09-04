@@ -1889,6 +1889,22 @@ Last 7d · 43 requests · 5 sessions Top MCP servers: ccd_session_mgmt 11%, ccd_
     ).toBe(formatUsageCommandOutput(report));
   });
 
+  it("recognizes the unwrapped single-line limits emitted by the live SDK", () => {
+    const liveReport = `/usage
+
+You are currently using your subscription to power your Claude Code usage
+Current session: 6% used · resets Sep 4 at 9pm (Asia/Yerevan) Current week (all models): 0% used · resets Sep 4 at 10pm (Asia/Yerevan) Current week (Fable): 0% used
+What's contributing to your limits usage? Approximate, based on local sessions on this machine — does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.
+Last 24h · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, claude_agent_acp 4%, ccd_session 4%
+Last 7d · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, claude_agent_acp 4%, ccd_session 4%`;
+
+    const formatted = formatUsageLocalCommandMessage(liveReport);
+    expect(formatted).toContain("## Usage");
+    expect(formatted).toContain("**5-hour limit** — **6%**");
+    expect(formatted).toContain("**Last 24h** · 50 requests · 4 sessions");
+    expect(formatted).not.toContain("Current session:");
+  });
+
   it("does not claim messages from other local commands", () => {
     expect(
       formatUsageLocalCommandMessage(

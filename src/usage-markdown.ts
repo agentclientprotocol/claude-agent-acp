@@ -103,16 +103,15 @@ export function formatUsageCommandOutput(output: string): string {
   return lines.join("\n");
 }
 
-/** Format a wrapped `/usage` command, returning `undefined` when the message
- * belongs to another local command and should follow its normal handling. */
+/** Format `/usage` output whether the SDK kept its local-command markers or
+ * already unwrapped it to plain text. Returns `undefined` for unrelated text. */
 export function formatUsageLocalCommandMessage(content: string): string | null | undefined {
   const command = markerContents(content, "command-name").at(-1)?.trim();
   const stdout = markerContents(content, "local-command-stdout").join("\n").trim();
-  const isUsage =
-    command === "/usage" ||
-    (/\bCurrent session:\s*\d+(?:\.\d+)?% used\b/i.test(stdout) &&
-      /\bCurrent week\s*\(/i.test(stdout));
-  if (!isUsage) return undefined;
-  if (!stdout) return null;
-  return formatUsageCommandOutput(stdout);
+  const report = stdout || content;
+  const hasUsageSignature =
+    /\bCurrent session:\s*\d+(?:\.\d+)?% used\b/i.test(report) &&
+    /\bCurrent week\s*\(/i.test(report);
+  if (hasUsageSignature) return formatUsageCommandOutput(report);
+  return command === "/usage" ? null : undefined;
 }
