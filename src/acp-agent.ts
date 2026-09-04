@@ -238,7 +238,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
-import { formatUsageLocalCommandMessage } from "./usage-markdown.js";
+import { formatUsageMessageContent } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -5467,21 +5467,18 @@ export class ClaudeAcpAgent {
             // marker-stripping behavior. Pure-marker payloads (e.g. /compact's
             // malformed output) strip to null and are skipped. Mirrors the
             // replay path at replaySessionHistory.
-            const stringContent =
-              message.message.role !== "system" && typeof message.message.content === "string"
-                ? message.message.content
-                : undefined;
             const usageMarkdown =
-              stringContent === undefined
+              message.message.role === "system"
                 ? undefined
-                : formatUsageLocalCommandMessage(stringContent);
+                : formatUsageMessageContent(message.message.content);
+            const stringContent =
+              typeof message.message.content === "string" ? message.message.content : undefined;
             if (
               message.message.role !== "system" &&
-              stringContent !== undefined &&
-              (stringContent.includes("<local-command-stdout>") || usageMarkdown !== undefined)
+              (usageMarkdown !== undefined || stringContent?.includes("<local-command-stdout>"))
             ) {
               const stripped =
-                usageMarkdown === undefined
+                usageMarkdown === undefined && stringContent !== undefined
                   ? stripLocalCommandMetadata(stringContent)
                   : usageMarkdown;
               if (typeof stripped === "string") {
@@ -6572,8 +6569,15 @@ export class ClaudeAcpAgent {
       ) {
         content = stripSubagentTextAndThinking(content);
       }
+      const replayUsageMarkdown = formatUsageMessageContent(content);
+      if (replayUsageMarkdown === null) {
+        continue;
+      }
+      if (replayUsageMarkdown !== undefined) {
+        content = replayUsageMarkdown;
+      }
       // @ts-expect-error - untyped in SDK but we handle all of these
-      if (message.message.role === "user") {
+      if (message.message.role === "user" && replayUsageMarkdown === undefined) {
         content = stripLocalCommandMetadata(content);
         if (content === null) continue;
       }

@@ -115,3 +115,22 @@ export function formatUsageLocalCommandMessage(content: string): string | null |
   if (hasUsageSignature) return formatUsageCommandOutput(report);
   return command === "/usage" ? null : undefined;
 }
+
+/** Normalize the SDK content shapes used by local commands. Claude currently
+ * emits `/usage` as either a string or one or more assistant text blocks. */
+export function formatUsageMessageContent(content: unknown): string | null | undefined {
+  if (typeof content === "string") return formatUsageLocalCommandMessage(content);
+  if (!Array.isArray(content)) return undefined;
+
+  const textBlocks = content.filter(
+    (block): block is { type: "text"; text: string } =>
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      block.type === "text" &&
+      "text" in block &&
+      typeof block.text === "string",
+  );
+  if (textBlocks.length !== content.length || textBlocks.length === 0) return undefined;
+  return formatUsageLocalCommandMessage(textBlocks.map((block) => block.text).join("\n"));
+}

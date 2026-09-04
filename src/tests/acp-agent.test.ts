@@ -49,7 +49,11 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
-import { formatUsageCommandOutput, formatUsageLocalCommandMessage } from "../usage-markdown.js";
+import {
+  formatUsageCommandOutput,
+  formatUsageLocalCommandMessage,
+  formatUsageMessageContent,
+} from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
@@ -1903,6 +1907,67 @@ Last 7d · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, clau
     expect(formatted).toContain("**5-hour limit** — **6%**");
     expect(formatted).toContain("**Last 24h** · 50 requests · 4 sessions");
     expect(formatted).not.toContain("Current session:");
+  });
+
+  it("normalizes the SDK assistant text-block shape", () => {
+    expect(formatUsageMessageContent([{ type: "text", text: report }])).toBe(
+      formatUsageCommandOutput(report),
+    );
+    expect(
+      formatUsageMessageContent([
+        { type: "text", text: report },
+        { type: "image", source: { type: "base64", data: "" } },
+      ]),
+    ).toBeUndefined();
+  });
+
+  it("publishes Markdown for an SDK assistant text-block result", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const iterator = input[Symbol.asyncIterator]();
+        const user = await iterator.next();
+        yield userEcho(user.value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "usage-command-result",
+            type: "message",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text: report }],
+            stop_reason: "stop_sequence",
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(text).toContain("## Usage");
+    expect(text).toContain("| MCP server | Usage |");
+    expect(text).not.toContain("Current session:");
   });
 
   it("does not claim messages from other local commands", () => {
