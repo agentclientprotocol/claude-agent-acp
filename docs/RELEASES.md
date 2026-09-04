@@ -12,6 +12,10 @@ publishes to npm, and dispatches a version update to the agent registry.
 There is no manual release button, and versions are never typed in by hand: the
 version is an output of the commit history, not an input.
 
+Every _other_ push to `main` publishes a preview instead — see
+[Preview releases](#preview-releases). Anything merged to `main` is on npm within
+minutes; there is no staging branch.
+
 ## Releasing
 
 ```sh
@@ -41,6 +45,70 @@ gh release view "v<version>"
 npm view "@agentclientprotocol/claude-agent-acp@<version>"
 ```
 
+## Preview releases
+
+Every push to `main` that is not a release merge publishes a preview from the
+`publish-preview` job in the same workflow. There is no GitHub release and no
+registry update — only an npm publish under the `preview` dist-tag and a
+`v<version>` tag on the commit it came from.
+
+```sh
+npm install @agentclientprotocol/claude-agent-acp@preview
+npm view @agentclientprotocol/claude-agent-acp dist-tags
+git ls-remote --tags origin 'refs/tags/*preview*'
+```
+
+The version is the `package.json` version with the patch incremented, plus
+`-preview.N`: with `main` at 0.73.0 the previews are `0.73.1-preview.1`,
+`0.73.1-preview.2`, and so on. `N` restarts at 1 whenever release-please moves
+`package.json`, which keeps the sequence monotonic whichever way the next release
+goes — a patch release makes the next base 0.73.2, a minor makes it 0.74.1, and
+both sort above every `0.73.1-preview.*`.
+
+`0.73.1-preview.4` is **not** a promise that 0.73.1 will ship. The base is a
+patch bump because that is the only choice depending solely on `package.json`,
+which release-please only ever increases. Using release-please's predicted next
+version would read better but that prediction moves mid-flight: a `fix:` opens a
+0.73.1 release PR, a later `feat:` moves it to 0.74.0, and `N` would reset under
+previews that were already published.
+
+`N` comes from [`scripts/next-preview-version.mjs`](../scripts/next-preview-version.mjs),
+which takes the larger of two sources. The npm registry says what is taken — npm
+versions are immutable and stay reserved even after `npm unpublish`, so reusing
+one is a hard failure — but it is CDN-served and can lag a publish by minutes.
+The git tags this job writes are strongly consistent and cover that window. The
+job publishes before it tags, so a version can exist on npm without a tag but
+never the reverse; that is why a registry read failure aborts the run rather than
+falling back to the tags alone.
+
+Two pushes landing together cannot collide, because the job takes a concurrency
+group. GitHub keeps only one run pending per group, so a third push arriving
+while one preview runs and another waits drops the waiting one — that commit
+simply gets no preview.
+
+`latest` stays put because the job passes `npm publish --tag preview`. Without
+it npm would move `latest` onto the preview: `--tag` defaults to `latest` even
+for a semver prerelease. Right after a release the `preview` dist-tag can name a
+version _below_ `latest` until the next push lands; that is cosmetic.
+
+Release merges are excluded by checking the head commit's author and the subject
+release-please generates. Both are checked, either is enough, and the cost of a
+miss is one wasted version number plus a `preview` tag briefly pointing at
+already-released code — `latest` is untouched. release-please's own
+`releases_created` output would be a sharper signal, but previews hang off the
+`CI` workflow finishing rather than off the push, so they run in a different
+workflow run from the `release-please` job and cannot read its outputs.
+
+To publish a preview by hand — from any commit, bypassing the CI gate:
+
+```sh
+gh workflow run publish.yml --ref main \
+  -f channel=preview -f ref=<commit-or-branch> -f publish_npm=false
+```
+
+`--ref main` is required: the `release` environment only accepts protected
+branches, so a dispatch from anywhere else is rejected before the job starts.
+
 ## How the version is chosen
 
 Squash merges use the PR title as the commit subject, so the PR title decides the
@@ -63,6 +131,14 @@ shipping 1.0.0 by accident.
 Note that `config-file` only takes effect while the workflow does **not** pass a
 `release-type` input to the action — with `release-type` set, the action ignores
 the config entirely. The release type is declared inside the config instead.
+
+`release-type` also switches release-please from `Manifest.fromManifest` to
+`Manifest.fromConfig`, which is a second and sharper reason never to set it. On
+the manifest path the previous release is found by an exact string match against
+the version in [`.release-please-manifest.json`](../.release-please-manifest.json),
+which is why the `v<x>-preview.<n>` tags are invisible to it. On the config path
+release-please instead sorts every candidate tag and release descending and takes
+the highest — and there the preview tags _would_ be candidates.
 
 Because the config is what is read, it also has to say
 `"include-component-in-tag": false`. Left at its default, release-please derives a
@@ -108,6 +184,18 @@ npm versions are immutable. If the package already published and only the
 registry update failed, pass `-f publish_npm=false` so the run skips publishing
 and only re-dispatches the registry update.
 
+### A preview published but the commit was not tagged
+
+The publish and the tag are separate steps and only the publish is irreversible.
+Nothing is broken — the next preview still picks the right `N` once the registry
+CDN catches up — but the tag is how that number is known immediately. Add it by
+hand:
+
+```sh
+gh api "repos/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/git/refs" \
+  -f ref="refs/tags/v<version>" -f sha="<commit-sha>"
+```
+
 ## Credentials
 
 | Secret                                                        | Used for                                                          |
@@ -117,3 +205,9 @@ and only re-dispatches the registry update.
 
 Publishing to npm uses OIDC trusted publishing, so there is no npm token. All
 release jobs run in the `release` environment.
+
+npm binds a trusted publisher to one repository, one **workflow filename** and
+one environment, and a package may only have one such binding. That is why
+preview publishing is another job inside `publish.yml` rather than a workflow of
+its own: a separate file would fail to authenticate, and registering it would
+cost the stable path its publisher.

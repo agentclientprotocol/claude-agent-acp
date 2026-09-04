@@ -22,6 +22,14 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
+To try changes that have landed on `main` but are not released yet, install from the
+`preview` channel — every push to `main` publishes one. See
+[`docs/RELEASES.md`](docs/RELEASES.md#preview-releases).
+
+```sh
+npm install @agentclientprotocol/claude-agent-acp@preview
+```
+
 ### Subagent sessions
 
 Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
