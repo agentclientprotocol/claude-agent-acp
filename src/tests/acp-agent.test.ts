@@ -49,11 +49,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
-import {
-  formatUsageCommandOutput,
-  formatUsageLocalCommandMessage,
-  formatUsageMessageContent,
-} from "../usage-markdown.js";
+import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
@@ -63,6 +59,7 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
@@ -1855,73 +1852,82 @@ describe("stripLocalCommandMetadata", () => {
 });
 
 describe("usage Markdown", () => {
-  const report = `You are currently using your subscription to power your Claude Code usage
-Current session: 3% used · resets Sep 4 at 8:59pm (Asia/Yerevan)
-Current week (all models): 0% used · resets Sep 4 at 9:59pm (Asia/Yerevan)
-Current week (Fable): 0% used
-What's contributing to your limits usage? Approximate, based on local sessions on this machine — does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.
-Last 24h · 34 requests · 3 sessions Top MCP servers: ccd_session_mgmt 13%, ccd_session 5%, claude_agent_acp 3%
-Last 7d · 43 requests · 5 sessions Top MCP servers: ccd_session_mgmt 11%, ccd_session 4%, claude_agent_acp 3%`;
+  const usageResponse = {
+    session: {
+      total_cost_usd: 0.33,
+      total_api_duration_ms: 20_000,
+      total_duration_ms: 69_000,
+      total_lines_added: 0,
+      total_lines_removed: 0,
+      model_usage: {
+        "claude-opus-4-1": {
+          inputTokens: 4,
+          outputTokens: 872,
+          cacheReadInputTokens: 98_700,
+          cacheCreationInputTokens: 25_300,
+          webSearchRequests: 0,
+          costUSD: 0.33,
+          contextWindow: 200_000,
+          maxOutputTokens: 32_000,
+        },
+      },
+    },
+    subscription_type: "max",
+    rate_limits_available: true,
+    rate_limits: {
+      five_hour: { utilization: 3, resets_at: "2026-09-04T16:59:00.000Z" },
+      seven_day: { utilization: 0, resets_at: "2026-09-04T17:59:00.000Z" },
+      model_scoped: [{ display_name: "Fable", utilization: 0, resets_at: null }],
+    },
+    behaviors: {
+      day: {
+        request_count: 34,
+        session_count: 3,
+        behaviors: [],
+        agents: [],
+        skills: [],
+        plugins: [],
+        mcp_servers: [{ name: "ccd_session_mgmt", pct: 13 }],
+      },
+      week: {
+        request_count: 43,
+        session_count: 5,
+        behaviors: [],
+        agents: [],
+        skills: [],
+        plugins: [],
+        mcp_servers: [{ name: "claude_agent_acp", pct: 3 }],
+      },
+    },
+  } satisfies SDKControlGetUsageResponse;
 
-  it("renders subscription limits and MCP contributions", () => {
-    const formatted = formatUsageCommandOutput(report);
+  it("keeps the expected experimental SDK response shape compile- and runtime-checked", () => {
+    expect(parseUsageResponse(usageResponse)).toEqual(usageResponse);
+    expect(
+      parseUsageResponse({ ...usageResponse, session: { total_cost_usd: "broken" } }),
+    ).toBeNull();
+  });
 
+  it("renders limits, session totals, and MCP contributions from structured data", () => {
+    const formatted = formatUsageResponse(usageResponse);
     expect(formatted).toContain("## Usage");
-    expect(formatted).toContain("**5-hour limit** — **3%** · Resets Sep 4 at 8:59pm");
-    expect(formatted).toContain("**Weekly · all models** — **0%**");
-    expect(formatted).toContain("`█░░░░░░░░░░░░░░░░░░░`");
-    expect(formatted).toContain("### What’s using your limits?");
+    expect(formatted).toContain("**5-hour limit** — **3%**");
+    expect(formatted).toContain("**Weekly · Fable** — **0%**");
+    expect(formatted).toContain("| $0.33 | 20s | 1m 9s |");
+    expect(formatted).toContain("| Cache read | 98.7K |");
     expect(formatted).toContain("**Last 24h** · 34 requests · 3 sessions");
-    expect(formatted).toContain("| `ccd_session_mgmt` | `███░░░░░░░░░░░░░░░░░` 13% |");
-    expect(formatted).toContain("**Last 7d** · 43 requests · 5 sessions");
-    expect(formatted).not.toContain("Current session:");
+    expect(formatted).toContain("| ccd\\_session\\_mgmt | `███░░░░░░░░░░░░░░░░░` 13% |");
   });
 
-  it("leaves an unknown future report shape readable", () => {
-    expect(formatUsageCommandOutput("Usage data is temporarily unavailable.")).toBe(
-      "Usage data is temporarily unavailable.",
-    );
+  it("recognizes only exact local usage commands", () => {
+    expect(isUsageCommandText(" /usage ")).toBe(true);
+    expect(isUsageCommandText("/cost")).toBe(true);
+    expect(isUsageCommandText("/stats")).toBe(true);
+    expect(isUsageCommandText("please review /usage")).toBe(false);
+    expect(isUsageCommandText("/usage now")).toBe(false);
   });
 
-  it("extracts stdout with and without a command-name marker", () => {
-    const wrapped =
-      `<command-name>/usage</command-name>` +
-      `<local-command-stdout>${report}</local-command-stdout>`;
-    expect(formatUsageLocalCommandMessage(wrapped)).toBe(formatUsageCommandOutput(report));
-    expect(
-      formatUsageLocalCommandMessage(`<local-command-stdout>${report}</local-command-stdout>`),
-    ).toBe(formatUsageCommandOutput(report));
-  });
-
-  it("recognizes the unwrapped single-line limits emitted by the live SDK", () => {
-    const liveReport = `/usage
-
-You are currently using your subscription to power your Claude Code usage
-Current session: 6% used · resets Sep 4 at 9pm (Asia/Yerevan) Current week (all models): 0% used · resets Sep 4 at 10pm (Asia/Yerevan) Current week (Fable): 0% used
-What's contributing to your limits usage? Approximate, based on local sessions on this machine — does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.
-Last 24h · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, claude_agent_acp 4%, ccd_session 4%
-Last 7d · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, claude_agent_acp 4%, ccd_session 4%`;
-
-    const formatted = formatUsageLocalCommandMessage(liveReport);
-    expect(formatted).toContain("## Usage");
-    expect(formatted).toContain("**5-hour limit** — **6%**");
-    expect(formatted).toContain("**Last 24h** · 50 requests · 4 sessions");
-    expect(formatted).not.toContain("Current session:");
-  });
-
-  it("normalizes the SDK assistant text-block shape", () => {
-    expect(formatUsageMessageContent([{ type: "text", text: report }])).toBe(
-      formatUsageCommandOutput(report),
-    );
-    expect(
-      formatUsageMessageContent([
-        { type: "text", text: report },
-        { type: "image", source: { type: "base64", data: "" } },
-      ]),
-    ).toBeUndefined();
-  });
-
-  it("publishes Markdown for an SDK assistant text-block result", async () => {
+  it("handles /usage through the structured SDK control API without prompting Claude", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -1929,35 +1935,62 @@ Last 7d · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, clau
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
+    let queryConsumed = false;
+    injectGeneratorSession(agent, () => {
+      async function* messages() {
+        queryConsumed = true;
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+    const getUsage = vi.fn(async () => usageResponse);
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/usage" }],
+    });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(response.stopReason).toBe("end_turn");
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(queryConsumed).toBe(false);
+    expect(text).toContain("## Usage");
+    expect(text).toContain("### This session");
+  });
+
+  it("runs the original command and preserves its raw output when structured usage is invalid", async () => {
+    const raw = "Original Claude Code usage output";
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let forwardedPrompt = "";
     injectGeneratorSession(agent, (input) => {
       async function* messages() {
-        const iterator = input[Symbol.asyncIterator]();
-        const user = await iterator.next();
+        const user = await input[Symbol.asyncIterator]().next();
+        forwardedPrompt = user.value.message.content[0].text;
         yield userEcho(user.value);
         yield {
-          type: "assistant",
-          parent_tool_use_id: null,
+          type: "system",
+          subtype: "local_command_output",
+          content: raw,
           uuid: randomUUID(),
           session_id: "test-session",
-          message: {
-            id: "usage-command-result",
-            type: "message",
-            role: "assistant",
-            model: "<synthetic>",
-            content: [{ type: "text", text: report }],
-            stop_reason: "stop_sequence",
-            usage: {
-              input_tokens: 0,
-              output_tokens: 0,
-              cache_read_input_tokens: 0,
-              cache_creation_input_tokens: 0,
-            },
-          },
         };
         yield successfulResultMessage();
       }
       return messages();
     });
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      vi.fn(async () => ({ broken: true }) as any);
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
 
@@ -1965,17 +1998,8 @@ Last 7d · 50 requests · 4 sessions Top MCP servers: ccd_session_mgmt 10%, clau
       .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
       .map((update) => (update.update as any).content.text)
       .join("");
-    expect(text).toContain("## Usage");
-    expect(text).toContain("| MCP server | Usage |");
-    expect(text).not.toContain("Current session:");
-  });
-
-  it("does not claim messages from other local commands", () => {
-    expect(
-      formatUsageLocalCommandMessage(
-        "<command-name>/status</command-name><local-command-stdout>ok</local-command-stdout>",
-      ),
-    ).toBeUndefined();
+    expect(forwardedPrompt).toBe("/usage");
+    expect(text).toBe(raw);
   });
 });
 

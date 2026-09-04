@@ -1,18 +1,91 @@
-function markerContents(text: string, tag: string): string[] {
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  const contents: string[] = [];
-  let offset = 0;
-  while (offset < text.length) {
-    const start = text.indexOf(open, offset);
-    if (start === -1) break;
-    const valueStart = start + open.length;
-    const end = text.indexOf(close, valueStart);
-    if (end === -1) break;
-    contents.push(text.slice(valueStart, end));
-    offset = end + close.length;
-  }
-  return contents;
+import type { SDKControlGetUsageResponse } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
+
+const usageWindowSchema = z
+  .object({ utilization: z.number().nullable(), resets_at: z.string().nullable() })
+  .nullable()
+  .optional();
+const contributionSchema = z.object({ name: z.string(), pct: z.number() });
+const behaviorPeriodSchema = z.object({
+  request_count: z.number(),
+  session_count: z.number(),
+  behaviors: z.array(
+    z.object({
+      key: z.enum(["cache_miss", "long_context", "subagent_heavy", "high_parallel", "cron"]),
+      pct: z.number(),
+      count: z.number(),
+    }),
+  ),
+  agents: z.array(contributionSchema),
+  skills: z.array(contributionSchema),
+  plugins: z.array(contributionSchema),
+  mcp_servers: z.array(contributionSchema),
+});
+const modelUsageSchema = z.object({
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  thinkingTokens: z.number().optional(),
+  cacheReadInputTokens: z.number(),
+  cacheCreationInputTokens: z.number(),
+  webSearchRequests: z.number(),
+  costUSD: z.number(),
+  contextWindow: z.number(),
+  maxOutputTokens: z.number(),
+  canonicalModel: z.string().optional(),
+  provider: z.string().optional(),
+  costBasis: z.enum(["list", "managed", "unknown"]).optional(),
+});
+
+const usageResponseSchema = z.object({
+  session: z.object({
+    total_cost_usd: z.number(),
+    total_api_duration_ms: z.number(),
+    total_duration_ms: z.number(),
+    total_lines_added: z.number(),
+    total_lines_removed: z.number(),
+    model_usage: z.record(z.string(), modelUsageSchema),
+  }),
+  subscription_type: z.string().nullable(),
+  rate_limits_available: z.boolean(),
+  rate_limits: z
+    .object({
+      five_hour: usageWindowSchema,
+      seven_day: usageWindowSchema,
+      seven_day_oauth_apps: usageWindowSchema,
+      seven_day_opus: usageWindowSchema,
+      seven_day_sonnet: usageWindowSchema,
+      model_scoped: z
+        .array(
+          z.object({
+            display_name: z.string(),
+            utilization: z.number().nullable(),
+            resets_at: z.string().nullable(),
+          }),
+        )
+        .optional(),
+      extra_usage: z
+        .object({
+          is_enabled: z.boolean(),
+          monthly_limit: z.number().nullable(),
+          used_credits: z.number().nullable(),
+          utilization: z.number().nullable(),
+          currency: z.string().nullable().optional(),
+        })
+        .nullable()
+        .optional(),
+    })
+    .nullable(),
+  behaviors: z.object({ day: behaviorPeriodSchema, week: behaviorPeriodSchema }).nullable(),
+});
+
+/** Validate the experimental SDK response at the runtime boundary. */
+export function parseUsageResponse(value: unknown): SDKControlGetUsageResponse | null {
+  const parsed = usageResponseSchema.safeParse(value);
+  return parsed.success ? (parsed.data as SDKControlGetUsageResponse) : null;
+}
+
+export function isUsageCommandText(text: string): boolean {
+  return ["/usage", "/cost", "/stats"].includes(text.trim());
 }
 
 function usageBar(percent: number): string {
@@ -22,61 +95,120 @@ function usageBar(percent: number): string {
   return `${"█".repeat(filled)}${"░".repeat(cells - filled)}`;
 }
 
-function usageLabel(raw: string): string {
-  if (/^current session$/i.test(raw)) return "5-hour limit";
-  const weekly = raw.match(/^current week\s*\((.+)\)$/i);
-  return weekly ? `Weekly · ${weekly[1]}` : raw;
+function escapeMarkdown(value: string): string {
+  return value.replace(/([\\`*_[\]<>|])/g, "\\$1").replace(/[\r\n]+/g, " ");
 }
 
-function markdownCode(value: string): string {
-  return `\`${value.replaceAll("`", "\\`")}\``;
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
 }
 
-/** Render Claude Code's plain `/usage` terminal report as compact Markdown.
- * The report is intentionally parsed by labels instead of line boundaries:
- * some CLI versions put several fields on one physical line. Unknown report
- * shapes are returned unchanged so a future Claude release stays readable. */
-export function formatUsageCommandOutput(output: string): string {
-  const limitPattern =
-    /(Current session|Current week\s*\([^)]+\)):\s*(\d+(?:\.\d+)?)% used(?:\s*·\s*resets\s+(.+?))?(?=\s+Current (?:session|week)\b|\n|$)/gi;
-  const limits = [...output.matchAll(limitPattern)].map((match) => ({
-    label: usageLabel(match[1].trim()),
-    percent: Number(match[2]),
-    reset: match[3]?.trim(),
-  }));
+function formatCount(value: number): string {
+  return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(
+    value,
+  );
+}
 
-  const periodPattern =
-    /Last\s+(24h|7d)\s*·\s*(\d+) requests\s*·\s*(\d+) sessions\s*Top MCP servers:\s*(.*?)(?=\s*Last\s+(?:24h|7d)\b|$)/gis;
-  const periods = [...output.matchAll(periodPattern)].map((match) => {
-    const servers = [...match[4].matchAll(/([^,\n]+?)\s+(\d+(?:\.\d+)?)%(?:\s*,|$)/g)].map(
-      (server) => ({ name: server[1].trim(), percent: Number(server[2]) }),
-    );
-    return { range: match[1], requests: match[2], sessions: match[3], servers };
-  });
+function formatReset(value: string | null): string {
+  if (!value) return "";
+  const reset = new Date(value);
+  if (Number.isNaN(reset.getTime())) return ` · Resets ${escapeMarkdown(value)}`;
+  return ` · Resets ${new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(reset)}`;
+}
 
-  if (limits.length === 0 && periods.length === 0) return output;
+function appendLimit(
+  lines: string[],
+  label: string,
+  window: { utilization: number | null; resets_at: string | null } | null | undefined,
+): void {
+  if (!window || window.utilization === null) return;
+  lines.push(
+    `**${escapeMarkdown(label)}** — **${window.utilization}%**${formatReset(window.resets_at)}`,
+    "",
+    `\`${usageBar(window.utilization)}\``,
+    "",
+  );
+}
 
+function appendContributions(
+  lines: string[],
+  label: string,
+  period: {
+    request_count: number;
+    session_count: number;
+    mcp_servers: { name: string; pct: number }[];
+  },
+): void {
+  lines.push(
+    "",
+    `**${label}** · ${period.request_count} requests · ${period.session_count} sessions`,
+  );
+  if (period.mcp_servers.length === 0) return;
+  lines.push("", "| MCP server | Usage |", "|:--|--:|");
+  for (const server of period.mcp_servers) {
+    lines.push(`| ${escapeMarkdown(server.name)} | \`${usageBar(server.pct)}\` ${server.pct}% |`);
+  }
+}
+
+/** Render the SDK's structured `/usage` response as Markdown. */
+export function formatUsageResponse(usage: SDKControlGetUsageResponse): string {
   const lines = ["## Usage"];
-  const intro = output
-    .match(/You are currently using.*?(?=\s*Current session:|\n|$)/i)?.[0]
-    ?.trim();
-  if (intro) lines.push("", `> ${intro}`);
+  if (usage.subscription_type) {
+    lines.push("", `> Claude ${escapeMarkdown(usage.subscription_type)} subscription usage`);
+  }
 
-  if (limits.length > 0) {
+  if (usage.rate_limits_available && usage.rate_limits) {
     lines.push("", "### Limits", "");
-    for (const limit of limits) {
-      const reset = limit.reset ? ` · Resets ${limit.reset}` : "";
-      lines.push(
-        `**${limit.label}** — **${limit.percent}%**${reset}`,
-        "",
-        markdownCode(usageBar(limit.percent)),
-        "",
-      );
+    appendLimit(lines, "5-hour limit", usage.rate_limits.five_hour);
+    appendLimit(lines, "Weekly · all models", usage.rate_limits.seven_day);
+    const modelWindows = usage.rate_limits.model_scoped ?? [];
+    for (const model of modelWindows) appendLimit(lines, `Weekly · ${model.display_name}`, model);
+    if (modelWindows.length === 0) {
+      appendLimit(lines, "Weekly · Opus", usage.rate_limits.seven_day_opus);
+      appendLimit(lines, "Weekly · Sonnet", usage.rate_limits.seven_day_sonnet);
     }
     if (lines.at(-1) === "") lines.pop();
   }
 
-  if (periods.length > 0) {
+  const models = Object.values(usage.session.model_usage);
+  const totals = models.reduce(
+    (sum, model) => ({
+      input: sum.input + model.inputTokens,
+      output: sum.output + model.outputTokens,
+      cacheRead: sum.cacheRead + model.cacheReadInputTokens,
+      cacheWrite: sum.cacheWrite + model.cacheCreationInputTokens,
+    }),
+    { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  );
+  lines.push(
+    "",
+    "---",
+    "",
+    "### This session",
+    "",
+    "| Cost | API time | Active |",
+    "|:--|:--|:--|",
+    `| $${usage.session.total_cost_usd.toFixed(2)} | ${formatDuration(usage.session.total_api_duration_ms)} | ${formatDuration(usage.session.total_duration_ms)} |`,
+    "",
+    "| Breakdown | Tokens |",
+    "|:--|--:|",
+    `| Input | ${formatCount(totals.input)} |`,
+    `| Output | ${formatCount(totals.output)} |`,
+    `| Cache read | ${formatCount(totals.cacheRead)} |`,
+    `| Cache write | ${formatCount(totals.cacheWrite)} |`,
+  );
+
+  if (usage.behaviors) {
     lines.push(
       "",
       "---",
@@ -85,52 +217,8 @@ export function formatUsageCommandOutput(output: string): string {
       "",
       "> Approximate, overlapping measures · this machine only · excludes claude.ai",
     );
-    for (const period of periods) {
-      lines.push(
-        "",
-        `**Last ${period.range}** · ${period.requests} requests · ${period.sessions} sessions`,
-      );
-      if (period.servers.length === 0) continue;
-      lines.push("", "| MCP server | Usage |", "|:--|--:|");
-      for (const server of period.servers) {
-        lines.push(
-          `| ${markdownCode(server.name)} | ${markdownCode(usageBar(server.percent))} ${server.percent}% |`,
-        );
-      }
-    }
+    appendContributions(lines, "Last 24h", usage.behaviors.day);
+    appendContributions(lines, "Last 7d", usage.behaviors.week);
   }
-
   return lines.join("\n");
-}
-
-/** Format `/usage` output whether the SDK kept its local-command markers or
- * already unwrapped it to plain text. Returns `undefined` for unrelated text. */
-export function formatUsageLocalCommandMessage(content: string): string | null | undefined {
-  const command = markerContents(content, "command-name").at(-1)?.trim();
-  const stdout = markerContents(content, "local-command-stdout").join("\n").trim();
-  const report = stdout || content;
-  const hasUsageSignature =
-    /\bCurrent session:\s*\d+(?:\.\d+)?% used\b/i.test(report) &&
-    /\bCurrent week\s*\(/i.test(report);
-  if (hasUsageSignature) return formatUsageCommandOutput(report);
-  return command === "/usage" ? null : undefined;
-}
-
-/** Normalize the SDK content shapes used by local commands. Claude currently
- * emits `/usage` as either a string or one or more assistant text blocks. */
-export function formatUsageMessageContent(content: unknown): string | null | undefined {
-  if (typeof content === "string") return formatUsageLocalCommandMessage(content);
-  if (!Array.isArray(content)) return undefined;
-
-  const textBlocks = content.filter(
-    (block): block is { type: "text"; text: string } =>
-      typeof block === "object" &&
-      block !== null &&
-      "type" in block &&
-      block.type === "text" &&
-      "text" in block &&
-      typeof block.text === "string",
-  );
-  if (textBlocks.length !== content.length || textBlocks.length === 0) return undefined;
-  return formatUsageLocalCommandMessage(textBlocks.map((block) => block.text).join("\n"));
 }

@@ -238,7 +238,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
-import { formatUsageMessageContent } from "./usage-markdown.js";
+import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -2571,6 +2571,41 @@ export class ClaudeAcpAgent {
     }
 
     session.titles.onPrompt(params.prompt);
+
+    // `/usage` is a local Claude Code command, not a model prompt. Prefer the
+    // SDK's structured control response so presentation does not depend on
+    // parsing human-readable CLI output. The API is explicitly experimental:
+    // validate it at runtime and fall through to the original command on any
+    // incompatibility. A busy query also takes the normal FIFO path so this
+    // fast path can never reorder output around another turn.
+    const isUsageCommand =
+      params.prompt.length === 1 &&
+      params.prompt[0]?.type === "text" &&
+      isUsageCommandText(params.prompt[0].text);
+    if (isUsageCommand && session.activeTurn == null && (session.turnQueue?.length ?? 0) === 0) {
+      try {
+        // Keeping the deliberately unstable method name visible here makes an
+        // SDK upgrade fail at compile time if Anthropic removes or renames it.
+        const rawUsage =
+          await session.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+        const usage = parseUsageResponse(rawUsage);
+        if (!usage) throw new Error("SDK returned an incompatible usage response");
+        await this.client.sessionUpdate({
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: formatUsageResponse(usage) },
+            messageId: promptUuid,
+          },
+        });
+        if (fileChangeAudit && session.fileChangeAuditSupport) {
+          await session.fileChangeAuditSupport.finishUnavailable(fileChangeAudit, "notReported");
+        }
+        return { stopReason: "end_turn" };
+      } catch (error) {
+        this.logger.error(`Structured /usage failed; falling back to Claude Code: ${error}`);
+      }
+    }
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
     // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
@@ -5462,25 +5497,13 @@ export class ClaudeAcpAgent {
               }
             }
 
-            // Render /usage as Markdown whether the SDK sends wrapped stdout or
-            // already-unwrapped plain text. Other local commands retain their
-            // marker-stripping behavior. Pure-marker payloads (e.g. /compact's
-            // malformed output) strip to null and are skipped. Mirrors the
-            // replay path at replaySessionHistory.
-            const usageMarkdown =
-              message.message.role === "system"
-                ? undefined
-                : formatUsageMessageContent(message.message.content);
             const stringContent =
               typeof message.message.content === "string" ? message.message.content : undefined;
             if (
               message.message.role !== "system" &&
-              (usageMarkdown !== undefined || stringContent?.includes("<local-command-stdout>"))
+              stringContent?.includes("<local-command-stdout>")
             ) {
-              const stripped =
-                usageMarkdown === undefined && stringContent !== undefined
-                  ? stripLocalCommandMetadata(stringContent)
-                  : usageMarkdown;
+              const stripped = stripLocalCommandMetadata(stringContent);
               if (typeof stripped === "string") {
                 for (const notification of toAcpNotifications(
                   stripped,
@@ -6569,15 +6592,8 @@ export class ClaudeAcpAgent {
       ) {
         content = stripSubagentTextAndThinking(content);
       }
-      const replayUsageMarkdown = formatUsageMessageContent(content);
-      if (replayUsageMarkdown === null) {
-        continue;
-      }
-      if (replayUsageMarkdown !== undefined) {
-        content = replayUsageMarkdown;
-      }
       // @ts-expect-error - untyped in SDK but we handle all of these
-      if (message.message.role === "user" && replayUsageMarkdown === undefined) {
+      if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
         if (content === null) continue;
       }
