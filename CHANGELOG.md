@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.74.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.73.0...v0.74.0) (2026-09-04)
+
+
+### Features
+
+* **auth:** refuse claude.ai subscriptions under `--hide-claude-auth` ([#1079](https://github.com/agentclientprotocol/claude-agent-acp/issues/1079)) ([da9f7e5](https://github.com/agentclientprotocol/claude-agent-acp/commit/da9f7e56956c770bd1339151d6166a011fe39174))
+
 ## [0.73.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.72.0...v0.73.0) (2026-09-01)
 
 
