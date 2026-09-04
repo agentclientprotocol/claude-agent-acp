@@ -350,7 +350,7 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("prefers a question's custom answer over its selection", () => {
+  it("prefers a single-select question's custom answer over its selection", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_0_custom: "  my own take  " },
@@ -362,6 +362,22 @@ describe("applyAskElicitationResponse", () => {
         questions,
         metadata: { source: "test" },
         answers: { "Single?": "my own take" },
+      },
+    });
+  });
+
+  it("appends a multi-select question's custom answer to its selections", () => {
+    const response = {
+      action: "accept",
+      content: { question_1: ["X", "Y"], question_1_custom: "  Z  " },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Multi?": "X, Y, Z" },
       },
     });
   });
