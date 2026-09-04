@@ -238,6 +238,7 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import { formatUsageLocalCommandMessage } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -5471,7 +5472,11 @@ export class ClaudeAcpAgent {
               typeof message.message.content === "string" &&
               message.message.content.includes("<local-command-stdout>")
             ) {
-              const stripped = stripLocalCommandMetadata(message.message.content);
+              const usageMarkdown = formatUsageLocalCommandMessage(message.message.content);
+              const stripped =
+                usageMarkdown === undefined
+                  ? stripLocalCommandMetadata(message.message.content)
+                  : usageMarkdown;
               if (typeof stripped === "string") {
                 for (const notification of toAcpNotifications(
                   stripped,
