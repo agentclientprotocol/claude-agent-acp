@@ -7697,6 +7697,7 @@ export class ClaudeAcpAgent {
       resumedModelHint?: string;
     } = {},
   ): Promise<NewSessionResponse> {
+    const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
     // this check a session is created against a missing directory and the
@@ -7721,7 +7722,7 @@ export class ClaudeAcpAgent {
     } else {
       sessionId = randomUUID();
     }
-    const timing = new SessionTiming(this.logger, "create", sessionId);
+    const timing = new SessionTiming(this.logger, "create", sessionId, createStartedAt);
     timing.phase("validate-cwd");
 
     const input = new Pushable<SDKUserMessage>();

@@ -4,14 +4,18 @@ type TimingLogger = {
 
 /** Small phase timer for session lifecycle diagnostics. */
 export class SessionTiming {
-  private readonly startedAt = performance.now();
-  private phaseStartedAt = this.startedAt;
+  private readonly startedAt: number;
+  private phaseStartedAt: number;
 
   constructor(
     private readonly logger: TimingLogger | undefined,
     private readonly operation: string,
     private readonly sessionId: string,
-  ) {}
+    startedAt = performance.now(),
+  ) {
+    this.startedAt = startedAt;
+    this.phaseStartedAt = startedAt;
+  }
 
   phase(name: string, detail = ""): void {
     const finishedAt = performance.now();
