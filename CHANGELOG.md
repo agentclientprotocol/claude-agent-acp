@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.75.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.75.0...v0.75.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* restore session forks and speed up loading ([#1089](https://github.com/agentclientprotocol/claude-agent-acp/issues/1089)) ([f5e79f5](https://github.com/agentclientprotocol/claude-agent-acp/commit/f5e79f55f8ba8d1cd0a72cbc78bfea726bea2f00))
+
 ## [0.75.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.74.0...v0.75.0) (2026-09-05)
 
 
