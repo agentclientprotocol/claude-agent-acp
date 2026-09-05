@@ -55,8 +55,16 @@ When an ACP caller provides `settings` via `_meta.claudeCode.options.settings` i
 - Only `modelOverrides` and `availableModels` keys are read; other keys in the JSON are ignored.
 - Both fields map directly to the Claude Agent SDK's `Settings` type.
 
-## Manual `opusplan` selections
+## Manual model selections
 
-The model picker includes `opusplan` when the SDK exposes both Opus and Sonnet aliases, subject to the configured `availableModels` allowlist. A successful manual selection is remembered per session under `$CLAUDE_CONFIG_DIR/claude-agent-acp/model-selections` (by default, `~/.claude/claude-agent-acp/model-selections`), because the transcript only records the concrete model used for a turn. Switching to another model clears this record; forks inherit it.
+The model picker includes `opusplan` when the SDK exposes both Opus and Sonnet aliases, subject to the configured `availableModels` allowlist.
 
-On resume, an explicit caller model or an environment/settings model configuration takes precedence over the saved selection. Removing `opusplan` from `availableModels` prevents a saved selection from restoring it. Sessions created before this persistence support need to select `opusplan` once to save their choice.
+Every successful manual model selection, including Sonnet and Default, is remembered per session under `$CLAUDE_CONFIG_DIR/claude-agent-acp/model-selections` (by default, `~/.claude/claude-agent-acp/model-selections`). This preserves choices such as `opusplan` that cannot be reconstructed from the concrete model recorded in the transcript. Switching models replaces the saved choice; forks inherit it.
+
+On resume, model selection uses this priority:
+
+1. An explicit caller model (`_meta.claudeCode.options.model`) for that launch.
+2. The saved manual selection, if allowed by the current model configuration.
+3. Environment/settings model defaults and the existing transcript fallback.
+
+New sessions continue to use configured defaults. Removing a model from `availableModels` prevents its saved selection from restoring it; Default and the configured custom model retain their usual allowlist exemptions. Sessions created before this persistence support need one successful manual selection to save their choice.

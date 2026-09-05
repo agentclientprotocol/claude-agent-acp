@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
@@ -31,30 +32,32 @@ function selectionPath(configDir: string, sessionId: string): string {
   );
 }
 
-/** A transcript's concrete API model cannot distinguish opusplan from an
- * ordinary Opus or Sonnet selection. Store only this otherwise-lost intent. */
-export async function readOpusplanSelection(
+/** Preserve the user's selection, including aliases and Default, rather than
+ * inferring it from the concrete API model recorded in the transcript. */
+export async function readModelSelection(
   configDir: string,
   sessionId: string,
-): Promise<boolean> {
+): Promise<string | undefined> {
   try {
-    return (await fs.readFile(selectionPath(configDir, sessionId), "utf8")) === "opusplan";
+    return (await fs.readFile(selectionPath(configDir, sessionId), "utf8")).trim() || undefined;
   } catch (error) {
-    if ((error as { code?: string }).code === "ENOENT") return false;
+    if ((error as { code?: string }).code === "ENOENT") return undefined;
     throw error;
   }
 }
 
-export async function writeOpusplanSelection(
+export async function writeModelSelection(
   configDir: string,
   sessionId: string,
   model: string,
 ): Promise<void> {
   const file = selectionPath(configDir, sessionId);
-  if (model === "opusplan") {
-    await fs.mkdir(path.dirname(file), { recursive: true });
-    await fs.writeFile(file, "opusplan");
-  } else {
-    await fs.rm(file, { force: true });
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, model);
+    await fs.rename(temporary, file);
+  } finally {
+    await fs.rm(temporary, { force: true });
   }
 }

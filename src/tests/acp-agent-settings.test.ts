@@ -472,19 +472,42 @@ describe("ClaudeAcpAgent settings", () => {
   it.each([
     { action: "restore", startup: "opusplan", current: "opusplan", selectable: true },
     { action: "fork", startup: "opusplan", current: "opusplan", selectable: true },
-    { action: "switch away", startup: undefined, current: "sonnet", selectable: true },
+    { action: "switch away", startup: "sonnet", current: "sonnet", selectable: true },
     { action: "reject selection", startup: undefined, current: "sonnet", selectable: true },
     { action: "reject switch away", startup: "opusplan", current: "opusplan", selectable: true },
     { action: "different session", startup: undefined, current: "sonnet", selectable: true },
-    { action: "env override", startup: undefined, current: "sonnet", selectable: true },
-    { action: "settings override", startup: undefined, current: "sonnet", selectable: true },
+    { action: "env default", startup: "opusplan", current: "opusplan", selectable: true },
+    { action: "settings default", startup: "opusplan", current: "opusplan", selectable: true },
+    { action: "sonnet beats env default", startup: "sonnet", current: "sonnet", selectable: true },
+    {
+      action: "default beats env default",
+      startup: "default",
+      current: "default",
+      selectable: true,
+    },
+    { action: "caller override", startup: "sonnet", current: "sonnet", selectable: true },
+    {
+      action: "custom outside allowlist",
+      startup: "provider-custom",
+      current: "provider-custom",
+      selectable: false,
+    },
+    {
+      action: "CLI alias with override",
+      startup: "sonnet",
+      current: "provider-sonnet",
+      selectable: false,
+    },
     { action: "allowlist excludes", startup: undefined, current: "sonnet", selectable: false },
-    { action: "CLI switch away", startup: undefined, current: "sonnet", selectable: true },
+    { action: "CLI switch away", startup: "sonnet", current: "sonnet", selectable: true },
   ])(
     "$action for a manual opusplan selection across adapter restarts",
     async ({ action, startup, current, selectable }) => {
       const previousModel = process.env.ANTHROPIC_MODEL;
       delete process.env.ANTHROPIC_MODEL;
+      const previousCustom = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION;
+      if (action === "custom outside allowlist")
+        process.env.ANTHROPIC_CUSTOM_MODEL_OPTION = "provider-custom";
       const setModel = vi.fn();
       const startedModels: (string | undefined)[] = [];
       let capturedOptions: any;
@@ -503,6 +526,9 @@ describe("ClaudeAcpAgent settings", () => {
         ];
         if (options.model === "opusplan") {
           models.push({ value: "opusplan", displayName: "Opus Plan Mode", description: "" });
+        }
+        if (action === "custom outside allowlist") {
+          models.push({ value: "provider-custom", displayName: "Custom", description: "" });
         }
         return makeMockQuery({
           initializationResult: async () => ({ models }),
@@ -525,12 +551,15 @@ describe("ClaudeAcpAgent settings", () => {
           await select("opusplan");
           expect(setModel).toHaveBeenLastCalledWith("opusplan");
         }
-        if (action === "switch away") await select("sonnet");
+        if (action === "switch away" || action === "sonnet beats env default")
+          await select("sonnet");
+        if (action === "default beats env default") await select("default");
+        if (action === "custom outside allowlist") await select("provider-custom");
         if (action === "reject switch away") {
           setModel.mockRejectedValueOnce(new Error("switch blocked"));
           await expect(select("sonnet")).rejects.toThrow("switch blocked");
         }
-        if (action === "CLI switch away") {
+        if (action === "CLI switch away" || action === "CLI alias with override") {
           await capturedOptions.hooks.PostModelSwitch.at(-1).hooks[0]({
             hook_event_name: "PostModelSwitch",
             source: "command",
@@ -539,15 +568,26 @@ describe("ClaudeAcpAgent settings", () => {
           });
           await new Promise((resolve) => setImmediate(resolve));
         }
-        if (action === "env override") process.env.ANTHROPIC_MODEL = "sonnet";
-        if (action === "settings override" || action === "allowlist excludes") {
+        if (action === "env default") process.env.ANTHROPIC_MODEL = "sonnet";
+        if (action.endsWith("beats env default") || action === "caller override")
+          process.env.ANTHROPIC_MODEL = "opusplan";
+        if (action === "settings default" || action === "allowlist excludes") {
           await fs.promises.writeFile(
             path.join(tempDir, "settings.json"),
             JSON.stringify(
-              action === "settings override"
-                ? { model: "sonnet" }
-                : { availableModels: ["sonnet"] },
+              action === "settings default" ? { model: "sonnet" } : { availableModels: ["sonnet"] },
             ),
+          );
+        }
+        if (action === "custom outside allowlist" || action === "CLI alias with override") {
+          await fs.promises.writeFile(
+            path.join(tempDir, "settings.json"),
+            JSON.stringify({
+              availableModels: ["sonnet"],
+              ...(action === "CLI alias with override"
+                ? { modelOverrides: { sonnet: "provider-sonnet" } }
+                : {}),
+            }),
           );
         }
         let resumeId = action === "different session" ? "other-session" : fresh.sessionId;
@@ -564,6 +604,10 @@ describe("ClaudeAcpAgent settings", () => {
           sessionId: resumeId,
           cwd: tempDir,
           mcpServers: [],
+          _meta:
+            action === "caller override"
+              ? { claudeCode: { options: { model: "sonnet" } } }
+              : undefined,
         });
         expect(startedModels).toEqual([undefined, startup]);
         const model = resumed.configOptions!.find((option) => option.id === "model") as any;
@@ -573,6 +617,8 @@ describe("ClaudeAcpAgent settings", () => {
         await agent.dispose();
         if (previousModel === undefined) delete process.env.ANTHROPIC_MODEL;
         else process.env.ANTHROPIC_MODEL = previousModel;
+        if (previousCustom === undefined) delete process.env.ANTHROPIC_CUSTOM_MODEL_OPTION;
+        else process.env.ANTHROPIC_CUSTOM_MODEL_OPTION = previousCustom;
       }
     },
   );

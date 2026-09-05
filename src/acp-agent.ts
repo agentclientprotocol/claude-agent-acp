@@ -237,11 +237,7 @@ import {
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
-import {
-  readOpusplanSelection,
-  withOpusplanModel,
-  writeOpusplanSelection,
-} from "./session-model.js";
+import { readModelSelection, withOpusplanModel, writeModelSelection } from "./session-model.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -2074,9 +2070,8 @@ export class ClaudeAcpAgent {
       messageIdForGrouping,
     });
     try {
-      if (await readOpusplanSelection(CLAUDE_CONFIG_DIR, params.sessionId)) {
-        await this.rememberOpusplanSelection(result.sessionId, "opusplan");
-      }
+      const selection = await readModelSelection(CLAUDE_CONFIG_DIR, params.sessionId);
+      if (selection) await this.rememberModelSelection(result.sessionId, selection);
     } catch (error) {
       this.logger.error(`Failed to copy model selection for session ${params.sessionId}:`, error);
     }
@@ -6349,7 +6344,7 @@ export class ClaudeAcpAgent {
       await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
-      await this.rememberOpusplanSelection(params.sessionId, resolvedValue);
+      await this.rememberModelSelection(params.sessionId, resolvedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
@@ -7182,9 +7177,9 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async rememberOpusplanSelection(sessionId: string, model: string): Promise<void> {
+  private async rememberModelSelection(sessionId: string, model: string): Promise<void> {
     try {
-      await writeOpusplanSelection(CLAUDE_CONFIG_DIR, sessionId, model);
+      await writeModelSelection(CLAUDE_CONFIG_DIR, sessionId, model);
     } catch (error) {
       this.logger.error(`Failed to save model selection for session ${sessionId}:`, error);
     }
@@ -7849,7 +7844,7 @@ export class ClaudeAcpAgent {
                   input.source !== "resume"
                 ) {
                   if (input.source === "command" || input.source === "picker") {
-                    await this.rememberOpusplanSelection(
+                    await this.rememberModelSelection(
                       sessionId,
                       input.requested_model ?? "default",
                     );
@@ -7925,26 +7920,35 @@ export class ClaudeAcpAgent {
       throw new Error("Cancelled");
     }
 
-    // Resume can replace an env/settings opusplan pin with the transcript's
-    // concrete model, dropping the hybrid alias from the SDK's picker. An
-    // explicit startup model preserves it before we resolve picker entries.
+    // An explicit startup model wins; otherwise resume the last manual choice
+    // before the CLI can replace its alias with a concrete transcript model.
     let restoredModelSelection: string | undefined;
     if (creationOpts.resume !== undefined && options.model === undefined) {
-      const configuredModel = process.env.ANTHROPIC_MODEL || settingsManager.getSettings().model;
-      const allowlist = settingsManager.getSettings().availableModels;
-      if (
-        configuredModel === undefined &&
-        (!Array.isArray(allowlist) || allowlist.some((model) => model.trim() === "opusplan"))
-      ) {
-        try {
-          if (await readOpusplanSelection(CLAUDE_CONFIG_DIR, creationOpts.resume)) {
-            restoredModelSelection = "opusplan";
-          }
-        } catch (error) {
-          this.logger.error(`Failed to read model selection for session ${sessionId}:`, error);
+      const settings = settingsManager.getSettings();
+      try {
+        const selection = await readModelSelection(CLAUDE_CONFIG_DIR, creationOpts.resume);
+        const allowlist = settings.availableModels;
+        if (
+          selection &&
+          (selection === "default" ||
+            selection === process.env.ANTHROPIC_CUSTOM_MODEL_OPTION?.trim() ||
+            !Array.isArray(allowlist) ||
+            allowlist.some((model) => {
+              const alias = model.trim();
+              return alias === selection || settings.modelOverrides?.[alias] === selection;
+            }))
+        ) {
+          restoredModelSelection = selection;
+          options.model = selection;
         }
+      } catch (error) {
+        this.logger.error(`Failed to read model selection for session ${sessionId}:`, error);
       }
-      if (configuredModel === "opusplan" || restoredModelSelection === "opusplan") {
+      // With no saved choice, preserve the configured hybrid default as well.
+      if (
+        !restoredModelSelection &&
+        (process.env.ANTHROPIC_MODEL || settings.model) === "opusplan"
+      ) {
         options.model = "opusplan";
       }
     }
@@ -8024,7 +8028,7 @@ export class ClaudeAcpAgent {
         settingsManager,
         this.logger,
         creationOpts.resume !== undefined,
-        restoredModelSelection,
+        options.model,
       );
 
       // Resolve the current model's capabilities separately from the stable
@@ -8203,7 +8207,7 @@ export class ClaudeAcpAgent {
       };
 
       if (restoredModelSelection && sessionId !== creationOpts.resume) {
-        await this.rememberOpusplanSelection(sessionId, restoredModelSelection);
+        await this.rememberModelSelection(sessionId, restoredModelSelection);
       }
 
       return {
@@ -9282,7 +9286,7 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-  restoredModelSelection?: string,
+  startupModel?: string,
 ): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
   const settings = settingsManager.getSettings();
 
@@ -9294,13 +9298,17 @@ async function getAvailableModels(
   // describes the model the session actually runs.
   let resumedContextWindow: number | null = null;
 
-  // Model priority (highest to lowest):
-  // 1. ANTHROPIC_MODEL environment variable
-  // 2. settings.model (user configuration)
-  // 3. a saved manual opusplan selection (resumed sessions only)
-  // 4. the resumed session's live model (resumed sessions only)
-  // 5. models[0] (default first model)
-  if (process.env.ANTHROPIC_MODEL) {
+  // An explicit caller model or saved manual selection takes precedence over
+  // environment/settings defaults. Without a saved selection, keep the legacy
+  // fallback to configuration, then the live transcript model on resume.
+  if (startupModel !== undefined) {
+    currentModel = resolveModelPreference(models, startupModel) ?? {
+      value: startupModel,
+      displayName: startupModel,
+      description: "",
+    };
+    resolvedFromInput = startupModel;
+  } else if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
       currentModel = match;
@@ -9311,14 +9319,6 @@ async function getAvailableModels(
     if (match) {
       currentModel = match;
       resolvedFromInput = settings.model;
-    }
-  }
-
-  if (resolvedFromInput === undefined && restoredModelSelection) {
-    const match = models.find((model) => model.value === restoredModelSelection);
-    if (match) {
-      currentModel = match;
-      resolvedFromInput = restoredModelSelection;
     }
   }
 
