@@ -424,6 +424,48 @@ describe("ClaudeAcpAgent settings", () => {
     });
   });
 
+  it.each(["env", "settings"])("preserves an opusplan pin from %s on resume", async (source) => {
+    const previousModel = process.env.ANTHROPIC_MODEL;
+    if (source === "env") process.env.ANTHROPIC_MODEL = "opusplan";
+    else delete process.env.ANTHROPIC_MODEL;
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify(source === "settings" ? { model: "opusplan" } : {}),
+    );
+    let capturedOptions: any;
+    const setModel = vi.fn();
+    querySpy.mockImplementation(({ options }: any) => {
+      capturedOptions = options;
+      // On resume, the CLI can replace an env/settings pin with the
+      // transcript model. Only an explicit startup model preserves opusplan.
+      const models = [
+        { value: "default", displayName: "Default", description: "" },
+        { value: "opus[1m]", displayName: "Opus", description: "" },
+      ];
+      if (options.model === "opusplan") {
+        models.push({ value: "opusplan", displayName: "Opus Plan Mode", description: "" });
+      }
+      return makeMockQuery({ initializationResult: async () => ({ models }), setModel });
+    });
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    try {
+      const response = await (agent as any).createSession(
+        { cwd: tempDir, mcpServers: [] },
+        { resume: "resumed-opusplan" },
+      );
+      expect(capturedOptions.model).toBe("opusplan");
+      const model = response.configOptions.find((option: any) => option.id === "model");
+      expect(model.currentValue).toBe("opusplan");
+      expect(model.options).toContainEqual(expect.objectContaining({ value: "opusplan" }));
+      expect(setModel).toHaveBeenCalledWith("opusplan");
+    } finally {
+      await agent.dispose();
+      if (previousModel === undefined) delete process.env.ANTHROPIC_MODEL;
+      else process.env.ANTHROPIC_MODEL = previousModel;
+    }
+  });
+
   describe("availableModels allowlist from settings", () => {
     function mockQueryWithModels(models: any[]): {
       setModelSpy: ReturnType<typeof vi.fn>;

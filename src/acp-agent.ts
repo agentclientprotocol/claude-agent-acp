@@ -7896,6 +7896,14 @@ export class ClaudeAcpAgent {
       throw new Error("Cancelled");
     }
 
+    // Resume can replace an env/settings opusplan pin with the transcript's
+    // concrete model, dropping the hybrid alias from the SDK's picker. An
+    // explicit startup model preserves it before we resolve picker entries.
+    if (creationOpts.resume !== undefined && options.model === undefined) {
+      const configuredModel = process.env.ANTHROPIC_MODEL || settingsManager.getSettings().model;
+      if (configuredModel === "opusplan") options.model = configuredModel;
+    }
+
     const q = query({
       prompt: input,
       options,
