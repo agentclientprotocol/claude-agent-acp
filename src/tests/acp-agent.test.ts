@@ -56,12 +56,13 @@ import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  importSessionToStore,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
 import {
   mockSessionState,
@@ -83,6 +84,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(),
     forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    importSessionToStore: vi.fn(actual.importSessionToStore),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
@@ -8407,6 +8409,12 @@ describe("logout", () => {
 });
 
 describe("session/fork", () => {
+  beforeEach(() => {
+    vi.mocked(forkSession).mockClear();
+    vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(importSessionToStore).mockClear();
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
@@ -8427,6 +8435,18 @@ describe("session/fork", () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-thinking-uuid",
+        session_id: "source-id",
+        message: {
+          id: "msg_123",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
       {
         type: "assistant",
         uuid: "assistant-uuid",
@@ -8450,9 +8470,140 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
       dir: "/workspace",
       upToMessageId: "assistant-uuid",
+    });
+  });
+
+  it.each([
+    {
+      resolution: "its ACP message id",
+      messageId: "persisted-message-id:segment:0",
+      messageOccurrence: 1,
+    },
+    {
+      resolution: "its fingerprint occurrence",
+      messageId: "stale-air-message-id:segment:0",
+      messageOccurrence: 2,
+    },
+  ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const targetText = "Answer from the branch that is no longer active.";
+    const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "active-assistant-uuid",
+        session_id: "source-id",
+        message: { id: "active-message-id", role: "assistant", content: [] },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ]);
+    vi.mocked(importSessionToStore).mockImplementationOnce(async (_sessionId, store) => {
+      await store.append({ projectKey: "-workspace", sessionId: "source-id" }, [
+        {
+          type: "assistant",
+          uuid: "earlier-duplicate-uuid",
+          parentUuid: "earlier-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "earlier-duplicate-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "user",
+          uuid: "inactive-user-uuid",
+          parentUuid: "earlier-duplicate-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: { role: "user", content: "regenerate" },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-thinking-uuid",
+          parentUuid: "inactive-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Hidden reasoning" }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-assistant-uuid",
+          parentUuid: "inactive-thinking-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "nested-assistant-uuid",
+          parentUuid: "nested-user-uuid",
+          isSidechain: true,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "active-assistant-uuid",
+          parentUuid: "active-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "active-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: "Answer from the active branch." }],
+          },
+        },
+      ]);
+    });
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: [],
+      mcpServers: [],
+      _meta: {
+        jetbrains: {
+          air: {
+            fork: {
+              version: 1,
+              messageId: forkPoint.messageId,
+              messageFingerprint: targetFingerprint,
+              messageOccurrence: forkPoint.messageOccurrence,
+            },
+          },
+        },
+      },
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
+      dir: "/workspace",
+      includeSubagents: false,
+    });
+    expect(forkSession).toHaveBeenLastCalledWith("source-id", {
+      dir: "/workspace",
+      upToMessageId: "inactive-assistant-uuid",
     });
   });
 });
@@ -9785,7 +9936,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
-  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+  it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
@@ -9809,18 +9960,18 @@ describe("usage_update computation", () => {
     // compaction — compaction frees occupancy, it doesn't change the window,
     // so the handler must not overwrite it from this response.
     session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update.used).toBe(12345);
-    // size stays at the session's learned window, NOT getContextUsage's value.
+    // size stays at the session's learned window; compaction changes occupancy only.
     expect(usageUpdate.update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
+    expect(getContextUsage).not.toHaveBeenCalled();
     expect(updates.map((notification) => notification.update)).toContainEqual({
       sessionUpdate: "tool_call",
       toolCallId: "compact-boundary",
@@ -9846,7 +9997,7 @@ describe("usage_update computation", () => {
     });
   });
 
-  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+  it("compact_boundary falls back to used:0 when post_tokens is unavailable", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle — see the sibling test above (issue #825).
     injectSession(agent, [
@@ -9854,7 +10005,8 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 200000;
-    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -9863,6 +10015,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(0);
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
+    expect(getContextUsage).not.toHaveBeenCalled();
   });
 
   it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {

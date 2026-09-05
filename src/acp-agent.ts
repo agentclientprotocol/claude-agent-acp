@@ -80,6 +80,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SessionMessage,
   SDKUserMessage,
   Settings,
   SlashCommand,
@@ -155,6 +156,8 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
@@ -842,17 +845,16 @@ export type Session = {
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
-   *  resumed session's own `getContextUsage` report wins, see
-   *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
-   *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
-   *  fresh session it stalls until the first turn runs (see the seeding call
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), then confirmed —
+   *  and the cache populated — by each result's modelUsage. No extra
+   *  `getContextUsage` IPC is on these paths: before the first turn it can add
+   *  tens of seconds to both fresh and resumed sessions (see the seeding call
    *  sites and `contextWindowCache`). */
   contextWindowSize: number;
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
-   *  cross-session cache, a resumed session's `getContextUsage` report, or a
-   *  `result.modelUsage`) rather than the text heuristic / default. Guards the
+   *  cross-session cache or a `result.modelUsage`) rather than the text
+   *  heuristic / default. Guards the
    *  mid-stream `message_start` heuristic upgrade: an authoritative window that
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
@@ -2129,6 +2131,7 @@ export class ClaudeAcpAgent {
     if (this.providerUpdate) await this.providerUpdate;
     return forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
+      logger: this.logger,
       messageIdForGrouping,
     });
   }
@@ -2146,10 +2149,14 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const resumedSession = await readResumedSession(params.sessionId, this.logger);
+    const result = await this.getOrCreateSession(params, resumedSession);
+    timing.phase("session-ready");
 
-    await this.replaySessionHistory(params.sessionId);
+    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -4107,14 +4114,11 @@ export class ClaudeAcpAgent {
                 // right after the user sees "Compacting completed", which is
                 // confusing and wrong.
                 //
-                // Prefer the SDK's authoritative post-compaction `used` via
-                // getContextUsage — it reflects the real retained context
-                // (system prompt + tools + surviving messages), which the
-                // per-message API usage numbers can't give us until the next
-                // turn's result. If the control request fails, fall back to the
-                // used:0 approximation: directionally correct (context just
-                // dropped dramatically) and replaced within seconds by the next
-                // result message.
+                // The compact boundary already carries the retained token
+                // count. Prefer it over a getContextUsage control request,
+                // which can block the live query for tens of seconds. Older
+                // SDK frames without post_tokens fall back to used:0 and are
+                // corrected by the next result message.
                 //
                 // `size` keeps coming from session.contextWindowSize —
                 // compaction frees occupancy, it doesn't change the model's
@@ -4128,10 +4132,10 @@ export class ClaudeAcpAgent {
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
                   true,
                 );
-                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
+                const usedTokens = compactMetadata?.post_tokens ?? 0;
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usedTokens ?? 0;
-                session.contextUsedTokens = usedTokens ?? 0;
+                lastAssistantTotalUsage = usedTokens;
+                session.contextUsedTokens = usedTokens;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -6487,9 +6491,17 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
-  private async replaySessionHistory(sessionId: string): Promise<void> {
+  private async replaySessionHistory(
+    sessionId: string,
+    resumedMessages?: SessionMessage[],
+  ): Promise<void> {
+    const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const historyLoadedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
+    );
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
@@ -6824,6 +6836,10 @@ export class ClaudeAcpAgent {
         );
       }
     }
+    const replayFinishedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=publish durationMs=${Math.round(replayFinishedAt - historyLoadedAt)} totalMs=${Math.round(replayFinishedAt - replayStartedAt)} messages=${messages.length}`,
+    );
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
@@ -7583,13 +7599,16 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async getOrCreateSession(params: {
-    sessionId: string;
-    cwd: string;
-    mcpServers?: NewSessionRequest["mcpServers"];
-    additionalDirectories?: NewSessionRequest["additionalDirectories"];
-    _meta?: NewSessionRequest["_meta"];
-  }): Promise<NewSessionResponse> {
+  private async getOrCreateSession(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      _meta?: NewSessionRequest["_meta"];
+    },
+    resumedSession?: ResumedSessionSnapshot,
+  ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
@@ -7607,6 +7626,10 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
+    const resumedModelHint = resumedSession
+      ? resumedSession.model
+      : (await readResumedSession(params.sessionId, this.logger)).model;
+
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -7616,6 +7639,7 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
+        resumedModelHint,
       },
     );
 
@@ -7667,8 +7691,13 @@ export class ClaudeAcpAgent {
        *  wrote one; this keeps the ACP session id alive with an empty history.
        *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
       reuseSessionId?: string;
+      /** Concrete model id from the resumed transcript's last real assistant
+       *  message. Claude Code restores from this same record, so it lets us
+       *  report the live model without a slow getContextUsage control request. */
+      resumedModelHint?: string;
     } = {},
   ): Promise<NewSessionResponse> {
+    const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
     // this check a session is created against a missing directory and the
@@ -7693,6 +7722,23 @@ export class ClaudeAcpAgent {
     } else {
       sessionId = randomUUID();
     }
+    const timing = new SessionTiming(this.logger, "create", sessionId, createStartedAt);
+    timing.phase("validate-cwd");
+
+    // Most session/load calls already carry a transcript snapshot so history
+    // replay and model restoration share one local read. A few resume paths
+    // intentionally call createSession directly (legacy session/new metadata,
+    // sign-out respawn, provider rerouting), so fill the same fast local hint
+    // here when the caller did not provide it. Never fall back to the slow
+    // getContextUsage control request.
+    let resumedModelHint = creationOpts.resumedModelHint;
+    if (
+      creationOpts.resume !== undefined &&
+      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
+    ) {
+      resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
+      timing.phase("resume-transcript");
+    }
 
     const input = new Pushable<SDKUserMessage>();
 
@@ -7700,6 +7746,7 @@ export class ClaudeAcpAgent {
       logger: this.logger,
     });
     await settingsManager.initialize();
+    timing.phase("settings");
 
     const mcpServers: Record<string, McpServerConfig> = {};
     if (Array.isArray(params.mcpServers)) {
@@ -7954,7 +8001,7 @@ export class ClaudeAcpAgent {
         // switches the session's model with no refusal-fallback frame, and
         // the client's picker silently drifts. `source: 'sdk'` is the
         // adapter's own setModel (applyConfigOptionValue already synced it),
-        // and 'resume' restores are read back via readResumedLiveModel, so
+        // and 'resume' restores are read from the transcript before startup, so
         // only the remaining sources sync here (CLI 2.1.251+; older CLIs
         // never fire the hook and keep the pre-hook behavior).
         PostModelSwitch: [
@@ -8041,6 +8088,7 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
     // registration in `this.sessions` would leave that child process running
@@ -8060,6 +8108,7 @@ export class ClaudeAcpAgent {
         }
         throw error;
       }
+      timing.phase("sdk-initialize");
 
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
@@ -8103,14 +8152,17 @@ export class ClaudeAcpAgent {
           )
         : initializationResult.models;
 
-      const { modelState: models, resumedContextWindow } = await getAvailableModels(
+      const models = await getAvailableModels(
         q,
         allowedModels,
         initializationResult.models,
         settingsManager,
         this.logger,
         creationOpts.resume !== undefined,
+        sessionId,
+        resumedModelHint,
       );
+      timing.phase("models");
 
       // Resolve the current model's capabilities separately from the stable
       // permission-mode catalog advertised to ACP clients.
@@ -8153,8 +8205,10 @@ export class ClaudeAcpAgent {
         currentModelInfo,
         currentModelId: models.currentModelId,
       });
+      timing.phase("modes");
 
       const agents = await discoverCustomAgents(q);
+      timing.phase("agents");
       // Only adopt the requested agent as the selected value if it's one we
       // actually surface in the picker. A built-in (filtered out above) or
       // otherwise-unknown name would leave the config option's `currentValue`
@@ -8204,18 +8258,13 @@ export class ClaudeAcpAgent {
         currentAgent,
         fastMode,
       );
-      // Seed the context window WITHOUT any extra IPC on the session/new path.
-      // On session/load, the resumed session's own `getContextUsage` report — a
-      // response `getAvailableModels` already awaited to learn the live model
-      // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-      // authoritative and wins. Otherwise: the cached authoritative window if a
-      // prior turn has learned it for this model (`result.modelUsage`,
-      // cross-session), else the text heuristic, else the default. We
-      // deliberately do NOT issue a getContextUsage call here: on a fresh
-      // session that control request is not serviced until the first prompt
-      // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-      // (issues #886/#880). The authoritative window arrives on the first
-      // `result.modelUsage` and is cached from there.
+      // Seed the context window without extra IPC. The cached authoritative
+      // window from a prior turn wins (`result.modelUsage`, cross-session),
+      // then the text heuristic, then the default. We deliberately do NOT issue
+      // a getContextUsage call here: before the first prompt turn that control
+      // request can take tens of seconds, on resumed as well as fresh sessions.
+      // The authoritative window arrives on the first `result.modelUsage` and
+      // is cached from there.
       //
       // Text inference alone misses aliases that resolve to extended-context
       // models with no "1m" token anywhere in their id or description (e.g.
@@ -8223,18 +8272,18 @@ export class ClaudeAcpAgent {
       // `usage_update.size: 200000` until the first result's modelUsage corrects
       // it — but the cache means only the FIRST session to ever run a turn on such
       // a model eats that window, not every fresh session after a process
-      // restart (issue #596; a post-restart session/load is covered by the
-      // resumed report above).
+      // restart (issue #596).
       //
       // The inference fallback is deliberately keyed to the allowlisted entry: a
       // fallback-resolved sibling's resolvedModel/displayName/description can
       // describe a different context lane than the verbatim live id (e.g. an
       // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
       // the id itself is a trustworthy window signal.
-      const seededWindow =
-        resumedContextWindow !== null
-          ? { size: resumedContextWindow, authoritative: true }
-          : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
+      const seededWindow = immediateContextWindow(
+        providerCacheKey,
+        models.currentModelId,
+        allowlistedModelInfo,
+      );
 
       this.sessions[sessionId] = {
         query: q,
@@ -8286,6 +8335,7 @@ export class ClaudeAcpAgent {
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
       };
+      timing.phase("register");
 
       return {
         sessionId,
@@ -9314,17 +9364,6 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
-/** Read the model a resumed session is actually running (via the
- *  `getContextUsage` control request — the same source `/context` prints) and
- *  map it onto the picker, along with the report's authoritative context
- *  window (`rawMaxTokens`). Resumed sessions get this request serviced before
- *  any turn runs in the new process — unlike fresh sessions, where it stalls
- *  until the first prompt turn (issues #886/#880) — so the same response that
- *  restores the live model (issue #845) also seeds the window for free,
- *  covering post-restart reloads of models the text heuristic misses (issue
- *  #596). Best-effort: a control-request failure is logged and returns nulls
- *  so callers keep their current choice; failing the whole session/load over
- *  an unreadable report would be worse. */
 /** Whether a rejected `setModel` was vetoed by a user-configured
  *  PreModelSwitch hook. The CLI's rejection message is the stable,
  *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
@@ -9334,23 +9373,6 @@ function isPreModelSwitchHookBlock(error: unknown): boolean {
   return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
 }
 
-async function readResumedLiveModel(
-  query: Query,
-  models: ModelInfo[],
-  logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
-  try {
-    const usage = await query.getContextUsage();
-    return {
-      model: usage.model ? matchResumedModel(models, usage.model) : null,
-      contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
-    };
-  } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
-  }
-}
-
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
@@ -9358,17 +9380,13 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
+  sessionId: string,
+  resumedModelHint?: string,
+): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
-  // The context window reported alongside a resumed session's live model.
-  // Only ever non-null on the paths where `currentModel` IS the live model
-  // (no override, or a failed override re-assert), so the window always
-  // describes the model the session actually runs.
-  let resumedContextWindow: number | null = null;
-
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
@@ -9388,17 +9406,14 @@ async function getAvailableModels(
     }
   }
 
-  // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
+  // A resumed session restores the model from its last real assistant
+  // transcript record. Use that same local record instead of getContextUsage:
+  // the latter is a control request to the live CLI process and can add tens
+  // of seconds to session/load before its first turn. No `setModel` here: the
+  // SDK is already running this model, and pushing a picker alias back (e.g.
+  // "opus[1m]") could change the live model rather than describe it.
   if (resolvedFromInput === undefined && isResumedSession) {
-    const live = await readResumedLiveModel(query, models, logger);
-    currentModel = live.model ?? currentModel;
-    resumedContextWindow = live.contextWindow;
+    currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : currentModel;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
@@ -9419,9 +9434,16 @@ async function getAvailableModels(
     resolvedFromInput === undefined ||
     (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
+    const setModelStartedAt = performance.now();
     try {
       await query.setModel(currentModel.value);
+      logger.log(
+        `[session/models] sessionId=${sessionId} phase=set-model durationMs=${Math.round(performance.now() - setModelStartedAt)} model=${currentModel.value} outcome=success`,
+      );
     } catch (error) {
+      logger.log(
+        `[session/models] sessionId=${sessionId} phase=set-model durationMs=${Math.round(performance.now() - setModelStartedAt)} model=${currentModel.value} outcome=error`,
+      );
       // On a fresh session the pin is a defining option — fail loudly. A
       // resumed session already runs fine on the transcript's model, so
       // failing the whole session/load over the re-assert would be worse
@@ -9449,23 +9471,18 @@ async function getAvailableModels(
         currentModel = models[0];
       } else {
         logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        const live = await readResumedLiveModel(query, models, logger);
-        currentModel = live.model ?? currentModel;
-        resumedContextWindow = live.contextWindow;
+        currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : models[0];
       }
     }
   }
 
   return {
-    modelState: {
-      availableModels: models.map((model) => ({
-        modelId: model.value,
-        name: model.displayName,
-        description: model.description,
-      })),
-      currentModelId: currentModel.value,
-    },
-    resumedContextWindow,
+    availableModels: models.map((model) => ({
+      modelId: model.value,
+      name: model.displayName,
+      description: model.description,
+    })),
+    currentModelId: currentModel.value,
   };
 }
 
@@ -10592,28 +10609,11 @@ function commonPrefixLength(a: string, b: string) {
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
  *  ~1M). Such a miss falls back to the default window and is corrected by
  *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
- *  SDK's `getContextUsage` to close that gap: on a fresh session it is not
- *  serviced before the first prompt turn (issues #886/#880, see
- *  `contextWindowCache`; resumed sessions do get it, via
- *  `readResumedLiveModel`). */
+ *  SDK's `getContextUsage` to close that gap: before the first prompt turn it
+ *  can take tens of seconds (issues #886/#880, see `contextWindowCache`). */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
-}
-
-/** Fetch the SDK's authoritative context-window occupancy via the
- *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), this `totalTokens` includes the system
- *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure. */
-async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.totalTokens;
-  } catch (error) {
-    logger.error("Failed to fetch context usage from SDK:", error);
-    return null;
-  }
 }
 
 /** Cross-session cache of authoritative context windows, keyed by
@@ -10636,9 +10636,6 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
  *  has run the control request is not serviced (it stalls ~15s, and serializes
  *  ahead of an awaited `setModel` — issues #886/#880, regressed in 0.59.0), so
  *  it can neither beat the first `result` nor be issued cheaply before one.
- *  Resumed sessions are the exception — their report IS serviced pre-turn, and
- *  the session/load path seeds (but does not cache) the window from the same
- *  response that restores the live model, see `readResumedLiveModel`.
  *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
  *  windows learned under one login must not seed sessions under the next. */
 const contextWindowCache = new Map<string, number>();
