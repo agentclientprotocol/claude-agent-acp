@@ -8409,6 +8409,12 @@ describe("logout", () => {
 });
 
 describe("session/fork", () => {
+  beforeEach(() => {
+    vi.mocked(forkSession).mockClear();
+    vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(importSessionToStore).mockClear();
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
@@ -8429,6 +8435,18 @@ describe("session/fork", () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-thinking-uuid",
+        session_id: "source-id",
+        message: {
+          id: "msg_123",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
       {
         type: "assistant",
         uuid: "assistant-uuid",
@@ -8452,6 +8470,7 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
       dir: "/workspace",
       upToMessageId: "assistant-uuid",
@@ -8499,6 +8518,14 @@ describe("session/fork", () => {
           },
         },
         {
+          type: "user",
+          uuid: "inactive-user-uuid",
+          parentUuid: "earlier-duplicate-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: { role: "user", content: "regenerate" },
+        },
+        {
           type: "assistant",
           uuid: "inactive-thinking-uuid",
           parentUuid: "inactive-user-uuid",
@@ -8515,6 +8542,18 @@ describe("session/fork", () => {
           uuid: "inactive-assistant-uuid",
           parentUuid: "inactive-thinking-uuid",
           isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "nested-assistant-uuid",
+          parentUuid: "nested-user-uuid",
+          isSidechain: true,
           sessionId: "source-id",
           message: {
             id: "persisted-message-id",

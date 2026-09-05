@@ -50,6 +50,7 @@ function forkPoint(meta: unknown): ForkPoint | undefined {
   return {
     messageId,
     ...(messageFingerprint ? { messageFingerprint } : {}),
+    // AIR computes this with count(...) over the visible prefix, so it is 1-based.
     ...(typeof messageOccurrence === "number" &&
     Number.isSafeInteger(messageOccurrence) &&
     messageOccurrence > 0
@@ -86,7 +87,14 @@ function assistantGroups(
 ) {
   const groups = new Map<string, { uuid?: string; text: string }>();
   for (const entry of entries) {
-    if (entry.type !== "assistant" || entry.isSidechain === true) continue;
+    if (
+      entry.type !== "assistant" ||
+      entry.isSidechain === true ||
+      entry.parent_tool_use_id != null ||
+      entry.parent_agent_id != null
+    ) {
+      continue;
+    }
     const messageId = messageIdForGrouping(entry);
     if (!messageId) continue;
     const group = groups.get(messageId) ?? { text: "" };
@@ -95,6 +103,44 @@ function assistantGroups(
     groups.set(messageId, group);
   }
   return groups;
+}
+
+function fingerprint(text: string): string {
+  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
+
+function fingerprintOccurrenceOnBranch(
+  targetUuid: string,
+  expectedFingerprint: string,
+  entries: SessionStoreEntry[],
+  groups: ReturnType<typeof assistantGroups>,
+  messageIdForGrouping: ForkSessionDependencies["messageIdForGrouping"],
+): number {
+  const entriesByUuid = new Map(
+    entries.flatMap((entry) => (typeof entry.uuid === "string" ? [[entry.uuid, entry]] : [])),
+  );
+  const seenGroups = new Set<string>();
+  let occurrence = 0;
+  let cursor: string | undefined = targetUuid;
+  while (cursor) {
+    const entry = entriesByUuid.get(cursor);
+    if (!entry) break;
+    if (
+      entry.type === "assistant" &&
+      entry.isSidechain !== true &&
+      entry.parent_tool_use_id == null &&
+      entry.parent_agent_id == null
+    ) {
+      const messageId = messageIdForGrouping(entry);
+      if (messageId && !seenGroups.has(messageId)) {
+        seenGroups.add(messageId);
+        const group = groups.get(messageId);
+        if (group && fingerprint(group.text) === expectedFingerprint) occurrence++;
+      }
+    }
+    cursor = typeof entry.parentUuid === "string" ? entry.parentUuid : undefined;
+  }
+  return occurrence;
 }
 
 function resolveFromFullHistory(
@@ -108,14 +154,25 @@ function resolveFromFullHistory(
   if (exact) return exact;
   if (!point.messageFingerprint || !point.messageOccurrence) return undefined;
 
-  let occurrence = 0;
-  for (const group of groups.values()) {
-    const fingerprint = `sha256:${createHash("sha256").update(group.text).digest("hex")}`;
-    if (fingerprint !== point.messageFingerprint) continue;
-    occurrence++;
-    if (occurrence === point.messageOccurrence) return group.uuid;
-  }
-  return undefined;
+  const fingerprintMatches = [...groups.values()].filter(
+    (group) => group.uuid && fingerprint(group.text) === point.messageFingerprint,
+  );
+  // If only one persisted message has this content, the fingerprint already
+  // identifies it even when an older client supplied an incompatible index.
+  if (fingerprintMatches.length === 1) return fingerprintMatches[0]?.uuid;
+
+  const occurrenceMatches = fingerprintMatches.filter(
+    (group) =>
+      group.uuid &&
+      fingerprintOccurrenceOnBranch(
+        group.uuid,
+        point.messageFingerprint!,
+        entries,
+        groups,
+        messageIdForGrouping,
+      ) === point.messageOccurrence,
+  );
+  return occurrenceMatches.length === 1 ? occurrenceMatches[0]?.uuid : undefined;
 }
 
 export async function forkSession(
@@ -143,8 +200,10 @@ export async function forkSession(
     candidateIds
       .map(
         (candidateId) =>
-          history?.find((message) => dependencies.messageIdForGrouping(message) === candidateId)
-            ?.uuid,
+          history
+            ?.slice()
+            .reverse()
+            .find((message) => dependencies.messageIdForGrouping(message) === candidateId)?.uuid,
       )
       .find(Boolean);
   const fullHistoryUuid = messageUuid

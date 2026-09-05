@@ -5,7 +5,7 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,6 +14,7 @@ import * as path from "node:path";
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
 let sessionMessages: Record<string, unknown>[];
+let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
@@ -49,7 +50,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
     },
-    getSessionMessages: vi.fn(async () => sessionMessages),
+    getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
 
@@ -78,6 +79,8 @@ describe("createSession options merging", () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
     sessionMessages = [];
+    sessionMessagesResult = async () => sessionMessages;
+    vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
@@ -816,6 +819,22 @@ describe("createSession options merging", () => {
       );
       expect(ctxSpy).not.toHaveBeenCalled();
       expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
+      expect(getSessionMessages).toHaveBeenCalledTimes(1);
+      expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
+    });
+
+    it("resume remains best-effort when the transcript hint cannot be read", async () => {
+      sessionMessagesResult = async () => {
+        throw new Error("unreadable transcript");
+      };
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "unreadable-resume-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+      ).resolves.toMatchObject({ sessionId: "unreadable-resume-probe" });
     });
 
     it("scopes providerCacheKey by per-session env routing", async () => {

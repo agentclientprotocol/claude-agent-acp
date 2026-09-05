@@ -80,6 +80,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SessionMessage,
   SDKUserMessage,
   Settings,
   SlashCommand,
@@ -155,7 +156,7 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { readResumedModelHint } from "./resumed-session.js";
+import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
@@ -2150,10 +2151,11 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const resumedSession = await readResumedSession(params.sessionId, this.logger);
+    const result = await this.getOrCreateSession(params, resumedSession);
     timing.phase("session-ready");
 
-    await this.replaySessionHistory(params.sessionId);
+    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
     timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
@@ -6489,10 +6491,13 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
-  private async replaySessionHistory(sessionId: string): Promise<void> {
+  private async replaySessionHistory(
+    sessionId: string,
+    resumedMessages?: SessionMessage[],
+  ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
@@ -7594,13 +7599,16 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async getOrCreateSession(params: {
-    sessionId: string;
-    cwd: string;
-    mcpServers?: NewSessionRequest["mcpServers"];
-    additionalDirectories?: NewSessionRequest["additionalDirectories"];
-    _meta?: NewSessionRequest["_meta"];
-  }): Promise<NewSessionResponse> {
+  private async getOrCreateSession(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      _meta?: NewSessionRequest["_meta"];
+    },
+    resumedSession?: ResumedSessionSnapshot,
+  ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
@@ -7618,7 +7626,9 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
-    const resumedModelHint = await readResumedModelHint(params.sessionId, params.cwd, this.logger);
+    const resumedModelHint = resumedSession
+      ? resumedSession.model
+      : (await readResumedSession(params.sessionId, this.logger)).model;
 
     const response = await this.createSession(
       {
