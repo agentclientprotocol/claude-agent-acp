@@ -569,6 +569,27 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** The uuid of the latest top-level `SDKAssistantMessage` the consumer
+   *  attributed to THIS turn, which is the point `resumeSessionAt` keys on.
+   *
+   *  Turn-owned rather than session-owned, and assigned where the message is
+   *  attributed rather than read back at settle time: a session-global "last
+   *  assistant message" would hand a turn whatever the session said most
+   *  recently, which after a hand-off, a hold, or a steered second cycle is
+   *  another turn's answer. Subagent messages are excluded for the same reason
+   *  they are excluded from the usage snapshot beside it — they are not this
+   *  turn's own answer.
+   *
+   *  Not the Anthropic API message id (`msg_…`), which is a different identity
+   *  and the one the ACP `messageId` already carries; not the user prompt's
+   *  uuid; and not a streamed chunk's, which the consolidated message supersedes. */
+  latestAssistantUuid?: string;
+  /** Set once this turn has published that the SDK dispatched it (see
+   *  `SESSION_MATERIALIZATION_META`). Two facts report the same dispatch — the
+   *  `command_lifecycle` "started" frame and the replayed echo of this turn's
+   *  own uuid — and either may arrive first, or both; the flag is what makes
+   *  the publication happen exactly once for the turn. */
+  materializationPublished?: boolean;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -1468,6 +1489,13 @@ const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start 
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
 const LOCAL_ONLY_COMMANDS = new Set(["/context", "/heapdump", "/extra-usage"]);
+
+/** The metadata key naming the SDK's acceptance of a queued prompt.
+ *
+ *  Versioned, because a client reads it to decide whether a conversation now
+ *  exists, and a changed meaning under an unchanged key would be read as the
+ *  old one. */
+const SESSION_MATERIALIZATION_META = "executablemd.session-materialization/v1";
 
 // The Claude SDK persists local slash command invocations (e.g. `/model`) and
 // their output as user messages in the session transcript, wrapping the
@@ -3388,6 +3416,30 @@ export class ClaudeAcpAgent {
       resetTurnScratch();
     };
 
+    /** Tell the client the SDK took this queued prompt into a turn.
+     *
+     *  A client that defers durable session state until a conversation really
+     *  exists cannot learn that from what the turn produces: output, an idle,
+     *  a result and a settled response each say the turn is under way or over,
+     *  never that the SDK accepted it. This says exactly that, once per queued
+     *  prompt, from whichever dispatch fact arrives first — the
+     *  `command_lifecycle` "started" frame on CLIs that emit one, or the
+     *  replayed echo of the prompt's own uuid everywhere else. A local-only
+     *  command is never dispatched into a turn and publishes nothing. */
+    const publishSessionMaterialization = async (turn: Turn) => {
+      if (turn.isLocalOnlyCommand || turn.materializationPublished) {
+        return;
+      }
+      turn.materializationPublished = true;
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { [SESSION_MATERIALIZATION_META]: { state: "accepted" } },
+        },
+      });
+    };
+
     /** Ensure there is an active turn before a user-turn result that carries no
      *  echo to activate it, by promoting the queue head. Most turns are
      *  activated by their replayed user message before their result, but some
@@ -3668,7 +3720,32 @@ export class ClaudeAcpAgent {
         // carries its own copy.
         session.emittedAssistantText = false;
       }
-      turn.resolve(result);
+      turn.resolve(withCheckpointMeta(result, turn));
+    };
+
+    /** Say which assistant message this turn ended on, without disturbing
+     *  anything already on the response.
+     *
+     *  Merged rather than assigned: `claudeCode` is a namespace this adapter
+     *  already writes into, and a failure lane may have put its own metadata on
+     *  the response before it got here. A cancelled turn carries none — it was
+     *  interrupted rather than answered, and there is no message it ended on. */
+    const withCheckpointMeta = (result: PromptResponse, turn: Turn): PromptResponse => {
+      if (result.stopReason === "cancelled" || turn.latestAssistantUuid === undefined) {
+        return result;
+      }
+      const meta = result._meta ?? {};
+      const claudeCode = meta["claudeCode"];
+      return {
+        ...result,
+        _meta: {
+          ...meta,
+          claudeCode: {
+            ...(typeof claudeCode === "object" && claudeCode !== null ? claudeCode : {}),
+            assistantMessageUuid: turn.latestAssistantUuid,
+          },
+        },
+      };
     };
 
     /** Reject the active turn (auth required, error result, …) without tearing
@@ -3972,6 +4049,7 @@ export class ClaudeAcpAgent {
               const queued = findUnsettledTurn(frame.command_uuid);
               if (queued) {
                 queued.commandStarted = true;
+                await publishSessionMaterialization(queued);
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
@@ -5515,6 +5593,7 @@ export class ClaudeAcpAgent {
                   // result re-emit the answer.
                   activateTurn(queued);
                 }
+                await publishSessionMaterialization(queued);
                 break;
               }
               if ("isReplay" in message && message.isReplay) {
@@ -5554,6 +5633,17 @@ export class ClaudeAcpAgent {
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
+              // The turn this message belongs to, as the consumer already
+              // decided: `activeTurn` is the turn whose output is being
+              // attributed right now.
+              if (
+                session.activeTurn &&
+                !session.activeTurn.settled &&
+                typeof message.uuid === "string" &&
+                message.uuid.length > 0
+              ) {
+                session.activeTurn.latestAssistantUuid = message.uuid;
+              }
               lastAssistantUsage = snapshotFromUsage(message.message.usage);
               lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
               session.contextUsedTokens = lastAssistantTotalUsage;
