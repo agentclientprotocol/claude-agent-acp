@@ -18709,3 +18709,271 @@ describe("permission_denied", () => {
     expect(denials(updates)).toHaveLength(1);
   });
 });
+
+describe("async task readiness", () => {
+  /** Client that negotiated #1017's async task lifecycle, so `AsyncTaskRuntime`
+   *  is live and its silence for a task is a decision rather than a disabled
+   *  runtime. */
+  const asyncTaskClient = {
+    _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+  };
+
+  function agentWithUpdates() {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    return { agent, updates };
+  }
+
+  function taskStarted(taskId: string, extra: Record<string, unknown> = {}) {
+    return {
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: `toolu_${taskId}`,
+      description: "Investigate",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...extra,
+    };
+  }
+
+  function settled() {
+    return {
+      type: "result" as const,
+      subtype: "success" as const,
+      stop_reason: null,
+      is_error: false,
+      result: "",
+      errors: [],
+      duration_ms: 0,
+      duration_api_ms: 0,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  /** Replays the prompt's user echo so the turn activates, then the given
+   *  messages, then settles the turn. */
+  function generator(messages: unknown[]) {
+    return async function* (input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage, done } = await iter.next();
+      if (!done && userMessage) yield userEcho(userMessage);
+      yield* messages as any;
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    };
+  }
+
+  /** Indices of the readiness frames, in emission order. */
+  function readinessAt(updates: AcpSessionNotification[]): number[] {
+    return updates.flatMap((notification, index) =>
+      notification.update.sessionUpdate === "session_info_update" &&
+      (notification.update._meta as any)?.asyncTaskReadiness
+        ? [index]
+        : [],
+    );
+  }
+
+  function kinds(updates: AcpSessionNotification[]): string[] {
+    return updates.map((notification) => notification.update.sessionUpdate);
+  }
+
+  describe("CLI provenance at initialize", () => {
+    const provenance = async () => {
+      const { agent } = agentWithUpdates();
+      const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      return (response._meta as any)?.asyncTaskReadiness;
+    };
+
+    it("reports the bundled binary when CLAUDE_CODE_EXECUTABLE is unset", async () => {
+      vi.stubEnv("CLAUDE_CODE_EXECUTABLE", undefined as unknown as string);
+      expect(await provenance()).toEqual({ cli: { source: "bundled" } });
+      vi.unstubAllEnvs();
+    });
+
+    it("reports a configured binary when CLAUDE_CODE_EXECUTABLE is set", async () => {
+      vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/local/bin/claude");
+      expect(await provenance()).toEqual({ cli: { source: "configured" } });
+      vi.unstubAllEnvs();
+    });
+
+    it("treats an empty CLAUDE_CODE_EXECUTABLE as bundled, as claudeCliPath does", async () => {
+      vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "");
+      expect(await provenance()).toEqual({ cli: { source: "bundled" } });
+      vi.unstubAllEnvs();
+    });
+
+    it("never puts the resolved path on the wire", async () => {
+      vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/local/bin/claude");
+      const { agent } = agentWithUpdates();
+      const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      expect(JSON.stringify(response)).not.toContain("/usr/local/bin/claude");
+      vi.unstubAllEnvs();
+    });
+
+    it("leaves the AIR capability object untouched", async () => {
+      const { agent } = agentWithUpdates();
+      const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      expect(Object.keys((response._meta as any).jetbrains.air)).toEqual([
+        "version",
+        "capabilities",
+      ]);
+    });
+  });
+
+  it("leads the update sequence a subagent task_started produces", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { ...asyncTaskClient, subagents: {} } as any,
+    });
+    // Child output buffered ahead of the task_started, so the subagent's own
+    // updates are in play rather than the frame sitting alone in the stream.
+    const childChunk = {
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_agent-42",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text: "buffered" },
+      },
+    };
+    injectGeneratorSession(
+      agent,
+      generator([childChunk, taskStarted("agent-42", { subagent_type: "Explore" }), settled()]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // A turn's tail is what consumers read for its outcome, so the session's
+    // one readiness frame belongs at the head. Note the ordering contract is
+    // only *observable* on the non-subagent path, where the async task runtime
+    // also publishes; `AsyncTaskRuntime` ignores subagent tasks, so nothing
+    // else is emitted in this window. The sensitive assertion is in
+    // "publishes readiness ahead of the async task updates ..." below.
+    const readiness = readinessAt(updates);
+    expect(readiness).toEqual([0]);
+    expect(kinds(updates).indexOf("subagent_spawned")).toBe(1);
+    expect(kinds(updates).at(-1)).toBe("subagent_state_update");
+  });
+
+  it("confirms readiness for a subagent task, which publishes no async task update", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { ...asyncTaskClient, subagents: {} } as any,
+    });
+    injectGeneratorSession(
+      agent,
+      generator([taskStarted("agent-42", { subagent_type: "Explore" }), settled()]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // The whole reason the latch is worth a frame: AsyncTaskRuntime ignores
+    // subagent tasks, so this client's async task stream stays empty for the
+    // session's lifetime even though the lifecycle demonstrably works.
+    expect(kinds(updates).filter((kind) => kind.startsWith("async_task_"))).toEqual([]);
+    expect(readinessAt(updates)).toHaveLength(1);
+    expect((updates[0].update._meta as any).asyncTaskReadiness).toEqual({
+      readiness: "confirmed",
+    });
+  });
+
+  it("publishes readiness ahead of the async task updates the same task_started produces", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: asyncTaskClient as any });
+    injectGeneratorSession(
+      agent,
+      generator([
+        taskStarted("shell-1", {
+          task_type: "local_bash",
+          description: "Build",
+          is_backgrounded: true,
+        }),
+        settled(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // The ordering contract, and the assertion that fails if readiness is
+    // published after the runtimes that stream a task's own updates.
+    expect(readinessAt(updates)).toEqual([0]);
+    expect(kinds(updates).indexOf("async_task_spawned")).toBe(1);
+    // Doubles as the positive control for the subagent case above: the runtime
+    // really is enabled on `asyncTaskClient`, so the empty async task stream
+    // asserted there is a decision about subagents rather than a disabled
+    // runtime satisfying the assertion vacuously.
+  });
+
+  it("latches: a second task_started publishes no further readiness frame", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: asyncTaskClient as any });
+    injectGeneratorSession(
+      agent,
+      generator([
+        taskStarted("shell-1", { task_type: "local_bash", is_backgrounded: true }),
+        taskStarted("shell-2", { task_type: "local_bash", is_backgrounded: true }),
+        settled(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(readinessAt(updates)).toEqual([0]);
+    // Control: both tasks really did reach the runtime, so the single frame is
+    // the latch holding rather than the second task never arriving.
+    expect(kinds(updates).filter((kind) => kind === "async_task_spawned")).toHaveLength(2);
+  });
+
+  it("publishes no readiness frame for a client that did not negotiate async tasks", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { subagents: {} } as any,
+    });
+    injectGeneratorSession(
+      agent,
+      generator([taskStarted("agent-42", { subagent_type: "Explore" }), settled()]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    // Readiness describes the async task stream, so a client that opted out of
+    // that stream is not told about it.
+    expect(readinessAt(updates)).toEqual([]);
+    // Control: the task really did reach the handler, so the absent frame is
+    // the capability gate rather than a turn that never ran.
+    expect(kinds(updates)).toContain("subagent_state_update");
+  });
+
+  it("publishes no readiness frame for a session that runs no background work", async () => {
+    const { agent, updates } = agentWithUpdates();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: asyncTaskClient as any });
+    injectGeneratorSession(agent, generator([settled()]));
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(readinessAt(updates)).toEqual([]);
+  });
+});
