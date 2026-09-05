@@ -837,6 +837,46 @@ describe("createSession options merging", () => {
       ).resolves.toMatchObject({ sessionId: "unreadable-resume-probe" });
     });
 
+    it("restores the transcript model for direct session/new resume metadata", async () => {
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "direct-resume-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
+
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { resume: "direct-resume-probe" } } },
+      });
+
+      expect(response.sessionId).toBe("direct-resume-probe");
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(getSessionMessages).toHaveBeenCalledOnce();
+      expect(getSessionMessages).toHaveBeenCalledWith("direct-resume-probe");
+    });
+
     it("scopes providerCacheKey by per-session env routing", async () => {
       // The context-window cache key must distinguish backends exactly as the
       // CLI will see them: a session routed to a proxy via _meta env shares a

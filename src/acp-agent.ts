@@ -7725,6 +7725,21 @@ export class ClaudeAcpAgent {
     const timing = new SessionTiming(this.logger, "create", sessionId, createStartedAt);
     timing.phase("validate-cwd");
 
+    // Most session/load calls already carry a transcript snapshot so history
+    // replay and model restoration share one local read. A few resume paths
+    // intentionally call createSession directly (legacy session/new metadata,
+    // sign-out respawn, provider rerouting), so fill the same fast local hint
+    // here when the caller did not provide it. Never fall back to the slow
+    // getContextUsage control request.
+    let resumedModelHint = creationOpts.resumedModelHint;
+    if (
+      creationOpts.resume !== undefined &&
+      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
+    ) {
+      resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
+      timing.phase("resume-transcript");
+    }
+
     const input = new Pushable<SDKUserMessage>();
 
     const settingsManager = new SettingsManager(params.cwd, {
@@ -8145,7 +8160,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        creationOpts.resumedModelHint,
+        resumedModelHint,
       );
       timing.phase("models");
 
