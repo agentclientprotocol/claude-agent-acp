@@ -114,6 +114,22 @@ describe("resolveModelPreference - resolvedModel matching", () => {
   });
 });
 
+describe("resolveModelPreference - hybrid selection", () => {
+  const hybrid: ModelInfo = {
+    value: "opusplan",
+    displayName: "Opus Plan Mode",
+    description: "",
+    resolvedModel: "claude-sonnet-5",
+  };
+  it("does not infer a hybrid selection from a concrete model", () => {
+    expect(resolveModelPreference([hybrid], "claude-sonnet-5")).toBeNull();
+    expect(resolveModelPreference([hybrid], "opus")).toBeNull();
+  });
+  it("does not replace a missing hybrid selection with ordinary Opus", () => {
+    expect(resolveModelPreference(LIVE_SHAPED_MODELS, "opusplan")).toBeNull();
+  });
+});
+
 describe("matchResumedModel", () => {
   // Environment shape from issue #845: the default resolves to Sonnet, the
   // session was explicitly switched to Opus before the process restart.

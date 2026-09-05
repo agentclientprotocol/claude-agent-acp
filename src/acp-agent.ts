@@ -237,6 +237,11 @@ import {
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
+import {
+  readOpusplanSelection,
+  withOpusplanModel,
+  writeOpusplanSelection,
+} from "./session-model.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -2064,10 +2069,18 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    return forkSession(params, {
+    const result = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       messageIdForGrouping,
     });
+    try {
+      if (await readOpusplanSelection(CLAUDE_CONFIG_DIR, params.sessionId)) {
+        await this.rememberOpusplanSelection(result.sessionId, "opusplan");
+      }
+    } catch (error) {
+      this.logger.error(`Failed to copy model selection for session ${params.sessionId}:`, error);
+    }
+    return result;
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -6336,6 +6349,7 @@ export class ClaudeAcpAgent {
       await this.sessionModes.publishCurrent(params.sessionId, effectiveValue);
     } else if (params.configId === MODEL_CONFIG_ID) {
       await this.sessions[params.sessionId].query.setModel(resolvedValue);
+      await this.rememberOpusplanSelection(params.sessionId, resolvedValue);
     }
     // Effort SDK sync is handled inside applyConfigOptionValue so that direct
     // effort changes and effort changes induced by a model switch go through
@@ -7168,6 +7182,14 @@ export class ClaudeAcpAgent {
     });
   }
 
+  private async rememberOpusplanSelection(sessionId: string, model: string): Promise<void> {
+    try {
+      await writeOpusplanSelection(CLAUDE_CONFIG_DIR, sessionId, model);
+    } catch (error) {
+      this.logger.error(`Failed to save model selection for session ${sessionId}:`, error);
+    }
+  }
+
   private async applyConfigOptionValue(
     sessionId: string,
     session: Session,
@@ -7826,13 +7848,20 @@ export class ClaudeAcpAgent {
                   input.source !== "sdk" &&
                   input.source !== "resume"
                 ) {
+                  if (input.source === "command" || input.source === "picker") {
+                    await this.rememberOpusplanSelection(
+                      sessionId,
+                      input.requested_model ?? "default",
+                    );
+                  }
                   // Don't run the sync before answering the hook: the sync
                   // can issue applyFlagSettings (an outgoing control request)
                   // while the CLI is awaiting this hook's response, and SDK
                   // control requests are serialized over one channel.
                   // syncModelAfterExternalSwitch contains its own errors, so
                   // the detached call can't surface an unhandled rejection.
-                  const toModel = input.to_model;
+                  const toModel =
+                    input.requested_model === "opusplan" ? "opusplan" : input.to_model;
                   setImmediate(() => {
                     const live = this.sessions[sessionId];
                     if (!live) return;
@@ -7899,9 +7928,25 @@ export class ClaudeAcpAgent {
     // Resume can replace an env/settings opusplan pin with the transcript's
     // concrete model, dropping the hybrid alias from the SDK's picker. An
     // explicit startup model preserves it before we resolve picker entries.
+    let restoredModelSelection: string | undefined;
     if (creationOpts.resume !== undefined && options.model === undefined) {
       const configuredModel = process.env.ANTHROPIC_MODEL || settingsManager.getSettings().model;
-      if (configuredModel === "opusplan") options.model = configuredModel;
+      const allowlist = settingsManager.getSettings().availableModels;
+      if (
+        configuredModel === undefined &&
+        (!Array.isArray(allowlist) || allowlist.some((model) => model.trim() === "opusplan"))
+      ) {
+        try {
+          if (await readOpusplanSelection(CLAUDE_CONFIG_DIR, creationOpts.resume)) {
+            restoredModelSelection = "opusplan";
+          }
+        } catch (error) {
+          this.logger.error(`Failed to read model selection for session ${sessionId}:`, error);
+        }
+      }
+      if (configuredModel === "opusplan" || restoredModelSelection === "opusplan") {
+        options.model = "opusplan";
+      }
     }
 
     const q = query({
@@ -7955,6 +8000,8 @@ export class ClaudeAcpAgent {
         }
       }
 
+      initializationResult.models = withOpusplanModel(initializationResult.models);
+
       // Apply user's `availableModels` allowlist from settings.json before any
       // downstream model handling. The SDK only enforces this allowlist in its
       // own UI, not in `initializationResult.models`, so we filter here to keep
@@ -7977,6 +8024,7 @@ export class ClaudeAcpAgent {
         settingsManager,
         this.logger,
         creationOpts.resume !== undefined,
+        restoredModelSelection,
       );
 
       // Resolve the current model's capabilities separately from the stable
@@ -8153,6 +8201,10 @@ export class ClaudeAcpAgent {
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
       };
+
+      if (restoredModelSelection && sessionId !== creationOpts.resume) {
+        await this.rememberOpusplanSelection(sessionId, restoredModelSelection);
+      }
 
       return {
         sessionId,
@@ -8945,7 +8997,6 @@ function tokenizeModelPreference(model: string): { tokens: string[]; contextHint
   const rawTokens = normalized.split(/[^a-z0-9]+/).filter(Boolean);
   const tokens = rawTokens
     .map((token) => {
-      if (token === "opusplan") return "opus";
       if (token === "best" || token === "default") return "";
       return token;
     })
@@ -8985,6 +9036,11 @@ export function resolveModelPreference(models: ModelInfo[], preference: string):
       model.displayName.toLowerCase() === lower,
   );
   if (directMatch) return directMatch;
+
+  // A hybrid selection is not interchangeable with either concrete model.
+  // Only an explicit opusplan match may select it or satisfy its preference.
+  if (canonicalPreference === "opusplan") return null;
+  models = models.filter((model) => model.value !== "opusplan");
 
   // Exact match on the alias's canonical resolved id (e.g. a pinned
   // "claude-sonnet-5" against the "sonnet" row's `resolvedModel`). SDK-
@@ -9068,7 +9124,8 @@ export function matchResumedModel(models: ModelInfo[], liveModel: string): Model
   // No default-row exclusion needed: a default row matching `live` exactly
   // already returned at the tier above.
   const exactMatch = models.find(
-    (m) => m.resolvedModel && canonicalizeModelId(m.resolvedModel) === live,
+    (m) =>
+      m.value !== "opusplan" && m.resolvedModel && canonicalizeModelId(m.resolvedModel) === live,
   );
   if (exactMatch) return exactMatch;
 
@@ -9225,6 +9282,7 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
+  restoredModelSelection?: string,
 ): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
   const settings = settingsManager.getSettings();
 
@@ -9239,8 +9297,9 @@ async function getAvailableModels(
   // Model priority (highest to lowest):
   // 1. ANTHROPIC_MODEL environment variable
   // 2. settings.model (user configuration)
-  // 3. the resumed session's live model (resumed sessions only)
-  // 4. models[0] (default first model)
+  // 3. a saved manual opusplan selection (resumed sessions only)
+  // 4. the resumed session's live model (resumed sessions only)
+  // 5. models[0] (default first model)
   if (process.env.ANTHROPIC_MODEL) {
     const match = resolveModelPreference(models, process.env.ANTHROPIC_MODEL);
     if (match) {
@@ -9252,6 +9311,14 @@ async function getAvailableModels(
     if (match) {
       currentModel = match;
       resolvedFromInput = settings.model;
+    }
+  }
+
+  if (resolvedFromInput === undefined && restoredModelSelection) {
+    const match = models.find((model) => model.value === restoredModelSelection);
+    if (match) {
+      currentModel = match;
+      resolvedFromInput = restoredModelSelection;
     }
   }
 

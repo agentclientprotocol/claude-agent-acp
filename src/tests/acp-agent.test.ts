@@ -8527,7 +8527,7 @@ describe("usage_update computation", () => {
     return { agent, updates };
   }
 
-  function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
+  function injectSession(agent: ClaudeAcpAgent, messages: any[], keepOpen = false) {
     const input = new Pushable<any>();
     async function* messageGenerator() {
       // Wait for the prompt to push its user message so we can replay it
@@ -8544,6 +8544,7 @@ describe("usage_update computation", () => {
         };
       }
       yield* messages;
+      if (keepOpen) await iter.next();
     }
     agent.sessions["test-session"] = mockSessionState({
       query: wrapQuery(messageGenerator()),
@@ -9580,24 +9581,28 @@ describe("usage_update computation", () => {
     const { agent } = createMockAgentWithCapture();
 
     // Provider-A session learns the authoritative window on a turn.
-    injectSession(agent, [
-      createAssistantMessage({ model: "claude-provkey-probe" }),
-      createResultMessageWithModel({
-        modelUsage: {
-          [RESOLVED_ID]: {
-            inputTokens: 1,
-            outputTokens: 1,
-            cacheReadInputTokens: 0,
-            cacheCreationInputTokens: 0,
-            webSearchRequests: 0,
-            costUSD: 0,
-            contextWindow: 500_000,
-            maxOutputTokens: 16384,
+    injectSession(
+      agent,
+      [
+        createAssistantMessage({ model: "claude-provkey-probe" }),
+        createResultMessageWithModel({
+          modelUsage: {
+            [RESOLVED_ID]: {
+              inputTokens: 1,
+              outputTokens: 1,
+              cacheReadInputTokens: 0,
+              cacheCreationInputTokens: 0,
+              webSearchRequests: 0,
+              costUSD: 0,
+              contextWindow: 500_000,
+              maxOutputTokens: 16384,
+            },
           },
-        },
-      }),
-      { type: "system", subtype: "session_state_changed", state: "idle" },
-    ]);
+        }),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      true,
+    );
     const sessionA = agent.sessions["test-session"]!;
     sessionA.providerCacheKey = "apiType-A https://a.example";
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
@@ -9655,6 +9660,7 @@ describe("usage_update computation", () => {
       value: "alias",
     });
     expect(sessionA.contextWindowSize).toBe(500_000);
+    sessionA.input.end();
   });
 
   it("ignores a nonsensical (non-positive) reported window: keeps the prior window and doesn't poison the cache", async () => {

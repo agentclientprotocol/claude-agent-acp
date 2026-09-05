@@ -5,8 +5,9 @@ import * as os from "node:os";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
 
-const { querySpy } = vi.hoisted(() => ({
+const { querySpy, forkSpy } = vi.hoisted(() => ({
   querySpy: vi.fn(),
+  forkSpy: vi.fn(),
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -14,6 +15,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   return {
     ...actual,
     query: querySpy,
+    forkSession: forkSpy,
   };
 });
 
@@ -56,6 +58,7 @@ describe("ClaudeAcpAgent settings", () => {
     originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = tempDir;
     querySpy.mockReset();
+    forkSpy.mockReset().mockResolvedValue({ sessionId: "forked-session" });
     vi.resetModules();
   });
 
@@ -465,6 +468,114 @@ describe("ClaudeAcpAgent settings", () => {
       else process.env.ANTHROPIC_MODEL = previousModel;
     }
   });
+
+  it.each([
+    { action: "restore", startup: "opusplan", current: "opusplan", selectable: true },
+    { action: "fork", startup: "opusplan", current: "opusplan", selectable: true },
+    { action: "switch away", startup: undefined, current: "sonnet", selectable: true },
+    { action: "reject selection", startup: undefined, current: "sonnet", selectable: true },
+    { action: "reject switch away", startup: "opusplan", current: "opusplan", selectable: true },
+    { action: "different session", startup: undefined, current: "sonnet", selectable: true },
+    { action: "env override", startup: undefined, current: "sonnet", selectable: true },
+    { action: "settings override", startup: undefined, current: "sonnet", selectable: true },
+    { action: "allowlist excludes", startup: undefined, current: "sonnet", selectable: false },
+    { action: "CLI switch away", startup: undefined, current: "sonnet", selectable: true },
+  ])(
+    "$action for a manual opusplan selection across adapter restarts",
+    async ({ action, startup, current, selectable }) => {
+      const previousModel = process.env.ANTHROPIC_MODEL;
+      delete process.env.ANTHROPIC_MODEL;
+      const setModel = vi.fn();
+      const startedModels: (string | undefined)[] = [];
+      let capturedOptions: any;
+      querySpy.mockImplementation(({ options }: any) => {
+        capturedOptions = options;
+        startedModels.push(options.model);
+        const models = [
+          { value: "default", displayName: "Default", description: "" },
+          { value: "opus[1m]", displayName: "Opus", description: "" },
+          {
+            value: "sonnet",
+            displayName: "Sonnet",
+            description: "",
+            resolvedModel: "claude-sonnet-5",
+          },
+        ];
+        if (options.model === "opusplan") {
+          models.push({ value: "opusplan", displayName: "Opus Plan Mode", description: "" });
+        }
+        return makeMockQuery({
+          initializationResult: async () => ({ models }),
+          setModel,
+          getContextUsage: async () => ({ model: "claude-sonnet-5", rawMaxTokens: 200000 }),
+        });
+      });
+      let { ClaudeAcpAgent } = await import("../acp-agent.js");
+      let agent = new ClaudeAcpAgent(createMockClient());
+      try {
+        const fresh = await agent.newSession({ cwd: tempDir, mcpServers: [] });
+        const picker = fresh.configOptions!.find((option) => option.id === "model") as any;
+        expect(picker.options).toContainEqual(expect.objectContaining({ value: "opusplan" }));
+        const select = (value: string) =>
+          agent.setSessionConfigOption({ sessionId: fresh.sessionId, configId: "model", value });
+        if (action === "reject selection") {
+          setModel.mockRejectedValueOnce(new Error("switch blocked"));
+          await expect(select("opusplan")).rejects.toThrow("switch blocked");
+        } else {
+          await select("opusplan");
+          expect(setModel).toHaveBeenLastCalledWith("opusplan");
+        }
+        if (action === "switch away") await select("sonnet");
+        if (action === "reject switch away") {
+          setModel.mockRejectedValueOnce(new Error("switch blocked"));
+          await expect(select("sonnet")).rejects.toThrow("switch blocked");
+        }
+        if (action === "CLI switch away") {
+          await capturedOptions.hooks.PostModelSwitch.at(-1).hooks[0]({
+            hook_event_name: "PostModelSwitch",
+            source: "command",
+            requested_model: "sonnet",
+            to_model: "claude-sonnet-5",
+          });
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        if (action === "env override") process.env.ANTHROPIC_MODEL = "sonnet";
+        if (action === "settings override" || action === "allowlist excludes") {
+          await fs.promises.writeFile(
+            path.join(tempDir, "settings.json"),
+            JSON.stringify(
+              action === "settings override"
+                ? { model: "sonnet" }
+                : { availableModels: ["sonnet"] },
+            ),
+          );
+        }
+        let resumeId = action === "different session" ? "other-session" : fresh.sessionId;
+        if (action === "fork") {
+          resumeId = (
+            await agent.unstable_forkSession({ sessionId: fresh.sessionId, cwd: tempDir })
+          ).sessionId;
+        }
+        await agent.dispose();
+        vi.resetModules();
+        ({ ClaudeAcpAgent } = await import("../acp-agent.js"));
+        agent = new ClaudeAcpAgent(createMockClient());
+        const resumed = await agent.resumeSession({
+          sessionId: resumeId,
+          cwd: tempDir,
+          mcpServers: [],
+        });
+        expect(startedModels).toEqual([undefined, startup]);
+        const model = resumed.configOptions!.find((option) => option.id === "model") as any;
+        expect(model.currentValue).toBe(current);
+        expect(model.options.some((option: any) => option.value === "opusplan")).toBe(selectable);
+      } finally {
+        await agent.dispose();
+        if (previousModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = previousModel;
+      }
+    },
+  );
 
   describe("availableModels allowlist from settings", () => {
     function mockQueryWithModels(models: any[]): {
