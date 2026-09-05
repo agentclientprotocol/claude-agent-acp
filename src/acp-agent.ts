@@ -327,6 +327,7 @@ async function structuredUsageMarkdown(
   signal: AbortSignal,
   logger: Logger,
 ): Promise<string | null> {
+  if (signal.aborted) return null;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   try {
@@ -551,11 +552,13 @@ type Turn = {
    * runs through the normal SDK turn so ordering, cancellation, persistence,
    * and replay remain unchanged. Null means the experimental API failed and
    * every output path must preserve Claude Code's original text. */
+  isUsageCommand?: boolean;
   usageMarkdown?: Promise<string | null>;
   usageMarkdownAbort?: AbortController;
   /** The SDK can expose a local command through more than one message shape;
    * publish the structured replacement at most once. */
   usageMarkdownDelivered?: boolean;
+  usageOriginalOutput?: string;
   /** Optional hidden, model-authored file-change audit requested by the ACP
    *  client for this turn. The state is turn-owned so a late tool call can
    *  never be rebound to a newer prompt. */
@@ -2634,9 +2637,6 @@ export class ClaudeAcpAgent {
       params.prompt[0]?.type === "text" &&
       isUsageCommandText(params.prompt[0].text);
     const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
-    const usageMarkdown = usageMarkdownAbort
-      ? structuredUsageMarkdown(session.query, usageMarkdownAbort.signal, this.logger)
-      : undefined;
 
     session.titles.onPrompt(params.prompt);
 
@@ -2647,7 +2647,7 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
-      ...(usageMarkdown ? { usageMarkdown } : {}),
+      ...(isUsageCommand ? { isUsageCommand: true } : {}),
       ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
       ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
@@ -3301,6 +3301,16 @@ export class ClaudeAcpAgent {
         supportsAirSessionFailures(this.clientCapabilities) ? undefined : rawDetail,
       );
 
+    const ensureUsageMarkdown = (turn: Turn): Promise<string | null> | undefined => {
+      if (!turn.isUsageCommand || !turn.usageMarkdownAbort) return undefined;
+      turn.usageMarkdown ??= structuredUsageMarkdown(
+        session.query,
+        turn.usageMarkdownAbort.signal,
+        this.logger,
+      );
+      return turn.usageMarkdown;
+    };
+
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
@@ -3342,6 +3352,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      ensureUsageMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -3535,13 +3546,23 @@ export class ClaudeAcpAgent {
      * local-command output. Undefined means this is not a structured usage
      * turn (or its request failed), null means another SDK message shape
      * already delivered it, and string is the one replacement to publish. */
-    const takeUsageMarkdown = async (): Promise<string | null | undefined> => {
+    const takeUsageMarkdown = async (
+      originalOutput: string,
+    ): Promise<string | null | undefined> => {
       const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
-      if (!turn?.usageMarkdown) return undefined;
-      const markdown = await turn.usageMarkdown;
+      if (!turn) return undefined;
+      const usageMarkdown = ensureUsageMarkdown(turn);
+      if (!usageMarkdown) return undefined;
+      const markdown = await usageMarkdown;
       if (markdown === null) return undefined;
-      if (turn.usageMarkdownDelivered) return null;
+      if (turn.usageMarkdownDelivered) {
+        // Different SDK message shapes can mirror the same local-command
+        // output. Suppress an exact mirror, but let a later, distinct frame
+        // (for example an interruption diagnostic) follow the normal path.
+        return turn.usageOriginalOutput === originalOutput ? null : undefined;
+      }
       turn.usageMarkdownDelivered = true;
+      turn.usageOriginalOutput = originalOutput;
       return markdown;
     };
 
@@ -4125,8 +4146,9 @@ export class ClaudeAcpAgent {
                 if (compaction.consumeDuplicateErrorOutput(message.content)) {
                   break;
                 }
-                const usageMarkdown = await takeUsageMarkdown();
-                if (session.cancelled) break;
+                const usageTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                const usageMarkdown = await takeUsageMarkdown(message.content);
+                if (usageTurn?.isUsageCommand && session.cancelled) break;
                 if (usageMarkdown === null) break;
                 await sendUpdate({
                   sessionId: message.session_id,
@@ -5134,15 +5156,14 @@ export class ClaudeAcpAgent {
                   // the fallback there. (Autonomous results never get here —
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
-                  const usageMarkdown = await takeUsageMarkdown();
-                  if (
-                    usageMarkdown !== null &&
-                    (usageMarkdown !== undefined ||
-                      session.activeTurn?.isLocalOnlyCommand ||
-                      (!deliveredAssistantText &&
-                        !deliveredCompactionOutput &&
-                        (message.usage.output_tokens ?? 0) === 0))
-                  ) {
+                  const shouldForwardResult =
+                    session.activeTurn?.isLocalOnlyCommand ||
+                    (!deliveredAssistantText &&
+                      !deliveredCompactionOutput &&
+                      (message.usage.output_tokens ?? 0) === 0);
+                  if (shouldForwardResult) {
+                    const usageMarkdown = await takeUsageMarkdown(message.result);
+                    if (usageMarkdown === null) break;
                     for (const notification of toAcpNotifications(
                       usageMarkdown ?? message.result,
                       "assistant",
@@ -5562,7 +5583,9 @@ export class ClaudeAcpAgent {
               message.parent_tool_use_id === null &&
               message.message.model === "<synthetic>"
             ) {
-              const usageMarkdown = await takeUsageMarkdown();
+              const usageMarkdown = await takeUsageMarkdown(
+                assistantMessageText(message.message) ?? "",
+              );
               if (session.cancelled) break;
               if (usageMarkdown !== undefined) {
                 if (usageMarkdown !== null) {

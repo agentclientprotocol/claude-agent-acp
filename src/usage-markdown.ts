@@ -11,31 +11,13 @@ const contributionSchema = z.object({ name: z.string(), pct: percentSchema });
 const behaviorPeriodSchema = z.object({
   request_count: countSchema,
   session_count: countSchema,
-  behaviors: z.array(
-    z.object({
-      key: z.enum(["cache_miss", "long_context", "subagent_heavy", "high_parallel", "cron"]),
-      pct: percentSchema,
-      count: countSchema,
-    }),
-  ),
-  agents: z.array(contributionSchema),
-  skills: z.array(contributionSchema),
-  plugins: z.array(contributionSchema),
   mcp_servers: z.array(contributionSchema),
 });
 const modelUsageSchema = z.object({
   inputTokens: countSchema,
   outputTokens: countSchema,
-  thinkingTokens: countSchema.optional(),
   cacheReadInputTokens: countSchema,
   cacheCreationInputTokens: countSchema,
-  webSearchRequests: countSchema,
-  costUSD: countSchema,
-  contextWindow: countSchema,
-  maxOutputTokens: countSchema,
-  canonicalModel: z.string().optional(),
-  provider: z.string().optional(),
-  costBasis: z.enum(["list", "managed", "unknown"]).optional(),
 });
 
 const usageResponseSchema = z.object({
@@ -43,8 +25,6 @@ const usageResponseSchema = z.object({
     total_cost_usd: countSchema,
     total_api_duration_ms: countSchema,
     total_duration_ms: countSchema,
-    total_lines_added: countSchema,
-    total_lines_removed: countSchema,
     model_usage: z.record(z.string(), modelUsageSchema),
   }),
   subscription_type: z.string().nullable(),
@@ -83,11 +63,14 @@ const usageResponseSchema = z.object({
 /** Validate the experimental SDK response at the runtime boundary. */
 export function parseUsageResponse(value: unknown): SDKControlGetUsageResponse | null {
   const parsed = usageResponseSchema.safeParse(value);
-  return parsed.success ? (parsed.data as SDKControlGetUsageResponse) : null;
+  // Validate only the fields the renderer reads, but preserve the complete
+  // response. The experimental API may add values to unused subtrees without
+  // making the useful, already-validated portion unsafe to render.
+  return parsed.success ? (value as SDKControlGetUsageResponse) : null;
 }
 
 export function isUsageCommandText(text: string): boolean {
-  return ["/usage", "/cost", "/stats"].includes(text.trim());
+  return text.trim() === "/usage";
 }
 
 function usageBar(percent: number): string {
@@ -170,16 +153,21 @@ export function formatUsageResponse(usage: SDKControlGetUsageResponse): string {
   }
 
   if (usage.rate_limits_available && usage.rate_limits) {
-    lines.push("", "### Limits", "");
-    appendLimit(lines, "5-hour limit", usage.rate_limits.five_hour);
-    appendLimit(lines, "Weekly · all models", usage.rate_limits.seven_day);
+    const limitLines: string[] = [];
+    appendLimit(limitLines, "5-hour limit", usage.rate_limits.five_hour);
+    appendLimit(limitLines, "Weekly · all models", usage.rate_limits.seven_day);
     const modelWindows = usage.rate_limits.model_scoped ?? [];
-    for (const model of modelWindows) appendLimit(lines, `Weekly · ${model.display_name}`, model);
-    if (modelWindows.length === 0) {
-      appendLimit(lines, "Weekly · Opus", usage.rate_limits.seven_day_opus);
-      appendLimit(lines, "Weekly · Sonnet", usage.rate_limits.seven_day_sonnet);
+    for (const model of modelWindows) {
+      appendLimit(limitLines, `Weekly · ${model.display_name}`, model);
     }
-    if (lines.at(-1) === "") lines.pop();
+    if (modelWindows.length === 0) {
+      appendLimit(limitLines, "Weekly · Opus", usage.rate_limits.seven_day_opus);
+      appendLimit(limitLines, "Weekly · Sonnet", usage.rate_limits.seven_day_sonnet);
+    }
+    if (limitLines.length > 0) {
+      if (limitLines.at(-1) === "") limitLines.pop();
+      lines.push("", "### Limits", "", ...limitLines);
+    }
   }
 
   const models = Object.values(usage.session.model_usage);

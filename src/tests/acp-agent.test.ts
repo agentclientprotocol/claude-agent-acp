@@ -1906,6 +1906,27 @@ describe("usage Markdown", () => {
     expect(
       parseUsageResponse({ ...usageResponse, session: { total_cost_usd: "broken" } }),
     ).toBeNull();
+    expect(
+      parseUsageResponse({
+        ...usageResponse,
+        session: {
+          ...usageResponse.session,
+          model_usage: {
+            "claude-opus-4-1": {
+              ...usageResponse.session.model_usage["claude-opus-4-1"],
+              costBasis: "a-future-value",
+            },
+          },
+        },
+        behaviors: {
+          ...usageResponse.behaviors,
+          day: {
+            ...usageResponse.behaviors.day,
+            behaviors: [{ key: "a-future-behavior", pct: 1, count: 1 }],
+          },
+        },
+      }),
+    ).not.toBeNull();
   });
 
   it("renders limits, session totals, and MCP contributions from structured data", () => {
@@ -1943,10 +1964,24 @@ describe("usage Markdown", () => {
 
   it("recognizes only exact local usage commands", () => {
     expect(isUsageCommandText(" /usage ")).toBe(true);
-    expect(isUsageCommandText("/cost")).toBe(true);
-    expect(isUsageCommandText("/stats")).toBe(true);
+    expect(isUsageCommandText("/cost")).toBe(false);
+    expect(isUsageCommandText("/stats")).toBe(false);
     expect(isUsageCommandText("please review /usage")).toBe(false);
     expect(isUsageCommandText("/usage now")).toBe(false);
+  });
+
+  it("omits the limits section when every utilization is unavailable", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      rate_limits: {
+        five_hour: { utilization: null, resets_at: null },
+        seven_day: { utilization: null, resets_at: null },
+        seven_day_opus: { utilization: null, resets_at: null },
+        seven_day_sonnet: { utilization: null, resets_at: null },
+      },
+    });
+    expect(formatted).not.toContain("### Limits");
+    expect(formatted).toContain("### This session");
   });
 
   it("replaces the exact SDK /usage turn output with structured Markdown", async () => {
@@ -2007,6 +2042,95 @@ describe("usage Markdown", () => {
     expect(text).toContain("## Usage");
     expect(text).toContain("### This session");
     expect(text).not.toContain(raw);
+  });
+
+  it("forwards a later diagnostic from the same local-command output lane", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Raw Claude Code usage output",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Raw Claude Code usage output",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Interrupted by user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      vi.fn(async () => usageResponse);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("\n");
+    expect(text).toContain("## Usage");
+    expect(text).toContain("Interrupted by user");
+    expect(text).not.toContain("Raw Claude Code usage output");
+  });
+
+  it("does not append usage Markdown to a model-generated /usage result", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield successfulResultMessage({
+          result: "A custom command's model answer",
+          usage: {
+            input_tokens: 1,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+      }
+      return messages();
+    });
+    const getUsage = vi.fn(async () => usageResponse);
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(text).not.toContain("## Usage");
   });
 
   it.each([
