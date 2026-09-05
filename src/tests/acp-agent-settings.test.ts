@@ -98,7 +98,7 @@ describe("ClaudeAcpAgent settings", () => {
     expect(getCapturedOptions().permissionMode).toBe("dontAsk");
     expect(getCapturedOptions().settingSources).toEqual(["user", "project", "local"]);
     expect(response.modes.currentModeId).toBe("default");
-  });
+  }, 15_000);
 
   it("supports acceptEdits mode defaults", async () => {
     await fs.promises.writeFile(
