@@ -1078,9 +1078,22 @@ describe("createSession options merging", () => {
     ];
 
     let originalAnthropicModel: string | undefined;
+    let originalClaudeConfigDir: string | undefined;
+    let configDir: string;
     beforeEach(() => {
       originalAnthropicModel = process.env.ANTHROPIC_MODEL;
       delete process.env.ANTHROPIC_MODEL;
+      // These tests assert which model a fresh session lands on with no
+      // override in play, so both override tiers above the SDK's default have
+      // to be neutralized: ANTHROPIC_MODEL and `model` from the user
+      // settings tier. Without the second one, a developer whose own
+      // ~/.claude/settings.json pins a model (e.g. "opus[1m]") sees the
+      // session start on that model instead of models[0]. resolveSettings
+      // reads the user tier from CLAUDE_CONFIG_DIR at call time, so pointing
+      // it at an empty directory is enough.
+      originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-model-config-"));
+      process.env.CLAUDE_CONFIG_DIR = configDir;
     });
     afterEach(() => {
       if (originalAnthropicModel !== undefined) {
@@ -1088,6 +1101,12 @@ describe("createSession options merging", () => {
       } else {
         delete process.env.ANTHROPIC_MODEL;
       }
+      if (originalClaudeConfigDir !== undefined) {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+      } else {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      }
+      fs.rmSync(configDir, { recursive: true, force: true });
     });
 
     it("tolerates a PreModelSwitch hook vetoing the fresh-session model pin", async () => {
