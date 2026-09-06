@@ -130,8 +130,8 @@ async function createHarness(): Promise<LiveHarness> {
     },
     readTextFile: async () => ({ content: "" }),
     writeTextFile: async () => ({}),
-    unstable_createElicitation: async () => ({ action: "decline" as const }),
-    unstable_completeElicitation: async () => {},
+    createElicitation: async () => ({ action: "decline" as const }),
+    completeElicitation: async () => {},
     extNotification: async (method: string, params: JsonObject) => {
       if (method !== "_claude/sdkMessage") return;
       const message = object(params.message);
