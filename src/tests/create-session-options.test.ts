@@ -33,6 +33,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
+        interrupt: async () => undefined,
+        close: () => {},
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -290,6 +292,36 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  it("recreates a resumed Query with changed skills and the same session ID", async () => {
+    const created = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf"] },
+        },
+      },
+    });
+    const initialQuery = agent.sessions[created.sessionId]!.query;
+    expect(capturedOptions!.skills).toEqual(["pdf"]);
+
+    await agent.resumeSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["docx"] },
+        },
+      },
+    });
+
+    expect(Object.keys(agent.sessions)).toEqual([created.sessionId]);
+    expect(agent.sessions[created.sessionId]!.query).not.toBe(initialQuery);
+    expect(capturedOptions!.resume).toBe(created.sessionId);
+    expect(capturedOptions!.skills).toEqual(["docx"]);
   });
 
   describe("subagent transcript forwarding", () => {

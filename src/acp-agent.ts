@@ -767,8 +767,8 @@ export type Session = {
    *  without ever reaching the model). */
   queryClosed?: boolean;
   cwd: string;
-  /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
-   *  detect when loadSession/resumeSession is called with changed values. */
+  /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
+   *  used to detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
   /** Original ACP parameters used to recreate this query with a new provider. */
   creationParams?: NewSessionRequest;
@@ -1121,16 +1121,32 @@ function disarmForceCancel(session: Session): void {
   }
 }
 
+/** Normalize skills without changing their SDK semantics. Array order and
+ *  duplicates do not affect the selected skill set, so neither should rebuild
+ *  the underlying Query process. */
+function normalizeSkills(skills: Options["skills"]): Options["skills"] {
+  return Array.isArray(skills) ? [...new Set(skills)].sort() : skills;
+}
+
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
- *  recreating the underlying Query process.  MCP servers are sorted by name
- *  so that ordering differences don't trigger unnecessary recreations. */
+ *  recreating the underlying Query process. MCP servers are sorted by name,
+ *  and skills are normalized as a set, so ordering differences don't trigger
+ *  unnecessary recreations. */
 function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+  const skills = normalizeSkills(
+    (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.skills,
+  );
+  return JSON.stringify({
+    cwd: params.cwd,
+    mcpServers: servers,
+    ...(skills !== undefined && { skills }),
+  });
 }
 
 export type SDKMessageFilter = {
@@ -7621,8 +7637,9 @@ export class ClaudeAcpAgent {
       }
 
       // Session-defining params changed (e.g. cwd pointed at a git worktree,
-      // or MCP servers reconfigured). Tear down the existing session and
-      // recreate it so the underlying Query process picks up the new values.
+      // MCP servers reconfigured, or the skill set changed). Tear down the
+      // existing session and recreate it so the underlying Query process picks
+      // up the new values.
       await this.teardownSession(params.sessionId);
     }
 

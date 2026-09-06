@@ -60,6 +60,7 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
@@ -8821,10 +8822,15 @@ describe("getOrCreateSession param change detection", () => {
   function injectSession(
     agent: ClaudeAcpAgent,
     sessionId: string,
-    opts: { cwd?: string; mcpServers?: { name: string }[] } = {},
+    opts: {
+      cwd?: string;
+      mcpServers?: { name: string }[];
+      skills?: Options["skills"];
+    } = {},
   ) {
     const cwd = opts.cwd ?? "/test";
     const mcpServers = (opts.mcpServers ?? []) as any[];
+    const skills = Array.isArray(opts.skills) ? [...new Set(opts.skills)].sort() : opts.skills;
     function* empty() {}
     const gen = Object.assign(empty(), {
       interrupt: vi.fn(),
@@ -8840,6 +8846,7 @@ describe("getOrCreateSession param change detection", () => {
       sessionFingerprint: JSON.stringify({
         cwd,
         mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
+        ...(skills !== undefined && { skills }),
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
@@ -8955,6 +8962,90 @@ describe("getOrCreateSession param change detection", () => {
       sessionId: "s1",
       cwd: "/project",
       mcpServers: [...servers].reverse() as any,
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each<{
+    label: string;
+    previousSkills: Options["skills"];
+    nextSkills: Options["skills"];
+  }>([
+    { label: "CLI defaults to all skills", previousSkills: undefined, nextSkills: "all" },
+    { label: "all skills to no skills", previousSkills: "all", nextSkills: [] },
+    { label: "no skills to CLI defaults", previousSkills: [], nextSkills: undefined },
+    { label: "one explicit skill list to another", previousSkills: ["pdf"], nextSkills: ["docx"] },
+  ])(
+    "tears down the existing session when skills change from $label",
+    async ({ previousSkills, nextSkills }) => {
+      const agent = createMockAgent();
+      const session = injectSession(agent, "s1", {
+        cwd: "/project",
+        skills: previousSkills,
+      });
+      const meta =
+        nextSkills === undefined ? undefined : { claudeCode: { options: { skills: nextSkills } } };
+      const createSessionSpy = vi
+        .spyOn(agent as any, "createSession")
+        .mockRejectedValue(new Error("mock"));
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "s1",
+          cwd: "/project",
+          mcpServers: [],
+          _meta: meta,
+        }),
+      ).rejects.toThrow("mock");
+
+      expect(session.settingsManager.dispose).toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect(session.query.interrupt).toHaveBeenCalled();
+      expect(agent.sessions["s1"]).toBeUndefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ _meta: meta }),
+        expect.objectContaining({ resume: "s1" }),
+      );
+    },
+  );
+
+  it("treats reordered and duplicate skills as unchanged", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      skills: ["pdf", "docx"],
+    });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf", "docx", "pdf"] },
+        },
+      },
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it("ignores unrelated Claude options when computing the fingerprint", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", { cwd: "/project" });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { env: { CUSTOM_ENV: "changed" } },
+        },
+      },
     });
 
     expect(agent.sessions["s1"]).toBe(session);
