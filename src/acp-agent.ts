@@ -80,6 +80,7 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
+  SessionMessage,
   SDKUserMessage,
   Settings,
   SlashCommand,
@@ -155,6 +156,8 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
@@ -239,6 +242,7 @@ import {
 import { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { readModelSelection, withOpusplanModel, writeModelSelection } from "./session-model.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID, EFFORT_CONFIG_ID } from "./session-config-ids.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
@@ -316,6 +320,57 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
+
+/** Best-effort structured presentation for a local `/usage` turn. The command
+ * itself always runs through Claude Code; null tells the consumer to forward
+ * its original output unchanged. The timeout prevents an unstable control
+ * request from holding an otherwise-completed local command indefinitely. */
+async function structuredUsageMarkdown(
+  query: Query,
+  signal: AbortSignal,
+  logger: Logger,
+): Promise<string | null> {
+  if (signal.aborted) return null;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const response = await Promise.race([
+      // Keeping the deliberately unstable method name visible makes an SDK
+      // upgrade fail at compile time if Anthropic removes or renames it.
+      query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), STRUCTURED_USAGE_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+      new Promise<null>((resolve) => {
+        onAbort = () => resolve(null);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+    if (response === null) {
+      if (!signal.aborted) {
+        logger.error("Structured /usage timed out; preserving Claude Code output");
+      }
+      return null;
+    }
+    const usage = parseUsageResponse(response);
+    if (!usage) {
+      logger.error(
+        "Structured /usage returned an incompatible response; preserving Claude Code output",
+      );
+      return null;
+    }
+    return formatUsageResponse(usage);
+  } catch (error) {
+    logger.error(`Structured /usage failed; preserving Claude Code output: ${error}`);
+    return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
 
 /** Claude Code keeps the OAuth callback listener open in the background after
  *  `mcpAuthenticate` returns the authorization URL. The SDK does not expose
@@ -497,6 +552,17 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Structured presentation for an exact /usage command. The command still
+   * runs through the normal SDK turn so ordering, cancellation, persistence,
+   * and replay remain unchanged. Null means the experimental API failed and
+   * every output path must preserve Claude Code's original text. */
+  isUsageCommand?: boolean;
+  usageMarkdown?: Promise<string | null>;
+  usageMarkdownAbort?: AbortController;
+  /** The SDK can expose a local command through more than one message shape;
+   * publish the structured replacement at most once. */
+  usageMarkdownDelivered?: boolean;
+  usageOriginalOutput?: string;
   /** Optional hidden, model-authored file-change audit requested by the ACP
    *  client for this turn. The state is turn-owned so a late tool call can
    *  never be rebound to a newer prompt. */
@@ -780,17 +846,16 @@ export type Session = {
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss; on session/load the
-   *  resumed session's own `getContextUsage` report wins, see
-   *  `readResumedLiveModel`), then confirmed — and the cache populated — by each
-   *  result's modelUsage. No extra `getContextUsage` IPC is on these paths: on a
-   *  fresh session it stalls until the first turn runs (see the seeding call
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), then confirmed —
+   *  and the cache populated — by each result's modelUsage. No extra
+   *  `getContextUsage` IPC is on these paths: before the first turn it can add
+   *  tens of seconds to both fresh and resumed sessions (see the seeding call
    *  sites and `contextWindowCache`). */
   contextWindowSize: number;
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
-   *  cross-session cache, a resumed session's `getContextUsage` report, or a
-   *  `result.modelUsage`) rather than the text heuristic / default. Guards the
+   *  cross-session cache or a `result.modelUsage`) rather than the text
+   *  heuristic / default. Guards the
    *  mid-stream `message_start` heuristic upgrade: an authoritative window that
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
@@ -2067,6 +2132,7 @@ export class ClaudeAcpAgent {
     if (this.providerUpdate) await this.providerUpdate;
     const result = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
+      logger: this.logger,
       messageIdForGrouping,
     });
     try {
@@ -2091,10 +2157,14 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const resumedSession = await readResumedSession(params.sessionId, this.logger);
+    const result = await this.getOrCreateSession(params, resumedSession);
+    timing.phase("session-ready");
 
-    await this.replaySessionHistory(params.sessionId);
+    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
     setTimeout(() => {
@@ -2577,6 +2647,12 @@ export class ClaudeAcpAgent {
       fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
     }
 
+    const isUsageCommand =
+      params.prompt.length === 1 &&
+      params.prompt[0]?.type === "text" &&
+      isUsageCommandText(params.prompt[0].text);
+    const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+
     session.titles.onPrompt(params.prompt);
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
@@ -2586,6 +2662,8 @@ export class ClaudeAcpAgent {
     const turn: Turn = {
       promptUuid,
       isLocalOnlyCommand,
+      ...(isUsageCommand ? { isUsageCommand: true } : {}),
+      ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
       ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
       resolve: () => {},
@@ -3238,6 +3316,16 @@ export class ClaudeAcpAgent {
         supportsAirSessionFailures(this.clientCapabilities) ? undefined : rawDetail,
       );
 
+    const ensureUsageMarkdown = (turn: Turn): Promise<string | null> | undefined => {
+      if (!turn.isUsageCommand || !turn.usageMarkdownAbort) return undefined;
+      turn.usageMarkdown ??= structuredUsageMarkdown(
+        session.query,
+        turn.usageMarkdownAbort.signal,
+        this.logger,
+      );
+      return turn.usageMarkdown;
+    };
+
     const resetTurnScratch = () => {
       lastAssistantTotalUsage = null;
       lastAssistantUsage = null;
@@ -3279,6 +3367,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      ensureUsageMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -3468,6 +3557,30 @@ export class ClaudeAcpAgent {
      *  the autonomous stretch-close guard. */
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
+    /** Claim the structured replacement for the turn currently producing a
+     * local-command output. Undefined means this is not a structured usage
+     * turn (or its request failed), null means another SDK message shape
+     * already delivered it, and string is the one replacement to publish. */
+    const takeUsageMarkdown = async (
+      originalOutput: string,
+    ): Promise<string | null | undefined> => {
+      const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
+      if (!turn) return undefined;
+      const usageMarkdown = ensureUsageMarkdown(turn);
+      if (!usageMarkdown) return undefined;
+      const markdown = await usageMarkdown;
+      if (markdown === null) return undefined;
+      if (turn.usageMarkdownDelivered) {
+        // Different SDK message shapes can mirror the same local-command
+        // output. Suppress an exact mirror, but let a later, distinct frame
+        // (for example an interruption diagnostic) follow the normal path.
+        return turn.usageOriginalOutput === originalOutput ? null : undefined;
+      }
+      turn.usageMarkdownDelivered = true;
+      turn.usageOriginalOutput = originalOutput;
+      return markdown;
+    };
+
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
@@ -3543,6 +3656,7 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
+      turn.usageMarkdownAbort?.abort();
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -4008,14 +4122,11 @@ export class ClaudeAcpAgent {
                 // right after the user sees "Compacting completed", which is
                 // confusing and wrong.
                 //
-                // Prefer the SDK's authoritative post-compaction `used` via
-                // getContextUsage — it reflects the real retained context
-                // (system prompt + tools + surviving messages), which the
-                // per-message API usage numbers can't give us until the next
-                // turn's result. If the control request fails, fall back to the
-                // used:0 approximation: directionally correct (context just
-                // dropped dramatically) and replaced within seconds by the next
-                // result message.
+                // The compact boundary already carries the retained token
+                // count. Prefer it over a getContextUsage control request,
+                // which can block the live query for tens of seconds. Older
+                // SDK frames without post_tokens fall back to used:0 and are
+                // corrected by the next result message.
                 //
                 // `size` keeps coming from session.contextWindowSize —
                 // compaction frees occupancy, it doesn't change the model's
@@ -4029,10 +4140,10 @@ export class ClaudeAcpAgent {
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
                   true,
                 );
-                const usedTokens = await fetchContextUsedTokens(session.query, this.logger);
+                const usedTokens = compactMetadata?.post_tokens ?? 0;
                 lastAssistantUsage = null;
-                lastAssistantTotalUsage = usedTokens ?? 0;
-                session.contextUsedTokens = usedTokens ?? 0;
+                lastAssistantTotalUsage = usedTokens;
+                session.contextUsedTokens = usedTokens;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
@@ -4047,11 +4158,15 @@ export class ClaudeAcpAgent {
                 if (compaction.consumeDuplicateErrorOutput(message.content)) {
                   break;
                 }
+                const usageTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                const usageMarkdown = await takeUsageMarkdown(message.content);
+                if (usageTurn?.isUsageCommand && session.cancelled) break;
+                if (usageMarkdown === null) break;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: message.content },
+                    content: { type: "text", text: usageMarkdown ?? message.content },
                   },
                 });
                 break;
@@ -5053,14 +5168,16 @@ export class ClaudeAcpAgent {
                   // the fallback there. (Autonomous results never get here —
                   // they exit at the early break above — so no background
                   // prose can be injected into the feed.)
-                  if (
+                  const shouldForwardResult =
                     session.activeTurn?.isLocalOnlyCommand ||
                     (!deliveredAssistantText &&
                       !deliveredCompactionOutput &&
-                      (message.usage.output_tokens ?? 0) === 0)
-                  ) {
+                      (message.usage.output_tokens ?? 0) === 0);
+                  if (shouldForwardResult) {
+                    const usageMarkdown = await takeUsageMarkdown(message.result);
+                    if (usageMarkdown === null) break;
                     for (const notification of toAcpNotifications(
-                      message.result,
+                      usageMarkdown ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -5469,17 +5586,44 @@ export class ClaudeAcpAgent {
               }
             }
 
-            // Strip <command-*>/<local-command-stdout> markers and render any
-            // remaining prose. Skill bodies and built-in slash commands (e.g.
-            // /usage, /status, /model) arrive wrapped in these tags; pure-marker
-            // payloads (e.g. /compact's malformed output) strip to null and are
-            // skipped. Mirrors the replay path at replaySessionHistory.
+            // Depending on the Claude Code build, a local command can arrive
+            // as the dedicated system message above or as a synthetic
+            // assistant message. Replace only the output owned by the exact
+            // /usage turn; no content signatures or text parsing are involved.
+            if (
+              message.type === "assistant" &&
+              message.parent_tool_use_id === null &&
+              message.message.model === "<synthetic>"
+            ) {
+              const usageMarkdown = await takeUsageMarkdown(
+                assistantMessageText(message.message) ?? "",
+              );
+              if (session.cancelled) break;
+              if (usageMarkdown !== undefined) {
+                if (usageMarkdown !== null) {
+                  for (const notification of toAcpNotifications(
+                    usageMarkdown,
+                    "assistant",
+                    params.sessionId,
+                    session.toolUseCache,
+                    routedNotificationClient,
+                    this.logger,
+                    { messageId: messageIdForGrouping(message) },
+                  )) {
+                    await sendUpdate(notification);
+                  }
+                }
+                break;
+              }
+            }
+
+            const stringContent =
+              typeof message.message.content === "string" ? message.message.content : undefined;
             if (
               message.message.role !== "system" &&
-              typeof message.message.content === "string" &&
-              message.message.content.includes("<local-command-stdout>")
+              stringContent?.includes("<local-command-stdout>")
             ) {
-              const stripped = stripLocalCommandMetadata(message.message.content);
+              const stripped = stripLocalCommandMetadata(stringContent);
               if (typeof stripped === "string") {
                 for (const notification of toAcpNotifications(
                   stripped,
@@ -5876,6 +6020,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    for (const turn of session.turnQueue ?? []) turn.usageMarkdownAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
@@ -6355,9 +6500,17 @@ export class ClaudeAcpAgent {
     return { configOptions: session.configOptions };
   }
 
-  private async replaySessionHistory(sessionId: string): Promise<void> {
+  private async replaySessionHistory(
+    sessionId: string,
+    resumedMessages?: SessionMessage[],
+  ): Promise<void> {
+    const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = await getSessionMessages(sessionId);
+    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const historyLoadedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
+    );
     const session = this.sessions[sessionId];
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
@@ -6692,6 +6845,10 @@ export class ClaudeAcpAgent {
         );
       }
     }
+    const replayFinishedAt = performance.now();
+    this.logger.log(
+      `[session/replay] sessionId=${sessionId} phase=publish durationMs=${Math.round(replayFinishedAt - historyLoadedAt)} totalMs=${Math.round(replayFinishedAt - replayStartedAt)} messages=${messages.length}`,
+    );
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
@@ -7459,13 +7616,16 @@ export class ClaudeAcpAgent {
     });
   }
 
-  private async getOrCreateSession(params: {
-    sessionId: string;
-    cwd: string;
-    mcpServers?: NewSessionRequest["mcpServers"];
-    additionalDirectories?: NewSessionRequest["additionalDirectories"];
-    _meta?: NewSessionRequest["_meta"];
-  }): Promise<NewSessionResponse> {
+  private async getOrCreateSession(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      _meta?: NewSessionRequest["_meta"];
+    },
+    resumedSession?: ResumedSessionSnapshot,
+  ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
@@ -7483,6 +7643,10 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
+    const resumedModelHint = resumedSession
+      ? resumedSession.model
+      : (await readResumedSession(params.sessionId, this.logger)).model;
+
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -7492,6 +7656,7 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
+        resumedModelHint,
       },
     );
 
@@ -7543,8 +7708,13 @@ export class ClaudeAcpAgent {
        *  wrote one; this keeps the ACP session id alive with an empty history.
        *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
       reuseSessionId?: string;
+      /** Concrete model id from the resumed transcript's last real assistant
+       *  message. Claude Code restores from this same record, so it lets us
+       *  report the live model without a slow getContextUsage control request. */
+      resumedModelHint?: string;
     } = {},
   ): Promise<NewSessionResponse> {
+    const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
     // this check a session is created against a missing directory and the
@@ -7569,6 +7739,23 @@ export class ClaudeAcpAgent {
     } else {
       sessionId = randomUUID();
     }
+    const timing = new SessionTiming(this.logger, "create", sessionId, createStartedAt);
+    timing.phase("validate-cwd");
+
+    // Most session/load calls already carry a transcript snapshot so history
+    // replay and model restoration share one local read. A few resume paths
+    // intentionally call createSession directly (legacy session/new metadata,
+    // sign-out respawn, provider rerouting), so fill the same fast local hint
+    // here when the caller did not provide it. Never fall back to the slow
+    // getContextUsage control request.
+    let resumedModelHint = creationOpts.resumedModelHint;
+    if (
+      creationOpts.resume !== undefined &&
+      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
+    ) {
+      resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
+      timing.phase("resume-transcript");
+    }
 
     const input = new Pushable<SDKUserMessage>();
 
@@ -7576,6 +7763,7 @@ export class ClaudeAcpAgent {
       logger: this.logger,
     });
     await settingsManager.initialize();
+    timing.phase("settings");
 
     const mcpServers: Record<string, McpServerConfig> = {};
     if (Array.isArray(params.mcpServers)) {
@@ -7830,7 +8018,7 @@ export class ClaudeAcpAgent {
         // switches the session's model with no refusal-fallback frame, and
         // the client's picker silently drifts. `source: 'sdk'` is the
         // adapter's own setModel (applyConfigOptionValue already synced it),
-        // and 'resume' restores are read back via readResumedLiveModel, so
+        // and 'resume' restores are read from the transcript before startup, so
         // only the remaining sources sync here (CLI 2.1.251+; older CLIs
         // never fire the hook and keep the pre-hook behavior).
         PostModelSwitch: [
@@ -7957,6 +8145,7 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
     // registration in `this.sessions` would leave that child process running
@@ -7976,6 +8165,7 @@ export class ClaudeAcpAgent {
         }
         throw error;
       }
+      timing.phase("sdk-initialize");
 
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
@@ -8021,15 +8211,18 @@ export class ClaudeAcpAgent {
           )
         : initializationResult.models;
 
-      const { modelState: models, resumedContextWindow } = await getAvailableModels(
+      const models = await getAvailableModels(
         q,
         allowedModels,
         initializationResult.models,
         settingsManager,
         this.logger,
         creationOpts.resume !== undefined,
+        sessionId,
+        resumedModelHint,
         options.model,
       );
+      timing.phase("models");
 
       // Resolve the current model's capabilities separately from the stable
       // permission-mode catalog advertised to ACP clients.
@@ -8072,8 +8265,10 @@ export class ClaudeAcpAgent {
         currentModelInfo,
         currentModelId: models.currentModelId,
       });
+      timing.phase("modes");
 
       const agents = await discoverCustomAgents(q);
+      timing.phase("agents");
       // Only adopt the requested agent as the selected value if it's one we
       // actually surface in the picker. A built-in (filtered out above) or
       // otherwise-unknown name would leave the config option's `currentValue`
@@ -8123,18 +8318,13 @@ export class ClaudeAcpAgent {
         currentAgent,
         fastMode,
       );
-      // Seed the context window WITHOUT any extra IPC on the session/new path.
-      // On session/load, the resumed session's own `getContextUsage` report — a
-      // response `getAvailableModels` already awaited to learn the live model
-      // (resumed sessions ARE serviced pre-turn, unlike fresh ones) — is
-      // authoritative and wins. Otherwise: the cached authoritative window if a
-      // prior turn has learned it for this model (`result.modelUsage`,
-      // cross-session), else the text heuristic, else the default. We
-      // deliberately do NOT issue a getContextUsage call here: on a fresh
-      // session that control request is not serviced until the first prompt
-      // turn runs, so awaiting it — as 0.59.0 did — made session/new take ~15s
-      // (issues #886/#880). The authoritative window arrives on the first
-      // `result.modelUsage` and is cached from there.
+      // Seed the context window without extra IPC. The cached authoritative
+      // window from a prior turn wins (`result.modelUsage`, cross-session),
+      // then the text heuristic, then the default. We deliberately do NOT issue
+      // a getContextUsage call here: before the first prompt turn that control
+      // request can take tens of seconds, on resumed as well as fresh sessions.
+      // The authoritative window arrives on the first `result.modelUsage` and
+      // is cached from there.
       //
       // Text inference alone misses aliases that resolve to extended-context
       // models with no "1m" token anywhere in their id or description (e.g.
@@ -8142,18 +8332,18 @@ export class ClaudeAcpAgent {
       // `usage_update.size: 200000` until the first result's modelUsage corrects
       // it — but the cache means only the FIRST session to ever run a turn on such
       // a model eats that window, not every fresh session after a process
-      // restart (issue #596; a post-restart session/load is covered by the
-      // resumed report above).
+      // restart (issue #596).
       //
       // The inference fallback is deliberately keyed to the allowlisted entry: a
       // fallback-resolved sibling's resolvedModel/displayName/description can
       // describe a different context lane than the verbatim live id (e.g. an
       // "opus[1m]" row matched for a bare 200k id), so on the fallback path only
       // the id itself is a trustworthy window signal.
-      const seededWindow =
-        resumedContextWindow !== null
-          ? { size: resumedContextWindow, authoritative: true }
-          : immediateContextWindow(providerCacheKey, models.currentModelId, allowlistedModelInfo);
+      const seededWindow = immediateContextWindow(
+        providerCacheKey,
+        models.currentModelId,
+        allowlistedModelInfo,
+      );
 
       this.sessions[sessionId] = {
         query: q,
@@ -8205,6 +8395,7 @@ export class ClaudeAcpAgent {
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
       };
+      timing.phase("register");
 
       if (restoredModelSelection && sessionId !== creationOpts.resume) {
         await this.rememberModelSelection(sessionId, restoredModelSelection);
@@ -9242,17 +9433,6 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
-/** Read the model a resumed session is actually running (via the
- *  `getContextUsage` control request — the same source `/context` prints) and
- *  map it onto the picker, along with the report's authoritative context
- *  window (`rawMaxTokens`). Resumed sessions get this request serviced before
- *  any turn runs in the new process — unlike fresh sessions, where it stalls
- *  until the first prompt turn (issues #886/#880) — so the same response that
- *  restores the live model (issue #845) also seeds the window for free,
- *  covering post-restart reloads of models the text heuristic misses (issue
- *  #596). Best-effort: a control-request failure is logged and returns nulls
- *  so callers keep their current choice; failing the whole session/load over
- *  an unreadable report would be worse. */
 /** Whether a rejected `setModel` was vetoed by a user-configured
  *  PreModelSwitch hook. The CLI's rejection message is the stable,
  *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
@@ -9262,23 +9442,6 @@ function isPreModelSwitchHookBlock(error: unknown): boolean {
   return error instanceof Error && error.message.includes("blocked by a PreModelSwitch hook");
 }
 
-async function readResumedLiveModel(
-  query: Query,
-  models: ModelInfo[],
-  logger: Logger,
-): Promise<{ model: ModelInfo | null; contextWindow: number | null }> {
-  try {
-    const usage = await query.getContextUsage();
-    return {
-      model: usage.model ? matchResumedModel(models, usage.model) : null,
-      contextWindow: usage.rawMaxTokens > 0 ? usage.rawMaxTokens : null,
-    };
-  } catch (error) {
-    logger.error("Failed to read the resumed session's live model:", error);
-    return { model: null, contextWindow: null };
-  }
-}
-
 async function getAvailableModels(
   query: Query,
   models: ModelInfo[],
@@ -9286,18 +9449,14 @@ async function getAvailableModels(
   settingsManager: SettingsManager,
   logger: Logger,
   isResumedSession: boolean,
+  sessionId: string,
+  resumedModelHint?: string,
   startupModel?: string,
-): Promise<{ modelState: SessionModelState; resumedContextWindow: number | null }> {
+): Promise<SessionModelState> {
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
   let resolvedFromInput: string | undefined;
-  // The context window reported alongside a resumed session's live model.
-  // Only ever non-null on the paths where `currentModel` IS the live model
-  // (no override, or a failed override re-assert), so the window always
-  // describes the model the session actually runs.
-  let resumedContextWindow: number | null = null;
-
   // An explicit caller model or saved manual selection takes precedence over
   // environment/settings defaults. Without a saved selection, keep the legacy
   // fallback to configuration, then the live transcript model on resume.
@@ -9322,17 +9481,14 @@ async function getAvailableModels(
     }
   }
 
-  // A resumed session restores the model it was previously running (the CLI
-  // re-reads it from the transcript), so without an env/settings override the
-  // freshly-computed default above can disagree with what the session actually
-  // runs — session/load then reports a model the session isn't using (issue
-  // #845). Ask the CLI for the live model and reflect it. No `setModel` here:
-  // the SDK is already running this model, and pushing a picker alias back
-  // (e.g. "opus[1m]") could change the live model rather than describe it.
+  // A resumed session restores the model from its last real assistant
+  // transcript record. Use that same local record instead of getContextUsage:
+  // the latter is a control request to the live CLI process and can add tens
+  // of seconds to session/load before its first turn. No `setModel` here: the
+  // SDK is already running this model, and pushing a picker alias back (e.g.
+  // "opus[1m]") could change the live model rather than describe it.
   if (resolvedFromInput === undefined && isResumedSession) {
-    const live = await readResumedLiveModel(query, models, logger);
-    currentModel = live.model ?? currentModel;
-    resumedContextWindow = live.contextWindow;
+    currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : currentModel;
   }
 
   // Skip the setModel round-trip when we can prove the SDK has already landed
@@ -9353,9 +9509,16 @@ async function getAvailableModels(
     resolvedFromInput === undefined ||
     (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
+    const setModelStartedAt = performance.now();
     try {
       await query.setModel(currentModel.value);
+      logger.log(
+        `[session/models] sessionId=${sessionId} phase=set-model durationMs=${Math.round(performance.now() - setModelStartedAt)} model=${currentModel.value} outcome=success`,
+      );
     } catch (error) {
+      logger.log(
+        `[session/models] sessionId=${sessionId} phase=set-model durationMs=${Math.round(performance.now() - setModelStartedAt)} model=${currentModel.value} outcome=error`,
+      );
       // On a fresh session the pin is a defining option — fail loudly. A
       // resumed session already runs fine on the transcript's model, so
       // failing the whole session/load over the re-assert would be worse
@@ -9383,23 +9546,18 @@ async function getAvailableModels(
         currentModel = models[0];
       } else {
         logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        const live = await readResumedLiveModel(query, models, logger);
-        currentModel = live.model ?? currentModel;
-        resumedContextWindow = live.contextWindow;
+        currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : models[0];
       }
     }
   }
 
   return {
-    modelState: {
-      availableModels: models.map((model) => ({
-        modelId: model.value,
-        name: model.displayName,
-        description: model.description,
-      })),
-      currentModelId: currentModel.value,
-    },
-    resumedContextWindow,
+    availableModels: models.map((model) => ({
+      modelId: model.value,
+      name: model.displayName,
+      description: model.description,
+    })),
+    currentModelId: currentModel.value,
   };
 }
 
@@ -10526,28 +10684,11 @@ function commonPrefixLength(a: string, b: string) {
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
  *  ~1M). Such a miss falls back to the default window and is corrected by
  *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
- *  SDK's `getContextUsage` to close that gap: on a fresh session it is not
- *  serviced before the first prompt turn (issues #886/#880, see
- *  `contextWindowCache`; resumed sessions do get it, via
- *  `readResumedLiveModel`). */
+ *  SDK's `getContextUsage` to close that gap: before the first prompt turn it
+ *  can take tens of seconds (issues #886/#880, see `contextWindowCache`). */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
-}
-
-/** Fetch the SDK's authoritative context-window occupancy via the
- *  `getContextUsage` control request. Unlike the per-message API usage numbers
- *  (which only count message tokens), this `totalTokens` includes the system
- *  prompt, tool schemas, MCP tools, and memory-file overhead — the real
- *  occupancy the user sees. Returns `null` on any control-request failure. */
-async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<number | null> {
-  try {
-    const usage = await query.getContextUsage();
-    return usage.totalTokens;
-  } catch (error) {
-    logger.error("Failed to fetch context usage from SDK:", error);
-    return null;
-  }
 }
 
 /** Cross-session cache of authoritative context windows, keyed by
@@ -10570,9 +10711,6 @@ async function fetchContextUsedTokens(query: Query, logger: Logger): Promise<num
  *  has run the control request is not serviced (it stalls ~15s, and serializes
  *  ahead of an awaited `setModel` — issues #886/#880, regressed in 0.59.0), so
  *  it can neither beat the first `result` nor be issued cheaply before one.
- *  Resumed sessions are the exception — their report IS serviced pre-turn, and
- *  the session/load path seeds (but does not cache) the window from the same
- *  response that restores the live model, see `readResumedLiveModel`.
  *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
  *  windows learned under one login must not seed sessions under the next. */
 const contextWindowCache = new Map<string, number>();

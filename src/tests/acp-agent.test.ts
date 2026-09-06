@@ -49,17 +49,20 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  importSessionToStore,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { readFile } from "node:fs/promises";
 import {
   mockSessionState,
@@ -81,6 +84,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(),
     forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
+    importSessionToStore: vi.fn(actual.importSessionToStore),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
@@ -1846,6 +1850,383 @@ describe("stripLocalCommandMetadata", () => {
     expect(stripLocalCommandMetadata(null)).toBeNull();
     expect(stripLocalCommandMetadata(undefined)).toBeUndefined();
     expect(stripLocalCommandMetadata({ arbitrary: "object" })).toEqual({ arbitrary: "object" });
+  });
+});
+
+describe("usage Markdown", () => {
+  const usageResponse = {
+    session: {
+      total_cost_usd: 0.33,
+      total_api_duration_ms: 20_000,
+      total_duration_ms: 69_000,
+      total_lines_added: 0,
+      total_lines_removed: 0,
+      model_usage: {
+        "claude-opus-4-1": {
+          inputTokens: 4,
+          outputTokens: 872,
+          cacheReadInputTokens: 98_700,
+          cacheCreationInputTokens: 25_300,
+          webSearchRequests: 0,
+          costUSD: 0.33,
+          contextWindow: 200_000,
+          maxOutputTokens: 32_000,
+        },
+      },
+    },
+    subscription_type: "max",
+    rate_limits_available: true,
+    rate_limits: {
+      five_hour: { utilization: 3, resets_at: "2026-09-04T16:59:00.000Z" },
+      seven_day: { utilization: 0, resets_at: "2026-09-04T17:59:00.000Z" },
+      model_scoped: [{ display_name: "Fable", utilization: 0, resets_at: null }],
+    },
+    behaviors: {
+      day: {
+        request_count: 34,
+        session_count: 3,
+        behaviors: [],
+        agents: [],
+        skills: [],
+        plugins: [],
+        mcp_servers: [{ name: "ccd_session_mgmt", pct: 13 }],
+      },
+      week: {
+        request_count: 43,
+        session_count: 5,
+        behaviors: [],
+        agents: [],
+        skills: [],
+        plugins: [],
+        mcp_servers: [{ name: "claude_agent_acp", pct: 3 }],
+      },
+    },
+  } satisfies SDKControlGetUsageResponse;
+
+  it("keeps the expected experimental SDK response shape compile- and runtime-checked", () => {
+    expect(parseUsageResponse(usageResponse)).toEqual(usageResponse);
+    expect(
+      parseUsageResponse({ ...usageResponse, session: { total_cost_usd: "broken" } }),
+    ).toBeNull();
+    expect(
+      parseUsageResponse({
+        ...usageResponse,
+        session: {
+          ...usageResponse.session,
+          model_usage: {
+            "claude-opus-4-1": {
+              ...usageResponse.session.model_usage["claude-opus-4-1"],
+              costBasis: "a-future-value",
+            },
+          },
+        },
+        behaviors: {
+          ...usageResponse.behaviors,
+          day: {
+            ...usageResponse.behaviors.day,
+            behaviors: [{ key: "a-future-behavior", pct: 1, count: 1 }],
+          },
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  it("renders limits, session totals, and MCP contributions from structured data", () => {
+    const formatted = formatUsageResponse(usageResponse);
+    expect(formatted).toContain("## Usage");
+    expect(formatted).toContain("**5-hour limit** — **3%**");
+    expect(formatted).toContain("**Weekly · Fable** — **0%**");
+    expect(formatted).toContain("| $0.33 | 20s | 1m 9s |");
+    expect(formatted).toContain("| Cache read | 98.7K |");
+    expect(formatted).toContain("**Last 24h** · 34 requests · 3 sessions");
+    expect(formatted).toContain("| ccd\\_session\\_mgmt | `███░░░░░░░░░░░░░░░░░` 13% |");
+  });
+
+  it("escapes and limits MCP contribution rows", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      behaviors: {
+        ...usageResponse.behaviors,
+        day: {
+          ...usageResponse.behaviors.day,
+          mcp_servers: [
+            { name: "lowest", pct: 1 },
+            { name: "pipe|name", pct: 40 },
+            { name: "second", pct: 30 },
+            { name: "third", pct: 20 },
+          ],
+        },
+      },
+    });
+    expect(formatted).toContain("pipe\\|name");
+    expect(formatted).toContain("second");
+    expect(formatted).toContain("third");
+    expect(formatted).not.toContain("lowest");
+  });
+
+  it("recognizes only exact local usage commands", () => {
+    expect(isUsageCommandText(" /usage ")).toBe(true);
+    expect(isUsageCommandText("/cost")).toBe(false);
+    expect(isUsageCommandText("/stats")).toBe(false);
+    expect(isUsageCommandText("please review /usage")).toBe(false);
+    expect(isUsageCommandText("/usage now")).toBe(false);
+  });
+
+  it("omits the limits section when every utilization is unavailable", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      rate_limits: {
+        five_hour: { utilization: null, resets_at: null },
+        seven_day: { utilization: null, resets_at: null },
+        seven_day_opus: { utilization: null, resets_at: null },
+        seven_day_sonnet: { utilization: null, resets_at: null },
+      },
+    });
+    expect(formatted).not.toContain("### Limits");
+    expect(formatted).toContain("### This session");
+  });
+
+  it("replaces the exact SDK /usage turn output with structured Markdown", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let forwardedPrompt = "";
+    const raw = "Raw Claude Code usage output";
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        forwardedPrompt = user.value.message.content[0].text;
+        yield userEcho(user.value);
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "usage-command-result",
+            type: "message",
+            role: "assistant",
+            model: "<synthetic>",
+            content: [{ type: "text", text: raw }],
+            stop_reason: "stop_sequence",
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+    const getUsage = vi.fn(async () => usageResponse);
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/usage" }],
+    });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(response.stopReason).toBe("end_turn");
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(forwardedPrompt).toBe("/usage");
+    expect(text).toContain("## Usage");
+    expect(text).toContain("### This session");
+    expect(text).not.toContain(raw);
+  });
+
+  it("forwards a later diagnostic from the same local-command output lane", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Raw Claude Code usage output",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Raw Claude Code usage output",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Interrupted by user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      vi.fn(async () => usageResponse);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("\n");
+    expect(text).toContain("## Usage");
+    expect(text).toContain("Interrupted by user");
+    expect(text).not.toContain("Raw Claude Code usage output");
+  });
+
+  it("does not append usage Markdown to a model-generated /usage result", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield successfulResultMessage({
+          result: "A custom command's model answer",
+          usage: {
+            input_tokens: 1,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+      }
+      return messages();
+    });
+    const getUsage = vi.fn(async () => usageResponse);
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      getUsage;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(getUsage).toHaveBeenCalledOnce();
+    expect(text).not.toContain("## Usage");
+  });
+
+  it.each([
+    ["the response is invalid", vi.fn(async () => ({ broken: true }))],
+    ["the request rejects", vi.fn(async () => Promise.reject(new Error("unsupported")))],
+    ["the runtime method is missing", undefined],
+  ])("runs the original command and preserves its raw output when %s", async (_case, getUsage) => {
+    const raw = "Original Claude Code usage output";
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let forwardedPrompt = "";
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        forwardedPrompt = user.value.message.content[0].text;
+        yield userEcho(user.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: raw,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+      }
+      return messages();
+    });
+    (
+      agent.sessions["test-session"].query as unknown as {
+        usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET?: typeof getUsage;
+      }
+    ).usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET = getUsage;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/usage" }] });
+
+    const text = updates
+      .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
+      .map((update) => (update.update as any).content.text)
+      .join("");
+    expect(forwardedPrompt).toBe("/usage");
+    expect(text).toBe(raw);
+  });
+
+  it("cancels a turn while structured usage is pending without publishing fallback output", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const user = await input[Symbol.asyncIterator]().next();
+        yield userEcho(user.value);
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "raw output after cancellation",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messages();
+    });
+    let usageStarted!: () => void;
+    const started = new Promise<void>((resolve) => (usageStarted = resolve));
+    agent.sessions["test-session"].query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET =
+      vi.fn(
+        () =>
+          new Promise<SDKControlGetUsageResponse>(() => {
+            usageStarted();
+          }),
+      );
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/usage" }],
+    });
+    await started;
+    await agent.cancel({ sessionId: "test-session" });
+
+    await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(updates).not.toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({ sessionUpdate: "agent_message_chunk" }),
+      }),
+    );
   });
 });
 
@@ -8028,6 +8409,12 @@ describe("logout", () => {
 });
 
 describe("session/fork", () => {
+  beforeEach(() => {
+    vi.mocked(forkSession).mockClear();
+    vi.mocked(getSessionMessages).mockClear();
+    vi.mocked(importSessionToStore).mockClear();
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
@@ -8048,6 +8435,18 @@ describe("session/fork", () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "assistant-thinking-uuid",
+        session_id: "source-id",
+        message: {
+          id: "msg_123",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden" }],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
       {
         type: "assistant",
         uuid: "assistant-uuid",
@@ -8071,9 +8470,140 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
       dir: "/workspace",
       upToMessageId: "assistant-uuid",
+    });
+  });
+
+  it.each([
+    {
+      resolution: "its ACP message id",
+      messageId: "persisted-message-id:segment:0",
+      messageOccurrence: 1,
+    },
+    {
+      resolution: "its fingerprint occurrence",
+      messageId: "stale-air-message-id:segment:0",
+      messageOccurrence: 2,
+    },
+  ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const targetText = "Answer from the branch that is no longer active.";
+    const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "assistant",
+        uuid: "active-assistant-uuid",
+        session_id: "source-id",
+        message: { id: "active-message-id", role: "assistant", content: [] },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ]);
+    vi.mocked(importSessionToStore).mockImplementationOnce(async (_sessionId, store) => {
+      await store.append({ projectKey: "-workspace", sessionId: "source-id" }, [
+        {
+          type: "assistant",
+          uuid: "earlier-duplicate-uuid",
+          parentUuid: "earlier-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "earlier-duplicate-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "user",
+          uuid: "inactive-user-uuid",
+          parentUuid: "earlier-duplicate-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: { role: "user", content: "regenerate" },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-thinking-uuid",
+          parentUuid: "inactive-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "thinking", thinking: "Hidden reasoning" }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "inactive-assistant-uuid",
+          parentUuid: "inactive-thinking-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "nested-assistant-uuid",
+          parentUuid: "nested-user-uuid",
+          isSidechain: true,
+          sessionId: "source-id",
+          message: {
+            id: "persisted-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: targetText }],
+          },
+        },
+        {
+          type: "assistant",
+          uuid: "active-assistant-uuid",
+          parentUuid: "active-user-uuid",
+          isSidechain: false,
+          sessionId: "source-id",
+          message: {
+            id: "active-message-id",
+            role: "assistant",
+            content: [{ type: "text", text: "Answer from the active branch." }],
+          },
+        },
+      ]);
+    });
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      additionalDirectories: [],
+      mcpServers: [],
+      _meta: {
+        jetbrains: {
+          air: {
+            fork: {
+              version: 1,
+              messageId: forkPoint.messageId,
+              messageFingerprint: targetFingerprint,
+              messageOccurrence: forkPoint.messageOccurrence,
+            },
+          },
+        },
+      },
+    });
+
+    expect(response.sessionId).toBe("fork-id");
+    expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
+      dir: "/workspace",
+      includeSubagents: false,
+    });
+    expect(forkSession).toHaveBeenLastCalledWith("source-id", {
+      dir: "/workspace",
+      upToMessageId: "inactive-assistant-uuid",
     });
   });
 });
@@ -9407,7 +9937,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.size).toBe(1000000);
   });
 
-  it("compact_boundary uses authoritative getContextUsage for used, keeps session window for size", async () => {
+  it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
@@ -9431,18 +9961,18 @@ describe("usage_update computation", () => {
     // compaction — compaction frees occupancy, it doesn't change the window,
     // so the handler must not overwrite it from this response.
     session.contextWindowSize = 1000000;
-    (session.query as any).getContextUsage = vi
-      .fn()
-      .mockResolvedValue({ totalTokens: 12345, rawMaxTokens: 200000 });
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdate).toBeDefined();
     expect(usageUpdate.update.used).toBe(12345);
-    // size stays at the session's learned window, NOT getContextUsage's value.
+    // size stays at the session's learned window; compaction changes occupancy only.
     expect(usageUpdate.update.size).toBe(1000000);
     expect(session.contextWindowSize).toBe(1000000);
+    expect(getContextUsage).not.toHaveBeenCalled();
     expect(updates.map((notification) => notification.update)).toContainEqual({
       sessionUpdate: "tool_call",
       toolCallId: "compact-boundary",
@@ -9468,7 +9998,7 @@ describe("usage_update computation", () => {
     });
   });
 
-  it("compact_boundary falls back to used:0 when getContextUsage fails", async () => {
+  it("compact_boundary falls back to used:0 when post_tokens is unavailable", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // No trailing idle — see the sibling test above (issue #825).
     injectSession(agent, [
@@ -9476,7 +10006,8 @@ describe("usage_update computation", () => {
     ]);
     const session = agent.sessions["test-session"];
     session.contextWindowSize = 200000;
-    (session.query as any).getContextUsage = vi.fn().mockRejectedValue(new Error("boom"));
+    const getContextUsage = vi.fn(() => new Promise<never>(() => {}));
+    (session.query as any).getContextUsage = getContextUsage;
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
@@ -9485,6 +10016,7 @@ describe("usage_update computation", () => {
     expect(usageUpdate.update.used).toBe(0);
     expect(usageUpdate.update.size).toBe(200000);
     expect(session.contextWindowSize).toBe(200000);
+    expect(getContextUsage).not.toHaveBeenCalled();
   });
 
   it("caches the turn's authoritative window under the resolved id and serves it on a later switch, with no getContextUsage IPC", async () => {

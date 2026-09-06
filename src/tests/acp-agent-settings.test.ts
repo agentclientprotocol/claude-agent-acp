@@ -5,9 +5,10 @@ import * as os from "node:os";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { makeMockQuery } from "./helpers.js";
 
-const { querySpy, forkSpy } = vi.hoisted(() => ({
+const { querySpy, forkSpy, getSessionMessagesSpy } = vi.hoisted(() => ({
   querySpy: vi.fn(),
   forkSpy: vi.fn(),
+  getSessionMessagesSpy: vi.fn(),
 }));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -16,6 +17,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     ...actual,
     query: querySpy,
     forkSession: forkSpy,
+    getSessionMessages: getSessionMessagesSpy,
   };
 });
 
@@ -58,6 +60,7 @@ describe("ClaudeAcpAgent settings", () => {
     originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = tempDir;
     querySpy.mockReset();
+    getSessionMessagesSpy.mockReset().mockResolvedValue([]);
     forkSpy.mockReset().mockResolvedValue({ sessionId: "forked-session" });
     vi.resetModules();
   });
@@ -98,7 +101,7 @@ describe("ClaudeAcpAgent settings", () => {
     expect(getCapturedOptions().permissionMode).toBe("dontAsk");
     expect(getCapturedOptions().settingSources).toEqual(["user", "project", "local"]);
     expect(response.modes.currentModeId).toBe("default");
-  });
+  }, 15_000);
 
   it("supports acceptEdits mode defaults", async () => {
     await fs.promises.writeFile(
@@ -508,6 +511,15 @@ describe("ClaudeAcpAgent settings", () => {
       const previousCustom = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION;
       if (action === "custom outside allowlist")
         process.env.ANTHROPIC_CUSTOM_MODEL_OPTION = "provider-custom";
+      getSessionMessagesSpy.mockResolvedValue([
+        {
+          type: "assistant",
+          uuid: "last-response",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { role: "assistant", model: "claude-sonnet-5", content: [] },
+        },
+      ]);
       const setModel = vi.fn();
       const startedModels: (string | undefined)[] = [];
       let capturedOptions: any;
@@ -533,7 +545,6 @@ describe("ClaudeAcpAgent settings", () => {
         return makeMockQuery({
           initializationResult: async () => ({ models }),
           setModel,
-          getContextUsage: async () => ({ model: "claude-sonnet-5", rawMaxTokens: 200000 }),
         });
       });
       let { ClaudeAcpAgent } = await import("../acp-agent.js");

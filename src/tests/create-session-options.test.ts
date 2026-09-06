@@ -5,7 +5,7 @@ import {
   SessionNotification,
 } from "@agentclientprotocol/sdk";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13,6 +13,8 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let sessionMessages: Record<string, unknown>[];
+let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
@@ -48,6 +50,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
     },
+    getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
 
@@ -75,6 +78,9 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    sessionMessages = [];
+    sessionMessagesResult = async () => sessionMessages;
+    vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
@@ -769,25 +775,106 @@ describe("createSession options merging", () => {
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("session/load seeds the window from the resumed session's getContextUsage report", async () => {
-      // Resumed sessions get getContextUsage serviced pre-turn (issue #845 uses
-      // it to restore the live model), and the same response carries the
-      // authoritative window (`rawMaxTokens`). After a process restart the
-      // module cache is empty and text inference misses natively-1M aliases, so
-      // discarding this in-hand value would replay the issue-#596 flicker on
-      // every reload — the flagship scenario. 888_000 can only come from the
-      // report: inference on the mock model yields null → 200_000 default.
-      contextUsageResult = async () => ({ rawMaxTokens: 888_000, model: "claude-sonnet-4-6" });
+    it("session/load restores the transcript model without waiting for getContextUsage", async () => {
+      // getContextUsage is a live CLI control request. On a real, large resumed
+      // session it can take tens of seconds before returning, so it must stay
+      // off the load critical path. Claude restores from this same last
+      // assistant model field, which is available through a local transcript
+      // read in milliseconds.
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
+      contextUsageResult = ctxSpy;
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "resumed-model-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
 
-      await (
-        agent as unknown as {
-          createSession: (params: object, opts: { resume?: string }) => Promise<unknown>;
-        }
-      ).createSession({ cwd: process.cwd(), mcpServers: [] }, { resume: "resumed-window-probe" });
+      const response = await agent.loadSession({
+        sessionId: "resumed-model-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
 
-      const session = sessionFor("resumed-window-probe");
-      expect(session.contextWindowSize).toBe(888_000);
-      expect(session.contextWindowAuthoritative).toBe(true);
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
+      expect(getSessionMessages).toHaveBeenCalledTimes(1);
+      expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
+    });
+
+    it("resume remains best-effort when the transcript hint cannot be read", async () => {
+      sessionMessagesResult = async () => {
+        throw new Error("unreadable transcript");
+      };
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "unreadable-resume-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        }),
+      ).resolves.toMatchObject({ sessionId: "unreadable-resume-probe" });
+    });
+
+    it("restores the transcript model for direct session/new resume metadata", async () => {
+      initModels = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "Default model",
+          resolvedModel: "claude-sonnet-4-6",
+        },
+        {
+          value: "haiku",
+          displayName: "Haiku",
+          description: "Fast",
+          resolvedModel: "claude-haiku-4-5",
+        },
+      ];
+      sessionMessages = [
+        {
+          type: "assistant",
+          uuid: "assistant-uuid",
+          session_id: "direct-resume-probe",
+          parent_tool_use_id: null,
+          parent_agent_id: null,
+          message: { model: "claude-haiku-4-5", role: "assistant", content: [] },
+        },
+      ];
+
+      const response = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { resume: "direct-resume-probe" } } },
+      });
+
+      expect(response.sessionId).toBe("direct-resume-probe");
+      expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
+        "haiku",
+      );
+      expect(getSessionMessages).toHaveBeenCalledOnce();
+      expect(getSessionMessages).toHaveBeenCalledWith("direct-resume-probe");
     });
 
     it("scopes providerCacheKey by per-session env routing", async () => {
