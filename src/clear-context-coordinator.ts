@@ -24,6 +24,7 @@ export type ClearContextTurn = {
   settled: boolean;
   promptUuid: string;
   carriedUsage?: Usage;
+  carriedModelUsage?: Record<string, Usage>;
 };
 
 /** The session state needed to replace Claude's private conversation without
@@ -33,6 +34,7 @@ export type ClearContextSession<Turn extends ClearContextTurn = ClearContextTurn
   cwd: string;
   creationParams?: NewSessionRequest;
   accumulatedUsage: Usage;
+  accumulatedModelUsage?: Record<string, Usage>;
   models: { currentModelId: string };
   configOptions: SessionConfigOption[];
   currentAgent: string;
@@ -135,6 +137,7 @@ export async function continuePlanInFreshContext<
   // Do not consume the reset or mutate the turn until a replacement exists.
   // A failed restart must remain distinguishable from a lost query transport.
   turn.carriedUsage = { ...oldSession.accumulatedUsage };
+  turn.carriedModelUsage = { ...oldSession.accumulatedModelUsage };
   oldSession.pendingExitPlanContextReset = undefined;
   if (oldSession.fastModeEnabled !== freshSession.fastModeEnabled) {
     try {

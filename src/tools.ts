@@ -30,6 +30,7 @@ import {
   WebSearchOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import {
+  DocumentBlockParam,
   ImageBlockParam,
   TextBlockParam,
   ToolResultBlockParam,
@@ -69,6 +70,7 @@ import path from "node:path";
  */
 type ToolResultContent =
   | TextBlockParam
+  | DocumentBlockParam
   | ImageBlockParam
   | BetaImageBlockParam
   | BetaToolReferenceBlock
@@ -574,6 +576,50 @@ function stripAgentTrailerFromContent(content: unknown): unknown {
   return content;
 }
 
+/** Leading model-directed note the CLI prepends to a subagent's report when
+ *  the agent stopped at its maxTurns limit (CLI 2.1.246+); the result still
+ *  ships as `status: "completed"`. Two body variants follow this prefix, and
+ *  the trailing "Send the agent a message (SendMessage) …" sentence is
+ *  omitted for some agent types — anchor only the stable prefix so a format
+ *  change makes the replacement stop matching rather than mangle a report. */
+const PARTIAL_OUTPUT_NOTE = /^NOTE: this agent stopped at its \d+-turn limit before finishing\./;
+
+/** Client-facing replacement: the partial-output fact matters to the user,
+ *  but the SendMessage continuation instruction is model-directed and
+ *  meaningless over ACP. */
+const PARTIAL_OUTPUT_LABEL = "[Agent stopped at its turn limit — the output below is partial]";
+
+/** Replace a leading partial-output note paragraph with the concise
+ *  client-facing label, leaving the report that follows intact. */
+function replacePartialNoteInText(text: string): string {
+  if (!PARTIAL_OUTPUT_NOTE.test(text)) return text;
+  const paragraphEnd = text.indexOf("\n\n");
+  const report = paragraphEnd === -1 ? "" : text.slice(paragraphEnd + 2).trimStart();
+  return report ? `${PARTIAL_OUTPUT_LABEL}\n\n${report}` : PARTIAL_OUTPUT_LABEL;
+}
+
+/** Apply {@link replacePartialNoteInText} to an Agent/Task result `content`.
+ *  In the structured AgentOutput lane the note is its own leading text block;
+ *  in the raw lane it is the first paragraph of the text — both reduce to
+ *  transforming the first text block (or the plain string). */
+function replacePartialOutputNote(content: unknown): unknown {
+  if (typeof content === "string") {
+    return replacePartialNoteInText(content);
+  }
+  if (Array.isArray(content) && content.length > 0) {
+    const [first, ...rest] = content;
+    if (
+      first !== null &&
+      typeof first === "object" &&
+      first.type === "text" &&
+      typeof first.text === "string"
+    ) {
+      return [{ ...first, text: replacePartialNoteInText(first.text) }, ...rest];
+    }
+  }
+  return content;
+}
+
 export function toolUpdateFromToolResult(
   toolResult:
     | ToolResultBlockParam
@@ -847,7 +893,10 @@ export function toolUpdateFromToolResult(
         structured.content.length > 0
       ) {
         return toAcpContentUpdate(
-          structured.content,
+          // A maxTurns-stopped subagent still completes, with a model-directed
+          // partial-output note prepended to its report — swap it for a
+          // client-facing label (see PARTIAL_OUTPUT_NOTE).
+          replacePartialOutputNote(structured.content),
           "is_error" in toolResult ? toolResult.is_error : false,
         );
       }
@@ -859,7 +908,9 @@ export function toolUpdateFromToolResult(
       // format changes it simply stops matching and the full raw text
       // renders, no worse than before.
       return toAcpContentUpdate(
-        stripAgentTrailerFromContent(toolResult.content),
+        // Head and tail cleanups are independent: the partial-output note
+        // leads the raw text the same way it leads the structured content.
+        replacePartialOutputNote(stripAgentTrailerFromContent(toolResult.content)),
         "is_error" in toolResult ? toolResult.is_error : false,
       );
     }
@@ -925,6 +976,14 @@ function formatWebSearchHit(hit: { title: string; url: string }): string {
   return `${hit.title} (${hit.url})`;
 }
 
+/** Human-readable size for the document placeholder ("312 B", "2.4 KB",
+ *  "1.3 MB"). */
+function formatByteSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function toAcpContentUpdate(
   content: any,
   isError: boolean = false,
@@ -988,6 +1047,33 @@ function toAcpContentBlock(content: ToolResultContent, isError: boolean): Conten
           : "[image: file reference]",
       );
 
+    case "document": {
+      // A PDF Read delivers its raw `document` block inside the tool_result
+      // content (SDK 0.3.243 moved it here from a separate follow-up user
+      // message; the MultiRead documents lane always lived here). ACP has no
+      // document block and the base64 payload can be megabytes — render a
+      // compact placeholder, never the data, matching the CLI's own compact
+      // "Read PDF (size)" rendering.
+      const title =
+        typeof content.title === "string" && content.title.length > 0 ? ` "${content.title}"` : "";
+      const source = content.source;
+      switch (source.type) {
+        case "url":
+          return wrapText(`[document${title}: ${source.url}]`);
+        case "base64":
+        case "text":
+          // base64 inflates the byte count by 4/3; plain text is 1:1.
+          return wrapText(
+            `[document${title}: ${source.media_type}, ${formatByteSize(
+              source.type === "base64"
+                ? Math.floor((source.data.length * 3) / 4)
+                : source.data.length,
+            )}]`,
+          );
+        default:
+          return wrapText(`[document${title}]`);
+      }
+    }
     case "tool_reference":
       return wrapText(`Tool: ${content.tool_name}`);
     case "tool_search_tool_search_result":
@@ -1286,6 +1372,14 @@ interface DiffToolResponseHunk {
 interface DiffToolResponse {
   filePath?: string;
   structuredPatch?: DiffToolResponseHunk[];
+  /** FileWriteOutput only (FileEditOutput carries no `type`): whether the
+   *  write created the file or overwrote an existing one. */
+  type?: "create" | "update";
+  /** FileWriteOutput only: the content that was written. */
+  content?: string;
+  /** FileWriteOutput only: the pre-write content — null on create, or on an
+   *  update whose previous content was too large to include. */
+  originalFile?: string | null;
 }
 
 /**
@@ -1330,22 +1424,55 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
     }
   }
 
+  // A Write `update` can arrive with an empty structuredPatch — nothing
+  // changed, the diff timed out, or the previous content was too large to
+  // diff (originalFile null; SDK 0.3.252 documents the lane). Returning `{}`
+  // would leave Write's optimistic tool_use-time content standing, and that
+  // was built with `oldText: null` — "creation" semantics — so an overwrite
+  // of a large existing file would render as creating it. Emit a truthful
+  // replacement instead. Gated on `type` so Edit (whose output carries no
+  // `type` and whose optimistic old/new diff is already truthful) keeps the
+  // empty-return behavior.
+  if (content.length === 0 && response.type === "update" && typeof response.content === "string") {
+    locations.push({ path: response.filePath });
+    content.push(
+      typeof response.originalFile === "string"
+        ? {
+            type: "diff",
+            path: response.filePath,
+            oldText: response.originalFile,
+            newText: response.content,
+          }
+        : {
+            type: "content",
+            content: {
+              type: "text",
+              text: `Updated \`${response.filePath}\` (previous content too large to diff)`,
+            },
+          },
+    );
+  }
+
   const result: { content?: ToolCallContent[]; locations?: ToolCallLocation[] } = {};
   if (content.length > 0) result.content = content;
   if (locations.length > 0) result.locations = locations;
   return result;
 }
 
-/* A global variable to store callbacks that should be executed when receiving hooks from Claude Code */
-const toolUseCallbacks: {
-  [toolUseId: string]: {
+/* Callbacks are keyed globally because the SDK hook is process-wide, but each
+ * entry retains its owning ACP session so cancellation/teardown can release it. */
+const toolUseCallbacks = new Map<
+  string,
+  {
+    ownerId?: string;
+    cleanupTimer?: ReturnType<typeof setTimeout>;
     onPostToolUseHook?: (
       toolUseID: string,
       toolInput: unknown,
       toolResponse: unknown,
     ) => Promise<void>;
-  };
-} = {};
+  }
+>();
 
 /* Setup callbacks that will be called when receiving hooks from Claude Code */
 export const registerHookCallback = (
@@ -1359,11 +1486,35 @@ export const registerHookCallback = (
       toolResponse: unknown,
     ) => Promise<void>;
   },
+  ownerId?: string,
 ) => {
-  toolUseCallbacks[toolUseID] = {
+  unregisterHookCallback(toolUseID);
+  toolUseCallbacks.set(toolUseID, {
+    ownerId,
     onPostToolUseHook,
-  };
+  });
 };
+
+export function unregisterHookCallback(toolUseID: string): void {
+  const callback = toolUseCallbacks.get(toolUseID);
+  if (callback?.cleanupTimer) clearTimeout(callback.cleanupTimer);
+  toolUseCallbacks.delete(toolUseID);
+}
+
+/** PostToolUse normally follows tool_result, so keep the callback for a short
+ * grace period while still bounding retention when the hook never arrives. */
+export function completeHookCallback(toolUseID: string): void {
+  const callback = toolUseCallbacks.get(toolUseID);
+  if (!callback || callback.cleanupTimer) return;
+  callback.cleanupTimer = setTimeout(() => unregisterHookCallback(toolUseID), 30_000);
+  callback.cleanupTimer.unref?.();
+}
+
+export function clearHookCallbacks(ownerId: string): void {
+  for (const [toolUseID, callback] of toolUseCallbacks) {
+    if (callback.ownerId === ownerId) unregisterHookCallback(toolUseID);
+  }
+}
 
 /* A callback for Claude Code that is called when receiving a PostToolUse hook */
 export const createPostToolUseHook =
@@ -1376,11 +1527,14 @@ export const createPostToolUseHook =
       }
 
       if (toolUseID) {
-        const onPostToolUseHook = toolUseCallbacks[toolUseID]?.onPostToolUseHook;
-        if (onPostToolUseHook) {
-          await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
+        const onPostToolUseHook = toolUseCallbacks.get(toolUseID)?.onPostToolUseHook;
+        try {
+          if (onPostToolUseHook) {
+            await onPostToolUseHook(toolUseID, input.tool_input, input.tool_response);
+          }
+        } finally {
+          unregisterHookCallback(toolUseID);
         }
-        delete toolUseCallbacks[toolUseID]; // Cleanup after execution
       }
     }
     return { continue: true };

@@ -110,7 +110,7 @@ describe("session config options", () => {
       input: null,
       cancelled: false,
       permissionMode: "default",
-      settingsManager: {},
+      settingsManager: { getSettings: () => ({}) },
       modes: structuredClone(MOCK_MODES),
       models: structuredClone(MOCK_MODELS),
       modelInfos: MOCK_MODELS.availableModels.map((m): ModelInfo => ({
@@ -419,14 +419,18 @@ describe("session config options", () => {
 
       const effortOption = response.configOptions.find((o) => o.id === "effort");
       expect(effortOption).toBeUndefined();
-      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      // Nothing was pinned at the flag layer (effort was "default"), so there
+      // is nothing to clear — the CLI resolves its own effort for the new model.
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
 
     it("clamps effort in returned configOptions when new model has different supported levels", async () => {
-      // Set current effort to "max" which the new model won't support
+      // Set current effort to "max" which the new model won't support —
+      // pinned, as a user's ACP picker choice would be.
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
       if (effortOpt) effortOpt.currentValue = "max";
+      session.effortPinnedByUser = true;
 
       session.modelInfos = [
         {
@@ -458,10 +462,12 @@ describe("session config options", () => {
     });
 
     it("preserves effort in returned configOptions when new model supports same level", async () => {
-      // Set effort to "low" first
+      // Set effort to "low" first — pinned, as a user's ACP picker choice
+      // would be (an unpinned value re-seeds from settings on a switch).
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
       if (effortOpt) effortOpt.currentValue = "low";
+      session.effortPinnedByUser = true;
 
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
@@ -630,7 +636,7 @@ describe("session config options", () => {
       expect(effortOption).toBeUndefined();
     });
 
-    it("clears effort via applyFlagSettings when switching to a model without effort", async () => {
+    it("clears a pinned effort via applyFlagSettings when switching to a model without effort", async () => {
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
       session.modelInfos = [
         {
@@ -648,6 +654,14 @@ describe("session config options", () => {
         },
       ];
 
+      // Pin an effort the way a user would, then switch to a model that
+      // cannot serve it: the flag layer must be cleared alongside, or the
+      // SDK would keep running the old pin invisibly.
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "high",
+      });
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
@@ -655,6 +669,8 @@ describe("session config options", () => {
       });
 
       expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ effortLevel: null });
+      // The clamp un-pins: a later switch back re-seeds from settings.
+      expect(session.effortPinnedByUser).toBe(false);
     });
 
     it("adds effort option when switching to a model that supports effort", async () => {
@@ -693,9 +709,11 @@ describe("session config options", () => {
 
     it("clamps effort to valid value when new model has different supported levels", async () => {
       const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
-      // Set current effort to "max" (not supported by sonnet in our mock)
+      // Set current effort to "max" (not supported by sonnet in our mock) —
+      // pinned, as a user's ACP picker choice would be.
       const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
       if (effortOpt) effortOpt.currentValue = "max";
+      session.effortPinnedByUser = true;
 
       session.modelInfos = [
         {
@@ -747,6 +765,48 @@ describe("session config options", () => {
       expect(effortOption?.currentValue).toBe("low");
       // applyFlagSettings was called once for the effort change, but not again for the model switch
       expect(applyFlagSettingsSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("seeds effort from the new model's persisted modelSettings entry on an unpinned switch", async () => {
+      // The CLI persists /effort per model (settings.modelSettings); with no
+      // user pin this session, the picker should show what the CLI will
+      // actually run on the new model, not drag the old model's value along.
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.settingsManager = {
+        getSettings: () => ({
+          effortLevel: "high",
+          modelSettings: { "claude-sonnet-4-6": { effortLevel: "low" } },
+        }),
+      };
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("low");
+      // Display-only: the CLI resolves persisted effort itself; pinning it at
+      // the flag layer would shadow the per-model values on later switches.
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
+    });
+
+    it("falls back to the top-level settings effort when the new model has no per-model entry", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      session.settingsManager = {
+        getSettings: () => ({ effortLevel: "medium" }),
+      };
+
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-sonnet-4-6",
+      });
+
+      const effortOption = response.configOptions.find((o) => o.id === "effort");
+      expect(effortOption?.currentValue).toBe("medium");
+      expect(applyFlagSettingsSpy).not.toHaveBeenCalled();
     });
   });
 
