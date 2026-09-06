@@ -15851,6 +15851,37 @@ describe("turn steering (_session/steering)", () => {
     await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
   });
 
+  it("does not reuse the interrupted result after the steered echo", async () => {
+    const agent = createMockAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        // The stream turns idle and closes without a result for the steered cycle.
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    turn.catch(() => {});
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await expect(turn).rejects.toThrow(/ended without a result/);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
   it("maps the correlated ExitPlanMode interrupt diagnostic to cancellation", async () => {
     const updates: any[] = [];
     const agent = new ClaudeAcpAgent(
