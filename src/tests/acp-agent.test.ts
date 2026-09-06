@@ -10523,6 +10523,33 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
+  function localCommandOutput(content: string) {
+    return {
+      type: "system" as const,
+      subtype: "local_command_output" as const,
+      content,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    };
+  }
+
+  // Local-only commands do not replay a user echo. Consume each pushed prompt
+  // before yielding its scripted SDK messages so tests preserve that ordering.
+  function injectLocalOnlyTurns(agent: ClaudeAcpAgent, turns: any[][]) {
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      for (const messages of turns) {
+        await iter.next();
+        yield* messages;
+      }
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+  }
+
   function messageChunkTexts(updates: any[]): string[] {
     return updates
       .filter((u) => u.update?.sessionUpdate === "agent_message_chunk")
@@ -10534,6 +10561,69 @@ describe("assembled assistant text fallback", () => {
       .filter((u) => u.update?.sessionUpdate === "agent_thought_chunk")
       .map((u) => u.update.content.text);
   }
+
+  it("does not re-emit local-only command output already delivered by local_command_output", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [localCommandOutput("Context Usage"), { ...result(), result: "Context Usage" }, idle],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
+  it("dedupes a local-only command assistant message repeated by result with trailing line breaks", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [
+        assistantMessage("msg-context", [{ type: "text", text: "Context Usage" }]),
+        { ...result(), result: "Context Usage\n\n" },
+        idle,
+      ],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
+  it("forwards a local-only command result when local_command_output is absent", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [[{ ...result(), result: "Context Usage" }, idle]]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage"]);
+  });
+
+  it("preserves distinct local-only command output after an assistant message", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [
+        assistantMessage("msg-context", [{ type: "text", text: "Preparing context" }]),
+        { ...result(), result: "Context Usage" },
+        idle,
+      ],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Preparing context", "Context Usage"]);
+  });
+
+  it("does not suppress identical local-command output in a later turn", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectLocalOnlyTurns(agent, [
+      [localCommandOutput("Context Usage"), { ...result(), result: "Context Usage" }, idle],
+      [localCommandOutput("Context Usage"), { ...result(), result: "Context Usage" }, idle],
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/context" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["Context Usage", "Context Usage"]);
+  });
 
   it("emits the assembled text when no content_block_delta was streamed", async () => {
     const { agent, updates } = createMockAgentWithCapture();
