@@ -5,7 +5,7 @@ import {
   ToolCallLocation,
   ToolKind,
 } from "@agentclientprotocol/sdk";
-import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
+import { HookCallback, SDKMcpResourceLink } from "@anthropic-ai/claude-agent-sdk";
 import {
   AgentInput,
   AgentOutput,
@@ -87,7 +87,15 @@ type ToolResultContent =
   | BetaTextEditorCodeExecutionViewResultBlock
   | BetaTextEditorCodeExecutionCreateResultBlock
   | BetaTextEditorCodeExecutionStrReplaceResultBlock
-  | BetaTextEditorCodeExecutionToolResultError;
+  | BetaTextEditorCodeExecutionToolResultError
+  | RestoredResourceLink;
+
+/**
+ * A `resource_link` an MCP tool returned, put back in place of the text line
+ * the CLI rewrote it into (see restoreResourceLinks). Never arrives in a
+ * tool_result's content from the SDK itself.
+ */
+type RestoredResourceLink = { type: "resource_link" } & SDKMcpResourceLink;
 
 interface ToolInfo {
   title: string;
@@ -964,9 +972,71 @@ export function toolUpdateFromToolResult(
     }
 
     default: {
+      // An MCP tool's `resource_link` result blocks never reach the
+      // tool_result: the CLI rewrites each into a `[Resource link: NAME] URI`
+      // text line for the model and keeps the originals on the message-level
+      // `tool_use_result.resourceLinks` (CLI 2.1.2xx). Put them back so a
+      // client renders the resource instead of parsing the line. Absent
+      // (older CLIs, replayed sessions), the raw text renders as before.
+      const links = mcpResourceLinks(
+        structuredResult<{ resourceLinks?: unknown }>(toolUseResult)?.resourceLinks,
+      );
+      if (links.length > 0) {
+        return toAcpContentUpdate(
+          restoreResourceLinks(toolResult.content, links),
+          "is_error" in toolResult ? toolResult.is_error : false,
+        );
+      }
       return rawContentUpdate();
     }
   }
+}
+
+/** The CLI-owned raw links of an MCP tool result, guarded field by field:
+ *  the value is untyped on the wire. Anything without a string uri and name
+ *  is dropped rather than rendered half-formed. */
+function mcpResourceLinks(value: unknown): SDKMcpResourceLink[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(
+    (link): link is SDKMcpResourceLink =>
+      typeof link === "object" &&
+      link !== null &&
+      typeof (link as SDKMcpResourceLink).uri === "string" &&
+      typeof (link as SDKMcpResourceLink).name === "string",
+  );
+}
+
+/** Rebuild an MCP tool result's content with its links restored: each text
+ *  line the CLI made from a link (`[Resource link: NAME] URI`, optionally
+ *  followed by the description) becomes that link again, in place, and any
+ *  link whose line is not found is appended — so a changed line format
+ *  degrades to the link AND its text, never to neither. */
+function restoreResourceLinks(content: unknown, links: SDKMcpResourceLink[]): unknown[] {
+  const blocks: unknown[] = Array.isArray(content)
+    ? content
+    : typeof content === "string" && content.length > 0
+      ? [{ type: "text", text: content }]
+      : typeof content === "object" && content !== null
+        ? [content]
+        : [];
+  const pending = [...links];
+  const restored = blocks.map((block) => {
+    const text =
+      typeof block === "object" &&
+      block !== null &&
+      (block as { type?: unknown }).type === "text" &&
+      typeof (block as { text?: unknown }).text === "string"
+        ? (block as { text: string }).text
+        : undefined;
+    if (text === undefined) return block;
+    const i = pending.findIndex((link) =>
+      text.startsWith(`[Resource link: ${link.name}] ${link.uri}`),
+    );
+    if (i < 0) return block;
+    const [link] = pending.splice(i, 1);
+    return { type: "resource_link", ...link } satisfies RestoredResourceLink;
+  });
+  return [...restored, ...pending.map((link) => ({ type: "resource_link", ...link }))];
 }
 
 /** One display format for a web-search hit, shared by the structured
@@ -1031,6 +1101,16 @@ function toAcpContentBlock(content: ToolResultContent, isError: boolean): Conten
       return {
         type: "text" as const,
         text: isError ? `\`\`\`\n${content.text}\n\`\`\`` : content.text,
+      };
+    case "resource_link":
+      return {
+        type: "resource_link" as const,
+        uri: content.uri,
+        name: content.name,
+        title: content.title,
+        description: content.description,
+        mimeType: content.mimeType,
+        size: content.size,
       };
     case "image":
       if (content.source.type === "base64") {

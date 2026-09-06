@@ -1701,6 +1701,70 @@ describe("Bash terminal output", () => {
   });
 });
 
+describe("MCP tool results with resource links", () => {
+  const mcpToolUse = { id: "toolu_mcp", name: "mcp__slick__show_surface" };
+  const link = {
+    uri: "slick://surface?slot=plot&revision=7",
+    name: "plot",
+    title: "Surface: plot",
+    description: "Interactive output",
+    mimeType: "text/html",
+  };
+  // What the CLI hands the model: each resource_link rewritten as a line,
+  // the other blocks untouched.
+  const toolResult: ToolResultBlockParam = {
+    type: "tool_result",
+    tool_use_id: "toolu_mcp",
+    content: [
+      { type: "text", text: `[Resource link: plot] ${link.uri} (Interactive output)` },
+      { type: "text", text: "shown inline as plot (rendition 7)" },
+    ],
+  };
+
+  it("restores each link in place of the line the CLI made from it", () => {
+    const update = toolUpdateFromToolResult(toolResult, mcpToolUse, false, {
+      content: toolResult.content,
+      resourceLinks: [link],
+    });
+    expect(update.content).toEqual([
+      { type: "content", content: { type: "resource_link", ...link, size: undefined } },
+      { type: "content", content: { type: "text", text: "shown inline as plot (rendition 7)" } },
+    ]);
+  });
+
+  it("appends a link whose line is not in the content, keeping the text", () => {
+    const update = toolUpdateFromToolResult(toolResult, mcpToolUse, false, {
+      content: toolResult.content,
+      resourceLinks: [{ ...link, name: "renamed" }],
+    });
+    expect(update.content?.map((c) => c.type === "content" && c.content.type)).toEqual([
+      "text",
+      "text",
+      "resource_link",
+    ]);
+  });
+
+  it("renders the raw text when tool_use_result carries no links", () => {
+    for (const toolUseResult of [undefined, toolResult.content, { resourceLinks: "no" }]) {
+      const update = toolUpdateFromToolResult(toolResult, mcpToolUse, false, toolUseResult);
+      expect(update.content?.map((c) => c.type === "content" && c.content.type)).toEqual([
+        "text",
+        "text",
+      ]);
+    }
+  });
+
+  it("drops a link without a string uri and name rather than render it half-formed", () => {
+    const update = toolUpdateFromToolResult(toolResult, mcpToolUse, false, {
+      resourceLinks: [{ uri: 42, name: "plot" }, "plot", null, link],
+    });
+    const restored = update.content?.filter(
+      (c) => c.type === "content" && c.content.type === "resource_link",
+    );
+    expect(restored).toHaveLength(1);
+  });
+});
+
 describe("toolInfoFromToolUse - ExitPlanMode", () => {
   it("should include plan text in content when input.plan is provided", () => {
     const toolUse = {
