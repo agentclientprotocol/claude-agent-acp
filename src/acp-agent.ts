@@ -18,7 +18,6 @@ import {
   InitializeResponse,
   ListProvidersRequest,
   ListProvidersResponse,
-  McpServer,
   LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
@@ -2599,25 +2598,22 @@ type McpAuthenticationHost = {
  *  `Session` shape exposed through `ClaudeAcpAgent.sessions`. */
 const mcpAuthentications = new WeakMap<Session, Promise<void>>();
 
-/** Start OAuth for ACP-provided MCP servers that Claude reported as needing
- *  authentication. This runs after session creation has returned so an
- *  interactive browser flow never delays `session/new`. */
-function startMcpAuthentication(
-  host: McpAuthenticationHost,
-  sessionId: string,
-  mcpServers: NewSessionRequest["mcpServers"],
-): void {
-  if (mcpServers.length === 0) return;
-  startMcpServerAuthentication(host, sessionId, new Set(mcpServers.map((server) => server.name)));
+/** Start OAuth for MCP servers that Claude reported as needing authentication,
+ *  whether the ACP client declared them or Claude's own configuration did.
+ *  This runs after session creation has returned so an interactive browser
+ *  flow never delays `session/new`. */
+function startMcpAuthentication(host: McpAuthenticationHost, sessionId: string): void {
+  startMcpServerAuthentication(host, sessionId);
 }
 
-/** Start OAuth in the background for the servers in `requestedServers` that
- *  Claude reports as needing authentication. Startup and `/mcp` use it. It
- *  does nothing while another OAuth run of the session is in progress. */
+/** Start OAuth in the background for the servers that Claude reports as
+ *  needing authentication, limited to `requestedServers` when given. Startup
+ *  and `/mcp` use it. It does nothing while another OAuth run of the session
+ *  is in progress. */
 function startMcpServerAuthentication(
   host: McpAuthenticationHost,
   sessionId: string,
-  requestedServers: Set<string>,
+  requestedServers?: Set<string>,
 ): void {
   if (!host.clientCapabilities?.elicitation?.url) return;
 
@@ -2661,16 +2657,20 @@ async function authenticateMcpServers(
   host: McpAuthenticationHost,
   sessionId: string,
   query: Query,
-  requestedServers: Set<string>,
+  requestedServers: Set<string> | undefined,
   signal: AbortSignal,
 ): Promise<void> {
+  const candidates = authenticationCandidates(
+    await settledMcpServerStatuses(query, signal),
+    requestedServers,
+  );
+  if (candidates.length === 0) return;
   if (!supportsMcpOAuth(query)) {
     host.logger.error("The Claude Agent SDK does not expose MCP OAuth authentication.");
     return;
   }
 
-  const statuses = await settledMcpServerStatuses(query, signal);
-  for (const server of authenticationCandidates(statuses, requestedServers)) {
+  for (const server of candidates) {
     try {
       await authenticateMcpServer(host, sessionId, query, server);
     } catch (error) {
@@ -2685,12 +2685,12 @@ async function authenticateMcpServers(
 
 function authenticationCandidates(
   statuses: McpServerStatus[],
-  requestedServers: Set<string>,
+  requestedServers: Set<string> | undefined,
 ): McpServerStatus[] {
   const candidates = statuses.filter(
     (server) =>
       (server.status === "needs-auth" || server.status === "failed") &&
-      requestedServers.has(server.name),
+      (!requestedServers || requestedServers.has(server.name)),
   );
   return candidates.sort(
     (a, b) => Number(a.status !== "needs-auth") - Number(b.status !== "needs-auth"),
@@ -3193,7 +3193,7 @@ export class ClaudeAcpAgent {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
-    this.afterSetupResponse(response.sessionId, params.mcpServers);
+    this.afterSetupResponse(response.sessionId);
     return response;
   }
 
@@ -3289,7 +3289,7 @@ export class ClaudeAcpAgent {
       systemPrompt: params.systemPrompt,
       _meta: params._meta,
     });
-    this.afterSetupResponse(sessionId, params.mcpServers ?? []);
+    this.afterSetupResponse(sessionId);
     return { sessionId, modes, configOptions };
   }
 
@@ -3304,7 +3304,7 @@ export class ClaudeAcpAgent {
     while (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
-    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
+    this.afterSetupResponse(params.sessionId);
     return result;
   }
 
@@ -3323,7 +3323,7 @@ export class ClaudeAcpAgent {
     timing.phase("replay");
 
     // After the replay, so the commands do not interleave with the history.
-    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
+    this.afterSetupResponse(params.sessionId);
 
     return result;
   }
@@ -11235,23 +11235,24 @@ export class ClaudeAcpAgent {
    * authentication. On v2 the setup handlers of `src/v2/agent.ts` do this
    * work once they have sent their response, so it does nothing here.
    */
-  private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+  private afterSetupResponse(sessionId: string): void {
     if (this.v2) return;
     setTimeout(() => {
       this.sendAvailableCommandsUpdate(sessionId);
       void this.publishCurrentSubagentStates(sessionId);
-      startMcpAuthentication(this, sessionId, mcpServers);
+      startMcpAuthentication(this, sessionId);
     }, 0);
   }
 
   /**
-   * Starts OAuth in the background for the servers of `mcpServers` that
-   * Claude Code reports as needing it, which sends the client a URL
+   * Starts OAuth in the background for the MCP servers that Claude Code
+   * reports as needing it, whether the client or Claude's own configuration
+   * declared them, which sends the client a URL
    * elicitation. The v2 surface calls it after the setup response, since v2
    * asks for no elicitation before the `session/new` response.
    */
-  authenticateMcpServers(sessionId: string, mcpServers: McpServer[]): void {
-    startMcpAuthentication(this, sessionId, mcpServers);
+  authenticateMcpServers(sessionId: string): void {
+    startMcpAuthentication(this, sessionId);
   }
 
   /**

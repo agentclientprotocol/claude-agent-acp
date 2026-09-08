@@ -11,7 +11,6 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
-  McpServer,
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
@@ -80,7 +79,7 @@ export function v2AgentApp(
       const request = v1NewSessionRequest(params);
       const response = await agent.newSession(request);
       const commands = await setupCommands(agent, response.sessionId, logger);
-      afterSetupResponse(agent, response.sessionId, request.mcpServers, commands, logger);
+      afterSetupResponse(agent, response.sessionId, commands, logger);
       return { ...v2NewSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
@@ -107,7 +106,6 @@ export function v2AgentApp(
       afterSetupResponse(
         agent,
         params.sessionId,
-        restore.request.mcpServers ?? [],
         commands,
         logger,
         () => void agent.publishCurrentSubagentStates(params.sessionId),
@@ -120,7 +118,7 @@ export function v2AgentApp(
         const request = v1ForkSessionRequest(params);
         const response = await agent.unstable_forkSession(request);
         const commands = await setupCommands(agent, response.sessionId, logger);
-        afterSetupResponse(agent, response.sessionId, request.mcpServers ?? [], commands, logger);
+        afterSetupResponse(agent, response.sessionId, commands, logger);
         return {
           sessionId: response.sessionId,
           ...v2ResumeSessionResponse(response),
@@ -201,7 +199,6 @@ async function setupCommands(
 function afterSetupResponse(
   agent: ClaudeAcpAgent,
   sessionId: string,
-  mcpServers: McpServer[],
   commands: { availableCommands?: v2.AvailableCommand[] } | undefined,
   logger: Logger | undefined,
   then?: () => void,
@@ -216,7 +213,7 @@ function afterSetupResponse(
       });
     }
     then?.();
-    agent.authenticateMcpServers(sessionId, mcpServers);
+    agent.authenticateMcpServers(sessionId);
   }, 0);
 }
 
