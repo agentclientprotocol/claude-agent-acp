@@ -55,6 +55,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   };
 });
 
+let openUrlImpl: (url: string) => Promise<void>;
+vi.mock("../open-url.js", () => ({
+  openUrl: (url: string) => openUrlImpl(url),
+}));
+
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
   return {
@@ -85,6 +90,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
+    openUrlImpl = async () => {};
     mcpAuthenticateImpl = async () => ({
       requiresUserAction: false,
       callbackExpected: false,
@@ -922,6 +928,63 @@ describe("createSession options merging", () => {
         timeout: 5000,
       });
       expect(flow.authenticate).toHaveBeenCalledWith("slack");
+    });
+
+    it("opens the browser when the client cannot present a URL", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      const openUrl = vi.fn(async (_url: string) => {});
+      openUrlImpl = openUrl;
+
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(openUrl).toHaveBeenCalledOnce(), { timeout: 5000 });
+      expect(openUrl).toHaveBeenCalledWith("https://example.com/oauth/authorize");
+      expect(flow.createElicitation).not.toHaveBeenCalled();
+    });
+
+    it("reports the URL when no browser can be opened", async () => {
+      stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      openUrlImpl = async () => {
+        throw new Error("spawn xdg-open ENOENT");
+      };
+      const error = vi.fn();
+      (agent as unknown as { logger: { log: unknown; error: unknown } }).logger = {
+        log: vi.fn(),
+        error,
+      };
+
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(error).toHaveBeenCalled(), { timeout: 5000 });
+      expect(error.mock.calls.flat().join(" ")).toContain("https://example.com/oauth/authorize");
+    });
+
+    it("prefers URL elicitation over the browser when the client supports it", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      const openUrl = vi.fn(async (_url: string) => {});
+      openUrlImpl = openUrl;
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(flow.completeElicitation).toHaveBeenCalledOnce(), {
+        timeout: 5000,
+      });
+      expect(openUrl).not.toHaveBeenCalled();
     });
 
     it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {

@@ -139,6 +139,7 @@ import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { openUrl } from "./open-url.js";
 import type { Stats } from "node:fs";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
@@ -1739,8 +1740,6 @@ const mcpAuthentications = new WeakMap<Session, Promise<void>>();
  *  This runs after session creation has returned so an interactive browser
  *  flow never delays `session/new`. */
 function startMcpAuthentication(host: McpAuthenticationHost, sessionId: string): void {
-  if (!host.clientCapabilities?.elicitation?.url) return;
-
   const session = host.sessions[sessionId];
   if (!session || mcpAuthentications.has(session)) return;
 
@@ -1811,9 +1810,9 @@ function authenticationCandidates(statuses: McpServerStatus[]): McpServerStatus[
   );
 }
 
-/** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
- *  Claude opens and owns the localhost callback listener; the ACP client only
- *  needs to present the returned authorization URL. */
+/** Bridge Claude Code's startup MCP OAuth control to the user. Claude opens
+ *  and owns the localhost callback listener; something just has to put the
+ *  returned authorization URL in front of the user. */
 async function authenticateMcpServer(
   host: McpAuthenticationHost,
   sessionId: string,
@@ -1830,53 +1829,103 @@ async function authenticateMcpServer(
     throw new Error("Claude Code requested user action without returning an authorization URL");
   }
 
-  const elicitationId = `mcp-oauth-${randomUUID()}`;
   const flowAbort = new AbortController();
   const abortFlow = () => flowAbort.abort(session.abortController.signal.reason);
   session.abortController.signal.addEventListener("abort", abortFlow, { once: true });
   if (session.abortController.signal.aborted) abortFlow();
 
   try {
-    const completed = waitForMcpAuthentication(
-      host.sessions,
-      sessionId,
-      query,
-      serverName,
-      server.status,
-      flowAbort.signal,
-    );
-    const elicitation = host.client.createElicitation(
-      {
-        mode: "url",
-        sessionId,
-        message: `Authenticate with MCP server ${serverName}`,
-        url: login.authUrl,
-        elicitationId,
-      },
-      flowAbort.signal,
-    );
-    const first = await Promise.race([
-      completed.then((authenticated) => ({ type: "completed" as const, authenticated })),
-      elicitation.then((response) => ({ type: "elicitation" as const, response })),
-    ]);
-
-    if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
-      return;
-    }
-
-    if (first.type === "elicitation") {
-      await completed;
-    }
-    try {
-      await host.client.completeElicitation({ elicitationId });
-    } catch (error) {
-      if (!flowAbort.signal.aborted) {
-        host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
-      }
-    }
+    const present = host.clientCapabilities?.elicitation?.url
+      ? elicitMcpAuthorization
+      : openMcpAuthorization;
+    await present(host, sessionId, query, server, login.authUrl, flowAbort.signal);
   } finally {
     flowAbort.abort();
     session.abortController.signal.removeEventListener("abort", abortFlow);
+  }
+}
+
+async function elicitMcpAuthorization(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  query: McpOAuthQuery,
+  server: McpServerStatus,
+  authUrl: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const elicitationId = `mcp-oauth-${randomUUID()}`;
+  const completed = waitForMcpAuthentication(
+    host.sessions,
+    sessionId,
+    query,
+    server.name,
+    server.status,
+    signal,
+  );
+  const elicitation = host.client.createElicitation(
+    {
+      mode: "url",
+      sessionId,
+      message: `Authenticate with MCP server ${server.name}`,
+      url: authUrl,
+      elicitationId,
+    },
+    signal,
+  );
+  const first = await Promise.race([
+    completed.then((authenticated) => ({ type: "completed" as const, authenticated })),
+    elicitation.then((response) => ({ type: "elicitation" as const, response })),
+  ]);
+
+  if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
+    return;
+  }
+
+  if (first.type === "elicitation") {
+    await completed;
+  }
+  try {
+    await host.client.completeElicitation({ elicitationId });
+  } catch (error) {
+    if (!signal.aborted) {
+      host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
+    }
+  }
+}
+
+async function openMcpAuthorization(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  query: McpOAuthQuery,
+  server: McpServerStatus,
+  authUrl: string,
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    await openUrl(authUrl);
+  } catch (error) {
+    host.logger.error(
+      `Cannot open a browser to authenticate MCP server ${server.name} (${error}). ` +
+        `Authorize it manually at ${authUrl}`,
+    );
+    return;
+  }
+
+  const authenticated = await waitForMcpAuthentication(
+    host.sessions,
+    sessionId,
+    query,
+    server.name,
+    server.status,
+    signal,
+  );
+  if (authenticated) {
+    host.logger.log(`MCP server ${server.name} is authenticated.`);
+  } else if (!signal.aborted) {
+    host.logger.error(
+      `MCP server ${server.name} did not connect after authorization. ` +
+        `Authorize it manually at ${authUrl}`,
+    );
   }
 }
 
