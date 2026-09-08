@@ -795,6 +795,103 @@ describe("createSession options merging", () => {
       expect(authenticate).toHaveBeenCalledWith("linear");
     });
 
+    function stubOAuthFlow(snapshots: Array<Array<{ name: string; status: string }>>) {
+      let statusCalls = 0;
+      mcpServerStatusResult = async () => snapshots[Math.min(statusCalls++, snapshots.length - 1)]!;
+      const authenticate = vi.fn(async (_serverName: string) => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async (_request: CreateElicitationRequest) => ({
+        action: "accept" as const,
+      }));
+      const completeElicitation = vi.fn(async () => {});
+      Object.assign((agent as unknown as { client: object }).client, {
+        createElicitation,
+        completeElicitation,
+      });
+      return {
+        authenticate,
+        createElicitation,
+        completeElicitation,
+        statusCalls: () => statusCalls,
+      };
+    }
+
+    it("starts OAuth for a server Claude reported as failed", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.completeElicitation).toHaveBeenCalledOnce());
+      expect(flow.authenticate).toHaveBeenCalledWith("slack");
+    });
+
+    it("keeps watching a failed server that is still failed on the next poll", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.statusCalls()).toBeGreaterThanOrEqual(3), {
+        timeout: 4000,
+      });
+    });
+
+    it("authenticates servers Claude is sure about before optimistic attempts", async () => {
+      const flow = stubOAuthFlow([
+        [
+          { name: "slack", status: "failed" },
+          { name: "linear", status: "needs-auth" },
+        ],
+        [
+          { name: "slack", status: "connected" },
+          { name: "linear", status: "connected" },
+        ],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.authenticate).toHaveBeenCalledTimes(2));
+      expect(flow.authenticate.mock.calls.map((call) => call[0])).toEqual(["linear", "slack"]);
+    });
+
     it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {
       await agent.initialize({
         protocolVersion: 1,

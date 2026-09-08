@@ -1794,17 +1794,31 @@ async function authenticateMcpServers(
   }
 
   const statuses = await settledMcpServerStatuses(query, signal);
-  for (const status of statuses) {
-    if (status.status !== "needs-auth" || !requestedServers.has(status.name)) continue;
+  for (const server of authenticationCandidates(statuses, requestedServers)) {
     try {
-      await authenticateMcpServer(host, sessionId, query, status.name);
+      await authenticateMcpServer(host, sessionId, query, server);
     } catch (error) {
       const session = host.sessions[sessionId];
-      if (session && !session.abortController.signal.aborted) {
-        host.logger.error(`Failed to authenticate MCP server ${status.name}: ${error}`);
-      }
+      if (!session || session.abortController.signal.aborted) continue;
+      const message = `Failed to authenticate MCP server ${server.name}: ${error}`;
+      if (server.status === "needs-auth") host.logger.error(message);
+      else host.logger.log(message);
     }
   }
+}
+
+function authenticationCandidates(
+  statuses: McpServerStatus[],
+  requestedServers: Set<string>,
+): McpServerStatus[] {
+  const candidates = statuses.filter(
+    (server) =>
+      (server.status === "needs-auth" || server.status === "failed") &&
+      requestedServers.has(server.name),
+  );
+  return candidates.sort(
+    (a, b) => Number(a.status !== "needs-auth") - Number(b.status !== "needs-auth"),
+  );
 }
 
 /** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
@@ -1814,8 +1828,9 @@ async function authenticateMcpServer(
   host: McpAuthenticationHost,
   sessionId: string,
   query: McpOAuthQuery,
-  serverName: string,
+  server: McpServerStatus,
 ): Promise<void> {
+  const serverName = server.name;
   const session = host.sessions[sessionId];
   if (!session) return;
 
@@ -1837,6 +1852,7 @@ async function authenticateMcpServer(
       sessionId,
       query,
       serverName,
+      server.status,
       flowAbort.signal,
     );
     const elicitation = host.client.createElicitation(
@@ -1879,6 +1895,7 @@ async function waitForMcpAuthentication(
   sessionId: string,
   query: Query,
   serverName: string,
+  initialStatus: McpServerStatus["status"],
   signal: AbortSignal,
 ): Promise<boolean> {
   const deadline = Date.now() + MCP_OAUTH_TIMEOUT_MS;
@@ -1889,8 +1906,9 @@ async function waitForMcpAuthentication(
     const status: McpServerStatus | undefined = (await query.mcpServerStatus()).find(
       (server) => server.name === serverName,
     );
-    if (!status || status.status === "failed" || status.status === "disabled") return false;
+    if (!status || status.status === "disabled") return false;
     if (status.status === "connected") return true;
+    if (status.status === "failed" && initialStatus !== "failed") return false;
     if (!(await waitUnlessAborted(MCP_OAUTH_STATUS_POLL_MS, signal))) return false;
   }
   return false;
