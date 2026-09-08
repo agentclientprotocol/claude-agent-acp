@@ -401,6 +401,9 @@ async function structuredUsageMarkdown(
 const MCP_OAUTH_STATUS_POLL_MS = 1_000;
 const MCP_OAUTH_TIMEOUT_MS = 10 * 60_000;
 
+const MCP_SETTLE_POLL_MS = 100;
+const MCP_SETTLE_TIMEOUT_MS = 5_000;
+
 /** Runtime MCP OAuth control exposed by the pinned Agent SDK. It is not yet in
  *  the public `Query` declaration, even though the method is present on the
  *  SDK query object and backed by Claude Code's `mcp_authenticate` control. */
@@ -1745,7 +1748,13 @@ function startMcpAuthentication(
   if (!session || mcpAuthentications.has(session)) return;
 
   const requestedServers = new Set(mcpServers.map((server) => server.name));
-  const authentication = authenticateMcpServers(host, sessionId, session.query, requestedServers)
+  const authentication = authenticateMcpServers(
+    host,
+    sessionId,
+    session.query,
+    requestedServers,
+    session.abortController.signal,
+  )
     .catch((error) => {
       if (!session.abortController.signal.aborted) {
         host.logger.error(`Failed to inspect MCP servers for OAuth: ${error}`);
@@ -1759,18 +1768,32 @@ function startMcpAuthentication(
   mcpAuthentications.set(session, authentication);
 }
 
+async function settledMcpServerStatuses(
+  query: Query,
+  signal: AbortSignal,
+): Promise<McpServerStatus[]> {
+  const deadline = Date.now() + MCP_SETTLE_TIMEOUT_MS;
+  let statuses = await query.mcpServerStatus();
+  while (statuses.some((server) => server.status === "pending") && Date.now() < deadline) {
+    if (!(await waitUnlessAborted(MCP_SETTLE_POLL_MS, signal))) break;
+    statuses = await query.mcpServerStatus();
+  }
+  return statuses;
+}
+
 async function authenticateMcpServers(
   host: McpAuthenticationHost,
   sessionId: string,
   query: Query,
   requestedServers: Set<string>,
+  signal: AbortSignal,
 ): Promise<void> {
   if (!supportsMcpOAuth(query)) {
     host.logger.error("The Claude Agent SDK does not expose MCP OAuth authentication.");
     return;
   }
 
-  const statuses = await query.mcpServerStatus();
+  const statuses = await settledMcpServerStatuses(query, signal);
   for (const status of statuses) {
     if (status.status !== "needs-auth" || !requestedServers.has(status.name)) continue;
     try {

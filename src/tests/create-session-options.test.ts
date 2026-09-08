@@ -757,6 +757,44 @@ describe("createSession options merging", () => {
       });
     });
 
+    it("waits for pending MCP servers to settle before starting OAuth", async () => {
+      const snapshots = [
+        [{ name: "linear", status: "pending" }],
+        [{ name: "linear", status: "needs-auth" }],
+        [{ name: "linear", status: "connected" }],
+      ];
+      let statusCall = 0;
+      mcpServerStatusResult = async () => snapshots[Math.min(statusCall++, snapshots.length - 1)]!;
+      const authenticate = vi.fn(async () => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async (_request: CreateElicitationRequest) => ({
+        action: "accept" as const,
+      }));
+      const completeElicitation = vi.fn(async () => {});
+      Object.assign((agent as unknown as { client: object }).client, {
+        createElicitation,
+        completeElicitation,
+      });
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(completeElicitation).toHaveBeenCalledOnce());
+      expect(authenticate).toHaveBeenCalledWith("linear");
+    });
+
     it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {
       await agent.initialize({
         protocolVersion: 1,
