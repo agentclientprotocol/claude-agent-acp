@@ -41,7 +41,9 @@ for i in "${!commands[@]}"; do
     fi
   elif [[ "$cmd" == "npm run format:check" ]]; then
     # Local override: format:check on git-tracked files only
+    # Symlinks (CLAUDE.md -> AGENTS.md) are tracked but prettier rejects them.
     git ls-files -z '*.ts' '*.tsx' '*.js' '*.jsx' '*.json' '*.md' '*.yml' '*.yaml' '*.css' '*.html' \
+      | while IFS= read -r -d '' file; do [[ -L "$file" ]] || printf '%s\0' "$file"; done \
       | xargs -0 npx prettier --check
   else
     eval "$cmd"
