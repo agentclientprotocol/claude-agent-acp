@@ -9370,8 +9370,8 @@ function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
  *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
- *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
- *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
+ *  drift. The initial `tool_call` carries `status: "pending"` and, for shell tools,
+ *  the `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
  *  updates key off of, and the programmatic tool `name` (ACP's tool-call-name
  *  RFD); a refining `tool_call_update` carries none of these. `name` is set
  *  once at first report — on a v1 update, omitting it means "unchanged", and
@@ -9395,7 +9395,7 @@ function toolCallNotification(
   return {
     _meta: {
       claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
-      ...(toolUse.name === "Bash" && supportsTerminalOutput
+      ...((toolUse.name === "Bash" || toolUse.name === "PowerShell") && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
     } satisfies ToolUpdateMeta,
