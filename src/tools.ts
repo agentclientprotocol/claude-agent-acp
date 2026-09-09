@@ -642,7 +642,7 @@ export function toolUpdateFromToolResult(
     toolResult.is_error &&
     toolResult.content &&
     toolResult.content.length > 0 &&
-    !(toolUse?.name === "Bash" && supportsTerminalOutput)
+    !((toolUse?.name === "Bash" || toolUse?.name === "PowerShell") && supportsTerminalOutput)
   ) {
     // Only return errors
     return toAcpContentUpdate(toolResult.content, true);
@@ -734,7 +734,8 @@ export function toolUpdateFromToolResult(
       return {};
     }
 
-    case "Bash": {
+    case "Bash":
+    case "PowerShell": {
       const result = toolResult.content;
       // The terminal was announced under the tool_use's own id (see
       // `toolInfoFromToolUse`), so key the output/exit metas off that: it is the
