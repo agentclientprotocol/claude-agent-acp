@@ -695,6 +695,10 @@ type Turn = {
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
   steeredSettle?: PromptResponse;
+  /** Backstop armed when a steered turn has an outcome but is waiting for an
+   *  echo that may never replay. Mirrors cancel's bounded-hang protection for
+   *  the steering lane. */
+  steeredSettleTimer?: ReturnType<typeof setTimeout>;
   carriedUsage?: AccumulatedUsage;
   /** `carriedUsage`'s per-model counterpart, so a turn that survives a
    *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
@@ -1154,6 +1158,13 @@ function disarmForceCancel(session: Session): void {
   if (session.forceCancelTimer) {
     clearTimeout(session.forceCancelTimer);
     session.forceCancelTimer = undefined;
+  }
+}
+
+function disarmSteeredSettle(turn: Turn): void {
+  if (turn.steeredSettleTimer) {
+    clearTimeout(turn.steeredSettleTimer);
+    delete turn.steeredSettleTimer;
   }
 }
 
@@ -3704,6 +3715,7 @@ export class ClaudeAcpAgent {
       session.fileChangeReporter?.finish(turn.fileChangeReport, reportReason);
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
+      disarmSteeredSettle(turn);
       turn.settled = true;
       turn.usageMarkdownAbort?.abort();
       disarmForceCancel(session);
@@ -4310,37 +4322,62 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles--;
                     }
                     await settleDeferredIfDrained();
+                  } else if (isSteering(session.activeTurn)) {
+                    // A steered turn settles here, not at a result: this idle is
+                    // the only signal spanning the interrupted and steered cycles
+                    // (see Turn.steeredEchoes). An idle before any result was
+                    // recorded means the answer is still ahead — swallow it, and
+                    // never let it reach the #825 fail below, which would reject
+                    // a prompt about to answer.
+                    //
+                    // Once a result HAS been recorded, the turn has an outcome to
+                    // deliver. Do not let stale trailing-idle debt consume that
+                    // only settling signal. If the SDK has not replayed all steer
+                    // echoes yet, arm a bounded backstop instead of parking the
+                    // session/prompt indefinitely (issue #1114).
+                    // Plain Turn so the fields can be cleared below; isSteering
+                    // narrows steeredEchoes to non-optional.
+                    const steered: Turn = session.activeTurn;
+                    const settleSteered = async (reason: "idle" | "backstop") => {
+                      if (!isSteering(steered) || steered.steeredSettle === undefined) return;
+                      const turn: Turn = steered;
+                      if (reason === "backstop" && turn.steeredEchoes?.size !== 0) {
+                        this.logger.error(
+                          `Session ${params.sessionId}: settling steered turn despite ` +
+                            `${turn.steeredEchoes?.size ?? 0} undrained steered echo(es) ` +
+                            `(issue #1114)`,
+                        );
+                      }
+                      disarmSteeredSettle(turn);
+                      // Via the subagent gate, not settleActive: a steered turn
+                      // can also have spawned background subagents, which own it
+                      // from here (settles now if none is live, holds otherwise).
+                      turn.deferredSettle = turn.steeredSettle;
+                      delete turn.steeredEchoes;
+                      delete turn.steeredSettle;
+                      await settleDeferredIfDrained();
+                    };
+                    if (steered.steeredSettle !== undefined) {
+                      if (steered.steeredEchoes?.size === 0) {
+                        await settleSteered("idle");
+                      } else if (!steered.steeredSettleTimer) {
+                        steered.steeredSettleTimer = setTimeout(() => {
+                          void settleSteered("backstop").catch((error: unknown) => {
+                            this.logger.error(
+                              `Session ${params.sessionId}: failed to settle steered turn backstop: ${String(error)}`,
+                            );
+                          });
+                        }, DEFAULT_FORCE_CANCEL_GRACE_MS);
+                        steered.steeredSettleTimer.unref?.();
+                      }
+                    }
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
                     // this lagged idle (no active turn to settle): the idle
                     // still belongs to that settled turn, and skipping the
                     // decrement would leak the debt permanently.
-                    // Deliberately BEFORE the steer lane below: an owed idle
-                    // belongs to an earlier turn, and reading it as the steered
-                    // sequence's turn-over signal would settle a turn whose
-                    // steered cycle is still running. Steered results owe none.
                     session.owedTrailingIdles--;
-                  } else if (isSteering(session.activeTurn)) {
-                    // A steered turn settles here, not at a result: this idle is
-                    // the only signal spanning the interrupted and steered cycles
-                    // (see Turn.steeredEchoes). An idle before the steered echo,
-                    // or before any result was recorded, means the answer is
-                    // still ahead — swallow it, and never let it reach the #825
-                    // fail below, which would reject a prompt about to answer.
-                    //
-                    // Plain Turn so the fields can be cleared below; isSteering
-                    // narrows steeredEchoes to non-optional.
-                    const steered: Turn = session.activeTurn;
-                    if (steered.steeredEchoes?.size === 0 && steered.steeredSettle !== undefined) {
-                      // Via the subagent gate, not settleActive: a steered turn
-                      // can also have spawned background subagents, which own it
-                      // from here (settles now if none is live, holds otherwise).
-                      steered.deferredSettle = steered.steeredSettle;
-                      steered.steeredEchoes = undefined;
-                      steered.steeredSettle = undefined;
-                      await settleDeferredIfDrained();
-                    }
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&

@@ -17071,6 +17071,46 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
   });
 
+  it("settles a steered turn when its result arrives but the steered echo never drains", async () => {
+    const agent = createMockAgent();
+    let releaseResult!: () => void;
+    const resultGate = new Promise<void>((resolve) => (releaseResult = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const original = await iter.next();
+        yield userEcho(original.value);
+        await iter.next(); // steered input is accepted but never echoed back.
+        await resultGate;
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+    // Model the stale-idle-debt candidate from #1114: the steered result must
+    // still arm the bounded fallback instead of parking behind old trailer debt.
+    agent.sessions["test-session"].owedTrailingIdles = 1;
+
+    vi.useFakeTimers();
+    try {
+      releaseResult();
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+  });
+
   it("does not fail the turn on the SDK diagnostic result emitted before a steered echo", async () => {
     const agent = createMockAgent();
     injectGeneratorSession(agent, (input) => {
