@@ -56,6 +56,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   importSessionToStore,
+  listSessions,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
@@ -84,6 +85,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     forkSession: vi.fn(),
     getSessionInfo: vi.fn(),
     importSessionToStore: vi.fn(actual.importSessionToStore),
+    listSessions: vi.fn(actual.listSessions),
     // Delegates to the real implementation so integration tests that read
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
@@ -8404,6 +8406,53 @@ describe("logout", () => {
         "recommendedValue",
       ],
     });
+  });
+});
+
+describe("session/list", () => {
+  function createMockAgent() {
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    return new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+  }
+
+  beforeEach(() => {
+    vi.mocked(listSessions).mockReset();
+  });
+
+  it("normalizes WSL drive cwd casing before querying stored sessions", async () => {
+    const agent = createMockAgent();
+    vi.mocked(listSessions).mockResolvedValueOnce([
+      {
+        sessionId: "session-1",
+        cwd: "/mnt/c/Users/Me/Notes/MyVault",
+        summary: "Project work",
+        lastModified: 1_725_000_000_000,
+      },
+    ] as Awaited<ReturnType<typeof listSessions>>);
+
+    const response = await agent.listSessions({
+      cwd: "/mnt/c/Users/Me/Notes/MyVault",
+      cursor: null,
+    });
+
+    expect(listSessions).toHaveBeenCalledWith({ dir: "/mnt/c/users/me/notes/myvault" });
+    expect(response.sessions).toEqual([
+      {
+        sessionId: "session-1",
+        cwd: "/mnt/c/Users/Me/Notes/MyVault",
+        title: "Project work",
+        updatedAt: new Date(1_725_000_000_000).toISOString(),
+      },
+    ]);
+  });
+
+  it("leaves non-WSL cwd filters case-preserving", async () => {
+    const agent = createMockAgent();
+    vi.mocked(listSessions).mockResolvedValueOnce([]);
+
+    await agent.listSessions({ cwd: "/Work/Project", cursor: null });
+
+    expect(listSessions).toHaveBeenCalledWith({ dir: "/Work/Project" });
   });
 });
 
