@@ -350,7 +350,7 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("prefers a question's custom answer over its selection", () => {
+  it("keeps the selected option when follow-up text is also supplied", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_0_custom: "  my own take  " },
@@ -361,7 +361,7 @@ describe("applyAskElicitationResponse", () => {
       updatedInput: {
         questions,
         metadata: { source: "test" },
-        answers: { "Single?": "my own take" },
+        answers: { "Single?": "A\n\nmy own take" },
       },
     });
   });
