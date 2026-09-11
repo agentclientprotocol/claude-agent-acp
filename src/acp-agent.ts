@@ -1217,6 +1217,7 @@ const AUTH_REQUIRED_CODE = RequestError.authRequired().code;
 const SUPPORTED_PROTOCOLS: LlmProtocol[] = ["anthropic", "bedrock", "vertex"];
 const PROVIDER_ID = "main";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+const DEFAULT_VERTEX_BASE_URL = "https://aiplatform.googleapis.com";
 
 /**
  * Vertex needs project + region that the standard `providers/set` payload
@@ -2544,7 +2545,7 @@ export class ClaudeAcpAgent {
     if (process.env.CLAUDE_CODE_USE_VERTEX) {
       return {
         apiType: "vertex",
-        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? "https://aiplatform.googleapis.com",
+        baseUrl: process.env.ANTHROPIC_VERTEX_BASE_URL ?? DEFAULT_VERTEX_BASE_URL,
         headers: {},
       };
     }
@@ -8806,10 +8807,16 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   if (config.apiType === "vertex") {
     // `config.vertex` is guaranteed present for vertex by `unstable_setProvider`
     // validation; fall back to empty strings defensively.
+    // Leaving ANTHROPIC_VERTEX_BASE_URL empty for the default endpoint lets
+    // Claude Code use its native Vertex endpoint/model resolution. Supplying
+    // even the default host marks the session as a custom Vertex deployment and
+    // can hide otherwise-valid models.
     return {
       ...resetRouting,
       CLAUDE_CODE_USE_VERTEX: "1",
-      ANTHROPIC_VERTEX_BASE_URL: config.baseUrl,
+      ...(config.baseUrl !== DEFAULT_VERTEX_BASE_URL
+        ? { ANTHROPIC_VERTEX_BASE_URL: config.baseUrl }
+        : {}),
       ANTHROPIC_VERTEX_PROJECT_ID: config.vertex?.projectId ?? "",
       CLOUD_ML_REGION: config.vertex?.region ?? "",
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
