@@ -63,6 +63,7 @@ import {
   BetaWebSearchToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
 import path from "node:path";
+import { AIR_DIFF_STATS_KEY, withAirMeta } from "./air-extension.js";
 
 /**
  * Union of all possible content types that can appear in tool results from the Anthropic SDK.
@@ -1400,15 +1401,23 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   const content: ToolCallContent[] = [];
   const locations: ToolCallLocation[] = [];
 
-  for (const { lines, newStart } of response.structuredPatch) {
+  for (const { lines, newStart, oldLines, newLines } of response.structuredPatch) {
     const oldText: string[] = [];
     const newText: string[] = [];
+    let added = 0;
+    let removed = 0;
+    let validPrefixes = true;
     for (const line of lines) {
       if (line.startsWith("-")) {
         oldText.push(line.slice(1));
+        removed++;
       } else if (line.startsWith("+")) {
         newText.push(line.slice(1));
+        added++;
+      } else if (line === "\\ No newline at end of file") {
+        continue;
       } else {
+        if (!line.startsWith(" ")) validPrefixes = false;
         oldText.push(line.slice(1));
         newText.push(line.slice(1));
       }
@@ -1420,6 +1429,9 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
         path: response.filePath,
         oldText: oldText.join("\n") || null,
         newText: newText.join("\n"),
+        ...(validPrefixes && oldText.length === oldLines && newText.length === newLines
+          ? { _meta: withAirMeta(undefined, AIR_DIFF_STATS_KEY, { version: 1, added, removed }) }
+          : {}),
       });
     }
   }
