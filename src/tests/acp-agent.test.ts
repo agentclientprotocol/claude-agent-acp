@@ -3452,6 +3452,9 @@ describe("permission request cancellation", () => {
       { kind: "allow_once", name: "Yes", optionId: "allow-once" },
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
+    expect(request?._meta).toEqual({
+      permission: { version: 1, title: "ls" },
+    });
   });
 
   it("maps explicit reject to deny while retaining Claude classification", async () => {
@@ -3787,6 +3790,29 @@ describe("tool_call emitted before permission request", () => {
     });
     expect(session.emittedToolCalls.has("tool-1")).toBe(true);
     expect(result).toMatchObject({ behavior: "allow" });
+  });
+
+  it("carries the PowerShell description in claudeCode meta like Bash", async () => {
+    const { agent, updates } = setup();
+
+    await agent.canUseTool("session-1")(
+      "PowerShell",
+      { command: "Get-ChildItem", description: "List files" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any,
+    );
+
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-1",
+      title: "Get-ChildItem",
+      _meta: {
+        claudeCode: { toolName: "PowerShell", title: "List files" },
+      },
+    });
   });
 
   it("does not re-emit the tool_call when the stream already surfaced it", async () => {

@@ -9234,10 +9234,10 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName) && !isFileChangeAuditTool(toolName);
 }
 
-/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
- *  are kept out of ACP's standard `title`, which clients may use as the shell
- *  command preview, while still giving clients access to Claude's concise
- *  human-readable title. */
+/** Build the Claude Code-specific metadata for a tool call. Shell (Bash and
+ *  PowerShell) descriptions are kept out of ACP's standard `title`, which
+ *  clients may use as the shell command preview, while still giving clients
+ *  access to Claude's concise human-readable title. */
 function claudeCodeMetaFromToolUse(
   toolUse: {
     name: string;
@@ -9246,7 +9246,7 @@ function claudeCodeMetaFromToolUse(
   cwd?: string,
 ): NonNullable<ToolUpdateMeta["claudeCode"]> {
   const description =
-    toolUse.name === "Bash" &&
+    (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
     toolUse.input !== null &&
     typeof toolUse.input === "object" &&
     "description" in toolUse.input &&
