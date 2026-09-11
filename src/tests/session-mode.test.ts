@@ -122,6 +122,19 @@ describe("session mode", () => {
     ).rejects.toThrow("start a new session");
   });
 
+  it("omits bypassPermissions from the catalog when bypass capability is disabled", async () => {
+    const setPermissionMode = vi.fn();
+    const { manager } = createManager(undefined);
+    const result = await manager.initialize({
+      query: { setPermissionMode },
+      requestedMode: "default",
+      currentModelId: "opus",
+      allowBypassCapability: false,
+    });
+
+    expect(result.modes.availableModes.map((mode) => mode.id)).not.toContain("bypassPermissions");
+  });
+
   it("initializes the stable mode catalog and falls unsupported Auto back", async () => {
     const setPermissionMode = vi.fn();
     const { manager, notifications } = createManager(undefined);

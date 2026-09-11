@@ -161,7 +161,10 @@ import {
 import { forkSession } from "./fork-session.js";
 import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
+import {
+  resolveAllowDangerouslySkipPermissions,
+  resolvePermissionMode,
+} from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
@@ -1163,10 +1166,14 @@ export type NewSessionMeta = {
      * Those parameters will not be forwarded because they are managed by ACP:
      *   - cwd
      *   - includePartialMessages
-     *   - allowDangerouslySkipPermissions
      *   - permissionMode
      *   - canUseTool
      *   - executable
+     * `allowDangerouslySkipPermissions` may be set to `false` to opt out of
+     * requesting the bypass capability (`--allow-dangerously-skip-permissions`).
+     * When omitted, the adapter enables it on non-root sessions. Setting it to
+     * `true` does not override root/sandbox policy. Opting out is separate from
+     * entering `bypassPermissions` mode.
      * The `agent` parameter is also ignored: main-thread agent selection is not
      * part of this adapter's ACP contract.
      * Those parameters will be used and updated to work with ACP:
@@ -7865,14 +7872,24 @@ export class ClaudeAcpAgent {
       }
     }
 
+    // Extract options from _meta if provided
+    const sessionMeta = params._meta as NewSessionMeta | undefined;
+    const allowDangerouslySkipPermissions = resolveAllowDangerouslySkipPermissions(
+      sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions,
+    );
+
     const permissionMode = resolvePermissionMode(
       settingsManager.getSettings().permissions?.defaultMode,
       this.logger,
     );
-    const initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
+    let initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
+    if (initialPermissionMode === "bypassPermissions" && !allowDangerouslySkipPermissions) {
+      this.logger.error(
+        "Ignoring bypassPermissions: allowDangerouslySkipPermissions was disabled by the host.",
+      );
+      initialPermissionMode = "default";
+    }
 
-    // Extract options from _meta if provided
-    const sessionMeta = params._meta as NewSessionMeta | undefined;
     const userProvidedOptions = sessionMeta?.claudeCode?.options
       ? { ...sessionMeta.claudeCode.options }
       : undefined;
@@ -8018,9 +8035,9 @@ export class ClaudeAcpAgent {
           ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
           : {}),
       },
-      // If we want bypassPermissions to be an option, we have to allow it here.
-      // But it doesn't work in root mode, so we only activate it if it will work.
-      allowDangerouslySkipPermissions: ALLOW_BYPASS,
+      // Request bypass capability unless the host explicitly opted out. Root
+      // sessions still cannot enable it (see resolveAllowDangerouslySkipPermissions).
+      allowDangerouslySkipPermissions,
       permissionMode: initialPermissionMode,
       canUseTool: this.canUseTool(sessionId),
       // Forward MCP elicitation requests onto ACP elicitation. Only attached
@@ -8282,6 +8299,7 @@ export class ClaudeAcpAgent {
         requestedMode: initialPermissionMode,
         currentModelInfo,
         currentModelId: models.currentModelId,
+        allowBypassCapability: allowDangerouslySkipPermissions,
       });
       timing.phase("modes");
 

@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Logger } from "../acp-agent.js";
-import { resolvePermissionMode } from "../permissions/modes.js";
+import {
+  ALLOW_BYPASS,
+  resolveAllowDangerouslySkipPermissions,
+  resolvePermissionMode,
+} from "../permissions/modes.js";
 
 function mockLogger() {
   const error = vi.fn<(...args: any[]) => void>();
@@ -8,6 +12,18 @@ function mockLogger() {
   const logger: Logger = { log, error };
   return { logger, error, log };
 }
+
+describe("resolveAllowDangerouslySkipPermissions", () => {
+  it("returns false when the host explicitly opts out", () => {
+    expect(resolveAllowDangerouslySkipPermissions(false)).toBe(false);
+  });
+
+  it("defaults to ALLOW_BYPASS when omitted or true", () => {
+    expect(resolveAllowDangerouslySkipPermissions()).toBe(ALLOW_BYPASS);
+    expect(resolveAllowDangerouslySkipPermissions(undefined)).toBe(ALLOW_BYPASS);
+    expect(resolveAllowDangerouslySkipPermissions(true)).toBe(ALLOW_BYPASS);
+  });
+});
 
 describe("resolvePermissionMode", () => {
   it("returns 'default' when no mode is provided", () => {

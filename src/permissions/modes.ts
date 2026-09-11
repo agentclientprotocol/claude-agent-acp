@@ -8,6 +8,13 @@ interface PermissionModeLogger {
 const IS_ROOT = (process.geteuid?.() ?? process.getuid?.()) === 0;
 export const ALLOW_BYPASS = !IS_ROOT || !!process.env.IS_SANDBOX;
 
+/** Host opt-out for --allow-dangerously-skip-permissions. Explicit false wins;
+ *  omitted (or true) keeps today's adapter default. */
+export function resolveAllowDangerouslySkipPermissions(hostValue?: boolean): boolean {
+  if (hostValue === false) return false;
+  return ALLOW_BYPASS;
+}
+
 const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   // Settings use user-facing, case-insensitive spellings while the SDK uses
   // camel-cased wire values. Keep legacy shorthand accepted by Claude Code too.
