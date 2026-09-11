@@ -6984,6 +6984,35 @@ describe("stop reason propagation", () => {
     expect(logged.join("\n")).not.toContain("cannot fail active turn");
   });
 
+  it("does not treat a successful answer mentioning /login as auth_required", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const answer = "A normal answer can quote: Please run /login.";
+    injectSession(agent, [
+      createAssistantError(undefined, answer),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: answer,
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
+  });
+
   it("republishes the signed-out state after a real model answer cleared the last one", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
