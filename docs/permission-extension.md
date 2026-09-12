@@ -81,6 +81,8 @@ The permission request carries the same standard ACP tool information used for n
 
 Compact text removes control characters, collapses whitespace where appropriate, and enforces length
 limits. Invalid optional presentation text is omitted instead of being truncated into misleading UI.
+Shell permission titles (`Bash` and `PowerShell`) preserve the full command verbatim, including
+whitespace and line breaks, without applying compact-text normalization or length limits.
 
 Permission options are fixed. When a durable suggestion contains a command prefix, path, host, or
 other rule, the adapter includes that value directly in `PermissionOption.name`, for example

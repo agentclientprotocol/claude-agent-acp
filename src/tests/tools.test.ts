@@ -1701,6 +1701,88 @@ describe("Bash terminal output", () => {
   });
 });
 
+describe("PowerShell terminal output", () => {
+  it("emits output and exit for the terminal announced by the tool call", () => {
+    const id = "toolu_powershell";
+    const toolUse = {
+      type: "tool_use" as const,
+      id,
+      name: "PowerShell",
+      input: { command: "Get-ChildItem" },
+    };
+    const toolResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: id,
+      content: "Get-ChildItem: command failed",
+      is_error: true,
+    };
+    const toolUseCache: ToolUseCache = {};
+    const client = {} as AcpClient;
+    const logger: Logger = { log: () => {}, error: () => {} };
+    const options = {
+      registerHooks: false,
+      clientCapabilities: { _meta: { terminal_output: true } },
+    };
+    const notifications = [
+      ...toAcpNotifications(
+        [toolUse],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        client,
+        logger,
+        options,
+      ),
+      ...toAcpNotifications(
+        [toolResult],
+        "user",
+        "test-session",
+        toolUseCache,
+        client,
+        logger,
+        options,
+      ),
+    ];
+
+    expect(notifications).toHaveLength(3);
+    const [started, output, exited] = notifications.map(({ update }) => update);
+    expect(started).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: id,
+      status: "pending",
+      title: "Get-ChildItem",
+      kind: "execute",
+      content: [{ type: "terminal", terminalId: id }],
+      _meta: { terminal_info: { terminal_id: id } },
+    });
+    expect(output).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: id,
+      _meta: {
+        terminal_output: {
+          terminal_id: id,
+          data: "Get-ChildItem: command failed",
+        },
+      },
+    });
+    expect(output).not.toHaveProperty("status");
+    expect(exited).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: id,
+      status: "failed",
+      content: [{ type: "terminal", terminalId: id }],
+      _meta: {
+        terminal_exit: {
+          terminal_id: id,
+          exit_code: 1,
+          signal: null,
+        },
+      },
+    });
+    expect(exited).not.toHaveProperty("rawOutput");
+  });
+});
+
 describe("toolInfoFromToolUse - ExitPlanMode", () => {
   it("should include plan text in content when input.plan is provided", () => {
     const toolUse = {
