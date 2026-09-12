@@ -162,6 +162,30 @@ describe("Claude permission ACP v1 presentation", () => {
     },
   );
 
+  describe.each(["Bash", "PowerShell"])("%s command fidelity", (toolName) => {
+    it.each([
+      { label: "quoted spaces and tabs", command: 'echo "a  b\tc"' },
+      { label: "newlines after comments", command: "echo first # first command\necho second" },
+      { label: "surrounding whitespace", command: " \techo first\n" },
+      {
+        label: "commands longer than 4,000 characters",
+        command: `echo "${"x".repeat(4_001)}"\necho last`,
+      },
+    ])("preserves $label in the approval title", ({ command }) => {
+      const input = { command, description: "Run the requested command" };
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input,
+        toolUseID: `tool-${toolName}`,
+        supportsTerminalOutput: true,
+      });
+
+      expect(presentation._meta).toEqual({ permission: { version: 1, title: command } });
+      expect(presentation.toolCall.title).toBe(command);
+      expect(presentation.toolCall.rawInput).toBe(input);
+    });
+  });
+
   it("keeps the WebFetch URL in structured tool input", () => {
     const input = { url: "https://example.com/docs", prompt: "Read the API reference" };
     const presentation = buildClaudePermissionPresentation({
