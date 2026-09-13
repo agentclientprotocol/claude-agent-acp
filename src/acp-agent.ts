@@ -113,6 +113,7 @@ import {
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SESSION_REWIND_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
@@ -159,6 +160,13 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import {
+  parseSessionRewindRequest,
+  rewindClaudeSession,
+  SESSION_REWIND_METHOD,
+  type SessionRewindRequest,
+  type SessionRewindResponse,
+} from "./session-rewind.js";
 import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
@@ -2143,6 +2151,7 @@ export class ClaudeAcpAgent {
           AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
           AIR_ASYNC_TASKS_CAPABILITY,
           AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+          AIR_SESSION_REWIND_CAPABILITY,
         ),
         steering: {
           supported: true,
@@ -2175,6 +2184,18 @@ export class ClaudeAcpAgent {
     return forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
+      messageIdForGrouping,
+    });
+  }
+
+  async rewindSession(params: SessionRewindRequest): Promise<SessionRewindResponse> {
+    return rewindClaudeSession(params, {
+      waitForProviderUpdate: async () => {
+        if (this.providerUpdate) await this.providerUpdate;
+      },
+      getSession: (sessionId) => this.sessions[sessionId],
+      teardownSession: (sessionId) => this.teardownSession(sessionId),
+      createSession: (creationParams, options) => this.createSession(creationParams, options),
       messageIdForGrouping,
     });
   }
@@ -7886,6 +7907,8 @@ export class ClaudeAcpAgent {
        *  wrote one; this keeps the ACP session id alive with an empty history.
        *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
       reuseSessionId?: string;
+      resumeSessionAt?: string;
+      resumeDropsTurn?: string;
       /** Concrete model id from the resumed transcript's last real assistant
        *  message. Claude Code restores from this same record, so it lets us
        *  report the live model without a slow getContextUsage control request. */
@@ -8290,6 +8313,12 @@ export class ClaudeAcpAgent {
         ],
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
+      ...(creationOpts.resumeSessionAt !== undefined && {
+        resumeSessionAt: creationOpts.resumeSessionAt,
+      }),
+      ...(creationOpts.resumeDropsTurn !== undefined && {
+        resumeDropsTurn: creationOpts.resumeDropsTurn,
+      }),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
       abortController,
     };
@@ -10263,6 +10292,11 @@ export function runAcp(logger?: Logger) {
       ASYNC_TASK_STOP_METHOD,
       { parse: parseAsyncTaskStopRequest },
       (ctx) => agent.stopAsyncTask(ctx.params),
+    )
+    .onRequest<SessionRewindRequest, SessionRewindResponse>(
+      SESSION_REWIND_METHOD,
+      { parse: parseSessionRewindRequest },
+      (ctx) => agent.rewindSession(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,

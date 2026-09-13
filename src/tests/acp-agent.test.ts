@@ -8646,6 +8646,7 @@ describe("logout", () => {
         "nativeSubagentSessions",
         "asyncTasks",
         "recommendedValue",
+        "sessionRewind",
       ],
     });
   });
@@ -8665,6 +8666,7 @@ describe("logout", () => {
         "nativeSubagentSessions",
         "asyncTasks",
         "recommendedValue",
+        "sessionRewind",
       ],
     });
   });
