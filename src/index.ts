@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { resolveSettings } from "@anthropic-ai/claude-agent-sdk";
 import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { applyManagedPolicyEnv } from "./managed-policy-env.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -43,21 +43,19 @@ if (process.argv.includes("--cli")) {
   console.log(packageJson.version);
   process.exit(0);
 } else {
-  // Apply env vars from the managed-policy tier before any SDK call so the
-  // SDK subprocess inherits them. Going through resolveSettings (vs. a raw
-  // read of managed-settings.json) also picks up MDM sources on macOS and
-  // HKLM/HKCU on Windows.
-  const policy = await resolveSettings({ settingSources: [] });
-  for (const [key, value] of Object.entries(policy.effective.env ?? {})) {
-    process.env[key] = value;
-  }
-
-  // stdout is used to send messages to the client
-  // we redirect everything else to stderr to make sure it doesn't interfere with ACP
+  // stdout is used to send messages to the client; redirect diagnostics before
+  // managed settings are read so startup warnings cannot corrupt ACP framing.
   console.log = console.error;
   console.info = console.error;
   console.warn = console.error;
   console.debug = console.error;
+
+  // Apply env vars from the managed-policy tier before any SDK call so the
+  // SDK subprocess inherits them. Going through resolveSettings (vs. a raw
+  // read of managed-settings.json) also picks up MDM sources on macOS and
+  // HKLM/HKCU on Windows. If this best-effort lookup fails, continue startup
+  // with the existing process environment so the ACP server can still answer.
+  await applyManagedPolicyEnv();
 
   process.on("unhandledRejection", (reason, promise) => {
     console.error("Unhandled Rejection at:", promise, "reason:", reason);
