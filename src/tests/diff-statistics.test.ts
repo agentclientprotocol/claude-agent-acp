@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toolUpdateFromDiffToolResponse } from "../tools.js";
+import { toolUpdateFromDiffToolResponse } from "../diff.js";
 
 describe("diff statistics", () => {
   it("counts each block independently without reading full file content", () => {

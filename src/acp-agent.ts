@@ -230,10 +230,10 @@ import {
   TaskState,
   taskStateToPlanEntries,
   toolInfoFromToolUse,
-  toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
   unregisterHookCallback,
 } from "./tools.js";
+import { toolUpdateFromDiffToolResponse } from "./diff.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,

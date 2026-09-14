@@ -27,8 +27,8 @@ import {
   toolInfoFromToolUse,
   toDisplayPath,
   toolUpdateFromToolResult,
-  toolUpdateFromDiffToolResponse,
 } from "../tools.js";
+import { toolUpdateFromDiffToolResponse } from "../diff.js";
 import {
   toAcpNotifications,
   promptToClaude,
