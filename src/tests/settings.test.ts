@@ -1,8 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { SettingsManager } from "../settings.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
+  const actual = await vi.importActual<any>("@anthropic-ai/claude-agent-sdk");
+  const { isolatedResolveSettings } = await import("./isolated-settings-resolver.js");
+  return {
+    ...actual,
+    resolveSettings: isolatedResolveSettings,
+  };
+});
 
 describe("SettingsManager", () => {
   let tempDir: string;
