@@ -13831,10 +13831,11 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   // out-of-turn session/update, but many clients stop consuming at the
   // prompt response, so the subagents' remaining output would be dropped
   // and their permission requests would block on an RPC nobody answers. The turn is held open
-  // across the CLI's idle cycles (observed cadence: user result → idle →
-  // subagent works → task_notification → followup turn → idle) and settles
-  // once its subagents are done — at the followup's terminal result, or at
-  // an idle with none of them left.
+  // across the CLI's idle cycles (cadence through CLI 2.1.269: user result →
+  // idle → subagent works → task_notification → followup turn → idle; from
+  // 2.1.270: no idle until the subagent drains) and settles once its
+  // subagents are done — at the followup's terminal result, or at an idle
+  // with none of them left.
 
   function createMockAgent() {
     const mockClient = {
@@ -14014,6 +14015,59 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     const summaryIndex = events.indexOf("chunk:promised summary");
     expect(summaryIndex).toBeGreaterThanOrEqual(0);
     expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.270+ stays `running` while background agents live (verified
+  // live: user result → task_notification → followup result → ONE idle), so
+  // the user result's trailing-idle debt is never paid. It must not linger:
+  // a stale unit would swallow a later un-owed idle (masking issue #825) or
+  // the idle a steered turn settles on. The next transition into `running`
+  // sweeps it.
+  it("settles under the 2.1.270 cadence and sweeps the unpaid idle debt at the next running", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield userEcho(first);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage();
+        // No idle here: the CLI is still `running` for the live subagent.
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle(); // one idle for both results
+        const { value: second } = await iter.next();
+        yield userEcho(second);
+        yield running();
+        yield assistantText("second answer");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const session = () => agent.sessions["test-session"]!;
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    expect(events.indexOf("chunk:promised summary")).toBeGreaterThanOrEqual(0);
+    // Two results, one idle: one unit of debt is left over.
+    await waitFor(() => session().owedTrailingIdles === 1);
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "again" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    // The `running` transition swept the stale unit, so the second turn's
+    // own idle leaves nothing outstanding.
+    await waitFor(() => session().owedTrailingIdles === 0);
     await agent.sessions["test-session"]?.consumer;
   });
 
