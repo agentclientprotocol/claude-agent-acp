@@ -5490,6 +5490,7 @@ export class ClaudeAcpAgent {
                 emittedToolCalls: session.emittedToolCalls,
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
+                suppressToolStarts: session.cancelled,
               },
             )) {
               // sendUpdate records delivery; a subagent stream's chunks carry
@@ -9969,6 +9970,7 @@ export function streamEventToAcpNotifications(
     emittedToolCalls?: Set<string>;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
+    suppressToolStarts?: boolean;
   },
 ): SessionNotification[] {
   const event = message.event;
@@ -9985,6 +9987,19 @@ export function streamEventToAcpNotifications(
   switch (event.type) {
     case "content_block_start": {
       const block = event.content_block;
+      // A cancelled turn's consolidated message path is dropped at the
+      // `session.cancelled` guard below. Apply the same fence to streamed
+      // tool-use starts: late SDK stream events after `session/cancel` otherwise
+      // open ACP tool calls whose matching tool_result terminals are never
+      // forwarded, poisoning clients that track open tools (#1061).
+      if (
+        options?.suppressToolStarts &&
+        (block.type === "tool_use" ||
+          block.type === "server_tool_use" ||
+          block.type === "mcp_tool_use")
+      ) {
+        return [];
+      }
       if (
         streamedToolInputs &&
         (block.type === "tool_use" ||

@@ -13,7 +13,13 @@ import {
   BetaBashCodeExecutionResultBlock,
   BetaBashCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-import { AcpClient, toAcpNotifications, ToolUseCache, Logger } from "../acp-agent.js";
+import {
+  AcpClient,
+  toAcpNotifications,
+  streamEventToAcpNotifications,
+  ToolUseCache,
+  Logger,
+} from "../acp-agent.js";
 import {
   toolUpdateFromToolResult,
   createPostToolUseHook,
@@ -54,6 +60,44 @@ describe("PostToolUse callback ownership", () => {
 
     expect(first).not.toHaveBeenCalled();
     expect(second).toHaveBeenCalledOnce();
+  });
+});
+
+describe("cancelled stream events", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("drops late streamed tool starts after session cancel", () => {
+    const toolUseCache: ToolUseCache = {};
+    const emittedToolCalls = new Set<string>();
+
+    const notifications = streamEventToAcpNotifications(
+      {
+        type: "stream_event",
+        session_id: "provider-session",
+        uuid: "provider-message",
+        parent_tool_use_id: null,
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_cancelled",
+            name: "Bash",
+            input: { command: "sleep 10" },
+          },
+        },
+      } as any,
+      "session-1",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { emittedToolCalls, suppressToolStarts: true },
+    );
+
+    expect(notifications).toEqual([]);
+    expect(toolUseCache).toEqual({});
+    expect(emittedToolCalls.has("toolu_cancelled")).toBe(false);
   });
 });
 
