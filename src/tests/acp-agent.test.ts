@@ -333,6 +333,42 @@ describe("task plan lifecycle", () => {
   });
 });
 
+describe("Claude fork session metadata", () => {
+  it("forwards forkSession while preserving the SDK persistence option", async () => {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const createSession = vi
+      .spyOn(
+        agent as unknown as {
+          createSession: (...args: unknown[]) => Promise<unknown>;
+        },
+        "createSession",
+      )
+      .mockResolvedValue({ sessionId: "child-session" });
+
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            resume: "parent-session",
+            forkSession: true,
+            persistSession: false,
+          },
+        },
+      },
+    } as any);
+
+    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({ cwd: process.cwd() }), {
+      resume: "parent-session",
+      forkSession: true,
+    });
+  });
+});
+
 describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration", () => {
   let child: ReturnType<typeof spawn>;
 
