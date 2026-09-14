@@ -450,7 +450,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     prompt(params: PromptRequest): Promise<PromptResponse>;
   };
 
-  async function setupTestSession(cwd: string): Promise<{
+  async function setupTestSession(
+    cwd: string,
+    extraClientCapabilities: Partial<ClientCapabilities> = {},
+  ): Promise<{
     client: TestClient;
     connection: TestConnection;
     newSessionResponse: NewSessionResponse;
@@ -482,6 +485,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         elicitation: {
           form: {},
         },
+        ...extraClientCapabilities,
       },
     });
 
@@ -602,12 +606,77 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       status: "in_progress",
       _meta: { contextCompaction: { version: 1 } },
     });
-    expect(compactionUpdates.at(-1)).toMatchObject({
+    // The terminal status lands on the compact_result frame; the boundary that
+    // follows only enriches the call with token counts (no status field).
+    const terminal = compactionUpdates.filter((update) => "status" in update && update.status);
+    expect(terminal.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
       status: "completed",
       _meta: { contextCompaction: { version: 1 } },
     });
-  }, 60000);
+    expect(compactionUpdates.at(-1)).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      _meta: { contextCompaction: { version: 1, trigger: "manual" } },
+    });
+  }, 90000);
+
+  it("/compact reports the ACP compaction lifecycle to a capable client", async () => {
+    const { client, connection, newSessionResponse } = await setupTestSession(__dirname, {
+      session: { compaction: {} },
+    });
+
+    for (let i = 0; i < 6; i++) {
+      await connection.prompt({
+        prompt: [{ type: "text", text: `Reply with just the number ${i}.` }],
+        sessionId: newSessionResponse.sessionId,
+      });
+      client.takeReceivedText();
+    }
+
+    await connection.prompt({
+      prompt: [{ type: "text", text: "/compact" }],
+      sessionId: newSessionResponse.sessionId,
+    });
+
+    expect(client.takeReceivedText()).toBe("");
+    const sessionUpdates = client.updates.map((notification) => notification.update);
+    // No legacy synthetic tool call for a client on the compaction contract.
+    expect(
+      sessionUpdates.some(
+        (update) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update._meta?.contextCompaction,
+      ),
+    ).toBe(false);
+    const compactionUpdates = sessionUpdates.filter(
+      (update) => update.sessionUpdate === "compaction_update",
+    );
+    expect(compactionUpdates[0]).toMatchObject({
+      status: "in_progress",
+      _meta: { contextCompaction: { version: 1 } },
+    });
+    const compactionId = compactionUpdates[0].compactionId;
+    expect(compactionUpdates.every((update) => update.compactionId === compactionId)).toBe(true);
+    expect(compactionUpdates.slice(1).every((update) => update.status === "completed")).toBe(true);
+    // The PostCompact hook's summary rides on the terminal update, stripped of
+    // the model's <analysis> block and <summary> tags.
+    const withSummary = compactionUpdates.find((update) => update.summary?.length);
+    expect(withSummary).toBeDefined();
+    const summaryText = withSummary!.summary![0];
+    expect(summaryText.type).toBe("text");
+    const text = summaryText.type === "text" ? summaryText.text : "";
+    expect(text.length).toBeGreaterThan(20);
+    // Tags can legitimately be quoted inside the summary; only the wrapper goes.
+    expect(text.startsWith("<analysis>")).toBe(false);
+    expect(text.startsWith("<summary>")).toBe(false);
+    expect(text.endsWith("</summary>")).toBe(false);
+    // The boundary enriches the entity with token counts.
+    expect(compactionUpdates.at(-1)).toMatchObject({
+      status: "completed",
+      _meta: { contextCompaction: { version: 1, trigger: "manual" } },
+    });
+    expect((compactionUpdates.at(-1)!._meta as any).contextCompaction.preTokens).toBeGreaterThan(0);
+  }, 90000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
   // AskUserQuestion tool is delivered to us through `canUseTool` (not the
@@ -11309,6 +11378,356 @@ describe("assembled assistant text fallback", () => {
         status: "completed",
       }),
     );
+  });
+
+  /** An agent whose client advertises the ACP session-compaction contract. */
+  function compactionCapableAgent() {
+    const capture = createMockAgentWithCapture();
+    (capture.agent as any).clientCapabilities = { session: { compaction: {} } };
+    return capture;
+  }
+
+  function compactingStatus(uuid = "compact-start") {
+    return {
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  function compactResult(
+    result: "success" | "failed",
+    uuid: string,
+    error?: string,
+  ): Record<string, unknown> {
+    return {
+      type: "system",
+      subtype: "status",
+      status: null,
+      compact_result: result,
+      ...(error ? { compact_error: error } : {}),
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  function compactionUpdates(updates: any[]) {
+    return updates
+      .map((notification) => notification.update)
+      .filter((update) => update.sessionUpdate === "compaction_update");
+  }
+
+  function hasSyntheticCompactionToolCall(updates: any[]) {
+    return updates
+      .map((notification) => notification.update)
+      .some(
+        (update) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update._meta?.contextCompaction,
+      );
+  }
+
+  it("emits the ACP compaction lifecycle for a client that advertises session.compaction", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [
+      compactingStatus(),
+      compactResult("success", "compact-completed"),
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "compact-boundary",
+        session_id: "test-session",
+        compact_metadata: {
+          trigger: "manual",
+          pre_tokens: 180000,
+          post_tokens: 12345,
+          duration_ms: 2500,
+        },
+      },
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(compactionUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: {
+          contextCompaction: {
+            version: 1,
+            trigger: "manual",
+            preTokens: 180000,
+            postTokens: 12345,
+            durationMs: 2500,
+          },
+        },
+      },
+    ]);
+    // The synthetic tool call is the fallback for clients without the capability.
+    expect(hasSyntheticCompactionToolCall(updates)).toBe(false);
+    // The compaction entity counts as the turn's delivered output: the result
+    // text (the generated summary) is not forwarded as an agent message.
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("reports a failed compaction through compaction_update and swallows the duplicated stdout", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [
+      compactingStatus(),
+      compactResult("failed", "compact-failed-1", "summary rejected"),
+      compactResult("failed", "compact-failed-2", "summary rejected"),
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "summary rejected",
+        uuid: "compact-local-output",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "additional diagnostic",
+        uuid: "compact-distinct-local-output",
+        session_id: "test-session",
+      },
+      replayedResult("summary rejected"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(compactionUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "failed",
+        error: "summary rejected",
+        _meta: { contextCompaction: { version: 1, error: "summary rejected" } },
+      },
+    ]);
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+  });
+
+  it("closes a compaction the turn abandoned as cancelled, before the prompt settles", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [compactingStatus(), replayedResult(""), idle]);
+
+    let updatesAtSettle: string[] | undefined;
+    const settled = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] })
+      .then(() => {
+        updatesAtSettle = compactionUpdates(updates).map((update) => update.status);
+      });
+    await settled;
+
+    expect(updatesAtSettle).toEqual(["in_progress", "cancelled"]);
+  });
+
+  it("does not open a compaction entity from API compaction stream blocks alone", async () => {
+    // The API block carries no terminal signal; without the CLI's compacting
+    // status there is nothing to close an entity but the turn boundary, which
+    // would misreport a successful compaction as cancelled.
+    const { agent, updates } = compactionCapableAgent();
+    const compactionDelta = (uuid: string, content: string, parentToolUseId: string | null) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: parentToolUseId,
+      uuid,
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "compaction_delta" as const, content, encrypted_content: null },
+      },
+    });
+    injectSession(agent, [
+      compactionDelta("compact-delta-1", "orphan ", null),
+      compactionDelta("compact-delta-2", "text", null),
+      compactingStatus(),
+      // A subagent compacting its own context never touches the root entity.
+      compactionDelta("subagent-delta", "child summary", "toolu_child"),
+      compactionDelta("compact-delta-3", "## Retained", null),
+      compactResult("success", "compact-completed"),
+      replayedResult(""),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const compactionFrames = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "compaction_update" ||
+          update.sessionUpdate === "compaction_summary_chunk",
+      );
+    expect(compactionFrames).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "compact-start",
+        content: { type: "text", text: "## Retained" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+    ]);
+    expect(JSON.stringify(updates)).not.toContain("child summary");
+  });
+
+  it("replays a persisted compaction summary as a completed compaction_update for capable clients", async () => {
+    const framedSummary =
+      "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+      "Summary:\n1. Primary Request and Intent:\n   Count upward.\n\n" +
+      "If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /tmp/session.jsonl\n" +
+      "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
+    const summaryMessage = (uuid: string | undefined) => ({
+      type: "user",
+      uuid,
+      session_id: "test-session",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      isCompactSummary: true,
+      message: { role: "user", content: framedSummary },
+    });
+    const replay = async (capable: boolean, messages: unknown[]) => {
+      const { agent, updates } = capable ? compactionCapableAgent() : createMockAgentWithCapture();
+      agent.sessions["test-session"] = mockSessionState();
+      vi.mocked(getSessionMessages).mockResolvedValueOnce(messages as any);
+      await (agent as any).replaySessionHistory("test-session");
+      return updates.map((notification) => notification.update);
+    };
+
+    expect(await replay(true, [summaryMessage("compact-summary")])).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-summary",
+        status: "completed",
+        summary: [{ type: "text", text: "1. Primary Request and Intent:\n   Count upward." }],
+        _meta: { contextCompaction: { version: 1 } },
+      },
+    ]);
+
+    // Without the capability the transcript text keeps replaying as before.
+    const legacy = await replay(false, [summaryMessage("compact-summary")]);
+    expect(legacy.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+    expect(legacy.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(true);
+
+    // A record without a uuid cannot be an entity; it stays transcript text.
+    const noId = await replay(true, [summaryMessage(undefined)]);
+    expect(noId.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+    expect(noId.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(true);
+
+    // A subagent's own compaction summary is not the root session's entity.
+    const child = await replay(true, [
+      { ...summaryMessage("child-summary"), parent_tool_use_id: "toolu_child" },
+    ]);
+    expect(child.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+
+    // Unrecognized framing: the text stays visible rather than vanishing
+    // behind a summary-less entity.
+    const unknownFraming = await replay(true, [
+      {
+        ...summaryMessage("odd-summary"),
+        message: {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context. Here is what happened:\n\nCounted.",
+        },
+      },
+    ]);
+    expect(unknownFraming.some((update) => update.sessionUpdate === "compaction_update")).toBe(
+      false,
+    );
+    expect(unknownFraming.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(
+      true,
+    );
+  });
+
+  it("ends a dangling replayed audit lane at a compaction summary", async () => {
+    // A Stop-hook audit whose result was never persisted must not hide the
+    // post-compaction history from a client on the compaction contract.
+    const { agent, updates } = compactionCapableAgent();
+    agent.sessions["test-session"] = mockSessionState();
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "audit-marker",
+        session_id: "test-session",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<claude-agent-acp-file-change-audit>report now</claude-agent-acp-file-change-audit>",
+            },
+          ],
+        },
+      },
+      {
+        type: "user",
+        uuid: "compact-summary",
+        session_id: "test-session",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        isCompactSummary: true,
+        message: {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nCounted.",
+        },
+      },
+      {
+        type: "assistant",
+        uuid: "after",
+        session_id: "test-session",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [{ type: "text", text: "Back after compaction." }],
+        },
+      },
+    ] as any);
+
+    await (agent as any).replaySessionHistory("test-session");
+
+    const kinds = updates.map((notification) => notification.update.sessionUpdate);
+    expect(kinds).toContain("compaction_update");
+    expect(messageChunkTexts(updates)).toEqual(["Back after compaction."]);
   });
 
   it("preserves the model response after multiple compactions in one turn", async () => {

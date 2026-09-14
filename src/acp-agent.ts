@@ -211,7 +211,9 @@ import {
 } from "./file-change-audit.js";
 import {
   ContextCompactionLifecycle,
+  clientSupportsCompactionUpdates,
   contextCompactionMetadataFromBoundary,
+  isCompactSummaryMessage,
 } from "./context-compaction.js";
 import {
   applyTaskCreate,
@@ -996,6 +998,9 @@ export type Session = {
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
+  /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
+   *  hand it the retained summary. */
+  contextCompaction?: ContextCompactionLifecycle;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -3193,7 +3198,14 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
     ));
 
-    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
+    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
+      sessionId: params.sessionId,
+      presentation: clientSupportsCompactionUpdates(this.clientCapabilities)
+        ? "compaction_update"
+        : "tool_call",
+      logError: (message, error) => this.logger.error(message, error),
+    });
+    session.contextCompaction = compaction;
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
@@ -3225,7 +3237,9 @@ export class ClaudeAcpAgent {
           update.sessionUpdate === "agent_thought_chunk" ||
           update.sessionUpdate === "user_message_chunk" ||
           update.sessionUpdate === "tool_call" ||
-          update.sessionUpdate === "tool_call_update")
+          update.sessionUpdate === "tool_call_update" ||
+          update.sessionUpdate === "compaction_update" ||
+          update.sessionUpdate === "compaction_summary_chunk")
       ) {
         return;
       }
@@ -4135,11 +4149,11 @@ export class ClaudeAcpAgent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
-                  await compaction.start(message.session_id, message.uuid);
+                  await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
-                  await compaction.finish(message.session_id, message.uuid, "completed");
+                  await compaction.finish(message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
-                  await compaction.finish(message.session_id, message.uuid, "failed", {
+                  await compaction.finish(message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
@@ -4163,7 +4177,6 @@ export class ClaudeAcpAgent {
                 //
                 const compactMetadata = message.compact_metadata;
                 await compaction.finish(
-                  message.session_id,
                   message.uuid,
                   "completed",
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
@@ -4257,7 +4270,7 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    compaction.reset();
+                    await compaction.reset();
                     settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
@@ -4320,7 +4333,7 @@ export class ClaudeAcpAgent {
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
-                    compaction.reset();
+                    await compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -5342,29 +5355,47 @@ export class ClaudeAcpAgent {
               // then, so both branches no-op); cancellation is left to the
               // idle/abort path. settleActive is idempotent, so a duplicate
               // idle is a no-op.
+              //
+              // A result also closes this compaction lifecycle — before the
+              // settle, so a `cancelled` terminal for an entity the runtime
+              // left open lands inside the prompt response rather than after
+              // it (clients may stop consuming at the response). Reset here
+              // rather than at idle: an owed idle from this turn can arrive
+              // after the next turn has already started and must not erase
+              // that turn's compaction state.
+              if (!isAutonomousResult) {
+                await compaction.reset();
+              }
               if (!session.cancelled) {
                 settleOrDefer(turnOutcome(session, stopReason));
               }
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
-                // A result closes this compaction lifecycle. Reset here rather
-                // than at idle: an owed idle from this turn can arrive after
-                // the next turn has already started and must not erase that
-                // turn's compaction state.
-                compaction.reset();
+                // The early exits above (cancelled guard, refusal) skip the
+                // pre-settle reset; idempotent, so a no-op on the normal path.
+                await compaction.reset();
               }
             }
             break;
           }
           case "stream_event": {
-            const isCompactionProgress =
-              (message.event.type === "content_block_start" &&
-                message.event.content_block.type === "compaction") ||
-              (message.event.type === "content_block_delta" &&
-                message.event.delta.type === "compaction_delta");
-            if (isCompactionProgress) {
-              await compaction.heartbeat(message.session_id, message.uuid);
+            // The API's compaction block streams the retained summary text;
+            // `content` is null on the opening block and on a failed compaction.
+            // Only the root conversation's compaction is the session's: a
+            // subagent compacting its own context must not touch it.
+            const compactionBlock =
+              message.parent_tool_use_id !== null
+                ? undefined
+                : message.event.type === "content_block_start" &&
+                    message.event.content_block.type === "compaction"
+                  ? message.event.content_block
+                  : message.event.type === "content_block_delta" &&
+                      message.event.delta.type === "compaction_delta"
+                    ? message.event.delta
+                    : undefined;
+            if (compactionBlock) {
+              await compaction.heartbeat(message.uuid, compactionBlock.content ?? undefined);
             }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
@@ -6399,6 +6430,7 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.consumer = undefined;
+    session.contextCompaction = undefined;
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -6598,6 +6630,7 @@ export class ClaudeAcpAgent {
     let replayingFileChangeAudit = false;
     const replayFileChangeAuditToolUseIds = new Set<string>();
     const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
       string,
@@ -6846,6 +6879,35 @@ export class ClaudeAcpAgent {
         if (replayMessageRole === "user") {
           replayingFileChangeAudit = false;
         } else {
+          continue;
+        }
+      }
+
+      // Claude persists the retained summary as a user message framed with
+      // continuation instructions for the model. Clients on the compaction
+      // contract get it materialized as the completed compaction entity at
+      // this transcript position (the boundary's own system record comes back
+      // from getSessionMessages without its metadata, so the summary message
+      // is the one durable marker); other clients keep the transcript text.
+      // The entity is keyed by the summary message's uuid, which differs from
+      // the live id (the `compacting` status uuid) — replay is terminal-first
+      // by the RFD, and no client merges a replay into a live entity store.
+      // A subagent's own compaction summary is not the root session's, and a
+      // summary whose framing is unrecognized stays visible as transcript
+      // text rather than vanishing behind a summary-less entity.
+      if (
+        replayCompactionUpdates &&
+        isCompactSummaryMessage(message) &&
+        parentToolUseId === null &&
+        typeof message.uuid === "string" &&
+        message.uuid.length > 0
+      ) {
+        const replayCompaction = new ContextCompactionLifecycle(
+          (notification) => this.client.sessionUpdate(notification),
+          { sessionId, presentation: "compaction_update" },
+        );
+        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
+          await replayCompaction.finish(message.uuid, "completed");
           continue;
         }
       }
@@ -8165,6 +8227,26 @@ export class ClaudeAcpAgent {
                     if (!live) return;
                     void this.syncModelAfterExternalSwitch(sessionId, live, toModel);
                   });
+                }
+                return { continue: true };
+              },
+            ],
+          },
+        ],
+        // The retained summary reaches the SDK stream only as the persisted
+        // user message that frames it with model-facing continuation
+        // instructions; the hook carries the raw summary for the ACP
+        // compaction_update. The CLI awaits this hook before emitting the
+        // compaction's terminal frames, so the summary is normally recorded
+        // while the entity is still in progress and rides on the terminal
+        // update. Subagent compactions stay out of the root session's entity.
+        PostCompact: [
+          ...(userProvidedOptions?.hooks?.PostCompact || []),
+          {
+            hooks: [
+              async (input) => {
+                if (input.hook_event_name === "PostCompact" && !input.agent_id) {
+                  this.sessions[sessionId]?.contextCompaction?.recordSummary(input.compact_summary);
                 }
                 return { continue: true };
               },
