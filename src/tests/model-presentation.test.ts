@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { query, type ModelInfo, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { buildModelConfigOption, getAvailableModels } from "../session-model.js";
