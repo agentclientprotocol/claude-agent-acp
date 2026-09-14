@@ -6887,7 +6887,15 @@ describe("stop reason propagation", () => {
       { log: () => {}, error: () => {} },
     );
     (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const priorAssistant = createAssistantError(undefined);
+    priorAssistant.message.usage = {
+      input_tokens: 170000,
+      output_tokens: 910,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    } as any;
     injectSession(agent, [
+      priorAssistant,
       createUsageLimitAssistantError(),
       createResultMessage({
         subtype: "success",
@@ -6912,6 +6920,10 @@ describe("stop reason propagation", () => {
       }),
     );
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
+    const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
+    expect(usageUpdates.at(-1)?.update).toEqual(
+      expect.objectContaining({ used: 170910, size: 200000 }),
+    );
   });
 
   it("preserves live usage-limit prose for clients without typed failures", async () => {

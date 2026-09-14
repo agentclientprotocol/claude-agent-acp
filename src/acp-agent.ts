@@ -5625,11 +5625,17 @@ export class ClaudeAcpAgent {
             // next `result` can emit a usage_update tied to the right context
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
+            // A synthetic spend-limit frame has an all-zero SDK usage object,
+            // but it is an error banner rather than a new model response. Do
+            // not let it erase the most recent real context measurement.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              lastAssistantUsage = snapshotFromUsage(message.message.usage);
-              lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
-              session.contextUsedTokens = lastAssistantTotalUsage;
-              lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
+              const isUsageLimit = isSyntheticUsageLimitMessage(message.message);
+              if (!isUsageLimit || lastAssistantTotalUsage === null) {
+                lastAssistantUsage = snapshotFromUsage(message.message.usage);
+                lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
+                session.contextUsedTokens = lastAssistantTotalUsage;
+              }
+              lastAssistantWasUsageLimit = isUsageLimit;
               if (message.error || lastAssistantWasUsageLimit) {
                 lastAssistantFailureTitle = assistantMessageText(message.message);
               }
