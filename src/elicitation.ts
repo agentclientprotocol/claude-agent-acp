@@ -168,8 +168,9 @@ const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
  *
  * Each question is followed by its own optional free-text "custom answer" field
  * (`question_<n>_custom`), mirroring the CLI's per-question "Other" box: the
- * user can type their own answer instead of (or, for a multi-select question,
- * as well as) picking an option, scoped to that specific question. Nothing is
+ * user can type their own answer instead of picking an option, add it to a
+ * multi-select's picks, or attach it as a note to a single-select's pick (see
+ * `applyAskElicitationResponse`), scoped to that specific question. Nothing is
  * marked required, so the user can also just skip — matching the built-in tool,
  * which always offers Skip + a free-text box.
  */
@@ -214,7 +215,7 @@ export function askUserQuestionsToCreateRequest(
       title: "Other",
       description: question.multiSelect
         ? "Type your own answer to add to your selection above (optional)."
-        : "Type your own answer instead of choosing an option above (optional).",
+        : "Type your own answer, or add a note to the option you chose above (optional).",
       _meta: {
         [CUSTOM_ANSWER_META_KEY]: {
           questionId: questionFieldKey(index),
@@ -264,11 +265,15 @@ function joinMultiSelectAnswer(items: string[]): string {
  * `answers` as a `{ [questionText]: label }` map — the key shape the tool's own
  * `call()` reads — with multi-selects comma-joined in the CLI's own quoted form
  * (see `joinMultiSelectAnswer`). A non-empty per-question custom-answer field
- * (`question_<n>_custom`) replaces the selection of a single-select question,
- * since the user typed their own answer instead of picking one, and joins the
- * selection of a multi-select question, where the two fields are independent
- * and filling both means both. Decline yields empty answers (the model is told
- * the user skipped rather than the turn aborting); cancel — and any
+ * (`question_<n>_custom`) joins the selection of a multi-select question, where
+ * the two fields are independent and filling both means both. For a
+ * single-select question it is the answer when nothing was picked (the user
+ * typed their own instead), and otherwise travels beside the pick as the
+ * tool's own per-question `annotations[question].notes` — the slot the CLI
+ * uses for free text attached to a selection and renders to the model as
+ * `"Q"="A" notes: ...` — so a client that presents the box as a notes field
+ * cannot make the selection disappear. Decline yields empty answers (the model
+ * is told the user skipped rather than the turn aborting); cancel — and any
  * custom/future action we don't understand — aborts the tool call.
  */
 export function applyAskElicitationResponse(
@@ -288,6 +293,7 @@ export function applyAskElicitationResponse(
   // Typed against the tool's own output schema so the answer/response shapes
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
+  const annotations: NonNullable<AskUserQuestionInput["annotations"]> = {};
   questions.forEach((question, index) => {
     const custom = content[questionCustomFieldKey(index)];
     const customText = typeof custom === "string" ? custom.trim() : "";
@@ -300,24 +306,44 @@ export function applyAskElicitationResponse(
           ? value.filter((item) => item !== undefined && item !== null && item !== "").map(String)
           : [String(value)];
 
-    // A single-select question is answered by exactly one thing, so a typed
-    // custom answer replaces the pick: the user wrote their own answer instead
-    // of choosing an option. A multi-select is additive, and the form offers
-    // the selection and the custom box as independent fields — a user who
-    // fills both means both, so the typed answer joins the checked options.
-    const items =
-      customText === "" ? picks : question.multiSelect ? [...picks, customText] : [customText];
-
-    // A single-select normally holds one item; the plain join only matters if a
-    // client hands back an array for it, and then mirrors the old behavior.
-    const text = question.multiSelect ? joinMultiSelectAnswer(items) : items.join(", ");
-    if (text === "") {
+    // A multi-select is additive, and the form offers the selection and the
+    // custom box as independent fields — a user who fills both means both, so
+    // the typed answer joins the checked options.
+    if (question.multiSelect) {
+      const text = joinMultiSelectAnswer(customText === "" ? picks : [...picks, customText]);
+      if (text !== "") {
+        answers[question.question] = text;
+      }
       return;
     }
-    answers[question.question] = text;
+
+    // A single-select question is answered by exactly one thing. With no option
+    // picked, the typed text is that answer (the CLI's "Other"). With an option
+    // picked as well, the pick stays the answer and the text rides along as the
+    // tool's per-question `notes` annotation, so neither is lost. A single-select
+    // normally holds one item; the plain join only matters if a client hands
+    // back an array for it, and then mirrors the old behavior.
+    const picked = picks.join(", ");
+    if (picked === "") {
+      if (customText !== "") {
+        answers[question.question] = customText;
+      }
+      return;
+    }
+    answers[question.question] = picked;
+    if (customText !== "") {
+      annotations[question.question] = { notes: customText };
+    }
   });
 
-  return { action: "answered", updatedInput: { ...toolInput, answers } };
+  return {
+    action: "answered",
+    updatedInput: {
+      ...toolInput,
+      answers,
+      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+    },
+  };
 }
 
 /**

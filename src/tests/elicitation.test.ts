@@ -350,7 +350,23 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
-  it("prefers a single-select question's custom answer over its selection", () => {
+  it("uses a single-select question's custom answer alone when nothing is selected", () => {
+    const response = {
+      action: "accept",
+      content: { question_0_custom: "  my own take  " },
+    } as CreateElicitationResponse;
+
+    expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "my own take" },
+      },
+    });
+  });
+
+  it("keeps a single-select pick and carries its custom text as the tool's notes annotation", () => {
     const response = {
       action: "accept",
       content: { question_0: "A", question_0_custom: "  my own take  " },
@@ -361,7 +377,8 @@ describe("applyAskElicitationResponse", () => {
       updatedInput: {
         questions,
         metadata: { source: "test" },
-        answers: { "Single?": "my own take" },
+        answers: { "Single?": "A" },
+        annotations: { "Single?": { notes: "my own take" } },
       },
     });
   });
