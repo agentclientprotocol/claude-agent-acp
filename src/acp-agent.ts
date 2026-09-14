@@ -4629,10 +4629,18 @@ export class ClaudeAcpAgent {
                 // here would outlive the `auth_required` rejection with no
                 // action to clear it (issue #1072).
                 if (kind === "auth_required") break;
+                // `no_response` (SDK 0.3.261+): the API sent no response headers
+                // within the first-byte window, so this retry waits longer for
+                // them. Say so — "attempt 1 of 1" alone reads like a final
+                // failure, and the wait is what the user is about to sit through.
+                const seconds = (ms: number) => `${Math.max(1, Math.round(ms / 1000))}s`;
+                const noResponse = message.no_response
+                  ? ` No response after ${seconds(message.no_response.waited_ms)}; waiting up to ${seconds(message.no_response.retry_wait_ms)}.`
+                  : "";
                 const title =
                   message.error_status === null
-                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.`
-                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.`;
+                    ? `Reconnecting to Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`
+                    : `Retrying Claude, attempt ${message.attempt} of ${message.max_retries}.${noResponse}`;
                 await publishSessionFailure(kind, { title, severity: "warning" });
                 break;
               }
@@ -7034,6 +7042,8 @@ export class ClaudeAcpAgent {
         title,
         displayName,
         description,
+        defaultToNo,
+        suppressAlwaysAllowRule,
       },
     ) => {
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
@@ -7124,10 +7134,13 @@ export class ClaudeAcpAgent {
       // explicit ask rule). Re-applying bypass in the host would erase that
       // provider safety decision.
 
-      const durableChangeSet = normalizeDurablePermissionChangeSet(
-        suggestions,
-        matchedAskRule !== undefined,
-      );
+      // No persistent "always allow" option when the user's own ask rule forced
+      // the prompt, or when the CLI says the rule it would write grants more
+      // than this ask's own action (`suppressAlwaysAllowRule`, SDK 0.3.268+ —
+      // set on its safety-check asks, e.g. delete-class Bash rulings and
+      // Artifact publishes).
+      const noPersistentRule = matchedAskRule !== undefined || suppressAlwaysAllowRule === true;
+      const durableChangeSet = normalizeDurablePermissionChangeSet(suggestions, noPersistentRule);
       const presentation = buildClaudePermissionPresentation({
         toolName,
         input: toolInput,
@@ -7139,6 +7152,7 @@ export class ClaudeAcpAgent {
         displayName,
         description,
         decisionReason,
+        defaultToNo,
       });
 
       if (parentToolUseId) {
@@ -7153,7 +7167,8 @@ export class ClaudeAcpAgent {
         input: toolInput,
         cwd: session.cwd,
         durableChangeSet,
-        allowPersistentOptions: matchedAskRule === undefined,
+        allowPersistentOptions: !noPersistentRule,
+        defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0

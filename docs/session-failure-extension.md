@@ -113,6 +113,7 @@ Claude SDK conditions map to these groups:
 | Claude condition                                                                         | Category                           |
 | ---------------------------------------------------------------------------------------- | ---------------------------------- |
 | `authentication_failed`, `oauth_org_not_allowed`, synthetic login message                | `access`                           |
+| `verification_required`, `cloud_credential_error`                                        | `access` (no `login` action)       |
 | `billing_error`, `rate_limit`, `max_output_tokens`, usage/spend limit, budget/turn limit | `limit`                            |
 | `invalid_request`, `model_not_found`                                                     | `request`                          |
 | `overloaded`, `server_error`, unknown provider error, adapter internal error             | `service`                          |

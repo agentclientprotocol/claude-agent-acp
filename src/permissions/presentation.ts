@@ -12,6 +12,7 @@ export interface ClaudePermissionPresentationInput {
   displayName?: string;
   description?: string;
   decisionReason?: string;
+  defaultToNo?: boolean;
 }
 
 function humanText(value: unknown, maxLength: number, singleLine = false): string | undefined {
@@ -104,6 +105,10 @@ export function buildClaudePermissionPresentation(
               version: 1,
               title,
               ...(description ? { description } : {}),
+              // The CLI's own hint, forwarded so a client that can pre-select
+              // an option keeps the decline focused; the option order already
+              // leads with the reject options when this is set.
+              ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
             },
           },
         }

@@ -4118,6 +4118,79 @@ describe("canUseTool in bypassPermissions mode", () => {
 
     expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
   });
+
+  // SDK 0.3.268+ hints on the CLI's safety-check asks (delete-class Bash
+  // rulings, Artifact publishes, …): the always-allow rule it would write is
+  // broader than the ask, so no persistent option may be offered; and the ask
+  // must open on its decline option, so the reject options lead.
+  it("offers no always-allow option when the CLI suppresses the persistent rule", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState();
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      suppressAlwaysAllowRule: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
+    expect(request?._meta).toEqual({ permission: { version: 1, title: "Bash" } });
+  });
+
+  it("leads with the reject option and forwards the hint when the CLI defaults to no", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState();
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      defaultToNo: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.kind)).toEqual([
+      "reject_once",
+      "allow_once",
+      "allow_always",
+    ]);
+    expect(request?._meta).toEqual({
+      permission: { version: 1, title: "Bash", defaultToNo: true },
+    });
+    expect(result).toMatchObject({ behavior: "deny" });
+  });
 });
 
 describe("subagent permission attribution (issue #851)", () => {
@@ -6547,6 +6620,52 @@ describe("stop reason propagation", () => {
     );
   });
 
+  it("says how long a no-response retry waited and will wait", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 1,
+        max_retries: 1,
+        retry_delay_ms: 0,
+        error_status: null,
+        error: "unknown",
+        // SDK 0.3.261+: the API sent no response headers within the
+        // first-byte window; the retry waits longer for them.
+        no_response: { waited_ms: 180_000, retry_wait_ms: 600_000 },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "ok",
+      }),
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const warning = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    expect(warning).toEqual(
+      expect.objectContaining({
+        category: "connection",
+        severity: "warning",
+        title:
+          "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
+      }),
+    );
+  });
+
   it("clears a connection retry warning internally after the turn succeeds", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6656,6 +6775,8 @@ describe("stop reason propagation", () => {
   it.each([
     ["billing_error", "limit"],
     ["account_on_hold", "limit"],
+    ["verification_required", "access"],
+    ["cloud_credential_error", "access"],
     ["rate_limit", "limit"],
     ["overloaded", "service"],
     ["invalid_request", "request"],

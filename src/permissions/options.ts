@@ -23,8 +23,12 @@ import {
 export { PERMISSION_OPTION_ID } from "./options/shared.js";
 
 export function buildClaudePermissionOptions(context: PermissionOptionContext): PermissionOption[] {
+  // ACP has no "pre-selected option" field, so option order is the only lever
+  // for the CLI's `defaultToNo` hint ("open on the decline option"): lead with
+  // the reject options instead of the approvals.
+  const order = context.defaultToNo === true ? declineFirstOptionOrder : permissionOptionOrder;
   return buildUnsortedClaudePermissionOptions(context).sort(
-    (left, right) => permissionOptionOrder(left) - permissionOptionOrder(right),
+    (left, right) => order(left) - order(right),
   );
 }
 
@@ -68,6 +72,16 @@ function buildUnsortedClaudePermissionOptions(
     case "Task":
     default:
       return buildFallbackPermissionOptions(context);
+  }
+}
+
+function declineFirstOptionOrder(option: PermissionOption): number {
+  switch (option.kind) {
+    case "reject_once":
+    case "reject_always":
+      return 0;
+    default:
+      return 1 + permissionOptionOrder(option);
   }
 }
 

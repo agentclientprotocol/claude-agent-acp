@@ -53,11 +53,12 @@ The request-level record is placed under `RequestPermissionRequest._meta.permiss
 }
 ```
 
-| Field         | Required | Type             | Meaning                                   |
-| ------------- | -------: | ---------------- | ----------------------------------------- |
-| `version`     |      yes | integer `1`      | Permission presentation schema version.   |
-| `title`       |      yes | non-empty string | The standard tool-call operation title.   |
-| `description` |       no | string           | Temporary diagnostic SDK decision reason. |
+| Field         | Required | Type             | Meaning                                                                                                                                                    |
+| ------------- | -------: | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`     |      yes | integer `1`      | Permission presentation schema version.                                                                                                                    |
+| `title`       |      yes | non-empty string | The standard tool-call operation title.                                                                                                                    |
+| `description` |       no | string           | Temporary diagnostic SDK decision reason.                                                                                                                  |
+| `defaultToNo` |       no | `true`           | The ask must not be approvable by a stray keystroke; the reject options are listed first and a client that pre-selects an option should focus the decline. |
 
 The permission title normally duplicates `toolCall.title`: one operation has one heading across the
 tool card and approval UI. `ExitPlanMode` is the deliberate exception and uses the action-oriented

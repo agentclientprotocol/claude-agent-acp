@@ -29,6 +29,26 @@ describe("Claude permission options and response mapping", () => {
       contextUsedPercent,
     });
 
+  it("leads with the reject options when the CLI defaults the ask to no", () => {
+    const changeSet = normalizeDurablePermissionChangeSet([
+      { type: "addRules", rules: [rule], behavior: "allow", destination: "localSettings" },
+    ]);
+    const context = {
+      toolName: "Bash",
+      input: { command: "npm test" },
+      cwd: "/workspace",
+      durableChangeSet: changeSet,
+    };
+    expect(buildClaudePermissionOptions(context).map((option) => option.kind)).toEqual([
+      "allow_once",
+      "allow_always",
+      "reject_once",
+    ]);
+    expect(
+      buildClaudePermissionOptions({ ...context, defaultToNo: true }).map((option) => option.kind),
+    ).toEqual(["reject_once", "allow_once", "allow_always"]);
+  });
+
   it("builds the native Bash static-suggestions option from the exact update bundle", () => {
     const changeSet = normalizeDurablePermissionChangeSet([
       { type: "addRules", rules: [rule], behavior: "allow", destination: "session" },
