@@ -422,6 +422,9 @@ function failedControlFallback(
         ...terminal.update,
         sessionUpdate: "tool_call",
         status: "failed",
+        // The synthesized tool_call is this call's first report, so give it
+        // the standard `name` the initial one would have carried.
+        ...(typeof claudeMeta?.toolName === "string" ? { name: claudeMeta.toolName } : {}),
         title:
           typeof terminal.update.title === "string" && terminal.update.title.length > 0
             ? terminal.update.title

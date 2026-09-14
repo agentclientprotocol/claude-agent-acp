@@ -71,7 +71,9 @@ with `Reason: `. The SDK `description` operation subtitle is not copied there.
 
 The permission request carries the same standard ACP tool information used for normal tool updates:
 
-- `name`, `kind`, `title`, `content`, and `locations` come from `toolInfoFromToolUse`;
+- `name` is the SDK tool name (for example `Read` or `mcp__server__tool`), matching the standard
+  `name` field on the initial `tool_call` update;
+- `kind`, `title`, `content`, and `locations` come from `toolInfoFromToolUse`;
 - `status` is `pending`;
 - `rawInput` is the original SDK input object;
 - `blockedPath` is appended to `locations` when it is valid and not already present;

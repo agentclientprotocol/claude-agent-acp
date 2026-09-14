@@ -3420,6 +3420,50 @@ describe("Skill tool rendering", () => {
     });
   });
 
+  // ACP tool-call-name RFD: the initial tool_call carries the programmatic
+  // tool name as the standard `name` field, alongside `_meta.claudeCode.toolName`.
+  describe("standard `name` on tool_call notifications", () => {
+    it.each([
+      ["Read", { file_path: "/tmp/a.ts" }],
+      ["Bash", { command: "ls" }],
+      ["mcp__github__list_issues", { repo: "acp" }],
+    ])("reports %s as `name` on the initial tool_call", (name, input) => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_name", name, input }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_name",
+        name,
+        _meta: { claudeCode: { toolName: name } },
+      });
+    });
+
+    it("does not re-send `name` on the refining tool_call_update", () => {
+      const notifications = toAcpNotifications(
+        [
+          { type: "tool_use", id: "toolu_refine", name: "Read", input: { file_path: "/tmp/a" } },
+        ] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+        { emittedToolCalls: new Set(["toolu_refine"]) },
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_refine",
+      });
+      expect((notifications[0]?.update as any).name).toBeUndefined();
+    });
+  });
+
   describe("_meta.claudeCode.skillPath", () => {
     const skillMeta = (skill: string, cwd?: string) =>
       (

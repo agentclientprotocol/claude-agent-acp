@@ -140,6 +140,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
       update: {
         sessionUpdate: "tool_call",
         toolCallId: "agent-tool",
+        name: "Agent",
         title: "Agent",
         status: "failed",
         _meta: { claudeCode: { toolName: "Agent" } },
