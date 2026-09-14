@@ -96,6 +96,48 @@ describe("createSession options merging", () => {
     agent = new ClaudeAcpAgent(createMockClient());
   });
 
+  for (const method of ["resumeSession", "loadSession"] as const) {
+    for (const limit of ["maxTurns", "maxBudgetUsd"] as const) {
+      it(`${method} applies added, tightened and removed ${limit} to the SDK query`, async () => {
+        const cwd = process.cwd();
+        const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+        for (const value of [10, 1, undefined]) {
+          const previousOptions = capturedOptions;
+          await agent[method]({
+            sessionId,
+            cwd,
+            mcpServers: [],
+            _meta: { claudeCode: { options: { [limit]: value } } },
+          });
+
+          expect(capturedOptions).not.toBe(previousOptions);
+          expect(capturedOptions?.[limit]).toBe(value);
+          expect(capturedOptions?.resume).toBe(sessionId);
+        }
+      });
+    }
+
+    it(`${method} reuses the SDK query when execution limits are unchanged`, async () => {
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxTurns: 10, maxBudgetUsd: 1 } } },
+      });
+      const previousOptions = capturedOptions;
+
+      await agent[method]({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { maxBudgetUsd: 1, maxTurns: 10 } } },
+      });
+
+      expect(capturedOptions).toBe(previousOptions);
+    });
+  }
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: process.cwd(),

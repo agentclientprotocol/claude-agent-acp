@@ -1141,14 +1141,22 @@ function disarmForceCancel(session: Session): void {
 
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
- *  recreating the underlying Query process.  MCP servers are sorted by name
- *  so that ordering differences don't trigger unnecessary recreations. */
+ *  recreating the underlying Query process. Execution limits are Query options,
+ *  so a warm resume must not silently keep the previous values. MCP servers
+ *  are sorted by name so ordering differences don't trigger recreations. */
 function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  return JSON.stringify({ cwd: params.cwd, mcpServers: servers });
+  const options = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
+  return JSON.stringify({
+    cwd: params.cwd,
+    mcpServers: servers,
+    maxTurns: options?.maxTurns,
+    maxBudgetUsd: options?.maxBudgetUsd,
+  });
 }
 
 export type SDKMessageFilter = {
