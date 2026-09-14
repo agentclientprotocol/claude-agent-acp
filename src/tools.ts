@@ -1400,14 +1400,37 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
 
   const content: ToolCallContent[] = [];
   const locations: ToolCallLocation[] = [];
+  let previousOldEnd = 0;
+  let previousNewEnd = 0;
+  let coordinatesRemainOrdered = true;
 
-  for (const { lines, newStart, oldLines, newLines } of response.structuredPatch) {
+  for (const { lines, oldStart, newStart, oldLines, newLines } of response.structuredPatch) {
     const oldText: string[] = [];
     const newText: string[] = [];
     let added = 0;
     let removed = 0;
     let validPrefixes = true;
-    for (const line of lines) {
+    let validEofMarkers = true;
+    const validCoordinates: boolean =
+      coordinatesRemainOrdered &&
+      Number.isSafeInteger(oldStart) &&
+      Number.isSafeInteger(newStart) &&
+      Number.isSafeInteger(oldLines) &&
+      Number.isSafeInteger(newLines) &&
+      oldStart >= (oldLines === 0 ? 0 : 1) &&
+      newStart >= (newLines === 0 ? 0 : 1) &&
+      oldLines >= 0 &&
+      newLines >= 0 &&
+      Number.isSafeInteger(oldStart + oldLines) &&
+      Number.isSafeInteger(newStart + newLines) &&
+      oldStart >= previousOldEnd &&
+      newStart >= previousNewEnd;
+    coordinatesRemainOrdered = validCoordinates;
+    if (validCoordinates) {
+      previousOldEnd = oldStart + oldLines;
+      previousNewEnd = newStart + newLines;
+    }
+    for (const [index, line] of lines.entries()) {
       if (line.startsWith("-")) {
         oldText.push(line.slice(1));
         removed++;
@@ -1415,6 +1438,15 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
         newText.push(line.slice(1));
         added++;
       } else if (line === "\\ No newline at end of file") {
+        const previousLine = lines[index - 1];
+        if (
+          typeof previousLine !== "string" ||
+          (!previousLine.startsWith("-") &&
+            !previousLine.startsWith("+") &&
+            !previousLine.startsWith(" "))
+        ) {
+          validEofMarkers = false;
+        }
         continue;
       } else {
         if (!line.startsWith(" ")) validPrefixes = false;
@@ -1429,7 +1461,11 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
         path: response.filePath,
         oldText: oldText.join("\n") || null,
         newText: newText.join("\n"),
-        ...(validPrefixes && oldText.length === oldLines && newText.length === newLines
+        ...(validCoordinates &&
+        validPrefixes &&
+        validEofMarkers &&
+        oldText.length === oldLines &&
+        newText.length === newLines
           ? { _meta: withAirMeta(undefined, AIR_DIFF_STATS_KEY, { version: 1, added, removed }) }
           : {}),
       });

@@ -21,7 +21,8 @@ The extension carries no navigation position.
 For `Edit` and `Write`, the adapter counts operations while it builds diff texts from the SDK's `structuredPatch`.
 Each hunk produces one block with its own counts. The adapter does not compare or scan the full file texts for statistics.
 
-When a patch has inconsistent line counts or unsupported prefixes, the adapter omits the statistics.
+When a patch has unsafe or unordered coordinates, inconsistent line counts, misplaced EOF markers,
+or unsupported prefixes, the adapter omits the statistics.
 Empty patches, initial tool inputs, and history without structured patches retain their existing behavior.
 They provide no statistics because the adapter has no patch operations to count.
 AIR uses its existing comparison when statistics are absent.

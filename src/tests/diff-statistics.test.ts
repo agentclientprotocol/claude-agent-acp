@@ -80,6 +80,13 @@ describe("diff statistics", () => {
     { oldLines: 1, newLines: 2, lines: ["-old", "+new"] },
     { oldLines: 1, newLines: 1, lines: ["?unsupported"] },
     { oldLines: "1", newLines: 1, lines: ["-old", "+new"] },
+    { oldStart: -1, oldLines: 1, newLines: 1, lines: ["-old", "+new"] },
+    { newStart: Number.NaN, oldLines: 1, newLines: 1, lines: ["-old", "+new"] },
+    {
+      oldLines: 1,
+      newLines: 1,
+      lines: ["\\ No newline at end of file", "-old", "+new"],
+    },
   ])("omits statistics for an inconsistent patch: %j", (hunk) => {
     const result = toolUpdateFromDiffToolResponse({
       filePath: "/file.ts",
@@ -88,5 +95,18 @@ describe("diff statistics", () => {
 
     expect(result.content).toHaveLength(1);
     expect(result.content?.[0]).not.toHaveProperty("_meta");
+  });
+
+  it("omits statistics once hunk coordinates stop increasing", () => {
+    const result = toolUpdateFromDiffToolResponse({
+      filePath: "/file.ts",
+      structuredPatch: [
+        { oldStart: 10, oldLines: 1, newStart: 10, newLines: 1, lines: ["-old", "+new"] },
+        { oldStart: 5, oldLines: 1, newStart: 5, newLines: 1, lines: ["-old", "+new"] },
+      ],
+    });
+
+    expect(result.content?.[0]).toHaveProperty("_meta");
+    expect(result.content?.[1]).not.toHaveProperty("_meta");
   });
 });
