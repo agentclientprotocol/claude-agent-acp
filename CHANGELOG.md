@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.77.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.76.0...v0.77.0) (2026-09-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* claudeCode.options.agent is no longer forwarded to Claude Code, and the agent-picker exports DEFAULT_AGENT_ID, AGENT_CONFIG_ID, BUILTIN_AGENT_NAMES, and discoverCustomAgents are removed. Consumers relying on main-thread agent selection must stop passing that option.
+
+### Features
+
+* Add tool names to tool calls ([#1128](https://github.com/agentclientprotocol/claude-agent-acp/issues/1128)) ([67c7c9b](https://github.com/agentclientprotocol/claude-agent-acp/commit/67c7c9b117af7464fd5d583f719bf6214a5508a8))
+* **deps:** Bump @anthropic-ai/claude-agent-sdk to 0.3.270 ([#1123](https://github.com/agentclientprotocol/claude-agent-acp/issues/1123)) ([d3205ab](https://github.com/agentclientprotocol/claude-agent-acp/commit/d3205ab11f873f58e50dddbf13f6d7c555a9f478))
+
+
+### Bug Fixes
+
+* keep multi-select answers when a custom answer is typed ([#1031](https://github.com/agentclientprotocol/claude-agent-acp/issues/1031)) ([1a4512c](https://github.com/agentclientprotocol/claude-agent-acp/commit/1a4512c71199709f6c59bd56c2c67aba63fe243d))
+* parse TaskList output without ambiguous regex ([#1006](https://github.com/agentclientprotocol/claude-agent-acp/issues/1006)) ([b274923](https://github.com/agentclientprotocol/claude-agent-acp/commit/b274923ef84a5a39b4ab3d12b3d10a8fa23f51f6))
+* strip injected system reminders from replayed prompts ([#1040](https://github.com/agentclientprotocol/claude-agent-acp/issues/1040)) ([15ba608](https://github.com/agentclientprotocol/claude-agent-acp/commit/15ba608a79b2cdfdb94c04ce1ebe03cfdae2fb51))
+
+
+### Code Refactoring
+
+* remove agent config option ([#1112](https://github.com/agentclientprotocol/claude-agent-acp/issues/1112)) ([6b7473b](https://github.com/agentclientprotocol/claude-agent-acp/commit/6b7473b1afb48fbf0cb3b463d576a89a73ddf7a3))
+
 ## [0.76.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.75.1...v0.76.0) (2026-09-09)
 
 
