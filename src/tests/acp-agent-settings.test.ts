@@ -262,6 +262,37 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.modes.currentModeId).toBe("default");
   });
 
+  it("honors the host opt-out from bypassPermissions", async () => {
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }),
+    );
+    const projectDir = path.join(tempDir, "project");
+    await fs.promises.mkdir(projectDir, { recursive: true });
+
+    const { getCapturedOptions } = mockQuery();
+
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+    (agent as any).logger = { log: () => {}, error: () => {} };
+
+    const response = await (agent as any).createSession({
+      cwd: projectDir,
+      mcpServers: [],
+      _meta: {
+        disableBuiltInTools: true,
+        claudeCode: { options: { allowDangerouslySkipPermissions: false } },
+      },
+    });
+
+    expect(getCapturedOptions().allowDangerouslySkipPermissions).toBe(false);
+    expect(getCapturedOptions().permissionMode).toBe("default");
+    expect(response.modes.currentModeId).toBe("default");
+    expect(response.modes.availableModes.map((mode: { id: string }) => mode.id)).not.toContain(
+      "bypassPermissions",
+    );
+  });
+
   it("defaults to 'default' when no permissions.defaultMode is set", async () => {
     const projectDir = path.join(tempDir, "project");
     await fs.promises.mkdir(projectDir, { recursive: true });

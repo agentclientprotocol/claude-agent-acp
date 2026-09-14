@@ -1,10 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Logger } from "../acp-agent.js";
-import {
-  ALLOW_BYPASS,
-  resolveAllowDangerouslySkipPermissions,
-  resolvePermissionMode,
-} from "../permissions/modes.js";
+import { resolvePermissionMode } from "../permissions/modes.js";
 
 function mockLogger() {
   const error = vi.fn<(...args: any[]) => void>();
@@ -12,18 +8,6 @@ function mockLogger() {
   const logger: Logger = { log, error };
   return { logger, error, log };
 }
-
-describe("resolveAllowDangerouslySkipPermissions", () => {
-  it("returns false when the host explicitly opts out", () => {
-    expect(resolveAllowDangerouslySkipPermissions(false)).toBe(false);
-  });
-
-  it("defaults to ALLOW_BYPASS when omitted or true", () => {
-    expect(resolveAllowDangerouslySkipPermissions()).toBe(ALLOW_BYPASS);
-    expect(resolveAllowDangerouslySkipPermissions(undefined)).toBe(ALLOW_BYPASS);
-    expect(resolveAllowDangerouslySkipPermissions(true)).toBe(ALLOW_BYPASS);
-  });
-});
 
 describe("resolvePermissionMode", () => {
   it("returns 'default' when no mode is provided", () => {
@@ -36,14 +20,20 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("acceptEdits")).toBe("acceptEdits");
     expect(resolvePermissionMode("dontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("plan")).toBe("plan");
-    expect(resolvePermissionMode("bypassPermissions")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypassPermissions", console, true)).toBe("bypassPermissions");
   });
 
   it("resolves case-insensitive aliases", () => {
     expect(resolvePermissionMode("DontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("DONTASK")).toBe("dontAsk");
     expect(resolvePermissionMode("AcceptEdits")).toBe("acceptEdits");
-    expect(resolvePermissionMode("bypass")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypass", console, true)).toBe("bypassPermissions");
+  });
+
+  it("clamps bypassPermissions to 'default' and logs when bypass is not allowed", () => {
+    const { logger, error } = mockLogger();
+    expect(resolvePermissionMode("bypassPermissions", logger, false)).toBe("default");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("bypassPermissions"));
   });
 
   it("resolves 'manual' as an alias for 'default'", () => {

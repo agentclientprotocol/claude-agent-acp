@@ -98,77 +98,13 @@ describe("createSession options merging", () => {
   });
 
   describe("allowDangerouslySkipPermissions", () => {
-    it("requests bypass capability by default", async () => {
-      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
-
-      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(ALLOW_BYPASS);
-    });
-
-    it("honors explicit allowDangerouslySkipPermissions: false", async () => {
-      const response = await agent.newSession({
-        cwd: process.cwd(),
-        mcpServers: [],
-        _meta: {
-          claudeCode: {
-            options: { allowDangerouslySkipPermissions: false },
-          },
-        },
-      });
-
-      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(false);
-      expect(response.modes.availableModes.map((mode) => mode.id)).not.toContain(
-        "bypassPermissions",
-      );
-    });
-
-    it("still offers bypassPermissions when capability is not opted out", async () => {
-      if (!ALLOW_BYPASS) return;
-
+    it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(true);
-      expect(response.modes.availableModes.map((mode) => mode.id)).toContain("bypassPermissions");
-    });
-
-    it("clamps bypassPermissions default mode when the host opts out", async () => {
-      const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-bypass-opt-out-"));
-      const originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
-      process.env.CLAUDE_CONFIG_DIR = configDir;
-      fs.writeFileSync(
-        path.join(configDir, "settings.json"),
-        JSON.stringify({ permissions: { defaultMode: "bypassPermissions" } }),
+      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(ALLOW_BYPASS);
+      expect(response.modes!.availableModes.some((mode) => mode.id === "bypassPermissions")).toBe(
+        ALLOW_BYPASS,
       );
-
-      vi.resetModules();
-      const acpAgent = await import("../acp-agent.js");
-      const localAgent = new acpAgent.ClaudeAcpAgent(createMockClient());
-      const errorSpy = vi.fn();
-      (localAgent as any).logger = { log: () => {}, error: errorSpy };
-
-      try {
-        const response = await localAgent.newSession({
-          cwd: process.cwd(),
-          mcpServers: [],
-          _meta: {
-            claudeCode: {
-              options: { allowDangerouslySkipPermissions: false },
-            },
-          },
-        });
-
-        expect(capturedOptions!.permissionMode).toBe("default");
-        expect(response.modes.currentModeId).toBe("default");
-        expect(errorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("allowDangerouslySkipPermissions was disabled"),
-        );
-      } finally {
-        if (originalClaudeConfigDir !== undefined) {
-          process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
-        } else {
-          delete process.env.CLAUDE_CONFIG_DIR;
-        }
-        fs.rmSync(configDir, { recursive: true, force: true });
-      }
     });
   });
 

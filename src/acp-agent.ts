@@ -161,10 +161,7 @@ import {
 import { forkSession } from "./fork-session.js";
 import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import {
-  resolveAllowDangerouslySkipPermissions,
-  resolvePermissionMode,
-} from "./permissions/modes.js";
+import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
@@ -1169,11 +1166,6 @@ export type NewSessionMeta = {
      *   - permissionMode
      *   - canUseTool
      *   - executable
-     * `allowDangerouslySkipPermissions` may be set to `false` to opt out of
-     * requesting the bypass capability (`--allow-dangerously-skip-permissions`).
-     * When omitted, the adapter enables it on non-root sessions. Setting it to
-     * `true` does not override root/sandbox policy. Opting out is separate from
-     * entering `bypassPermissions` mode.
      * The `agent` parameter is also ignored: main-thread agent selection is not
      * part of this adapter's ACP contract.
      * Those parameters will be used and updated to work with ACP:
@@ -1181,6 +1173,8 @@ export type NewSessionMeta = {
      *   - mcpServers (merged with ACP's mcpServers)
      *   - disallowedTools (merged with ACP's disallowedTools)
      *   - tools (passed through; defaults to claude_code preset if not provided)
+     *   - allowDangerouslySkipPermissions (set to `false` to remove bypassPermissions
+     *     from this session; repeat it on session/load. `true` cannot override root)
      */
     options?: Options;
     /**
@@ -7874,21 +7868,17 @@ export class ClaudeAcpAgent {
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
-    const allowDangerouslySkipPermissions = resolveAllowDangerouslySkipPermissions(
-      sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions,
-    );
+    // Bypass is off for root outside a sandbox, and hosts may opt a session out.
+    // Decided once here: it gates the SDK flag, the spawn-time mode (the SDK
+    // rejects bypassPermissions without the flag), and the mode catalog.
+    const allowBypass =
+      ALLOW_BYPASS && sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
-    const permissionMode = resolvePermissionMode(
-      settingsManager.getSettings().permissions?.defaultMode,
+    const initialPermissionMode = resolvePermissionMode(
+      creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
       this.logger,
+      allowBypass,
     );
-    let initialPermissionMode = creationOpts.permissionMode ?? permissionMode;
-    if (initialPermissionMode === "bypassPermissions" && !allowDangerouslySkipPermissions) {
-      this.logger.error(
-        "Ignoring bypassPermissions: allowDangerouslySkipPermissions was disabled by the host.",
-      );
-      initialPermissionMode = "default";
-    }
 
     const userProvidedOptions = sessionMeta?.claudeCode?.options
       ? { ...sessionMeta.claudeCode.options }
@@ -8035,9 +8025,7 @@ export class ClaudeAcpAgent {
           ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
           : {}),
       },
-      // Request bypass capability unless the host explicitly opted out. Root
-      // sessions still cannot enable it (see resolveAllowDangerouslySkipPermissions).
-      allowDangerouslySkipPermissions,
+      allowDangerouslySkipPermissions: allowBypass,
       permissionMode: initialPermissionMode,
       canUseTool: this.canUseTool(sessionId),
       // Forward MCP elicitation requests onto ACP elicitation. Only attached
@@ -8299,7 +8287,7 @@ export class ClaudeAcpAgent {
         requestedMode: initialPermissionMode,
         currentModelInfo,
         currentModelId: models.currentModelId,
-        allowBypassCapability: allowDangerouslySkipPermissions,
+        allowBypass,
       });
       timing.phase("modes");
 

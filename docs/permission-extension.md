@@ -161,6 +161,11 @@ The session exposes the Claude modes available for the current model using Claud
 internal `dontAsk` SDK mode is accepted from settings for compatibility but is not advertised as a
 user-selectable mode.
 
+Hosts can remove `Bypass permissions` from a session by sending
+`_meta.claudeCode.options.allowDangerouslySkipPermissions: false` on `session/new` (and again on
+`session/load`); the mode leaves the catalog and a `bypassPermissions` settings default clamps to
+`default`.
+
 The ACP mode ids are the Claude SDK wire ids: `default`, `acceptEdits`, `plan`, `auto`, and
 `bypassPermissions`. `Manual` deliberately retains the SDK id `default`; `manual` is only a settings
 input alias. The adapter does not invent parallel ids for presentation labels.

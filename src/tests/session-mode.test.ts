@@ -129,7 +129,7 @@ describe("session mode", () => {
       query: { setPermissionMode },
       requestedMode: "default",
       currentModelId: "opus",
-      allowBypassCapability: false,
+      allowBypass: false,
     });
 
     expect(result.modes.availableModes.map((mode) => mode.id)).not.toContain("bypassPermissions");
@@ -143,6 +143,7 @@ describe("session mode", () => {
       requestedMode: "auto",
       currentModelInfo: { value: "haiku", displayName: "Haiku", description: "" },
       currentModelId: "haiku",
+      allowBypass: true,
     });
 
     expect(result.modes.currentModeId).toBe("acceptEdits");
