@@ -579,6 +579,10 @@ type Turn = {
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** Set while the terminal checkpoint preview is in flight. The consumer can
+   *  observe another terminal signal during that bounded await; only the first
+   *  one may continue into settlement. */
+  settling?: boolean;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -3416,7 +3420,7 @@ export class ClaudeAcpAgent {
      *  a stamp naming an orphaned command consumes the result outright, and a
      *  stamp naming anything else positively refutes "this is a dead turn's
      *  result", so the dup-over-loss one-skip must not eat it. */
-    const ensureActiveTurn = (resultUserMessageUuid?: string) => {
+    const ensureActiveTurn = async (resultUserMessageUuid?: string) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -3438,7 +3442,7 @@ export class ClaudeAcpAgent {
         // promoted command's own delivery decision is not judged against the
         // held turn's followup text (issue #453) — the caller snapshots the
         // flag AFTER this runs.
-        settleActive(session.activeTurn.deferredSettle);
+        await settleActive(session.activeTurn.deferredSettle);
       }
       // Orphan accounting runs BEFORE the head check: an orphan's echo-less
       // result can arrive with an EMPTY queue (the common post-cancel
@@ -3604,10 +3608,10 @@ export class ClaudeAcpAgent {
     /** Settle the active turn's stored deferred outcome once none of its
      *  spawned subagents is live. The single drain rule shared by the
      *  followup-result and idle settle sites, so the two lanes can't drift. */
-    const settleDeferredIfDrained = () => {
+    const settleDeferredIfDrained = async () => {
       const turn = session.activeTurn;
       if (isHeldOpen(turn) && !turnAwaitingSubagents(turn)) {
-        settleActive(turn.deferredSettle);
+        await settleActive(turn.deferredSettle);
       }
     };
 
@@ -3617,7 +3621,7 @@ export class ClaudeAcpAgent {
      *  turn that can have spawned subagents must route through here: a site
      *  calling settleActive directly bypasses the hold and re-opens the
      *  out-of-turn permission deadlock (issue #866) through its lane. */
-    const settleOrDefer = (outcome: PromptResponse) => {
+    const settleOrDefer = async (outcome: PromptResponse) => {
       // No result ends a steered turn: the steer aborted the cycle this result
       // may belong to, and the steered one is still to come. Record the outcome
       // for the idle lane (see Turn.steeredEchoes); later cycles overwrite it,
@@ -3633,21 +3637,29 @@ export class ClaudeAcpAgent {
       ) {
         session.activeTurn.deferredSettle = outcome;
       } else {
-        settleActive(outcome);
+        await settleActive(outcome);
       }
     };
 
-    /** Settle the active turn's deferred exactly once, disarm the force-cancel
-     *  backstop (the turn is over), and drop it from the queue. */
-    const settleActive = (
+    /** At the actual turn boundary, preview its checkpoint, settle the active
+     *  turn exactly once, disarm the force-cancel backstop, and drop it from
+     *  the queue. Cancellation and provider failures skip checkpoint I/O. */
+    const settleActive = async (
       result: PromptResponse,
       reportReason: FileChangeReportUnavailableReason = result.stopReason === "cancelled"
         ? "cancelled"
         : "notReported",
     ) => {
       const turn = session.activeTurn;
-      if (!turn || turn.settled) {
+      if (!turn || turn.settled || turn.settling) {
         return;
+      }
+      turn.settling = true;
+      if (reportReason === "notReported") {
+        await session.fileChangeReporter?.report(turn, session.query);
+        // cancel() can settle a held turn while the bounded checkpoint preview
+        // is in flight. Its cancellation outcome wins; never settle twice.
+        if (turn.settled || session.activeTurn !== turn) return;
       }
       session.fileChangeReporter?.finish(turn.fileChangeReport, reportReason);
       // Captured before the settled flip below (isHeldOpen tests !settled).
@@ -3756,7 +3768,10 @@ export class ClaudeAcpAgent {
         return;
       }
       sessionFailures.recordActive(failure);
-      settleActive(turnOutcome(session, "end_turn", sessionFailureMeta(failure)), "providerError");
+      await settleActive(
+        turnOutcome(session, "end_turn", sessionFailureMeta(failure)),
+        "providerError",
+      );
     };
 
     /** Reject every in-flight turn — used when the stream dies. */
@@ -3859,7 +3874,7 @@ export class ClaudeAcpAgent {
               this.trackOrphanCommand(session, active.promptUuid, "started");
             }
           }
-          settleActive(turnOutcome(session, "cancelled"));
+          await settleActive(turnOutcome(session, "cancelled"));
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
           // streamed text can't suppress the next turn's issue-#453 fallback.
@@ -3922,7 +3937,7 @@ export class ClaudeAcpAgent {
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
           );
-          settleActive(
+          await settleActive(
             session.cancelled
               ? turnOutcome(session, "cancelled")
               : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
@@ -4225,7 +4240,7 @@ export class ClaudeAcpAgent {
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
                     await compaction.reset();
-                    settleActive(turnOutcome(session, "cancelled"));
+                    await settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
                     // delivery stretch here: idle is the SDK's authoritative
@@ -4250,7 +4265,7 @@ export class ClaudeAcpAgent {
                     if (session.owedTrailingIdles > 0) {
                       session.owedTrailingIdles--;
                     }
-                    settleDeferredIfDrained();
+                    await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -4280,7 +4295,7 @@ export class ClaudeAcpAgent {
                       steered.deferredSettle = steered.steeredSettle;
                       steered.steeredEchoes = undefined;
                       steered.steeredSettle = undefined;
-                      settleDeferredIfDrained();
+                      await settleDeferredIfDrained();
                     }
                   } else if (
                     !session.cancelled &&
@@ -4804,7 +4819,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                ensureActiveTurn(message.user_message_uuid);
+                await ensureActiveTurn(message.user_message_uuid);
                 // Once the submitted goal command has produced its own result,
                 // no older runtime update can still precede it in the ordered
                 // SDK stream. Stop suppressing updates even when this runtime
@@ -4999,7 +5014,7 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
-                settleDeferredIfDrained();
+                await settleDeferredIfDrained();
                 // With no turn in flight OR QUEUED (also after the settle
                 // above), the stretch holds only autonomous prose — close
                 // it, so a replayed next prompt isn't silently suppressed by
@@ -5088,7 +5103,7 @@ export class ClaudeAcpAgent {
                   return;
                 }
                 stopReason = "cancelled";
-                settleOrDefer(turnOutcome(session, "cancelled"));
+                await settleOrDefer(turnOutcome(session, "cancelled"));
                 break;
               }
               if (pendingExitPlanModeInterruption) {
@@ -5116,13 +5131,12 @@ export class ClaudeAcpAgent {
                   });
                 }
                 stopReason = "refusal";
-                await session.fileChangeReporter?.report(session.activeTurn, session.query);
                 // Through the deferral gate, not settleActive: a refusal can
                 // land on a turn whose spawned subagents are still live, and
                 // settling it out from under them would strand their output
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
-                settleOrDefer(turnOutcome(session, "refusal"));
+                await settleOrDefer(turnOutcome(session, "refusal"));
                 break;
               }
 
@@ -5136,7 +5150,7 @@ export class ClaudeAcpAgent {
                 isSteering(session.activeTurn) &&
                 session.activeTurn.steeredEchoes.size > 0
               ) {
-                settleOrDefer(turnOutcome(session, "end_turn"));
+                await settleOrDefer(turnOutcome(session, "end_turn"));
                 break;
               }
 
@@ -5322,13 +5336,7 @@ export class ClaudeAcpAgent {
                 await compaction.reset();
               }
               if (!session.cancelled) {
-                // A steered result belongs to an interrupted intermediate
-                // cycle; its replacement cycle will report the checkpoint at
-                // the actual turn boundary.
-                if (!isSteering(session.activeTurn)) {
-                  await session.fileChangeReporter?.report(session.activeTurn, session.query);
-                }
-                settleOrDefer(turnOutcome(session, stopReason));
+                await settleOrDefer(turnOutcome(session, stopReason));
               }
             } finally {
               if (!isAutonomousResult) {
@@ -5538,7 +5546,7 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles++;
                       // Before activateTurn resets the accumulator, so the
                       // usage still belongs to the cancelled turn.
-                      settleActive(turnOutcome(session, "cancelled"));
+                      await settleActive(turnOutcome(session, "cancelled"));
                     } else if (isHeldOpen(session.activeTurn)) {
                       // A turn held open for its background subagents (see
                       // Turn.deferredSettle) hands off with the real outcome
@@ -5547,7 +5555,7 @@ export class ClaudeAcpAgent {
                       // subagent, but it must not rewrite the stop reason
                       // either. Its trailing-idle debt stands and is absorbed
                       // when the drain idle eventually arrives.
-                      settleActive(session.activeTurn.deferredSettle);
+                      await settleActive(session.activeTurn.deferredSettle);
                     } else if (
                       isSteering(session.activeTurn) &&
                       session.activeTurn.steeredSettle !== undefined
@@ -5564,9 +5572,9 @@ export class ClaudeAcpAgent {
                       // turn and false-fails it (issue #825). Harmless if it
                       // never comes: the debt absorbs one future idle.
                       session.owedTrailingIdles++;
-                      settleActive(session.activeTurn.steeredSettle);
+                      await settleActive(session.activeTurn.steeredSettle);
                     } else {
-                      settleActive(turnOutcome(session, "end_turn"));
+                      await settleActive(turnOutcome(session, "end_turn"));
                     }
                   }
                   // Unlike the no-result teardown lanes, this hand-off must
