@@ -2141,6 +2141,7 @@ export class ClaudeAcpAgent {
         ),
         steering: {
           supported: true,
+          idlePromptRequired: true,
         },
         goal: {
           version: GOAL_EXTENSION_VERSION,
