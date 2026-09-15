@@ -48,6 +48,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { SessionRewindBootstrap } from "../session-rewind-bootstrap.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import {
@@ -188,6 +189,127 @@ function injectGeneratorSession(
   });
   return input;
 }
+
+describe("session rewind coordination", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("keeps provider recreation behind an in-flight rewind lock", async () => {
+    const instance = agent() as any;
+    const releaseRewind = instance.sessionMutations.acquireExclusive("test-session") as () => void;
+    instance.sessions["test-session"] = mockSessionState({
+      creationParams: { cwd: "/workspace", mcpServers: [] },
+    });
+    const close = vi.spyOn(instance, "closeQueryStream").mockImplementation(() => {});
+    vi.spyOn(instance, "createSession").mockResolvedValue({ sessionId: "test-session" });
+
+    const update = instance.enqueueProviderUpdate(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(close).not.toHaveBeenCalled();
+
+    releaseRewind();
+    await update;
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps close and delete behind an in-flight rewind lock", async () => {
+    const closing = agent() as any;
+    closing.sessions["test-session"] = mockSessionState();
+    const closeTeardown = vi.spyOn(closing, "teardownSession").mockResolvedValue(undefined);
+    const releaseCloseRewind = closing.sessionMutations.acquireExclusive(
+      "test-session",
+    ) as () => void;
+    const close = closing.closeSession({ sessionId: "test-session" });
+    await Promise.resolve();
+    expect(closeTeardown).not.toHaveBeenCalled();
+    releaseCloseRewind();
+    await close;
+    expect(closeTeardown).toHaveBeenCalledOnce();
+
+    const deleting = agent() as any;
+    const releaseDeleteRewind = deleting.sessionMutations.acquireExclusive(
+      "test-session",
+    ) as () => void;
+    const deleteCalls = vi.mocked(deleteSession).mock.calls.length;
+    const deletion = deleting.deleteSession({ sessionId: "test-session" });
+    await Promise.resolve();
+    expect(vi.mocked(deleteSession).mock.calls).toHaveLength(deleteCalls);
+    releaseDeleteRewind();
+    await deletion;
+    expect(vi.mocked(deleteSession).mock.calls).toHaveLength(deleteCalls + 1);
+  });
+
+  it("acknowledges a truncating resume only when its init frame is consumed", async () => {
+    const instance = agent();
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield lifecycleInit;
+      },
+      { rewindBootstrap },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(rewindBootstrap.wait()).resolves.toBeUndefined();
+    expect(instance.sessions["test-session"].msgLifecycleV1).toBe(true);
+  });
+
+  it("rejects truncating resume before a later init when resumeDropsTurn refuses it", async () => {
+    const instance = agent();
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["Resume rejected by --resume-drops-turn: unexpected tail"],
+        };
+        yield lifecycleInit;
+      },
+      { rewindBootstrap },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(rewindBootstrap.wait()).rejects.toThrow(
+      "Resume rejected by --resume-drops-turn: unexpected tail",
+    );
+    expect(instance.sessions["test-session"].msgLifecycleV1).not.toBe(true);
+  });
+
+  it("does not publish a session failure when the temporary bootstrap stream fails", async () => {
+    const updates: SessionNotification[] = [];
+    const instance = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield await Promise.reject(new Error("bootstrap transport failed"));
+      },
+      { rewindBootstrap },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(rewindBootstrap.wait()).rejects.toThrow("bootstrap transport failed");
+    expect(updates).toEqual([]);
+  });
+});
 
 describe("task plan lifecycle", () => {
   function setup(
@@ -8646,6 +8768,7 @@ describe("logout", () => {
         "nativeSubagentSessions",
         "asyncTasks",
         "recommendedValue",
+        "sessionRewind",
       ],
     });
   });
@@ -8665,6 +8788,7 @@ describe("logout", () => {
         "nativeSubagentSessions",
         "asyncTasks",
         "recommendedValue",
+        "sessionRewind",
       ],
     });
   });

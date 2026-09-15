@@ -16,6 +16,15 @@ npm run format        # prettier --write
 CI runs `format:check`, `lint`, `build` and `test:run`. Run `npm run check` before
 opening a PR.
 
+## Architecture
+
+Keep `src/acp-agent.ts` as a thin ACP orchestration layer. Do not add substantial
+domain logic, state machines, lifecycle coordination, rollback behavior, or
+concurrency primitives directly to that file. Whenever practical, extract such
+logic into focused classes or modules under `src/`, grouped by responsibility;
+`acp-agent.ts` should only adapt those components to `ClaudeAcpAgent` state, ACP,
+and Claude SDK callbacks.
+
 ## Pull requests
 
 Squash merges use the PR title as the commit subject, and release-please parses it
