@@ -48,6 +48,7 @@ import {
   type StreamedToolInputCache,
 } from "../acp-agent.js";
 import { SessionTitles } from "../session-titles.js";
+import { SessionRewindBootstrap } from "../session-rewind-bootstrap.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
 import {
@@ -197,39 +198,9 @@ describe("session rewind coordination", () => {
     });
   }
 
-  it("waits for every prompt reservation before exclusively rewinding", async () => {
-    const instance = agent() as any;
-    const releaseFirst = instance.reserveSessionPrompt("test-session") as () => void;
-    const releaseSecond = instance.reserveSessionPrompt("test-session") as () => void;
-    const rewind = instance.acquireSessionMutationLock("test-session") as Promise<() => void>;
-    let acquired = false;
-    void rewind.then(() => {
-      acquired = true;
-    });
-
-    releaseFirst();
-    await Promise.resolve();
-    expect(acquired).toBe(false);
-    releaseSecond();
-    const releaseRewind = await rewind;
-    expect(acquired).toBe(true);
-
-    const blockedPrompt = instance.reserveSessionPrompt("test-session") as Promise<() => void>;
-    let promptAdmitted = false;
-    void blockedPrompt.then(() => {
-      promptAdmitted = true;
-    });
-    await Promise.resolve();
-    expect(promptAdmitted).toBe(false);
-    releaseRewind();
-    const releasePrompt = await blockedPrompt;
-    expect(promptAdmitted).toBe(true);
-    releasePrompt();
-  });
-
   it("keeps provider recreation behind an in-flight rewind lock", async () => {
     const instance = agent() as any;
-    const releaseRewind = instance.acquireSessionMutationLock("test-session") as () => void;
+    const releaseRewind = instance.sessionMutations.acquireExclusive("test-session") as () => void;
     instance.sessions["test-session"] = mockSessionState({
       creationParams: { cwd: "/workspace", mcpServers: [] },
     });
@@ -250,7 +221,9 @@ describe("session rewind coordination", () => {
     const closing = agent() as any;
     closing.sessions["test-session"] = mockSessionState();
     const closeTeardown = vi.spyOn(closing, "teardownSession").mockResolvedValue(undefined);
-    const releaseCloseRewind = closing.acquireSessionMutationLock("test-session") as () => void;
+    const releaseCloseRewind = closing.sessionMutations.acquireExclusive(
+      "test-session",
+    ) as () => void;
     const close = closing.closeSession({ sessionId: "test-session" });
     await Promise.resolve();
     expect(closeTeardown).not.toHaveBeenCalled();
@@ -259,7 +232,9 @@ describe("session rewind coordination", () => {
     expect(closeTeardown).toHaveBeenCalledOnce();
 
     const deleting = agent() as any;
-    const releaseDeleteRewind = deleting.acquireSessionMutationLock("test-session") as () => void;
+    const releaseDeleteRewind = deleting.sessionMutations.acquireExclusive(
+      "test-session",
+    ) as () => void;
     const deleteCalls = vi.mocked(deleteSession).mock.calls.length;
     const deletion = deleting.deleteSession({ sessionId: "test-session" });
     await Promise.resolve();
@@ -271,34 +246,24 @@ describe("session rewind coordination", () => {
 
   it("acknowledges a truncating resume only when its init frame is consumed", async () => {
     const instance = agent();
-    let acknowledge!: () => void;
-    let refuse!: (error: unknown) => void;
-    const acknowledged = new Promise<void>((resolve, reject) => {
-      acknowledge = resolve;
-      refuse = reject;
-    });
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
     injectGeneratorSession(
       instance,
       async function* () {
         yield lifecycleInit;
       },
-      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+      { rewindBootstrap },
     );
 
     (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
 
-    await expect(acknowledged).resolves.toBeUndefined();
+    await expect(rewindBootstrap.wait()).resolves.toBeUndefined();
     expect(instance.sessions["test-session"].msgLifecycleV1).toBe(true);
   });
 
   it("rejects truncating resume before a later init when resumeDropsTurn refuses it", async () => {
     const instance = agent();
-    let acknowledge!: () => void;
-    let refuse!: (error: unknown) => void;
-    const acknowledged = new Promise<void>((resolve, reject) => {
-      acknowledge = resolve;
-      refuse = reject;
-    });
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
     injectGeneratorSession(
       instance,
       async function* () {
@@ -309,12 +274,12 @@ describe("session rewind coordination", () => {
         };
         yield lifecycleInit;
       },
-      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+      { rewindBootstrap },
     );
 
     (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
 
-    await expect(acknowledged).rejects.toThrow(
+    await expect(rewindBootstrap.wait()).rejects.toThrow(
       "Resume rejected by --resume-drops-turn: unexpected tail",
     );
     expect(instance.sessions["test-session"].msgLifecycleV1).not.toBe(true);
@@ -330,23 +295,18 @@ describe("session rewind coordination", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    let acknowledge!: () => void;
-    let refuse!: (error: unknown) => void;
-    const acknowledged = new Promise<void>((resolve, reject) => {
-      acknowledge = resolve;
-      refuse = reject;
-    });
+    const rewindBootstrap = new SessionRewindBootstrap(() => {});
     injectGeneratorSession(
       instance,
       async function* () {
         yield await Promise.reject(new Error("bootstrap transport failed"));
       },
-      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+      { rewindBootstrap },
     );
 
     (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
 
-    await expect(acknowledged).rejects.toThrow("bootstrap transport failed");
+    await expect(rewindBootstrap.wait()).rejects.toThrow("bootstrap transport failed");
     expect(updates).toEqual([]);
   });
 });
