@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.78.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.77.0...v0.78.0) (2026-09-15)
+
+
+### Features
+
+* Add experimental ACP compaction update support ([#1134](https://github.com/agentclientprotocol/claude-agent-acp/issues/1134)) ([543a9a2](https://github.com/agentclientprotocol/claude-agent-acp/commit/543a9a2f97429659bb28d09691a71e4c99e41ed5))
+
+
+### Bug Fixes
+
+* keep the picked option when AskUserQuestion custom text is also supplied ([#1131](https://github.com/agentclientprotocol/claude-agent-acp/issues/1131)) ([8823ea6](https://github.com/agentclientprotocol/claude-agent-acp/commit/8823ea6fcb6743d37c1aad91ccd44725164b8927))
+
+
+### Performance Improvements
+
+* report file changes from Claude checkpoints ([#1138](https://github.com/agentclientprotocol/claude-agent-acp/issues/1138)) ([91f1699](https://github.com/agentclientprotocol/claude-agent-acp/commit/91f1699366ee98f9b3e9a6b96f0662c40b6ee38e))
+* supply AIR diff counts from Claude structured patches ([#1122](https://github.com/agentclientprotocol/claude-agent-acp/issues/1122)) ([735950a](https://github.com/agentclientprotocol/claude-agent-acp/commit/735950a83ee1fa25366515a3239482183a051dca))
+
 ## [0.77.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.76.0...v0.77.0) (2026-09-14)
 
 
