@@ -1,33 +1,22 @@
-import type {
-  HookCallback,
-  Options,
-  PermissionResult,
-  SDKUserMessage,
-} from "@anthropic-ai/claude-agent-sdk";
+import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
-  FILE_CHANGE_AUDIT_SERVER_NAME,
-  FILE_CHANGE_AUDIT_TOOL_NAME,
-  FILE_CHANGE_AUDIT_WIRE_TOOL_NAME,
-  type AgentFileChangeReport,
   type AgentFileChangeReportResult,
 } from "../file-change-audit.js";
 import type { Pushable } from "../utils.js";
 
-let observedStopOutputs: unknown[] = [];
-let observedPreToolDecision: unknown;
-let observedCanUseToolDecision: PermissionResult | null | undefined;
+type Scenario = "reported" | "providerError" | "localOnly" | "waitForCancel";
+let scenario: Scenario = "reported";
+let observedOptions: Options | undefined;
 let replayMessages: unknown[] = [];
-type AuditScenario =
-  "reported" | "successWithoutReport" | "providerError" | "localOnly" | "waitForCancel";
-let auditScenario: AuditScenario = "reported";
-let auditTurnActivated = Promise.resolve();
-let resolveAuditTurnActivated = () => {};
+let turnActivated = Promise.resolve();
+let resolveTurnActivated = () => {};
+const rewindFiles = vi.fn();
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const actual = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
@@ -37,11 +26,18 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     ...actual,
     getSessionMessages: vi.fn(async () => replayMessages),
     query: ({ prompt, options }: { prompt: Pushable<SDKUserMessage>; options: Options }) => {
+      observedOptions = options;
       let resolveInterrupt = () => {};
       const interrupted = new Promise<void>((resolve) => {
         resolveInterrupt = resolve;
       });
-      return Object.assign(runAuditedTurn(prompt, options, interrupted), {
+      rewindFiles.mockImplementation(async () => ({
+        canRewind: true,
+        filesChanged: ["src/changed.ts"],
+        insertions: 4,
+        deletions: 1,
+      }));
+      return Object.assign(runTurn(prompt, interrupted), {
         initializationResult: async () => ({
           models: [
             {
@@ -57,6 +53,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         supportedAgents: vi.fn(async () => []),
         supportedCommands: vi.fn(async () => []),
         getContextUsage: vi.fn(async () => ({ totalTokens: 0, rawMaxTokens: 200000 })),
+        rewindFiles,
         interrupt: vi.fn(async () => {
           resolveInterrupt();
           return undefined;
@@ -72,29 +69,7 @@ vi.mock("../tools.js", async () => ({
   registerHookCallback: vi.fn(),
 }));
 
-type RegisteredAuditTool = {
-  handler: (
-    report: AgentFileChangeReport,
-  ) => Promise<{ content: unknown; structuredContent?: AgentFileChangeReportResult }>;
-};
-
-function hookFrom(options: Options, event: "PreToolUse" | "Stop"): HookCallback {
-  const matcher = options.hooks?.[event]?.at(-1);
-  const hook = matcher?.hooks.at(-1);
-  if (!hook) throw new Error(`Missing ${event} audit hook`);
-  return hook;
-}
-
-function auditToolFrom(options: Options): RegisteredAuditTool {
-  const server = options.mcpServers?.[FILE_CHANGE_AUDIT_SERVER_NAME] as unknown as {
-    instance: { _registeredTools: Record<string, RegisteredAuditTool> };
-  };
-  const tool = server.instance._registeredTools[FILE_CHANGE_AUDIT_TOOL_NAME];
-  if (!tool) throw new Error("Missing internal audit tool");
-  return tool;
-}
-
-function assistantMessage(content: unknown[]) {
+function assistantMessage(text: string) {
   return {
     type: "assistant" as const,
     parent_tool_use_id: null,
@@ -110,7 +85,7 @@ function assistantMessage(content: unknown[]) {
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
       },
-      content,
+      content: [{ type: "text", text }],
     },
   };
 }
@@ -125,7 +100,7 @@ function successResult() {
     errors: [],
     duration_ms: 0,
     duration_api_ms: 0,
-    num_turns: 2,
+    num_turns: 1,
     total_cost_usd: 0,
     usage: {
       input_tokens: 2,
@@ -140,16 +115,12 @@ function successResult() {
   };
 }
 
-async function* runAuditedTurn(
-  input: Pushable<SDKUserMessage>,
-  options: Options,
-  interrupted: Promise<void>,
-) {
+async function* runTurn(input: Pushable<SDKUserMessage>, interrupted: Promise<void>) {
   const iterator = input[Symbol.asyncIterator]();
   const { value: userMessage } = await iterator.next();
   if (!userMessage) return;
 
-  if (auditScenario === "localOnly") {
+  if (scenario === "localOnly") {
     yield { ...successResult(), result: "Local command output" };
     return;
   }
@@ -162,23 +133,9 @@ async function* runAuditedTurn(
     session_id: "sdk-session",
     isReplay: true,
   };
-  resolveAuditTurnActivated();
+  resolveTurnActivated();
 
-  if (auditScenario === "successWithoutReport") {
-    yield assistantMessage([{ type: "text", text: "Visible answer" }]);
-    yield successResult();
-    return;
-  }
-  if (auditScenario === "providerError") {
-    yield {
-      ...successResult(),
-      is_error: true,
-      result: "Provider failed",
-      errors: ["Provider failed"],
-    };
-    return;
-  }
-  if (auditScenario === "waitForCancel") {
+  if (scenario === "waitForCancel") {
     await interrupted;
     yield {
       type: "system" as const,
@@ -190,90 +147,28 @@ async function* runAuditedTurn(
     return;
   }
 
-  yield assistantMessage([{ type: "text", text: "Visible answer" }]);
+  if (scenario === "providerError") {
+    yield {
+      ...successResult(),
+      is_error: true,
+      result: "Provider failed",
+      errors: ["Provider failed"],
+    };
+    return;
+  }
 
-  const hookOptions = { signal: new AbortController().signal };
-  const stopHook = hookFrom(options, "Stop");
-  observedStopOutputs.push(
-    await stopHook(
-      { hook_event_name: "Stop", stop_hook_active: false } as Parameters<HookCallback>[0],
-      undefined,
-      hookOptions,
-    ),
-  );
-
-  const preToolUseHook = hookFrom(options, "PreToolUse");
-  observedPreToolDecision = await preToolUseHook(
-    {
-      hook_event_name: "PreToolUse",
-      tool_name: "Bash",
-      tool_input: { command: "git status" },
-      tool_use_id: "blocked-tool",
-    } as Parameters<HookCallback>[0],
-    "blocked-tool",
-    hookOptions,
-  );
-  observedCanUseToolDecision = await options.canUseTool?.(
-    "Bash",
-    { command: "git status" },
-    {
-      signal: hookOptions.signal,
-      toolUseID: "blocked-tool",
-      requestId: "permission-request",
-    },
-  );
-
-  const toolUseId = "audit-tool-use";
-  yield assistantMessage([
-    { type: "text", text: "Audit prose must stay hidden" },
-    {
-      type: "tool_use",
-      id: toolUseId,
-      name: FILE_CHANGE_AUDIT_WIRE_TOOL_NAME,
-      input: { paths: ["src/changed.ts"], complete: true },
-    },
-  ]);
-
-  const toolResult = await auditToolFrom(options).handler({
-    paths: ["src/changed.ts"],
-    complete: true,
-  });
-  yield {
-    type: "user" as const,
-    message: {
-      role: "user" as const,
-      content: [
-        {
-          type: "tool_result",
-          tool_use_id: toolUseId,
-          content: toolResult.content,
-        },
-      ],
-    },
-    parent_tool_use_id: null,
-    uuid: randomUUID(),
-    session_id: "sdk-session",
-  };
-
-  observedStopOutputs.push(
-    await stopHook(
-      { hook_event_name: "Stop", stop_hook_active: true } as Parameters<HookCallback>[0],
-      undefined,
-      hookOptions,
-    ),
-  );
+  yield assistantMessage("Visible answer");
   yield successResult();
 }
 
-describe("agent file-change audit integration", () => {
+describe("native file-change report integration", () => {
   beforeEach(() => {
-    observedStopOutputs = [];
-    observedPreToolDecision = undefined;
-    observedCanUseToolDecision = undefined;
+    scenario = "reported";
+    observedOptions = undefined;
     replayMessages = [];
-    auditScenario = "reported";
-    auditTurnActivated = new Promise<void>((resolve) => {
-      resolveAuditTurnActivated = resolve;
+    rewindFiles.mockReset();
+    turnActivated = new Promise<void>((resolve) => {
+      resolveTurnActivated = resolve;
     });
   });
 
@@ -288,7 +183,7 @@ describe("agent file-change audit integration", () => {
     },
   };
 
-  async function createAuditAgent(updates: SessionNotification[]) {
+  async function createAgent(updates: SessionNotification[]) {
     const client = {
       sessionUpdate: async (notification: SessionNotification) => void updates.push(notification),
       requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
@@ -308,7 +203,7 @@ describe("agent file-change audit integration", () => {
     return { agent, sessionId };
   }
 
-  function fileChangeTerminals(updates: SessionNotification[]): AgentFileChangeReportResult[] {
+  function reports(updates: SessionNotification[]): AgentFileChangeReportResult[] {
     return updates.flatMap((notification) => {
       if (notification.update.sessionUpdate !== "session_info_update") return [];
       const meta = notification.update._meta as
@@ -323,7 +218,7 @@ describe("agent file-change audit integration", () => {
     });
   }
 
-  function auditedPrompt(sessionId: string, requestId: string, text: string) {
+  function prompt(sessionId: string, requestId: string, text: string) {
     return {
       sessionId,
       prompt: [{ type: "text" as const, text }],
@@ -337,268 +232,138 @@ describe("agent file-change audit integration", () => {
     };
   }
 
-  it.each([
-    {
-      name: "normal success without a Stop report",
-      scenario: "successWithoutReport" as const,
-      prompt: "Finish normally",
-      reason: "notReported" as const,
-      rejects: false,
-    },
-    {
-      name: "a local-only command",
-      scenario: "localOnly" as const,
-      prompt: "/context",
-      reason: "notReported" as const,
-      rejects: false,
-    },
-    {
-      name: "a provider error",
-      scenario: "providerError" as const,
-      prompt: "Call the provider",
-      reason: "providerError" as const,
-      rejects: false,
-    },
-  ])("publishes one terminal for $name", async ({ scenario, prompt, reason, rejects }) => {
-    auditScenario = scenario;
+  it("enables native checkpointing and reports its dry-run paths", async () => {
     const updates: SessionNotification[] = [];
-    const { agent, sessionId } = await createAuditAgent(updates);
-    const requestId = `request-${scenario}`;
-    const result = agent.prompt(auditedPrompt(sessionId, requestId, prompt));
+    const { agent, sessionId } = await createAgent(updates);
 
-    if (rejects) {
-      await expect(result).rejects.toBeDefined();
-    } else {
-      await expect(result).resolves.toBeDefined();
-    }
-    expect(fileChangeTerminals(updates)).toEqual([
+    await expect(
+      agent.prompt(prompt(sessionId, "request-native", "Change a file")),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    expect(observedOptions?.enableFileCheckpointing).toBe(true);
+    expect(observedOptions?.mcpServers).not.toHaveProperty("claude_agent_acp");
+    expect(observedOptions?.hooks?.Stop).toBeUndefined();
+    expect(rewindFiles).toHaveBeenCalledTimes(1);
+    expect(rewindFiles).toHaveBeenCalledWith(expect.any(String), { dryRun: true });
+    expect(reports(updates)).toEqual([
       {
         version: 1,
-        requestId,
-        status: "unavailable",
-        reason,
+        requestId: "request-native",
+        status: "reported",
+        paths: [path.join(process.cwd(), "src/changed.ts")],
+        declaredComplete: true,
+        truncated: false,
       },
     ]);
 
     await agent.dispose();
-    expect(fileChangeTerminals(updates)).toHaveLength(1);
   });
 
-  it.each([
-    { name: "cancel", close: false },
-    { name: "session close", close: true },
-  ])("publishes one cancelled terminal and settles the prompt on $name", async ({ close }) => {
-    auditScenario = "waitForCancel";
+  it("does not inspect a checkpoint when the prompt did not request a report", async () => {
     const updates: SessionNotification[] = [];
-    const { agent, sessionId } = await createAuditAgent(updates);
-    const requestId = close ? "request-close" : "request-cancel";
-    const result = agent.prompt(auditedPrompt(sessionId, requestId, "Wait"));
-    await auditTurnActivated;
+    const { agent, sessionId } = await createAgent(updates);
 
-    if (close) {
-      await agent.closeSession({ sessionId });
-    } else {
-      await agent.cancel({ sessionId });
-    }
-    await expect(result).resolves.toMatchObject({ stopReason: "cancelled" });
-    expect(fileChangeTerminals(updates)).toEqual([
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "No report" }] });
+
+    expect(rewindFiles).not.toHaveBeenCalled();
+    expect(reports(updates)).toEqual([]);
+    await agent.dispose();
+  });
+
+  it("publishes providerError without attempting checkpoint inspection", async () => {
+    scenario = "providerError";
+    const updates: SessionNotification[] = [];
+    const { agent, sessionId } = await createAgent(updates);
+
+    await expect(agent.prompt(prompt(sessionId, "request-error", "Fail"))).resolves.toBeDefined();
+
+    expect(rewindFiles).not.toHaveBeenCalled();
+    expect(reports(updates)).toEqual([
       {
         version: 1,
-        requestId,
+        requestId: "request-error",
+        status: "unavailable",
+        reason: "providerError",
+      },
+    ]);
+    await agent.dispose();
+  });
+
+  it("publishes cancelled without attempting checkpoint inspection", async () => {
+    scenario = "waitForCancel";
+    const updates: SessionNotification[] = [];
+    const { agent, sessionId } = await createAgent(updates);
+    const result = agent.prompt(prompt(sessionId, "request-cancel", "Wait"));
+    await turnActivated;
+
+    await agent.cancel({ sessionId });
+    await expect(result).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    expect(rewindFiles).not.toHaveBeenCalled();
+    expect(reports(updates)).toEqual([
+      {
+        version: 1,
+        requestId: "request-cancel",
         status: "unavailable",
         reason: "cancelled",
       },
     ]);
-
     await agent.dispose();
-    expect(fileChangeTerminals(updates)).toHaveLength(1);
   });
 
-  it("negotiates an opt-in turn, publishes one report, and hides the audit continuation", async () => {
-    const updates: SessionNotification[] = [];
-    const client = {
-      sessionUpdate: async (notification: SessionNotification) => void updates.push(notification),
-      requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
-      readTextFile: async () => ({ content: "" }),
-      writeTextFile: async () => ({}),
-    } as unknown as AcpClient;
-    const { ClaudeAcpAgent } = await import("../acp-agent.js");
-    const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(client, {
-      log: () => {},
-      error: () => {},
-    });
-
-    const capabilities = {
-      _meta: {
-        jetbrains: {
-          air: {
-            version: 1,
-            capabilities: [AGENT_FILE_CHANGE_REPORT_CAPABILITY],
-          },
-        },
-      },
-    };
-    const initialize = await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: capabilities,
-    });
-    expect(initialize._meta).toMatchObject({
-      jetbrains: {
-        air: {
-          version: 1,
-          capabilities: expect.arrayContaining([AGENT_FILE_CHANGE_REPORT_CAPABILITY]),
-        },
-      },
-    });
-
-    const cwd = process.cwd();
-    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
-    const response = await agent.prompt({
-      sessionId,
-      prompt: [{ type: "text", text: "Change the file" }],
-      _meta: {
-        jetbrains: {
-          air: {
-            agentFileChangeReportRequest: { version: 1, requestId: "request-integration" },
-          },
-        },
-      },
-    });
-
-    expect(response.stopReason).toBe("end_turn");
-    expect(observedStopOutputs).toHaveLength(2);
-    expect(observedStopOutputs[0]).toMatchObject({
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext: expect.stringContaining(FILE_CHANGE_AUDIT_WIRE_TOOL_NAME),
-      },
-    });
-    expect(observedStopOutputs[1]).toEqual({});
-    expect(observedPreToolDecision).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "deny" },
-    });
-    expect(observedCanUseToolDecision).toMatchObject({ behavior: "deny" });
-
-    const reportUpdates = updates.filter((notification) => {
-      if (notification.update.sessionUpdate !== "session_info_update") return false;
-      const meta = notification.update._meta as
-        { jetbrains?: { air?: { agentFileChangeReport?: unknown } } } | undefined;
-      return meta?.jetbrains?.air?.agentFileChangeReport !== undefined;
-    });
-    expect(reportUpdates).toEqual([
-      {
-        sessionId,
-        update: {
-          sessionUpdate: "session_info_update",
-          _meta: {
-            jetbrains: {
-              air: {
-                version: 1,
-                agentFileChangeReport: {
-                  version: 1,
-                  requestId: "request-integration",
-                  status: "reported",
-                  paths: [path.join(cwd, "src/changed.ts")],
-                  declaredComplete: true,
-                  truncated: false,
-                },
-              },
-            },
-          },
-        },
-      },
-    ]);
-
-    const serializedUpdates = JSON.stringify(updates);
-    expect(serializedUpdates).toContain("Visible answer");
-    expect(serializedUpdates).not.toContain("Audit prose must stay hidden");
-    expect(serializedUpdates).not.toContain(FILE_CHANGE_AUDIT_WIRE_TOOL_NAME);
-
-    await agent.dispose();
-
-    const firstStop = observedStopOutputs[0] as {
-      hookSpecificOutput?: { additionalContext?: string };
-    };
-    const auditContext = firstStop.hookSpecificOutput?.additionalContext;
-    if (!auditContext) throw new Error("Missing audit continuation context");
-    const replayToolUseId = "replay-audit-tool";
-    const deniedReplayToolUseId = "replay-denied-tool";
-    const replayUserMessage = (content: unknown) => ({
-      type: "user" as const,
-      message: { role: "user" as const, content },
-      parent_tool_use_id: null,
-      uuid: randomUUID(),
-      session_id: "replay-session",
-    });
+  it("keeps old hidden audit exchanges out of replay", async () => {
     replayMessages = [
-      replayUserMessage("Original prompt"),
-      assistantMessage([{ type: "text", text: "Visible persisted answer" }]),
-      replayUserMessage(auditContext),
-      assistantMessage([{ type: "text", text: "Separate audit prose must stay hidden" }]),
-      assistantMessage([
-        {
-          type: "tool_use",
-          id: deniedReplayToolUseId,
-          name: "Bash",
-          input: { command: "git status" },
+      {
+        type: "user",
+        uuid: "prompt-1",
+        parent_tool_use_id: null,
+        message: { role: "user", content: "Visible prompt" },
+      },
+      assistantMessage("Visible answer"),
+      {
+        type: "user",
+        uuid: "legacy-audit",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content:
+            "<claude-agent-acp-file-change-audit>report now</claude-agent-acp-file-change-audit>",
         },
-      ]),
-      replayUserMessage([
-        {
-          type: "tool_result",
-          tool_use_id: deniedReplayToolUseId,
-          content: "denied",
-          is_error: true,
+      },
+      {
+        ...assistantMessage("Hidden legacy audit prose"),
+        message: {
+          ...assistantMessage("").message,
+          content: [
+            {
+              type: "tool_use",
+              id: "legacy-tool",
+              name: "mcp__claude_agent_acp__report_changed_files",
+              input: { paths: ["src/changed.ts"], complete: true },
+            },
+          ],
         },
-      ]),
-      assistantMessage([{ type: "text", text: "Prose after denial must stay hidden" }]),
-      assistantMessage([
-        {
-          type: "tool_use",
-          id: replayToolUseId,
-          name: FILE_CHANGE_AUDIT_WIRE_TOOL_NAME,
-          input: { paths: ["src/changed.ts"], complete: true },
+      },
+      {
+        type: "user",
+        uuid: "legacy-result",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "legacy-tool", content: "recorded" }],
         },
-      ]),
-      replayUserMessage([
-        {
-          type: "tool_result",
-          tool_use_id: replayToolUseId,
-          content: "recorded",
-        },
-      ]),
-      replayUserMessage("Follow-up prompt"),
-      assistantMessage([{ type: "text", text: "Follow-up answer" }]),
+      },
     ];
 
-    const replayUpdates: SessionNotification[] = [];
-    const replayAgent = new ClaudeAcpAgent(
-      {
-        ...client,
-        sessionUpdate: async (notification: SessionNotification) =>
-          void replayUpdates.push(notification),
-      } as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    await replayAgent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: capabilities,
-    });
-    await replayAgent.loadSession({
-      sessionId: "replay-session",
-      cwd,
-      mcpServers: [],
-    });
+    const updates: SessionNotification[] = [];
+    const { agent } = await createAgent(updates);
+    await agent.loadSession({ sessionId: "legacy-session", cwd: process.cwd(), mcpServers: [] });
 
-    const serializedReplay = JSON.stringify(replayUpdates);
-    expect(serializedReplay).toContain("Original prompt");
-    expect(serializedReplay).toContain("Visible persisted answer");
-    expect(serializedReplay).toContain("Follow-up prompt");
-    expect(serializedReplay).toContain("Follow-up answer");
-    expect(serializedReplay).not.toContain("Separate audit prose must stay hidden");
-    expect(serializedReplay).not.toContain("Prose after denial must stay hidden");
-    expect(serializedReplay).not.toContain(FILE_CHANGE_AUDIT_WIRE_TOOL_NAME);
-    expect(serializedReplay).not.toContain("claude-agent-acp-file-change-audit");
-    await replayAgent.dispose();
+    const serialized = JSON.stringify(updates);
+    expect(serialized).toContain("Visible prompt");
+    expect(serialized).toContain("Visible answer");
+    expect(serialized).not.toContain("Hidden legacy audit prose");
+    expect(serialized).not.toContain("report_changed_files");
+    await agent.dispose();
   });
 });
