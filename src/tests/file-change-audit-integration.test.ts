@@ -10,12 +10,14 @@ import {
 } from "../file-change-audit.js";
 import type { Pushable } from "../utils.js";
 
-type Scenario = "reported" | "providerError" | "localOnly" | "waitForCancel";
+type Scenario =
+  "reported" | "providerError" | "localOnly" | "waitForCancel" | "waitForCheckpointCancel";
 let scenario: Scenario = "reported";
 let observedOptions: Options | undefined;
 let replayMessages: unknown[] = [];
 let turnActivated = Promise.resolve();
 let resolveTurnActivated = () => {};
+let resolveCheckpointPreview = () => {};
 const rewindFiles = vi.fn();
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
@@ -31,12 +33,25 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       const interrupted = new Promise<void>((resolve) => {
         resolveInterrupt = resolve;
       });
-      rewindFiles.mockImplementation(async () => ({
-        canRewind: true,
-        filesChanged: ["src/changed.ts"],
-        insertions: 4,
-        deletions: 1,
-      }));
+      rewindFiles.mockImplementation(() => {
+        if (scenario === "waitForCheckpointCancel") {
+          return new Promise((resolve) => {
+            resolveCheckpointPreview = () =>
+              resolve({
+                canRewind: true,
+                filesChanged: ["src/late.ts"],
+                insertions: 1,
+                deletions: 0,
+              });
+          });
+        }
+        return Promise.resolve({
+          canRewind: true,
+          filesChanged: ["src/changed.ts"],
+          insertions: 4,
+          deletions: 1,
+        });
+      });
       return Object.assign(runTurn(prompt, interrupted), {
         initializationResult: async () => ({
           models: [
@@ -167,6 +182,7 @@ describe("native file-change report integration", () => {
     observedOptions = undefined;
     replayMessages = [];
     rewindFiles.mockReset();
+    resolveCheckpointPreview = () => {};
     turnActivated = new Promise<void>((resolve) => {
       resolveTurnActivated = resolve;
     });
@@ -308,6 +324,30 @@ describe("native file-change report integration", () => {
         reason: "cancelled",
       },
     ]);
+    await agent.dispose();
+  });
+
+  it("lets cancellation settle a turn while checkpoint inspection is pending", async () => {
+    scenario = "waitForCheckpointCancel";
+    const updates: SessionNotification[] = [];
+    const { agent, sessionId } = await createAgent(updates);
+    const result = agent.prompt(prompt(sessionId, "request-checkpoint-cancel", "Change a file"));
+    await vi.waitFor(() => expect(rewindFiles).toHaveBeenCalledTimes(1));
+
+    await agent.cancel({ sessionId });
+    await expect(result).resolves.toMatchObject({ stopReason: "cancelled" });
+    await vi.waitFor(() =>
+      expect(reports(updates)).toEqual([
+        {
+          version: 1,
+          requestId: "request-checkpoint-cancel",
+          status: "unavailable",
+          reason: "cancelled",
+        },
+      ]),
+    );
+
+    resolveCheckpointPreview();
     await agent.dispose();
   });
 });

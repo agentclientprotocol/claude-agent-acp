@@ -583,6 +583,9 @@ type Turn = {
    *  observe another terminal signal during that bounded await; only the first
    *  one may continue into settlement. */
   settling?: boolean;
+  /** Outcome captured before the checkpoint preview await, so cancel() can
+   *  preserve its usage and metadata while atomically winning that race. */
+  settlingOutcome?: PromptResponse;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -3655,6 +3658,7 @@ export class ClaudeAcpAgent {
         return;
       }
       turn.settling = true;
+      turn.settlingOutcome = result;
       if (reportReason === "notReported") {
         await session.fileChangeReporter?.report(turn, session.query);
         // cancel() can settle a held turn while the bounded checkpoint preview
@@ -6214,19 +6218,17 @@ export class ClaudeAcpAgent {
       }
     }
 
-    // A deferred active turn (see Turn.deferredSettle) already has its
-    // result — it is only held open for its background subagents, which the
-    // interrupt below tears down. Settle it "cancelled" NOW: during the hold
-    // the session is typically already in state idle (the CLI's trailer
-    // fired at the result), so the interrupt may produce no fresh idle for
-    // the consumer's cancelled-settle path to run on, and the cancel would
-    // otherwise stall until the force-cancel backstop. Any outstanding
-    // trailer debt is absorbed by the idle handler when its idle does come.
-    // The turn's own usage snapshot is reported per the cancelled-usage
-    // contract (issue #844).
+    // A deferred active turn (see Turn.deferredSettle) already has its result
+    // and is only held open for subagents. A settling turn likewise has its
+    // result but is awaiting the bounded checkpoint preview. Settle either one
+    // "cancelled" NOW: the consumer cannot process the interrupt's trailing
+    // idle while blocked in that preview, and a held turn may already be idle.
+    // The captured outcome preserves usage and metadata (issue #844), while
+    // reporter state makes a late checkpoint response harmless.
     {
       const active = session.activeTurn;
-      if (isHeldOpen(active)) {
+      const pendingOutcome = active?.deferredSettle ?? active?.settlingOutcome;
+      if (active && pendingOutcome && (isHeldOpen(active) || active.settling)) {
         session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
@@ -6265,8 +6267,8 @@ export class ClaudeAcpAgent {
         // from it here.
         active.resolve({
           stopReason: "cancelled",
-          usage: active.deferredSettle.usage,
-          ...(active.deferredSettle._meta ? { _meta: active.deferredSettle._meta } : {}),
+          usage: pendingOutcome.usage,
+          ...(pendingOutcome._meta ? { _meta: pendingOutcome._meta } : {}),
         });
       }
     }
