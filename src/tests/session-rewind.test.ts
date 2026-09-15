@@ -57,11 +57,12 @@ describe("session rewind", () => {
       creationParams: { cwd: "/workspace", mcpServers: [] },
     };
     vi.mocked(getSessionMessages).mockResolvedValue([
-      assistantMessage("retained-chain-uuid", "assistant-id", "answer"),
-      {
-        ...userMessage("selected-user-uuid", "selected-user-id", "edit me"),
-        parentUuid: "retained-chain-uuid",
-      },
+      userMessage("previous-user-uuid", "previous-user-id", "previous prompt"),
+      assistantMessage("visible-assistant-uuid", "assistant-id", "answer"),
+      assistantMessage("structured-output-uuid", "structured-id", "hidden output"),
+      toolResultMessage("tool-result-uuid"),
+      assistantMessage("retained-chain-uuid", "hidden-assistant-id", "audit result"),
+      userMessage("selected-user-uuid", "selected-user-id", "edit me"),
     ] as never);
     const teardown = vi.fn().mockResolvedValue(undefined);
     const create = vi.fn().mockResolvedValue({ sessionId: "session-1" });
@@ -90,12 +91,11 @@ describe("session rewind", () => {
   it("rejects a retained assistant that is not the selected prompt boundary", async () => {
     const session = { cwd: "/workspace", turnQueue: [] };
     vi.mocked(getSessionMessages).mockResolvedValue([
+      userMessage("older-user", "older-user-id", "older prompt"),
       assistantMessage("older-assistant", "older-id", "answer"),
+      userMessage("retained-user", "retained-user-id", "retained prompt"),
       assistantMessage("retained-assistant", "retained-id", "latest"),
-      {
-        ...userMessage("selected-user", "selected-user-id", "edit me"),
-        parentUuid: "retained-assistant",
-      },
+      userMessage("selected-user", "selected-user-id", "edit me"),
     ] as never);
     const teardown = vi.fn();
 
@@ -116,10 +116,7 @@ describe("session rewind", () => {
     const session = { cwd: "/workspace", turnQueue: [] };
     vi.mocked(getSessionMessages).mockResolvedValue([
       assistantMessage("retained-assistant", "assistant-id", "answer"),
-      {
-        ...userMessage("selected-user", "selected-user-id", "edit me"),
-        parentUuid: "retained-assistant",
-      },
+      userMessage("selected-user", "selected-user-id", "edit me"),
     ] as never);
     const create = vi
       .fn()
@@ -230,6 +227,15 @@ function assistantMessage(uuid: string, providerMessageId: string, text: string)
     uuid,
     session_id: "session-1",
     message: { id: providerMessageId, role: "assistant", content: [{ type: "text", text }] },
+  };
+}
+
+function toolResultMessage(uuid: string) {
+  return {
+    type: "user" as const,
+    uuid,
+    session_id: "session-1",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool-1" }] },
   };
 }
 

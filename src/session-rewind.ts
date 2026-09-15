@@ -68,7 +68,7 @@ export async function rewindClaudeSession(
   const session = dependencies.getSession(params.sessionId);
   if (!session || session.activeTurn || session.turnQueue?.length) return { rewound: false };
 
-  const messages = await getSessionMessages(params.sessionId);
+  const messages = await getSessionMessages(params.sessionId, { includeSystemMessages: true });
   const beforeMessage = resolveHistoryPointFromMessages(
     messages,
     params.sessionId,
@@ -79,11 +79,11 @@ export async function rewindClaudeSession(
   const beforeUuid = beforeMessage.uuid;
   if (!beforeUuid) return { rewound: false };
 
-  // The selected prompt's parent is the final chain entry of the retained turn. It can be a tool result or
-  // structured output after the visible assistant message, which is the exact boundary resumeSessionAt needs.
-  const resumeAtUuid = params.resumeAtMessage
-    ? (beforeMessage as SessionMessage & { parentUuid?: string }).parentUuid
-    : undefined;
+  // The SDK returns the current chain in chronological order, but its public SessionMessage omits parentUuid. The entry
+  // before the selected prompt is therefore the final retained boundary. It can be a tool result, a system entry, or
+  // structured output after the visible assistant message.
+  const beforeIndex = messages.indexOf(beforeMessage);
+  const resumeAtUuid = params.resumeAtMessage ? messages[beforeIndex - 1]?.uuid : undefined;
   if (params.resumeAtMessage && !resumeAtUuid) return { rewound: false };
   if (params.resumeAtMessage) {
     const visibleAssistant = resolveHistoryPointFromMessages(
@@ -93,7 +93,7 @@ export async function rewindClaudeSession(
       "assistant",
       dependencies.messageIdForGrouping,
     );
-    if (!isAssistantAtRetainedBoundary(messages, resumeAtUuid!, visibleAssistant.uuid)) {
+    if (!isAssistantInPrecedingAuthoredTurn(messages, beforeIndex, visibleAssistant)) {
       throw RequestError.invalidParams(
         { messageId: params.resumeAtMessage.messageId },
         "resumeAtMessage is not the assistant message immediately preceding beforeMessage",
@@ -171,25 +171,27 @@ function resolveHistoryPointFromMessages(
   );
 }
 
-function isAssistantAtRetainedBoundary(
+function isAssistantInPrecedingAuthoredTurn(
   messages: SessionMessage[],
-  boundaryUuid: string,
-  assistantUuid: string | undefined,
+  beforeIndex: number,
+  assistant: SessionMessage,
 ): boolean {
-  if (!assistantUuid) return false;
-  const byUuid = new Map(
-    messages.flatMap((message) => (message.uuid ? [[message.uuid, message]] : [])),
+  const assistantIndex = messages.indexOf(assistant);
+  const precedingAuthoredUserIndex = messages
+    .slice(0, beforeIndex)
+    .findLastIndex(isAuthoredUserMessage);
+  return assistantIndex > precedingAuthoredUserIndex && assistantIndex < beforeIndex;
+}
+
+function isAuthoredUserMessage(message: SessionMessage): boolean {
+  if (message.type !== "user") return false;
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (typeof content === "string") return true;
+  if (!Array.isArray(content)) return false;
+  return content.some(
+    (block) =>
+      !block || typeof block !== "object" || (block as { type?: unknown }).type !== "tool_result",
   );
-  const visited = new Set<string>();
-  let uuid: string | undefined = boundaryUuid;
-  while (uuid && !visited.has(uuid)) {
-    visited.add(uuid);
-    const message = byUuid.get(uuid);
-    if (!message) return false;
-    if (message.type === "assistant") return message.uuid === assistantUuid;
-    uuid = (message as SessionMessage & { parentUuid?: string }).parentUuid;
-  }
-  return false;
 }
 
 function parseHistoryPoint(value: unknown, name: string): SessionHistoryPoint {
