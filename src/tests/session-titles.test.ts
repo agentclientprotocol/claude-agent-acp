@@ -48,12 +48,18 @@ describe("session titles at turn-end", () => {
     vi.mocked(getSessionInfo).mockReset();
   });
 
-  /** Collect every `session_info_update` an agent pushes. */
+  /** Collect every `session_info_update` an agent pushes that carries a title.
+   *  A prompt also reports its backend's acceptance on a title-less
+   *  `session_info_update` (see `SESSION_MATERIALIZATION_META`), which says
+   *  nothing about titles and would read here as a title of `undefined`. */
+  function carriesTitle(update: any) {
+    return update?.sessionUpdate === "session_info_update" && "title" in update;
+  }
   function titleRecorder() {
     const updates: any[] = [];
     const client = {
       sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "session_info_update") updates.push(u.update);
+        if (carriesTitle(u.update)) updates.push(u.update);
       },
     } as unknown as AcpClient;
     return { client, titles: () => updates.map((u) => u.title) };
@@ -112,9 +118,7 @@ describe("session titles at turn-end", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
     await agent.sessions["test-session"]?.consumer;
 
-    const titleUpdate = sessionUpdates.find(
-      (u) => u.update?.sessionUpdate === "session_info_update",
-    );
+    const titleUpdate = sessionUpdates.find((u) => carriesTitle(u.update));
     expect(titleUpdate?.update).toEqual({
       sessionUpdate: "session_info_update",
       title: "Fix the flaky title test",
