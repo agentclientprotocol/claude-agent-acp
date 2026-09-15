@@ -3376,7 +3376,6 @@ describe("permission request cancellation", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
-      fileChangeReportRequestIds: new Set(),
     } as any;
     return agent.sessions[sessionId]!;
   }
@@ -8920,7 +8919,6 @@ describe("session/close", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -9014,7 +9012,6 @@ describe("session/delete", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -9125,7 +9122,6 @@ describe("getOrCreateSession param change detection", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -12701,7 +12697,6 @@ describe("post-error recovery", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }
@@ -17326,7 +17321,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }

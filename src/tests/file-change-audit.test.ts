@@ -5,9 +5,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AGENT_FILE_CHANGE_REPORT_MAX_BYTES,
   agentFileChangeReportRequestId,
-  createFileChangeReportTurnState,
-  createNativeFileChangeReportSupport,
+  createNativeFileChangeReporter,
   type AgentFileChangeReportResult,
+  type NativeFileChangeReporter,
 } from "../file-change-audit.js";
 
 function createSupport(options: {
@@ -17,13 +17,25 @@ function createSupport(options: {
   logError?: (message: string) => void;
   timeoutMs?: number;
 }) {
-  return createNativeFileChangeReportSupport({
+  return createNativeFileChangeReporter({
     cwd: options.cwd ?? process.cwd(),
     additionalDirectories: options.additionalDirectories ?? [],
     publish: options.publish ?? (async () => {}),
     logError: options.logError ?? (() => {}),
     timeoutMs: options.timeoutMs,
   });
+}
+
+function requestedTurn(reporter: NativeFileChangeReporter, requestId: string) {
+  const fileChangeReport = reporter.request({
+    jetbrains: {
+      air: {
+        agentFileChangeReportRequest: { version: 1, requestId },
+      },
+    },
+  });
+  expect(fileChangeReport).toBeDefined();
+  return { promptUuid: "prompt-uuid", fileChangeReport };
 }
 
 describe("native agent file-change report", () => {
@@ -54,6 +66,25 @@ describe("native agent file-change report", () => {
     }
   });
 
+  it("owns request-id deduplication for the session", () => {
+    const reporter = createSupport({});
+    const turn = requestedTurn(reporter, "request-deduplicated");
+
+    expect(turn.fileChangeReport?.requestId).toBe("request-deduplicated");
+    expect(
+      reporter.request({
+        jetbrains: {
+          air: {
+            agentFileChangeReportRequest: {
+              version: 1,
+              requestId: "request-deduplicated",
+            },
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
   it("uses Claude checkpoint dry-run and normalizes its paths", async () => {
     const cwd = path.join(os.tmpdir(), "native-file-report-project");
     const additionalRoot = path.join(os.tmpdir(), "native-file-report-shared");
@@ -64,7 +95,7 @@ describe("native agent file-change report", () => {
       additionalDirectories: [additionalRoot],
       publish: async (result) => void published.push(result),
     });
-    const state = createFileChangeReportTurnState("request-1");
+    const turn = requestedTurn(support, "request-1");
     const rewindFiles = vi.fn(async () => ({
       canRewind: true,
       filesChanged: ["src/a.ts", "src/a.ts", path.join(additionalRoot, "generated.ts")],
@@ -72,7 +103,7 @@ describe("native agent file-change report", () => {
       deletions: 3,
     }));
 
-    await support.report(state, { rewindFiles }, "prompt-uuid");
+    await support.report(turn, { rewindFiles });
 
     expect(rewindFiles).toHaveBeenCalledWith("prompt-uuid", { dryRun: true });
     expect(published).toEqual([
@@ -88,19 +119,17 @@ describe("native agent file-change report", () => {
         truncated: false,
       },
     ]);
-    expect(state.phase).toBe("finished");
+    expect(turn.fileChangeReport?.phase).toBe("finished");
   });
 
   it("publishes unavailable when Claude cannot preview the checkpoint", async () => {
     const published: AgentFileChangeReportResult[] = [];
     const support = createSupport({ publish: async (result) => void published.push(result) });
-    const state = createFileChangeReportTurnState("request-invalid");
+    const turn = requestedTurn(support, "request-invalid");
 
-    await support.report(
-      state,
-      { rewindFiles: vi.fn(async () => ({ canRewind: false, error: "checkpoint missing" })) },
-      "prompt-uuid",
-    );
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => ({ canRewind: false, error: "checkpoint missing" })),
+    });
 
     expect(published).toEqual([
       {
@@ -118,11 +147,11 @@ describe("native agent file-change report", () => {
       publish: async (result) => void published.push(result),
       timeoutMs: 1,
     });
-    const state = createFileChangeReportTurnState("request-timeout");
+    const turn = requestedTurn(support, "request-timeout");
     const never = new Promise<never>(() => {});
 
-    await support.report(state, { rewindFiles: vi.fn(() => never) }, "prompt-uuid");
-    await support.finishUnavailable(state, "cancelled");
+    await support.report(turn, { rewindFiles: vi.fn(() => never) });
+    support.finish(turn.fileChangeReport, "cancelled");
 
     expect(published).toEqual([
       {
@@ -137,14 +166,14 @@ describe("native agent file-change report", () => {
   it("lets cancellation win a race with a late checkpoint response", async () => {
     const published: AgentFileChangeReportResult[] = [];
     const support = createSupport({ publish: async (result) => void published.push(result) });
-    const state = createFileChangeReportTurnState("request-race");
+    const turn = requestedTurn(support, "request-race");
     let resolvePreview!: (value: { canRewind: true; filesChanged: string[] }) => void;
     const preview = new Promise<{ canRewind: true; filesChanged: string[] }>((resolve) => {
       resolvePreview = resolve;
     });
-    const reporting = support.report(state, { rewindFiles: vi.fn(() => preview) }, "prompt-uuid");
+    const reporting = support.report(turn, { rewindFiles: vi.fn(() => preview) });
 
-    await support.finishUnavailable(state, "cancelled");
+    support.finish(turn.fileChangeReport, "cancelled");
     resolvePreview({ canRewind: true, filesChanged: ["src/late.ts"] });
     await reporting;
 
@@ -165,21 +194,17 @@ describe("native agent file-change report", () => {
       cwd,
       publish: async (result) => void reports.push(result),
     });
-    const state = createFileChangeReportTurnState("request-caps");
+    const turn = requestedTurn(support, "request-caps");
 
-    await support.report(
-      state,
-      {
-        rewindFiles: vi.fn(async () => ({
-          canRewind: true,
-          filesChanged: Array.from(
-            { length: 1030 },
-            (_, index) => `generated/${index}-${"x".repeat(280)}.txt`,
-          ),
-        })),
-      },
-      "prompt-uuid",
-    );
+    await support.report(turn, {
+      rewindFiles: vi.fn(async () => ({
+        canRewind: true,
+        filesChanged: Array.from(
+          { length: 1030 },
+          (_, index) => `generated/${index}-${"x".repeat(280)}.txt`,
+        ),
+      })),
+    });
 
     expect(reports[0]).toMatchObject({
       status: "reported",
@@ -199,17 +224,15 @@ describe("native agent file-change report", () => {
       },
       logError,
     });
-    const state = createFileChangeReportTurnState("request-publish-failure");
+    const turn = requestedTurn(support, "request-publish-failure");
 
     await expect(
-      support.report(
-        state,
-        { rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })) },
-        "prompt-uuid",
-      ),
+      support.report(turn, {
+        rewindFiles: vi.fn(async () => ({ canRewind: true, filesChanged: [] })),
+      }),
     ).resolves.toBeUndefined();
 
-    expect(state.phase).toBe("finished");
+    expect(turn.fileChangeReport?.phase).toBe("finished");
     expect(logError).toHaveBeenCalledWith(expect.stringContaining("transport closed"));
   });
 });

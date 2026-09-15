@@ -88,7 +88,6 @@ export function mockSessionState(
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-    fileChangeReportRequestIds: new Set(),
     ...overrides,
   } as any;
 }

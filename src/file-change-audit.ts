@@ -22,6 +22,11 @@ export type FileChangeReportTurnState = {
   phase: "requested" | "collecting" | "finished";
 };
 
+export type NativeFileChangeReportTurn = {
+  promptUuid: string;
+  fileChangeReport?: FileChangeReportTurnState;
+};
+
 export type FileChangeReportWorkspace = {
   cwd: string;
   additionalDirectories: string[];
@@ -46,7 +51,7 @@ export type AgentFileChangeReportResult = {
 export type FileChangeReportUnavailableReason =
   "cancelled" | "timeout" | "invalidOutput" | "notReported" | "providerError";
 
-type NativeFileChangeReportSupportOptions = {
+type NativeFileChangeReporterOptions = {
   cwd: string;
   additionalDirectories: string[];
   publish: (result: AgentFileChangeReportResult) => Promise<void>;
@@ -54,16 +59,16 @@ type NativeFileChangeReportSupportOptions = {
   timeoutMs?: number;
 };
 
-export type NativeFileChangeReportSupport = {
+export type NativeFileChangeReporter = {
+  request(meta: unknown): FileChangeReportTurnState | undefined;
   report(
-    state: FileChangeReportTurnState,
+    turn: NativeFileChangeReportTurn | null | undefined,
     query: Pick<Query, "rewindFiles">,
-    checkpointId: string,
   ): Promise<void>;
-  finishUnavailable(
-    state: FileChangeReportTurnState,
+  finish(
+    state: FileChangeReportTurnState | undefined,
     reason: FileChangeReportUnavailableReason,
-  ): Promise<void>;
+  ): void;
 };
 
 export function agentFileChangeReportRequestId(meta: unknown): string | undefined {
@@ -95,10 +100,6 @@ export function agentFileChangeReportMeta(
   return withAirMeta(undefined, AGENT_FILE_CHANGE_REPORT_CAPABILITY, result);
 }
 
-export function createFileChangeReportTurnState(requestId: string): FileChangeReportTurnState {
-  return { requestId, phase: "requested" };
-}
-
 export function isLegacyFileChangeAuditTool(toolName: string): boolean {
   return toolName === LEGACY_FILE_CHANGE_AUDIT_WIRE_TOOL_NAME;
 }
@@ -107,11 +108,12 @@ export function containsLegacyFileChangeAuditMarker(text: string): boolean {
   return text.includes(`<${LEGACY_FILE_CHANGE_AUDIT_MARKER}>`);
 }
 
-export function createNativeFileChangeReportSupport(
-  options: NativeFileChangeReportSupportOptions,
-): NativeFileChangeReportSupport {
+export function createNativeFileChangeReporter(
+  options: NativeFileChangeReporterOptions,
+): NativeFileChangeReporter {
   const workspace = normalizeWorkspace(options.cwd, options.additionalDirectories);
   const timeoutMs = options.timeoutMs ?? AGENT_FILE_CHANGE_REPORT_TIMEOUT_MS;
+  const requestIds = new Set<string>();
 
   const publish = async (state: FileChangeReportTurnState, result: AgentFileChangeReportResult) => {
     if (state.phase === "finished") return;
@@ -136,15 +138,15 @@ export function createNativeFileChangeReportSupport(
   };
 
   const report = async (
-    state: FileChangeReportTurnState,
+    turn: NativeFileChangeReportTurn | null | undefined,
     query: Pick<Query, "rewindFiles">,
-    checkpointId: string,
   ) => {
-    if (state.phase !== "requested") return;
+    const state = turn?.fileChangeReport;
+    if (!state || state.phase !== "requested") return;
     state.phase = "collecting";
 
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const previewPromise = query.rewindFiles(checkpointId, { dryRun: true });
+    const previewPromise = query.rewindFiles(turn.promptUuid, { dryRun: true });
     // A timed-out control request may still settle later. Observe it so a late
     // rejection cannot become unhandled, but never let it publish a second terminal.
     void previewPromise.catch(() => {});
@@ -178,14 +180,26 @@ export function createNativeFileChangeReportSupport(
         }),
       );
     } catch (error) {
-      options.logError(`Failed to inspect Claude file checkpoint ${checkpointId}: ${error}`);
+      options.logError(`Failed to inspect Claude file checkpoint ${turn.promptUuid}: ${error}`);
       await finishUnavailable(state, "providerError");
     } finally {
       if (timer) clearTimeout(timer);
     }
   };
 
-  return { report, finishUnavailable };
+  return {
+    request(meta) {
+      const requestId = agentFileChangeReportRequestId(meta);
+      if (!requestId || requestIds.has(requestId)) return undefined;
+      requestIds.add(requestId);
+      return { requestId, phase: "requested" };
+    },
+    report,
+    finish(state, reason) {
+      if (!state) return;
+      void finishUnavailable(state, reason);
+    },
+  };
 }
 
 function normalizeWorkspace(

@@ -197,14 +197,12 @@ import {
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
-  agentFileChangeReportRequestId,
   containsLegacyFileChangeAuditMarker,
-  createFileChangeReportTurnState,
-  createNativeFileChangeReportSupport,
+  createNativeFileChangeReporter,
   type FileChangeReportTurnState,
   type FileChangeReportUnavailableReason,
   isLegacyFileChangeAuditTool,
-  type NativeFileChangeReportSupport,
+  type NativeFileChangeReporter,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
 import {
@@ -698,14 +696,8 @@ export type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
-  /** Request ids already accepted for native agent file-change reports. Kept
-   *  for the session lifetime so a redelivered prompt cannot publish the same
-   *  checkpoint preview twice or bind a late report to another turn. */
-  fileChangeReportRequestIds: Set<string>;
-  /** Session-owned publisher for negotiated native file-change reports. Turn state
-   *  stays on each Turn; this controller supplies the single idempotent
-   *  unavailable terminal used by every non-report settlement path. */
-  fileChangeReportSupport?: NativeFileChangeReportSupport;
+  /** Session-owned native checkpoint reporter. Turn state stays on each Turn. */
+  fileChangeReporter?: NativeFileChangeReporter;
   /** Optimistic goal state published for a submitted `/goal` command whose
    *  matching runtime update has not arrived yet. Runtime updates for the old
    *  goal are suppressed until this command is echoed or completes, otherwise
@@ -1944,13 +1936,13 @@ export class ClaudeAcpAgent {
       },
       settleCancelledTurn: (original, session, turn) => {
         disarmForceCancel(session);
-        this.finishFileChangeReport(session, turn, "cancelled");
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
         turn.settled = true;
         turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
       },
       settleFailedTurn: (session, turn, error) => {
         disarmForceCancel(session);
-        this.finishFileChangeReport(session, turn, "providerError");
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
         turn.settled = true;
         turn.reject(error);
       },
@@ -2668,17 +2660,7 @@ export class ClaudeAcpAgent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
-    const fileChangeReportRequestId = supportsAgentFileChangeReport(this.clientCapabilities)
-      ? agentFileChangeReportRequestId(params._meta)
-      : undefined;
-    let fileChangeReport: FileChangeReportTurnState | undefined;
-    if (
-      fileChangeReportRequestId &&
-      !session.fileChangeReportRequestIds.has(fileChangeReportRequestId)
-    ) {
-      session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
-      fileChangeReport = createFileChangeReportTurnState(fileChangeReportRequestId);
-    }
+    const fileChangeReport = session.fileChangeReporter?.request(params._meta);
 
     const isUsageCommand =
       params.prompt.length === 1 &&
@@ -3094,30 +3076,6 @@ export class ClaudeAcpAgent {
       asyncTasks.releaseStop(params.asyncTaskId);
       throw error;
     }
-  }
-
-  /** Publish the unavailable terminal for every turn path that did not reach
-   *  the native checkpoint preview. The support claims the turn state before
-   *  its transport await, so settlement stays fail-open and idempotent. */
-  private finishFileChangeReport(
-    session: Session,
-    turn: Turn,
-    reason: FileChangeReportUnavailableReason,
-  ): void {
-    if (!turn.fileChangeReport || !session.fileChangeReportSupport) return;
-    void session.fileChangeReportSupport.finishUnavailable(turn.fileChangeReport, reason);
-  }
-
-  /** Ask Claude Code's native checkpoint store for the net files changed since
-   *  this turn's user-message checkpoint. The support bounds the control call
-   *  and publishes fail-open, so reporting cannot hold the ACP turn forever. */
-  private async reportNativeFileChanges(session: Session, turn: Turn | null | undefined) {
-    if (!turn?.fileChangeReport || !session.fileChangeReportSupport) return;
-    await session.fileChangeReportSupport.report(
-      turn.fileChangeReport,
-      session.query,
-      turn.promptUuid,
-    );
   }
 
   /** Lazily start the per-session consumer that drains the SDK query stream for
@@ -3693,7 +3651,7 @@ export class ClaudeAcpAgent {
       if (!turn || turn.settled) {
         return;
       }
-      this.finishFileChangeReport(session, turn, reportReason);
+      session.fileChangeReporter?.finish(turn.fileChangeReport, reportReason);
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
@@ -3731,7 +3689,7 @@ export class ClaudeAcpAgent {
         );
         return;
       }
-      this.finishFileChangeReport(session, turn, "providerError");
+      session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -3813,7 +3771,7 @@ export class ClaudeAcpAgent {
       session.turnQueue = [];
       for (const turn of turns) {
         if (!turn.settled) {
-          this.finishFileChangeReport(session, turn, "providerError");
+          session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
           const wasHeld = isHeldOpen(turn);
           turn.settled = true;
           if (wasHeld) {
@@ -3978,7 +3936,7 @@ export class ClaudeAcpAgent {
           // still here was enqueued afterward and was not part of the cancel.)
           for (const queued of [...(session.turnQueue ?? [])]) {
             if (!queued.settled) {
-              this.finishFileChangeReport(session, queued, "providerError");
+              session.fileChangeReporter?.finish(queued.fileChangeReport, "providerError");
               queued.settled = true;
               queued.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
             }
@@ -5160,7 +5118,7 @@ export class ClaudeAcpAgent {
                   });
                 }
                 stopReason = "refusal";
-                await this.reportNativeFileChanges(session, session.activeTurn);
+                await session.fileChangeReporter?.report(session.activeTurn, session.query);
                 // Through the deferral gate, not settleActive: a refusal can
                 // land on a turn whose spawned subagents are still live, and
                 // settling it out from under them would strand their output
@@ -5370,7 +5328,7 @@ export class ClaudeAcpAgent {
                 // cycle; its replacement cycle will report the checkpoint at
                 // the actual turn boundary.
                 if (!isSteering(session.activeTurn)) {
-                  await this.reportNativeFileChanges(session, session.activeTurn);
+                  await session.fileChangeReporter?.report(session.activeTurn, session.query);
                 }
                 settleOrDefer(turnOutcome(session, stopReason));
               }
@@ -6170,7 +6128,7 @@ export class ClaudeAcpAgent {
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
-          this.finishFileChangeReport(session, turn, "cancelled");
+          session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
           turn.settled = true;
           // Deliberately no `usage`: a queued turn never ran, so the session
           // accumulator (the active turn's tally) is not its spend.
@@ -6263,7 +6221,7 @@ export class ClaudeAcpAgent {
     {
       const active = session.activeTurn;
       if (isHeldOpen(active)) {
-        this.finishFileChangeReport(session, active, "cancelled");
+        session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -8042,8 +8000,8 @@ export class ClaudeAcpAgent {
       ...acpAdditionalDirectories,
     ];
 
-    const fileChangeReportSupport = supportsAgentFileChangeReport(this.clientCapabilities)
-      ? createNativeFileChangeReportSupport({
+    const fileChangeReporter = supportsAgentFileChangeReport(this.clientCapabilities)
+      ? createNativeFileChangeReporter({
           cwd: params.cwd,
           additionalDirectories,
           publish: async (result) => {
@@ -8121,7 +8079,7 @@ export class ClaudeAcpAgent {
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids
       // snapshot I/O for every other session.
-      ...(fileChangeReportSupport ? { enableFileCheckpointing: true } : {}),
+      ...(fileChangeReporter ? { enableFileCheckpointing: true } : {}),
       ...(settings && { settings }),
       env,
       // Override certain fields that must be controlled by ACP
@@ -8531,8 +8489,7 @@ export class ClaudeAcpAgent {
         sessionFailureState: createSessionFailureState(),
         claudeSubscriptionGuard,
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
-        fileChangeReportRequestIds: new Set(),
-        fileChangeReportSupport,
+        fileChangeReporter,
       };
       timing.phase("register");
 
