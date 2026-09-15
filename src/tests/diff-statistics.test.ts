@@ -22,7 +22,7 @@ describe("diff statistics", () => {
         {
           oldStart: 1_000_000,
           oldLines: 0,
-          newStart: 999_999,
+          newStart: 1_000_000,
           newLines: 2,
           lines: ["+first", "+second"],
         },
@@ -103,6 +103,25 @@ describe("diff statistics", () => {
       structuredPatch: [
         { oldStart: 10, oldLines: 1, newStart: 10, newLines: 1, lines: ["-old", "+new"] },
         { oldStart: 5, oldLines: 1, newStart: 5, newLines: 1, lines: ["-old", "+new"] },
+      ],
+    });
+
+    expect(result.content?.[0]).toHaveProperty("_meta");
+    expect(result.content?.[1]).not.toHaveProperty("_meta");
+  });
+
+  it("omits statistics when later hunk coordinates ignore the accumulated line delta", () => {
+    const result = toolUpdateFromDiffToolResponse({
+      filePath: "/file.ts",
+      structuredPatch: [
+        {
+          oldStart: 10,
+          oldLines: 1,
+          newStart: 10,
+          newLines: 2,
+          lines: ["-old", "+new", "+extra"],
+        },
+        { oldStart: 20, oldLines: 1, newStart: 20, newLines: 1, lines: ["-old", "+new"] },
       ],
     });
 

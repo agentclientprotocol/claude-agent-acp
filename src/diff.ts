@@ -41,7 +41,8 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   const locations: ToolCallLocation[] = [];
   let previousOldEnd = 0;
   let previousNewEnd = 0;
-  let coordinatesRemainOrdered = true;
+  let accumulatedDelta = 0;
+  let coordinatesRemainConsistent = true;
 
   for (const { lines, oldStart, newStart, oldLines, newLines } of response.structuredPatch) {
     const oldText: string[] = [];
@@ -50,8 +51,13 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
     let removed = 0;
     let validPrefixes = true;
     let validEofMarkers = true;
+    const oldPosition = oldStart + (oldLines === 0 ? 1 : 0);
+    const newPosition = newStart + (newLines === 0 ? 1 : 0);
+    const oldEnd = oldPosition + oldLines;
+    const newEnd = newPosition + newLines;
+    const nextDelta = accumulatedDelta + newLines - oldLines;
     const validCoordinates: boolean =
-      coordinatesRemainOrdered &&
+      coordinatesRemainConsistent &&
       Number.isSafeInteger(oldStart) &&
       Number.isSafeInteger(newStart) &&
       Number.isSafeInteger(oldLines) &&
@@ -60,14 +66,19 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
       newStart >= (newLines === 0 ? 0 : 1) &&
       oldLines >= 0 &&
       newLines >= 0 &&
-      Number.isSafeInteger(oldStart + oldLines) &&
-      Number.isSafeInteger(newStart + newLines) &&
-      oldStart >= previousOldEnd &&
-      newStart >= previousNewEnd;
-    coordinatesRemainOrdered = validCoordinates;
+      Number.isSafeInteger(oldPosition) &&
+      Number.isSafeInteger(newPosition) &&
+      Number.isSafeInteger(oldEnd) &&
+      Number.isSafeInteger(newEnd) &&
+      Number.isSafeInteger(nextDelta) &&
+      oldPosition >= previousOldEnd &&
+      newPosition >= previousNewEnd &&
+      newPosition - oldPosition === accumulatedDelta;
+    coordinatesRemainConsistent = validCoordinates;
     if (validCoordinates) {
-      previousOldEnd = oldStart + oldLines;
-      previousNewEnd = newStart + newLines;
+      previousOldEnd = oldEnd;
+      previousNewEnd = newEnd;
+      accumulatedDelta = nextDelta;
     }
     for (const [index, line] of lines.entries()) {
       if (line.startsWith("-")) {
