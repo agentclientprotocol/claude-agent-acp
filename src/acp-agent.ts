@@ -246,6 +246,12 @@ import {
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
+import {
+  isMcpServerCommandRefusal,
+  parseMcpServerCommand,
+  runMcpServerCommand,
+  type McpServerCommand,
+} from "./mcp-commands.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
@@ -578,6 +584,13 @@ type Turn = {
    * publish the structured replacement at most once. */
   usageMarkdownDelivered?: boolean;
   usageOriginalOutput?: string;
+  /** `/mcp reconnect|enable|disable`: sent to Claude Code like any command,
+   * so ordering, cancellation, persistence, and replay stay unchanged. The
+   * headless CLI refuses it; only that refusal is replaced, by running the
+   * action through the SDK. A CLI that handles the action keeps its output. */
+  mcpServerCommand?: McpServerCommand;
+  mcpServerCommandReply?: Promise<string>;
+  mcpServerCommandRefusal?: string;
   /** Optional hidden, model-authored file-change audit requested by the ACP
    *  client for this turn. The state is turn-owned so a late tool call can
    *  never be rebound to a newer prompt. */
@@ -2687,6 +2700,10 @@ export class ClaudeAcpAgent {
       params.prompt[0]?.type === "text" &&
       isUsageCommandText(params.prompt[0].text);
     const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+    const mcpServerCommand =
+      params.prompt.length === 1 && params.prompt[0]?.type === "text"
+        ? parseMcpServerCommand(params.prompt[0].text)
+        : null;
 
     session.titles.onPrompt(params.prompt);
 
@@ -2699,6 +2716,7 @@ export class ClaudeAcpAgent {
       isLocalOnlyCommand,
       ...(isUsageCommand ? { isUsageCommand: true } : {}),
       ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
+      ...(mcpServerCommand ? { mcpServerCommand } : {}),
       ...(fileChangeAudit ? { fileChangeAudit } : {}),
       settled: false,
       resolve: () => {},
@@ -3625,6 +3643,32 @@ export class ClaudeAcpAgent {
       return markdown;
     };
 
+    /** Claim the adapter's reply for a `/mcp` server action the CLI refused,
+     * with the same contract as takeUsageMarkdown. The action runs once, on the
+     * first frame carrying the refusal; any other output passes through. */
+    const takeMcpServerCommandReply = async (
+      originalOutput: string,
+    ): Promise<string | null | undefined> => {
+      const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
+      if (!turn?.mcpServerCommand) return undefined;
+      if (turn.mcpServerCommandReply) {
+        return turn.mcpServerCommandRefusal === originalOutput ? null : undefined;
+      }
+      if (!isMcpServerCommandRefusal(originalOutput)) return undefined;
+      turn.mcpServerCommandRefusal = originalOutput;
+      turn.mcpServerCommandReply = runMcpServerCommand(session.query, turn.mcpServerCommand);
+      return turn.mcpServerCommandReply;
+    };
+
+    const takeLocalCommandReplacement = async (
+      originalOutput: string,
+    ): Promise<string | null | undefined> => {
+      const usageMarkdown = await takeUsageMarkdown(originalOutput);
+      return usageMarkdown !== undefined
+        ? usageMarkdown
+        : takeMcpServerCommandReply(originalOutput);
+    };
+
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
@@ -4202,14 +4246,14 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 const usageTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
-                const usageMarkdown = await takeUsageMarkdown(message.content);
+                const replacement = await takeLocalCommandReplacement(message.content);
                 if (usageTurn?.isUsageCommand && session.cancelled) break;
-                if (usageMarkdown === null) break;
+                if (replacement === null) break;
                 await sendUpdate({
                   sessionId: message.session_id,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: usageMarkdown ?? message.content },
+                    content: { type: "text", text: replacement ?? message.content },
                   },
                 });
                 break;
@@ -5251,10 +5295,10 @@ export class ClaudeAcpAgent {
                       !deliveredCompactionOutput &&
                       (message.usage.output_tokens ?? 0) === 0);
                   if (shouldForwardResult) {
-                    const usageMarkdown = await takeUsageMarkdown(message.result);
-                    if (usageMarkdown === null) break;
+                    const replacement = await takeLocalCommandReplacement(message.result);
+                    if (replacement === null) break;
                     for (const notification of toAcpNotifications(
-                      usageMarkdown ?? message.result,
+                      replacement ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -5684,20 +5728,20 @@ export class ClaudeAcpAgent {
             // Depending on the Claude Code build, a local command can arrive
             // as the dedicated system message above or as a synthetic
             // assistant message. Replace only the output owned by the exact
-            // /usage turn; no content signatures or text parsing are involved.
+            // /usage turn, or the CLI's exact refusal of a `/mcp` server action.
             if (
               message.type === "assistant" &&
               message.parent_tool_use_id === null &&
               message.message.model === "<synthetic>"
             ) {
-              const usageMarkdown = await takeUsageMarkdown(
+              const replacement = await takeLocalCommandReplacement(
                 assistantMessageText(message.message) ?? "",
               );
               if (session.cancelled) break;
-              if (usageMarkdown !== undefined) {
-                if (usageMarkdown !== null) {
+              if (replacement !== undefined) {
+                if (replacement !== null) {
                   for (const notification of toAcpNotifications(
-                    usageMarkdown,
+                    replacement,
                     "assistant",
                     params.sessionId,
                     session.toolUseCache,
