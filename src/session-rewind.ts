@@ -28,6 +28,7 @@ type RewindSessionState = {
 
 type RewindSessionCreationOptions =
   | { reuseSessionId: string }
+  | { resume: string }
   | {
       resume: string;
       resumeSessionAt: string;
@@ -67,7 +68,9 @@ export async function rewindClaudeSession(
   const session = dependencies.getSession(params.sessionId);
   if (!session || session.activeTurn || session.turnQueue?.length) return { rewound: false };
 
-  const beforeMessage = await resolveHistoryPoint(
+  const messages = await getSessionMessages(params.sessionId);
+  const beforeMessage = resolveHistoryPointFromMessages(
+    messages,
     params.sessionId,
     params.beforeMessage,
     "user",
@@ -82,18 +85,53 @@ export async function rewindClaudeSession(
     ? (beforeMessage as SessionMessage & { parentUuid?: string }).parentUuid
     : undefined;
   if (params.resumeAtMessage && !resumeAtUuid) return { rewound: false };
+  if (params.resumeAtMessage) {
+    const visibleAssistant = resolveHistoryPointFromMessages(
+      messages,
+      params.sessionId,
+      params.resumeAtMessage,
+      "assistant",
+      dependencies.messageIdForGrouping,
+    );
+    if (!isAssistantAtRetainedBoundary(messages, resumeAtUuid!, visibleAssistant.uuid)) {
+      throw RequestError.invalidParams(
+        { messageId: params.resumeAtMessage.messageId },
+        "resumeAtMessage is not the assistant message immediately preceding beforeMessage",
+      );
+    }
+  }
 
   await dependencies.teardownSession(params.sessionId);
-  await dependencies.createSession(
-    session.creationParams ?? { cwd: session.cwd, mcpServers: [] },
-    resumeAtUuid
-      ? {
-          resume: params.sessionId,
-          resumeSessionAt: resumeAtUuid,
-          resumeDropsTurn: beforeUuid,
-        }
-      : { reuseSessionId: params.sessionId },
-  );
+  const creationParams = session.creationParams ?? { cwd: session.cwd, mcpServers: [] };
+  try {
+    await dependencies.createSession(
+      creationParams,
+      resumeAtUuid
+        ? {
+            resume: params.sessionId,
+            resumeSessionAt: resumeAtUuid,
+            resumeDropsTurn: beforeUuid,
+          }
+        : { reuseSessionId: params.sessionId },
+    );
+  } catch (rewindError) {
+    try {
+      await dependencies.createSession(creationParams, { resume: params.sessionId });
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [rewindError, rollbackError],
+        `Session ${params.sessionId} rewind failed and the original session could not be restored`,
+        { cause: rollbackError },
+      );
+    }
+    if (
+      rewindError instanceof Error &&
+      rewindError.message.startsWith("Resume rejected by --resume-drops-turn:")
+    ) {
+      return { rewound: false };
+    }
+    throw rewindError;
+  }
   return { rewound: true };
 }
 
@@ -104,6 +142,16 @@ export async function resolveHistoryPoint(
   messageIdForGrouping: (message: SessionMessage) => string | undefined,
 ): Promise<SessionMessage> {
   const messages = await getSessionMessages(sessionId);
+  return resolveHistoryPointFromMessages(messages, sessionId, point, role, messageIdForGrouping);
+}
+
+function resolveHistoryPointFromMessages(
+  messages: SessionMessage[],
+  sessionId: string,
+  point: SessionHistoryPoint,
+  role: "user" | "assistant",
+  messageIdForGrouping: (message: SessionMessage) => string | undefined,
+): SessionMessage {
   const roleMessages = messages.filter((message) => message.type === role);
   const candidates = messageIdCandidates(point.messageId);
   const exact = roleMessages
@@ -121,6 +169,27 @@ export async function resolveHistoryPoint(
     { messageId: point.messageId },
     `Rewind message ${point.messageId} was not found in session ${sessionId}`,
   );
+}
+
+function isAssistantAtRetainedBoundary(
+  messages: SessionMessage[],
+  boundaryUuid: string,
+  assistantUuid: string | undefined,
+): boolean {
+  if (!assistantUuid) return false;
+  const byUuid = new Map(
+    messages.flatMap((message) => (message.uuid ? [[message.uuid, message]] : [])),
+  );
+  const visited = new Set<string>();
+  let uuid: string | undefined = boundaryUuid;
+  while (uuid && !visited.has(uuid)) {
+    visited.add(uuid);
+    const message = byUuid.get(uuid);
+    if (!message) return false;
+    if (message.type === "assistant") return message.uuid === assistantUuid;
+    uuid = (message as SessionMessage & { parentUuid?: string }).parentUuid;
+  }
+  return false;
 }
 
 function parseHistoryPoint(value: unknown, name: string): SessionHistoryPoint {

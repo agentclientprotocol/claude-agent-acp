@@ -189,6 +189,168 @@ function injectGeneratorSession(
   return input;
 }
 
+describe("session rewind coordination", () => {
+  function agent() {
+    return new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+  }
+
+  it("waits for every prompt reservation before exclusively rewinding", async () => {
+    const instance = agent() as any;
+    const releaseFirst = instance.reserveSessionPrompt("test-session") as () => void;
+    const releaseSecond = instance.reserveSessionPrompt("test-session") as () => void;
+    const rewind = instance.acquireSessionMutationLock("test-session") as Promise<() => void>;
+    let acquired = false;
+    void rewind.then(() => {
+      acquired = true;
+    });
+
+    releaseFirst();
+    await Promise.resolve();
+    expect(acquired).toBe(false);
+    releaseSecond();
+    const releaseRewind = await rewind;
+    expect(acquired).toBe(true);
+
+    const blockedPrompt = instance.reserveSessionPrompt("test-session") as Promise<() => void>;
+    let promptAdmitted = false;
+    void blockedPrompt.then(() => {
+      promptAdmitted = true;
+    });
+    await Promise.resolve();
+    expect(promptAdmitted).toBe(false);
+    releaseRewind();
+    const releasePrompt = await blockedPrompt;
+    expect(promptAdmitted).toBe(true);
+    releasePrompt();
+  });
+
+  it("keeps provider recreation behind an in-flight rewind lock", async () => {
+    const instance = agent() as any;
+    const releaseRewind = instance.acquireSessionMutationLock("test-session") as () => void;
+    instance.sessions["test-session"] = mockSessionState({
+      creationParams: { cwd: "/workspace", mcpServers: [] },
+    });
+    const close = vi.spyOn(instance, "closeQueryStream").mockImplementation(() => {});
+    vi.spyOn(instance, "createSession").mockResolvedValue({ sessionId: "test-session" });
+
+    const update = instance.enqueueProviderUpdate(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(close).not.toHaveBeenCalled();
+
+    releaseRewind();
+    await update;
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("keeps close and delete behind an in-flight rewind lock", async () => {
+    const closing = agent() as any;
+    closing.sessions["test-session"] = mockSessionState();
+    const closeTeardown = vi.spyOn(closing, "teardownSession").mockResolvedValue(undefined);
+    const releaseCloseRewind = closing.acquireSessionMutationLock("test-session") as () => void;
+    const close = closing.closeSession({ sessionId: "test-session" });
+    await Promise.resolve();
+    expect(closeTeardown).not.toHaveBeenCalled();
+    releaseCloseRewind();
+    await close;
+    expect(closeTeardown).toHaveBeenCalledOnce();
+
+    const deleting = agent() as any;
+    const releaseDeleteRewind = deleting.acquireSessionMutationLock("test-session") as () => void;
+    const deleteCalls = vi.mocked(deleteSession).mock.calls.length;
+    const deletion = deleting.deleteSession({ sessionId: "test-session" });
+    await Promise.resolve();
+    expect(vi.mocked(deleteSession).mock.calls).toHaveLength(deleteCalls);
+    releaseDeleteRewind();
+    await deletion;
+    expect(vi.mocked(deleteSession).mock.calls).toHaveLength(deleteCalls + 1);
+  });
+
+  it("acknowledges a truncating resume only when its init frame is consumed", async () => {
+    const instance = agent();
+    let acknowledge!: () => void;
+    let refuse!: (error: unknown) => void;
+    const acknowledged = new Promise<void>((resolve, reject) => {
+      acknowledge = resolve;
+      refuse = reject;
+    });
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield lifecycleInit;
+      },
+      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(acknowledged).resolves.toBeUndefined();
+    expect(instance.sessions["test-session"].msgLifecycleV1).toBe(true);
+  });
+
+  it("rejects truncating resume before a later init when resumeDropsTurn refuses it", async () => {
+    const instance = agent();
+    let acknowledge!: () => void;
+    let refuse!: (error: unknown) => void;
+    const acknowledged = new Promise<void>((resolve, reject) => {
+      acknowledge = resolve;
+      refuse = reject;
+    });
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield {
+          type: "result",
+          subtype: "error_during_execution",
+          errors: ["Resume rejected by --resume-drops-turn: unexpected tail"],
+        };
+        yield lifecycleInit;
+      },
+      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(acknowledged).rejects.toThrow(
+      "Resume rejected by --resume-drops-turn: unexpected tail",
+    );
+    expect(instance.sessions["test-session"].msgLifecycleV1).not.toBe(true);
+  });
+
+  it("does not publish a session failure when the temporary bootstrap stream fails", async () => {
+    const updates: SessionNotification[] = [];
+    const instance = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    let acknowledge!: () => void;
+    let refuse!: (error: unknown) => void;
+    const acknowledged = new Promise<void>((resolve, reject) => {
+      acknowledge = resolve;
+      refuse = reject;
+    });
+    injectGeneratorSession(
+      instance,
+      async function* () {
+        yield await Promise.reject(new Error("bootstrap transport failed"));
+      },
+      { rewindBootstrap: { resolve: acknowledge, reject: refuse } },
+    );
+
+    (instance as any).ensureConsumer(instance.sessions["test-session"], "test-session");
+
+    await expect(acknowledged).rejects.toThrow("bootstrap transport failed");
+    expect(updates).toEqual([]);
+  });
+});
+
 describe("task plan lifecycle", () => {
   function setup(
     taskState: Map<string, any>,

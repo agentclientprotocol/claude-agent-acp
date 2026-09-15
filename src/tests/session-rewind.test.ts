@@ -57,6 +57,7 @@ describe("session rewind", () => {
       creationParams: { cwd: "/workspace", mcpServers: [] },
     };
     vi.mocked(getSessionMessages).mockResolvedValue([
+      assistantMessage("retained-chain-uuid", "assistant-id", "answer"),
       {
         ...userMessage("selected-user-uuid", "selected-user-id", "edit me"),
         parentUuid: "retained-chain-uuid",
@@ -83,6 +84,84 @@ describe("session rewind", () => {
         resumeSessionAt: "retained-chain-uuid",
         resumeDropsTurn: "selected-user-uuid",
       },
+    );
+  });
+
+  it("rejects a retained assistant that is not the selected prompt boundary", async () => {
+    const session = { cwd: "/workspace", turnQueue: [] };
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      assistantMessage("older-assistant", "older-id", "answer"),
+      assistantMessage("retained-assistant", "retained-id", "latest"),
+      {
+        ...userMessage("selected-user", "selected-user-id", "edit me"),
+        parentUuid: "retained-assistant",
+      },
+    ] as never);
+    const teardown = vi.fn();
+
+    await expect(
+      rewindClaudeSession(
+        {
+          sessionId: "session-1",
+          beforeMessage: historyPoint("selected-user-id", "edit me"),
+          resumeAtMessage: historyPoint("older-id", "answer"),
+        },
+        dependencies(session, teardown, vi.fn()),
+      ),
+    ).rejects.toThrow("resumeAtMessage is not the assistant message immediately preceding");
+    expect(teardown).not.toHaveBeenCalled();
+  });
+
+  it("plain-resumes and reports false when resumeDropsTurn refuses the boundary", async () => {
+    const session = { cwd: "/workspace", turnQueue: [] };
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      assistantMessage("retained-assistant", "assistant-id", "answer"),
+      {
+        ...userMessage("selected-user", "selected-user-id", "edit me"),
+        parentUuid: "retained-assistant",
+      },
+    ] as never);
+    const create = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Resume rejected by --resume-drops-turn: changed tail"))
+      .mockResolvedValueOnce({ sessionId: "session-1" });
+
+    await expect(
+      rewindClaudeSession(
+        {
+          sessionId: "session-1",
+          beforeMessage: historyPoint("selected-user-id", "edit me"),
+          resumeAtMessage: historyPoint("assistant-id", "answer"),
+        },
+        dependencies(session, vi.fn().mockResolvedValue(undefined), create),
+      ),
+    ).resolves.toEqual({ rewound: false });
+    expect(create).toHaveBeenLastCalledWith(
+      { cwd: "/workspace", mcpServers: [] },
+      { resume: "session-1" },
+    );
+  });
+
+  it("restores the original session and rethrows an unexpected rewind failure", async () => {
+    const session = { cwd: "/workspace", turnQueue: [] };
+    vi.mocked(getSessionMessages).mockResolvedValue([
+      userMessage("selected-user", "selected-id", "edit me"),
+    ] as never);
+    const failure = new Error("query ended before acknowledgement");
+    const create = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce({});
+
+    await expect(
+      rewindClaudeSession(
+        {
+          sessionId: "session-1",
+          beforeMessage: historyPoint("selected-id", "edit me"),
+        },
+        dependencies(session, vi.fn().mockResolvedValue(undefined), create),
+      ),
+    ).rejects.toBe(failure);
+    expect(create).toHaveBeenLastCalledWith(
+      { cwd: "/workspace", mcpServers: [] },
+      { resume: "session-1" },
     );
   });
 
@@ -142,6 +221,15 @@ function userMessage(uuid: string, providerMessageId: string, text: string) {
     uuid,
     session_id: "session-1",
     message: { id: providerMessageId, role: "user", content: text },
+  };
+}
+
+function assistantMessage(uuid: string, providerMessageId: string, text: string) {
+  return {
+    type: "assistant" as const,
+    uuid,
+    session_id: "session-1",
+    message: { id: providerMessageId, role: "assistant", content: [{ type: "text", text }] },
   };
 }
 

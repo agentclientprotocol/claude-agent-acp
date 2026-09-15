@@ -708,6 +708,11 @@ export type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
+  /** Resolves only after a guarded truncating resume reaches its first init frame. */
+  rewindBootstrap?: {
+    resolve(): void;
+    reject(error: unknown): void;
+  };
   /** Request ids already accepted for hidden agent file-change reports. Kept
    *  for the session lifetime so a redelivered prompt cannot publish the same
    *  audit twice or bind a late report to another turn. */
@@ -1500,6 +1505,7 @@ function isMuslLibc(): boolean {
  *  query stream has already ended (ran to `done` or died). The stream is not
  *  revivable, so the only recovery is a fresh session. */
 const SESSION_ENDED_MESSAGE = "The Claude Agent session has ended. Please start a new session.";
+const RESUME_DROPS_TURN_REJECTION_PREFIX = "Resume rejected by --resume-drops-turn:";
 
 // Slash commands that the SDK handles locally without replaying the user
 // message and without invoking the model.
@@ -1919,10 +1925,68 @@ export class ClaudeAcpAgent {
   /** Same, for the "the CLI probe timed out" warning: a wedged CLI stays wedged
    *  and would otherwise warn once per probe, i.e. once per user prompt. */
   private loggedProbeTimeout = false;
+  /** Serializes the short session-state mutation window shared by prompt enqueue and rewind. */
+  private readonly sessionMutationLocks = new Map<string, Promise<void>>();
+  private readonly sessionPromptReservations = new Map<string, number>();
+  private readonly sessionPromptReservationWaiters = new Map<string, Array<() => void>>();
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+
+  private acquireSessionMutationLock(sessionId: string): (() => void) | Promise<() => void> {
+    const previous = this.sessionMutationLocks.get(sessionId);
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    this.sessionMutationLocks.set(sessionId, current);
+    const release = () => {
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        releaseCurrent();
+        if (this.sessionMutationLocks.get(sessionId) === current) {
+          this.sessionMutationLocks.delete(sessionId);
+        }
+      };
+    };
+    const waitForPrompts = (): (() => void) | Promise<() => void> => {
+      if (!this.sessionPromptReservations.get(sessionId)) return release();
+      return new Promise<() => void>((resolve) => {
+        const waiters = this.sessionPromptReservationWaiters.get(sessionId) ?? [];
+        waiters.push(() => resolve(release()));
+        this.sessionPromptReservationWaiters.set(sessionId, waiters);
+      });
+    };
+    return previous ? previous.then(waitForPrompts) : waitForPrompts();
+  }
+
+  private reserveSessionPrompt(sessionId: string): (() => void) | Promise<() => void> {
+    const pendingRewind = this.sessionMutationLocks.get(sessionId);
+    if (pendingRewind) {
+      return pendingRewind.then(() => this.reserveSessionPrompt(sessionId));
+    }
+    this.sessionPromptReservations.set(
+      sessionId,
+      (this.sessionPromptReservations.get(sessionId) ?? 0) + 1,
+    );
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.sessionPromptReservations.get(sessionId) ?? 1) - 1;
+      if (remaining > 0) {
+        this.sessionPromptReservations.set(sessionId, remaining);
+        return;
+      }
+      this.sessionPromptReservations.delete(sessionId);
+      const waiters = this.sessionPromptReservationWaiters.get(sessionId) ?? [];
+      this.sessionPromptReservationWaiters.delete(sessionId);
+      for (const waiter of waiters) waiter();
+    };
+  }
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -2189,20 +2253,34 @@ export class ClaudeAcpAgent {
   }
 
   async rewindSession(params: SessionRewindRequest): Promise<SessionRewindResponse> {
-    return rewindClaudeSession(params, {
-      waitForProviderUpdate: async () => {
-        if (this.providerUpdate) await this.providerUpdate;
-      },
-      getSession: (sessionId) => this.sessions[sessionId],
-      teardownSession: (sessionId) => this.teardownSession(sessionId),
-      createSession: (creationParams, options) => this.createSession(creationParams, options),
-      messageIdForGrouping,
-    });
+    if (this.providerUpdate) await this.providerUpdate;
+    const sessionMutation = this.acquireSessionMutationLock(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    try {
+      return await rewindClaudeSession(params, {
+        waitForProviderUpdate: async () => {},
+        getSession: (sessionId) => this.sessions[sessionId],
+        teardownSession: (sessionId) => this.teardownSession(sessionId),
+        createSession: (creationParams, options) => this.createSession(creationParams, options),
+        messageIdForGrouping,
+      });
+    } finally {
+      releaseSessionMutation();
+    }
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    const result = await this.getOrCreateSession(params);
+    const sessionMutation = this.acquireSessionMutationLock(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    let result: ResumeSessionResponse;
+    try {
+      result = await this.getOrCreateSession(params);
+    } finally {
+      releaseSessionMutation();
+    }
 
     // Needs to happen after we return the session
     setTimeout(() => {
@@ -2215,8 +2293,17 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const resumedSession = await readResumedSession(params.sessionId, this.logger);
-    const result = await this.getOrCreateSession(params, resumedSession);
+    const sessionMutation = this.acquireSessionMutationLock(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    let resumedSession: ResumedSessionSnapshot;
+    let result: LoadSessionResponse;
+    try {
+      resumedSession = await readResumedSession(params.sessionId, this.logger);
+      result = await this.getOrCreateSession(params, resumedSession);
+    } finally {
+      releaseSessionMutation();
+    }
     timing.phase("session-ready");
 
     await this.replaySessionHistory(params.sessionId, resumedSession.messages);
@@ -2648,104 +2735,113 @@ export class ClaudeAcpAgent {
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    let session = this.sessions[params.sessionId];
-    if (!session) {
-      throw new Error("Session not found");
-    }
-    // The one re-read per user prompt, fired here and never awaited: a prompt
-    // must not wait on a CLI process, and its result is pushed on change
-    // whenever it lands, mid-turn included. It runs BEFORE the guard on
-    // purpose — a refused prompt is exactly the one whose retry follows a
-    // sign-in in the terminal, and that retry is a new prompt, so the read
-    // that finds the new credential must not be the one the refusal skipped.
-    // The guard itself consumes the result only at the next turn boundary (see
-    // `markSessionsWhoseAccountKindChanged`).
-    void this.probeCliAuthStatus();
-    const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
-    if (signOutRespawn) session = await signOutRespawn;
-    // The SDK query stream already terminated (see `queryClosed`); its iterator
-    // can't be revived, so enqueueing here would hang on a deferred that never
-    // settles. Fail clearly and let the client start a fresh session.
-    if (session.queryClosed) {
-      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
-    }
+    const sessionMutation = this.reserveSessionPrompt(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    try {
+      let session = this.sessions[params.sessionId];
+      if (!session) {
+        throw new Error("Session not found");
+      }
+      // The one re-read per user prompt, fired here and never awaited: a prompt
+      // must not wait on a CLI process, and its result is pushed on change
+      // whenever it lands, mid-turn included. It runs BEFORE the guard on
+      // purpose — a refused prompt is exactly the one whose retry follows a
+      // sign-in in the terminal, and that retry is a new prompt, so the read
+      // that finds the new credential must not be the one the refusal skipped.
+      // The guard itself consumes the result only at the next turn boundary (see
+      // `markSessionsWhoseAccountKindChanged`).
+      void this.probeCliAuthStatus();
+      const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
+      if (signOutRespawn) session = await signOutRespawn;
+      // The SDK query stream already terminated (see `queryClosed`); its iterator
+      // can't be revived, so enqueueing here would hang on a deferred that never
+      // settles. Fail clearly and let the client start a fresh session.
+      if (session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
 
-    const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
-    if (subscriptionGuard) await subscriptionGuard;
+      const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
+      if (subscriptionGuard) await subscriptionGuard;
 
-    if (session.autoModeFallbackWarningPending) {
-      await this.sessionModes.publishFallbackWarning(params.sessionId, session);
-    }
+      if (session.autoModeFallbackWarningPending) {
+        await this.sessionModes.publishFallbackWarning(params.sessionId, session);
+      }
 
-    if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
-      await this.publishTaskPlan(params.sessionId, session.taskState);
-    }
+      if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
+        await this.publishTaskPlan(params.sessionId, session.taskState);
+      }
 
-    const userMessage = promptToClaude(params);
-    const promptUuid = randomUUID();
-    userMessage.uuid = promptUuid;
+      const userMessage = promptToClaude(params);
+      const promptUuid = randomUUID();
+      userMessage.uuid = promptUuid;
 
-    // Local-only commands (e.g. `/clear`) return a result without replaying the
-    // user message, so the consumer can't promote the turn from the echo.
-    const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
-    const isLocalOnlyCommand =
-      firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
+      // Local-only commands (e.g. `/clear`) return a result without replaying the
+      // user message, so the consumer can't promote the turn from the echo.
+      const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
+      const isLocalOnlyCommand =
+        firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
-    const fileChangeReportRequestId = supportsAgentFileChangeReport(this.clientCapabilities)
-      ? agentFileChangeReportRequestId(params._meta)
-      : undefined;
-    let fileChangeAudit: FileChangeAuditTurnState | undefined;
-    if (
-      fileChangeReportRequestId &&
-      !session.fileChangeReportRequestIds.has(fileChangeReportRequestId)
-    ) {
-      session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
-      fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
-    }
+      const fileChangeReportRequestId = supportsAgentFileChangeReport(this.clientCapabilities)
+        ? agentFileChangeReportRequestId(params._meta)
+        : undefined;
+      let fileChangeAudit: FileChangeAuditTurnState | undefined;
+      if (
+        fileChangeReportRequestId &&
+        !session.fileChangeReportRequestIds.has(fileChangeReportRequestId)
+      ) {
+        session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
+        fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
+      }
 
-    const isUsageCommand =
-      params.prompt.length === 1 &&
-      params.prompt[0]?.type === "text" &&
-      isUsageCommandText(params.prompt[0].text);
-    const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+      const isUsageCommand =
+        params.prompt.length === 1 &&
+        params.prompt[0]?.type === "text" &&
+        isUsageCommandText(params.prompt[0].text);
+      const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
 
-    session.titles.onPrompt(params.prompt);
+      session.titles.onPrompt(params.prompt);
 
-    // Each prompt is a Turn whose deferred the persistent consumer settles once
-    // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
-    // turn, pushes the user message onto the streaming input, makes sure the
-    // consumer is running, and awaits the deferred.
-    const turn: Turn = {
-      promptUuid,
-      isLocalOnlyCommand,
-      ...(isUsageCommand ? { isUsageCommand: true } : {}),
-      ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
-      ...(fileChangeAudit ? { fileChangeAudit } : {}),
-      settled: false,
-      resolve: () => {},
-      reject: () => {},
-    };
-    let completeTurn!: () => void;
-    turn.completion = new Promise<void>((resolve) => {
-      completeTurn = resolve;
-    });
-    const response = new Promise<PromptResponse>((resolve, reject) => {
-      turn.resolve = (result) => {
-        resolve(result);
-        completeTurn();
+      // Each prompt is a Turn whose deferred the persistent consumer settles once
+      // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
+      // turn, pushes the user message onto the streaming input, makes sure the
+      // consumer is running, and awaits the deferred.
+      const turn: Turn = {
+        promptUuid,
+        isLocalOnlyCommand,
+        ...(isUsageCommand ? { isUsageCommand: true } : {}),
+        ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
+        ...(fileChangeAudit ? { fileChangeAudit } : {}),
+        settled: false,
+        resolve: () => {},
+        reject: () => {},
       };
-      turn.reject = (error) => {
-        reject(error);
-        completeTurn();
-      };
-    });
+      let completeTurn!: () => void;
+      turn.completion = new Promise<void>((resolve) => {
+        completeTurn = resolve;
+      });
+      const response = new Promise<PromptResponse>((resolve, reject) => {
+        turn.resolve = (result) => {
+          resolve(result);
+          completeTurn();
+        };
+        turn.reject = (error) => {
+          reject(error);
+          completeTurn();
+        };
+      });
 
-    session.turnQueue ??= [];
-    session.turnQueue.push(turn);
-    session.input.push(userMessage);
-    this.ensureConsumer(session, params.sessionId);
-    await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
-    return response;
+      session.turnQueue ??= [];
+      session.turnQueue.push(turn);
+      session.input.push(userMessage);
+      this.ensureConsumer(session, params.sessionId);
+      releaseSessionMutation();
+      await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
+      return response;
+    } catch (error) {
+      releaseSessionMutation();
+      throw error;
+    }
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -3953,6 +4049,18 @@ export class ClaudeAcpAgent {
         const { value: message, done } = raced.result as IteratorResult<SDKMessage, void>;
 
         if (done || !message) {
+          if (session.rewindBootstrap) {
+            const rewindBootstrap = session.rewindBootstrap;
+            session.rewindBootstrap = undefined;
+            this.closeQueryStream(session);
+            if (this.sessions[params.sessionId] === session) {
+              delete this.sessions[params.sessionId];
+            }
+            rewindBootstrap.reject(
+              new Error("Claude query ended before truncating resume was acknowledged"),
+            );
+            return;
+          }
           if (pendingWorkerShutdown) {
             pendingWorkerShutdown = false;
             if (session.activeTurn) {
@@ -4014,6 +4122,25 @@ export class ClaudeAcpAgent {
           // front rather than restarting a consumer on the exhausted stream.
           this.closeQueryStream(session);
           return;
+        }
+
+        if (
+          session.rewindBootstrap &&
+          message.type === "result" &&
+          message.subtype === "error_during_execution" &&
+          message.errors.some((error) => error.startsWith(RESUME_DROPS_TURN_REJECTION_PREFIX))
+        ) {
+          const reason =
+            message.errors.find((error) => error.startsWith(RESUME_DROPS_TURN_REJECTION_PREFIX)) ??
+            RESUME_DROPS_TURN_REJECTION_PREFIX;
+          session.rewindBootstrap.reject(new Error(reason));
+          session.rewindBootstrap = undefined;
+          return;
+        }
+
+        if (session.rewindBootstrap && message.type === "system" && message.subtype === "init") {
+          session.rewindBootstrap.resolve();
+          session.rewindBootstrap = undefined;
         }
 
         if (
@@ -6043,6 +6170,8 @@ export class ClaudeAcpAgent {
       // query.next()). Turn-level failures (auth, error results) are handled
       // inline via failActive and never reach here. Reject every in-flight turn;
       // if the process is gone, tear the session down so the client starts fresh.
+      const rewindBootstrap = session.rewindBootstrap;
+      session.rewindBootstrap = undefined;
       const message = error instanceof Error ? error.message : String(error);
       const processDied =
         error instanceof Error &&
@@ -6051,6 +6180,18 @@ export class ClaudeAcpAgent {
           message.includes("process exited with") ||
           message.includes("process terminated by signal") ||
           message.includes("Failed to write to process stdin"));
+      if (rewindBootstrap) {
+        this.closeQueryStream(session);
+        session.eagerToolCallSessions?.clear();
+        clearHookCallbacks(params.sessionId);
+        session.nativeSubagentRuntime?.clear();
+        session.asyncTaskRuntime?.clear();
+        if (this.sessions[params.sessionId] === session) {
+          delete this.sessions[params.sessionId];
+        }
+        rewindBootstrap.reject(error);
+        return;
+      }
       await finishLifecycle(
         session.cancelled ? "cancelled" : "failed",
         session.cancelled ? "stopped" : "failed",
@@ -6088,7 +6229,9 @@ export class ClaudeAcpAgent {
         clearHookCallbacks(params.sessionId);
         session.nativeSubagentRuntime?.clear();
         session.asyncTaskRuntime?.clear();
-        delete this.sessions[params.sessionId];
+        if (this.sessions[params.sessionId] === session) {
+          delete this.sessions[params.sessionId];
+        }
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
         failAllTurns(
@@ -6489,30 +6632,57 @@ export class ClaudeAcpAgent {
     clearHookCallbacks(sessionId);
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
-    delete this.sessions[sessionId];
+    if (this.sessions[sessionId] === session) {
+      delete this.sessions[sessionId];
+    }
   }
 
   /** Tear down all active sessions. Called when the ACP connection closes. */
   async dispose(): Promise<void> {
-    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    await Promise.all(
+      Object.keys(this.sessions).map(async (id) => {
+        const sessionMutation = this.acquireSessionMutationLock(id);
+        const releaseSessionMutation =
+          typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+        try {
+          await this.teardownSession(id);
+        } finally {
+          releaseSessionMutation();
+        }
+      }),
+    );
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    if (!this.sessions[params.sessionId]) {
-      throw new Error("Session not found");
+    const sessionMutation = this.acquireSessionMutationLock(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    try {
+      if (!this.sessions[params.sessionId]) {
+        throw new Error("Session not found");
+      }
+      await this.teardownSession(params.sessionId);
+      return {};
+    } finally {
+      releaseSessionMutation();
     }
-    await this.teardownSession(params.sessionId);
-    return {};
   }
 
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    // Tear down any active in-memory state first so the on-disk file isn't
-    // recreated by an outstanding query writing to it.
-    if (this.sessions[params.sessionId]) {
-      await this.teardownSession(params.sessionId);
+    const sessionMutation = this.acquireSessionMutationLock(params.sessionId);
+    const releaseSessionMutation =
+      typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
+    try {
+      // Tear down any active in-memory state first so the on-disk file isn't
+      // recreated by an outstanding query writing to it.
+      if (this.sessions[params.sessionId]) {
+        await this.teardownSession(params.sessionId);
+      }
+      await deleteSession(params.sessionId);
+      return {};
+    } finally {
+      releaseSessionMutation();
     }
-    await deleteSession(params.sessionId);
-    return {};
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -8343,6 +8513,14 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    let resolveRewindBootstrap!: () => void;
+    let rejectRewindBootstrap!: (error: unknown) => void;
+    const rewindBootstrapPromise = creationOpts.resumeDropsTurn
+      ? new Promise<void>((resolve, reject) => {
+          resolveRewindBootstrap = resolve;
+          rejectRewindBootstrap = reject;
+        })
+      : undefined;
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -8594,8 +8772,24 @@ export class ClaudeAcpAgent {
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
         fileChangeReportRequestIds: new Set(),
         fileChangeAuditSupport,
+        ...(rewindBootstrapPromise
+          ? {
+              rewindBootstrap: {
+                resolve: resolveRewindBootstrap,
+                reject: rejectRewindBootstrap,
+              },
+            }
+          : {}),
       };
       timing.phase("register");
+
+      if (rewindBootstrapPromise) {
+        const session = this.sessions[sessionId];
+        this.ensureConsumer(session, sessionId);
+        await rewindBootstrapPromise;
+        session.rewindBootstrap = undefined;
+        timing.phase("rewind-bootstrap");
+      }
 
       return {
         sessionId,
@@ -8603,7 +8797,15 @@ export class ClaudeAcpAgent {
         configOptions,
       };
     } catch (error) {
-      this.discardUnregisteredQuery(q, input, settingsManager);
+      const registered = this.sessions[sessionId];
+      if (registered?.query === q) {
+        registered.rewindBootstrap = undefined;
+        this.closeQueryStream(registered);
+        registered.abortController.abort();
+        delete this.sessions[sessionId];
+      } else {
+        this.discardUnregisteredQuery(q, input, settingsManager);
+      }
       throw error;
     }
   }
@@ -8629,21 +8831,28 @@ export class ClaudeAcpAgent {
 
       this.providerConfig = config;
       for (const [sessionId, session] of sessions) {
-        if (this.sessions[sessionId] !== session || !session.creationParams) {
-          continue;
-        }
-        this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
-        this.closeQueryStream(session);
-        delete this.sessions[sessionId];
+        const sessionMutation = this.acquireSessionMutationLock(sessionId);
+        const releaseSessionMutation =
+          typeof sessionMutation === "function" ? sessionMutation : await sessionMutation;
         try {
-          await this.createSession(session.creationParams, { resume: sessionId });
-        } catch (error) {
-          // One session that cannot come back must not abort the switch. The
-          // `--hide-claude-auth` guard makes this a normal outcome of
-          // `providers/disable`: the override kept a subscription account
-          // usable, and creation refuses without it. The session is already
-          // gone, so tell the client why and go on to the next one.
-          this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+          if (this.sessions[sessionId] !== session || !session.creationParams) {
+            continue;
+          }
+          this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
+          this.closeQueryStream(session);
+          delete this.sessions[sessionId];
+          try {
+            await this.createSession(session.creationParams, { resume: sessionId });
+          } catch (error) {
+            // One session that cannot come back must not abort the switch. The
+            // `--hide-claude-auth` guard makes this a normal outcome of
+            // `providers/disable`: the override kept a subscription account
+            // usable, and creation refuses without it. The session is already
+            // gone, so tell the client why and go on to the next one.
+            this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+          }
+        } finally {
+          releaseSessionMutation();
         }
       }
     });
