@@ -197,11 +197,9 @@ import {
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
-  containsLegacyFileChangeAuditMarker,
   createNativeFileChangeReporter,
   type FileChangeReportTurnState,
   type FileChangeReportUnavailableReason,
-  isLegacyFileChangeAuditTool,
   type NativeFileChangeReporter,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
@@ -6585,13 +6583,6 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    // Stop-hook additionalContext is persisted as an internal user message.
-    // Once that marker (or the internal tool itself) appears, suppress the
-    // whole audit exchange until its tool result. This also hides a disobedient
-    // model's separate prose message, while an ordinary next user prompt safely
-    // ends an incomplete audit lane.
-    let replayingFileChangeAudit = false;
-    const replayFileChangeAuditToolUseIds = new Set<string>();
     const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
@@ -6784,67 +6775,6 @@ export class ClaudeAcpAgent {
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
         if (content === null) continue;
-      }
-
-      const auditBlocks = Array.isArray(content)
-        ? content.filter(
-            (block): block is Record<string, unknown> =>
-              typeof block === "object" && block !== null,
-          )
-        : [];
-      const hasFileChangeAuditMarker =
-        (typeof content === "string" && containsLegacyFileChangeAuditMarker(content)) ||
-        auditBlocks.some(
-          (block) =>
-            typeof block.text === "string" && containsLegacyFileChangeAuditMarker(block.text),
-        );
-      const fileChangeAuditToolUseIds = auditBlocks.flatMap((block) =>
-        (block.type === "tool_use" ||
-          block.type === "server_tool_use" ||
-          block.type === "mcp_tool_use") &&
-        typeof block.name === "string" &&
-        isLegacyFileChangeAuditTool(block.name) &&
-        typeof block.id === "string"
-          ? [block.id]
-          : [],
-      );
-      const replayMessageRole = (message as unknown as { message?: { role?: unknown } }).message
-        ?.role;
-      if (hasFileChangeAuditMarker || fileChangeAuditToolUseIds.length > 0) {
-        replayingFileChangeAudit = true;
-        for (const toolUseId of fileChangeAuditToolUseIds) {
-          replayFileChangeAuditToolUseIds.add(toolUseId);
-        }
-        continue;
-      }
-      if (replayingFileChangeAudit) {
-        const toolResultIds = auditBlocks.flatMap((block) =>
-          (block.type === "tool_result" || block.type === "mcp_tool_result") &&
-          typeof block.tool_use_id === "string"
-            ? [block.tool_use_id]
-            : [],
-        );
-        let completedReport = false;
-        for (const toolUseId of toolResultIds) {
-          if (replayFileChangeAuditToolUseIds.delete(toolUseId)) completedReport = true;
-        }
-        if (completedReport && replayFileChangeAuditToolUseIds.size === 0) {
-          replayingFileChangeAudit = false;
-          continue;
-        }
-        // A denied attempt to call another tool is still part of the hidden
-        // lane. Its result must not end replay suppression before the report.
-        if (toolResultIds.length > 0) {
-          continue;
-        }
-        // The next real user prompt is already represented by the client and
-        // starts a new turn; do not let a missing audit result hide it or the
-        // rest of the replay.
-        if (replayMessageRole === "user") {
-          replayingFileChangeAudit = false;
-        } else {
-          continue;
-        }
       }
 
       // Claude persists the retained summary as a user message framed with
@@ -9305,9 +9235,7 @@ function isTaskTool(toolName: string): boolean {
  *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
-  return (
-    toolName !== "TodoWrite" && !isTaskTool(toolName) && !isLegacyFileChangeAuditTool(toolName)
-  );
+  return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
 /** Build the Claude Code-specific metadata for a tool call. Bash descriptions
@@ -9549,7 +9477,7 @@ export function toAcpNotifications(
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
-    if (content.length === 0 || containsLegacyFileChangeAuditMarker(content)) {
+    if (content.length === 0) {
       return [];
     }
     const update: SessionNotification["update"] = {
@@ -9588,17 +9516,6 @@ export function toAcpNotifications(
   // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
   // messages need no single-block guard.
   const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
-  // A report-phase assistant message may contain a short text preface and the
-  // internal tool call in the same content array. Hide the whole message, not
-  // only the tool block, so it stays absent on session replay as well as live.
-  const containsFileChangeAuditToolUse = content.some(
-    (chunk) =>
-      (chunk.type === "tool_use" ||
-        chunk.type === "server_tool_use" ||
-        chunk.type === "mcp_tool_use") &&
-      isLegacyFileChangeAuditTool(chunk.name),
-  );
-
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
   for (const chunk of content) {
@@ -9606,11 +9523,7 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta": {
-        if (
-          chunk.text &&
-          !containsFileChangeAuditToolUse &&
-          !containsLegacyFileChangeAuditMarker(chunk.text)
-        ) {
+        if (chunk.text) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
@@ -9622,22 +9535,21 @@ export function toAcpNotifications(
         break;
       }
       case "image":
-        if (!containsFileChangeAuditToolUse)
-          update = {
-            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-            content: {
-              type: "image",
-              data: chunk.source.type === "base64" ? chunk.source.data : "",
-              mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
-              uri: chunk.source.type === "url" ? chunk.source.url : undefined,
-            },
-          };
+        update = {
+          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+          content: {
+            type: "image",
+            data: chunk.source.type === "base64" ? chunk.source.data : "",
+            mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
+            uri: chunk.source.type === "url" ? chunk.source.url : undefined,
+          },
+        };
         break;
       case "thinking":
       case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking && !containsFileChangeAuditToolUse) {
+        if (chunk.thinking) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
@@ -9653,10 +9565,7 @@ export function toAcpNotifications(
       case "mcp_tool_use": {
         const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
-        if (isLegacyFileChangeAuditTool(chunk.name)) {
-          // Wrapper-owned audit protocol: never surface or register generic
-          // PostToolUse callbacks for the internal tool.
-        } else if (chunk.name === "TodoWrite") {
+        if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
             update = {
@@ -9796,11 +9705,6 @@ export function toAcpNotifications(
           logger.error(
             `[claude-agent-acp] Got a tool result for tool use that wasn't tracked: ${chunk.tool_use_id}`,
           );
-          break;
-        }
-
-        if (isLegacyFileChangeAuditTool(toolUse.name)) {
-          delete toolUseCache[chunk.tool_use_id];
           break;
         }
 

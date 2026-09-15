@@ -11682,62 +11682,6 @@ describe("assembled assistant text fallback", () => {
     );
   });
 
-  it("ends a dangling replayed audit lane at a compaction summary", async () => {
-    // A Stop-hook audit whose result was never persisted must not hide the
-    // post-compaction history from a client on the compaction contract.
-    const { agent, updates } = compactionCapableAgent();
-    agent.sessions["test-session"] = mockSessionState();
-    vi.mocked(getSessionMessages).mockResolvedValueOnce([
-      {
-        type: "user",
-        uuid: "audit-marker",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        message: {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "<claude-agent-acp-file-change-audit>report now</claude-agent-acp-file-change-audit>",
-            },
-          ],
-        },
-      },
-      {
-        type: "user",
-        uuid: "compact-summary",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        isCompactSummary: true,
-        message: {
-          role: "user",
-          content:
-            "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nCounted.",
-        },
-      },
-      {
-        type: "assistant",
-        uuid: "after",
-        session_id: "test-session",
-        parent_tool_use_id: null,
-        parent_agent_id: null,
-        message: {
-          role: "assistant",
-          model: "claude-sonnet-4-6",
-          content: [{ type: "text", text: "Back after compaction." }],
-        },
-      },
-    ] as any);
-
-    await (agent as any).replaySessionHistory("test-session");
-
-    const kinds = updates.map((notification) => notification.update.sessionUpdate);
-    expect(kinds).toContain("compaction_update");
-    expect(messageChunkTexts(updates)).toEqual(["Back after compaction."]);
-  });
-
   it("preserves the model response after multiple compactions in one turn", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [

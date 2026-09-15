@@ -5,12 +5,6 @@ import { airExtensionMeta, clientSupportsAirCapability, withAirMeta } from "./ai
 
 export const AGENT_FILE_CHANGE_REPORT_CAPABILITY = "agentFileChangeReport";
 
-/** Legacy identifiers are retained only so persisted hidden audit turns stay hidden on replay. */
-const LEGACY_FILE_CHANGE_AUDIT_SERVER_NAME = "claude_agent_acp";
-const LEGACY_FILE_CHANGE_AUDIT_TOOL_NAME = "report_changed_files";
-const LEGACY_FILE_CHANGE_AUDIT_WIRE_TOOL_NAME = `mcp__${LEGACY_FILE_CHANGE_AUDIT_SERVER_NAME}__${LEGACY_FILE_CHANGE_AUDIT_TOOL_NAME}`;
-const LEGACY_FILE_CHANGE_AUDIT_MARKER = "claude-agent-acp-file-change-audit";
-
 const MAX_REPORTED_PATHS = 1024;
 const MAX_REPORTED_PATH_LENGTH = 4096;
 export const AGENT_FILE_CHANGE_REPORT_MAX_BYTES = 256 * 1024;
@@ -98,14 +92,6 @@ export function agentFileChangeReportMeta(
   result: AgentFileChangeReportResult,
 ): Record<string, unknown> {
   return withAirMeta(undefined, AGENT_FILE_CHANGE_REPORT_CAPABILITY, result);
-}
-
-export function isLegacyFileChangeAuditTool(toolName: string): boolean {
-  return toolName === LEGACY_FILE_CHANGE_AUDIT_WIRE_TOOL_NAME;
-}
-
-export function containsLegacyFileChangeAuditMarker(text: string): boolean {
-  return text.includes(`<${LEGACY_FILE_CHANGE_AUDIT_MARKER}>`);
 }
 
 export function createNativeFileChangeReporter(
