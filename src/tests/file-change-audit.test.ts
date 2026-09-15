@@ -115,7 +115,7 @@ describe("native agent file-change report", () => {
           path.join(canonicalTempRoot, "native-file-report-project", "src/a.ts"),
           path.join(canonicalTempRoot, "native-file-report-shared", "generated.ts"),
         ],
-        declaredComplete: true,
+        declaredComplete: false,
         truncated: false,
       },
     ]);

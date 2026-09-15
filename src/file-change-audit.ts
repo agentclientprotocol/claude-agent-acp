@@ -161,7 +161,9 @@ export function createNativeFileChangeReporter(
           requestId: state.requestId,
           status: "reported",
           paths: normalized.paths,
-          declaredComplete: !normalized.truncated,
+          // Checkpoints cover Claude file tools, but not every mutation source
+          // (notably Bash and most subagents), so this list is never exhaustive.
+          declaredComplete: false,
           truncated: normalized.truncated,
         }),
       );

@@ -251,7 +251,7 @@ describe("native file-change report integration", () => {
         requestId: "request-native",
         status: "reported",
         paths: [path.join(process.cwd(), "src/changed.ts")],
-        declaredComplete: true,
+        declaredComplete: false,
         truncated: false,
       },
     ]);
