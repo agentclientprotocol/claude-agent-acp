@@ -160,7 +160,7 @@ export function toolInfoFromToolUse(
     case "PowerShell": {
       const input = toolUse.input as BashInput | undefined;
       return {
-        title: input?.command ? input.command : name === "PowerShell" ? "PowerShell" : "Terminal",
+        title: input?.command ? input.command : "Terminal",
         kind: "execute",
         content: supportsTerminalOutput
           ? [{ type: "terminal" as const, terminalId: toolUse.id }]

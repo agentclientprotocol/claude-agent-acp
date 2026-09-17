@@ -149,20 +149,22 @@ describe("Claude permission ACP v1 presentation", () => {
     expect(presentation.toolCall.rawInput).toBe(input);
   });
 
-  it.each([
-    ["Bash", "Terminal"],
-    ["PowerShell", "PowerShell"],
-  ])("uses the canonical %s fallback when no command is available", (toolName, title) => {
-    const input = {};
-    const presentation = buildClaudePermissionPresentation({
-      toolName,
-      input,
-      toolUseID: `tool-${toolName}`,
-    });
+  // `command` is required, so this only shows while the input is still
+  // streaming; both shells share the standard terminal card in that state.
+  it.each(["Bash", "PowerShell"])(
+    "uses the Terminal fallback for %s when no command is available yet",
+    (toolName) => {
+      const input = {};
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input,
+        toolUseID: `tool-${toolName}`,
+      });
 
-    expect(presentation._meta).toEqual({ permission: { version: 1, title } });
-    expect(presentation.toolCall).toMatchObject({ title, rawInput: input });
-  });
+      expect(presentation._meta).toEqual({ permission: { version: 1, title: "Terminal" } });
+      expect(presentation.toolCall).toMatchObject({ title: "Terminal", rawInput: input });
+    },
+  );
 
   it.each([
     ["Bash", "ls -la ~/.config/zed"],
