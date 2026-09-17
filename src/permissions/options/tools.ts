@@ -107,6 +107,15 @@ export function buildExitPlanModePermissionOptions(
       kind: "allow_always",
     });
   }
+  // Auto and bypass have different permission semantics. Keep bypass selectable
+  // whenever the session advertises it, even when Auto is the preferred choice.
+  if (elevatedMode !== "bypassPermissions" && modes.has("bypassPermissions")) {
+    options.push({
+      optionId: PERMISSION_OPTION_ID.exitPlanBypass,
+      name: "Yes, and bypass permissions",
+      kind: "allow_always",
+    });
+  }
   options.push({
     optionId: PERMISSION_OPTION_ID.exitPlanDefault,
     name: "Yes, manually approve edits",
