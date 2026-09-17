@@ -7285,6 +7285,15 @@ export class ClaudeAcpAgent {
       if (autoFallback.fallbackApplied) {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
       }
+      if (toolName === "ExitPlanMode" && permissionResult.behavior === "allow") {
+        const modeUpdate = permissionResult.updatedPermissions?.find(
+          (update) => update.type === "setMode" && update.destination === "session",
+        );
+        if (modeUpdate?.type === "setMode") {
+          await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
+          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
+        }
+      }
       const clearContextMode = decodedPermission.contextResetMode
         ? this.sessionModes.effectiveMode(session, decodedPermission.contextResetMode)
         : undefined;
