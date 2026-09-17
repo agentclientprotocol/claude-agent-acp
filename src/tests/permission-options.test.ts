@@ -485,7 +485,7 @@ describe("Claude permission options and response mapping", () => {
     ]);
   });
 
-  it("offers only the highest-priority elevated ExitPlanMode choice", () => {
+  it("offers bypass alongside Auto when both modes are available", () => {
     const options = build("ExitPlanMode", undefined, {}, undefined, true, [
       "auto",
       "default",
@@ -495,6 +495,7 @@ describe("Claude permission options and response mapping", () => {
     expect(options).toMatchObject([
       { optionId: PERMISSION_OPTION_ID.exitPlanDefault, name: "Yes, manually approve edits" },
       { optionId: PERMISSION_OPTION_ID.exitPlanAuto, name: "Yes, and use auto mode" },
+      { optionId: PERMISSION_OPTION_ID.exitPlanBypass, name: "Yes, and bypass permissions" },
       { optionId: PERMISSION_OPTION_ID.reject, name: "No, keep planning" },
     ]);
     expect(options[2]?._meta).toBeUndefined();
