@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.79.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.78.0...v0.79.0) (2026-09-17)
+
+
+### Features
+
+* Update to claude agent sdk 0.3.274 ([#1143](https://github.com/agentclientprotocol/claude-agent-acp/issues/1143)) ([d0fa8e0](https://github.com/agentclientprotocol/claude-agent-acp/commit/d0fa8e03853c4f5a9b074fc2af32931ffe6f588f))
+
+
+### Bug Fixes
+
+* show shell commands in permission prompts ([#1070](https://github.com/agentclientprotocol/claude-agent-acp/issues/1070)) ([bbae5c2](https://github.com/agentclientprotocol/claude-agent-acp/commit/bbae5c2c0936554104b07630b142fd71fe1d839e))
+
 ## [0.78.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.77.0...v0.78.0) (2026-09-15)
 
 
