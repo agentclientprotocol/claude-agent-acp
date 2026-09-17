@@ -61,9 +61,12 @@ The request-level record is placed under `RequestPermissionRequest._meta.permiss
 | `defaultToNo` |       no | `true`           | The ask must not be approvable by a stray keystroke; the reject options are listed first and a client that pre-selects an option should focus the decline. |
 
 The permission title normally duplicates `toolCall.title`: one operation has one heading across the
-tool card and approval UI. `ExitPlanMode` is the deliberate exception and uses the action-oriented
-permission heading `Ready to code?`. Commands, paths, URLs, and other structured details remain in
-`rawInput`, `content`, and `locations`.
+tool card and approval UI. For `Bash` and `PowerShell` that heading is the command being approved,
+copied verbatim (no whitespace normalization or length limit), never the model-authored
+`description`; the description stays available as `_meta.claudeCode.title` on the standard
+`tool_call`. `ExitPlanMode` is the deliberate exception and uses the action-oriented permission
+heading `Ready to code?`. Paths, URLs, and other structured details remain in `rawInput`, `content`,
+and `locations`.
 
 `description` temporarily carries the SDK's non-blank `decisionReason` for diagnostics, prefixed
 with `Reason: `. The SDK `description` operation subtitle is not copied there.

@@ -3594,7 +3594,7 @@ describe("permission request cancellation", () => {
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
     expect(request?._meta).toEqual({
-      permission: { version: 1, title: "Bash" },
+      permission: { version: 1, title: "ls" },
     });
   });
 
@@ -4292,7 +4292,7 @@ describe("canUseTool in bypassPermissions mode", () => {
     } as any);
 
     expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
-    expect(request?._meta).toEqual({ permission: { version: 1, title: "Bash" } });
+    expect(request?._meta).toEqual({ permission: { version: 1, title: "rm -rf build" } });
   });
 
   it("leads with the reject option and forwards the hint when the CLI defaults to no", async () => {
@@ -4328,7 +4328,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       "allow_always",
     ]);
     expect(request?._meta).toEqual({
-      permission: { version: 1, title: "Bash", defaultToNo: true },
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
     });
     expect(result).toMatchObject({ behavior: "deny" });
   });

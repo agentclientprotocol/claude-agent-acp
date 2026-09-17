@@ -111,7 +111,7 @@ describe("Claude permission ACP v1 presentation", () => {
       defaultToNo: true,
     });
     expect(presentation._meta).toEqual({
-      permission: { version: 1, title: "Bash", defaultToNo: true },
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
     });
     expect(
       buildClaudePermissionPresentation({
@@ -120,10 +120,12 @@ describe("Claude permission ACP v1 presentation", () => {
         toolUseID: "tool-1",
         defaultToNo: false,
       })._meta,
-    ).toEqual({ permission: { version: 1, title: "Bash" } });
+    ).toEqual({ permission: { version: 1, title: "rm -rf build" } });
   });
 
-  it("uses the human command description as the permission title", () => {
+  // #1068: the user approves the command, so the heading must be the command.
+  // The model-authored description is a summary, not the operation.
+  it("shows the shell command, not its description, as the permission title", () => {
     const input = { command: "npm test", description: "Run the tests" };
     const presentation = buildClaudePermissionPresentation({
       toolName: "Bash",
@@ -136,7 +138,7 @@ describe("Claude permission ACP v1 presentation", () => {
     expect(presentation._meta).toEqual({
       permission: {
         version: 1,
-        title: "Run the tests",
+        title: "npm test",
         description: "Reason: Needed to verify the change.",
       },
     });
@@ -146,30 +148,49 @@ describe("Claude permission ACP v1 presentation", () => {
       kind: "execute",
       status: "pending",
       rawInput: input,
-      title: "Run the tests",
+      title: "npm test",
     });
+    // Without terminal support the description stays visible as the card body.
+    expect(presentation.toolCall.content).toEqual([
+      { type: "content", content: { type: "text", text: "Run the tests" } },
+    ]);
     expect(presentation.toolCall.rawInput).toBe(input);
   });
 
-  it.each(["Bash", "PowerShell"])(
-    "uses the %s tool name when no human command description is available",
-    (toolName) => {
-      const input = { command: "echo raw command" };
-      const presentation = buildClaudePermissionPresentation({
-        toolName,
-        input,
-        toolUseID: `tool-${toolName}`,
-      });
+  it("uses the standard Terminal fallback when the shell input has no command", () => {
+    const input = { description: "List files" };
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Bash",
+      input,
+      toolUseID: "tool-1",
+    });
 
-      expect(presentation._meta).toEqual({
-        permission: { version: 1, title: toolName },
-      });
-      expect(presentation.toolCall).toMatchObject({
-        title: toolName,
-        rawInput: input,
-      });
-    },
-  );
+    expect(presentation._meta).toEqual({ permission: { version: 1, title: "Terminal" } });
+    expect(presentation.toolCall).toMatchObject({ title: "Terminal", rawInput: input });
+  });
+
+  // The permission heading mirrors the tool-call title verbatim for shell
+  // commands: single-line normalization would rewrite quoted arguments and
+  // join lines, and the 4,000-character cap would drop the heading for long
+  // commands.
+  it.each([
+    { label: "quoted runs of whitespace", command: 'echo "a  b\tc"' },
+    { label: "line breaks after comments", command: "echo first # first command\necho second" },
+    { label: "surrounding whitespace", command: " \techo first\n" },
+    { label: "commands longer than 4,000 characters", command: `echo "${"x".repeat(4_001)}"` },
+  ])("preserves $label in the shell permission title", ({ command }) => {
+    const input = { command, description: "Run the requested command" };
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Bash",
+      input,
+      toolUseID: "tool-1",
+      supportsTerminalOutput: true,
+    });
+
+    expect(presentation._meta).toEqual({ permission: { version: 1, title: command } });
+    expect(presentation.toolCall.title).toBe(command);
+    expect(presentation.toolCall.content).toEqual([{ type: "terminal", terminalId: "tool-1" }]);
+  });
 
   it("keeps the WebFetch URL in structured tool input", () => {
     const input = { url: "https://example.com/docs", prompt: "Read the API reference" };

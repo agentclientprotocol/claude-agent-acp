@@ -76,15 +76,22 @@ export function buildClaudePermissionPresentation(
       : info.content;
   // Reuse the exact standard tool-call heading as the permission heading so
   // the approval never maintains a second, divergent name for the operation.
+  // For shell tools that heading is the command itself (`toolInfoFromToolUse`):
+  // the user is approving the command, and the model-authored `description`
+  // is no substitute for seeing it (#1068). The description still reaches the
+  // client through `_meta.claudeCode.title` on the standard tool_call.
   // decisionReason is temporarily exposed as the permission description so
   // its actual SDK values can be inspected; it remains diagnostic policy text.
-  const shellTitle =
-    value.toolName === "Bash" || value.toolName === "PowerShell"
-      ? (compactText(value.input.description) ?? value.toolName)
-      : undefined;
-  const toolCallTitle = shellTitle ?? subjectTitle ?? info.title;
+  const toolCallTitle = subjectTitle ?? info.title;
   const permissionTitle = value.toolName === "ExitPlanMode" ? "Ready to code?" : toolCallTitle;
-  const title = humanText(permissionTitle, 4_000, true) ?? "Use tool?";
+  // A shell command is executable input, not prose: collapsing whitespace
+  // rewrites quoted arguments and joins lines, and a length cap would drop the
+  // heading for exactly the long commands that most need reading. Mirror the
+  // tool-call title verbatim instead.
+  const isShell = value.toolName === "Bash" || value.toolName === "PowerShell";
+  const title = isShell
+    ? permissionTitle
+    : (humanText(permissionTitle, 4_000, true) ?? "Use tool?");
   const decisionReason = humanText(value.decisionReason, 4_000);
   const description = decisionReason ? `Reason: ${decisionReason}` : undefined;
   return {
