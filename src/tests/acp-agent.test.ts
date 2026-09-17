@@ -4421,6 +4421,36 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
+  it("forwards the MCP server provenance on the permission request", async () => {
+    const { agent, requests } = setup();
+
+    await agent.canUseTool("session-1")("mcp__github__create_issue", { title: "x" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_mcp",
+      mcpServer: { name: "github", source: "project" },
+    } as any);
+
+    expect(requests[0].toolCall._meta).toEqual({
+      claudeCode: {
+        toolName: "mcp__github__create_issue",
+        mcpServer: { name: "github", source: "project" },
+      },
+    });
+  });
+
+  it("omits permission _meta for a root tool without MCP provenance", async () => {
+    const { agent, requests } = setup();
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_plain",
+    } as any);
+
+    expect(requests[0].toolCall._meta).toBeUndefined();
+  });
+
   it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
     const { agent, updates, requests, session } = setup();
     (agent as any).clientCapabilities = { elicitation: { form: {} } };
@@ -14643,6 +14673,62 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // The `running` transition swept the stale unit, so the second turn's
     // own idle leaves nothing outstanding.
     await waitFor(() => session().owedTrailingIdles === 0);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.274+ answers completions that were already queued with ONE model
+  // call: every queued notification still gets a result, but all except the
+  // last are placeholders (num_turns 0, empty text) written BEFORE the shared
+  // followup runs. Settling the hold on a placeholder would release the
+  // prompt with the promised summary still ahead — the out-of-turn delivery
+  // the hold exists to prevent.
+  it("holds through a coalesced completion's placeholder result until the real followup", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield subagentStarted("agent-2");
+        yield resultMessage();
+        // Both subagents settle while the loop is busy: their notifications
+        // queue and the CLI answers them with one call.
+        yield taskNotification("agent-1");
+        yield taskNotification("agent-2");
+        // agent-1's placeholder: no model call of its own.
+        yield resultMessage({
+          origin: { kind: "task-notification" },
+          num_turns: 0,
+          result: "",
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 1 });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+      .then((r) => {
+        events.push("resolved");
+        return r;
+      });
+    expect(response.stopReason).toBe("end_turn");
+    const summaryIndex = events.indexOf("chunk:promised summary");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    // The summary reached the client before session/prompt returned: the
+    // placeholder did not settle the hold.
+    expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
     await agent.sessions["test-session"]?.consumer;
   });
 
