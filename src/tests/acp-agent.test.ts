@@ -3620,6 +3620,73 @@ describe("permission request cancellation", () => {
     });
   });
 
+  it.each([
+    ["exit-plan-bypass", "bypassPermissions", true],
+    ["exit-plan-auto", "auto", true],
+    ["exit-plan-auto", "acceptEdits", false],
+    ["exit-plan-default", "default", true],
+  ])("publishes the effective mode after %s approval", async (optionId, mode, supportsAutoMode) => {
+    const sessionUpdate = vi.fn(async () => {});
+    const mockClient = {
+      sessionUpdate,
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: [
+        "default",
+        "plan",
+        "bypassPermissions",
+        ...(optionId === "exit-plan-bypass" ? [] : ["auto"]),
+      ].map((id) => ({
+        id,
+        name: id,
+      })),
+    };
+    session.configOptions = [
+      {
+        id: "mode",
+        name: "Mode",
+        type: "select",
+        currentValue: "plan",
+        options: [],
+      },
+    ];
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "", supportsAutoMode },
+    ];
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode, destination: "session" }],
+    });
+    expect(session.modes.currentModeId).toBe(mode);
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+    });
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [expect.objectContaining({ id: "mode", currentValue: mode })],
+      },
+    });
+  });
+
   it("interrupts the turn after an ExitPlanMode keep-planning rejection", async () => {
     const mockClient = {
       sessionUpdate: async () => {},
