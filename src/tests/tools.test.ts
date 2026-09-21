@@ -970,6 +970,29 @@ describe("Bash terminal output", () => {
       expect(exitUpdate).not.toHaveProperty("rawOutput");
     });
 
+    it("should prefer terminal_output_delta and omit full output when supported", () => {
+      const clientCapabilities: ClientCapabilities = {
+        _meta: { terminal_output: true, terminal_output_delta: true },
+      };
+
+      const notifications = toAcpNotifications(
+        [toolResult],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClient,
+        mockLogger,
+        { clientCapabilities },
+      );
+
+      expect(notifications).toHaveLength(2);
+      expect((notifications[0].update as any)._meta).toEqual({
+        terminal_output_delta: { terminal_id: "toolu_bash", data: "file1.txt\nfile2.txt" },
+      });
+      expect(notifications[1].update).not.toHaveProperty("rawOutput");
+      expect((notifications[1].update as any)._meta).not.toHaveProperty("terminal_output");
+    });
+
     it("should not include terminal _meta when client does not declare terminal_output support", () => {
       const notifications = toAcpNotifications(
         [toolResult],

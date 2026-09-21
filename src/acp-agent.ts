@@ -1298,6 +1298,10 @@ export type ToolUpdateMeta = {
     terminal_id: string;
     data: string;
   };
+  terminal_output_delta?: {
+    terminal_id: string;
+    data: string;
+  };
   terminal_exit?: {
     terminal_id: string;
     exit_code: number;
@@ -6980,7 +6984,9 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
-    const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+    const supportsTerminalOutput =
+      this.clientCapabilities?._meta?.["terminal_output"] === true ||
+      this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
     const update = toolCallNotification(
       { id: toolCallId, name: toolName, input: toolInput },
       toolInput,
@@ -7028,7 +7034,9 @@ export class ClaudeAcpAgent {
         suppressAlwaysAllowRule,
       },
     ) => {
-      const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+      const supportsTerminalOutput =
+        this.clientCapabilities?._meta?.["terminal_output"] === true ||
+        this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
         return {
@@ -9485,7 +9493,10 @@ export function toAcpNotifications(
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
-  const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
+  const supportsTerminalOutputDelta =
+    options?.clientCapabilities?._meta?.["terminal_output_delta"] === true;
+  const supportsTerminalOutput =
+    supportsTerminalOutputDelta || options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];
@@ -9799,19 +9810,25 @@ export function toAcpNotifications(
             toolUseCache[chunk.tool_use_id],
             supportsTerminalOutput,
             toolUseResult,
+            supportsTerminalOutputDelta,
           );
 
-          // When terminal output is supported, send terminal_output as a
+          const terminalOutput = toolMeta?.terminal_output_delta ?? toolMeta?.terminal_output;
+          const terminalOutputKey = toolMeta?.terminal_output_delta
+            ? "terminal_output_delta"
+            : "terminal_output";
+
+          // When terminal output is supported, send its payload as a
           // separate notification to match codex-acp's streaming lifecycle:
           //   1. tool_call       → _meta.terminal_info  (already sent above)
-          //   2. tool_call_update → _meta.terminal_output (sent here)
+          //   2. tool_call_update → terminal output      (sent here)
           //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
-          if (toolMeta?.terminal_output) {
+          if (terminalOutput) {
             output.push({
               sessionId,
               update: {
                 _meta: {
-                  terminal_output: toolMeta.terminal_output,
+                  [terminalOutputKey]: terminalOutput,
                   ...(options?.parentToolUseId
                     ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
                     : {}),
@@ -9833,10 +9850,10 @@ export function toAcpNotifications(
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
-            // terminal_output already carried the exact bytes in the preceding
+            // The terminal output already carried the exact bytes in the preceding
             // update. Repeating them as rawOutput wastes bandwidth and lets a
             // client accidentally render the same output twice.
-            ...(toolMeta?.terminal_output
+            ...(terminalOutput
               ? {}
               : { rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content) }),
             ...toolUpdate,
