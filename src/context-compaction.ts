@@ -138,6 +138,10 @@ export class ContextCompactionLifecycle {
   private activeCompaction: CompactionState | undefined;
   private outputDelivered = false;
   private duplicateErrorOutput: string | undefined;
+  /** After interruption, uncorrelated terminal frames and hooks may still
+   *  arrive from the abandoned work, including an opening we never consumed.
+   *  Wait for a known new turn before accepting them again. */
+  private interrupted = false;
   /** Summary reported by PostCompact before the opening status was consumed.
    *  Deliberately survives `reset()`: the CLI awaits the hook before emitting
    *  the compaction's terminal frames, so a pending summary always belongs to
@@ -188,6 +192,26 @@ export class ContextCompactionLifecycle {
     );
   }
 
+  /** Abandon the current work before settling its prompt or tearing down the
+   *  stream. Unlike a normal result boundary, its pending hooks are not safe
+   *  to carry into the next compaction. A hook has no command ID, so even an
+   *  early hook for the next compaction must be omitted until the stream gives
+   *  us a new live turn boundary. Idempotent and best-effort. */
+  async interrupt(): Promise<void> {
+    if (this.presentation === "compaction_update") {
+      this.interrupted = true;
+      this.pendingSummary = undefined;
+    }
+    await this.reset();
+  }
+
+  /** A live command's dispatch/echo proves the interrupted command's tail
+   *  has drained in the SDK's FIFO stream. Do not reset normal lifecycle
+   *  state: compaction may already have started before the user echo. */
+  resume(): void {
+    this.interrupted = false;
+  }
+
   /**
    * Claude also emits a failed manual compaction's error as local-command
    * stdout. Consume that one duplicate after the lifecycle carried it,
@@ -204,12 +228,13 @@ export class ContextCompactionLifecycle {
     return true;
   }
 
-  async start(compactionId: string): Promise<CompactionState> {
+  async start(compactionId: string): Promise<void> {
+    if (this.interrupted) return;
     if (this.activeCompaction && !this.activeCompaction.terminalStatus) {
-      return this.activeCompaction;
+      return;
     }
 
-    const state = this.open(compactionId);
+    this.open(compactionId);
     if (this.presentation === "compaction_update") {
       await this.send({
         sessionUpdate: "compaction_update",
@@ -217,7 +242,7 @@ export class ContextCompactionLifecycle {
         status: "in_progress",
         _meta: createContextCompactionMeta(),
       });
-      return state;
+      return;
     }
     await this.send({
       sessionUpdate: "tool_call",
@@ -227,7 +252,6 @@ export class ContextCompactionLifecycle {
       status: "in_progress",
       _meta: compactionToolMeta(),
     });
-    return state;
   }
 
   /**
@@ -253,8 +277,9 @@ export class ContextCompactionLifecycle {
       return;
     }
 
-    const state = this.activeCompaction ?? (await this.start(fallbackId));
-    if (state.terminalStatus || state.heartbeatSent) return;
+    if (!this.activeCompaction) await this.start(fallbackId);
+    const state = this.activeCompaction;
+    if (!state || state.terminalStatus || state.heartbeatSent) return;
     state.heartbeatSent = true;
     await this.send({
       sessionUpdate: "tool_call_update",
@@ -277,6 +302,7 @@ export class ContextCompactionLifecycle {
    * retained.
    */
   recordSummary(rawSummary: unknown): boolean {
+    if (this.interrupted) return false;
     if (this.presentation !== "compaction_update" || typeof rawSummary !== "string") return false;
     const summary = compactionSummaryText(rawSummary);
     if (!summary) return false;
@@ -296,6 +322,7 @@ export class ContextCompactionLifecycle {
     metadata: Omit<ContextCompactionMetadata, "version"> = {},
     enrichTerminal = false,
   ): Promise<void> {
+    if (this.interrupted) return;
     // The opening status can be missed (replay, or a terminal-only runtime):
     // the first update for the ID is then already terminal.
     const opened = this.activeCompaction === undefined;

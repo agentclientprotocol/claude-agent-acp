@@ -11607,6 +11607,313 @@ describe("assembled assistant text fallback", () => {
     expect(updatesAtSettle).toEqual(["in_progress", "cancelled"]);
   });
 
+  it.each(["echo", "dispatch", "no echo"] as const)(
+    "closes compaction before a cancelled wedged prompt settles (%s)",
+    async (boundary) => {
+      const { agent, updates } = compactionCapableAgent();
+      agent.forceCancelGraceMs = 20;
+      let releaseGenerator!: () => void;
+      const generatorReleased = new Promise<void>((resolve) => {
+        releaseGenerator = resolve;
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          if (boundary === "echo") {
+            yield userEcho(first.value);
+          } else if (boundary === "dispatch") {
+            yield {
+              type: "command_lifecycle",
+              command_uuid: first.value.uuid,
+              state: "started",
+            };
+          }
+          yield compactingStatus("force-cancel-compaction");
+          await generatorReleased;
+          yield idle;
+        }
+        return generator();
+      });
+
+      let updatesAtSettle: any[] | undefined;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "compact it" }] })
+        .then((response) => {
+          updatesAtSettle = compactionUpdates(updates);
+          return response;
+        });
+
+      try {
+        await vi.waitFor(() => {
+          expect(compactionUpdates(updates)).toHaveLength(1);
+        });
+        if (boundary !== "echo") {
+          expect((agent as any).sessions["test-session"].activeTurn).toBeFalsy();
+        }
+        await agent.cancel({ sessionId: "test-session" });
+        await expect(prompt).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+        expect(updatesAtSettle).toEqual([
+          {
+            sessionUpdate: "compaction_update",
+            compactionId: "force-cancel-compaction",
+            status: "in_progress",
+            _meta: { contextCompaction: { version: 1 } },
+          },
+          {
+            sessionUpdate: "compaction_update",
+            compactionId: "force-cancel-compaction",
+            status: "cancelled",
+          },
+        ]);
+      } finally {
+        // Let the consumer's outstanding next() finish so this regression cannot
+        // leave a live async generator behind, even when an assertion fails.
+        releaseGenerator();
+        await agent.closeSession({ sessionId: "test-session" });
+      }
+    },
+  );
+
+  it.each(["echo", "dispatch", "unattributed opening"] as const)(
+    "discards force-cancelled compaction frames until the next %s",
+    async (nextBoundary) => {
+      const { agent, updates } = compactionCapableAgent();
+      agent.forceCancelGraceMs = 20;
+      let releaseGenerator!: () => void;
+      const generatorReleased = new Promise<void>((resolve) => {
+        releaseGenerator = resolve;
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield compactingStatus("interrupted");
+          await generatorReleased;
+
+          const lifecycle = (agent as any).sessions["test-session"].contextCompaction;
+          expect(lifecycle.recordSummary("stale summary")).toBe(false);
+          yield compactingStatus("interrupted");
+          yield compactingStatus("unseen-late-opening");
+          yield compactResult("success", "late-completion");
+          yield {
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "late-boundary",
+            session_id: "test-session",
+            compact_metadata: { trigger: "auto", pre_tokens: 100, post_tokens: 10 },
+          };
+          yield {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            uuid: "late-chunk",
+            session_id: "test-session",
+            event: {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "compaction_delta",
+                content: "stale chunk",
+                encrypted_content: null,
+              },
+            },
+          };
+          // The abandoned turn's result must not lift the interruption guard.
+          yield replayedResult("");
+          yield idle;
+          expect(compactionUpdates(updates)).toHaveLength(2);
+
+          const second = await iter.next();
+          if (nextBoundary === "echo") {
+            yield userEcho(second.value);
+          } else if (nextBoundary === "dispatch") {
+            yield {
+              type: "command_lifecycle",
+              command_uuid: second.value.uuid,
+              state: "started",
+            };
+          } else {
+            // Older SDKs may give /compact neither an echo nor dispatch ID.
+            // Omit the ambiguous lifecycle rather than attributing stale work.
+            yield compactingStatus("fresh");
+          }
+          expect(lifecycle.recordSummary("fresh summary")).toBe(
+            nextBoundary !== "unattributed opening",
+          );
+          yield compactResult("success", "fresh");
+          yield replayedResult("");
+          yield idle;
+        }
+        return generator();
+      });
+
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "compact it" }],
+      });
+      try {
+        await vi.waitFor(() => expect(compactionUpdates(updates)).toHaveLength(1));
+        await agent.cancel({ sessionId: "test-session" });
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        releaseGenerator();
+        await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "/compact" }],
+        });
+
+        expect(
+          compactionUpdates(updates).map(({ compactionId, status }) => ({ compactionId, status })),
+        ).toEqual([
+          { compactionId: "interrupted", status: "in_progress" },
+          { compactionId: "interrupted", status: "cancelled" },
+          ...(nextBoundary === "unattributed opening"
+            ? []
+            : [{ compactionId: "fresh", status: "completed" }]),
+        ]);
+        if (nextBoundary !== "unattributed opening") {
+          expect(compactionUpdates(updates).at(-1).summary).toEqual([
+            { type: "text", text: "fresh summary" },
+          ]);
+        }
+        expect(
+          updates.some(
+            (notification) => notification.update.sessionUpdate === "compaction_summary_chunk",
+          ),
+        ).toBe(false);
+      } finally {
+        releaseGenerator();
+        await agent.closeSession({ sessionId: "test-session" });
+      }
+    },
+  );
+
+  it.each([
+    ["ends", false],
+    ["throws", true],
+  ] as const)(
+    "closes an active compaction before the SDK iterator %s",
+    async (_description, shouldThrow) => {
+      const { agent, updates } = compactionCapableAgent();
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield compactingStatus(`iterator-${shouldThrow ? "error" : "eof"}`);
+          if (shouldThrow) {
+            throw new Error("controlled SDK iterator failure");
+          }
+        }
+        return generator();
+      });
+
+      let updatesAtSettle: any[] | undefined;
+      await agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "compact it" }] })
+        .then(
+          () => {
+            updatesAtSettle = compactionUpdates(updates);
+          },
+          () => {
+            updatesAtSettle = compactionUpdates(updates);
+          },
+        );
+
+      expect(
+        updatesAtSettle?.map(({ compactionId, status }) => ({ compactionId, status })),
+      ).toEqual([
+        {
+          compactionId: `iterator-${shouldThrow ? "error" : "eof"}`,
+          status: "in_progress",
+        },
+        {
+          compactionId: `iterator-${shouldThrow ? "error" : "eof"}`,
+          status: "cancelled",
+        },
+      ]);
+      expect(compactionUpdates(updates)).toHaveLength(2);
+    },
+  );
+
+  it("resets an active compaction before starting a fresh compaction lifecycle", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* generator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield compactingStatus("pre-reset-compaction");
+        yield {
+          type: "conversation_reset",
+          new_conversation_id: "fresh-conversation",
+          uuid: "conversation-reset",
+          session_id: "test-session",
+        };
+        // Reset itself must close the lifecycle, not the later result.
+        expect(compactionUpdates(updates).map((update) => update.status)).toEqual([
+          "in_progress",
+          "cancelled",
+        ]);
+        expect(
+          (agent as any).sessions["test-session"].contextCompaction.recordSummary("stale summary"),
+        ).toBe(false);
+        yield compactResult("success", "stale-reset-result");
+        yield replayedResult("");
+        yield idle;
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield compactingStatus("post-reset-compaction");
+        yield {
+          type: "stream_event",
+          parent_tool_use_id: null,
+          uuid: "fresh-summary",
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "compaction_delta",
+              content: "fresh summary",
+              encrypted_content: null,
+            },
+          },
+        };
+        yield compactResult("success", "post-reset-result");
+        yield replayedResult("");
+        yield idle;
+      }
+      return generator();
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/clear" }] });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "compact fresh context" }],
+    });
+
+    expect(
+      compactionUpdates(updates).map(({ compactionId, status }) => ({ compactionId, status })),
+    ).toEqual([
+      { compactionId: "pre-reset-compaction", status: "in_progress" },
+      { compactionId: "pre-reset-compaction", status: "cancelled" },
+      { compactionId: "post-reset-compaction", status: "in_progress" },
+      { compactionId: "post-reset-compaction", status: "completed" },
+    ]);
+    expect(
+      updates
+        .map((notification) => notification.update)
+        .filter((update) => update.sessionUpdate === "compaction_summary_chunk"),
+    ).toEqual([
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "post-reset-compaction",
+        content: { type: "text", text: "fresh summary" },
+      },
+    ]);
+  });
+
   it("does not open a compaction entity from API compaction stream blocks alone", async () => {
     // The API block carries no terminal signal; without the CLI's compacting
     // status there is nothing to close an entity but the turn boundary, which

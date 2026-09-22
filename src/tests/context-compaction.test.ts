@@ -362,7 +362,81 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
     expect(sent).toHaveLength(before);
   });
 
-  it("never throws from reset", async () => {
+  it("ignores interrupted work's late frames and hooks until a new turn begins", async () => {
+    const { sent, compaction } = lifecycle("compaction_update");
+
+    await compaction.start("cmp-1");
+    compaction.recordSummary("<summary>Abandoned.</summary>");
+    await compaction.interrupt();
+    await compaction.interrupt();
+    // An orphaned result still calls reset; it must not reopen the tail.
+    await compaction.reset();
+    await compaction.start("cmp-1");
+    await compaction.start("unseen-late-opening");
+    await compaction.heartbeat("late-stream", "late chunk");
+    await compaction.finish("late-status", "completed");
+    await compaction.finish("late-boundary", "completed", { preTokens: 100 }, true);
+    expect(compaction.recordSummary("<summary>Late hook.</summary>")).toBe(false);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toEqual({
+      sessionUpdate: "compaction_update",
+      compactionId: "cmp-1",
+      status: "cancelled",
+    });
+
+    compaction.resume();
+    await compaction.start("cmp-2");
+    await compaction.finish("cmp-2", "completed");
+    expect(sent.at(-1)).toEqual({
+      sessionUpdate: "compaction_update",
+      compactionId: "cmp-2",
+      status: "completed",
+      _meta: { contextCompaction: { version: 1 } },
+    });
+  });
+
+  it("discards pending summaries on interruption and accepts terminal-only output in a new turn", async () => {
+    const { sent, compaction } = lifecycle("compaction_update");
+
+    compaction.recordSummary("<summary>Pending abandoned summary.</summary>");
+    await compaction.interrupt();
+    expect(compaction.recordSummary("<summary>Late abandoned summary.</summary>")).toBe(false);
+    await compaction.finish("abandoned-terminal", "completed");
+    expect(sent).toEqual([]);
+
+    compaction.resume();
+    await compaction.finish("next-terminal", "completed");
+    expect(sent).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "next-terminal",
+        status: "completed",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+    ]);
+  });
+
+  it("leaves completed entities terminal when their surrounding work is interrupted", async () => {
+    const { sent, compaction } = lifecycle("compaction_update");
+
+    await compaction.start("cmp-1");
+    await compaction.finish("cmp-1", "completed");
+    compaction.recordSummary("<summary>Pending hook.</summary>");
+    await compaction.interrupt();
+    expect(sent).toHaveLength(2);
+
+    compaction.resume();
+    await compaction.start("cmp-2");
+    expect(compaction.recordSummary("<summary>Fresh.</summary>")).toBe(true);
+    await compaction.finish("cmp-2", "completed");
+    expect(sent.at(-1)).toMatchObject({
+      compactionId: "cmp-2",
+      status: "completed",
+      summary: [{ type: "text", text: "Fresh." }],
+    });
+  });
+
+  it.each(["reset", "interrupt"] as const)("never throws from %s", async (method) => {
     const failing = vi.fn<(notification: SessionNotification) => Promise<void>>(async () => {
       throw new Error("client gone");
     });
@@ -370,7 +444,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
 
     // start() itself propagates like every other consumer send.
     await expect(compaction.start("cmp-1")).rejects.toThrow("client gone");
-    await expect(compaction.reset()).resolves.toBeUndefined();
+    await expect(compaction[method]()).resolves.toBeUndefined();
     expect(logError).toHaveBeenCalledTimes(1);
   });
 
