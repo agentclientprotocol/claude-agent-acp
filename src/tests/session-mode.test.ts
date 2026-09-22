@@ -31,7 +31,11 @@ function createNotifications(updates: SessionNotification[]) {
   };
 }
 
-function createManager(session: SessionMode | undefined, updates: SessionNotification[] = []) {
+function createManager(
+  session: SessionMode | undefined,
+  updates: SessionNotification[] = [],
+  options: { supportsNotices?: boolean } = {},
+) {
   const notifications = createNotifications(updates);
   const updateConfigOption = vi.fn();
   const manager = new SessionModeManager({
@@ -39,6 +43,9 @@ function createManager(session: SessionMode | undefined, updates: SessionNotific
     getSession: () => session,
     sessionEndedMessage: "start a new session",
     updateConfigOption,
+    ...(options.supportsNotices !== undefined
+      ? { supportsNotices: () => options.supportsNotices! }
+      : {}),
   });
   return { manager, notifications, updateConfigOption };
 }
@@ -92,6 +99,34 @@ describe("session mode", () => {
     expect(
       updates.filter((notification) => notification.update.sessionUpdate === "agent_message_chunk"),
     ).toHaveLength(1);
+    expect(updates[0].update).toEqual({
+      sessionUpdate: "agent_message_chunk",
+      content: {
+        type: "text",
+        text: "**Auto mode unavailable:** the selected model does not support Auto mode; using Accept edits instead.",
+      },
+    });
+  });
+
+  it("warns about the Auto fallback as a live notice when the client can present one", async () => {
+    const updates: SessionNotification[] = [];
+    const session = createSession({
+      models: { currentModelId: "haiku" },
+      modelInfos: [{ value: "haiku", displayName: "Haiku", description: "" }],
+    });
+    const { manager } = createManager(session, updates, { supportsNotices: true });
+
+    await expect(manager.selectMode(SESSION_ID, "auto")).resolves.toBe(AUTO_MODE_FALLBACK);
+    await manager.selectMode(SESSION_ID, "auto");
+
+    expect(updates.map((notification) => notification.update)).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "Auto mode unavailable",
+        description: "The selected model does not support Auto mode; using Accept edits instead.",
+      },
+    ]);
   });
 
   it("handles setSessionMode and publishes the updated config option", async () => {

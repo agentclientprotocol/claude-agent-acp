@@ -8219,6 +8219,79 @@ describe("model refusal fallback handling", () => {
     ).toEqual([advisory]);
   });
 
+  it("publishes the model fallback as a notice for clients on the notice contract", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        session: { notices: {} },
+        // Both lanes advertised: the standard notice wins over the AIR record.
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ api_refusal_explanation: "The request looked like malware." }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    // Exactly one surface: no transcript line and no AIR advisory beside the notice.
+    expect(
+      updates.find(
+        (u: any) =>
+          u.sessionUpdate === "agent_message_chunk" && u.content?.text?.includes("Model fallback"),
+      ),
+    ).toBeUndefined();
+    expect(updates.find((u: any) => u._meta?.jetbrains?.air?.sessionFailure)).toBeUndefined();
+
+    const notices = updates.filter((u: any) => u.sessionUpdate === "notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toEqual({
+      sessionUpdate: "notice",
+      severity: "warning",
+      title:
+        "claude-fable-5 declined this request (cyber); retried with claude-opus-4-8. " +
+        "The session will continue on claude-opus-4-8.",
+      description: "The request looked like malware.",
+    });
+    // The swap itself is still reconciled.
+    expect(agent.sessions["test-session"].models.currentModelId).toBe("claude-opus-4-8");
+  });
+
+  it("moves an over-long model fallback summary under a generic notice title", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+    const longCategory = "c".repeat(300);
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({
+          api_refusal_category: longCategory,
+          api_refusal_explanation: "why",
+        }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find((u: any) => u.sessionUpdate === "notice");
+    expect(notice.title).toBe("Model fallback");
+    expect(notice.description).toContain(longCategory);
+    expect(notice.description).toContain("\n\nwhy");
+  });
+
   it("puts only a genuinely long model fallback explanation in details", async () => {
     const { agent, sessionUpdate } = createCapturingAgent();
     await agent.initialize({
@@ -12260,6 +12333,149 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
     expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+  });
+
+  it("delivers an informational frame as a notice and still owns the result text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "hook says no",
+        level: "warning",
+        session_id: "test-session",
+      },
+      replayedResult("hook says no"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    // The notice is the turn's delivered text: nothing lands in the transcript,
+    // and the result's repeat of the block reason must not either.
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      { sessionUpdate: "notice", severity: "warning", title: "hook says no" },
+    ]);
+  });
+
+  it("records the notice against the queued turn when the hook blocks before any echo", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    // Live frame order for a UserPromptSubmit block (CLI 2.1.x): no user echo
+    // at all — the informational frame, then the 0-token result repeating it,
+    // then idle. The turn is only promoted when the result lands.
+    const blocked =
+      "UserPromptSubmit operation blocked by hook:\nhook says no\n\nOriginal prompt: 1+2";
+    const input = new Pushable<any>();
+    async function* echoless() {
+      yield {
+        type: "system",
+        subtype: "informational",
+        content: blocked,
+        level: "warning",
+        session_id: "test-session",
+      };
+      yield replayedResult(blocked);
+      yield idle;
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(echoless()), input });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "UserPromptSubmit operation blocked by hook:",
+        description: "hook says no\n\nOriginal prompt: 1+2",
+      },
+    ]);
+  });
+
+  it("collapses repeated tool-use progress into one notice and drops transcript-only info", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    const progress = (content: string) => ({
+      type: "system",
+      subtype: "informational",
+      content,
+      level: "notice",
+      tool_use_id: "tool-1",
+      session_id: "test-session",
+    });
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "transcript-only",
+        level: "info",
+        session_id: "test-session",
+      },
+      progress("Step 1 of 3"),
+      progress("Step 2 of 3"),
+      progress("Step 3 of 3"),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      { sessionUpdate: "notice", severity: "info", title: "Step 1 of 3" },
+    ]);
+  });
+
+  it("still forwards a replayed answer that an info notice merely preceded", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "some status line",
+        level: "info",
+        session_id: "test-session",
+      },
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    // A notice is not the turn's answer: only a result that repeats it is skipped.
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("maps the SDK's gray informational levels to info notices", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Tip: run /help\nMore detail on a second line.",
+        level: "suggestion",
+        session_id: "test-session",
+      },
+      replayedResult(""),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: "Tip: run /help",
+        description: "More detail on a second line.",
+      },
+    ]);
   });
 
   it("still forwards the result text after a turn failed without a result", async () => {

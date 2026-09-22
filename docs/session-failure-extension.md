@@ -123,6 +123,11 @@ Claude SDK conditions map to these groups:
 Unknown SDK error kinds degrade to `service`; they never become success. Category does not determine
 message text or client behavior beyond presentation.
 
+The model fallback notice is the one advisory that also has a standard ACP home. When the client
+advertises `clientCapabilities.session.notices` (the Session Notices RFD), the adapter sends it as an
+ACP `notice` update instead and publishes no AIR advisory record, even if `sessionFailure` is also
+advertised.
+
 ## Severity
 
 - `warning` means the operation may still succeed and normally has no actions while recovery is in
