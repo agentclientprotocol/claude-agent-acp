@@ -6984,9 +6984,7 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
-    const supportsTerminalOutput =
-      this.clientCapabilities?._meta?.["terminal_output"] === true ||
-      this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
+    const supportsTerminalOutput = clientSupportsTerminalOutput(this.clientCapabilities);
     const update = toolCallNotification(
       { id: toolCallId, name: toolName, input: toolInput },
       toolInput,
@@ -7034,9 +7032,7 @@ export class ClaudeAcpAgent {
         suppressAlwaysAllowRule,
       },
     ) => {
-      const supportsTerminalOutput =
-        this.clientCapabilities?._meta?.["terminal_output"] === true ||
-        this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
+      const supportsTerminalOutput = clientSupportsTerminalOutput(this.clientCapabilities);
       const session = this.sessions[sessionId];
       if (!session) {
         return {
@@ -8932,6 +8928,13 @@ export function clientSupportsRecommendedConfigValue(
   return clientSupportsAirCapability(clientCapabilities, AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY);
 }
 
+function clientSupportsTerminalOutput(clientCapabilities?: ClientCapabilities | null): boolean {
+  return (
+    clientCapabilities?._meta?.["terminal_output_delta"] === true ||
+    clientCapabilities?._meta?.["terminal_output"] === true
+  );
+}
+
 /** Build the Fast mode config option. When the Client supports boolean config
  *  options we expose a native `type: "boolean"` toggle; otherwise we degrade to
  *  a two-value `select` ("on"/"off") so older Clients still get a usable
@@ -9495,8 +9498,7 @@ export function toAcpNotifications(
   const registerHooks = options?.registerHooks !== false;
   const supportsTerminalOutputDelta =
     options?.clientCapabilities?._meta?.["terminal_output_delta"] === true;
-  const supportsTerminalOutput =
-    supportsTerminalOutputDelta || options?.clientCapabilities?._meta?.["terminal_output"] === true;
+  const supportsTerminalOutput = clientSupportsTerminalOutput(options?.clientCapabilities);
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];
@@ -9805,7 +9807,11 @@ export function toAcpNotifications(
             };
           }
         } else if (toolUse.name !== "TodoWrite") {
-          const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
+          const {
+            _meta: toolMeta,
+            content: toolContent,
+            ...toolUpdate
+          } = toolUpdateFromToolResult(
             chunk,
             toolUseCache[chunk.tool_use_id],
             supportsTerminalOutput,
@@ -9850,12 +9856,16 @@ export function toAcpNotifications(
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
-            // The terminal output already carried the exact bytes in the preceding
-            // update. Repeating them as rawOutput wastes bandwidth and lets a
-            // client accidentally render the same output twice.
+            // In delta mode, the initial call established the terminal and the
+            // preceding update carried its output. The completion repeats neither.
             ...(terminalOutput
-              ? {}
-              : { rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content) }),
+              ? toolMeta?.terminal_output && toolContent
+                ? { content: toolContent }
+                : {}
+              : {
+                  rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content),
+                  ...(toolContent ? { content: toolContent } : {}),
+                }),
             ...toolUpdate,
           };
         }
@@ -9988,8 +9998,7 @@ export function streamEventToAcpNotifications(
           streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
         );
         if (!input) return [];
-        const supportsTerminalOutput =
-          options?.clientCapabilities?._meta?.["terminal_output"] === true;
+        const supportsTerminalOutput = clientSupportsTerminalOutput(options?.clientCapabilities);
         const update = streamedInputRefinement(
           streamedInput,
           input,

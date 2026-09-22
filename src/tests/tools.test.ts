@@ -990,7 +990,9 @@ describe("Bash terminal output", () => {
         terminal_output_delta: { terminal_id: "toolu_bash", data: "file1.txt\nfile2.txt" },
       });
       expect(notifications[1].update).not.toHaveProperty("rawOutput");
+      expect(notifications[1].update).not.toHaveProperty("content");
       expect((notifications[1].update as any)._meta).not.toHaveProperty("terminal_output");
+      expect((notifications[1].update as any)._meta).not.toHaveProperty("terminal_output_delta");
     });
 
     it("should not include terminal _meta when client does not declare terminal_output support", () => {
