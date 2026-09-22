@@ -801,7 +801,11 @@ export type Session = {
   /** The last per-model reading seen on this query, autonomous cycles included.
    *  `result.modelUsage` is a running total for the whole query() call rather
    *  than a per-result figure, so consecutive readings are what a result's own
-   *  spend is derived from — this is not itself a turn tally. */
+   *  spend is derived from — this is not itself a turn tally. `undefined` on a
+   *  resumed session until its first result: the CLI continues the running
+   *  total from the totals the transcript saved (SDK 0.3.277+), so that first
+   *  reading is the baseline for later increments, not the first turn's spend
+   *  (see resumedFirstResultModelUsage). */
   lastModelUsageReading?: ModelTokenTally;
   modes: SessionModeState;
   models: SessionModelState;
@@ -4912,17 +4916,27 @@ export class ClaudeAcpAgent {
                   message.usage.cache_creation_input_tokens;
               }
 
+              const matchingModelUsage = lastAssistantModel
+                ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
+                : null;
+
               // The same tally split by model, for `_meta.quota.model_usage`.
               // `modelUsage` is a running total for the whole query() call, so
               // this result's own spend is what it added to the previous
               // reading. Advance the reading even for an autonomous result — it
               // is part of the running total the NEXT increment is measured
               // from — but leave the turn tally alone, exactly as above.
+              // A resumed session's first reading has no predecessor and
+              // already contains the pre-resume history, so it only seeds the
+              // baseline; that turn's rows come from the per-turn `usage`.
               const modelUsageReading = normalizeModelUsage(message.modelUsage);
-              const resultModelUsage = modelUsageIncrement(
-                modelUsageReading,
-                session.lastModelUsageReading ?? {},
-              );
+              const resultModelUsage =
+                session.lastModelUsageReading === undefined
+                  ? resumedFirstResultModelUsage(
+                      message.usage,
+                      matchingModelUsage?.key ?? lastAssistantModel,
+                    )
+                  : modelUsageIncrement(modelUsageReading, session.lastModelUsageReading);
               session.lastModelUsageReading = modelUsageReading;
               if (!isAutonomousResult) {
                 session.accumulatedModelUsage = addModelUsage(
@@ -4930,10 +4944,6 @@ export class ClaudeAcpAgent {
                   resultModelUsage,
                 );
               }
-
-              const matchingModelUsage = lastAssistantModel
-                ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
-                : null;
               // Only overwrite when we have an authoritative, sane value. A miss
               // (e.g. a turn with no top-level assistant message), or a
               // nonsensical non-positive/NaN window (observed from third-party
@@ -8411,7 +8421,9 @@ export class ClaudeAcpAgent {
           cachedWriteTokens: 0,
         },
         accumulatedModelUsage: {},
-        lastModelUsageReading: {},
+        // A resumed session's running total continues from the transcript's
+        // saved totals, so its first result is a baseline, not an increment.
+        lastModelUsageReading: creationOpts.resume !== undefined ? undefined : {},
         modes,
         models,
         modelInfos,
@@ -8684,8 +8696,8 @@ function finiteCount(value: number | null | undefined): number {
 /** `current - previous` per model, dropping models with nothing to report so a
  *  turn only lists the models it actually ran on. A reading that fell BELOW the
  *  previous one means the running total restarted under us (a mid-session
- *  /clear, a resumed session starting fresh, a zeroed crash result): there is no
- *  usable reference left to subtract, so the reading itself is the increment. */
+ *  /clear, a zeroed crash result): there is no usable reference left to
+ *  subtract, so the reading itself is the increment. */
 function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally): ModelTokenTally {
   const increment: ModelTokenTally = {};
   for (const [model, usage] of Object.entries(current)) {
@@ -8705,6 +8717,36 @@ function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally
     }
   }
   return increment;
+}
+
+/** The per-model rows for the first result of a resumed session. Its
+ *  `modelUsage` reading continues from the totals the transcript saved (SDK
+ *  0.3.277+; older transcripts may hold none), so there is no earlier reading
+ *  to subtract from, and taking the reading itself would charge the whole
+ *  pre-resume history to this one turn. The result's own `usage` is per-turn
+ *  (main agent loop only, like the response's `usage`), so it stands in under
+ *  the turn's top-level model — `key` is that model's `modelUsage` spelling
+ *  when the reading has one, else the assistant message's own. Any subagent
+ *  spend on this one turn goes unlisted rather than over-listed. */
+function resumedFirstResultModelUsage(
+  usage: {
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    cache_read_input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+  },
+  key: string | null,
+): ModelTokenTally {
+  if (key === null) {
+    return {};
+  }
+  const row: AccumulatedUsage = {
+    inputTokens: finiteCount(usage.input_tokens),
+    outputTokens: finiteCount(usage.output_tokens),
+    cachedReadTokens: finiteCount(usage.cache_read_input_tokens),
+    cachedWriteTokens: finiteCount(usage.cache_creation_input_tokens),
+  };
+  return tallyTotal(row) > 0 ? { [key]: row } : {};
 }
 
 /** Fold `increment` into `base` per model — the per-model counterpart of the

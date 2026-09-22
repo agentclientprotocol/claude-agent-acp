@@ -17767,6 +17767,141 @@ describe("prompt response quota metadata (_meta.quota)", () => {
     );
     await agent.sessions["test-session"]?.consumer;
   });
+
+  it("seeds the per-model baseline from a resumed session's first result", async () => {
+    // SDK 0.3.277+: a resumed session's `modelUsage` continues from the totals
+    // the transcript saved, so the first reading holds the pre-resume history.
+    // That turn reports its per-turn `usage` under the top-level model (the
+    // reading's spelling of it) instead of the whole history, and the second
+    // turn's increment is measured from the seeded baseline.
+    const agent = createAgent();
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            event: {
+              type: "message_start",
+              message: {
+                model: "claude-opus-5",
+                usage: {
+                  input_tokens: 10,
+                  output_tokens: 5,
+                  cache_read_input_tokens: 0,
+                  cache_creation_input_tokens: 0,
+                },
+              },
+            },
+          };
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-opus-5[1m]": modelRow({ inputTokens: 510, outputTokens: 205 }),
+              "claude-haiku-4-5": modelRow({ inputTokens: 900, outputTokens: 300 }),
+            },
+          });
+          yield idle();
+
+          const second = await iter.next();
+          yield userEcho(second.value);
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 15,
+              output_tokens: 7,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-opus-5[1m]": modelRow({ inputTokens: 525, outputTokens: 212 }),
+              "claude-haiku-4-5": modelRow({ inputTokens: 900, outputTokens: 300 }),
+            },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      // What createSession seeds for a `resume` (baseline unknown).
+      { lastModelUsageReading: undefined },
+    );
+
+    const first = await promptOnce(agent, "first");
+    expect(first._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 10, outputTokens: 5, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5[1m]",
+            { inputTokens: 10, outputTokens: 5, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+
+    const second = await promptOnce(agent, "second");
+    expect(second._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5[1m]",
+            { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("lists no per-model rows for a resumed first result with no top-level model", async () => {
+    // Without an assistant message there is no model to attribute the per-turn
+    // usage to; an empty list beats charging the pre-resume history.
+    const agent = createAgent();
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: { "claude-opus-5": modelRow({ inputTokens: 510, outputTokens: 205 }) },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      { lastModelUsageReading: undefined },
+    );
+
+    const first = await promptOnce(agent, "first");
+    expect(first._meta).toEqual(
+      expectedQuotaMeta({
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      }),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
 });
 
 describe("turn abandoned by the SDK (issue #825)", () => {
