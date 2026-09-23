@@ -3,11 +3,11 @@
  * prompt turns per tool and per stream feature.
  */
 import {
+  activeSdkSessionId,
   assistant,
   assistantTurn,
   result,
   type Scenario,
-  SESSION_ID,
   streamMessage,
   system,
   toolCall,
@@ -394,7 +394,7 @@ export const SCENARIOS: Scenario[] = [
           elapsed_time_seconds: 3,
           subagent_type: "Explore",
           uuid: "00000000-0000-4000-8000-00000000a001",
-          session_id: SESSION_ID,
+          session_id: activeSdkSessionId(),
         };
         yield toolResult("toolu_sub_read", "1\tparser", { parent });
         yield* toolCall(
@@ -734,7 +734,7 @@ export const SCENARIOS: Scenario[] = [
           parent_tool_use_id: parent,
           elapsed_time_seconds: 4,
           uuid: "00000000-0000-4000-8000-00000000a002",
-          session_id: SESSION_ID,
+          session_id: activeSdkSessionId(),
         };
         yield toolResult("toolu_late_read", "1\tok", { parent });
         yield result();
@@ -1064,7 +1064,7 @@ export const SCENARIOS: Scenario[] = [
             parent_tool_use_id: null,
             elapsed_time_seconds: seconds,
             uuid: `00000000-0000-4000-8000-00000000b00${seconds}`,
-            session_id: SESSION_ID,
+            session_id: activeSdkSessionId(),
           };
         }
         yield toolResult("toolu_slow", "built", {
@@ -1083,7 +1083,7 @@ export const SCENARIOS: Scenario[] = [
           type: "rate_limit_event",
           rate_limit_info: { status: "allowed_warning", resetsAt: 1700000000, utilization: 0.9 },
           uuid: "00000000-0000-4000-8000-00000000e001",
-          session_id: SESSION_ID,
+          session_id: activeSdkSessionId(),
         };
         yield result({ origin: { kind: "human" } });
       },
@@ -1225,7 +1225,7 @@ function compactionScenario(name: string, capabilities?: Scenario["capabilities"
           },
           parent_tool_use_id: null,
           uuid: "00000000-0000-4000-8000-00000000d001",
-          session_id: SESSION_ID,
+          session_id: activeSdkSessionId(),
         };
         yield {
           type: "stream_event",
@@ -1236,7 +1236,7 @@ function compactionScenario(name: string, capabilities?: Scenario["capabilities"
           },
           parent_tool_use_id: null,
           uuid: "00000000-0000-4000-8000-00000000d002",
-          session_id: SESSION_ID,
+          session_id: activeSdkSessionId(),
         };
         await ctx.hook("PostCompact", { trigger: "auto", compact_summary: "The summary." });
         yield system("compact_boundary", {

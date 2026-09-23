@@ -87,6 +87,8 @@ export const PROFILES: Record<Profile["name"], Profile> = {
 
 /** The SDK options that the agent passed to `query`. */
 type QueryOptions = {
+  sessionId?: string;
+  resume?: string;
   canUseTool?: (
     toolName: string,
     input: Record<string, unknown>,
@@ -98,6 +100,7 @@ type QueryOptions = {
 /** What a scenario script reads and calls. */
 export interface ScriptContext {
   cwd: string;
+  /** The session id that the agent passed to the SDK. */
   sessionId: string;
   options: QueryOptions;
   /** Calls `canUseTool` like Claude Code does before it runs a tool. */
@@ -137,8 +140,21 @@ export interface Scenario {
   recordSessionResponse?: boolean;
 }
 
-/** The fixed session id of every scenario, so that the recordings compare. */
+/** The fixed session id of every `session/load` scenario, so that the recordings compare. */
 export const SESSION_ID = "11111111-2222-4333-8444-555555555555";
+
+/**
+ * The session id of the active SDK query. Claude Code writes the session id
+ * that the agent passed in `options.sessionId` (or `options.resume`) into
+ * every SDK message, so the mock does the same.
+ */
+let sdkSessionId: string | undefined;
+
+/** The session id that the SDK messages of the active query carry. */
+export function activeSdkSessionId(): string {
+  if (!sdkSessionId) throw new Error("no active SDK query");
+  return sdkSessionId;
+}
 
 let activeScript:
   | {
@@ -153,9 +169,15 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
   if (!activeScript) throw new Error("no active scenario");
   const script = activeScript;
   const options = args.options;
+  // Claude Code uses `sessionId` for a new or forked session and `resume` for
+  // a continued one. A query without either gets a random id, which no
+  // scenario expects.
+  const sessionId = options.sessionId ?? options.resume;
+  if (!sessionId) throw new Error("the agent passed no session id to the SDK");
+  sdkSessionId = sessionId;
   const ctx: ScriptContext = {
     cwd: script.cwd,
-    sessionId: SESSION_ID,
+    sessionId,
     options,
     canUseTool: (toolName, input, toolUseID, extra = {}) =>
       options.canUseTool!(toolName, input, {
@@ -168,7 +190,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       for (const matcher of options.hooks?.[event] ?? []) {
         for (const callback of matcher.hooks) {
           await callback(
-            { hook_event_name: event, session_id: SESSION_ID, cwd: script.cwd, ...input },
+            { hook_event_name: event, session_id: sessionId, cwd: script.cwd, ...input },
             toolUseID ?? "",
             { signal: new AbortController().signal },
           );
@@ -194,7 +216,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
         message: user.message,
         parent_tool_use_id: null,
         uuid: user.uuid,
-        session_id: SESSION_ID,
+        session_id: sessionId,
         isReplay: true,
       };
       yield* turn(ctx);
@@ -236,6 +258,8 @@ type AgentClass = new (client: any, logger?: any) => any;
 
 /** The outbound messages of one scenario run. */
 export interface ScenarioRun {
+  /** The ACP session id of the run. */
+  sessionId: string;
   /** The messages as the agent sent them. */
   raw: Recorded[];
   /** The messages with the run-specific values replaced (see {@link normalize}). */
@@ -310,41 +334,43 @@ export async function runScenario(
   };
   const logger = { log: () => {}, error: () => {}, warn: () => {}, debug: () => {} };
   const agent = new Agent(client, logger);
+  let sessionId: string | undefined;
   try {
     const initialized = await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: capabilities,
     });
     if (scenario.recordSessionResponse) record("initialize", initialized);
-    let sessionId: string;
-    if (scenario.transcript) {
-      const response = await agent.loadSession({ sessionId: SESSION_ID, cwd, mcpServers: [] });
-      if (scenario.recordSessionResponse) record("loadSession", response);
-      sessionId = SESSION_ID;
-    } else {
-      const response = await agent.newSession({ cwd, mcpServers: [] });
-      if (scenario.recordSessionResponse) record("newSession", response);
-      sessionId = response.sessionId;
+    const opened = scenario.transcript
+      ? await agent.loadSession({ sessionId: SESSION_ID, cwd, mcpServers: [] })
+      : await agent.newSession({ cwd, mcpServers: [] });
+    if (scenario.recordSessionResponse) {
+      record(scenario.transcript ? "loadSession" : "newSession", opened);
     }
+    const acpSessionId: string = scenario.transcript ? SESSION_ID : opened.sessionId;
+    sessionId = acpSessionId;
     await settle();
     for (let turn = 0; turn < scenario.turns.length; turn++) {
       const response = await agent.prompt({
-        sessionId,
+        sessionId: acpSessionId,
         prompt: [{ type: "text", text: scenario.prompts?.[turn] ?? `prompt ${turn + 1}` }],
       });
       record("promptResponse", response);
       await settle();
     }
+    const raw = [...recorded];
     return {
-      raw: recorded,
-      normalized: normalize(recorded, cwd, sessionId, generatedIds) as Recorded[],
+      sessionId: acpSessionId,
+      raw,
+      normalized: normalize(raw, cwd, acpSessionId, generatedIds) as Recorded[],
     };
   } finally {
     activeScript = undefined;
+    sdkSessionId = undefined;
     try {
-      await agent.unstable_closeSession?.({ sessionId: SESSION_ID });
+      if (sessionId) await agent.unstable_closeSession?.({ sessionId });
     } catch {
-      // The scenario ended without a session.
+      // The session is already gone.
     }
     fs.rmSync(cwd, { recursive: true, force: true });
   }
@@ -456,7 +482,7 @@ function streamEvent(event: Record<string, unknown>, parent: Parent) {
     event,
     parent_tool_use_id: parent,
     uuid: uuid(),
-    session_id: SESSION_ID,
+    session_id: activeSdkSessionId(),
   };
 }
 
@@ -604,7 +630,7 @@ export function assistant(
     },
     parent_tool_use_id: parent,
     uuid: uuid(),
-    session_id: SESSION_ID,
+    session_id: activeSdkSessionId(),
   };
 }
 
@@ -646,13 +672,13 @@ export function toolResult(
     parent_tool_use_id: options.parent ?? null,
     ...(options.structured !== undefined ? { tool_use_result: options.structured } : {}),
     uuid: uuid(),
-    session_id: SESSION_ID,
+    session_id: activeSdkSessionId(),
   };
 }
 
 /** A system message. */
 export function system(subtype: string, fields: Record<string, unknown> = {}) {
-  return { type: "system", subtype, uuid: uuid(), session_id: SESSION_ID, ...fields };
+  return { type: "system", subtype, uuid: uuid(), session_id: activeSdkSessionId(), ...fields };
 }
 
 /** The successful result of a turn. */
@@ -677,7 +703,7 @@ export function result(overrides: Record<string, unknown> = {}) {
     modelUsage: {},
     permission_denials: [],
     uuid: uuid(),
-    session_id: SESSION_ID,
+    session_id: activeSdkSessionId(),
     ...overrides,
   };
 }
