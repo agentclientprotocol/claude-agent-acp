@@ -1532,6 +1532,17 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
   return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
 }
 
+/** The number of sessions in one page of session/list. */
+const SESSION_LIST_PAGE_SIZE = 100;
+
+/** The offset that a session/list cursor names. */
+function sessionListOffset(cursor: string | null | undefined): number {
+  if (cursor === null || cursor === undefined) return 0;
+  const match = /^offset:(\d+)$/.exec(cursor);
+  if (!match) throw RequestError.invalidParams(undefined, `Unknown session/list cursor: ${cursor}`);
+  return Number(match[1]);
+}
+
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
@@ -2551,11 +2562,21 @@ export class ClaudeAcpAgent {
     return result;
   }
 
+  /**
+   * One page of the sessions, newest first. The cursor is the offset of the
+   * page. The SDK then orders the transcripts by their modification time and
+   * reads the start and the end only of the transcripts of the page.
+   */
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    const sdk_sessions = await listSessions({ dir: params.cwd ?? undefined });
+    const offset = sessionListOffset(params.cursor);
+    // One more session than the page tells whether a next page exists.
+    const sdkSessions = await listSessions({
+      dir: params.cwd ?? undefined,
+      limit: SESSION_LIST_PAGE_SIZE + 1,
+      offset,
+    });
     const sessions = [];
-
-    for (const session of sdk_sessions) {
+    for (const session of sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE)) {
       if (!session.cwd) continue;
       sessions.push({
         sessionId: session.sessionId,
@@ -2564,9 +2585,9 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(session.lastModified).toISOString(),
       });
     }
-    return {
-      sessions,
-    };
+    return sdkSessions.length > SESSION_LIST_PAGE_SIZE
+      ? { sessions, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
+      : { sessions };
   }
 
   /**
