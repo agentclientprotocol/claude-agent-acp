@@ -111,6 +111,21 @@ export function executionDiagnostic(message: SDKResultMessage): string | undefin
   return message.errors.find((error) => error.startsWith("[ede_diagnostic]"));
 }
 
+/** Whether `message` is the error-shaped diagnostic Claude emits for the cycle
+ * a recorded ExitPlanMode `interrupt: true` answer stopped. */
+export function isExitPlanInterruptionResult(
+  message: SDKResultMessage,
+  pending: ExitPlanState["pendingExitPlanModeInterruption"],
+): boolean {
+  if (!pending?.toolResultSeen || !message.is_error) return false;
+  const diagnostic = executionDiagnostic(message);
+  return (
+    !!diagnostic &&
+    /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
+    /(?:^|\s)stop_reason=tool_use(?:\s|$)/.test(diagnostic)
+  );
+}
+
 /** Claude wraps a rejected ExitPlanMode explanation in a Markdown code fence.
  * Strip exactly one complete outer fence for that tool only. */
 export function exitPlanModeRawOutput(toolName: string, content: unknown): unknown {

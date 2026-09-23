@@ -242,8 +242,8 @@ import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./u
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
-  executionDiagnostic,
   exitPlanModeRawOutput,
+  isExitPlanInterruptionResult,
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -5372,6 +5372,44 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
+                // A held turn's followup can itself plan: the subagent
+                // finishes, the model writes the plan and calls ExitPlanMode
+                // inside the task-notification cycle, and the user answers it
+                // within the still-open turn. The interrupted cycle's
+                // diagnostic then carries that cycle's origin, so it lands
+                // here rather than in the user-lane check below — and settling
+                // the hold at it would end the turn with `end_turn`, silently
+                // dropping an accepted clear-context plan (issue #1167).
+                const heldTurn = session.activeTurn;
+                if (
+                  isHeldOpen(heldTurn) &&
+                  pendingExitPlanModeInterruption &&
+                  isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
+                ) {
+                  session.pendingExitPlanModeInterruption = undefined;
+                  if (
+                    pendingExitPlanContextReset &&
+                    pendingExitPlanContextReset.toolUseId ===
+                      pendingExitPlanModeInterruption.toolUseId
+                  ) {
+                    // The fresh query has none of this one's background
+                    // tasks, so the hold can never drain there: drop it, and
+                    // let the continuation's own result settle the turn.
+                    (heldTurn as Turn).deferredSettle = undefined;
+                    await this.exitPlan.restart(
+                      params.sessionId,
+                      session,
+                      pendingExitPlanContextReset,
+                    );
+                    return;
+                  }
+                  // "No, keep planning": the turn ends cancelled, with the
+                  // usage its own result recorded — still held while other
+                  // subagents it spawned are live.
+                  session.pendingExitPlanContextReset = undefined;
+                  await settleOrDefer({ ...heldTurn.deferredSettle, stopReason: "cancelled" });
+                  break;
+                }
                 // CLI 2.1.274+ answers background-task completions that were
                 // already queued with ONE model call: every queued
                 // notification still gets its own result, but all except the
@@ -5450,14 +5488,9 @@ export class ClaudeAcpAgent {
               // interrupt as an error-shaped diagnostic, so translate only a
               // diagnostic causally paired with the recorded ExitPlanMode
               // permission response.
-              const diagnostic = executionDiagnostic(message);
               if (
                 pendingExitPlanModeInterruption &&
-                pendingExitPlanModeInterruption.toolResultSeen &&
-                message.is_error &&
-                diagnostic &&
-                /(?:^|\s)result_type=user(?:\s|$)/.test(diagnostic) &&
-                /(?:^|\s)stop_reason=tool_use(?:\s|$)/.test(diagnostic)
+                isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
               ) {
                 session.pendingExitPlanModeInterruption = undefined;
                 if (
