@@ -856,6 +856,40 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       });
     });
 
+    it("sends no creation patch over a file and no Edit patch before the preview", async () => {
+      const patches = (reports: Record<string, any>[]) =>
+        reports.flatMap((report) =>
+          (report.content ?? [])
+            .map((block: any) => block._meta?.jetbrains?.air?.diffPatch?.text)
+            .filter((text: unknown) => text !== undefined),
+        );
+      // Streamed: the Write of an existing file and the Edit before its approval.
+      expect(patches(toolCallReports(air("write-existing"), "toolu_write"))).toEqual([]);
+      const edit = air("edit-with-permission");
+      const approval = edit.findIndex((record) => record.kind === "requestPermission");
+      expect(approval).toBeGreaterThan(0);
+      expect(patches(toolCallReports(edit.slice(0, approval), "toolu_edit"))).toEqual([]);
+      // Replayed: session/load renders the same tool uses from the transcript.
+      const replay = await runAir(replayedEditsScenario());
+      expect(patches(toolCallReports(replay))).toEqual([]);
+      expect(toolCallReports(replay, "toolu_r_write")[0].content).toEqual([
+        {
+          type: "diff",
+          path: expect.stringMatching(/old\.ts$/),
+          oldText: "export const x = 0;\n",
+          newText: "export const x = 1;\n",
+        },
+      ]);
+      expect(toolCallReports(replay, "toolu_r_edit")[0].content).toEqual([
+        {
+          type: "diff",
+          path: expect.stringMatching(/app\.ts$/),
+          oldText: "const value = 1;",
+          newText: "const value = 2;",
+        },
+      ]);
+    });
+
     it("sends the Bash output as terminal deltas", () => {
       const reports = toolCallReports(air("bash-foreground"), "toolu_bash");
       expect(reports).toContainEqual(
@@ -899,5 +933,52 @@ function writtenFileScenario(): Scenario {
         yield result();
       },
     ],
+  };
+}
+
+/** A session/load of a Write over an existing file and of an Edit. */
+function replayedEditsScenario(): Scenario {
+  return {
+    name: "replayed-edits",
+    files: { "old.ts": "export const x = 0;\n", "app.ts": "line 1\nconst value = 1;\n" },
+    transcript: ({ cwd, sessionId }) => [
+      {
+        type: "user",
+        uuid: "00000000-0000-4000-8000-00000000f001",
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: { role: "user", content: "Change both files" },
+      },
+      {
+        type: "assistant",
+        uuid: "00000000-0000-4000-8000-00000000f002",
+        session_id: sessionId,
+        parent_tool_use_id: null,
+        message: {
+          id: "msg_r_edits",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_r_write",
+              name: "Write",
+              input: { file_path: path.join(cwd, "old.ts"), content: "export const x = 1;\n" },
+            },
+            {
+              type: "tool_use",
+              id: "toolu_r_edit",
+              name: "Edit",
+              input: {
+                file_path: path.join(cwd, "app.ts"),
+                old_string: "const value = 1;",
+                new_string: "const value = 2;",
+              },
+            },
+          ],
+        },
+      },
+    ],
+    turns: [],
   };
 }
