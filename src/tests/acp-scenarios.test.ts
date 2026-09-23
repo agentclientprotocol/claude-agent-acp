@@ -270,6 +270,41 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     });
   });
 
+  describe("schema check", () => {
+    const none = new Set<string>();
+    const elicitation = (url: string): Recorded => ({
+      kind: "createElicitation",
+      payload: {
+        sessionId: "s",
+        message: "Sign in",
+        mode: "url",
+        elicitationId: "e",
+        url,
+      },
+    });
+    const location = (line: number): Recorded => ({
+      kind: "sessionUpdate",
+      payload: {
+        sessionId: "s",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "t",
+          locations: [{ path: "/a.ts", line }],
+        },
+      },
+    });
+
+    it("rejects a value that breaks a standard format", () => {
+      expect(validateRecorded(elicitation("https://example.com/login"), none)).toEqual([]);
+      expect(validateRecorded(elicitation("not a uri"), none)).not.toEqual([]);
+    });
+
+    it("rejects a value that breaks an ACP integer format", () => {
+      expect(validateRecorded(location(2 ** 32 - 1), none)).toEqual([]);
+      expect(validateRecorded(location(2 ** 32), none)).not.toEqual([]);
+    });
+  });
+
   describe("air golden files", () => {
     it.each(SCENARIOS.map((scenario) => scenario.name))("%s", async (scenario) => {
       await expect(toJsonLines(run("air", scenario).normalized)).toMatchFileSnapshot(
