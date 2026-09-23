@@ -9,6 +9,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Context @-mentions
 - Images
 - Tool calls (with permission requests)
+- Compact file changes through the negotiated [AIR diff patch extension](docs/air-extensions.md#diff-patch)
 - Following
 - Edit review
 - TODO lists
@@ -16,10 +17,12 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Interactive (and background) terminals
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
-- Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
-- Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/session-failure-extension.md)
-- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/recommended-config-values-extension.md)
-- Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/permission-extension.md)
+- Session-scoped long-running goals through the provider-neutral [goal extension](docs/air-extensions.md#goal)
+- Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/air-extensions.md#session-failure)
+- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/air-extensions.md#recommended-config-values)
+- Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/air-extensions.md#permission-presentation)
+- One fact per field in every tool call report, as the [ACP tool call contract](docs/air-extensions.md#tool-call-contract) defines
+- All AIR extensions, capabilities, and `_meta` keys: [AIR extensions](docs/air-extensions.md)
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
@@ -40,7 +43,7 @@ in its initialize response. The canonical field remains supported and takes prec
 available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
 tool-call representation and child interactions stay on the root session. Clients that use the
 historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
-the flattened child transcript behavior.
+the flattened child transcript behavior. See [AIR extensions](docs/air-extensions.md#native-subagent-sessions).
 
 ## Contribution Policy
 

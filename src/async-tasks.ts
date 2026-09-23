@@ -23,6 +23,8 @@ type AsyncTask = {
   state: AsyncTaskState;
   terminalSummary?: string;
   terminalSource?: TerminalSource;
+  /** The optional fields that the client holds now, as JSON. */
+  published: Map<string, string>;
 };
 
 type TaskIdentity = { taskId?: unknown; task_id?: unknown };
@@ -401,6 +403,7 @@ export class AsyncTaskRuntime {
       stopping: false,
       stopAnnounced: false,
       state: "running",
+      published: new Map(),
     };
     this.tasks.set(taskId, task);
     return task;
@@ -473,6 +476,11 @@ export class AsyncTaskRuntime {
       },
     });
     task.announced = true;
+    recordPublished(task, {
+      description: task.description,
+      outputFilePath: task.outputFilePath,
+      toolCallId: task.toolCallId,
+    });
     if (isTerminal(task.state)) {
       await this.publishState(task, task.state, task.terminalSummary);
     }
@@ -521,6 +529,10 @@ export class AsyncTaskRuntime {
     }
   }
 
+  /**
+   * Publishes the progress fields that changed since the last report of the
+   * task. A beat with nothing new is not sent.
+   */
   private async publishProgress(
     task: AsyncTask,
     update: {
@@ -532,21 +544,29 @@ export class AsyncTaskRuntime {
       toolCallId?: string;
     },
   ): Promise<void> {
+    const changed = changedFields(task, update);
+    if (Object.keys(changed).length === 0) return;
     await this.publish({
       sessionId: this.sessionId,
       update: {
         sessionUpdate: "async_task_progress",
         asyncTaskId: task.id,
-        ...update,
+        ...changed,
       },
     });
+    recordPublished(task, changed);
   }
 
+  /** Publishes a state, with the output path and the tool call only when they changed. */
   private async publishState(
     task: AsyncTask,
     state: AsyncTaskState,
     summary?: string,
   ): Promise<void> {
+    const changed = changedFields(task, {
+      outputFilePath: task.outputFilePath,
+      toolCallId: task.toolCallId,
+    });
     await this.publish({
       sessionId: this.sessionId,
       update: {
@@ -554,10 +574,33 @@ export class AsyncTaskRuntime {
         asyncTaskId: task.id,
         state,
         ...(summary ? { summary } : {}),
-        ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-        ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
+        ...changed,
       },
     });
+    recordPublished(task, changed);
+  }
+}
+
+/**
+ * The fields whose value differs from what the client holds. An undefined
+ * value is not a field. The caller records the fields with
+ * {@link recordPublished} after the send succeeds, so a retry after a failed
+ * send carries them again.
+ */
+function changedFields<T extends Record<string, unknown>>(task: AsyncTask, fields: T): Partial<T> {
+  const changed: Partial<T> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined) continue;
+    if (task.published.get(key) === JSON.stringify(value)) continue;
+    (changed as Record<string, unknown>)[key] = value;
+  }
+  return changed;
+}
+
+/** Records the fields that the client holds now. An undefined value is not a field. */
+function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(fields)) {
+    if (value !== undefined) task.published.set(key, JSON.stringify(value));
   }
 }
 

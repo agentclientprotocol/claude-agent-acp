@@ -1,12 +1,16 @@
-import type { RequestPermissionRequest, ToolCallLocation } from "@agentclientprotocol/sdk";
-import { toolInfoFromToolUse } from "../tools.js";
+import type { RequestPermissionRequest, ToolCallContent } from "@agentclientprotocol/sdk";
+import { AIR_PERMISSION_KEY, withAirMeta } from "../air-extension.js";
+import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 
 export interface ClaudePermissionPresentationInput {
   toolName: string;
   input: Record<string, unknown>;
   toolUseID: string;
   cwd?: string;
-  supportsTerminalOutput?: boolean;
+  capabilities?: ClientCapabilities;
+  /** The exact patch of the change to approve, for a negotiated `diffPatch` client. */
+  previewContent?: ToolCallContent[];
   blockedPath?: string;
   title?: string;
   displayName?: string;
@@ -39,46 +43,30 @@ function compactText(value: unknown): string | undefined {
   return humanText(value, 160, true);
 }
 
-function withBlockedPath(
-  locations: ToolCallLocation[] | undefined,
-  blockedPath: unknown,
-): ToolCallLocation[] | undefined {
-  const path = humanText(blockedPath, 4_096, true);
-  if (!path) return locations;
-  const result = [...(locations ?? [])];
-  if (!result.some((location) => location.path === path)) result.push({ path });
-  return result;
-}
-
+/**
+ * The permission request presentation.
+ *
+ * The request `toolCall` carries `toolCallId`, `title`, and `rawInput`. The
+ * adapter emits the `tool_call` before the request, so the client already
+ * holds the rest. The request adds only what it shows new: the exact preview
+ * patch, and the blocked path when the tool call has no such location.
+ */
 export function buildClaudePermissionPresentation(
   value: ClaudePermissionPresentationInput,
 ): Pick<RequestPermissionRequest, "toolCall" | "_meta"> {
-  const info = toolInfoFromToolUse(
-    { id: value.toolUseID, name: value.toolName, input: value.input },
-    value.supportsTerminalOutput ?? false,
-    value.cwd,
-  );
+  const capabilities = value.capabilities ?? new ClientCapabilities();
+  const renderer = new AcpToolCallRenderer(capabilities);
+  const toolUse = { id: value.toolUseID, name: value.toolName, input: value.input };
+  const facts = renderer.facts(toolUse, value.cwd);
   const host =
     value.toolName === "SandboxNetworkAccess" ? compactText(value.input.host) : undefined;
   const isComputerUse = value.toolName.startsWith("mcp__computer-use__");
   const subjectTitle = host ?? (isComputerUse ? compactText(value.displayName) : undefined);
-  const subjectContent =
-    (host || isComputerUse) && info.content.length === 0
-      ? [
-          {
-            type: "content" as const,
-            content: {
-              type: "text" as const,
-              text: `\`\`\`json\n${JSON.stringify(value.input, null, 2)}\n\`\`\``,
-            },
-          },
-        ]
-      : info.content;
   // Reuse the exact standard tool-call heading as the permission heading so
   // the approval never maintains a second, divergent name for the operation.
   // decisionReason is temporarily exposed as the permission description so
   // its actual SDK values can be inspected; it remains diagnostic policy text.
-  const toolCallTitle = subjectTitle ?? info.title;
+  const toolCallTitle = subjectTitle ?? facts.title;
   const permissionTitle = value.toolName === "ExitPlanMode" ? "Ready to code?" : toolCallTitle;
   // Shell titles are executable input: compacting whitespace changes quoted
   // arguments and comment boundaries, and length limits can hide the command.
@@ -88,30 +76,44 @@ export function buildClaudePermissionPresentation(
       : (humanText(permissionTitle, 4_000, true) ?? "Use tool?");
   const decisionReason = humanText(value.decisionReason, 4_000);
   const description = decisionReason ? `Reason: ${decisionReason}` : undefined;
+  const blockedPath = humanText(value.blockedPath, 4_096, true);
+  const extraLocations =
+    blockedPath && !(facts.locations ?? []).some((location) => location.path === blockedPath)
+      ? [{ path: blockedPath }]
+      : undefined;
   return {
-    toolCall: {
-      toolCallId: value.toolUseID,
-      name: value.toolName,
-      status: "pending",
-      rawInput: value.input,
-      ...info,
+    toolCall: renderer.permissionToolCall(toolUse, {
+      cwd: value.cwd,
       title: toolCallTitle,
-      content: subjectContent,
-      locations: withBlockedPath(info.locations, value.blockedPath),
-    },
-    ...(title
+      previewContent: value.previewContent,
+      extraLocations,
+      // The upstream request shows the input of a network or computer-use
+      // request that has no content of its own.
+      fallbackContent:
+        host || isComputerUse
+          ? [
+              {
+                type: "content" as const,
+                content: {
+                  type: "text" as const,
+                  text: `\`\`\`json\n${JSON.stringify(value.input, null, 2)}\n\`\`\``,
+                },
+              },
+            ]
+          : undefined,
+    }),
+    // Only AIR gets the permission presentation.
+    ...(title && capabilities.air.client
       ? {
-          _meta: {
-            permission: {
-              version: 1,
-              title,
-              ...(description ? { description } : {}),
-              // The CLI's own hint, forwarded so a client that can pre-select
-              // an option keeps the decline focused; the option order already
-              // leads with the reject options when this is set.
-              ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
-            },
-          },
+          _meta: withAirMeta(undefined, AIR_PERMISSION_KEY, {
+            version: 1,
+            title,
+            ...(description ? { description } : {}),
+            // The CLI's own hint, forwarded so a client that can pre-select
+            // an option keeps the decline focused; the option order already
+            // leads with the reject options when this is set.
+            ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
+          }),
         }
       : {}),
   };

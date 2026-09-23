@@ -254,7 +254,7 @@ describe("askUserQuestionsToCreateRequest", () => {
       mkQuestion("What else?", [{ label: "C" }, { label: "D" }]),
     ];
     const schema = (
-      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
+      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined, true) as Extract<
         CreateElicitationRequest,
         { mode: "form" }
       >
@@ -265,9 +265,8 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        _askUserQuestionCustomAnswer: {
-          questionId: "question_0",
-          isCustomAnswer: true,
+        jetbrains: {
+          air: { customAnswer: { questionId: "question_0", isCustomAnswer: true } },
         },
       },
     });
@@ -275,12 +274,20 @@ describe("askUserQuestionsToCreateRequest", () => {
       type: "string",
       title: "Other",
       _meta: {
-        _askUserQuestionCustomAnswer: {
-          questionId: "question_1",
-          isCustomAnswer: true,
+        jetbrains: {
+          air: { customAnswer: { questionId: "question_1", isCustomAnswer: true } },
         },
       },
     });
+
+    // A client that is not AIR gets the field without the AIR marker.
+    const plain = (
+      askUserQuestionsToCreateRequest(questions, SESSION_ID, undefined) as Extract<
+        CreateElicitationRequest,
+        { mode: "form" }
+      >
+    ).requestedSchema;
+    expect(plain.properties?.["question_0_custom"]).not.toHaveProperty("_meta");
   });
 
   it("builds an array property for multi-select questions and includes per-field question text", () => {

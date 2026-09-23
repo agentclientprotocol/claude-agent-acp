@@ -490,11 +490,34 @@ describe("AsyncTaskRuntime", () => {
       description: "Fast build",
       outputFilePath: "/tmp/tasks/fast-shell.output",
     });
-    expect(published[1]?.update).toMatchObject({
+    // The spawn carried the output path and the tool call. The state does not repeat them.
+    expect(published[1]?.update).toEqual({
+      sessionUpdate: "async_task_state_update",
+      asyncTaskId: "fast-shell",
       state: "completed",
       summary: "Already done",
-      outputFilePath: "/tmp/tasks/fast-shell.output",
     });
+  });
+
+  it("sends only the progress fields that changed", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+    await runtime.taskStarted({
+      task_id: "shell",
+      task_type: "local_bash",
+      description: "Build",
+      isBackgrounded: true,
+    } as any);
+    await runtime.taskProgress({ task_id: "shell", description: "Build", summary: "Step 1" });
+    await runtime.taskProgress({ task_id: "shell", description: "Build", summary: "Step 1" });
+    await runtime.taskProgress({ task_id: "shell", description: "Build", summary: "Step 2" });
+
+    expect(published.slice(1).map((notification) => notification.update)).toEqual([
+      { sessionUpdate: "async_task_progress", asyncTaskId: "shell", summary: "Step 1" },
+      { sessionUpdate: "async_task_progress", asyncTaskId: "shell", summary: "Step 2" },
+    ]);
   });
 
   it("retains a terminal task_updated tombstone until background promotion", async () => {
@@ -693,6 +716,36 @@ describe("AsyncTaskRuntime", () => {
       asyncTaskId: "lost-start",
       name: "Build assets",
       showInTranscript: false,
+    });
+  });
+
+  it("sends the changed fields again when a retry follows a failed send", async () => {
+    const published: AcpSessionNotification[] = [];
+    let failNext = false;
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("client disconnected");
+      }
+      published.push(notification);
+    });
+    await runtime.taskStarted({
+      task_id: "build",
+      task_type: "local_bash",
+      description: "build",
+      is_backgrounded: true,
+    });
+
+    failNext = true;
+    await expect(
+      runtime.taskNotification("build", "completed", "Done", "/tmp/build.output"),
+    ).rejects.toThrow("client disconnected");
+    await runtime.taskNotification("build", "completed", "Done", "/tmp/build.output");
+
+    expect(published.at(-1)?.update).toMatchObject({
+      sessionUpdate: "async_task_state_update",
+      state: "completed",
+      outputFilePath: "/tmp/build.output",
     });
   });
 

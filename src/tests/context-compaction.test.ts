@@ -13,9 +13,11 @@ const PERSISTED_SUMMARY =
   "If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /tmp/session.jsonl\n" +
   "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening.";
 
+/** A lifecycle for an AIR client, which gets the compaction facts, unless `airClient` is false. */
 function lifecycle(
   presentation: "tool_call" | "compaction_update",
   sendUpdate?: (notification: SessionNotification) => Promise<void>,
+  airClient = true,
 ) {
   const sent: SessionNotification["update"][] = [];
   const logError = vi.fn();
@@ -24,10 +26,57 @@ function lifecycle(
       (async (notification) => {
         sent.push(notification.update);
       }),
-    { sessionId: "s", presentation, logError },
+    { sessionId: "s", presentation, logError, airClient },
   );
   return { sent, compaction, logError };
 }
+
+describe("ContextCompactionLifecycle for a client that is not AIR", () => {
+  it("sends the upstream tool call fields and no AIR key", async () => {
+    const { sent, compaction } = lifecycle("tool_call", undefined, false);
+    await compaction.start("c");
+    await compaction.finish("c", "completed", { trigger: "manual", preTokens: 10 });
+    expect(sent).toEqual([
+      {
+        sessionUpdate: "tool_call",
+        toolCallId: "c",
+        title: "Compact conversation",
+        kind: "think",
+        status: "in_progress",
+        _meta: { claudeCode: { toolName: "compact" } },
+      },
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "c",
+        status: "completed",
+        rawOutput: { trigger: "manual", preTokens: 10 },
+        _meta: { claudeCode: { toolName: "compact" } },
+      },
+    ]);
+  });
+
+  it("sends compaction updates without _meta, and a summary that differs from the chunks", async () => {
+    const { sent, compaction } = lifecycle("compaction_update", undefined, false);
+    await compaction.start("c");
+    await compaction.heartbeat("c", "Part");
+    compaction.recordSummary("<summary>\nThe whole summary\n</summary>");
+    await compaction.finish("c", "completed", { trigger: "manual" });
+    expect(sent).toEqual([
+      { sessionUpdate: "compaction_update", compactionId: "c", status: "in_progress" },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "c",
+        content: { type: "text", text: "Part" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "c",
+        status: "completed",
+        summary: [{ type: "text", text: "The whole summary" }],
+      },
+    ]);
+  });
+});
 
 describe("clientSupportsCompactionUpdates", () => {
   it("requires the v1 session.compaction object", () => {
@@ -154,26 +203,31 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "in_progress",
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
         summary: [{ type: "text", text: "Retained." }],
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
         _meta: {
-          contextCompaction: {
-            version: 1,
-            trigger: "manual",
-            preTokens: 100,
-            postTokens: 10,
-            durationMs: 5,
+          jetbrains: {
+            air: {
+              version: 1,
+              contextCompaction: {
+                version: 1,
+                trigger: "manual",
+                preTokens: 100,
+                postTokens: 10,
+                durationMs: 5,
+              },
+            },
           },
         },
       },
@@ -259,7 +313,14 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         compactionId: "cmp-boundary",
         status: "completed",
         summary: [{ type: "text", text: "Only terminal." }],
-        _meta: { contextCompaction: { version: 1, trigger: "automatic", preTokens: 50 } },
+        _meta: {
+          jetbrains: {
+            air: {
+              version: 1,
+              contextCompaction: { version: 1, trigger: "automatic", preTokens: 50 },
+            },
+          },
+        },
       },
     ]);
   });
@@ -274,7 +335,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-boundary",
         status: "completed",
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -291,7 +352,8 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
       compactionId: "cmp-1",
       status: "failed",
       error: "summary rejected",
-      _meta: { contextCompaction: { version: 1, error: "summary rejected" } },
+      // The standard error field carries the error once.
+      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
     });
     expect(compaction.consumeDuplicateErrorOutput("summary rejected\n")).toBe(true);
     expect(compaction.consumeDuplicateErrorOutput("summary rejected")).toBe(false);
@@ -321,7 +383,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "in_progress",
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "compaction_summary_chunk",
@@ -337,7 +399,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "cmp-1",
         status: "completed",
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -391,7 +453,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
       sessionUpdate: "compaction_update",
       compactionId: "cmp-2",
       status: "completed",
-      _meta: { contextCompaction: { version: 1 } },
+      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
     });
   });
 
@@ -411,7 +473,7 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
         sessionUpdate: "compaction_update",
         compactionId: "next-terminal",
         status: "completed",
-        _meta: { contextCompaction: { version: 1 } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -459,6 +521,41 @@ describe("ContextCompactionLifecycle (compaction_update)", () => {
   });
 });
 
+describe("ContextCompactionLifecycle summary chunks", () => {
+  it("does not repeat a streamed summary in the terminal update", async () => {
+    const { sent, compaction } = lifecycle("compaction_update");
+    await compaction.start("cmp-1");
+    await compaction.heartbeat("cmp-1", "Retained ");
+    await compaction.heartbeat("cmp-1", "context.");
+    compaction.recordSummary("<summary>\nRetained context.\n</summary>");
+    await compaction.finish("cmp-1", "completed");
+
+    expect(sent.map((notification) => notification.sessionUpdate)).toEqual([
+      "compaction_update",
+      "compaction_summary_chunk",
+      "compaction_summary_chunk",
+      "compaction_update",
+    ]);
+    expect(sent[3]).not.toHaveProperty("summary");
+  });
+});
+
+describe("ContextCompactionLifecycle summary for AIR", () => {
+  it("sends the summary when it differs from the streamed chunks", async () => {
+    const { sent, compaction } = lifecycle("compaction_update");
+    await compaction.start("cmp-1");
+    await compaction.heartbeat("cmp-1", "<analysis>raw</analysis><summary>Retained");
+    compaction.recordSummary("<summary>\nRetained context.\n</summary>");
+    await compaction.finish("cmp-1", "completed");
+
+    expect(sent.at(-1)).toMatchObject({
+      sessionUpdate: "compaction_update",
+      status: "completed",
+      summary: [{ type: "text", text: "Retained context." }],
+    });
+  });
+});
+
 describe("ContextCompactionLifecycle (tool_call)", () => {
   it("keeps the legacy synthetic tool call and never exposes the summary", async () => {
     const { sent, compaction } = lifecycle("tool_call");
@@ -477,19 +574,19 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
         title: "Compact conversation",
         kind: "think",
         status: "in_progress",
-        _meta: { contextCompaction: { version: 1 }, claudeCode: { toolName: "compact" } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-start",
         status: "in_progress",
-        _meta: { contextCompaction: { version: 1 }, claudeCode: { toolName: "compact" } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-start",
         status: "completed",
-        _meta: { contextCompaction: { version: 1 }, claudeCode: { toolName: "compact" } },
+        _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
       },
     ]);
   });
@@ -520,19 +617,19 @@ describe("ContextCompactionLifecycle (tool_call)", () => {
             content: { type: "text", text: "Compaction failed: summary rejected" },
           },
         ],
-        rawOutput: { error: "summary rejected" },
         _meta: {
-          contextCompaction: { version: 1, error: "summary rejected" },
-          claudeCode: { toolName: "compact" },
+          jetbrains: {
+            air: { version: 1, contextCompaction: { version: 1, error: "summary rejected" } },
+          },
         },
       },
       {
         sessionUpdate: "tool_call_update",
         toolCallId: "compact-failed",
-        rawOutput: { trigger: "manual", preTokens: 3 },
         _meta: {
-          contextCompaction: { version: 1, trigger: "manual", preTokens: 3 },
-          claudeCode: { toolName: "compact" },
+          jetbrains: {
+            air: { version: 1, contextCompaction: { version: 1, trigger: "manual", preTokens: 3 } },
+          },
         },
       },
     ]);

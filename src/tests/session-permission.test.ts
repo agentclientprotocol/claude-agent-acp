@@ -63,9 +63,8 @@ describe("session permission updates", () => {
       "exit-plan-accept-edits",
       "reject",
     ]);
-    expect(capturedPermissionRequest._meta).toEqual({
-      permission: { version: 1, title: "Ready to code?" },
-    });
+    // A client that is not AIR gets no permission presentation.
+    expect(capturedPermissionRequest._meta).toBeUndefined();
     expect(result.updatedPermissions).toEqual([
       { type: "setMode", mode: "default", destination: "session" },
     ]);
