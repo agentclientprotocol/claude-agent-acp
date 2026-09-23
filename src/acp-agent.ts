@@ -4482,7 +4482,7 @@ export class ClaudeAcpAgent {
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
                 await this.syncFastModeState(
-                  message.session_id,
+                  params.sessionId,
                   session,
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
@@ -4498,7 +4498,7 @@ export class ClaudeAcpAgent {
                 ) {
                   session.terminalSlashCommands = message.terminal_slash_commands;
                   try {
-                    await this.sendAvailableCommandsUpdate(message.session_id);
+                    await this.sendAvailableCommandsUpdate(params.sessionId);
                   } catch (error) {
                     // Advisory reconcile only — the client keeps its current
                     // (unfiltered) list; never fail the turn over it.
@@ -4546,7 +4546,7 @@ export class ClaudeAcpAgent {
                 lastAssistantTotalUsage = usedTokens;
                 session.contextUsedTokens = usedTokens;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
@@ -4564,7 +4564,7 @@ export class ClaudeAcpAgent {
                 if (usageTurn?.isUsageCommand && session.cancelled) break;
                 if (usageMarkdown === null) break;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: usageMarkdown ?? message.content },
@@ -4724,7 +4724,7 @@ export class ClaudeAcpAgent {
               }
               case "memory_recall": {
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: AcpToolCallRenderer.for(this.clientCapabilities).memoryRecall(message),
                 });
                 break;
@@ -4737,7 +4737,7 @@ export class ClaudeAcpAgent {
                 // it's authoritative, and re-querying supportedCommands()
                 // would just return the same list with an extra round-trip.
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "available_commands_update",
                     availableCommands: getAvailableSlashCommands(
@@ -4809,7 +4809,7 @@ export class ClaudeAcpAgent {
                 });
                 // A denial is final, so it replaces a pinned approval patch.
                 if (toolCallFieldsOf(session).apply(denied, { replacePinnedContent: true })) {
-                  await sendUpdate({ sessionId: message.session_id, update: denied });
+                  await sendUpdate({ sessionId: params.sessionId, update: denied });
                 }
                 break;
               }
@@ -4844,7 +4844,7 @@ export class ClaudeAcpAgent {
                     ? message.content
                     : `**${sentenceCase(message.level)}:** ${message.content}`;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
                     {
                       severity,
@@ -5086,7 +5086,7 @@ export class ClaudeAcpAgent {
                           ...(explanation ? { description: explanation } : {}),
                         };
                   await sendUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: noticeOrTranscriptUpdate(
                       { severity: "warning", ...notice },
                       supportsNotices,
@@ -6330,14 +6330,14 @@ export class ClaudeAcpAgent {
               subagentRetry: message.subagent_retry,
             });
             if (toolCallFieldsOf(session).apply(beat)) {
-              await sendUpdate({ sessionId: message.session_id, update: beat });
+              await sendUpdate({ sessionId: params.sessionId, update: beat });
             }
             break;
           }
           case "rate_limit_event": {
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
-                sessionId: message.session_id,
+                sessionId: params.sessionId,
                 update: attachUsageModel({
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,

@@ -20434,6 +20434,76 @@ describe("buildConfigOptions model option resolved description", () => {
   });
 });
 
+describe("the SDK session id of a fresh Claude context", () => {
+  // After a clear-context restart the SDK runs under a new session id, and
+  // every SDK message carries it. The client knows only the ACP session id.
+  it("sends every update to the ACP session", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const sdkSessionId = "sdk-session-after-clear";
+    const input = new Pushable<any>();
+    async function* messages() {
+      const { value } = await input[Symbol.asyncIterator]().next();
+      yield { ...userEcho(value), session_id: sdkSessionId };
+      yield {
+        type: "tool_progress",
+        tool_use_id: "toolu_slow",
+        tool_name: "Bash",
+        parent_tool_use_id: null,
+        elapsed_time_seconds: 3,
+        uuid: randomUUID(),
+        session_id: sdkSessionId,
+      };
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: { status: "allowed_warning", resetsAt: 1700000000, utilization: 0.9 },
+        uuid: randomUUID(),
+        session_id: sdkSessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 1000, post_tokens: 100 },
+        uuid: randomUUID(),
+        session_id: sdkSessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "local_command_output",
+        content: "Local output",
+        uuid: randomUUID(),
+        session_id: sdkSessionId,
+      };
+      yield successfulResultMessage({ session_id: sdkSessionId });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messages()),
+      input,
+      emittedToolCalls: new Set(["toolu_slow"]),
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const kinds = updates.map((update) => update.update.sessionUpdate);
+    expect(kinds).toEqual(
+      expect.arrayContaining(["tool_call_update", "usage_update", "agent_message_chunk"]),
+    );
+    expect(
+      updates
+        .filter((update) => update.sessionId !== "test-session")
+        .map((update) => update.update.sessionUpdate),
+    ).toEqual([]);
+  });
+});
+
 describe("tool_progress heartbeats", () => {
   // Heartbeat beats identify themselves with a derived
   // `<tool_use_id>-heartbeat-<n>` that never had a `tool_call` of its own.
