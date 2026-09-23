@@ -9670,7 +9670,7 @@ describe("getOrCreateSession param change detection", () => {
     expect(agent.sessions["s1"]).toBeUndefined();
   });
 
-  it("ignores option key order and per-call resume controls", async () => {
+  it("ignores option key order, per-call resume controls and creation-only options", async () => {
     const agent = createMockAgent();
     const session = injectSession(agent, "s1", {
       cwd: "/project",
@@ -9690,6 +9690,8 @@ describe("getOrCreateSession param change detection", () => {
             sessionId: "s1",
             forkSession: false,
             resumeSessionAt: "msg-1",
+            resumeDropsTurn: "msg-1",
+            title: "Renamed",
             abortController: new AbortController(),
           },
         },
