@@ -68,6 +68,11 @@ export interface ToolResultFacts {
 export interface ToolUseContext {
   cwd?: string;
   capabilities: ClientCapabilities;
+  /**
+   * True when the tool use comes from the history of a loaded session. The
+   * files on disk then show a later state, so a reporter must not read them.
+   */
+  replay?: boolean;
 }
 
 /** What a reporter reads to report a tool result. */

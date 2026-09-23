@@ -7243,6 +7243,7 @@ export class ClaudeAcpAgent {
         this.logger,
         {
           registerHooks: false,
+          replay: true,
           clientCapabilities: this.clientCapabilities,
           cwd: this.sessions[sessionId]?.cwd,
           taskState: this.sessions[sessionId]?.taskState,
@@ -9814,11 +9815,13 @@ export function toAcpNotifications(
     // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
     // denied/interrupted tool_call_updates with why the tool never ran.
     toolResultMeta?: unknown;
+    // True when the content comes from the history of a loaded session.
+    replay?: boolean;
   },
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
-  const renderer = AcpToolCallRenderer.for(options?.clientCapabilities);
+  const renderer = AcpToolCallRenderer.for(options?.clientCapabilities, options?.replay);
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];

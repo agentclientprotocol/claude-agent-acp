@@ -112,10 +112,17 @@ type ResultBlock = ToolResultContext["result"];
  * earlier report of the same tool call already sent.
  */
 export class AcpToolCallRenderer {
-  constructor(readonly capabilities: ClientCapabilities = new ClientCapabilities()) {}
+  constructor(
+    readonly capabilities: ClientCapabilities = new ClientCapabilities(),
+    /** True when the renderer reports the history of a loaded session. */
+    readonly replay = false,
+  ) {}
 
-  static for(capabilities: AcpClientCapabilities | null | undefined): AcpToolCallRenderer {
-    return new AcpToolCallRenderer(ClientCapabilities.from(capabilities));
+  static for(
+    capabilities: AcpClientCapabilities | null | undefined,
+    replay = false,
+  ): AcpToolCallRenderer {
+    return new AcpToolCallRenderer(ClientCapabilities.from(capabilities), replay);
   }
 
   /** The facts of a tool use. */
@@ -123,6 +130,7 @@ export class AcpToolCallRenderer {
     return reporterFor(toolUse.name).toolUse(toolUse.input, {
       cwd,
       capabilities: this.capabilities,
+      replay: this.replay,
     });
   }
 
