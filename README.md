@@ -18,20 +18,29 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Client MCP servers
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/session-failure-extension.md)
+- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/recommended-config-values-extension.md)
 - Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/permission-extension.md)
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
 
-### Nested subagent transcripts
+To try changes that have landed on `main` but are not released yet, install from the
+`preview` channel — every push to `main` publishes one. See
+[`docs/RELEASES.md`](docs/RELEASES.md#preview-releases).
 
-ACP 1.2 has no standard subagent tool kind or nested-message relationship. Clients that can render
-nested transcripts can opt in with `clientCapabilities._meta["subagent-transcript"] = true`.
-The agent then forwards subagent text, thinking, and tool calls, relating nested updates to the
-launching Agent/Task call through `_meta.claudeCode.parentToolUseId`. Agent/Task calls are marked
-with `_meta.claudeCode.subagent = true`.
+```sh
+npm install @agentclientprotocol/claude-agent-acp@preview
+```
 
-Clients that do not advertise the capability retain the legacy flattened behavior. In both modes,
-the normal Agent/Task tool result is preserved as the protocol-compatible fallback.
+### Subagent sessions
+
+Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
+preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
+`nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
+in its initialize response. The canonical field remains supported and takes precedence once it is
+available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
+tool-call representation and child interactions stay on the root session. Clients that use the
+historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
+the flattened child transcript behavior.
 
 ## Contribution Policy
 

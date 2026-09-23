@@ -53,11 +53,12 @@ The request-level record is placed under `RequestPermissionRequest._meta.permiss
 }
 ```
 
-| Field         | Required | Type             | Meaning                                   |
-| ------------- | -------: | ---------------- | ----------------------------------------- |
-| `version`     |      yes | integer `1`      | Permission presentation schema version.   |
-| `title`       |      yes | non-empty string | The standard tool-call operation title.   |
-| `description` |       no | string           | Temporary diagnostic SDK decision reason. |
+| Field         | Required | Type             | Meaning                                                                                                                                                    |
+| ------------- | -------: | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `version`     |      yes | integer `1`      | Permission presentation schema version.                                                                                                                    |
+| `title`       |      yes | non-empty string | The standard tool-call operation title.                                                                                                                    |
+| `description` |       no | string           | Temporary diagnostic SDK decision reason.                                                                                                                  |
+| `defaultToNo` |       no | `true`           | The ask must not be approvable by a stray keystroke; the reject options are listed first and a client that pre-selects an option should focus the decline. |
 
 The permission title normally duplicates `toolCall.title`: one operation has one heading across the
 tool card and approval UI. `ExitPlanMode` is the deliberate exception and uses the action-oriented
@@ -71,7 +72,9 @@ with `Reason: `. The SDK `description` operation subtitle is not copied there.
 
 The permission request carries the same standard ACP tool information used for normal tool updates:
 
-- `name`, `kind`, `title`, `content`, and `locations` come from `toolInfoFromToolUse`;
+- `name` is the SDK tool name (for example `Read` or `mcp__server__tool`), matching the standard
+  `name` field on the initial `tool_call` update;
+- `kind`, `title`, `content`, and `locations` come from `toolInfoFromToolUse`;
 - `status` is `pending`;
 - `rawInput` is the original SDK input object;
 - `blockedPath` is appended to `locations` when it is valid and not already present;
@@ -81,6 +84,8 @@ The permission request carries the same standard ACP tool information used for n
 
 Compact text removes control characters, collapses whitespace where appropriate, and enforces length
 limits. Invalid optional presentation text is omitted instead of being truncated into misleading UI.
+Shell permission titles (`Bash` and `PowerShell`) preserve the full command verbatim, including
+whitespace and line breaks, without applying compact-text normalization or length limits.
 
 Permission options are fixed. When a durable suggestion contains a command prefix, path, host, or
 other rule, the adapter includes that value directly in `PermissionOption.name`, for example
@@ -160,6 +165,11 @@ The session exposes the Claude modes available for the current model using Claud
 `Manual`, `Accept edits`, `Plan`, conditional `Auto`, and conditional `Bypass permissions`. The
 internal `dontAsk` SDK mode is accepted from settings for compatibility but is not advertised as a
 user-selectable mode.
+
+Hosts can remove `Bypass permissions` from a session by sending
+`_meta.claudeCode.options.allowDangerouslySkipPermissions: false` on `session/new` (and again on
+`session/load`); the mode leaves the catalog and a `bypassPermissions` settings default clamps to
+`default`.
 
 The ACP mode ids are the Claude SDK wire ids: `default`, `acceptEdits`, `plan`, `auto`, and
 `bypassPermissions`. `Manual` deliberately retains the SDK id `default`; `manual` is only a settings

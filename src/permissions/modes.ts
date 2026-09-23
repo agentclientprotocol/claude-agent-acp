@@ -23,9 +23,12 @@ const PERMISSION_MODE_ALIASES: Record<string, PermissionMode> = {
   bypass: "bypassPermissions",
 };
 
+/** When `allowBypass` is false, `bypassPermissions` clamps to `default` so the SDK
+ *  is never spawned in a mode it would reject. */
 export function resolvePermissionMode(
   defaultMode?: unknown,
   logger: PermissionModeLogger = console,
+  allowBypass: boolean = ALLOW_BYPASS,
 ): PermissionMode {
   if (defaultMode === undefined) {
     return "default";
@@ -48,10 +51,8 @@ export function resolvePermissionMode(
     return "default";
   }
 
-  if (mapped === "bypassPermissions" && !ALLOW_BYPASS) {
-    logger.error(
-      "Ignoring permissions.defaultMode from settings: bypassPermissions is not available when running as root.",
-    );
+  if (mapped === "bypassPermissions" && !allowBypass) {
+    logger.error("Ignoring permission mode bypassPermissions: not available in this session.");
     return "default";
   }
 

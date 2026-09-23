@@ -23,7 +23,12 @@ export interface PermissionOptionContext {
   cwd: string;
   durableChangeSet?: DurablePermissionChangeSet;
   allowPersistentOptions?: boolean;
+  /** The CLI's `defaultToNo` hint (SDK 0.3.268+): the ask must not be
+   *  approvable by a stray keystroke, so the decline option leads. */
+  defaultToNo?: boolean;
   availableModes?: readonly string[];
+  /** The mode the session left when it entered plan mode. */
+  prePlanMode?: string;
   contextUsedPercent?: number;
 }
 

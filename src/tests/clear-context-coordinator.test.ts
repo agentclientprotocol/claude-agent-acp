@@ -18,9 +18,16 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
       cachedReadTokens: 30,
       cachedWriteTokens: 40,
     },
+    accumulatedModelUsage: {
+      "claude-sonnet-5": {
+        inputTokens: 10,
+        outputTokens: 20,
+        cachedReadTokens: 30,
+        cachedWriteTokens: 40,
+      },
+    },
     models: { currentModelId: "default" },
     configOptions: [],
-    currentAgent: "default",
     fastModeEnabled: false,
     input: { push: vi.fn() },
     ...overrides,
@@ -69,8 +76,8 @@ describe("continuePlanInFreshContext", () => {
       turnQueue: [turn],
       pendingExitPlanContextReset: reset,
       models: { currentModelId: "claude-sonnet" },
-      currentAgent: "reviewer",
       fastModeEnabled: true,
+      effortPinnedLevel: "high",
       configOptions: [
         {
           id: "effort",
@@ -100,7 +107,6 @@ describe("continuePlanInFreshContext", () => {
             options: expect.objectContaining({
               env: { PRESERVED: "yes" },
               model: "claude-sonnet",
-              agent: "reviewer",
               effort: "high",
             }),
           },
@@ -110,6 +116,10 @@ describe("continuePlanInFreshContext", () => {
     );
     expect(turn.carriedUsage).toEqual(oldSession.accumulatedUsage);
     expect(turn.carriedUsage).not.toBe(oldSession.accumulatedUsage);
+    // The per-model breakdown rides along, so the turn's `_meta.quota` rows
+    // still cover what it spent before the restart.
+    expect(turn.carriedModelUsage).toEqual(oldSession.accumulatedModelUsage);
+    expect(turn.carriedModelUsage).not.toBe(oldSession.accumulatedModelUsage);
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);
@@ -133,6 +143,41 @@ describe("continuePlanInFreshContext", () => {
     expect(host.ensureConsumer).toHaveBeenCalledWith(freshSession, "public-session");
   });
 
+  it("does not turn an automatic displayed effort into a pin during restart", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({
+      activeTurn: turn,
+      configOptions: [
+        {
+          id: "effort",
+          name: "Effort",
+          type: "select",
+          currentValue: "high",
+          options: [{ value: "high", name: "High" }],
+        },
+      ],
+      creationParams: {
+        cwd: "/workspace",
+        mcpServers: [],
+        _meta: { claudeCode: { options: { effort: "max" } } },
+      },
+    });
+    const host = testHost(oldSession, testSession());
+
+    await continuePlanInFreshContext(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "default" },
+      host,
+    );
+
+    const params = vi.mocked(host.restartSession).mock.calls[0]?.[0];
+    expect((params?._meta as any)?.claudeCode?.options).not.toHaveProperty("effort");
+  });
+
   it("does not resurrect original preferences after the session returns to defaults", async () => {
     const turn: ClearContextTurn = {
       settled: false,
@@ -141,7 +186,6 @@ describe("continuePlanInFreshContext", () => {
     const oldSession = testSession({
       activeTurn: turn,
       models: { currentModelId: "default" },
-      currentAgent: "default",
       configOptions: [
         {
           id: "effort",
@@ -337,6 +381,7 @@ describe("ExitPlanCoordinator", () => {
 
     expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
     expect(turn.carriedUsage).toBeUndefined();
+    expect(turn.carriedModelUsage).toBeUndefined();
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);

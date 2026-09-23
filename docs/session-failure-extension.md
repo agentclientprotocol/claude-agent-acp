@@ -113,6 +113,7 @@ Claude SDK conditions map to these groups:
 | Claude condition                                                                         | Category                           |
 | ---------------------------------------------------------------------------------------- | ---------------------------------- |
 | `authentication_failed`, `oauth_org_not_allowed`, synthetic login message                | `access`                           |
+| `verification_required`, `cloud_credential_error`                                        | `access` (no `login` action)       |
 | `billing_error`, `rate_limit`, `max_output_tokens`, usage/spend limit, budget/turn limit | `limit`                            |
 | `invalid_request`, `model_not_found`                                                     | `request`                          |
 | `overloaded`, `server_error`, unknown provider error, adapter internal error             | `service`                          |
@@ -121,6 +122,11 @@ Claude SDK conditions map to these groups:
 
 Unknown SDK error kinds degrade to `service`; they never become success. Category does not determine
 message text or client behavior beyond presentation.
+
+The model fallback notice is the one advisory that also has a standard ACP home. When the client
+advertises `clientCapabilities.session.notices` (the Session Notices RFD), the adapter sends it as an
+ACP `notice` update instead and publishes no AIR advisory record, even if `sessionFailure` is also
+advertised.
 
 ## Severity
 

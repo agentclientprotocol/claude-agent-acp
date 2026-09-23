@@ -38,6 +38,7 @@ export function userEcho(u: any) {
 export function wrapQuery(generator: AsyncGenerator<any>) {
   return Object.assign(generator, {
     interrupt: vi.fn(async () => {}),
+    stopTask: vi.fn(async () => {}),
     close: vi.fn(),
     setModel: vi.fn(async () => {}),
   }) as any;
@@ -63,16 +64,16 @@ export function mockSessionState(
     modes: { currentModeId: "default", availableModes: [] },
     models: { currentModelId: "default", availableModels: [] },
     modelInfos: [],
-    settingsManager: { dispose: vi.fn() },
+    settingsManager: { dispose: vi.fn(), getSettings: () => ({}) },
     accumulatedUsage: {
       inputTokens: 0,
       outputTokens: 0,
       cachedReadTokens: 0,
       cachedWriteTokens: 0,
     },
+    accumulatedModelUsage: {},
+    lastModelUsageReading: {},
     configOptions: [],
-    agents: [],
-    currentAgent: "default",
     abortController: new AbortController(),
     emitRawSDKMessages: false,
     forwardSubagentText: false,
@@ -87,7 +88,6 @@ export function mockSessionState(
     owedTrailingIdles: 0,
     messageIdToUuid: new Map(),
     sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-    fileChangeReportRequestIds: new Set(),
     ...overrides,
   } as any;
 }

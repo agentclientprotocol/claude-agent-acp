@@ -6,7 +6,8 @@ import {
   resolveModelPreference,
   applyAvailableModelsAllowlist,
   matchResumedModel,
-} from "../acp-agent.js";
+} from "../session-model.js";
+import { settingsEffortForModel } from "../session-effort.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
 // `resolvedModel`, and "Sonnet 5" has no `major.minor` dot unlike older
@@ -269,4 +270,58 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("model resolution (real SDK)
       q.return(undefined);
     }
   }, 30000);
+});
+
+describe("settingsEffortForModel", () => {
+  const SONNET: ModelInfo = {
+    value: "sonnet",
+    resolvedModel: "claude-sonnet-5",
+    displayName: "Sonnet",
+    description: "Sonnet 5 · Efficient for routine tasks",
+  };
+
+  it("prefers the per-model entry keyed by the resolved model id", () => {
+    const settings = {
+      effortLevel: "high" as const,
+      modelSettings: { "claude-sonnet-5": { effortLevel: "low" as const } },
+    };
+    expect(settingsEffortForModel(settings, SONNET)).toBe("low");
+  });
+
+  it("falls back to the picker row value, then the raw model id", () => {
+    const byValue = { modelSettings: { sonnet: { effortLevel: "medium" as const } } };
+    expect(settingsEffortForModel(byValue, SONNET)).toBe("medium");
+
+    const byRawId = { modelSettings: { "claude-x": { effortLevel: "xhigh" as const } } };
+    expect(settingsEffortForModel(byRawId, undefined, "claude-x")).toBe("xhigh");
+  });
+
+  it("matches equivalent -1m and [1m] modelSettings keys", () => {
+    const settings = {
+      effortLevel: "high" as const,
+      modelSettings: { "claude-sonnet-5-1m": { effortLevel: "low" as const } },
+    };
+    expect(
+      settingsEffortForModel(settings, {
+        ...SONNET,
+        value: "sonnet[1m]",
+        resolvedModel: "claude-sonnet-5[1m]",
+      }),
+    ).toBe("low");
+  });
+
+  it("falls back to the top-level effortLevel when no per-model entry matches", () => {
+    expect(settingsEffortForModel({ effortLevel: "high" }, SONNET)).toBe("high");
+    expect(
+      settingsEffortForModel(
+        { effortLevel: "high", modelSettings: { "claude-opus-4-8": { effortLevel: "low" } } },
+        SONNET,
+      ),
+    ).toBe("high");
+  });
+
+  it("returns undefined when neither layer sets an effort", () => {
+    expect(settingsEffortForModel({}, SONNET)).toBeUndefined();
+    expect(settingsEffortForModel({ modelSettings: {} }, undefined)).toBeUndefined();
+  });
 });

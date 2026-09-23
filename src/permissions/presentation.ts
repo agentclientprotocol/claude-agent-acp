@@ -12,6 +12,7 @@ export interface ClaudePermissionPresentationInput {
   displayName?: string;
   description?: string;
   decisionReason?: string;
+  defaultToNo?: boolean;
 }
 
 function humanText(value: unknown, maxLength: number, singleLine = false): string | undefined {
@@ -77,13 +78,14 @@ export function buildClaudePermissionPresentation(
   // the approval never maintains a second, divergent name for the operation.
   // decisionReason is temporarily exposed as the permission description so
   // its actual SDK values can be inspected; it remains diagnostic policy text.
-  const shellTitle =
-    value.toolName === "Bash" || value.toolName === "PowerShell"
-      ? (compactText(value.input.description) ?? value.toolName)
-      : undefined;
-  const toolCallTitle = shellTitle ?? subjectTitle ?? info.title;
+  const toolCallTitle = subjectTitle ?? info.title;
   const permissionTitle = value.toolName === "ExitPlanMode" ? "Ready to code?" : toolCallTitle;
-  const title = humanText(permissionTitle, 4_000, true) ?? "Use tool?";
+  // Shell titles are executable input: compacting whitespace changes quoted
+  // arguments and comment boundaries, and length limits can hide the command.
+  const title =
+    value.toolName === "Bash" || value.toolName === "PowerShell"
+      ? permissionTitle
+      : (humanText(permissionTitle, 4_000, true) ?? "Use tool?");
   const decisionReason = humanText(value.decisionReason, 4_000);
   const description = decisionReason ? `Reason: ${decisionReason}` : undefined;
   return {
@@ -104,6 +106,10 @@ export function buildClaudePermissionPresentation(
               version: 1,
               title,
               ...(description ? { description } : {}),
+              // The CLI's own hint, forwarded so a client that can pre-select
+              // an option keeps the decline focused; the option order already
+              // leads with the reject options when this is set.
+              ...(value.defaultToNo === true ? { defaultToNo: true } : {}),
             },
           },
         }

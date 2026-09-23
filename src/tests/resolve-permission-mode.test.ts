@@ -20,14 +20,20 @@ describe("resolvePermissionMode", () => {
     expect(resolvePermissionMode("acceptEdits")).toBe("acceptEdits");
     expect(resolvePermissionMode("dontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("plan")).toBe("plan");
-    expect(resolvePermissionMode("bypassPermissions")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypassPermissions", console, true)).toBe("bypassPermissions");
   });
 
   it("resolves case-insensitive aliases", () => {
     expect(resolvePermissionMode("DontAsk")).toBe("dontAsk");
     expect(resolvePermissionMode("DONTASK")).toBe("dontAsk");
     expect(resolvePermissionMode("AcceptEdits")).toBe("acceptEdits");
-    expect(resolvePermissionMode("bypass")).toBe("bypassPermissions");
+    expect(resolvePermissionMode("bypass", console, true)).toBe("bypassPermissions");
+  });
+
+  it("clamps bypassPermissions to 'default' and logs when bypass is not allowed", () => {
+    const { logger, error } = mockLogger();
+    expect(resolvePermissionMode("bypassPermissions", logger, false)).toBe("default");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("bypassPermissions"));
   });
 
   it("resolves 'manual' as an alias for 'default'", () => {
