@@ -19630,6 +19630,66 @@ describe("streamEventToAcpNotifications", () => {
     expect(streamedToolInputs.size).toBe(0);
   });
 
+  it("scans a large streamed tool input in linear time", () => {
+    const streamedToolInputs: StreamedToolInputCache = new Map();
+    const options = {
+      cwd: "/Users/test/project",
+      emittedToolCalls: new Set<string>(),
+      streamedToolInputs,
+      clientCapabilities: AIR_CLIENT_CAPABILITIES,
+    };
+    const toolUseCache = {};
+    const stream = (event: unknown) =>
+      streamEventToAcpNotifications(
+        {
+          type: "stream_event",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event,
+        } as Parameters<typeof streamEventToAcpNotifications>[0],
+        "test-session",
+        toolUseCache,
+        {} as AcpClient,
+        console,
+        options,
+      );
+    stream({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "toolu_write", name: "Write", input: {} },
+    });
+    // The API streams a tool input in small parts. A 1 MB content arrives in
+    // about 50,000 parts.
+    const input = JSON.stringify({
+      file_path: "/Users/test/project/big.txt",
+      content: 'a "quoted", {braced} line\n'.repeat(40_000),
+    });
+
+    const started = performance.now();
+    const updates = [];
+    for (let start = 0; start < input.length; start += 20) {
+      updates.push(
+        ...stream({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: input.slice(start, start + 20) },
+        }),
+      );
+    }
+
+    // A scan of the whole input on each part took about 5 s here.
+    expect(performance.now() - started).toBeLessThan(1500);
+    // The commas and braces inside the content do not end a field.
+    expect(updates).toHaveLength(1);
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_write",
+      locations: [{ path: "/Users/test/project/big.txt" }],
+    });
+    expect(streamedToolInputs.size).toBe(0);
+  });
+
   describe("partial tool input coverage", () => {
     function refineFromPartialInput({
       name,

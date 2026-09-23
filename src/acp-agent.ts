@@ -1577,9 +1577,6 @@ type StreamedToolInput = {
   id: string;
   name: string;
   partialJson: string;
-  /** Offset into `partialJson` the scanner has consumed; each delta only scans
-   *  the newly appended fragment, so total scan work stays linear. */
-  scannedTo: number;
   inString: boolean;
   escaped: boolean;
   objectDepth: number;
@@ -1600,11 +1597,19 @@ export type StreamedToolInputCache = Map<string, Map<number, StreamedToolInput>>
  * that sit at the top level of the input object — everything before such a
  * comma is a set of complete fields. Returns true once the input object's
  * closing brace arrives.
+ *
+ * The lexer reads the fragment itself, never `partialJson` by index. V8 keeps a
+ * string built with `+=` as a chain of parts, and the first index access
+ * copies the whole chain into one flat string. An index scan of `partialJson`
+ * would copy the whole input on each delta, so a large Write would cost
+ * quadratic time. A test in `acp-agent.test.ts` checks this.
  */
-function scanStreamedToolInput(state: StreamedToolInput): boolean {
+function scanStreamedToolInput(state: StreamedToolInput, fragment: string): boolean {
+  const offset = state.partialJson.length;
+  state.partialJson += fragment;
   let complete = false;
-  for (let index = state.scannedTo; index < state.partialJson.length; index++) {
-    const character = state.partialJson[index];
+  for (let index = 0; index < fragment.length; index++) {
+    const character = fragment[index];
     if (state.inString) {
       if (state.escaped) {
         state.escaped = false;
@@ -1630,10 +1635,9 @@ function scanStreamedToolInput(state: StreamedToolInput): boolean {
     } else if (character === "]") {
       state.arrayDepth--;
     } else if (character === "," && state.objectDepth === 1 && state.arrayDepth === 0) {
-      state.lastTopLevelComma = index;
+      state.lastTopLevelComma = offset + index;
     }
   }
-  state.scannedTo = state.partialJson.length;
   return complete;
 }
 
@@ -10236,7 +10240,6 @@ export function streamEventToAcpNotifications(
           id: block.id,
           name: block.name,
           partialJson: "",
-          scannedTo: 0,
           inString: false,
           escaped: false,
           objectDepth: 0,
@@ -10257,8 +10260,7 @@ export function streamEventToAcpNotifications(
         const streamedInput = streamedToolInputs?.get(streamKey)?.get(event.index);
         if (!streamedInput) return [];
 
-        streamedInput.partialJson += event.delta.partial_json;
-        if (scanStreamedToolInput(streamedInput)) {
+        if (scanStreamedToolInput(streamedInput, event.delta.partial_json)) {
           // Input complete: the consolidated assistant message replays the
           // block with its full input and refines the call there; emitting
           // here too would send a duplicate identical update.
