@@ -3453,6 +3453,8 @@ export class ClaudeAcpAgent {
       );
     };
 
+    // ACP's usage_update has no model field, so the model the usage belongs
+    // to rides in `_meta` alongside the other `_claude/*` keys.
     const attachUsageModel = <
       T extends {
         sessionUpdate: "usage_update";
@@ -3462,11 +3464,10 @@ export class ClaudeAcpAgent {
       },
     >(
       update: T,
-    ): T & { model?: string } => {
+    ): T => {
       if (!lastAssistantModel) return update;
       return {
         ...update,
-        model: lastAssistantModel,
         _meta: {
           ...(update._meta ?? {}),
           "_claude/model": lastAssistantModel,

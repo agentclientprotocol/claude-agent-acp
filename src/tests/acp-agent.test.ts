@@ -9931,7 +9931,7 @@ describe("usage_update computation", () => {
     const usageUpdates = updates.filter((u: any) => u.update?.sessionUpdate === "usage_update");
     expect(usageUpdates).toHaveLength(3);
     for (const { update } of usageUpdates) {
-      expect(update.model).toBe("claude-sonnet-4-20250514");
+      expect(update).not.toHaveProperty("model");
       expect(update._meta?.["_claude/model"]).toBe("claude-sonnet-4-20250514");
     }
   });
@@ -13262,9 +13262,10 @@ describe("result origin handling", () => {
     });
   });
 
-  it("omits _meta when origin and assistant model are absent", async () => {
+  it("carries only the model in _meta when origin is absent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
+      createAssistantMessage(),
       createResult(),
       { type: "system", subtype: "session_state_changed", state: "idle" },
     ]);
@@ -13272,7 +13273,8 @@ describe("result origin handling", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
 
     const usageUpdate = updates.find((u: any) => u.update?.sessionUpdate === "usage_update");
-    expect(usageUpdate).toBeUndefined();
+    expect(usageUpdate).toBeDefined();
+    expect(usageUpdate.update._meta).toEqual({ "_claude/model": "claude-sonnet-4-6" });
   });
 
   it("task-notification result with max_tokens does not override the user-turn stopReason", async () => {
