@@ -181,6 +181,30 @@ describe("approval patch previews", () => {
     expect(patch).toContain("-b\n\\ No newline at end of file\n+c\n\\ No newline at end of file\n");
   });
 
+  it("marks the final newline of a Write that changes only that newline", async () => {
+    const added = await temporaryFile("same");
+    const removed = await temporaryFile("same\n");
+
+    expect(
+      patchText(await previewPatchContent("Write", { file_path: added, content: "same\n" })),
+    ).toContain("@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n");
+    expect(
+      patchText(await previewPatchContent("Write", { file_path: removed, content: "same" })),
+    ).toContain("@@ -1 +1 @@\n-same\n+same\n\\ No newline at end of file\n");
+    // The PostToolUse hook builds the same patch from the written file.
+    await writeFile(added, "same\n");
+    const hook = await patchUpdateFromDiffToolResponse({
+      type: "update",
+      filePath: added,
+      content: "same\n",
+      originalFile: "same",
+      structuredPatch: [],
+    });
+    expect(patchText(hook?.content)).toContain(
+      "@@ -1 +1 @@\n-same\n\\ No newline at end of file\n+same\n",
+    );
+  });
+
   it("strips trailing whitespace from new text like Claude, except in Markdown", async () => {
     const code = await temporaryFile("a\nb\n");
     const markdown = await temporaryFile("a\nb\n", "notes.md");
