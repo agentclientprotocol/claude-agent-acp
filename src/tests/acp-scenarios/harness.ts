@@ -302,6 +302,7 @@ export async function runScenario(
       ? { _meta: { ...profile.capabilities._meta, ...scenario.capabilities?._meta } }
       : {}),
   };
+  generatedIds.clear();
   activeScript = {
     scenario,
     cwd,
@@ -334,7 +335,10 @@ export async function runScenario(
       record("promptResponse", response);
       await settle();
     }
-    return { raw: recorded, normalized: normalize(recorded, cwd, sessionId) as Recorded[] };
+    return {
+      raw: recorded,
+      normalized: normalize(recorded, cwd, sessionId, generatedIds) as Recorded[],
+    };
   } finally {
     activeScript = undefined;
     try {
@@ -352,34 +356,67 @@ async function settle() {
 
 const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
+/** The version of this adapter in `package.json`, which `agentInfo` reports. */
+const PACKAGE_VERSION: string = JSON.parse(
+  fs.readFileSync(new URL("../../../package.json", import.meta.url), "utf8"),
+).version;
+
+/** The ids that `randomUUID` of `node:crypto` generated during the active run. */
+const generatedIds = new Set<string>();
+
 /**
- * Replaces the values that change from run to run: the temporary working
- * directory, the home directory, the Node binary, random ids, and timestamps.
+ * Records an id that `randomUUID` generated. The test file wraps `randomUUID`
+ * of `node:crypto` with this function, so that {@link normalize} replaces only
+ * the ids that the run generated.
  */
-export function normalize(value: unknown, cwd: string, sessionId: string): unknown {
+export function noteGeneratedId(id: string): void {
+  generatedIds.add(id);
+}
+
+/**
+ * Replaces the values that change from run to run. Each rule replaces only an
+ * exact known value, so a recording shows every other value:
+ *
+ * - the temporary working directory of the run and `os.homedir()`;
+ * - `process.execPath` in a `command` key;
+ * - the exact prefix `process.argv.slice(1)` of an `args` array;
+ * - the version of this adapter in a `version` key;
+ * - the session id, and the ids in `generated` (the ids that `randomUUID`
+ *   generated during the run). Each id gets a name in the order of its first
+ *   appearance, so a message that names a wrong id still differs.
+ *
+ * A UUID that the scenario scripted (an SDK message uuid, a tool use id) is
+ * the same in each run and stays in the recording.
+ */
+export function normalize(
+  value: unknown,
+  cwd: string,
+  sessionId: string,
+  generated: ReadonlySet<string> = new Set(),
+): unknown {
   const ids = new Map<string, string>([[sessionId, "<session>"]]);
   const home = os.homedir();
+  const argv = process.argv.slice(1);
   const visit = (node: unknown, key?: string): unknown => {
     if (typeof node === "string") {
       // A terminal-auth command reruns this Node binary, whose path depends on
       // the machine. Any other command stays as it is, so a recording shows it.
       if (key === "command" && node === process.execPath) return "<executable>";
-      if (key === "version" && /^\d+\.\d+\.\d+/.test(node)) return "<version>";
-      let text = node.split(cwd).join("<cwd>").split(home).join("<home>");
-      text = text.replace(UUID, (id) => {
-        if (!ids.has(id)) ids.set(id, `<id-${ids.size}>`);
+      if (key === "version" && node === PACKAGE_VERSION) return "<version>";
+      const text = node.split(cwd).join("<cwd>").split(home).join("<home>");
+      return text.replace(UUID, (id) => {
+        if (!ids.has(id)) {
+          if (!generated.has(id)) return id;
+          ids.set(id, `<id-${ids.size}>`);
+        }
         return ids.get(id)!;
       });
-      if (key === "updatedAt" || key === "timestamp") return "<time>";
-      return text;
-    }
-    if (typeof node === "number" && key !== undefined && /duration|Ms$/i.test(key)) {
-      return "<number>";
     }
     if (Array.isArray(node)) {
-      // A terminal-auth command reruns this process: its argv depends on the runner.
-      if (key === "args" && node.includes("--cli")) {
-        return ["<argv>", ...node.slice(node.indexOf("--cli"))];
+      // A terminal-auth command reruns this process with its own argv, which
+      // depends on the test runner. Only that exact prefix is replaced.
+      if (key === "args" && startsWith(node, argv)) {
+        return ["<argv>", ...node.slice(argv.length).map((item) => visit(item))];
       }
       return node.map((item) => visit(item));
     }
@@ -391,6 +428,10 @@ export function normalize(value: unknown, cwd: string, sessionId: string): unkno
     return node;
   };
   return visit(value);
+}
+
+function startsWith(array: unknown[], prefix: string[]): boolean {
+  return prefix.length > 0 && prefix.every((item, i) => array[i] === item);
 }
 
 // ---------------------------------------------------------------------------

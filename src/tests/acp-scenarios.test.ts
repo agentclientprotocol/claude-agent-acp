@@ -3,7 +3,8 @@
  * for three client profiles: a plain ACP client, Zed, and JetBrains AIR.
  *
  * - Recordings are JSON Lines: one outbound message on each line, with sorted
- *   keys and normalized ids, paths, and times (see `normalize` in `harness.ts`).
+ *   keys. `normalize` in `harness.ts` replaces only exact run-specific values:
+ *   the generated ids, the paths, and the argv and version of this process.
  * - AIR golden files: `acp-scenarios/__snapshots__/air/<scenario>.jsonl`.
  *   Run `npx vitest run src/tests/acp-scenarios.test.ts -u` to update them.
  * - Schema: every message is valid against the ACP schema of the SDK.
@@ -27,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import {
   AIR_CAPABILITY_NAMES,
   assistantTurn,
+  normalize,
   PROFILES,
   type Profile,
   type Recorded,
@@ -54,6 +56,21 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     ...actual,
     query: harness.mockedQuery,
     getSessionMessages: harness.mockedSessionMessages,
+  };
+});
+
+// The recordings replace only the ids that the run generated, so the harness
+// learns each id that `randomUUID` returns.
+vi.mock("node:crypto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:crypto")>();
+  const harness = await import("./acp-scenarios/harness.js");
+  return {
+    ...actual,
+    randomUUID: (...args: Parameters<typeof actual.randomUUID>) => {
+      const id = actual.randomUUID(...args);
+      harness.noteGeneratedId(id);
+      return id;
+    },
   };
 });
 
@@ -181,6 +198,78 @@ describe.runIf(baselineDir)("the origin/main baseline", () => {
 });
 
 describe.skipIf(baselineDir)("ACP scenarios", () => {
+  describe("normalize", () => {
+    const cwd = "/tmp/acp-scenario-x";
+    const session = "aaaaaaaa-0000-4000-8000-000000000001";
+    const first = "bbbbbbbb-0000-4000-8000-000000000002";
+    const second = "cccccccc-0000-4000-8000-000000000003";
+    const scripted = "00000000-0000-4000-8000-00000000c001";
+    const version = JSON.parse(
+      fs.readFileSync(path.join(here, "..", "..", "package.json"), "utf8"),
+    ).version;
+    const argv = process.argv.slice(1);
+
+    it("keeps a UUID that the run did not generate", () => {
+      expect(normalize({ toolCallId: scripted }, cwd, session, new Set([first]))).toEqual({
+        toolCallId: scripted,
+      });
+    });
+
+    it("names the generated ids in the order of their first appearance", () => {
+      const generated = new Set([first, second]);
+      const reports = (ids: string[]) =>
+        normalize(
+          ids.map((id) => ({ sessionId: session, toolCallId: id })),
+          cwd,
+          session,
+          generated,
+        );
+      expect(reports([first, first])).toEqual([
+        { sessionId: "<session>", toolCallId: "<id-1>" },
+        { sessionId: "<session>", toolCallId: "<id-1>" },
+      ]);
+      // A report that names another generated id, or the session id, still differs.
+      expect(reports([first, second])).not.toEqual(reports([first, first]));
+      expect(reports([first, session])).not.toEqual(reports([first, first]));
+    });
+
+    it("replaces only the exact argv prefix of this process", () => {
+      expect(argv.length).toBeGreaterThan(0);
+      expect(normalize({ args: [...argv, "--cli", "login"] }, cwd, session)).toEqual({
+        args: ["<argv>", "--cli", "login"],
+      });
+      // An extra argument stays in the recording, before or after the prefix.
+      expect(normalize({ args: [...argv, "--inspect", "--cli"] }, cwd, session)).toEqual({
+        args: ["<argv>", "--inspect", "--cli"],
+      });
+      const before = ["--inspect", ...argv, "--cli"];
+      const { args } = normalize({ args: before }, cwd, session) as { args: string[] };
+      expect(args).toHaveLength(before.length);
+      expect(args).not.toContain("<argv>");
+      expect(normalize({ args: ["other.js", "--cli"] }, cwd, session)).toEqual({
+        args: ["other.js", "--cli"],
+      });
+    });
+
+    it("replaces only the version of this adapter and the path of this Node binary", () => {
+      expect(normalize({ version, command: process.execPath }, cwd, session)).toEqual({
+        version: "<version>",
+        command: "<executable>",
+      });
+      expect(normalize({ version: "9.9.9", command: "/usr/bin/node" }, cwd, session)).toEqual({
+        version: "9.9.9",
+        command: "/usr/bin/node",
+      });
+    });
+
+    it("keeps durations and other numbers", () => {
+      expect(normalize({ durationMs: 7, totalDurationMs: 10 }, cwd, session)).toEqual({
+        durationMs: 7,
+        totalDurationMs: 10,
+      });
+    });
+  });
+
   describe("air golden files", () => {
     it.each(SCENARIOS.map((scenario) => scenario.name))("%s", async (scenario) => {
       await expect(toJsonLines(run("air", scenario).normalized)).toMatchFileSnapshot(
