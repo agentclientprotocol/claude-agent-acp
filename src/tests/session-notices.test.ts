@@ -36,6 +36,13 @@ describe("session notices", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text", text: "custom line" },
     });
+    const meta = { claudeCode: { kind: "informational", level: "warning" } };
+    expect(noticeOrTranscriptUpdate(notice, false, "custom line", meta)).toEqual({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "custom line" },
+      _meta: meta,
+    });
+    expect(noticeOrTranscriptUpdate(notice, true, "custom line", meta)).not.toHaveProperty("_meta");
   });
 
   it("sends a notice update when the client can present one", () => {

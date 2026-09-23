@@ -39,14 +39,20 @@ export function noticeTranscriptText(notice: SessionNotice): string {
 
 /** The update to send for `notice`: a `notice` when the client can present
  *  one, else an agent message carrying `transcriptText` (by default the
- *  bold-label rendering of the notice). */
+ *  bold-label rendering of the notice) and `transcriptMeta`, so clients
+ *  without the capability can still tell the line apart from Claude's reply. */
 export function noticeOrTranscriptUpdate(
   notice: SessionNotice,
   supportsNotices: boolean,
   transcriptText: string = noticeTranscriptText(notice),
+  transcriptMeta?: Record<string, unknown>,
 ): SessionNotification["update"] {
   if (supportsNotices) return noticeUpdate(notice);
-  return { sessionUpdate: "agent_message_chunk", content: { type: "text", text: transcriptText } };
+  return {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: transcriptText },
+    ...(transcriptMeta ? { _meta: transcriptMeta } : {}),
+  };
 }
 
 /** Fragments that read on after a bold label stand alone as a notice
