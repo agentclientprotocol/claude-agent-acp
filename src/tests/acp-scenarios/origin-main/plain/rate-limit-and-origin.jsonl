@@ -1,0 +1,8 @@
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"Work","type":"text"},"messageId":"msg_rate","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"ing.","type":"text"},"messageId":"msg_rate","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<id-1>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6","_claude/rateLimit":{"resetsAt":1700000000,"status":"allowed_warning","utilization":0.9}},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6","_claude/origin":{"kind":"human"}},"cost":{"amount":0,"currency":"USD"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"promptResponse","payload":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}
