@@ -3687,6 +3687,46 @@ describe("permission request cancellation", () => {
     });
   });
 
+  it("keeps the plan approval when publishing the new mode fails", async () => {
+    const error = vi.fn();
+    const mockClient = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "current_mode_update") {
+          throw new Error("client gone");
+        }
+      }),
+      requestPermission: async () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-default" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: ["default", "plan"].map((id) => ({ id, name: id })),
+    };
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }],
+    });
+    expect(error).toHaveBeenCalledWith(
+      "Failed to publish mode after plan approval:",
+      expect.any(Error),
+    );
+  });
+
   it("interrupts the turn after an ExitPlanMode keep-planning rejection", async () => {
     const mockClient = {
       sessionUpdate: async () => {},

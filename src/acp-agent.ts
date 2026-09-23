@@ -7290,8 +7290,14 @@ export class ClaudeAcpAgent {
           (update) => update.type === "setMode" && update.destination === "session",
         );
         if (modeUpdate?.type === "setMode") {
-          await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
-          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
+          try {
+            await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
+            await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
+          } catch (error) {
+            // The user already approved the plan; a failed notification must not
+            // turn that approval into a failed permission request.
+            this.logger.error("Failed to publish mode after plan approval:", error);
+          }
         }
       }
       const clearContextMode = decodedPermission.contextResetMode
