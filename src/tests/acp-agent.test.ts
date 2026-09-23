@@ -58,6 +58,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   importSessionToStore,
+  listSessions,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
@@ -93,6 +94,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
     getSessionMessages: vi.fn(actual.getSessionMessages),
+    listSessions: vi.fn(actual.listSessions),
   };
 });
 import type {
@@ -2828,6 +2830,43 @@ describe("usage-limit failure replay", () => {
       .find(Boolean);
     expect(failure).toEqual(expect.objectContaining({ category: "limit", severity: "error" }));
     expect(failure.title).toContain("individual spend limit");
+  });
+});
+
+describe("session/list", () => {
+  const sdkSession = (index: number) => ({
+    sessionId: `session-${index}`,
+    summary: `Session ${index}`,
+    lastModified: Date.UTC(2026, 8, 24) - index * 1000,
+    cwd: "/workspace",
+  });
+
+  function agent() {
+    return new ClaudeAcpAgent({} as AcpClient, { log: () => {}, error: () => {} });
+  }
+
+  it("returns one page and a cursor while more sessions exist", async () => {
+    vi.mocked(listSessions)
+      .mockResolvedValueOnce(Array.from({ length: 101 }, (_, index) => sdkSession(index)))
+      .mockResolvedValueOnce([sdkSession(100)]);
+
+    const first = await agent().listSessions({ cwd: "/workspace" });
+    const second = await agent().listSessions({ cwd: "/workspace", cursor: first.nextCursor });
+
+    expect(first.sessions).toHaveLength(100);
+    expect(first.nextCursor).toBe("offset:100");
+    expect(second.sessions.map((session) => session.sessionId)).toEqual(["session-100"]);
+    expect(second.nextCursor).toBeUndefined();
+    expect(vi.mocked(listSessions).mock.calls).toEqual([
+      [{ dir: "/workspace", limit: 101, offset: 0 }],
+      [{ dir: "/workspace", limit: 101, offset: 100 }],
+    ]);
+  });
+
+  it("rejects a cursor that it did not issue", async () => {
+    await expect(agent().listSessions({ cursor: "page-2" })).rejects.toThrow(
+      "Unknown session/list cursor",
+    );
   });
 });
 
