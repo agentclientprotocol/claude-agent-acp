@@ -15,8 +15,16 @@ import { AIR_DIFF_PATCH_CAPABILITY, withAirMeta } from "./air-extension.js";
  */
 export const MAX_PATCH_FILE_BYTES = 1024 * 1024;
 
-/** The wall-clock budget, in milliseconds, of one line diff for a patch. */
-const PATCH_DIFF_TIMEOUT_MS = 500;
+/**
+ * The wall-clock budget, in milliseconds, of one line diff for a patch.
+ *
+ * The diff runs synchronously, so the budget is also the longest block of the
+ * event loop.
+ */
+const PATCH_DIFF_TIMEOUT_MS = 100;
+
+/** The number of context lines around a change in a hunk. */
+const PATCH_CONTEXT_LINES = 3;
 
 /** Git reads this many leading bytes to decide that a file is binary. */
 const BINARY_SNIFF_BYTES = 8000;
@@ -492,8 +500,8 @@ function wholeFileHunk(text: string): PatchHunk | undefined {
 }
 
 /**
- * The line-diff hunks between two texts, computed without blocking the event
- * loop. Returns undefined when the diff runs out of its time budget.
+ * The line-diff hunks between two texts. Returns undefined when the diff runs
+ * out of its time budget.
  */
 async function diffHunks(
   oldText: string | null,
@@ -503,13 +511,41 @@ async function diffHunks(
     const hunk = wholeFileHunk(newText);
     return hunk ? [hunk] : [];
   }
-  return new Promise((resolve) => {
-    structuredPatch("", "", oldText, newText, "", "", {
-      context: 3,
-      timeout: PATCH_DIFF_TIMEOUT_MS,
-      callback: (patch) => resolve(patch?.hunks),
-    });
-  });
+  const oldLines = textLines(oldText);
+  const newLines = textLines(newText);
+  // The diff gets only the changed middle and its context lines. An edit
+  // usually changes a small part of a large file.
+  const common = Math.min(oldLines.length, newLines.length);
+  let prefix = 0;
+  while (prefix < common && oldLines[prefix] === newLines[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < common - prefix &&
+    oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+  ) {
+    suffix++;
+  }
+  const skipped = Math.max(0, prefix - PATCH_CONTEXT_LINES);
+  const skippedEnd = Math.max(0, suffix - PATCH_CONTEXT_LINES);
+  const patch = structuredPatch(
+    "",
+    "",
+    oldLines.slice(skipped, oldLines.length - skippedEnd).join(""),
+    newLines.slice(skipped, newLines.length - skippedEnd).join(""),
+    "",
+    "",
+    { context: PATCH_CONTEXT_LINES, timeout: PATCH_DIFF_TIMEOUT_MS },
+  );
+  return patch?.hunks.map((hunk) => ({
+    ...hunk,
+    oldStart: hunk.oldStart + skipped,
+    newStart: hunk.newStart + skipped,
+  }));
+}
+
+/** The lines of a text, each with its line break. The last line can have none. */
+function textLines(text: string): string[] {
+  return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 }
 
 async function filePatchContent(
