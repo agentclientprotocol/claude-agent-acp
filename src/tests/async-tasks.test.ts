@@ -74,6 +74,7 @@ describe("AsyncTaskRuntime", () => {
       taskId: "task-1",
       taskType: "local_workflow",
       description: "Build generated assets",
+      toolCallId: "workflow-tool",
     });
     expect(runtime.canStop("task-1")).toBe(true);
     expect(runtime.claimStop("task-1")).toBe(true);
@@ -115,6 +116,7 @@ describe("AsyncTaskRuntime", () => {
       taskId: "task-1",
       taskType: "local_workflow",
       description: "Build generated assets",
+      toolCallId: "workflow-tool",
     });
     await runtime.taskStopped("task-1");
     await runtime.taskStopped("task-1");
@@ -145,6 +147,7 @@ describe("AsyncTaskRuntime", () => {
       taskType: "local_bash",
       description: "npm run build",
       isBackgrounded: true,
+      toolCallId: "bash-tool",
     });
     expect(runtime.claimStop("task-1")).toBe(true);
     // The SDK kills the process and reports it before `stopTask` resolves, so
@@ -179,6 +182,7 @@ describe("AsyncTaskRuntime", () => {
       description: "npm run build",
       isBackgrounded: true,
       skipTranscript: true,
+      toolCallId: "bash-tool",
     });
     expect(runtime.claimStop("task-1")).toBe(true);
     await runtime.taskStopped("task-1");
@@ -398,6 +402,7 @@ describe("AsyncTaskRuntime", () => {
       taskId: "shell",
       taskType: "local_bash",
       description: "Run tests",
+      toolCallId: "bash-tool",
     });
     await runtime.taskStarted({
       taskId: "agent",
@@ -509,6 +514,7 @@ describe("AsyncTaskRuntime", () => {
       task_type: "local_bash",
       description: "Build",
       isBackgrounded: true,
+      tool_use_id: "bash-tool",
     } as any);
     await runtime.taskProgress({ task_id: "shell", description: "Build", summary: "Step 1" });
     await runtime.taskProgress({ task_id: "shell", description: "Build", summary: "Step 1" });
@@ -555,6 +561,7 @@ describe("AsyncTaskRuntime", () => {
       taskType: "local_bash",
       description: "Build",
       isBackgrounded: true,
+      toolCallId: "bash-tool",
     });
     await runtime.taskUpdated("shell", { output_file: "/tmp/tasks/one.output" });
     await runtime.taskUpdated("shell", { outputFilePath: "/tmp/tasks/two.output" });
@@ -571,7 +578,7 @@ describe("AsyncTaskRuntime", () => {
     ]);
   });
 
-  it("publishes a tool id discovered after spawn", async () => {
+  it("holds the spawn until the Bash result brings the tool id", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
       published.push(notification);
@@ -583,6 +590,33 @@ describe("AsyncTaskRuntime", () => {
       description: "Build",
       is_backgrounded: true,
     });
+    expect(published).toEqual([]);
+    await runtime.taskBackgrounded({
+      task_id: "shell",
+      task_type: "local_bash",
+      description: "Build",
+      is_backgrounded: true,
+      tool_use_id: "bash-tool",
+    });
+
+    expect(published.map(({ update }) => update)).toEqual([
+      expect.objectContaining({ sessionUpdate: "async_task_spawned", toolCallId: "bash-tool" }),
+    ]);
+  });
+
+  it("publishes a tool id that arrives after the turn released the spawn", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      task_id: "shell",
+      task_type: "local_bash",
+      description: "Build",
+      is_backgrounded: true,
+    });
+    await runtime.releaseHeld();
     await runtime.taskBackgrounded({
       task_id: "shell",
       task_type: "local_bash",
@@ -682,6 +716,9 @@ describe("AsyncTaskRuntime", () => {
     await runtime.backgroundTasksChanged([
       { task_id: "lost-start", task_type: "local_bash", description: "Build" },
     ]);
+    // The level carries no tool call id. The spawn waits for the end of the turn.
+    expect(published).toEqual([]);
+    await runtime.releaseHeld();
 
     expect(published[0]?.update).toMatchObject({
       sessionUpdate: "async_task_spawned",
@@ -709,12 +746,14 @@ describe("AsyncTaskRuntime", () => {
       skip_transcript: true,
       is_backgrounded: true,
     });
+    await runtime.releaseHeld();
 
     expect(published).toHaveLength(1);
     expect(published[0]?.update).toMatchObject({
       sessionUpdate: "async_task_spawned",
       asyncTaskId: "lost-start",
-      name: "Build assets",
+      // The held spawn takes the name of the late task_started.
+      name: "assets",
       showInTranscript: false,
     });
   });
@@ -734,6 +773,7 @@ describe("AsyncTaskRuntime", () => {
       task_type: "local_bash",
       description: "build",
       is_backgrounded: true,
+      tool_use_id: "bash-tool",
     });
 
     failNext = true;
@@ -790,5 +830,111 @@ describe("AsyncTaskRuntime", () => {
       update.sessionUpdate === "async_task_state_update" ? [update.asyncTaskId] : [],
     );
     expect(terminalIds).toEqual(["second", "first"]);
+  });
+
+  it("keeps the updates of a held task behind its spawn", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      task_id: "monitor",
+      task_type: "local_monitor",
+      description: "Watch the logs",
+    });
+    await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
+    await runtime.taskUpdated("monitor", { status: "paused" });
+    expect(published).toEqual([]);
+
+    await runtime.taskProgress({
+      task_id: "monitor",
+      summary: "Second line",
+      tool_use_id: "monitor-tool",
+    });
+
+    expect(published.map(({ update }) => update)).toEqual([
+      expect.objectContaining({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "monitor",
+        toolCallId: "monitor-tool",
+      }),
+      { sessionUpdate: "async_task_progress", asyncTaskId: "monitor", summary: "First line" },
+      { sessionUpdate: "async_task_state_update", asyncTaskId: "monitor", state: "paused" },
+      { sessionUpdate: "async_task_progress", asyncTaskId: "monitor", summary: "Second line" },
+    ]);
+  });
+
+  it("sends the spawn without a tool id when a held task ends first", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      task_id: "workflow",
+      task_type: "local_workflow",
+      description: "Build assets",
+    });
+    await runtime.taskProgress({ task_id: "workflow", summary: "Half done" });
+    await runtime.taskNotification({ task_id: "workflow", status: "completed", summary: "Done" });
+
+    expect(published.map(({ update }) => update)).toEqual([
+      expect.objectContaining({ sessionUpdate: "async_task_spawned", asyncTaskId: "workflow" }),
+      { sessionUpdate: "async_task_progress", asyncTaskId: "workflow", summary: "Half done" },
+      {
+        sessionUpdate: "async_task_state_update",
+        asyncTaskId: "workflow",
+        state: "completed",
+        summary: "Done",
+      },
+    ]);
+    expect(published[0]?.update).not.toHaveProperty("toolCallId");
+    await runtime.releaseHeld();
+    expect(published).toHaveLength(3);
+  });
+
+  it("takes the tool id of the terminal notification of a held task", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      task_id: "workflow",
+      task_type: "local_workflow",
+      description: "Build assets",
+    });
+    await runtime.taskNotification({
+      task_id: "workflow",
+      status: "failed",
+      tool_use_id: "workflow-tool",
+    });
+
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+    expect(published[0]?.update).toMatchObject({ toolCallId: "workflow-tool" });
+  });
+
+  it("finishes a held task at shutdown", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    await runtime.taskStarted({
+      task_id: "workflow",
+      task_type: "local_workflow",
+      description: "Build assets",
+    });
+    await runtime.finishAll("stopped");
+
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+    expect(published[1]?.update).toMatchObject({ state: "stopped" });
   });
 });

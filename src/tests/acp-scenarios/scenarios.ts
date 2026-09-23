@@ -114,6 +114,68 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    // task_started has no tool_use_id. The spawn waits for task_progress to
+    // bring it, and the progress of the held task follows the spawn.
+    name: "async-task-held-until-tool-id",
+    turns: [
+      async function* () {
+        yield system("task_started", {
+          task_id: "monitor_1",
+          task_type: "local_monitor",
+          description: "Watch the logs",
+        });
+        yield system("task_progress", {
+          task_id: "monitor_1",
+          description: "Watch the logs",
+          summary: "first line",
+          usage: { total_tokens: 0, tool_uses: 0, duration_ms: 5 },
+        });
+        yield system("task_progress", {
+          task_id: "monitor_1",
+          tool_use_id: "toolu_monitor",
+          description: "Watch the logs",
+          summary: "second line",
+          usage: { total_tokens: 0, tool_uses: 0, duration_ms: 6 },
+        });
+        yield result();
+      },
+    ],
+  },
+  {
+    // The task ends before a tool_use_id arrives: the spawn goes out without it.
+    name: "async-task-ends-before-tool-id",
+    turns: [
+      async function* () {
+        yield system("task_started", {
+          task_id: "workflow_1",
+          task_type: "local_workflow",
+          description: "Build assets",
+        });
+        yield system("task_notification", {
+          task_id: "workflow_1",
+          status: "completed",
+          summary: "done",
+          output_file: "/tmp/tasks/workflow_1.output",
+        });
+        yield result();
+      },
+    ],
+  },
+  {
+    // No tool_use_id arrives in the turn: the result releases the spawn.
+    name: "async-task-released-at-turn-end",
+    turns: [
+      async function* () {
+        yield system("task_started", {
+          task_id: "workflow_2",
+          task_type: "local_workflow",
+          description: "Build assets",
+        });
+        yield result();
+      },
+    ],
+  },
+  {
     name: "read",
     files: { "a.ts": "const a = 1;\n" },
     turns: [

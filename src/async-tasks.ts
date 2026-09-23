@@ -15,6 +15,12 @@ type AsyncTask = {
   outputFilePath?: string;
   toolCallId?: string;
   announced: boolean;
+  /**
+   * Whether the spawn waits for the tool call id. The updates of a held task
+   * wait in {@link AsyncTask.deferred} and follow the spawn in order.
+   */
+  held: boolean;
+  deferred: (() => Promise<void>)[];
   ignored: boolean;
   startedObserved: boolean;
   panelOnlyRecovery: boolean;
@@ -61,6 +67,8 @@ type TaskPatch = {
 
 export type AsyncTaskNotification = TaskIdentity & {
   status?: unknown;
+  toolCallId?: unknown;
+  tool_use_id?: unknown;
   summary?: unknown;
   outputFilePath?: unknown;
   output_file?: unknown;
@@ -68,6 +76,8 @@ export type AsyncTaskNotification = TaskIdentity & {
 
 type TaskProgress = TaskIdentity & {
   description?: unknown;
+  toolCallId?: unknown;
+  tool_use_id?: unknown;
   summary?: unknown;
   lastToolName?: unknown;
   last_tool_name?: unknown;
@@ -124,6 +134,8 @@ export class AsyncTaskRuntime {
         field(message, "taskType", "task_type"),
       )
     ) {
+      await this.announce(task);
+    } else if (task.held) {
       await this.announce(task);
     }
     if (
@@ -189,7 +201,8 @@ export class AsyncTaskRuntime {
       }
       if (task.state !== state) {
         task.state = state;
-        if (task.announced) await this.publishState(task, state, nonBlankString(patch.error));
+        const error = nonBlankString(patch.error);
+        await this.whenAnnounced(task, () => this.publishState(task, state, error));
       } else if (task.announced && task.outputFilePath !== previousOutputFilePath) {
         await this.publishMetadata(task);
       }
@@ -204,10 +217,12 @@ export class AsyncTaskRuntime {
     const taskId = taskIdOf(message);
     if (!taskId) return;
     const task = this.tasks.get(taskId);
-    if (!task || !task.announced || task.ignored) return;
+    if (!task || task.ignored || !(task.announced || task.held)) return;
 
     const previousOutputFilePath = task.outputFilePath;
+    const previousToolCallId = task.toolCallId;
     this.mergeOutputFilePath(task, message);
+    this.mergeToolCallId(task, message);
     const outputChanged = task.outputFilePath !== previousOutputFilePath;
     if (isTerminal(task.state)) {
       if (outputChanged) await this.publishMetadata(task);
@@ -218,13 +233,20 @@ export class AsyncTaskRuntime {
     const description = nonBlankString(message.description);
     const summary = nonBlankString(message.summary);
     const lastToolName = nonBlankString(field(message, "lastToolName", "last_tool_name"));
-    await this.publishProgress(task, {
+    const progress = {
       ...(description ? { description } : {}),
       ...(summary ? { summary } : {}),
       ...(lastToolName ? { lastToolName } : {}),
       ...(usage ? { usage } : {}),
       ...(outputChanged && task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-    });
+      ...(task.toolCallId !== previousToolCallId && task.toolCallId
+        ? { toolCallId: task.toolCallId }
+        : {}),
+    };
+    await this.whenAnnounced(task, () => this.publishProgress(task, progress));
+    // The progress brought the tool call id of a held task: send the spawn,
+    // then the progress beats that waited for it.
+    if (task.held && task.toolCallId) await this.announce(task);
   }
 
   async taskNotification(message: AsyncTaskNotification): Promise<void>;
@@ -259,6 +281,7 @@ export class AsyncTaskRuntime {
     const correctsLevelState = wasTerminal && task.terminalSource === "level";
     const previousOutputFilePath = task.outputFilePath;
     this.mergeOutputFilePath(task, message);
+    this.mergeToolCallId(task, message);
     await this.finish(task, state, nonBlankString(message.summary), "event");
     if (
       wasTerminal &&
@@ -312,7 +335,12 @@ export class AsyncTaskRuntime {
     }
 
     for (const task of this.tasks.values()) {
-      if (task.announced && !task.ignored && !isTerminal(task.state) && !live.has(task.id)) {
+      if (
+        (task.announced || task.held) &&
+        !task.ignored &&
+        !isTerminal(task.state) &&
+        !live.has(task.id)
+      ) {
         // This replace-semantics level is itself the authoritative liveness
         // boundary. Close immediately so a lost terminal edge cannot leave a
         // permanent running card; a following task_notification may correct
@@ -325,7 +353,7 @@ export class AsyncTaskRuntime {
   async finishAll(state: Extract<AsyncTaskState, "failed" | "stopped">): Promise<void> {
     const errors: unknown[] = [];
     for (const task of this.tasks.values()) {
-      if (task.announced && !task.ignored && !isTerminal(task.state)) {
+      if ((task.announced || task.held) && !task.ignored && !isTerminal(task.state)) {
         try {
           await this.finish(task, state, undefined, "shutdown");
         } catch (error) {
@@ -383,6 +411,18 @@ export class AsyncTaskRuntime {
     });
   }
 
+  /**
+   * Sends the spawn of each held task without a tool call id. The prompt
+   * result ends the model turn, and the result of the tool call that started a
+   * task comes before it. So a held task is never held for longer than one turn.
+   */
+  async releaseHeld(): Promise<void> {
+    if (!this.enabled) return;
+    for (const task of this.tasks.values()) {
+      if (task.held) await this.announce(task, { withoutToolCall: true });
+    }
+  }
+
   clear(): void {
     this.tasks.clear();
   }
@@ -397,6 +437,8 @@ export class AsyncTaskRuntime {
       description: "Background task",
       showInTranscript: true,
       announced: false,
+      held: false,
+      deferred: [],
       ignored: false,
       startedObserved: false,
       panelOnlyRecovery: false,
@@ -432,6 +474,20 @@ export class AsyncTaskRuntime {
     if (toolCallId) task.toolCallId = toolCallId;
   }
 
+  /** Keeps the first tool call id that a later SDK message brings. */
+  private mergeToolCallId(
+    task: AsyncTask,
+    value: { toolCallId?: unknown; tool_use_id?: unknown },
+  ): void {
+    task.toolCallId ??= nonBlankString(field(value, "toolCallId", "tool_use_id"));
+  }
+
+  /** Sends an update of an announced task. A held task sends it after its spawn. */
+  private async whenAnnounced(task: AsyncTask, send: () => Promise<void>): Promise<void> {
+    if (task.announced) await send();
+    else if (task.held) task.deferred.push(send);
+  }
+
   private mergePatch(task: AsyncTask, patch: TaskPatch): void {
     const description = nonBlankString(patch.description);
     if (description) {
@@ -459,8 +515,24 @@ export class AsyncTaskRuntime {
     if (outputFilePath) task.outputFilePath = outputFilePath;
   }
 
-  private async announce(task: AsyncTask): Promise<void> {
+  /**
+   * Sends the spawn of the task. The spawn names the tool call that started the
+   * task, so it waits for the tool call id: the task is held until the id
+   * arrives. The id comes as `tool_use_id` of the SDK `task_started`,
+   * `task_progress`, or `task_notification`, or from the Bash result of a
+   * backgrounded command. A held task gets its spawn without the id when it
+   * ends first, or when the prompt result ends the model turn
+   * ({@link releaseHeld}). No guess by the command text binds a task.
+   */
+  private async announce(
+    task: AsyncTask,
+    options: { withoutToolCall?: boolean } = {},
+  ): Promise<void> {
     if (task.announced || task.ignored) return;
+    if (!task.toolCallId && !options.withoutToolCall && !isTerminal(task.state)) {
+      task.held = true;
+      return;
+    }
     await this.publish({
       sessionId: this.sessionId,
       update: {
@@ -476,11 +548,13 @@ export class AsyncTaskRuntime {
       },
     });
     task.announced = true;
+    task.held = false;
     recordPublished(task, {
       description: task.description,
       outputFilePath: task.outputFilePath,
       toolCallId: task.toolCallId,
     });
+    for (const send of task.deferred.splice(0)) await send();
     if (isTerminal(task.state)) {
       await this.publishState(task, task.state, task.terminalSummary);
     }
@@ -508,6 +582,9 @@ export class AsyncTaskRuntime {
     task.terminalSource = source;
     try {
       if (task.announced) await this.publishState(task, state, summary);
+      // The task ended before its tool call id arrived. The spawn goes out now
+      // without the id, so the task still appears.
+      else if (task.held) await this.announce(task);
     } catch (error) {
       task.state = previous.state;
       task.terminalSummary = previous.terminalSummary;

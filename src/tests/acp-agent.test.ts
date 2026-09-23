@@ -5658,7 +5658,7 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
-  it("attaches a Bash tool id discovered after async_task_spawned", async () => {
+  it("holds async_task_spawned until the Bash result brings the tool id", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -5734,17 +5734,15 @@ describe("subagent permission attribution (issue #851)", () => {
           update.sessionUpdate === "async_task_spawned" ||
           update.sessionUpdate === "async_task_progress",
       );
-    expect(lifecycle[0]).toMatchObject({
-      sessionUpdate: "async_task_spawned",
-      asyncTaskId: "shell-1",
-    });
-    expect(lifecycle[0]).not.toHaveProperty("toolCallId");
-    expect(lifecycle[1]).toMatchObject({
-      sessionUpdate: "async_task_progress",
-      asyncTaskId: "shell-1",
-      toolCallId: "bash-tool",
-      outputFilePath: "/tmp/tasks/shell-1.output",
-    });
+    // task_started has no tool_use_id, so the spawn waits for the Bash result.
+    expect(lifecycle).toEqual([
+      expect.objectContaining({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "shell-1",
+        toolCallId: "bash-tool",
+        outputFilePath: "/tmp/tasks/shell-1.output",
+      }),
+    ]);
 
     // The Bash card completes as soon as the command detaches, so this marker is
     // the only thing telling a client it is backgrounded work, not finished work.
