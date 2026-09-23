@@ -1,4 +1,5 @@
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
+import { applyPatch } from "diff";
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -219,6 +220,49 @@ describe("approval patch previews", () => {
     expect(edit).toContain("-b\n+c  \n");
     expect(write).toContain("@@ -0,0 +1,2 @@\n+x \n+y\n");
     expect(patchText(creationPatchContent(missing, "x \ny\n"))).toBe(write);
+  });
+
+  it("builds the patch of a Write that changes hundreds of lines of a large file", async () => {
+    const lines = Array.from({ length: 5000 }, (_, index) => `line ${index}\n`);
+    const oldText = lines.join("");
+    const newText = lines
+      .map((line, index) => (index % 25 === 0 ? `changed ${index}\n` : line))
+      .join("");
+    const filePath = await temporaryFile(oldText);
+
+    const started = performance.now();
+    const patch = patchText(
+      await previewPatchContent("Write", { file_path: filePath, content: newText }),
+    );
+
+    // 200 changed lines. The async diff ran out of its 500 ms budget here.
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(applyPatch(oldText, patch)).toBe(newText);
+  });
+
+  it("builds patches that turn the old text into the new text", async () => {
+    let seed = 7;
+    const random = (limit: number) => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return seed % limit;
+    };
+    for (let round = 0; round < 200; round++) {
+      const oldLines = Array.from({ length: random(40) }, () => `v${random(4)}\n`);
+      const newLines = [...oldLines];
+      for (let edit = random(4); edit >= 0; edit--) {
+        const at = random(newLines.length + 1);
+        if (random(2) === 0) newLines.splice(at, 1);
+        else newLines.splice(at, 0, `n${random(4)}\n`);
+      }
+      const oldText = oldLines.join("") + (random(3) === 0 ? "tail" : "");
+      const newText = newLines.join("") + (random(3) === 0 ? "tail" : "");
+      if (oldText === newText || oldText === "" || newText === "") continue;
+      const filePath = await temporaryFile(oldText);
+
+      const content = await previewPatchContent("Write", { file_path: filePath, content: newText });
+
+      expect(applyPatch(oldText, patchText(content)), `round ${round}`).toBe(newText);
+    }
   });
 
   it("removes the line break of a line that an empty new_string deletes", async () => {
