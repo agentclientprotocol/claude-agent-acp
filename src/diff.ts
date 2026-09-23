@@ -80,8 +80,9 @@ type FileChange = "create" | "update" | "delete";
  * an `old_string` that does not match exactly once, because Claude then
  * normalizes quotes or fails.
  *
- * The patch mirrors the input normalization of Claude: see
- * {@link normalizedToolText} and {@link replacedText}.
+ * The preview uses the tool input as it is. Claude can still remove the
+ * trailing whitespace of a line before it writes. The PostToolUse hook then
+ * sends the patch of the written file.
  */
 export async function previewPatchContent(
   toolName: string,
@@ -101,13 +102,7 @@ export async function previewPatchContent(
     const filePath = resolveToolPath(edit.file_path, cwd);
     const oldText = await readPatchSource(filePath);
     if (oldText === undefined) return undefined;
-    // Claude normalizes new_string only when it can read the file.
-    let newString = edit.new_string;
-    if (oldText !== null) {
-      const normalized = normalizedToolText(edit.file_path, newString);
-      if (normalized !== newString && mayKeepEditInput(edit.file_path, filePath)) return undefined;
-      newString = normalized;
-    }
+    const newString = edit.new_string;
     if (oldString === newString || !isPatchableText(newString)) return undefined;
     if (oldString.length === 0) {
       // An empty old_string creates the file, or fills an existing file that
@@ -133,7 +128,7 @@ export async function previewPatchContent(
     if (typeof write.file_path !== "string" || typeof write.content !== "string") {
       return undefined;
     }
-    const content = normalizedToolText(write.file_path, write.content);
+    const content = write.content;
     if (!isPatchableText(content)) return undefined;
     const filePath = resolveToolPath(write.file_path, cwd);
     const oldText = await readPatchSource(filePath);
@@ -142,42 +137,6 @@ export async function previewPatchContent(
   }
 
   return undefined;
-}
-
-/**
- * The text that Claude writes for the `new_string` of an Edit or the
- * `content` of a Write.
- *
- * Claude removes the trailing whitespace of each line, except in a Markdown
- * file. The test uses the path of the tool input, as Claude does.
- */
-export function normalizedToolText(filePath: string, text: string): string {
-  if (/\.(md|mdx)$/i.test(filePath)) return text;
-  // The same split and the same pattern as Claude, so that a Unicode space
-  // or a lone CR gets the same result.
-  const parts = text.split(/(\r\n|\n|\r)/);
-  let result = "";
-  for (let index = 0; index < parts.length; index++) {
-    const part = parts[index];
-    result += index % 2 === 0 ? part.replace(/\s+$/, "") : part;
-  }
-  return result;
-}
-
-/**
- * Whether Claude can leave the Edit input of this path as it is.
- *
- * Claude does not read a UNC path, a `\??\` path, or an automount path
- * under `/net` or `/Network/Servers` to normalize the input. The check is
- * wider than the Claude check, so the caller declines when it matters.
- */
-function mayKeepEditInput(inputPath: string, filePath: string): boolean {
-  return [inputPath, filePath].some(
-    (candidate) =>
-      /^[\\/]{2}/u.test(candidate) ||
-      candidate.includes("??") ||
-      /^\/(?:net|network)(?:\/|$)/iu.test(path.posix.normalize(candidate.replaceAll("\\", "/"))),
-  );
 }
 
 /**
@@ -361,8 +320,7 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
 /**
  * The patch content for a Write that creates `filePath` with `content`.
  *
- * The patch holds the text that Claude writes (see {@link normalizedToolText}).
- * Returns undefined when that text is empty, too large, binary, or contains a
+ * Returns undefined when the content is empty, too large, binary, or contains a
  * CR. Claude converts the line endings of a written file, so such a patch
  * would not be exact.
  */
@@ -370,9 +328,8 @@ export function creationPatchContent(
   filePath: string,
   content: string,
 ): ToolCallContent | undefined {
-  const text = normalizedToolText(filePath, content);
-  if (!isPatchableText(text)) return undefined;
-  const hunk = wholeFileHunk(text);
+  if (!isPatchableText(content)) return undefined;
+  const hunk = wholeFileHunk(content);
   return hunk ? patchContent(filePath, gitPatchText(filePath, "create", [hunk])) : undefined;
 }
 
@@ -433,7 +390,7 @@ export function writeToolUseChange(
         type: "diff",
         path: filePath,
         oldText,
-        newText: normalizedToolText(filePath, content),
+        newText: content,
       },
     ],
     holdsFileText: true,
