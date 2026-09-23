@@ -354,14 +354,16 @@ const UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
 /**
  * Replaces the values that change from run to run: the temporary working
- * directory, the home directory, random ids, and timestamps.
+ * directory, the home directory, the Node binary, random ids, and timestamps.
  */
 export function normalize(value: unknown, cwd: string, sessionId: string): unknown {
   const ids = new Map<string, string>([[sessionId, "<session>"]]);
   const home = os.homedir();
   const visit = (node: unknown, key?: string): unknown => {
     if (typeof node === "string") {
-      if (key === "command" && path.isAbsolute(node)) return "<executable>";
+      // A terminal-auth command reruns this Node binary, whose path depends on
+      // the machine. Any other command stays as it is, so a recording shows it.
+      if (key === "command" && node === process.execPath) return "<executable>";
       if (key === "version" && /^\d+\.\d+\.\d+/.test(node)) return "<version>";
       let text = node.split(cwd).join("<cwd>").split(home).join("<home>");
       text = text.replace(UUID, (id) => {
