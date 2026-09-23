@@ -17911,6 +17911,169 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 
+  // Issue #1114: the CLI never replays the steered message's echo, so the idle
+  // lane would swallow every idle and park the prompt. A result stamped with the
+  // steer's uuid proves the steered work ran: it settles the turn right there,
+  // and owes its trailing idle like any other settling result.
+  it("settles a steered turn at a result that names the steer, even with its echo missing", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+    let releaseIdle = () => {};
+    const idleReleased = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield { ...interruptedCycleResult(), user_message_uuid: u1.value.uuid };
+        // No echo for the steered message.
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: steered.value.uuid,
+          user_message_uuids: [steered.value.uuid],
+        };
+        await idleReleased;
+        yield idleMessage(); // the settling result's own trailer
+        // Held open: no teardown may rescue the turn.
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    // Settles before any idle arrives.
+    const response = await turn;
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(1);
+
+    releaseIdle();
+    await waitFor(() => agent.sessions["test-session"].owedTrailingIdles === 0);
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // Issue #1114's other hang, and #1063's: the steer aborts an autonomous
+  // followup, whose result counts a trailing idle that the abort then folds into
+  // the one idle spanning both cycles. Absorbing that idle as debt would starve
+  // the steered turn of the only signal it settles on.
+  it("settles a ready steered turn at an idle that owed-idle debt would absorb", async () => {
+    const agent = createMockAgent();
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        // The aborted cycle is an autonomous followup: it owes a trailer.
+        yield { ...createResultMessage(), origin: { kind: "task-notification" } };
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage(); // unstamped producer
+        yield idleMessage(); // the only idle
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // The guard the ready lane must keep: an owed idle arriving after the steered
+  // echo but before the steered cycle's result belongs to an earlier cycle. The
+  // outcome recorded by then is the interrupted cycle's, so settling on it would
+  // answer the prompt while the steered answer is still streaming.
+  it("does not settle a steered turn on a lagged owed idle before the steered result", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        // An autonomous cycle finishes mid-turn; its trailer lags.
+        yield {
+          ...createResultMessage(),
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          origin: { kind: "task-notification" },
+        };
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        yield idleMessage(); // the autonomous cycle's lagged trailer
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // Both cycles' usage, not just the interrupted one's.
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+  });
+
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
     const agent = createMockAgent();
     const captured: any[] = [];
