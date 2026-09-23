@@ -291,6 +291,32 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     );
   });
 
+  describe.each(profiles.map((profile) => profile.name))("%s session ids", (profile) => {
+    // Only AIR negotiates native subagent sessions. There a child session
+    // gets updates after its parent announced it with `subagent_spawned`.
+    const nativeSubagents = profile === "air";
+    it.each(SCENARIOS.map((scenario) => scenario.name))(
+      "%s sends every session/update to the ACP session",
+      (scenario) => {
+        const { sessionId, raw } = run(profile, scenario);
+        const sessions = new Set([sessionId]);
+        const wrong: string[] = [];
+        for (const record of raw) {
+          if (record.kind !== "sessionUpdate") continue;
+          const payload = record.payload as { sessionId: string; update: Record<string, any> };
+          if (!sessions.has(payload.sessionId)) {
+            wrong.push(`${payload.sessionId}: ${payload.update.sessionUpdate}`);
+            continue;
+          }
+          if (nativeSubagents && payload.update.sessionUpdate === "subagent_spawned") {
+            sessions.add(payload.update.subagentSessionId);
+          }
+        }
+        expect(wrong).toEqual([]);
+      },
+    );
+  });
+
   describe.each(["plain", "zed"] as const)("%s client", (profile) => {
     it.each(SCENARIOS.map((scenario) => scenario.name))(
       "%s carries the same information as origin/main",
