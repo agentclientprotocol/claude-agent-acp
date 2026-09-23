@@ -390,6 +390,8 @@ An `Edit` input holds a snippet, not the file.
 The tool call therefore shows the standard diff of the snippet until a preview or the final patch replaces it.
 A `Write` tool call shows a creation patch of its content only when the file is missing.
 For an existing file, it shows the standard diff from the current text, and the preview or the final patch replaces it.
+A `Write` of a loaded session history shows the standard diff without old text, because the adapter does not read the file on disk.
+The disk shows a later state than the history.
 When the adapter cannot read the current text, the tool call shows a notice that the `Write` overwrites an existing file.
 The notice holds no file text, so `rawInput` keeps `content`.
 

@@ -872,11 +872,12 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       // Replayed: session/load renders the same tool uses from the transcript.
       const replay = await runAir(replayedEditsScenario());
       expect(patches(toolCallReports(replay))).toEqual([]);
+      // A replay does not read old.ts: the disk shows a later state than the history.
       expect(toolCallReports(replay, "toolu_r_write")[0].content).toEqual([
         {
           type: "diff",
           path: expect.stringMatching(/old\.ts$/),
-          oldText: "export const x = 0;\n",
+          oldText: null,
           newText: "export const x = 1;\n",
         },
       ]);

@@ -23,7 +23,7 @@ import type {
  * diff, so the result text is only a confirmation.
  */
 export class WriteReporter implements ToolReporter {
-  toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
+  toolUse(input: unknown, { cwd, capabilities, replay }: ToolUseContext): ToolUseFacts {
     const write = normalizeWriteInput(input);
     const displayPath = write?.file_path ? toDisplayPath(write.file_path, cwd) : undefined;
     const facts: ToolUseFacts = {
@@ -34,9 +34,10 @@ export class WriteReporter implements ToolReporter {
     if (write?.file_path) {
       // A negotiated client gets the creation patch that the PostToolUse hook
       // would send for a new file, so that update can be skipped. An existing
-      // file never gets a creation patch.
+      // file never gets a creation patch. A replay does not read the file:
+      // the disk shows a later state than the history.
       const negotiated =
-        capabilities.diffPatch && typeof write.content === "string"
+        capabilities.diffPatch && !replay && typeof write.content === "string"
           ? writeToolUseChange(write.file_path, write.content, cwd)
           : undefined;
       facts.change = negotiated?.change ?? [
