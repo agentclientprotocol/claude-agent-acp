@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.81.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.0...v0.81.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* gate login result text on error state ([#1103](https://github.com/agentclientprotocol/claude-agent-acp/issues/1103)) ([6e97e07](https://github.com/agentclientprotocol/claude-agent-acp/commit/6e97e071c581002b43d9556dbd1d1376ebf9516f))
+* honor permissions.disableBypassPermissionsMode ([#1165](https://github.com/agentclientprotocol/claude-agent-acp/issues/1165)) ([281e47e](https://github.com/agentclientprotocol/claude-agent-acp/commit/281e47eb810da748b9e66798086f0010dbb4dc4b))
+* include model on usage updates ([#1032](https://github.com/agentclientprotocol/claude-agent-acp/issues/1032)) ([da11f1f](https://github.com/agentclientprotocol/claude-agent-acp/commit/da11f1feb269b93f13fde7470f2b5a1b070867a9))
+* keep the agent starting when the managed-policy tier cannot be read ([#1146](https://github.com/agentclientprotocol/claude-agent-acp/issues/1146)) ([58c5db1](https://github.com/agentclientprotocol/claude-agent-acp/commit/58c5db1fdc1b6fbce27224523fddebd3c52a65dd))
+* mark informational chunks with metadata ([#1055](https://github.com/agentclientprotocol/claude-agent-acp/issues/1055)) ([bd059c1](https://github.com/agentclientprotocol/claude-agent-acp/commit/bd059c10e042c126933f27abd33f5523f39fab72))
+* offer bypass alongside auto in plan approval ([#1164](https://github.com/agentclientprotocol/claude-agent-acp/issues/1164)) ([43c27e9](https://github.com/agentclientprotocol/claude-agent-acp/commit/43c27e97aacd9b711aefcb4b84271bf872c2eea7))
+* preserve context usage when quota is exhausted ([#1132](https://github.com/agentclientprotocol/claude-agent-acp/issues/1132)) ([39062b6](https://github.com/agentclientprotocol/claude-agent-acp/commit/39062b63ff3087fc7ce2655a9738450f5f61682c))
+* preserve native Vertex endpoint defaults ([#1104](https://github.com/agentclientprotocol/claude-agent-acp/issues/1104)) ([29a4e98](https://github.com/agentclientprotocol/claude-agent-acp/commit/29a4e9847761837ab85ea42d4bab9267be606755))
+* publish effective mode after plan approval ([#1163](https://github.com/agentclientprotocol/claude-agent-acp/issues/1163)) ([a2f4239](https://github.com/agentclientprotocol/claude-agent-acp/commit/a2f4239543b22d0928fbdbef7a9c7a4854b3d61d))
+* recreate resumed sessions when any session option changes ([#1097](https://github.com/agentclientprotocol/claude-agent-acp/issues/1097)) ([df38ccc](https://github.com/agentclientprotocol/claude-agent-acp/commit/df38cccae04ce4abb525447c5e8d9db78ffec61c))
+* render Write tool calls that use path/file_text aliases ([#1161](https://github.com/agentclientprotocol/claude-agent-acp/issues/1161)) ([90cde4b](https://github.com/agentclientprotocol/claude-agent-acp/commit/90cde4b3974656794fbb274ac6ad8e57f701e618))
+* replay marker-only slash skill prompts ([#1035](https://github.com/agentclientprotocol/claude-agent-acp/issues/1035)) ([97394d9](https://github.com/agentclientprotocol/claude-agent-acp/commit/97394d93b695c141eda71b85025bc4e22141b8c4))
+* **session:** recreate query when configured skills change ([#968](https://github.com/agentclientprotocol/claude-agent-acp/issues/968)) ([388a0f5](https://github.com/agentclientprotocol/claude-agent-acp/commit/388a0f51914ef59f2168007b633927e1a9d6ec48)), closes [#955](https://github.com/agentclientprotocol/claude-agent-acp/issues/955)
+* settle steered turns on the result that answers the steer ([#1166](https://github.com/agentclientprotocol/claude-agent-acp/issues/1166)) ([9392c69](https://github.com/agentclientprotocol/claude-agent-acp/commit/9392c69cc66591ade56a08200d807577180aa682))
+
 ## [0.81.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.80.0...v0.81.0) (2026-09-22)
 
 
