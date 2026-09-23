@@ -47,10 +47,10 @@ interface DiffToolResponse {
   content?: string;
   /** The pre-change content. It is null on a Write create, or on a Write
    *  update whose previous content was too large to include. An Edit that
-   *  creates a file reports an empty string. */
+   *  creates a file reports an empty string, as for an existing empty file. */
   originalFile?: string | null;
   /** FileEditOutput only: the text that the Edit replaced. It is empty when
-   *  the Edit created the file. */
+   *  the Edit created the file or filled an existing empty file. */
   oldString?: string;
 }
 
@@ -238,15 +238,17 @@ export async function patchUpdateFromDiffToolResponse(
   const response = toolResponse as DiffToolResponse;
   if (typeof response.filePath !== "string") return undefined;
   // An Edit with an empty old_string reports "" as the original of a created
-  // file. Claude cannot tell that from an existing empty file, so both get the
-  // creation header.
-  const creates =
-    response.type === "create" || (response.oldString === "" && response.originalFile === "");
-  const oldText = creates
-    ? null
-    : typeof response.originalFile === "string"
-      ? response.originalFile
-      : undefined;
+  // file and of an existing empty file. The response does not tell the two
+  // apart, so the caller keeps the standard diff.
+  if (response.type === undefined && response.oldString === "" && response.originalFile === "") {
+    return undefined;
+  }
+  const oldText =
+    response.type === "create"
+      ? null
+      : typeof response.originalFile === "string"
+        ? response.originalFile
+        : undefined;
   if (oldText === undefined) return undefined;
   const newText = await readPatchSource(response.filePath);
   if (typeof newText !== "string" || newText.startsWith("\uFEFF")) return undefined;

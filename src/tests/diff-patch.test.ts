@@ -375,6 +375,22 @@ describe("PostToolUse hook patches", () => {
     );
   });
 
+  it("keeps the standard diff for an Edit that fills an empty file", async () => {
+    // Claude reports the same response for a created file and for an existing
+    // empty file, so the hook cannot choose the creation header.
+    const filePath = await temporaryFile("a\n");
+
+    const result = await patchUpdateFromDiffToolResponse({
+      filePath,
+      oldString: "",
+      newString: "a\n",
+      originalFile: "",
+      structuredPatch: [{ oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, lines: ["+a"] }],
+    });
+
+    expect(result).toBeUndefined();
+  });
+
   it("declines a patch that it cannot build exactly", async () => {
     const crlf = await temporaryFile("a\r\nc\r\n");
     const missing = await temporaryFile();
