@@ -163,7 +163,11 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { readResumedSession, type ResumedSessionSnapshot } from "./resumed-session.js";
+import {
+  readResumedModel,
+  readResumedSession,
+  type ResumedSessionSnapshot,
+} from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
@@ -8180,7 +8184,7 @@ export class ClaudeAcpAgent {
 
     const resumedModelHint = resumedSession
       ? resumedSession.model
-      : (await readResumedSession(params.sessionId, this.logger)).model;
+      : await readResumedModel(params.sessionId, this.logger);
 
     const response = await this.createSession(
       {
@@ -8288,7 +8292,7 @@ export class ClaudeAcpAgent {
       creationOpts.resume !== undefined &&
       !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
     ) {
-      resumedModelHint = (await readResumedSession(creationOpts.resume, this.logger)).model;
+      resumedModelHint = await readResumedModel(creationOpts.resume, this.logger);
       timing.phase("resume-transcript");
     }
 
