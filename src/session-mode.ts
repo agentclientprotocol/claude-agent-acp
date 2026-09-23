@@ -42,6 +42,8 @@ export type SessionMode = {
   autoModeFallbackWarningShown?: boolean;
   /** Initial mode fallback is reported after session/new, on the first prompt. */
   autoModeFallbackWarningPending?: boolean;
+  /** The mode the session left when it entered plan mode, if it is in plan. */
+  prePlanMode?: string;
 };
 
 export type SessionModeManagerOptions<S extends SessionMode> = {
@@ -132,6 +134,12 @@ export class SessionModeManager<S extends SessionMode> {
   }
 
   syncConfig(session: ModeConfigSession, mode: string): void {
+    const previousMode = session.modes.currentModeId;
+    if (mode !== "plan") {
+      session.prePlanMode = undefined;
+    } else if (previousMode !== "plan") {
+      session.prePlanMode = previousMode;
+    }
     session.modes = { ...session.modes, currentModeId: mode };
     session.configOptions = session.configOptions.map((option) =>
       option.id === MODE_CONFIG_ID && typeof option.currentValue === "string"

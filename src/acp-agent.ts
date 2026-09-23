@@ -822,6 +822,8 @@ export type Session = {
    *  (see resumedFirstResultModelUsage). */
   lastModelUsageReading?: ModelTokenTally;
   modes: SessionModeState;
+  /** The mode the session left when it entered plan mode, if it is in plan. */
+  prePlanMode?: string;
   models: SessionModelState;
   modelInfos: ModelInfo[];
   /** Prevents the model-specific Auto fallback from spamming the transcript. */
@@ -7247,6 +7249,7 @@ export class ClaudeAcpAgent {
         allowPersistentOptions: !noPersistentRule,
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
+        prePlanMode: session.prePlanMode,
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined

@@ -60,59 +60,58 @@ export function buildExitPlanModePermissionOptions(
 ): PermissionOption[] {
   const modes = new Set(context.availableModes);
   const options: PermissionOption[] = [];
-  const elevatedMode = modes.has("auto")
-    ? "auto"
-    : modes.has("bypassPermissions")
-      ? "bypassPermissions"
-      : "acceptEdits";
+  // Claude Code offers bypass only when the user launched with it, so it can
+  // prefer bypass outright. The adapter advertises bypass by default, so Auto
+  // leads unless the session was in bypass before entering plan mode. Both stay
+  // selectable: they have different permission semantics.
+  const elevatedModes = (
+    context.prePlanMode === "bypassPermissions"
+      ? (["bypassPermissions", "auto"] as const)
+      : (["auto", "bypassPermissions"] as const)
+  ).filter((mode) => modes.has(mode));
+  const preferredMode = elevatedModes[0] ?? "acceptEdits";
   if (plainString(context.input.plan)) {
     const usage =
       context.contextUsedPercent === undefined ? "" : ` (${context.contextUsedPercent}% used)`;
-    if (elevatedMode === "auto") {
-      options.push({
-        optionId: PERMISSION_OPTION_ID.exitPlanClearAuto,
-        name: `Yes, clear context${usage} and use auto mode`,
-        kind: "allow_always",
-      });
-    } else if (elevatedMode === "bypassPermissions") {
-      options.push({
-        optionId: PERMISSION_OPTION_ID.exitPlanClearBypass,
-        name: `Yes, clear context${usage} and bypass permissions`,
-        kind: "allow_always",
-      });
-    } else {
-      options.push({
-        optionId: PERMISSION_OPTION_ID.exitPlanClearAcceptEdits,
-        name: `Yes, clear context${usage} and auto-accept edits`,
-        kind: "allow_always",
-      });
-    }
+    options.push(
+      preferredMode === "auto"
+        ? {
+            optionId: PERMISSION_OPTION_ID.exitPlanClearAuto,
+            name: `Yes, clear context${usage} and use auto mode`,
+            kind: "allow_always",
+          }
+        : preferredMode === "bypassPermissions"
+          ? {
+              optionId: PERMISSION_OPTION_ID.exitPlanClearBypass,
+              name: `Yes, clear context${usage} and bypass permissions`,
+              kind: "allow_always",
+            }
+          : {
+              optionId: PERMISSION_OPTION_ID.exitPlanClearAcceptEdits,
+              name: `Yes, clear context${usage} and auto-accept edits`,
+              kind: "allow_always",
+            },
+    );
   }
-  if (elevatedMode === "auto") {
-    options.push({
-      optionId: PERMISSION_OPTION_ID.exitPlanAuto,
-      name: "Yes, and use auto mode",
-      kind: "allow_always",
-    });
-  } else if (elevatedMode === "bypassPermissions") {
-    options.push({
-      optionId: PERMISSION_OPTION_ID.exitPlanBypass,
-      name: "Yes, and bypass permissions",
-      kind: "allow_always",
-    });
-  } else {
+  for (const mode of elevatedModes) {
+    options.push(
+      mode === "auto"
+        ? {
+            optionId: PERMISSION_OPTION_ID.exitPlanAuto,
+            name: "Yes, and use auto mode",
+            kind: "allow_always",
+          }
+        : {
+            optionId: PERMISSION_OPTION_ID.exitPlanBypass,
+            name: "Yes, and bypass permissions",
+            kind: "allow_always",
+          },
+    );
+  }
+  if (elevatedModes.length === 0) {
     options.push({
       optionId: PERMISSION_OPTION_ID.exitPlanAcceptEdits,
       name: "Yes, auto-accept edits",
-      kind: "allow_always",
-    });
-  }
-  // Auto and bypass have different permission semantics. Keep bypass selectable
-  // whenever the session advertises it, even when Auto is the preferred choice.
-  if (elevatedMode !== "bypassPermissions" && modes.has("bypassPermissions")) {
-    options.push({
-      optionId: PERMISSION_OPTION_ID.exitPlanBypass,
-      name: "Yes, and bypass permissions",
       kind: "allow_always",
     });
   }

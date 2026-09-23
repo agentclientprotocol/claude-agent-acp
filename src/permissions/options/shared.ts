@@ -27,6 +27,8 @@ export interface PermissionOptionContext {
    *  approvable by a stray keystroke, so the decline option leads. */
   defaultToNo?: boolean;
   availableModes?: readonly string[];
+  /** The mode the session left when it entered plan mode. */
+  prePlanMode?: string;
   contextUsedPercent?: number;
 }
 

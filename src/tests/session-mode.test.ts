@@ -201,6 +201,25 @@ describe("session mode", () => {
     expect(session.configOptions[0].currentValue).toBe("plan");
   });
 
+  it("remembers the mode the session left when it entered plan mode", () => {
+    const session = {
+      ...createSession(),
+      configOptions: [SessionModeManager.configOption(createSession().modes)],
+    };
+    const { manager } = createManager(session);
+
+    manager.syncConfig(session, "bypassPermissions");
+    manager.syncConfig(session, "plan");
+    expect(session.prePlanMode).toBe("bypassPermissions");
+
+    // A repeated plan sync (e.g. EnterPlanMode while already planning) keeps it.
+    manager.syncConfig(session, "plan");
+    expect(session.prePlanMode).toBe("bypassPermissions");
+
+    manager.syncConfig(session, "auto");
+    expect(session.prePlanMode).toBeUndefined();
+  });
+
   it("reconciles Auto after a model switch", async () => {
     const session = createSession();
     session.modes.currentModeId = "auto";
