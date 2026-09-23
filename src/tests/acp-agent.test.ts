@@ -15579,6 +15579,159 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  describe("ExitPlanMode answered inside a held turn's followup (issue #1167)", () => {
+    // Plan mode + a background Explore agent: the user turn's result holds,
+    // the subagent finishes, and the model writes the plan and calls
+    // ExitPlanMode in the task-notification cycle. The interrupted cycle's
+    // diagnostic carries that cycle's task-notification origin.
+    function* heldTurnPlanningFollowup(first: any) {
+      yield userEcho(first);
+      yield running();
+      yield subagentStarted("agent-1");
+      yield resultMessage(); // held for agent-1
+      yield taskNotification("agent-1");
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-plan",
+              name: "ExitPlanMode",
+              input: { plan: "Implement it" },
+            },
+          ],
+          usage: {},
+        },
+      };
+      yield {
+        type: "user",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "tool-plan",
+              content: "User accepted the plan and requested a fresh context",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+      };
+      yield resultMessage({
+        subtype: "error_during_execution",
+        is_error: true,
+        stop_reason: null,
+        errors: ["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        origin: { kind: "task-notification" },
+      });
+    }
+
+    it("continues an accepted clear-context plan in a fresh query instead of ending the turn", async () => {
+      const updates: any[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      let continuation: unknown;
+      const createSession = vi
+        .spyOn(agent as any, "createSession")
+        .mockImplementation(async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            const next = await input[Symbol.asyncIterator]().next();
+            continuation = next.value;
+            yield userEcho(next.value);
+            yield running();
+            yield assistantText("Implemented");
+            yield resultMessage({ stop_reason: "max_tokens" });
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        });
+      injectGeneratorSession(
+        agent,
+        (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield* heldTurnPlanningFollowup(first);
+            yield idle();
+          }
+          return messageGenerator();
+        },
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it",
+            mode: "auto",
+          },
+        },
+      );
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(createSession).toHaveBeenCalledWith(
+        expect.objectContaining({ cwd: "/test" }),
+        expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
+      );
+      expect(JSON.stringify(continuation)).toContain(
+        "Implement the following plan:\\n\\nImplement it",
+      );
+      // Settled by the continuation's own result, not the pre-restart hold.
+      expect(response.stopReason).toBe("max_tokens");
+      expect(updates).toContainEqual(
+        expect.objectContaining({
+          update: expect.objectContaining({
+            sessionUpdate: "current_mode_update",
+            currentModeId: "auto",
+          }),
+        }),
+      );
+    });
+
+    it("cancels the held turn when the user keeps planning", async () => {
+      const agent = createMockAgent();
+      const createSession = vi.spyOn(agent as any, "createSession");
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield* heldTurnPlanningFollowup(first);
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(response.stopReason).toBe("cancelled");
+      // The user turn's own usage, not the followup's.
+      expect(response.usage?.totalTokens).toBe(15);
+      expect(createSession).not.toHaveBeenCalled();
+      expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
+    });
+  });
+
   // CLI 2.1.270+ stays `running` while background agents live (verified
   // live: user result → task_notification → followup result → ONE idle), so
   // the user result's trailing-idle debt is never paid. It must not linger:
