@@ -39,6 +39,7 @@ import {
   type ScenarioRun,
   streamMessage,
   toolCall,
+  toolResult,
 } from "./acp-scenarios/harness.js";
 import { SCENARIOS } from "./acp-scenarios/scenarios.js";
 import {
@@ -832,6 +833,29 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       }
     });
 
+    it("gets the Write patch, but no file text in the PostToolUse toolResponse", async () => {
+      const scenario = writtenFileScenario();
+      const hookReport = (recorded: Recorded[]) =>
+        toolCallReports(recorded, "toolu_write").find(
+          (report) =>
+            report._meta?.claudeCode?.toolResponse !== undefined || report.content?.[0]?._meta,
+        );
+      const airReport = hookReport(await runAir(scenario));
+      expect(airReport?.content?.[0]?._meta?.jetbrains?.air?.diffPatch?.text).toContain(
+        "-export const x = 0;\n+export const x = 1;\n",
+      );
+      expect(airReport?._meta?.claudeCode?.toolResponse).toBeUndefined();
+      expect(JSON.stringify(airReport)).not.toContain("originalFile");
+      // A client that is not AIR keeps the full toolResponse of origin/main.
+      resetIds();
+      const plain = (await runScenario(Agent, PROFILES.plain, scenario)).raw;
+      expect(hookReport(plain)?._meta?.claudeCode?.toolResponse).toMatchObject({
+        type: "update",
+        content: "export const x = 1;\n",
+        originalFile: "export const x = 0;\n",
+      });
+    });
+
     it("sends the Bash output as terminal deltas", () => {
       const reports = toolCallReports(air("bash-foreground"), "toolu_bash");
       expect(reports).toContainEqual(
@@ -842,3 +866,38 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     });
   });
 });
+
+/** A Write that changes the file on disk before its PostToolUse hook runs. */
+function writtenFileScenario(): Scenario {
+  return {
+    name: "write-on-disk",
+    files: { "old.ts": "export const x = 0;\n" },
+    turns: [
+      async function* (ctx) {
+        const file = path.join(ctx.cwd, "old.ts");
+        const input = { file_path: file, content: "export const x = 1;\n" };
+        yield* assistantTurn("msg_write", [
+          { type: "tool_use", id: "toolu_write", name: "Write", input },
+        ]);
+        fs.writeFileSync(file, input.content);
+        yield toolResult("toolu_write", `The file ${file} has been updated successfully.`);
+        await ctx.postToolUse("toolu_write", "Write", input, {
+          type: "update",
+          filePath: file,
+          content: input.content,
+          structuredPatch: [
+            {
+              oldStart: 1,
+              oldLines: 1,
+              newStart: 1,
+              newLines: 1,
+              lines: ["-export const x = 0;", "+export const x = 1;"],
+            },
+          ],
+          originalFile: "export const x = 0;\n",
+        });
+        yield result();
+      },
+    ],
+  };
+}
