@@ -403,6 +403,37 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
         });
       }
     });
+
+    it("sends terminal-auth commands that rerun this adapter with --cli", () => {
+      // The raw traffic, because the recordings normalize the machine paths.
+      const initialize = zed("session-setup").find((record) => record.kind === "initialize")!
+        .payload as Record<string, any>;
+      const argv = process.argv.slice(1);
+      expect(initialize.authMethods).toEqual([
+        expect.objectContaining({
+          id: "claude-ai-login",
+          args: ["--cli", "auth", "login", "--claudeai"],
+          _meta: {
+            "terminal-auth": {
+              command: process.execPath,
+              args: [...argv, "--cli", "auth", "login", "--claudeai"],
+              label: "Claude Login",
+            },
+          },
+        }),
+        expect.objectContaining({
+          id: "console-login",
+          args: ["--cli", "auth", "login", "--console"],
+          _meta: {
+            "terminal-auth": {
+              command: process.execPath,
+              args: [...argv, "--cli", "auth", "login", "--console"],
+              label: "Anthropic Console Login",
+            },
+          },
+        }),
+      ]);
+    });
   });
 
   describe("AIR", () => {
