@@ -5,3 +5,7 @@ dist
 .release-please-manifest.json
 release-please-config.json
 CHANGELOG.md
+
+# Recorded ACP traffic, written by src/tests/acp-scenarios.test.ts.
+src/tests/acp-scenarios/__snapshots__
+src/tests/acp-scenarios/origin-main

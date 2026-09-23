@@ -1,0 +1,9 @@
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"Let me thin","type":"text"},"messageId":"msg_text","sessionUpdate":"agent_thought_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"k about it.","type":"text"},"messageId":"msg_text","sessionUpdate":"agent_thought_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"Here is t","type":"text"},"messageId":"msg_text","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":{"text":"he answer.","type":"text"},"messageId":"msg_text","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"cost":{"amount":0,"currency":"USD"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"promptResponse","payload":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}

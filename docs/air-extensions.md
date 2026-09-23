@@ -68,6 +68,8 @@ The adapter leaves out only repeated data for such a client:
 - Streamed subagent text is not sent again in full when the complete message arrives, for a client that gets the complete message.
 - A compaction summary is not sent again in full when the chunks that went out before it hold the same text.
 
+`src/tests/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
+
 ## Negotiation
 
 ### Client declaration

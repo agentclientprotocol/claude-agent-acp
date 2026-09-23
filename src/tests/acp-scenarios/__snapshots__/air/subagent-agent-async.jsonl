@@ -1,0 +1,10 @@
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{"isAsync":true,"status":"async_launched"}}},"sessionUpdate":"tool_call_update","toolCallId":"toolu_agent"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Background review","sessionUpdate":"subagent_spawned","subagentSessionId":"a2","task":"Review the diff"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"a2","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_agent"}},"content":{"text":"Reviewi","type":"text"},"messageId":"msg_async_sub","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"a2","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_agent"}},"content":{"text":"ng now.","type":"text"},"messageId":"msg_async_sub","sessionUpdate":"agent_message_chunk"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"subagent_state_update","state":"completed","subagentSessionId":"a2"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"cost":{"amount":0,"currency":"USD"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
+{"kind":"promptResponse","payload":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}
