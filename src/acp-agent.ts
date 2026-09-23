@@ -62,6 +62,7 @@ import {
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
+  getSubagentMessages,
   listSessions,
   McpServerConfig,
   McpServerStatus,
@@ -163,6 +164,7 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import { subagentIdsByToolUse } from "./subagent-history.js";
 import {
   readResumedModel,
   readResumedSession,
@@ -1533,6 +1535,20 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
+}
+
+/** The ids of the Agent and Task tool uses in the content of a message. */
+function subagentLaunchIds(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) =>
+    typeof block === "object" &&
+    block !== null &&
+    block.type === "tool_use" &&
+    typeof block.id === "string" &&
+    isNativeSubagentControlTool(block.name)
+      ? [block.id as string]
+      : [],
+  );
 }
 
 function replaySubagentTerminalState(
@@ -7025,8 +7041,10 @@ export class ClaudeAcpAgent {
       }
     >();
 
-    if (nativeReplayEnabled) {
-      for (const message of messages) {
+    // Registers the Agent and Task launches of `list`, and the terminal state
+    // of each launch from its tool_result.
+    const registerLaunches = (list: SessionMessage[]): void => {
+      for (const message of list) {
         const content = (message as unknown as { message?: { content?: unknown } }).message
           ?.content;
         if (!Array.isArray(content)) continue;
@@ -7085,7 +7103,8 @@ export class ClaudeAcpAgent {
         const child = replayChildren.get(toolUseId);
         if (child) child.terminalState = terminalState;
       }
-    }
+    };
+    if (nativeReplayEnabled) registerLaunches(messages);
 
     const announceReplayChild = async (
       parentToolUseId: string,
@@ -7133,7 +7152,11 @@ export class ClaudeAcpAgent {
       return child.sessionId;
     };
 
-    for (const message of messages) {
+    const subagentIds = nativeReplayEnabled
+      ? await subagentIdsByToolUse(sessionId)
+      : new Map<string, string>();
+    const replayedSubagents = new Set<string>();
+    const replayMessage = async (message: SessionMessage): Promise<void> => {
       if (
         message.type === "user" &&
         message.parent_tool_use_id === null &&
@@ -7156,7 +7179,7 @@ export class ClaudeAcpAgent {
       // assistant message into an authRequired error instead of showing its
       // TUI-specific text; skip it on replay too (issue #863).
       if (message.type === "assistant" && isSyntheticLoginMessage(message.message)) {
-        continue;
+        return;
       }
 
       // Capable clients saw every synthetic usage-limit message as a typed
@@ -7179,7 +7202,7 @@ export class ClaudeAcpAgent {
             message.uuid === activeUsageLimit?.uuid,
           );
         }
-        continue;
+        return;
       }
 
       // @ts-expect-error - untyped in SDK but we handle all of these
@@ -7200,7 +7223,7 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
-        if (content === null) continue;
+        if (content === null) return;
       }
 
       // Claude persists the retained summary as a user message framed with
@@ -7232,7 +7255,7 @@ export class ClaudeAcpAgent {
         );
         if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
           await replayCompaction.finish(message.uuid, "completed");
-          continue;
+          return;
         }
       }
 
@@ -7268,7 +7291,28 @@ export class ClaudeAcpAgent {
         }
         await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
       }
-    }
+
+      // The history of each subagent is in its own transcript. The replay
+      // sends it to the child session right after the launch, one message at
+      // a time, and keeps no subagent history after that.
+      if (nativeReplayEnabled && message.type === "assistant") {
+        for (const toolUseId of subagentLaunchIds(content)) {
+          await announceReplayChild(toolUseId);
+          const agentId = subagentIds.get(toolUseId);
+          if (!agentId || replayedSubagents.has(agentId)) continue;
+          replayedSubagents.add(agentId);
+          let childMessages: SessionMessage[] = [];
+          try {
+            childMessages = await getSubagentMessages(sessionId, agentId);
+          } catch (error) {
+            this.logger.error(`Failed to read the history of subagent ${agentId}:`, error);
+          }
+          registerLaunches(childMessages);
+          for (const childMessage of childMessages) await replayMessage(childMessage);
+        }
+      }
+    };
+    for (const message of messages) await replayMessage(message);
 
     if (nativeReplayEnabled) {
       // Claude history persists sidechain messages and Agent/Task tool uses,

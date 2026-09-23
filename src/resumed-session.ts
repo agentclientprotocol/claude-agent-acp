@@ -96,7 +96,7 @@ export async function readResumedModel(
 }
 
 /** The local transcript of a session in any project directory, as the SDK looks it up. */
-async function findTranscript(sessionId: string): Promise<string | undefined> {
+export async function findTranscript(sessionId: string): Promise<string | undefined> {
   const projects = path.join(
     process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
     "projects",
