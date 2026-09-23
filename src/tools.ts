@@ -134,6 +134,19 @@ export function toDisplayPath(filePath: string, cwd?: string): string {
   return filePath;
 }
 
+/** Read a Write tool_use input the way the CLI validates it. Since 2.1.280 the
+ *  CLI accepts `path` for `file_path` and `file_text`/`file_content` for
+ *  `content` when a model sends those spellings, but the streamed tool_use
+ *  block still carries them raw — without this the call renders as
+ *  "Preparing file…" with no diff while the write goes through. */
+function normalizeWriteInput(input: unknown): FileWriteInput | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const raw = input as Record<string, unknown>;
+  const filePath = raw.file_path ?? (typeof raw.path === "string" ? raw.path : undefined);
+  const content = raw.content ?? raw.file_text ?? raw.file_content;
+  return { ...raw, file_path: filePath, content } as FileWriteInput;
+}
+
 export function toolInfoFromToolUse(
   toolUse: any,
   supportsTerminalOutput: boolean = false,
@@ -204,7 +217,7 @@ export function toolInfoFromToolUse(
     }
 
     case "Write": {
-      const input = toolUse.input as FileWriteInput | undefined;
+      const input = normalizeWriteInput(toolUse.input);
       let content: ToolCallContent[] = [];
       if (input && input.file_path) {
         content = [

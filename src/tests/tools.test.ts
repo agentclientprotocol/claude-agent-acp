@@ -1867,6 +1867,43 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
   });
 });
 
+describe("toolInfoFromToolUse - Write input aliases", () => {
+  it.each([
+    ["path + file_text", { path: "/repo/a.ts", file_text: "x" }],
+    ["path + file_content", { path: "/repo/a.ts", file_content: "x" }],
+    ["file_path + file_text", { file_path: "/repo/a.ts", file_text: "x" }],
+  ])("renders %s like file_path + content", (_label, input) => {
+    const info = toolInfoFromToolUse(
+      { name: "Write", id: "toolu_write_alias", input },
+      false,
+      "/repo",
+    );
+
+    expect(info.title).toBe("Write a.ts");
+    expect(info.locations).toEqual([{ path: "/repo/a.ts" }]);
+    expect(info.content).toEqual([
+      { type: "diff", path: "/repo/a.ts", oldText: null, newText: "x" },
+    ]);
+  });
+
+  it("prefers the canonical fields when both spellings are present", () => {
+    const info = toolInfoFromToolUse(
+      {
+        name: "Write",
+        id: "toolu_write_both",
+        input: { file_path: "/repo/a.ts", path: "/repo/b.ts", content: "a", file_text: "b" },
+      },
+      false,
+      "/repo",
+    );
+
+    expect(info.title).toBe("Write a.ts");
+    expect(info.content).toEqual([
+      { type: "diff", path: "/repo/a.ts", oldText: null, newText: "a" },
+    ]);
+  });
+});
+
 describe("toolInfoFromToolUse - undefined input regression", () => {
   it("Read with undefined input should not throw", () => {
     const toolUse = { name: "Read", id: "toolu_read_undef", input: undefined };
