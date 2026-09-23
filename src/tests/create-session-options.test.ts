@@ -55,6 +55,11 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   };
 });
 
+let openUrlImpl: (url: string) => Promise<void>;
+vi.mock("../open-url.js", () => ({
+  openUrl: (url: string) => openUrlImpl(url),
+}));
+
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
   return {
@@ -85,6 +90,7 @@ describe("createSession options merging", () => {
     initModels = undefined;
     setModelImpl = undefined;
     mcpServerStatusResult = async () => [];
+    openUrlImpl = async () => {};
     mcpAuthenticateImpl = async () => ({
       requiresUserAction: false,
       callbackExpected: false,
@@ -95,6 +101,14 @@ describe("createSession options merging", () => {
     ClaudeAcpAgent = acpAgent.ClaudeAcpAgent;
 
     agent = new ClaudeAcpAgent(createMockClient());
+  });
+
+  afterEach(() => {
+    const sessions = (agent as unknown as { sessions: Record<string, any> }).sessions;
+    for (const sessionId of Object.keys(sessions)) {
+      sessions[sessionId].abortController.abort();
+      delete sessions[sessionId];
+    }
   });
 
   describe("allowDangerouslySkipPermissions", () => {
@@ -755,6 +769,222 @@ describe("createSession options merging", () => {
       expect(completeElicitation).toHaveBeenCalledWith({
         elicitationId: request.elicitationId,
       });
+    });
+
+    it("waits for pending MCP servers to settle before starting OAuth", async () => {
+      const snapshots = [
+        [{ name: "linear", status: "pending" }],
+        [{ name: "linear", status: "needs-auth" }],
+        [{ name: "linear", status: "connected" }],
+      ];
+      let statusCall = 0;
+      mcpServerStatusResult = async () => snapshots[Math.min(statusCall++, snapshots.length - 1)]!;
+      const authenticate = vi.fn(async () => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async (_request: CreateElicitationRequest) => ({
+        action: "accept" as const,
+      }));
+      const completeElicitation = vi.fn(async () => {});
+      Object.assign((agent as unknown as { client: object }).client, {
+        createElicitation,
+        completeElicitation,
+      });
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(completeElicitation).toHaveBeenCalledOnce(), {
+        timeout: 5000,
+      });
+      expect(authenticate).toHaveBeenCalledWith("linear");
+    });
+
+    function stubOAuthFlow(snapshots: Array<Array<{ name: string; status: string }>>) {
+      let statusCalls = 0;
+      mcpServerStatusResult = async () => snapshots[Math.min(statusCalls++, snapshots.length - 1)]!;
+      const authenticate = vi.fn(async (_serverName: string) => ({
+        authUrl: "https://example.com/oauth/authorize",
+        requiresUserAction: true,
+        callbackExpected: true,
+      }));
+      mcpAuthenticateImpl = authenticate;
+      const createElicitation = vi.fn(async (_request: CreateElicitationRequest) => ({
+        action: "accept" as const,
+      }));
+      const completeElicitation = vi.fn(async () => {});
+      Object.assign((agent as unknown as { client: object }).client, {
+        createElicitation,
+        completeElicitation,
+      });
+      return {
+        authenticate,
+        createElicitation,
+        completeElicitation,
+        statusCalls: () => statusCalls,
+      };
+    }
+
+    it("starts OAuth for a server Claude reported as failed", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.completeElicitation).toHaveBeenCalledOnce(), {
+        timeout: 5000,
+      });
+      expect(flow.authenticate).toHaveBeenCalledWith("slack");
+    });
+
+    it("keeps watching a failed server that is still failed on the next poll", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "failed" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.statusCalls()).toBeGreaterThanOrEqual(3), {
+        timeout: 8000,
+      });
+    });
+
+    it("authenticates servers Claude is sure about before optimistic attempts", async () => {
+      const flow = stubOAuthFlow([
+        [
+          { name: "slack", status: "failed" },
+          { name: "linear", status: "needs-auth" },
+        ],
+        [
+          { name: "slack", status: "connected" },
+          { name: "linear", status: "connected" },
+        ],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [
+          { name: "slack", type: "http", url: "https://mcp.slack.com/mcp", headers: [] },
+          { name: "linear", type: "http", url: "https://mcp.linear.app/mcp", headers: [] },
+        ],
+      });
+
+      await vi.waitFor(() => expect(flow.authenticate).toHaveBeenCalledTimes(2), {
+        timeout: 5000,
+      });
+      expect(flow.authenticate.mock.calls.map((call) => call[0])).toEqual(["linear", "slack"]);
+    });
+
+    it("authenticates a server the ACP client never declared", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(flow.completeElicitation).toHaveBeenCalledOnce(), {
+        timeout: 5000,
+      });
+      expect(flow.authenticate).toHaveBeenCalledWith("slack");
+    });
+
+    it("opens the browser when the client cannot present a URL", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      const openUrl = vi.fn(async (_url: string) => {});
+      openUrlImpl = openUrl;
+
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(openUrl).toHaveBeenCalledOnce(), { timeout: 5000 });
+      expect(openUrl).toHaveBeenCalledWith("https://example.com/oauth/authorize");
+      expect(flow.createElicitation).not.toHaveBeenCalled();
+    });
+
+    it("reports the URL when no browser can be opened", async () => {
+      stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      openUrlImpl = async () => {
+        throw new Error("spawn xdg-open ENOENT");
+      };
+      const error = vi.fn();
+      (agent as unknown as { logger: { log: unknown; error: unknown } }).logger = {
+        log: vi.fn(),
+        error,
+      };
+
+      await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(error).toHaveBeenCalled(), { timeout: 5000 });
+      expect(error.mock.calls.flat().join(" ")).toContain("https://example.com/oauth/authorize");
+    });
+
+    it("prefers URL elicitation over the browser when the client supports it", async () => {
+      const flow = stubOAuthFlow([
+        [{ name: "slack", status: "needs-auth" }],
+        [{ name: "slack", status: "connected" }],
+      ]);
+      const openUrl = vi.fn(async (_url: string) => {});
+      openUrlImpl = openUrl;
+
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { elicitation: { url: {} } },
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(flow.completeElicitation).toHaveBeenCalledOnce(), {
+        timeout: 5000,
+      });
+      expect(openUrl).not.toHaveBeenCalled();
     });
 
     it("still merges user-provided disallowedTools when AskUserQuestion is enabled", async () => {
