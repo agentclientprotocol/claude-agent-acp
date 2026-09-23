@@ -3566,6 +3566,28 @@ export class ClaudeAcpAgent {
       );
     };
 
+    // ACP's usage_update has no model field, so the model the usage belongs
+    // to rides in `_meta` alongside the other `_claude/*` keys.
+    const attachUsageModel = <
+      T extends {
+        sessionUpdate: "usage_update";
+        used: number;
+        size: number;
+        _meta?: Record<string, unknown> | null;
+      },
+    >(
+      update: T,
+    ): T => {
+      if (!lastAssistantModel) return update;
+      return {
+        ...update,
+        _meta: {
+          ...(update._meta ?? {}),
+          "_claude/model": lastAssistantModel,
+        },
+      };
+    };
+
     const internalErrorForClient = (data: unknown, rawDetail?: string) =>
       RequestError.internalError(
         data,
@@ -4420,11 +4442,11 @@ export class ClaudeAcpAgent {
                 session.contextUsedTokens = usedTokens;
                 await sendUpdate({
                   sessionId: message.session_id,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
                     size: session.contextWindowSize,
-                  },
+                  }),
                 });
                 break;
               }
@@ -5309,7 +5331,7 @@ export class ClaudeAcpAgent {
               if (lastAssistantTotalUsage !== null) {
                 await sendUpdate({
                   sessionId: params.sessionId,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
                     size: session.contextWindowSize,
@@ -5320,7 +5342,7 @@ export class ClaudeAcpAgent {
                     ...(message.origin && {
                       _meta: { "_claude/origin": message.origin },
                     }),
-                  },
+                  }),
                 });
               }
 
@@ -5820,11 +5842,11 @@ export class ClaudeAcpAgent {
                 session.contextUsedTokens = nextUsage;
                 await sendUpdate({
                   sessionId: params.sessionId,
-                  update: {
+                  update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: nextUsage,
                     size: session.contextWindowSize,
-                  },
+                  }),
                 });
               }
             }
@@ -6305,12 +6327,12 @@ export class ClaudeAcpAgent {
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: message.session_id,
-                update: {
+                update: attachUsageModel({
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
                   size: session.contextWindowSize,
                   _meta: { "_claude/rateLimit": message.rate_limit_info },
-                },
+                }),
               });
             }
             break;
