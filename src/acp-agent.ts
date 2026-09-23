@@ -53,6 +53,7 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
   StopReason,
+  ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import {
   AccountInfo,
@@ -112,8 +113,12 @@ import {
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
+  AIR_DIFF_PATCH_CAPABILITY,
+  AIR_PLAN_FILE_CAPABILITY,
+  AIR_GOAL_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
+  isAirClient,
   withAirMeta,
 } from "./air-extension.js";
 import {
@@ -140,7 +145,6 @@ import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/re
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -167,7 +171,6 @@ import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
-import { ContextCompactionMetadata } from "./context-compaction-meta.js";
 import {
   activeUsageLimitMessage,
   airSessionFailureCapabilityMeta,
@@ -225,25 +228,29 @@ import {
   clearHookCallbacks,
   completeHookCallback,
   createPostToolUseHook,
+  hasHookCallback,
   createTaskHook,
   parseTaskCreateOutput,
   parseTaskListOutput,
   parseTaskUpdateOutput,
   planEntries,
   registerHookCallback,
+  changedTaskPlanEntries,
+  forgetPublishedTaskPlan,
   TaskState,
-  taskStateToPlanEntries,
-  toolInfoFromToolUse,
-  toolUpdateFromToolResult,
   unregisterHookCallback,
 } from "./tools.js";
-import { toolUpdateFromDiffToolResponse } from "./diff.js";
+import { previewPatchContent } from "./diff.js";
+import { backgroundedBashToolCall } from "./tool-calls/background.js";
+import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
+import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
+import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
+import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
   executionDiagnostic,
-  exitPlanModeRawOutput,
   observeExitPlanToolResults,
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -940,6 +947,10 @@ export type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** The fields that the client holds for each open tool call, so that a
+   *  `tool_call_update` resends only the fields that changed. Created lazily
+   *  by {@link toolCallFieldsOf}. */
+  toolCallFields?: ToolCallFieldTracker;
   /** ACP session affinity for calls emitted eagerly by permission handling. */
   eagerToolCallSessions?: Map<string, string>;
   /** ExitPlanMode denial that intentionally interrupts the current Claude
@@ -1446,60 +1457,68 @@ type ProviderConfig = {
   };
 };
 
-export type ToolUpdateMeta = {
-  contextCompaction?: ContextCompactionMetadata;
-  claudeCode?: {
-    /* The name of the tool that was used in Claude Code. Also carried as the
-       standard ACP `name` field on the initial `tool_call`; kept here so every
-       `tool_call_update` stays self-describing for clients that key off it. */
-    toolName: string;
-    /* A human-readable title supplied by Claude Code for the tool call. */
-    title?: string;
-    /* The structured output provided by Claude Code. */
-    toolResponse?: unknown;
-    /* For a tool call made inside a subagent: the tool_use id of the
-       Agent/Task call that spawned the subagent. Mirrors the SDK's
-       `parent_tool_use_id` on streamed subagent messages. */
-    parentToolUseId?: string;
-    /* On a "failed" tool_call_update: why the tool never actually ran, so a
-       client can render the denial/cancellation distinctly from a real tool
-       failure. From the SDK's `tool_result_meta` non_execution_kind:
-       "user-rejected", "permission-rule", "interrupted", "cancelled", …
-       (open set). Absent when the tool executed — including real failures. */
-    nonExecutionKind?: string;
-    /* Free-text the user supplied when rejecting the tool call, when the
-       harness collected any. Only ever present alongside nonExecutionKind. */
-    userFeedback?: string;
-    /* Marks Agent/Task tool calls as subagent launches. ACP 1.2 has no
-       standard subagent ToolKind yet, so clients that support nested
-       transcripts need a namespaced marker instead of inferring from
-       `toolName` or the generic `think` kind. */
-    subagent?: true;
-    /* For Skill tool calls: the name of the skill being loaded (e.g. "commits").
-       Lets clients render a "Load skill: <name>" block without parsing the title. */
-    skill?: string;
-    /* For Skill tool calls: absolute path of that skill's SKILL.md, when it could be
-       located on disk. Lets clients turn the rendered skill name into a link to it. */
-    skillPath?: string;
+export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
+
+/** Text or thinking that streamed live as deltas, accumulated per block. */
+type StreamedBlock = { index: number; type: "text" | "thinking"; text: string };
+
+/**
+ * The blocks of a consolidated assistant message without the text that
+ * already streamed as deltas.
+ *
+ * Each assembled text/thinking block is diffed against the streamed blocks in
+ * document order: nothing is left if it streamed in full (the common case),
+ * the whole block if it never streamed (a non-streaming gateway), and just the
+ * tail if the stream was cut short mid-block. Matching on content rather than
+ * the message id keeps the dedupe robust for gateways without a stable id.
+ * Tool-use and other blocks pass through untouched.
+ */
+function unstreamedRemainder<Block extends { type: string }>(
+  blocks: Block[],
+  streamedBlocks: StreamedBlock[],
+): Block[] {
+  const kept: Block[] = [];
+  let streamPos = 0;
+  for (const item of blocks) {
+    if (item.type !== "text" && item.type !== "thinking") {
+      kept.push(item);
+      continue;
+    }
+    const block = item as Block & { text?: string; thinking?: string };
+    const full = (item.type === "text" ? block.text : block.thinking) ?? "";
+    // Empty assembled blocks carry nothing: drop them.
+    if (full.length === 0) continue;
+    // A streamed block of the same type whose text is a prefix of this one
+    // was already delivered, at least partly. A non-empty streamed text is
+    // required so an empty or aborted streamed block does not swallow it.
+    const streamed = streamedBlocks[streamPos];
+    if (
+      streamed &&
+      streamed.type === item.type &&
+      streamed.text.length > 0 &&
+      full.startsWith(streamed.text)
+    ) {
+      streamPos++;
+      const remainder = full.slice(streamed.text.length);
+      if (remainder.length === 0) continue;
+      kept.push({ ...item, [item.type === "text" ? "text" : "thinking"]: remainder });
+      continue;
+    }
+    kept.push(item);
+  }
+  return kept;
+}
+
+/** Attributes a report to the Agent/Task tool call of the subagent that made it. */
+function stampParentToolUseId(update: SessionNotification["update"], parentToolUseId: string) {
+  update._meta = {
+    ...update._meta,
+    claudeCode: {
+      ...((update._meta?.claudeCode as Record<string, unknown> | undefined) ?? {}),
+      parentToolUseId,
+    },
   };
-  /* Terminal metadata for Bash tool execution, matching codex-acp's _meta protocol. */
-  terminal_info?: {
-    terminal_id: string;
-  };
-  terminal_output?: {
-    terminal_id: string;
-    data: string;
-  };
-  terminal_output_delta?: {
-    terminal_id: string;
-    data: string;
-  };
-  terminal_exit?: {
-    terminal_id: string;
-    exit_code: number;
-    signal: string | null;
-  };
-};
+}
 
 const SUBAGENT_TRANSCRIPT_CAPABILITY = "subagent-transcript";
 
@@ -1934,6 +1953,58 @@ class ClientConnection implements AcpClient {
   }
 }
 
+/**
+ * The client that the agent talks to. For an AIR client, every session update
+ * passes the {@link ChangedMetaFilter} last, after the native subagent routing,
+ * so a `tool_call_update` carries only the `_meta` keys that changed. ACP
+ * merges only the top-level tool call fields, not the `_meta` keys. So another
+ * client gets the full `_meta` on each update.
+ */
+class ChangedMetaClient implements AcpClient {
+  private readonly filter = new ChangedMetaFilter();
+
+  constructor(
+    private readonly inner: AcpClient,
+    private readonly airClient: () => boolean,
+  ) {}
+
+  async sessionUpdate(params: AcpSessionNotification): Promise<void> {
+    if (!this.airClient()) return this.inner.sessionUpdate(params);
+    const update = this.filter.apply(params.update as SessionNotification["update"]);
+    if (update) await this.inner.sessionUpdate({ ...params, update } as AcpSessionNotification);
+  }
+
+  requestPermission(
+    params: RequestPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    return this.inner.requestPermission(params, signal);
+  }
+
+  readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
+    return this.inner.readTextFile(params);
+  }
+
+  writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
+    return this.inner.writeTextFile(params);
+  }
+
+  createElicitation(
+    params: CreateElicitationRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    return this.inner.createElicitation(params, signal);
+  }
+
+  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+    return this.inner.completeElicitation(params);
+  }
+
+  extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+    return this.inner.extNotification(method, params);
+  }
+}
+
 function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const cleanup = () => signal.removeEventListener("abort", onAbort);
@@ -2151,7 +2222,7 @@ export class ClaudeAcpAgent {
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
-    this.client = client;
+    this.client = new ChangedMetaClient(client, () => isAirClient(this.clientCapabilities));
     this.logger = logger ?? console;
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
@@ -2172,6 +2243,7 @@ export class ClaudeAcpAgent {
         this.closeQueryStream(session);
         session.abortController.abort();
         session.eagerToolCallSessions?.clear();
+        session.toolCallFields?.clear();
         clearHookCallbacks(id);
         session.nativeSubagentRuntime?.clear();
         session.asyncTaskRuntime?.clear();
@@ -2192,6 +2264,7 @@ export class ClaudeAcpAgent {
     });
     this.sessionModes = new SessionModeManager({
       getSession: (sessionId) => this.sessions[sessionId],
+      airClient: () => isAirClient(this.clientCapabilities),
       sessionEndedMessage: SESSION_ENDED_MESSAGE,
       updateConfigOption: (sessionId, configId, value) =>
         this.updateConfigOption(sessionId, configId, value),
@@ -2372,21 +2445,30 @@ export class ClaudeAcpAgent {
       // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
+      // Only AIR gets the AIR capabilities and the goal capability, under
+      // `jetbrains.air`.
       _meta: {
-        ...airSessionFailureCapabilityMeta(
-          AGENT_FILE_CHANGE_REPORT_CAPABILITY,
-          AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
-          AIR_ASYNC_TASKS_CAPABILITY,
-          AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
-        ),
+        ...(isAirClient(request.clientCapabilities)
+          ? withAirMeta(
+              airSessionFailureCapabilityMeta(
+                AGENT_FILE_CHANGE_REPORT_CAPABILITY,
+                AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+                AIR_ASYNC_TASKS_CAPABILITY,
+                AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+                AIR_DIFF_PATCH_CAPABILITY,
+                AIR_PLAN_FILE_CAPABILITY,
+              ),
+              AIR_GOAL_KEY,
+              {
+                version: GOAL_EXTENSION_VERSION,
+                controlMethod: GOAL_CONTROL_METHOD,
+                actions: [...GOAL_ACTIONS],
+              } satisfies GoalCapability,
+            )
+          : {}),
         steering: {
           supported: true,
         },
-        goal: {
-          version: GOAL_EXTENSION_VERSION,
-          controlMethod: GOAL_CONTROL_METHOD,
-          actions: [...GOAL_ACTIONS],
-        } satisfies GoalCapability,
       },
     };
   }
@@ -3153,22 +3235,23 @@ export class ClaudeAcpAgent {
     if (session) {
       session.lastPublishedGoal = goal;
     }
+    // The goal is an AIR extension: only AIR gets it.
+    if (!isAirClient(this.clientCapabilities)) return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "session_info_update",
-        _meta: { goal },
+        _meta: withAirMeta(undefined, AIR_GOAL_KEY, goal),
       },
     });
   }
 
   private async publishTaskPlan(sessionId: string, taskState: TaskState): Promise<void> {
+    const entries = changedTaskPlanEntries(taskState, isAirClient(this.clientCapabilities));
+    if (!entries) return;
     await this.client.sessionUpdate({
       sessionId,
-      update: {
-        sessionUpdate: "plan",
-        entries: taskStateToPlanEntries(taskState),
-      },
+      update: { sessionUpdate: "plan", entries },
     });
   }
 
@@ -3380,7 +3463,28 @@ export class ClaudeAcpAgent {
     // on content rather than the Anthropic message id makes dedupe robust to
     // gateways that don't carry a stable/matching id across the stream and the
     // consolidated message. Reset after each consolidated message consumes it.
-    const streamedBlocks: { index: number; type: "text" | "thinking"; text: string }[] = [];
+    //
+    // Keyed by the parent tool use of the stream ("" for the top level), so a
+    // subagent message gets the same remainder diff as a top-level message.
+    // The entry of a subagent goes when the subagent finishes.
+    const streamedBlocksByParent = new Map<string, StreamedBlock[]>();
+    const streamedBlocksOf = (parentToolUseId: string | null): StreamedBlock[] => {
+      const key = parentToolUseId ?? "";
+      let blocks = streamedBlocksByParent.get(key);
+      if (!blocks) streamedBlocksByParent.set(key, (blocks = []));
+      return blocks;
+    };
+    // A client gets the consolidated subagent text when it negotiated the
+    // transcript extension or the `forwardSubagentText` session option. AIR
+    // also gets it with native subagent sessions, and AIR gets no streamed
+    // subagent text without it: nested text then stays internal to the Agent
+    // tool call. Every other client gets the streamed subagent text, like
+    // upstream.
+    const airClient = isAirClient(this.clientCapabilities);
+    const forwardsSubagentText = () =>
+      session.forwardSubagentText ||
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      (airClient && clientSupportsSubagents(this.clientCapabilities));
     // Tool-use blocks start streaming before their JSON input. Keep the
     // partial input per parent message and block index so completed top-level
     // fields can refine the pending tool call while it streams. Entries are
@@ -3424,6 +3528,7 @@ export class ClaudeAcpAgent {
 
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
+      airClient: isAirClient(this.clientCapabilities),
       presentation: clientSupportsCompactionUpdates(this.clientCapabilities)
         ? "compaction_update"
         : "tool_call",
@@ -3433,7 +3538,7 @@ export class ClaudeAcpAgent {
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
-        { parentToolUseId?: string | null; subagent?: true; toolName?: string } | undefined;
+        { parentToolUseId?: string | null; toolName?: string } | undefined;
       const toolCallId =
         update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update"
           ? update.toolCallId
@@ -3612,12 +3717,12 @@ export class ClaudeAcpAgent {
       lastAssistantWasUsageLimit = false;
       lastAssistantFailureTitle = undefined;
       lastRefusalExplanation = null;
-      // Do NOT reset currentStreamMessageId or streamedBlocks here. Turn
+      // Do NOT reset currentStreamMessageId or the streamed blocks here. Turn
       // activation can fire mid-message (the replayed user echo with
       // --replay-user-messages lands between a message's blocks); clearing the
       // streamed-content record on activation would drop the blocks that
       // streamed before the echo, so the consolidated assistant message would
-      // re-emit them as duplicates. streamedBlocks is bounded instead by being
+      // re-emit them as duplicates. The streamed blocks are bounded instead by being
       // cleared when each consolidated message consumes it. #785 stopped
       // resetting the streamed-content tracking here but left this line.
       stopReason = "end_turn";
@@ -4377,7 +4482,7 @@ export class ClaudeAcpAgent {
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
                 await this.syncFastModeState(
-                  message.session_id,
+                  params.sessionId,
                   session,
                   message.fast_mode_state,
                   message.fast_mode_disabled_reason,
@@ -4393,7 +4498,7 @@ export class ClaudeAcpAgent {
                 ) {
                   session.terminalSlashCommands = message.terminal_slash_commands;
                   try {
-                    await this.sendAvailableCommandsUpdate(message.session_id);
+                    await this.sendAvailableCommandsUpdate(params.sessionId);
                   } catch (error) {
                     // Advisory reconcile only — the client keeps its current
                     // (unfiltered) list; never fail the turn over it.
@@ -4441,7 +4546,7 @@ export class ClaudeAcpAgent {
                 lastAssistantTotalUsage = usedTokens;
                 session.contextUsedTokens = usedTokens;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: attachUsageModel({
                     sessionUpdate: "usage_update",
                     used: lastAssistantTotalUsage,
@@ -4459,7 +4564,7 @@ export class ClaudeAcpAgent {
                 if (usageTurn?.isUsageCommand && session.cancelled) break;
                 if (usageMarkdown === null) break;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: usageMarkdown ?? message.content },
@@ -4618,42 +4723,9 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "memory_recall": {
-                const isSynthesis = message.mode === "synthesize";
-                const locations = isSynthesis
-                  ? []
-                  : message.memories.map((m) => ({ path: m.path }));
-                const content = isSynthesis
-                  ? message.memories
-                      .filter(
-                        (m): m is (typeof message.memories)[number] & { content: string } =>
-                          typeof m.content === "string",
-                      )
-                      .map((m) => ({
-                        type: "content" as const,
-                        content: { type: "text" as const, text: m.content },
-                      }))
-                  : [];
-                const count = message.memories.length;
-                const title = isSynthesis
-                  ? "Recalled synthesized memory"
-                  : `Recalled ${count} ${count === 1 ? "memory" : "memories"}`;
                 await sendUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "tool_call",
-                    toolCallId: message.uuid,
-                    title,
-                    kind: "read",
-                    status: "completed",
-                    ...(locations.length > 0 && { locations }),
-                    ...(content.length > 0 && { content }),
-                    _meta: {
-                      claudeCode: {
-                        toolName: "memory_recall",
-                        toolResponse: { mode: message.mode },
-                      },
-                    } satisfies ToolUpdateMeta,
-                  },
+                  sessionId: params.sessionId,
+                  update: AcpToolCallRenderer.for(this.clientCapabilities).memoryRecall(message),
                 });
                 break;
               }
@@ -4665,7 +4737,7 @@ export class ClaudeAcpAgent {
                 // it's authoritative, and re-querying supportedCommands()
                 // would just return the same list with an extra round-trip.
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "available_commands_update",
                     availableCommands: getAvailableSlashCommands(
@@ -4727,32 +4799,18 @@ export class ClaudeAcpAgent {
                   // child tool call was not announced there.
                   break;
                 }
-                const reason = message.decision_reason ?? message.message;
-                await sendUpdate({
-                  sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId: message.tool_use_id,
-                    status: "failed",
-                    content: [
-                      {
-                        type: "content",
-                        content: { type: "text", text: `Permission denied: ${reason}` },
-                      },
-                    ],
-                    _meta: {
-                      claudeCode: {
-                        toolName: message.tool_name,
-                        ...(parentToolUseId ? { parentToolUseId } : {}),
-                        toolResponse: {
-                          decisionReasonType: message.decision_reason_type,
-                          decisionReason: message.decision_reason,
-                          message: message.message,
-                        },
-                      },
-                    } satisfies ToolUpdateMeta,
-                  },
+                const denied = AcpToolCallRenderer.for(this.clientCapabilities).permissionDenied({
+                  toolCallId: message.tool_use_id,
+                  toolName: message.tool_name,
+                  parentToolUseId,
+                  decisionReasonType: message.decision_reason_type,
+                  decisionReason: message.decision_reason,
+                  message: message.message,
                 });
+                // A denial is final, so it replaces a pinned approval patch.
+                if (toolCallFieldsOf(session).apply(denied, { replacePinnedContent: true })) {
+                  await sendUpdate({ sessionId: params.sessionId, update: denied });
+                }
                 break;
               }
               case "informational": {
@@ -4786,7 +4844,7 @@ export class ClaudeAcpAgent {
                     ? message.content
                     : `**${sentenceCase(message.level)}:** ${message.content}`;
                 await sendUpdate({
-                  sessionId: message.session_id,
+                  sessionId: params.sessionId,
                   update: noticeOrTranscriptUpdate(
                     {
                       severity,
@@ -4884,7 +4942,11 @@ export class ClaudeAcpAgent {
                   summary: message.summary,
                   output_file: message.output_file,
                 });
-                if (message.tool_use_id) subagents.discardPending(message.tool_use_id);
+                if (message.tool_use_id) {
+                  subagents.discardPending(message.tool_use_id);
+                  // The subagent streams no more text under this parent.
+                  streamedBlocksByParent.delete(message.tool_use_id);
+                }
                 session.liveBackgroundTasks.delete(message.task_id);
                 break;
               case "task_updated":
@@ -4900,6 +4962,10 @@ export class ClaudeAcpAgent {
                   message.patch.status === "killed"
                 ) {
                   await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
+                  const parentToolUseId = session.liveBackgroundTasks.get(
+                    message.task_id,
+                  )?.parentToolUseId;
+                  if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
                   session.liveBackgroundTasks.delete(message.task_id);
                 }
                 break;
@@ -5020,7 +5086,7 @@ export class ClaudeAcpAgent {
                           ...(explanation ? { description: explanation } : {}),
                         };
                   await sendUpdate({
-                    sessionId: message.session_id,
+                    sessionId: params.sessionId,
                     update: noticeOrTranscriptUpdate(
                       { severity: "warning", ...notice },
                       supportsNotices,
@@ -5755,21 +5821,16 @@ export class ClaudeAcpAgent {
               // the top-level record. Fires once, before any of this message's
               // blocks, so it doesn't disturb the mid-message turn-activation
               // path the way resetting on turn activation would.
-              if (message.parent_tool_use_id === null) {
-                streamedBlocks.length = 0;
-              }
+              streamedBlocksOf(message.parent_tool_use_id).length = 0;
             }
             // Accumulate the text/thinking actually streamed live, so the
             // `assistant` case below can diff its assembled blocks against what
             // already reached the client as chunks and forward only the
-            // remainder. Gated on `parent_tool_use_id === null` so a subagent
-            // stream can't attribute its content to the top-level message.
+            // remainder. Each stream (top level or one subagent) keeps its own
+            // record, so a subagent cannot attribute content to another stream.
             // Contiguous deltas of the same block (same index and type) extend
             // the current entry; anything else opens a new one.
-            if (
-              message.parent_tool_use_id === null &&
-              message.event.type === "content_block_delta"
-            ) {
+            if (message.event.type === "content_block_delta") {
               const delta = message.event.delta;
               const chunk =
                 delta.type === "text_delta"
@@ -5784,6 +5845,7 @@ export class ClaudeAcpAgent {
               // re-emitting the next block as a duplicate.
               if (chunk?.text) {
                 const index = message.event.index;
+                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
                 const last = streamedBlocks[streamedBlocks.length - 1];
                 if (last && last.index === index && last.type === chunk.type) {
                   last.text += chunk.text;
@@ -5861,10 +5923,22 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                toolCallFields: toolCallFieldsOf(session),
                 messageId: currentStreamMessageId,
                 streamedToolInputs,
               },
             )) {
+              // Nested text stays internal for an AIR client that does not
+              // get it, like the consolidated subagent message below.
+              if (
+                message.parent_tool_use_id !== null &&
+                airClient &&
+                !forwardsSubagentText() &&
+                (notification.update.sessionUpdate === "agent_message_chunk" ||
+                  notification.update.sessionUpdate === "agent_thought_chunk")
+              ) {
+                continue;
+              }
               // sendUpdate records delivery; a subagent stream's chunks carry
               // the stamped parentToolUseId meta and are excluded there.
               await sendUpdate(notification);
@@ -6141,77 +6215,25 @@ export class ClaudeAcpAgent {
             }
 
             let content: typeof message.message.content;
-            if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              // Top-level assistant message: each text/thinking block may have
-              // already been streamed live as deltas. Diff each against what
-              // streamed (`streamedBlocks`, in document order) and forward only
-              // the un-streamed remainder — nothing if it streamed in full (the
-              // common case), the whole block if it never streamed (a
-              // non-streaming gateway), or just the tail if the stream was cut
-              // short mid-block. `streamPos` walks the streamed blocks in step
-              // with the assembled text/thinking blocks; tool_use and other
-              // blocks pass through untouched (their own `toolUseCache` collapses
-              // the streamed/assembled pair) without advancing it.
-              const blocks = message.message.content;
-              const kept: typeof blocks = [];
-              let streamPos = 0;
-              for (const item of blocks) {
-                if (item.type !== "text" && item.type !== "thinking") {
-                  kept.push(item);
-                  continue;
-                }
-                const full = item.type === "text" ? item.text : item.thinking;
-                // Empty assembled blocks carry nothing (some gateways emit an
-                // empty `thinking` block before the real text) — drop them.
-                if (full.length === 0) {
-                  continue;
-                }
-                // A streamed block of the same type whose accumulated text is a
-                // prefix of this one was already (at least partly) delivered as
-                // chunks; consume it and forward only what's left. A non-empty
-                // streamed text is required so an empty/aborted streamed block
-                // doesn't swallow the assembled copy.
-                const streamed = streamedBlocks[streamPos];
-                if (
-                  streamed &&
-                  streamed.type === item.type &&
-                  streamed.text.length > 0 &&
-                  full.startsWith(streamed.text)
-                ) {
-                  streamPos++;
-                  const remainder = full.slice(streamed.text.length);
-                  if (remainder.length === 0) {
-                    continue;
-                  }
-                  // Overwrite in place with just the un-streamed tail (the
-                  // assembled message isn't read again after this) so the block
-                  // keeps its exact SDK type.
-                  if (item.type === "text") {
-                    item.text = remainder;
-                  } else {
-                    item.thinking = remainder;
-                  }
-                  kept.push(item);
-                  continue;
-                }
-                // Not matched: never streamed (or the stream diverged from the
-                // assembled text) — forward the block in full.
-                kept.push(item);
-              }
-              content = kept;
-              // Consumed: reset so the next message's blocks accumulate fresh and
-              // the record stays bounded to the in-flight message.
-              streamedBlocks.length = 0;
-            } else if (
+            if (
               message.type === "assistant" &&
-              !(session.forwardSubagentText || supportsSubagentTranscript(this.clientCapabilities))
+              (message.parent_tool_use_id === null || forwardsSubagentText())
             ) {
-              // Legacy clients keep the flattened tool-call representation,
-              // but nested text/thinking stays internal unless explicitly
-              // requested through the historical transcript extension.
+              // Each text/thinking block may have streamed live as deltas
+              // already, for the top level and for a subagent. Forward only
+              // the un-streamed remainder (see `unstreamedRemainder`), and
+              // reset the record of the stream so the next message starts
+              // fresh.
+              const streamed = streamedBlocksOf(message.parent_tool_use_id);
+              content = unstreamedRemainder(message.message.content, streamed);
+              streamed.length = 0;
+            } else if (message.type === "assistant") {
+              // Nested text/thinking stays internal for a client that does
+              // not get subagent text.
               content = message.message.content.filter(
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
+              streamedBlocksOf(message.parent_tool_use_id).length = 0;
             } else {
               content = message.message.content;
             }
@@ -6240,6 +6262,7 @@ export class ClaudeAcpAgent {
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
+                toolCallFields: toolCallFieldsOf(session),
                 messageId: messageIdForGrouping(message),
                 toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
@@ -6291,42 +6314,30 @@ export class ClaudeAcpAgent {
                 ? message.parent_tool_use_id
                 : undefined
               : undefined;
-            await sendUpdate({
-              sessionId: message.session_id,
-              update: {
-                sessionUpdate: "tool_call_update",
-                toolCallId,
-                status: "in_progress",
-                _meta: {
-                  claudeCode: {
-                    toolName: message.tool_name,
-                    ...(subagentParentToolUseId
-                      ? { parentToolUseId: subagentParentToolUseId }
-                      : {}),
-                    toolResponse: {
-                      elapsedTimeSeconds: message.elapsed_time_seconds,
-                      // For Agent/Task calls: the subagent's type, and — when
-                      // the subagent is waiting out an API rate-limit retry —
-                      // the SDK's retry counters (attempt, max_retries,
-                      // retry_delay_ms, …), forwarded verbatim so clients can
-                      // show why a spawn looks stalled.
-                      ...(message.subagent_type !== undefined && {
-                        subagentType: message.subagent_type,
-                      }),
-                      ...(message.subagent_retry !== undefined && {
-                        subagentRetry: message.subagent_retry,
-                      }),
-                    },
-                  },
-                } satisfies ToolUpdateMeta,
-              },
+            // `tool_name` names the tool that reports the beat. When the beat
+            // falls back to the parent call, AIR gets the name of that call,
+            // or no name. Every other client gets `tool_name`, like upstream.
+            const toolName =
+              toolCallId !== message.tool_use_id && isAirClient(this.clientCapabilities)
+                ? session.toolUseCache[toolCallId]?.name
+                : message.tool_name;
+            const beat = AcpToolCallRenderer.for(this.clientCapabilities).progress({
+              toolCallId,
+              toolName,
+              parentToolUseId: subagentParentToolUseId,
+              elapsedTimeSeconds: message.elapsed_time_seconds,
+              subagentType: message.subagent_type,
+              subagentRetry: message.subagent_retry,
             });
+            if (toolCallFieldsOf(session).apply(beat)) {
+              await sendUpdate({ sessionId: params.sessionId, update: beat });
+            }
             break;
           }
           case "rate_limit_event": {
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
-                sessionId: message.session_id,
+                sessionId: params.sessionId,
                 update: attachUsageModel({
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
@@ -6346,6 +6357,7 @@ export class ClaudeAcpAgent {
             subagents.clear();
             asyncTasks.clear();
             session.eagerToolCallSessions?.clear();
+            session.toolCallFields?.clear();
             clearHookCallbacks(params.sessionId);
             session.taskState.clear();
             await this.publishTaskPlan(params.sessionId, session.taskState);
@@ -6417,6 +6429,7 @@ export class ClaudeAcpAgent {
         );
         this.closeQueryStream(session);
         session.eagerToolCallSessions?.clear();
+        session.toolCallFields?.clear();
         clearHookCallbacks(params.sessionId);
         session.nativeSubagentRuntime?.clear();
         session.asyncTaskRuntime?.clear();
@@ -6477,6 +6490,7 @@ export class ClaudeAcpAgent {
     // this fire-and-forget notification, so there is nothing to do here.
     if (session.queryClosed) {
       session.eagerToolCallSessions?.clear();
+      session.toolCallFields?.clear();
       clearHookCallbacks(params.sessionId);
       return;
     }
@@ -6498,6 +6512,7 @@ export class ClaudeAcpAgent {
       );
     } finally {
       session.eagerToolCallSessions?.clear();
+      session.toolCallFields?.clear();
       clearHookCallbacks(params.sessionId);
     }
     // A priority steer may still be queued in the SDK when cancellation
@@ -6820,6 +6835,7 @@ export class ClaudeAcpAgent {
     // appropriate; query.close() above has already torn the subprocess down.
     session.abortController.abort();
     session.eagerToolCallSessions?.clear();
+    session.toolCallFields?.clear();
     clearHookCallbacks(sessionId);
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
@@ -6962,6 +6978,8 @@ export class ClaudeAcpAgent {
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
     );
     const session = this.sessions[sessionId];
+    // A replay rebuilds the client view, so its plan goes out again.
+    if (session?.taskState) forgetPublishedTaskPlan(session.taskState);
     const forwardSubagentText =
       session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
@@ -7193,7 +7211,11 @@ export class ClaudeAcpAgent {
       ) {
         const replayCompaction = new ContextCompactionLifecycle(
           (notification) => this.client.sessionUpdate(notification),
-          { sessionId, presentation: "compaction_update" },
+          {
+            sessionId,
+            presentation: "compaction_update",
+            airClient: isAirClient(this.clientCapabilities),
+          },
         );
         if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
           await replayCompaction.finish(message.uuid, "completed");
@@ -7301,6 +7323,8 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
     parentToolUseId?: string,
     ownerSessionId: string = params.sessionId,
+    toolInput: unknown = params.toolCall.rawInput,
+    previewContent?: ToolCallContent[],
   ): Promise<RequestPermissionResponse> {
     if (signal.aborted) throw new Error("Tool use aborted");
     // The SDK may invoke `canUseTool` (and therefore this permission request)
@@ -7313,10 +7337,12 @@ export class ClaudeAcpAgent {
       ownerSessionId,
       toolName,
       params.toolCall.toolCallId,
-      params.toolCall.rawInput,
+      toolInput,
       parentToolUseId,
       signal,
       params.sessionId,
+      previewContent,
+      previewContent !== undefined,
     );
     if (signal.aborted) throw new Error("Tool use aborted");
 
@@ -7355,34 +7381,33 @@ export class ClaudeAcpAgent {
     parentToolUseId?: string,
     signal?: AbortSignal,
     notificationSessionId: string = sessionId,
+    previewContent?: ToolCallContent[],
+    pinPreviewContent = false,
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
       return;
     }
+    // The permission request shows an exact approval patch. The streamed
+    // tool input must not replace it with the standard diff of the snippet.
+    const pinPreview = () => {
+      if (pinPreviewContent && previewContent) {
+        toolCallFieldsOf(session).pinContent(toolCallId, previewContent);
+      }
+    };
     if (session.emittedToolCalls.has(toolCallId)) {
+      pinPreview();
       return;
     }
     session.emittedToolCalls.add(toolCallId);
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
-    const supportsTerminalOutput =
-      this.clientCapabilities?._meta?.["terminal_output"] === true ||
-      this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
-    const update = toolCallNotification(
+    const update = AcpToolCallRenderer.for(this.clientCapabilities).toolCall(
       { id: toolCallId, name: toolName, input: toolInput },
-      toolInput,
-      supportsTerminalOutput,
-      session.cwd,
+      { cwd: session.cwd, previewContent },
     );
-    if (parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId,
-        },
-      };
-    }
+    if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
+    toolCallFieldsOf(session).apply(update);
+    pinPreview();
     try {
       const emission = this.client.sessionUpdate({ sessionId: notificationSessionId, update });
       await (signal ? raceWithAbort(emission, signal) : emission);
@@ -7392,6 +7417,7 @@ export class ClaudeAcpAgent {
       // be allowed to publish the tool call instead of refining a phantom one.
       session.emittedToolCalls.delete(toolCallId);
       session.eagerToolCallSessions?.delete(toolCallId);
+      session.toolCallFields?.delete(toolCallId);
       throw error;
     }
   }
@@ -7416,9 +7442,6 @@ export class ClaudeAcpAgent {
         mcpServer,
       },
     ) => {
-      const supportsTerminalOutput =
-        this.clientCapabilities?._meta?.["terminal_output"] === true ||
-        this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
         return {
@@ -7492,12 +7515,20 @@ export class ClaudeAcpAgent {
       // Artifact publishes).
       const noPersistentRule = matchedAskRule !== undefined || suppressAlwaysAllowRule === true;
       const durableChangeSet = normalizeDurablePermissionChangeSet(suggestions, noPersistentRule);
+      const supportsDiffPatch = clientSupportsAirCapability(
+        this.clientCapabilities,
+        AIR_DIFF_PATCH_CAPABILITY,
+      );
+      const previewContent = supportsDiffPatch
+        ? await previewPatchContent(toolName, toolInput, session.cwd)
+        : undefined;
       const presentation = buildClaudePermissionPresentation({
         toolName,
         input: toolInput,
         toolUseID,
         cwd: session.cwd,
-        supportsTerminalOutput,
+        capabilities: ToolCallClientCapabilities.from(this.clientCapabilities),
+        previewContent,
         blockedPath,
         title,
         displayName,
@@ -7512,11 +7543,14 @@ export class ClaudeAcpAgent {
       // server; anything else is configuration) instead of parsing the
       // tool-name prefix. The name is the config key as authored — untrusted
       // text, so it rides `_meta` rather than the title.
-      if (parentToolUseId || mcpServer) {
+      // AIR already holds the tool name and the parent tool call. Every
+      // other client gets them again, like upstream.
+      const airClient = isAirClient(this.clientCapabilities);
+      if (mcpServer || (parentToolUseId && !airClient)) {
         presentation.toolCall._meta = {
           claudeCode: {
-            toolName,
-            ...(parentToolUseId ? { parentToolUseId } : {}),
+            ...(airClient ? {} : { toolName }),
+            ...(parentToolUseId && !airClient ? { parentToolUseId } : {}),
             ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
           },
         };
@@ -7554,6 +7588,8 @@ export class ClaudeAcpAgent {
         signal,
         parentToolUseId,
         sessionId,
+        toolInput,
+        previewContent,
       );
       if (signal.aborted) throw new Error("Tool use aborted");
       const decodedPermission = decodeClaudePermissionResponse(
@@ -7664,7 +7700,12 @@ export class ClaudeAcpAgent {
       return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
     }
 
-    const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);
+    const createRequest = askUserQuestionsToCreateRequest(
+      questions,
+      sessionId,
+      toolUseID,
+      isAirClient(this.clientCapabilities),
+    );
     let response;
     try {
       response = await this.withPendingUserInput(sessionId, () =>
@@ -9710,198 +9751,11 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
-/** Build the Claude Code-specific metadata for a tool call. Shell (Bash and
- *  PowerShell) descriptions are kept out of ACP's standard `title`, which
- *  clients may use as the shell command preview, while still giving clients
- *  access to Claude's concise human-readable title. */
-function claudeCodeMetaFromToolUse(
-  toolUse: {
-    name: string;
-    input?: unknown;
-  },
-  cwd?: string,
-): NonNullable<ToolUpdateMeta["claudeCode"]> {
-  const description =
-    (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
-    toolUse.input !== null &&
-    typeof toolUse.input === "object" &&
-    "description" in toolUse.input &&
-    typeof toolUse.input.description === "string"
-      ? toolUse.input.description
-      : undefined;
-  const skillName =
-    toolUse.name === "Skill"
-      ? (toolUse.input as { skill?: string } | null | undefined)?.skill
-      : undefined;
-  const skillPath = skillName ? resolveSkillPath(skillName, cwd) : undefined;
-  return {
-    toolName: toolUse.name,
-    ...(description ? { title: description } : {}),
-    ...((toolUse.name === "Agent" || toolUse.name === "Task") && { subagent: true as const }),
-    ...(skillName ? { skill: skillName } : {}),
-    ...(skillPath ? { skillPath } : {}),
-  };
-}
-
-/**
- * Marks the Bash `tool_call_update` whose command detached into the background.
- *
- * A backgrounded Bash call returns as soon as the command is handed off, so the
- * card reaches `completed` while the command itself runs on for minutes. ACP has
- * no tool-call status for "still running elsewhere", so this marker is what lets
- * a client render the card as backgrounded work instead of finished work. It
- * rides the update the tool result already emits, so it costs no extra
- * notification and cannot arrive out of order.
- *
- * The command's own lifecycle -- progress, completion, the stop control -- is
- * published separately as an async task; this says only that the card has one.
- * Hence the AIR namespace rather than `claudeCode`: to a client without the
- * `asyncTasks` capability, which is never sent that lifecycle, the marker would
- * promise a card state it has no way to ever resolve.
- */
-function backgroundedBashToolCall(
-  notification: SessionNotification,
-  task: AsyncTaskStarted | undefined,
-  asyncTasksSupported: boolean,
-): SessionNotification {
-  const update = notification.update;
-  const toolCallId = task ? nonBlankTaskField(task.toolCallId ?? task.tool_use_id) : undefined;
-  if (
-    !asyncTasksSupported ||
-    !toolCallId ||
-    update.sessionUpdate !== "tool_call_update" ||
-    update.toolCallId !== toolCallId
-  ) {
-    return notification;
-  }
-  return {
-    ...notification,
-    update: {
-      ...update,
-      _meta: withAirMeta(update._meta, AIR_ASYNC_TASKS_CAPABILITY, { backgrounded: true }),
-    },
-  };
-}
-
-/** The task fields arrive as `unknown` off the wire; only non-blank strings carry a link. */
-function nonBlankTaskField(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
-}
-
-/** Roots a skill's directory may sit under, relative to the directory the scope resolves to. */
-const SKILL_CONTAINER_DIRS = [".claude/skills", ".agents/skills"] as const;
-
-/**
- * Absolute path of a skill's `SKILL.md`, or `undefined` when none of the known layouts holds one.
- *
- * The `Skill` tool reports only the skill's name, so the file has to be located by probing the layouts skills
- * actually use: project- and user-level `.claude/skills` (plus this repo's `.agents/skills` source of truth), and
- * for a `<prefix>:<name>` spelling either a plugin (`.claude/plugins/<prefix>/skills/<name>`) or a
- * directory-scoped skill (`<prefix>/.claude/skills/<name>`), which share that spelling. Only a path that exists
- * on disk is returned, so a wrong guess costs nothing and clients never render a link to a missing file.
- */
-function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
-  if (!cwd) {
-    return undefined;
-  }
-  const colon = skillName.indexOf(":");
-  const scope = colon < 0 ? undefined : skillName.slice(0, colon);
-  const name = colon < 0 ? skillName : skillName.slice(colon + 1);
-  if (!name) {
-    return undefined;
-  }
-  const candidates: string[] = [];
-  const addCandidates = (base: string) => {
-    for (const container of SKILL_CONTAINER_DIRS) {
-      candidates.push(path.join(base, container, name, "SKILL.md"));
-    }
-  };
-  if (scope) {
-    // A `<prefix>:<name>` skill is either directory-scoped or a plugin's; both spellings look identical.
-    addCandidates(path.join(cwd, scope));
-    candidates.push(path.join(cwd, ".claude/plugins", scope, "skills", name, "SKILL.md"));
-  }
-  addCandidates(cwd);
-  addCandidates(os.homedir());
-  return candidates.find((candidate) => existsSync(candidate));
-}
-
-/** Build the `tool_call` (or, with `refine`, the `tool_call_update`)
- *  notification for a tool_use. Shared by every site that surfaces a tool call:
- *  the streamed tool_use path (first encounter → tool_call, later encounter →
- *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
- *  drift. The initial `tool_call` carries `status: "pending"` and, for shell tools,
- *  the `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
- *  updates key off of, and the programmatic tool `name` (ACP's tool-call-name
- *  RFD); a refining `tool_call_update` carries none of these. `name` is set
- *  once at first report — on a v1 update, omitting it means "unchanged", and
- *  the tool behind a `toolCallId` never changes. */
-function toolCallNotification(
-  toolUse: { id: string; name: string; input: unknown },
-  rawInput: unknown,
-  supportsTerminalOutput: boolean,
-  cwd?: string,
-  refine = false,
-): SessionNotification["update"] {
-  if (refine) {
-    return {
-      _meta: { claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd) } satisfies ToolUpdateMeta,
-      toolCallId: toolUse.id,
-      sessionUpdate: "tool_call_update",
-      rawInput,
-      ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
-    };
-  }
-  return {
-    _meta: {
-      claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
-      ...((toolUse.name === "Bash" || toolUse.name === "PowerShell") && supportsTerminalOutput
-        ? { terminal_info: { terminal_id: toolUse.id } }
-        : {}),
-    } satisfies ToolUpdateMeta,
-    toolCallId: toolUse.id,
-    sessionUpdate: "tool_call",
-    name: toolUse.name,
-    rawInput,
-    status: "pending",
-    ...toolInfoFromToolUse(toolUse, supportsTerminalOutput, cwd),
-  };
-}
-
-/** Refine a pending tool call from the complete top-level fields recovered
- *  from its still-streaming input. Shares `toolInfoFromToolUse` with the
- *  consolidated path but never carries `content`: content built from partial
- *  input is misleading (an Edit missing its `new_string` renders as a pure
- *  deletion) or invalid (a Write diff without `content` lacks the required
- *  `newText`), and the consolidated message supplies it moments later. */
-function streamedInputRefinement(
-  toolUse: { id: string; name: string },
-  input: Record<string, unknown>,
-  supportsTerminalOutput: boolean,
-  cwd?: string,
-): SessionNotification["update"] | undefined {
-  // TodoWrite/Task* never surfaced a tool_call to refine (plan lane).
-  if (!shouldEmitToolCall(toolUse.name)) {
-    return undefined;
-  }
-  const { title, kind, locations } = toolInfoFromToolUse(
-    { ...toolUse, input },
-    supportsTerminalOutput,
-    cwd,
-  );
-  return {
-    _meta: {
-      claudeCode: claudeCodeMetaFromToolUse({ ...toolUse, input }, cwd),
-    } satisfies ToolUpdateMeta,
-    toolCallId: toolUse.id,
-    sessionUpdate: "tool_call_update",
-    rawInput: input,
-    title,
-    kind,
-    ...(locations ? { locations } : {}),
-  };
+/** The tool-call field tracker of a session, created on first use. */
+function toolCallFieldsOf(session: {
+  toolCallFields?: ToolCallFieldTracker;
+}): ToolCallFieldTracker {
+  return (session.toolCallFields ??= new ToolCallFieldTracker());
 }
 
 /**
@@ -9928,6 +9782,14 @@ export function toAcpNotifications(
     // tool_call/update decision falls back to `toolUseCache` presence (the
     // historical single-source behavior).
     emittedToolCalls?: Set<string>;
+    // False while the input of a streamed tool_use still streams: the first
+    // tool_call then leaves `rawInput` out, and the consolidated message
+    // sends it once it is complete.
+    inputComplete?: boolean;
+    // Remembers the fields sent for each open tool call. When present, a
+    // tool_call_update carries only the fields that changed, and an update
+    // with nothing new is dropped. Mutated in place.
+    toolCallFields?: ToolCallFieldTracker;
     // Opaque id identifying the message these chunks belong to (ACP message ids
     // are opaque strings — no particular format is required). Attached to
     // user/agent message and thought chunks so clients can group streamed chunks
@@ -9947,10 +9809,7 @@ export function toAcpNotifications(
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
-  const supportsTerminalOutputDelta =
-    options?.clientCapabilities?._meta?.["terminal_output_delta"] === true;
-  const supportsTerminalOutput =
-    supportsTerminalOutputDelta || options?.clientCapabilities?._meta?.["terminal_output"] === true;
+  const renderer = AcpToolCallRenderer.for(options?.clientCapabilities);
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];
@@ -9995,6 +9854,8 @@ export function toAcpNotifications(
   // Only handle the first chunk for streaming; extend as needed for batching
   for (const chunk of content) {
     let update: SessionNotification["update"] | null = null;
+    // The tool call that this chunk finishes, if it is a tool result.
+    let finishedToolCallId: string | undefined;
     switch (chunk.type) {
       case "text":
       case "text_delta": {
@@ -10061,41 +9922,34 @@ export function toAcpNotifications(
             // closing over the name keeps the diff working without depending on
             // (or pinning) the cache entry's lifetime.
             const toolName = chunk.name;
+            const hookToolCallId = chunk.id;
             registerHookCallback(
               chunk.id,
               {
-                onPostToolUseHook: async (toolUseId, toolInput, toolResponse) => {
-                  // Both `Edit` and `Write` produce a structuredPatch in their
-                  // PostToolUse tool_response. For Edit the diff replaces the
-                  // optimistic content built at tool_use time. For Write the
-                  // optimistic content (built from `input.content` alone with
-                  // `oldText: null`) shows "creation" semantics regardless of
-                  // whether the file existed; the structuredPatch from the
-                  // hook lets us emit the real diff for `type: "update"`. The
-                  // helper returns `{}` if the response shape isn't usable.
-                  const editDiff =
-                    toolName === "Edit" || toolName === "Write"
-                      ? toolUpdateFromDiffToolResponse(toolResponse)
-                      : {};
-                  const update: SessionNotification["update"] = {
-                    _meta: {
-                      claudeCode: {
-                        toolResponse,
-                        toolName,
-                        ...(options?.parentToolUseId
-                          ? { parentToolUseId: options.parentToolUseId }
-                          : {}),
-                      },
-                    } satisfies ToolUpdateMeta,
-                    toolCallId: toolUseId,
-                    sessionUpdate: "tool_call_update",
-                    ...editDiff,
-                  };
-                  await client.sessionUpdate({
-                    sessionId,
-                    update,
-                  });
+                onPostToolUseHook: async (toolUseId, _toolInput, toolResponse) => {
+                  // The final diff of an Edit or a Write replaces the
+                  // optimistic content built from the input. Only the marker
+                  // fields of the tool_response travel: the rest repeats
+                  // output that the content already carries.
+                  const update = await renderer.hookResult(
+                    { id: toolUseId, name: toolName },
+                    toolResponse,
+                    options?.cwd,
+                  );
+                  if (!update) return;
+                  if (options?.parentToolUseId) {
+                    stampParentToolUseId(update, options.parentToolUseId);
+                  }
+                  // The final result may replace a pinned approval patch.
+                  if (
+                    options?.toolCallFields &&
+                    !options.toolCallFields.apply(update, { replacePinnedContent: true })
+                  ) {
+                    return;
+                  }
+                  await client.sessionUpdate({ sessionId, update });
                 },
+                onRelease: () => options?.toolCallFields?.finishHook(hookToolCallId),
               },
               sessionId,
             );
@@ -10107,6 +9961,7 @@ export function toAcpNotifications(
           } catch {
             // ignore if we can't turn it to JSON
           }
+          const toolUse = { id: chunk.id, name: chunk.name, input: rawInput };
 
           // Emit a `tool_call` only the first time this id surfaces to the
           // client; afterwards refine it with a `tool_call_update`. The first
@@ -10118,22 +9973,19 @@ export function toAcpNotifications(
           const alreadyEmitted = emittedToolCalls ? emittedToolCalls.has(chunk.id) : alreadyCached;
           emittedToolCalls?.add(chunk.id);
 
-          if (alreadyEmitted) {
-            // Already surfaced (full assistant message after streaming, or a
-            // permission request emitted it first) — refine with a
-            // tool_call_update rather than emitting a duplicate tool_call.
-            update = toolCallNotification(
-              chunk,
-              rawInput,
-              supportsTerminalOutput,
-              options?.cwd,
-              true,
-            );
-          } else {
-            // First surface (streaming content_block_start or replay) — send as
-            // tool_call (with terminal_info for Bash).
-            update = toolCallNotification(chunk, rawInput, supportsTerminalOutput, options?.cwd);
-          }
+          // A permission request surfaced the tool call with its complete
+          // input. The empty input at the stream start has nothing to add.
+          if (alreadyEmitted && options?.inputComplete === false) break;
+          update = alreadyEmitted
+            ? // Already surfaced (full assistant message after streaming, or a
+              // permission request emitted it first): refine it with the
+              // complete input.
+              renderer.refinement(toolUse, options?.cwd)
+            : // First surface (streaming content_block_start or replay).
+              renderer.toolCall(toolUse, {
+                cwd: options?.cwd,
+                inputComplete: options?.inputComplete,
+              });
         }
         break;
       }
@@ -10149,6 +10001,7 @@ export function toAcpNotifications(
         const wasEmitted = options?.emittedToolCalls?.has(chunk.tool_use_id) === true;
         options?.emittedToolCalls?.delete(chunk.tool_use_id);
         completeHookCallback(chunk.tool_use_id);
+        finishedToolCallId = chunk.tool_use_id;
         // Why this is_error result carries harness prose instead of tool
         // output (user-rejected / interrupted / …), when the SDK said so.
         // Spread into the claudeCode meta of every update emitted below; the
@@ -10252,66 +10105,25 @@ export function toAcpNotifications(
               }
             }
           }
-          if (shouldEmitTaskPlan) {
-            update = {
-              sessionUpdate: "plan",
-              entries: taskStateToPlanEntries(taskState),
-            };
-          }
+          const entries = shouldEmitTaskPlan
+            ? changedTaskPlanEntries(taskState, renderer.capabilities.air.client)
+            : undefined;
+          if (entries) update = { sessionUpdate: "plan", entries };
         } else if (toolUse.name !== "TodoWrite") {
-          const { _meta: toolMeta, ...toolUpdate } = toolUpdateFromToolResult(
-            chunk,
-            toolUseCache[chunk.tool_use_id],
-            supportsTerminalOutput,
-            toolUseResult,
-            supportsTerminalOutputDelta,
-          );
-
-          const terminalOutput = toolMeta?.terminal_output_delta ?? toolMeta?.terminal_output;
-          const terminalOutputKey = toolMeta?.terminal_output_delta
-            ? "terminal_output_delta"
-            : "terminal_output";
-
-          // When terminal output is supported, send its payload as a
-          // separate notification to match codex-acp's streaming lifecycle:
-          //   1. tool_call       → _meta.terminal_info  (already sent above)
-          //   2. tool_call_update → terminal output      (sent here)
-          //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
-          if (terminalOutput) {
-            output.push({
-              sessionId,
-              update: {
-                _meta: {
-                  [terminalOutputKey]: terminalOutput,
-                  ...(options?.parentToolUseId
-                    ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
-                    : {}),
-                },
-                toolCallId: chunk.tool_use_id,
-                sessionUpdate: "tool_call_update" as const,
-              },
-            });
+          // A command sends its output first, then the exit and the status.
+          const [finalUpdate, ...rest] = renderer
+            .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
+              structured: toolUseResult,
+              nonExecution: nonExecution as Record<string, unknown> | undefined,
+            })
+            .reverse();
+          for (const outputUpdate of rest.reverse()) {
+            if (options?.parentToolUseId) {
+              stampParentToolUseId(outputUpdate, options.parentToolUseId);
+            }
+            output.push({ sessionId, update: outputUpdate });
           }
-
-          update = {
-            _meta: {
-              claudeCode: {
-                toolName: toolUse.name,
-                ...(nonExecution ?? {}),
-              },
-              ...(toolMeta?.terminal_exit ? { terminal_exit: toolMeta.terminal_exit } : {}),
-            } satisfies ToolUpdateMeta,
-            toolCallId: chunk.tool_use_id,
-            sessionUpdate: "tool_call_update",
-            status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
-            // The terminal output already carried the exact bytes in the preceding
-            // update. Repeating them as rawOutput wastes bandwidth and lets a
-            // client accidentally render the same output twice.
-            ...(terminalOutput
-              ? {}
-              : { rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content) }),
-            ...toolUpdate,
-          };
+          update = finalUpdate;
         }
         // The tool_use is fully resolved now — drop it so a long session doesn't
         // retain every tool call. The PostToolUse hook (Edit/Write diffs) closes
@@ -10349,7 +10161,24 @@ export function toAcpNotifications(
         };
       }
       applyMessageId(update, options?.messageId);
-      output.push({ sessionId, update });
+      // A tool result is final, so it may replace a pinned approval patch,
+      // for example with the error text of a rejected Edit.
+      if (
+        !options?.toolCallFields ||
+        options.toolCallFields.apply(update, {
+          replacePinnedContent: finishedToolCallId !== undefined,
+        })
+      ) {
+        output.push({ sessionId, update });
+      }
+    }
+    if (finishedToolCallId !== undefined) {
+      // The PostToolUse hook can still send the final diff, so the fields
+      // stay tracked until its callback leaves the registry.
+      options?.toolCallFields?.finishResult(
+        finishedToolCallId,
+        hasHookCallback(finishedToolCallId),
+      );
     }
   }
 
@@ -10367,6 +10196,7 @@ export function streamEventToAcpNotifications(
     cwd?: string;
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
+    toolCallFields?: ToolCallFieldTracker;
     messageId?: string;
     streamedToolInputs?: StreamedToolInputCache;
   },
@@ -10380,6 +10210,7 @@ export function streamEventToAcpNotifications(
     cwd: options?.cwd,
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
+    toolCallFields: options?.toolCallFields,
     messageId: options?.messageId,
   };
   switch (event.type) {
@@ -10409,15 +10240,12 @@ export function streamEventToAcpNotifications(
           emittedThroughComma: -1,
         });
       }
-      return toAcpNotifications(
-        [block],
-        "assistant",
-        sessionId,
-        toolUseCache,
-        client,
-        logger,
-        forwardedOptions,
-      );
+      // The input of a streamed tool_use starts empty and streams after this
+      // event, so the tool_call waits for the complete input.
+      return toAcpNotifications([block], "assistant", sessionId, toolUseCache, client, logger, {
+        ...forwardedOptions,
+        inputComplete: false,
+      });
     }
     case "content_block_delta": {
       if (event.delta.type === "input_json_delta") {
@@ -10442,15 +10270,11 @@ export function streamEventToAcpNotifications(
           streamedInput.partialJson.slice(0, streamedInput.lastTopLevelComma),
         );
         if (!input) return [];
-        const supportsTerminalOutput =
-          options?.clientCapabilities?._meta?.["terminal_output"] === true;
-        const update = streamedInputRefinement(
-          streamedInput,
-          input,
-          supportsTerminalOutput,
-          options?.cwd,
-        );
-        if (!update) return [];
+        // TodoWrite and the Task* tools never surfaced a tool_call to refine.
+        if (!shouldEmitToolCall(streamedInput.name)) return [];
+        const update: SessionNotification["update"] = AcpToolCallRenderer.for(
+          options?.clientCapabilities,
+        ).partialRefinement(streamedInput, input, options?.cwd);
         if (message.parent_tool_use_id) {
           update._meta = {
             ...update._meta,
@@ -10461,6 +10285,9 @@ export function streamEventToAcpNotifications(
           };
         }
         applyMessageId(update, options?.messageId);
+        // A refinement resends only what changed: rawInput grows with every
+        // field, and title, kind, and locations usually stay the same.
+        if (options?.toolCallFields && !options.toolCallFields.apply(update)) return [];
         return [{ sessionId, update }];
       }
       return toAcpNotifications(

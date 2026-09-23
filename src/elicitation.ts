@@ -12,6 +12,7 @@ import type {
   AskUserQuestionInput,
   AskUserQuestionOutput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
+import { AIR_CUSTOM_ANSWER_KEY, withAirMeta } from "./air-extension.js";
 
 /**
  * Bridges between the Claude Agent SDK's elicitation/dialog callbacks and ACP's
@@ -149,14 +150,6 @@ function questionCustomFieldKey(index: number): string {
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
 
 /**
- * Shared `_meta` key for marking a per-question free-text field as the custom
- * answer companion for a select question. This intentionally has no
- * agent-specific namespace so ACP clients can recognize the same marker across
- * Codex, Claude, and other AskUserQuestion bridges.
- */
-const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
-
-/**
  * Render the AskUserQuestion tool's questions as an ACP form elicitation.
  *
  * Fields are keyed by a short stable id (`question_<n>`) rather than the full
@@ -178,6 +171,7 @@ export function askUserQuestionsToCreateRequest(
   questions: AskUserQuestion[],
   sessionId: string,
   toolCallId: string | undefined,
+  airClient = false,
 ): CreateElicitationRequest {
   const single = questions.length === 1;
   const properties: Record<string, ElicitationPropertySchema> = {};
@@ -216,12 +210,16 @@ export function askUserQuestionsToCreateRequest(
       description: question.multiSelect
         ? "Type your own answer to add to your selection above (optional)."
         : "Type your own answer, or add a note to the option you chose above (optional).",
-      _meta: {
-        [CUSTOM_ANSWER_META_KEY]: {
-          questionId: questionFieldKey(index),
-          isCustomAnswer: true,
-        },
-      },
+      // Marks the field as the custom answer companion of a select question,
+      // under `_meta.jetbrains.air.customAnswer`. Only AIR gets the marker.
+      ...(airClient
+        ? {
+            _meta: withAirMeta(undefined, AIR_CUSTOM_ANSWER_KEY, {
+              questionId: questionFieldKey(index),
+              isCustomAnswer: true,
+            }),
+          }
+        : {}),
     };
   });
 

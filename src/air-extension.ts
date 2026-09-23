@@ -2,7 +2,26 @@ export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
-export const AIR_DIFF_STATS_KEY = "diffStats";
+export const AIR_DIFF_PATCH_CAPABILITY = "diffPatch";
+/** AIR renders `rawInput` itself and needs no display copy of the input. */
+export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
+/** AIR appends the streamed text of a plan. */
+export const AIR_PLAN_CONTENT_DELTA_CAPABILITY = "planContentDelta";
+/**
+ * The plan of an ExitPlanMode is a file. `rawInput.planFilePath` names the
+ * file, and AIR reads the plan from it.
+ */
+export const AIR_PLAN_FILE_CAPABILITY = "planFile";
+
+/** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
+export const AIR_COMMAND_TITLE_KEY = "commandTitle";
+export const AIR_SUBAGENT_KEY = "subagent";
+export const AIR_SKILL_KEY = "skill";
+export const AIR_CONTEXT_COMPACTION_KEY = "contextCompaction";
+export const AIR_GOAL_KEY = "goal";
+export const AIR_KIND_KEY = "kind";
+export const AIR_PERMISSION_KEY = "permission";
+export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
 
 const JETBRAINS_META_KEY = "jetbrains";
 const AIR_META_KEY = "air";
@@ -40,6 +59,31 @@ export function withAirMeta(
       },
     },
   };
+}
+
+/**
+ * Whether the client is JetBrains AIR: it declared `_meta.jetbrains.air` in
+ * its capabilities.
+ *
+ * Only AIR gets the AIR extensions of `docs/air-extensions.md`. Every other
+ * client, Zed too, gets the fields and the upstream `_meta` keys of the
+ * upstream adapter, and no key that exists only for AIR.
+ */
+export function isAirClient(capabilities: unknown): boolean {
+  return airExtensionMeta(asRecord(capabilities)._meta) !== undefined;
+}
+
+/**
+ * The `_meta` of an AIR client with one more AIR payload, or undefined for
+ * every other client: a client that is not AIR gets no AIR key.
+ */
+export function airOnlyMeta(
+  airClient: boolean,
+  capability: string,
+  payload: unknown,
+  meta?: Record<string, unknown> | null,
+): Record<string, unknown> | undefined {
+  return airClient ? withAirMeta(meta, capability, payload) : (meta ?? undefined);
 }
 
 /** The `air` object inside a `_meta`, or undefined when the peer sent no AIR extension. */
