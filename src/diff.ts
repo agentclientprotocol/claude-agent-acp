@@ -243,6 +243,15 @@ export async function patchUpdateFromDiffToolResponse(
   if (response.type === undefined && response.oldString === "" && response.originalFile === "") {
     return undefined;
   }
+  // A Write whose content is the previous text changed nothing. The file on
+  // disk can hold a later change, and that change is not the change of this Write.
+  if (
+    response.type === "update" &&
+    typeof response.content === "string" &&
+    response.originalFile === response.content
+  ) {
+    return undefined;
+  }
   const oldText =
     response.type === "create"
       ? null

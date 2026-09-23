@@ -494,6 +494,24 @@ describe("PostToolUse hook patches", () => {
     expect(result).toBeUndefined();
   });
 
+  it("builds no patch for a Write that changed nothing", async () => {
+    // The file changed after the Write. The Write itself wrote the same text.
+    const filePath = await temporaryFile("changed later\n");
+    const response = {
+      type: "update",
+      filePath,
+      content: "same\n",
+      originalFile: "same\n",
+      structuredPatch: [],
+    };
+
+    expect(await patchUpdateFromDiffToolResponse(response)).toBeUndefined();
+    // The standard diff then shows that the text stayed the same.
+    expect(toolUpdateFromDiffToolResponse(response).content).toEqual([
+      { type: "diff", path: filePath, oldText: "same\n", newText: "same\n" },
+    ]);
+  });
+
   it("declines a patch that it cannot build exactly", async () => {
     const crlf = await temporaryFile("a\r\nc\r\n");
     const missing = await temporaryFile();
