@@ -27,8 +27,8 @@ import {
   toolInfoFromToolUse,
   toDisplayPath,
   toolUpdateFromToolResult,
-  toolUpdateFromDiffToolResponse,
 } from "../tools.js";
+import { toolUpdateFromDiffToolResponse } from "../diff.js";
 import {
   toAcpNotifications,
   promptToClaude,
@@ -41,7 +41,6 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
-  discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
@@ -60,6 +59,7 @@ import {
   PermissionUpdate,
   query,
   SDKAssistantMessage,
+  type Options,
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
@@ -451,7 +451,10 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     prompt(params: PromptRequest): Promise<PromptResponse>;
   };
 
-  async function setupTestSession(cwd: string): Promise<{
+  async function setupTestSession(
+    cwd: string,
+    extraClientCapabilities: Partial<ClientCapabilities> = {},
+  ): Promise<{
     client: TestClient;
     connection: TestConnection;
     newSessionResponse: NewSessionResponse;
@@ -483,6 +486,7 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
         elicitation: {
           form: {},
         },
+        ...extraClientCapabilities,
       },
     });
 
@@ -603,12 +607,77 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
       status: "in_progress",
       _meta: { contextCompaction: { version: 1 } },
     });
-    expect(compactionUpdates.at(-1)).toMatchObject({
+    // The terminal status lands on the compact_result frame; the boundary that
+    // follows only enriches the call with token counts (no status field).
+    const terminal = compactionUpdates.filter((update) => "status" in update && update.status);
+    expect(terminal.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
       status: "completed",
       _meta: { contextCompaction: { version: 1 } },
     });
-  }, 60000);
+    expect(compactionUpdates.at(-1)).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      _meta: { contextCompaction: { version: 1, trigger: "manual" } },
+    });
+  }, 90000);
+
+  it("/compact reports the ACP compaction lifecycle to a capable client", async () => {
+    const { client, connection, newSessionResponse } = await setupTestSession(__dirname, {
+      session: { compaction: {} },
+    });
+
+    for (let i = 0; i < 6; i++) {
+      await connection.prompt({
+        prompt: [{ type: "text", text: `Reply with just the number ${i}.` }],
+        sessionId: newSessionResponse.sessionId,
+      });
+      client.takeReceivedText();
+    }
+
+    await connection.prompt({
+      prompt: [{ type: "text", text: "/compact" }],
+      sessionId: newSessionResponse.sessionId,
+    });
+
+    expect(client.takeReceivedText()).toBe("");
+    const sessionUpdates = client.updates.map((notification) => notification.update);
+    // No legacy synthetic tool call for a client on the compaction contract.
+    expect(
+      sessionUpdates.some(
+        (update) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update._meta?.contextCompaction,
+      ),
+    ).toBe(false);
+    const compactionUpdates = sessionUpdates.filter(
+      (update) => update.sessionUpdate === "compaction_update",
+    );
+    expect(compactionUpdates[0]).toMatchObject({
+      status: "in_progress",
+      _meta: { contextCompaction: { version: 1 } },
+    });
+    const compactionId = compactionUpdates[0].compactionId;
+    expect(compactionUpdates.every((update) => update.compactionId === compactionId)).toBe(true);
+    expect(compactionUpdates.slice(1).every((update) => update.status === "completed")).toBe(true);
+    // The PostCompact hook's summary rides on the terminal update, stripped of
+    // the model's <analysis> block and <summary> tags.
+    const withSummary = compactionUpdates.find((update) => update.summary?.length);
+    expect(withSummary).toBeDefined();
+    const summaryText = withSummary!.summary![0];
+    expect(summaryText.type).toBe("text");
+    const text = summaryText.type === "text" ? summaryText.text : "";
+    expect(text.length).toBeGreaterThan(20);
+    // Tags can legitimately be quoted inside the summary; only the wrapper goes.
+    expect(text.startsWith("<analysis>")).toBe(false);
+    expect(text.startsWith("<summary>")).toBe(false);
+    expect(text.endsWith("</summary>")).toBe(false);
+    // The boundary enriches the entity with token counts.
+    expect(compactionUpdates.at(-1)).toMatchObject({
+      status: "completed",
+      _meta: { contextCompaction: { version: 1, trigger: "manual" } },
+    });
+    expect((compactionUpdates.at(-1)!._meta as any).contextCompaction.preTokens).toBeGreaterThan(0);
+  }, 90000);
 
   // Regression guard for the SDK's AskUserQuestion routing. The built-in
   // AskUserQuestion tool is delivered to us through `canUseTool` (not the
@@ -1608,6 +1677,9 @@ describe("toolUpdateFromDiffToolResponse", () => {
           path: "/Users/test/project/test.txt",
           oldText: "context before\nold line\ncontext after",
           newText: "context before\nnew line\ncontext after",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
         },
       ],
       locations: [{ path: "/Users/test/project/test.txt", line: 1 }],
@@ -1642,12 +1714,18 @@ describe("toolUpdateFromDiffToolResponse", () => {
           path: "/Users/test/project/file.ts",
           oldText: "oldValue",
           newText: "newValue",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
         },
         {
           type: "diff",
           path: "/Users/test/project/file.ts",
           oldText: "oldValue",
           newText: "newValue",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
+          },
         },
       ],
       locations: [
@@ -1678,6 +1756,9 @@ describe("toolUpdateFromDiffToolResponse", () => {
           path: "/Users/test/project/file.ts",
           oldText: "context\nremoved line",
           newText: "context",
+          _meta: {
+            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 0, removed: 1 } } },
+          },
         },
       ],
       locations: [{ path: "/Users/test/project/file.ts", line: 10 }],
@@ -1782,6 +1863,38 @@ describe("stripLocalCommandMetadata", () => {
     ).toBeNull();
   });
 
+  it("reconstructs marker-only model-bound slash skill prompts", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-message>example-skill</command-message>\n" +
+          "<command-name>/example-skill</command-name>\n" +
+          "<command-args>explain the startup decision</command-args>",
+      ),
+    ).toBe("/example-skill explain the startup decision");
+
+    expect(
+      stripLocalCommandMetadata([
+        {
+          type: "text",
+          text:
+            "<command-message>example-skill</command-message>\n" +
+            "<command-name>/example-skill</command-name>\n" +
+            "<command-args>explain the startup decision</command-args>",
+        },
+      ]),
+    ).toEqual([{ type: "text", text: "/example-skill explain the startup decision" }]);
+  });
+
+  it("keeps local-command stdout marker-only payloads hidden", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<command-name>/example-skill</command-name>" +
+          "<command-args>explain</command-args>" +
+          "<local-command-stdout>handled locally</local-command-stdout>",
+      ),
+    ).toBeNull();
+  });
+
   it("returns the string unchanged for real content", () => {
     expect(stripLocalCommandMetadata("hi")).toBe("hi");
     expect(stripLocalCommandMetadata("please run /model with args")).toBe(
@@ -1807,6 +1920,26 @@ describe("stripLocalCommandMetadata", () => {
     expect(stripped as string).not.toContain("<command-args>");
     expect(stripped as string).not.toContain("<local-command-stdout>");
     expect((stripped as string).trimEnd()).toMatch(/hi$/);
+  });
+
+  // A reminder the CLI appends to the user's own turn: never typed, never
+  // shown live, but persisted next to the prose it was appended to.
+  it("strips injected system reminders, keeping what the user typed", () => {
+    expect(
+      stripLocalCommandMetadata("is that right?<system-reminder>be nice</system-reminder>"),
+    ).toBe("is that right?");
+    expect(
+      stripLocalCommandMetadata("<system-reminder>do not mention this</system-reminder>"),
+    ).toBeNull();
+  });
+
+  it("drops reminder-only blocks from mixed arrays, keeping real blocks", () => {
+    expect(
+      stripLocalCommandMetadata([
+        { type: "text", text: "is that right?" },
+        { type: "text", text: "<system-reminder>be nice</system-reminder>" },
+      ]),
+    ).toEqual([{ type: "text", text: "is that right?" }]);
   });
 
   it("drops marker-only blocks from mixed arrays, keeping real blocks", () => {
@@ -2292,6 +2425,47 @@ describe("synthetic login message (issue #863)", () => {
     expect(isSyntheticLoginMessage("Not logged in · Please run /login")).toBe(false);
   });
 
+  it("loadSession replay hands the client the prompt without the reminder appended to it", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: {
+          role: "user",
+          content:
+            "is that right?<system-reminder>Do not mention this reminder to the user.</system-reminder>",
+        },
+      },
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    // What the user typed still replays…
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text === "is that right?",
+      ),
+    ).toBe(true);
+    // …without the instruction the CLI appended to it.
+    expect(JSON.stringify(updates)).not.toContain("system-reminder");
+  });
+
   it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
     const updates: SessionNotification[] = [];
     const client = {
@@ -2562,9 +2736,9 @@ describe("usage-limit failure replay", () => {
     session.input = input;
 
     await agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "/usage" }] });
-    await vi.waitFor(() => {
-      expect(updates.some((update) => update.update.sessionUpdate === "usage_update")).toBe(true);
-    });
+    // The synthetic local-command frame carries zero usage; it must not be
+    // reported as the session's context usage.
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
 
     const failures = updates
       .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
@@ -3221,8 +3395,6 @@ describe("permission request cancellation", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -3237,7 +3409,6 @@ describe("permission request cancellation", () => {
       emittedAssistantText: false,
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
-      fileChangeReportRequestIds: new Set(),
     } as any;
     return agent.sessions[sessionId]!;
   }
@@ -3456,7 +3627,7 @@ describe("permission request cancellation", () => {
       { kind: "reject_once", name: "No", optionId: "reject" },
     ]);
     expect(request?._meta).toEqual({
-      permission: { version: 1, title: "Bash" },
+      permission: { version: 1, title: "ls" },
     });
   });
 
@@ -3480,6 +3651,113 @@ describe("permission request cancellation", () => {
       toolUseID: "tool-1",
       decisionClassification: "user_reject",
     });
+  });
+
+  it.each([
+    ["exit-plan-bypass", "bypassPermissions", true],
+    ["exit-plan-auto", "auto", true],
+    ["exit-plan-auto", "acceptEdits", false],
+    ["exit-plan-default", "default", true],
+  ])("publishes the effective mode after %s approval", async (optionId, mode, supportsAutoMode) => {
+    const sessionUpdate = vi.fn(async () => {});
+    const mockClient = {
+      sessionUpdate,
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: [
+        "default",
+        "plan",
+        "bypassPermissions",
+        ...(optionId === "exit-plan-bypass" ? [] : ["auto"]),
+      ].map((id) => ({
+        id,
+        name: id,
+      })),
+    };
+    session.configOptions = [
+      {
+        id: "mode",
+        name: "Mode",
+        type: "select",
+        currentValue: "plan",
+        options: [],
+      },
+    ];
+    session.modelInfos = [
+      { value: "default", displayName: "Default", description: "", supportsAutoMode },
+    ];
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode, destination: "session" }],
+    });
+    expect(session.modes.currentModeId).toBe(mode);
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: { sessionUpdate: "current_mode_update", currentModeId: mode },
+    });
+    expect(sessionUpdate).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [expect.objectContaining({ id: "mode", currentValue: mode })],
+      },
+    });
+  });
+
+  it("keeps the plan approval when publishing the new mode fails", async () => {
+    const error = vi.fn();
+    const mockClient = {
+      sessionUpdate: vi.fn(async (notification: SessionNotification) => {
+        if (notification.update.sessionUpdate === "current_mode_update") {
+          throw new Error("client gone");
+        }
+      }),
+      requestPermission: async () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-default" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: ["default", "plan"].map((id) => ({ id, name: id })),
+    };
+
+    const result = await agent.canUseTool("session-1")(
+      "ExitPlanMode",
+      { plan: "Implement it" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      },
+    );
+
+    expect(result).toMatchObject({
+      behavior: "allow",
+      updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }],
+    });
+    expect(error).toHaveBeenCalledWith(
+      "Failed to publish mode after plan approval:",
+      expect.any(Error),
+    );
   });
 
   it("interrupts the turn after an ExitPlanMode keep-planning rejection", async () => {
@@ -3793,6 +4071,29 @@ describe("tool_call emitted before permission request", () => {
     });
     expect(session.emittedToolCalls.has("tool-1")).toBe(true);
     expect(result).toMatchObject({ behavior: "allow" });
+  });
+
+  it("carries the PowerShell description in claudeCode meta like Bash", async () => {
+    const { agent, updates } = setup();
+
+    await agent.canUseTool("session-1")(
+      "PowerShell",
+      { command: "Get-ChildItem", description: "List files" },
+      {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any,
+    );
+
+    expect(updates[0].update).toMatchObject({
+      sessionUpdate: "tool_call",
+      toolCallId: "tool-1",
+      title: "Get-ChildItem",
+      _meta: {
+        claudeCode: { toolName: "PowerShell", title: "List files" },
+      },
+    });
   });
 
   it("does not re-emit the tool_call when the stream already surfaced it", async () => {
@@ -4121,6 +4422,79 @@ describe("canUseTool in bypassPermissions mode", () => {
 
     expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
   });
+
+  // SDK 0.3.268+ hints on the CLI's safety-check asks (delete-class Bash
+  // rulings, Artifact publishes, …): the always-allow rule it would write is
+  // broader than the ask, so no persistent option may be offered; and the ask
+  // must open on its decline option, so the reject options lead.
+  it("offers no always-allow option when the CLI suppresses the persistent rule", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState();
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      suppressAlwaysAllowRule: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
+    expect(request?._meta).toEqual({ permission: { version: 1, title: "rm -rf build" } });
+  });
+
+  it("leads with the reject option and forwards the hint when the CLI defaults to no", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "reject" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState();
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "rm -rf build" }, {
+      signal: new AbortController().signal,
+      suggestions: [
+        {
+          type: "addRules",
+          rules: [{ toolName: "Bash", ruleContent: "rm:*" }],
+          behavior: "allow",
+          destination: "localSettings",
+        },
+      ],
+      toolUseID: "tool-1",
+      defaultToNo: true,
+    } as any);
+
+    expect(request?.options.map((option) => option.kind)).toEqual([
+      "reject_once",
+      "allow_once",
+      "allow_always",
+    ]);
+    expect(request?._meta).toEqual({
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
+    });
+    expect(result).toMatchObject({ behavior: "deny" });
+  });
 });
 
 describe("subagent permission attribution (issue #851)", () => {
@@ -4185,6 +4559,36 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(requests[0].toolCall._meta).toMatchObject({
       claudeCode: { toolName: "Bash", parentToolUseId: "toolu_parent" },
     });
+  });
+
+  it("forwards the MCP server provenance on the permission request", async () => {
+    const { agent, requests } = setup();
+
+    await agent.canUseTool("session-1")("mcp__github__create_issue", { title: "x" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_mcp",
+      mcpServer: { name: "github", source: "project" },
+    } as any);
+
+    expect(requests[0].toolCall._meta).toEqual({
+      claudeCode: {
+        toolName: "mcp__github__create_issue",
+        mcpServer: { name: "github", source: "project" },
+      },
+    });
+  });
+
+  it("omits permission _meta for a root tool without MCP provenance", async () => {
+    const { agent, requests } = setup();
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_plain",
+    } as any);
+
+    expect(requests[0].toolCall._meta).toBeUndefined();
   });
 
   it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
@@ -6550,6 +6954,52 @@ describe("stop reason propagation", () => {
     );
   });
 
+  it("says how long a no-response retry waited and will wait", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "api_retry",
+        attempt: 1,
+        max_retries: 1,
+        retry_delay_ms: 0,
+        error_status: null,
+        error: "unknown",
+        // SDK 0.3.261+: the API sent no response headers within the
+        // first-byte window; the retry waits longer for them.
+        no_response: { waited_ms: 180_000, retry_wait_ms: 600_000 },
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: "ok",
+      }),
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    const warning = updates
+      .map((update) => (update.update._meta as any)?.jetbrains?.air?.sessionFailure)
+      .find(Boolean);
+    expect(warning).toEqual(
+      expect.objectContaining({
+        category: "connection",
+        severity: "warning",
+        title:
+          "Reconnecting to Claude, attempt 1 of 1. No response after 180s; waiting up to 600s.",
+      }),
+    );
+  });
+
   it("clears a connection retry warning internally after the turn succeeds", async () => {
     const updates: SessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6659,6 +7109,8 @@ describe("stop reason propagation", () => {
   it.each([
     ["billing_error", "limit"],
     ["account_on_hold", "limit"],
+    ["verification_required", "access"],
+    ["cloud_credential_error", "access"],
     ["rate_limit", "limit"],
     ["overloaded", "service"],
     ["invalid_request", "request"],
@@ -6708,7 +7160,15 @@ describe("stop reason propagation", () => {
       { log: () => {}, error: () => {} },
     );
     (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const priorAssistant = createAssistantError(undefined);
+    priorAssistant.message.usage = {
+      input_tokens: 170000,
+      output_tokens: 910,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    } as any;
     injectSession(agent, [
+      priorAssistant,
       createUsageLimitAssistantError(),
       createResultMessage({
         subtype: "success",
@@ -6733,6 +7193,42 @@ describe("stop reason propagation", () => {
       }),
     );
     expect(JSON.stringify(updates)).not.toContain("agent_message_chunk");
+    const usageUpdates = updates.filter((update) => update.update.sessionUpdate === "usage_update");
+    expect(usageUpdates.at(-1)?.update).toEqual(
+      expect.objectContaining({ used: 170910, size: 200000 }),
+    );
+  });
+
+  it("keeps the prior turn's context usage when a fresh turn is refused for quota", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => updates.push(update),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    injectSession(agent, [
+      createUsageLimitAssistantError(),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: true,
+        result: "private provider detail",
+      }),
+    ]);
+    agent.sessions["test-session"].contextUsedTokens = 170910;
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "test" }],
+    });
+
+    expect(sessionFailureFromResponse(response)).toEqual(
+      expect.objectContaining({ category: "limit" }),
+    );
+    expect(updates.filter((update) => update.update.sessionUpdate === "usage_update")).toEqual([]);
+    expect(agent.sessions["test-session"].contextUsedTokens).toBe(170910);
   });
 
   it("preserves live usage-limit prose for clients without typed failures", async () => {
@@ -6985,6 +7481,35 @@ describe("stop reason propagation", () => {
     // The first delivery already rejected the turn, so the second one has no
     // turn to fail. That is expected here and must not be logged as a fault.
     expect(logged.join("\n")).not.toContain("cannot fail active turn");
+  });
+
+  it("does not treat a successful answer mentioning /login as auth_required", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    const answer = "A normal answer can quote: Please run /login.";
+    injectSession(agent, [
+      createAssistantError(undefined, answer),
+      createResultMessage({
+        subtype: "success",
+        stop_reason: "end_turn",
+        is_error: false,
+        result: answer,
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(sessionFailuresFromUpdates(updates)).toEqual([]);
   });
 
   it("republishes the signed-out state after a real model answer cleared the last one", async () => {
@@ -7907,6 +8432,79 @@ describe("model refusal fallback handling", () => {
     ).toEqual([advisory]);
   });
 
+  it("publishes the model fallback as a notice for clients on the notice contract", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        session: { notices: {} },
+        // Both lanes advertised: the standard notice wins over the AIR record.
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({ api_refusal_explanation: "The request looked like malware." }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    // Exactly one surface: no transcript line and no AIR advisory beside the notice.
+    expect(
+      updates.find(
+        (u: any) =>
+          u.sessionUpdate === "agent_message_chunk" && u.content?.text?.includes("Model fallback"),
+      ),
+    ).toBeUndefined();
+    expect(updates.find((u: any) => u._meta?.jetbrains?.air?.sessionFailure)).toBeUndefined();
+
+    const notices = updates.filter((u: any) => u.sessionUpdate === "notice");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toEqual({
+      sessionUpdate: "notice",
+      severity: "warning",
+      title:
+        "claude-fable-5 declined this request (cyber); retried with claude-opus-4-8. " +
+        "The session will continue on claude-opus-4-8.",
+      description: "The request looked like malware.",
+    });
+    // The swap itself is still reconciled.
+    expect(agent.sessions["test-session"].models.currentModelId).toBe("claude-opus-4-8");
+  });
+
+  it("moves an over-long model fallback summary under a generic notice title", async () => {
+    const { agent, sessionUpdate } = createCapturingAgent();
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { session: { notices: {} } },
+    });
+    const longCategory = "c".repeat(300);
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        refusalFallbackMessage({
+          api_refusal_category: longCategory,
+          api_refusal_explanation: "why",
+        }),
+        successResult(),
+      ]),
+      modelStateOverrides,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const notice = updates.find((u: any) => u.sessionUpdate === "notice");
+    expect(notice.title).toBe("Model fallback");
+    expect(notice.description).toContain(longCategory);
+    expect(notice.description).toContain("\n\nwhy");
+  });
+
   it("puts only a genuinely long model fallback explanation in details", async () => {
     const { agent, sessionUpdate } = createCapturingAgent();
     await agent.initialize({
@@ -8385,6 +8983,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "recommendedValue",
       ],
     });
   });
@@ -8403,6 +9002,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "recommendedValue",
       ],
     });
   });
@@ -8643,8 +9243,6 @@ describe("session/close", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -8660,7 +9258,6 @@ describe("session/close", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -8739,8 +9336,6 @@ describe("session/delete", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -8756,7 +9351,6 @@ describe("session/delete", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -8821,10 +9415,15 @@ describe("getOrCreateSession param change detection", () => {
   function injectSession(
     agent: ClaudeAcpAgent,
     sessionId: string,
-    opts: { cwd?: string; mcpServers?: { name: string }[] } = {},
+    opts: {
+      cwd?: string;
+      mcpServers?: { name: string }[];
+      skills?: Options["skills"];
+    } = {},
   ) {
     const cwd = opts.cwd ?? "/test";
     const mcpServers = (opts.mcpServers ?? []) as any[];
+    const skills = Array.isArray(opts.skills) ? [...new Set(opts.skills)].sort() : opts.skills;
     function* empty() {}
     const gen = Object.assign(empty(), {
       interrupt: vi.fn(),
@@ -8840,6 +9439,7 @@ describe("getOrCreateSession param change detection", () => {
       sessionFingerprint: JSON.stringify({
         cwd,
         mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
+        ...(skills !== undefined && { skills }),
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
@@ -8852,8 +9452,6 @@ describe("getOrCreateSession param change detection", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -8869,7 +9467,6 @@ describe("getOrCreateSession param change detection", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return agent.sessions[sessionId]!;
   }
@@ -8955,6 +9552,90 @@ describe("getOrCreateSession param change detection", () => {
       sessionId: "s1",
       cwd: "/project",
       mcpServers: [...servers].reverse() as any,
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each<{
+    label: string;
+    previousSkills: Options["skills"];
+    nextSkills: Options["skills"];
+  }>([
+    { label: "CLI defaults to all skills", previousSkills: undefined, nextSkills: "all" },
+    { label: "all skills to no skills", previousSkills: "all", nextSkills: [] },
+    { label: "no skills to CLI defaults", previousSkills: [], nextSkills: undefined },
+    { label: "one explicit skill list to another", previousSkills: ["pdf"], nextSkills: ["docx"] },
+  ])(
+    "tears down the existing session when skills change from $label",
+    async ({ previousSkills, nextSkills }) => {
+      const agent = createMockAgent();
+      const session = injectSession(agent, "s1", {
+        cwd: "/project",
+        skills: previousSkills,
+      });
+      const meta =
+        nextSkills === undefined ? undefined : { claudeCode: { options: { skills: nextSkills } } };
+      const createSessionSpy = vi
+        .spyOn(agent as any, "createSession")
+        .mockRejectedValue(new Error("mock"));
+
+      await expect(
+        agent.resumeSession({
+          sessionId: "s1",
+          cwd: "/project",
+          mcpServers: [],
+          _meta: meta,
+        }),
+      ).rejects.toThrow("mock");
+
+      expect(session.settingsManager.dispose).toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(true);
+      expect(session.query.interrupt).toHaveBeenCalled();
+      expect(agent.sessions["s1"]).toBeUndefined();
+      expect(createSessionSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ _meta: meta }),
+        expect.objectContaining({ resume: "s1" }),
+      );
+    },
+  );
+
+  it("treats reordered and duplicate skills as unchanged", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      skills: ["pdf", "docx"],
+    });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf", "docx", "pdf"] },
+        },
+      },
+    });
+
+    expect(agent.sessions["s1"]).toBe(session);
+    expect(session.settingsManager.dispose).not.toHaveBeenCalled();
+  });
+
+  it("ignores unrelated Claude options when computing the fingerprint", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", { cwd: "/project" });
+
+    await agent.resumeSession({
+      sessionId: "s1",
+      cwd: "/project",
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { env: { CUSTOM_ENV: "changed" } },
+        },
+      },
     });
 
     expect(agent.sessions["s1"]).toBe(session);
@@ -11136,6 +11817,607 @@ describe("assembled assistant text fallback", () => {
     );
   });
 
+  /** An agent whose client advertises the ACP session-compaction contract. */
+  function compactionCapableAgent() {
+    const capture = createMockAgentWithCapture();
+    (capture.agent as any).clientCapabilities = { session: { compaction: {} } };
+    return capture;
+  }
+
+  function compactingStatus(uuid = "compact-start") {
+    return {
+      type: "system",
+      subtype: "status",
+      status: "compacting",
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  function compactResult(
+    result: "success" | "failed",
+    uuid: string,
+    error?: string,
+  ): Record<string, unknown> {
+    return {
+      type: "system",
+      subtype: "status",
+      status: null,
+      compact_result: result,
+      ...(error ? { compact_error: error } : {}),
+      uuid,
+      session_id: "test-session",
+    };
+  }
+
+  function compactionUpdates(updates: any[]) {
+    return updates
+      .map((notification) => notification.update)
+      .filter((update) => update.sessionUpdate === "compaction_update");
+  }
+
+  function hasSyntheticCompactionToolCall(updates: any[]) {
+    return updates
+      .map((notification) => notification.update)
+      .some(
+        (update) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update._meta?.contextCompaction,
+      );
+  }
+
+  it("emits the ACP compaction lifecycle for a client that advertises session.compaction", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [
+      compactingStatus(),
+      compactResult("success", "compact-completed"),
+      {
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "compact-boundary",
+        session_id: "test-session",
+        compact_metadata: {
+          trigger: "manual",
+          pre_tokens: 180000,
+          post_tokens: 12345,
+          duration_ms: 2500,
+        },
+      },
+      replayedResult("conversation summarized"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(compactionUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: {
+          contextCompaction: {
+            version: 1,
+            trigger: "manual",
+            preTokens: 180000,
+            postTokens: 12345,
+            durationMs: 2500,
+          },
+        },
+      },
+    ]);
+    // The synthetic tool call is the fallback for clients without the capability.
+    expect(hasSyntheticCompactionToolCall(updates)).toBe(false);
+    // The compaction entity counts as the turn's delivered output: the result
+    // text (the generated summary) is not forwarded as an agent message.
+    expect(messageChunkTexts(updates)).toEqual([]);
+  });
+
+  it("reports a failed compaction through compaction_update and swallows the duplicated stdout", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [
+      compactingStatus(),
+      compactResult("failed", "compact-failed-1", "summary rejected"),
+      compactResult("failed", "compact-failed-2", "summary rejected"),
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "summary rejected",
+        uuid: "compact-local-output",
+        session_id: "test-session",
+      },
+      {
+        type: "system",
+        subtype: "local_command_output",
+        content: "additional diagnostic",
+        uuid: "compact-distinct-local-output",
+        session_id: "test-session",
+      },
+      replayedResult("summary rejected"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
+
+    expect(compactionUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "failed",
+        error: "summary rejected",
+        _meta: { contextCompaction: { version: 1, error: "summary rejected" } },
+      },
+    ]);
+    expect(messageChunkTexts(updates)).toEqual(["additional diagnostic"]);
+  });
+
+  it("closes a compaction the turn abandoned as cancelled, before the prompt settles", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectSession(agent, [compactingStatus(), replayedResult(""), idle]);
+
+    let updatesAtSettle: string[] | undefined;
+    const settled = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] })
+      .then(() => {
+        updatesAtSettle = compactionUpdates(updates).map((update) => update.status);
+      });
+    await settled;
+
+    expect(updatesAtSettle).toEqual(["in_progress", "cancelled"]);
+  });
+
+  it.each(["echo", "dispatch", "no echo"] as const)(
+    "closes compaction before a cancelled wedged prompt settles (%s)",
+    async (boundary) => {
+      const { agent, updates } = compactionCapableAgent();
+      agent.forceCancelGraceMs = 20;
+      let releaseGenerator!: () => void;
+      const generatorReleased = new Promise<void>((resolve) => {
+        releaseGenerator = resolve;
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          if (boundary === "echo") {
+            yield userEcho(first.value);
+          } else if (boundary === "dispatch") {
+            yield {
+              type: "command_lifecycle",
+              command_uuid: first.value.uuid,
+              state: "started",
+            };
+          }
+          yield compactingStatus("force-cancel-compaction");
+          await generatorReleased;
+          yield idle;
+        }
+        return generator();
+      });
+
+      let updatesAtSettle: any[] | undefined;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "compact it" }] })
+        .then((response) => {
+          updatesAtSettle = compactionUpdates(updates);
+          return response;
+        });
+
+      try {
+        await vi.waitFor(() => {
+          expect(compactionUpdates(updates)).toHaveLength(1);
+        });
+        if (boundary !== "echo") {
+          expect((agent as any).sessions["test-session"].activeTurn).toBeFalsy();
+        }
+        await agent.cancel({ sessionId: "test-session" });
+        await expect(prompt).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+        expect(updatesAtSettle).toEqual([
+          {
+            sessionUpdate: "compaction_update",
+            compactionId: "force-cancel-compaction",
+            status: "in_progress",
+            _meta: { contextCompaction: { version: 1 } },
+          },
+          {
+            sessionUpdate: "compaction_update",
+            compactionId: "force-cancel-compaction",
+            status: "cancelled",
+          },
+        ]);
+      } finally {
+        // Let the consumer's outstanding next() finish so this regression cannot
+        // leave a live async generator behind, even when an assertion fails.
+        releaseGenerator();
+        await agent.closeSession({ sessionId: "test-session" });
+      }
+    },
+  );
+
+  it.each(["echo", "dispatch", "unattributed opening"] as const)(
+    "discards force-cancelled compaction frames until the next %s",
+    async (nextBoundary) => {
+      const { agent, updates } = compactionCapableAgent();
+      agent.forceCancelGraceMs = 20;
+      let releaseGenerator!: () => void;
+      const generatorReleased = new Promise<void>((resolve) => {
+        releaseGenerator = resolve;
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield compactingStatus("interrupted");
+          await generatorReleased;
+
+          const lifecycle = (agent as any).sessions["test-session"].contextCompaction;
+          expect(lifecycle.recordSummary("stale summary")).toBe(false);
+          yield compactingStatus("interrupted");
+          yield compactingStatus("unseen-late-opening");
+          yield compactResult("success", "late-completion");
+          yield {
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "late-boundary",
+            session_id: "test-session",
+            compact_metadata: { trigger: "auto", pre_tokens: 100, post_tokens: 10 },
+          };
+          yield {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            uuid: "late-chunk",
+            session_id: "test-session",
+            event: {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "compaction_delta",
+                content: "stale chunk",
+                encrypted_content: null,
+              },
+            },
+          };
+          // The abandoned turn's result must not lift the interruption guard.
+          yield replayedResult("");
+          yield idle;
+          expect(compactionUpdates(updates)).toHaveLength(2);
+
+          const second = await iter.next();
+          if (nextBoundary === "echo") {
+            yield userEcho(second.value);
+          } else if (nextBoundary === "dispatch") {
+            yield {
+              type: "command_lifecycle",
+              command_uuid: second.value.uuid,
+              state: "started",
+            };
+          } else {
+            // Older SDKs may give /compact neither an echo nor dispatch ID.
+            // Omit the ambiguous lifecycle rather than attributing stale work.
+            yield compactingStatus("fresh");
+          }
+          expect(lifecycle.recordSummary("fresh summary")).toBe(
+            nextBoundary !== "unattributed opening",
+          );
+          yield compactResult("success", "fresh");
+          yield replayedResult("");
+          yield idle;
+        }
+        return generator();
+      });
+
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "compact it" }],
+      });
+      try {
+        await vi.waitFor(() => expect(compactionUpdates(updates)).toHaveLength(1));
+        await agent.cancel({ sessionId: "test-session" });
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        releaseGenerator();
+        await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "/compact" }],
+        });
+
+        expect(
+          compactionUpdates(updates).map(({ compactionId, status }) => ({ compactionId, status })),
+        ).toEqual([
+          { compactionId: "interrupted", status: "in_progress" },
+          { compactionId: "interrupted", status: "cancelled" },
+          ...(nextBoundary === "unattributed opening"
+            ? []
+            : [{ compactionId: "fresh", status: "completed" }]),
+        ]);
+        if (nextBoundary !== "unattributed opening") {
+          expect(compactionUpdates(updates).at(-1).summary).toEqual([
+            { type: "text", text: "fresh summary" },
+          ]);
+        }
+        expect(
+          updates.some(
+            (notification) => notification.update.sessionUpdate === "compaction_summary_chunk",
+          ),
+        ).toBe(false);
+      } finally {
+        releaseGenerator();
+        await agent.closeSession({ sessionId: "test-session" });
+      }
+    },
+  );
+
+  it.each([
+    ["ends", false],
+    ["throws", true],
+  ] as const)(
+    "closes an active compaction before the SDK iterator %s",
+    async (_description, shouldThrow) => {
+      const { agent, updates } = compactionCapableAgent();
+      injectGeneratorSession(agent, (input) => {
+        async function* generator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield compactingStatus(`iterator-${shouldThrow ? "error" : "eof"}`);
+          if (shouldThrow) {
+            throw new Error("controlled SDK iterator failure");
+          }
+        }
+        return generator();
+      });
+
+      let updatesAtSettle: any[] | undefined;
+      await agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "compact it" }] })
+        .then(
+          () => {
+            updatesAtSettle = compactionUpdates(updates);
+          },
+          () => {
+            updatesAtSettle = compactionUpdates(updates);
+          },
+        );
+
+      expect(
+        updatesAtSettle?.map(({ compactionId, status }) => ({ compactionId, status })),
+      ).toEqual([
+        {
+          compactionId: `iterator-${shouldThrow ? "error" : "eof"}`,
+          status: "in_progress",
+        },
+        {
+          compactionId: `iterator-${shouldThrow ? "error" : "eof"}`,
+          status: "cancelled",
+        },
+      ]);
+      expect(compactionUpdates(updates)).toHaveLength(2);
+    },
+  );
+
+  it("resets an active compaction before starting a fresh compaction lifecycle", async () => {
+    const { agent, updates } = compactionCapableAgent();
+    injectGeneratorSession(agent, (input) => {
+      async function* generator() {
+        const iter = input[Symbol.asyncIterator]();
+        const first = await iter.next();
+        yield userEcho(first.value);
+        yield compactingStatus("pre-reset-compaction");
+        yield {
+          type: "conversation_reset",
+          new_conversation_id: "fresh-conversation",
+          uuid: "conversation-reset",
+          session_id: "test-session",
+        };
+        // Reset itself must close the lifecycle, not the later result.
+        expect(compactionUpdates(updates).map((update) => update.status)).toEqual([
+          "in_progress",
+          "cancelled",
+        ]);
+        expect(
+          (agent as any).sessions["test-session"].contextCompaction.recordSummary("stale summary"),
+        ).toBe(false);
+        yield compactResult("success", "stale-reset-result");
+        yield replayedResult("");
+        yield idle;
+
+        const second = await iter.next();
+        yield userEcho(second.value);
+        yield compactingStatus("post-reset-compaction");
+        yield {
+          type: "stream_event",
+          parent_tool_use_id: null,
+          uuid: "fresh-summary",
+          session_id: "test-session",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "compaction_delta",
+              content: "fresh summary",
+              encrypted_content: null,
+            },
+          },
+        };
+        yield compactResult("success", "post-reset-result");
+        yield replayedResult("");
+        yield idle;
+      }
+      return generator();
+    });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/clear" }] });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "compact fresh context" }],
+    });
+
+    expect(
+      compactionUpdates(updates).map(({ compactionId, status }) => ({ compactionId, status })),
+    ).toEqual([
+      { compactionId: "pre-reset-compaction", status: "in_progress" },
+      { compactionId: "pre-reset-compaction", status: "cancelled" },
+      { compactionId: "post-reset-compaction", status: "in_progress" },
+      { compactionId: "post-reset-compaction", status: "completed" },
+    ]);
+    expect(
+      updates
+        .map((notification) => notification.update)
+        .filter((update) => update.sessionUpdate === "compaction_summary_chunk"),
+    ).toEqual([
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "post-reset-compaction",
+        content: { type: "text", text: "fresh summary" },
+      },
+    ]);
+  });
+
+  it("does not open a compaction entity from API compaction stream blocks alone", async () => {
+    // The API block carries no terminal signal; without the CLI's compacting
+    // status there is nothing to close an entity but the turn boundary, which
+    // would misreport a successful compaction as cancelled.
+    const { agent, updates } = compactionCapableAgent();
+    const compactionDelta = (uuid: string, content: string, parentToolUseId: string | null) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: parentToolUseId,
+      uuid,
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "compaction_delta" as const, content, encrypted_content: null },
+      },
+    });
+    injectSession(agent, [
+      compactionDelta("compact-delta-1", "orphan ", null),
+      compactionDelta("compact-delta-2", "text", null),
+      compactingStatus(),
+      // A subagent compacting its own context never touches the root entity.
+      compactionDelta("subagent-delta", "child summary", "toolu_child"),
+      compactionDelta("compact-delta-3", "## Retained", null),
+      compactResult("success", "compact-completed"),
+      replayedResult(""),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const compactionFrames = updates
+      .map((notification) => notification.update)
+      .filter(
+        (update) =>
+          update.sessionUpdate === "compaction_update" ||
+          update.sessionUpdate === "compaction_summary_chunk",
+      );
+    expect(compactionFrames).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "in_progress",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "compact-start",
+        content: { type: "text", text: "## Retained" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-start",
+        status: "completed",
+        _meta: { contextCompaction: { version: 1 } },
+      },
+    ]);
+    expect(JSON.stringify(updates)).not.toContain("child summary");
+  });
+
+  it("replays a persisted compaction summary as a completed compaction_update for capable clients", async () => {
+    const framedSummary =
+      "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+      "Summary:\n1. Primary Request and Intent:\n   Count upward.\n\n" +
+      "If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /tmp/session.jsonl\n" +
+      "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
+    const summaryMessage = (uuid: string | undefined) => ({
+      type: "user",
+      uuid,
+      session_id: "test-session",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      isCompactSummary: true,
+      message: { role: "user", content: framedSummary },
+    });
+    const replay = async (capable: boolean, messages: unknown[]) => {
+      const { agent, updates } = capable ? compactionCapableAgent() : createMockAgentWithCapture();
+      agent.sessions["test-session"] = mockSessionState();
+      vi.mocked(getSessionMessages).mockResolvedValueOnce(messages as any);
+      await (agent as any).replaySessionHistory("test-session");
+      return updates.map((notification) => notification.update);
+    };
+
+    expect(await replay(true, [summaryMessage("compact-summary")])).toEqual([
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact-summary",
+        status: "completed",
+        summary: [{ type: "text", text: "1. Primary Request and Intent:\n   Count upward." }],
+        _meta: { contextCompaction: { version: 1 } },
+      },
+    ]);
+
+    // Without the capability the transcript text keeps replaying as before.
+    const legacy = await replay(false, [summaryMessage("compact-summary")]);
+    expect(legacy.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+    expect(legacy.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(true);
+
+    // A record without a uuid cannot be an entity; it stays transcript text.
+    const noId = await replay(true, [summaryMessage(undefined)]);
+    expect(noId.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+    expect(noId.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(true);
+
+    // A subagent's own compaction summary is not the root session's entity.
+    const child = await replay(true, [
+      { ...summaryMessage("child-summary"), parent_tool_use_id: "toolu_child" },
+    ]);
+    expect(child.some((update) => update.sessionUpdate === "compaction_update")).toBe(false);
+
+    // Unrecognized framing: the text stays visible rather than vanishing
+    // behind a summary-less entity.
+    const unknownFraming = await replay(true, [
+      {
+        ...summaryMessage("odd-summary"),
+        message: {
+          role: "user",
+          content:
+            "This session is being continued from a previous conversation that ran out of context. Here is what happened:\n\nCounted.",
+        },
+      },
+    ]);
+    expect(unknownFraming.some((update) => update.sessionUpdate === "compaction_update")).toBe(
+      false,
+    );
+    expect(unknownFraming.some((update) => update.sessionUpdate === "user_message_chunk")).toBe(
+      true,
+    );
+  });
+
   it("preserves the model response after multiple compactions in one turn", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
@@ -11333,7 +12615,7 @@ describe("assembled assistant text fallback", () => {
     });
   }
 
-  it("does not re-emit the result text after an informational notice delivered it", async () => {
+  it("marks informational notices with metadata", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // A hook-blocked prompt: the SDK surfaces the block reason as an
     // informational notice and then repeats it on the result with zero output
@@ -11353,7 +12635,177 @@ describe("assembled assistant text fallback", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
     expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "warning" } },
+    });
+  });
+
+  it("marks info-level notices even when their text has no severity prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "plain hook detail",
+        level: "info",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
+    expect(messageChunkTexts(updates)).toEqual(["plain hook detail"]);
+    expect(chunks[0]?.update).toMatchObject({
+      _meta: { claudeCode: { kind: "informational", level: "info" } },
+    });
+  });
+
+  it("delivers an informational frame as a notice and still owns the result text", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "hook says no",
+        level: "warning",
+        session_id: "test-session",
+      },
+      replayedResult("hook says no"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    // The notice is the turn's delivered text: nothing lands in the transcript,
+    // and the result's repeat of the block reason must not either.
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      { sessionUpdate: "notice", severity: "warning", title: "hook says no" },
+    ]);
+  });
+
+  it("records the notice against the queued turn when the hook blocks before any echo", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    // Live frame order for a UserPromptSubmit block (CLI 2.1.x): no user echo
+    // at all — the informational frame, then the 0-token result repeating it,
+    // then idle. The turn is only promoted when the result lands.
+    const blocked =
+      "UserPromptSubmit operation blocked by hook:\nhook says no\n\nOriginal prompt: 1+2";
+    const input = new Pushable<any>();
+    async function* echoless() {
+      yield {
+        type: "system",
+        subtype: "informational",
+        content: blocked,
+        level: "warning",
+        session_id: "test-session",
+      };
+      yield replayedResult(blocked);
+      yield idle;
+    }
+    agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(echoless()), input });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "UserPromptSubmit operation blocked by hook:",
+        description: "hook says no\n\nOriginal prompt: 1+2",
+      },
+    ]);
+  });
+
+  it("collapses repeated tool-use progress into one notice and drops transcript-only info", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    const progress = (content: string) => ({
+      type: "system",
+      subtype: "informational",
+      content,
+      level: "notice",
+      tool_use_id: "tool-1",
+      session_id: "test-session",
+    });
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "transcript-only",
+        level: "info",
+        session_id: "test-session",
+      },
+      progress("Step 1 of 3"),
+      progress("Step 2 of 3"),
+      progress("Step 3 of 3"),
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      { sessionUpdate: "notice", severity: "info", title: "Step 1 of 3" },
+    ]);
+  });
+
+  it("still forwards a replayed answer that an info notice merely preceded", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "some status line",
+        level: "info",
+        session_id: "test-session",
+      },
+      replayedResult("**3**"),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    // A notice is not the turn's answer: only a result that repeats it is skipped.
+    expect(messageChunkTexts(updates)).toEqual(["**3**"]);
+  });
+
+  it("maps the SDK's gray informational levels to info notices", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    (agent as any).clientCapabilities = { session: { notices: {} } };
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Tip: run /help\nMore detail on a second line.",
+        level: "suggestion",
+        session_id: "test-session",
+      },
+      replayedResult(""),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([]);
+    expect(updates.map((u) => u.update).filter((u) => u.sessionUpdate === "notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "info",
+        title: "Tip: run /help",
+        description: "More detail on a second line.",
+      },
+    ]);
   });
 
   it("still forwards the result text after a turn failed without a result", async () => {
@@ -12080,8 +13532,6 @@ describe("post-error recovery", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -12097,7 +13547,6 @@ describe("post-error recovery", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }
@@ -13840,10 +15289,11 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   // out-of-turn session/update, but many clients stop consuming at the
   // prompt response, so the subagents' remaining output would be dropped
   // and their permission requests would block on an RPC nobody answers. The turn is held open
-  // across the CLI's idle cycles (observed cadence: user result → idle →
-  // subagent works → task_notification → followup turn → idle) and settles
-  // once its subagents are done — at the followup's terminal result, or at
-  // an idle with none of them left.
+  // across the CLI's idle cycles (cadence through CLI 2.1.269: user result →
+  // idle → subagent works → task_notification → followup turn → idle; from
+  // 2.1.270: no idle until the subagent drains) and settles once its
+  // subagents are done — at the followup's terminal result, or at an idle
+  // with none of them left.
 
   function createMockAgent() {
     const mockClient = {
@@ -14022,6 +15472,115 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // the turn, where every client is still listening.
     const summaryIndex = events.indexOf("chunk:promised summary");
     expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.270+ stays `running` while background agents live (verified
+  // live: user result → task_notification → followup result → ONE idle), so
+  // the user result's trailing-idle debt is never paid. It must not linger:
+  // a stale unit would swallow a later un-owed idle (masking issue #825) or
+  // the idle a steered turn settles on. The next transition into `running`
+  // sweeps it.
+  it("settles under the 2.1.270 cadence and sweeps the unpaid idle debt at the next running", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield userEcho(first);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage();
+        // No idle here: the CLI is still `running` for the live subagent.
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle(); // one idle for both results
+        const { value: second } = await iter.next();
+        yield userEcho(second);
+        yield running();
+        yield assistantText("second answer");
+        yield resultMessage();
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const session = () => agent.sessions["test-session"]!;
+    const first = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    expect(first.stopReason).toBe("end_turn");
+    expect(events.indexOf("chunk:promised summary")).toBeGreaterThanOrEqual(0);
+    // Two results, one idle: one unit of debt is left over.
+    await waitFor(() => session().owedTrailingIdles === 1);
+
+    const second = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "again" }],
+    });
+    expect(second.stopReason).toBe("end_turn");
+    // The `running` transition swept the stale unit, so the second turn's
+    // own idle leaves nothing outstanding.
+    await waitFor(() => session().owedTrailingIdles === 0);
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.274+ answers completions that were already queued with ONE model
+  // call: every queued notification still gets a result, but all except the
+  // last are placeholders (num_turns 0, empty text) written BEFORE the shared
+  // followup runs. Settling the hold on a placeholder would release the
+  // prompt with the promised summary still ahead — the out-of-turn delivery
+  // the hold exists to prevent.
+  it("holds through a coalesced completion's placeholder result until the real followup", async () => {
+    const { agent, events } = chunkCapturingAgent();
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield subagentStarted("agent-2");
+        yield resultMessage();
+        // Both subagents settle while the loop is busy: their notifications
+        // queue and the CLI answers them with one call.
+        yield taskNotification("agent-1");
+        yield taskNotification("agent-2");
+        // agent-1's placeholder: no model call of its own.
+        yield resultMessage({
+          origin: { kind: "task-notification" },
+          num_turns: 0,
+          result: "",
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 1 });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+      .then((r) => {
+        events.push("resolved");
+        return r;
+      });
+    expect(response.stopReason).toBe("end_turn");
+    const summaryIndex = events.indexOf("chunk:promised summary");
+    expect(summaryIndex).toBeGreaterThanOrEqual(0);
+    // The summary reached the client before session/prompt returned: the
+    // placeholder did not settle the hold.
     expect(summaryIndex).toBeLessThan(events.indexOf("resolved"));
     await agent.sessions["test-session"]?.consumer;
   });
@@ -14333,25 +15892,36 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     // deferral gate, or the subagent's remaining work is stranded
     // out-of-turn through the refusal lane.
     const agent = createMockAgent();
+    const report = vi.fn(async () => {});
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => (releaseDrain = resolve));
 
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield running();
-        yield subagentStarted("agent-1");
-        yield resultMessage({ stop_reason: "refusal" }); // held, not settled
-        yield idle();
-        await drainGate;
-        yield taskNotification("agent-1");
-        yield resultMessage({ origin: { kind: "task-notification" } }); // settles
-        yield idle();
-      }
-      return messageGenerator();
-    });
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: userMessage } = await iter.next();
+          yield userEcho(userMessage);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage({ stop_reason: "refusal" }); // held, not settled
+          yield idle();
+          await drainGate;
+          yield taskNotification("agent-1");
+          yield resultMessage({ origin: { kind: "task-notification" } }); // settles
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      {
+        fileChangeReporter: {
+          request: vi.fn(),
+          report,
+          finish: vi.fn(),
+        },
+      },
+    );
 
     const response = agent.prompt({
       sessionId: "test-session",
@@ -14362,8 +15932,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await waitFor(
       () => agent.sessions["test-session"]?.activeTurn?.deferredSettle?.stopReason === "refusal",
     );
+    expect(report).not.toHaveBeenCalled();
     releaseDrain();
     await expect(response).resolves.toEqual(expect.objectContaining({ stopReason: "refusal" }));
+    expect(report).toHaveBeenCalledTimes(1);
     await agent.sessions["test-session"]?.consumer;
   });
 
@@ -15759,29 +17331,40 @@ describe("turn steering (_session/steering)", () => {
       error: () => {},
     });
 
-    injectGeneratorSession(agent, (input) => {
-      async function* messageGenerator() {
-        const iter = input[Symbol.asyncIterator]();
-        const u1 = await iter.next();
-        yield userEcho(u1.value); // turn becomes active
-        yield createAssistantText("working on it");
-        // The steered message is pushed at priority 'now'...
-        const steered = await iter.next();
-        // ...so the CLI aborts the query, ending the interrupted cycle with a
-        // result of its own. No idle follows it: one comes at the very end, for
-        // the whole interrupted + steered sequence.
-        yield interruptedCycleResult();
-        // Only now does the steered message run, as a second cycle. Its echo
-        // matches no queued turn (dropped as an unrelated replay), its output is
-        // the answer the user is waiting for, and its result has the last word
-        // on the turn's stop reason.
-        yield userEcho(steered.value);
-        yield createAssistantText("STEERED-OK");
-        yield createResultMessage();
-        yield idleMessage();
-      }
-      return messageGenerator();
-    });
+    const report = vi.fn(async () => void timeline.push("checkpoint"));
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value); // turn becomes active
+          yield createAssistantText("working on it");
+          // The steered message is pushed at priority 'now'...
+          const steered = await iter.next();
+          // ...so the CLI aborts the query, ending the interrupted cycle with a
+          // result of its own. No idle follows it: one comes at the very end, for
+          // the whole interrupted + steered sequence.
+          yield interruptedCycleResult();
+          // Only now does the steered message run, as a second cycle. Its echo
+          // matches no queued turn (dropped as an unrelated replay), its output is
+          // the answer the user is waiting for, and its result has the last word
+          // on the turn's stop reason.
+          yield userEcho(steered.value);
+          yield createAssistantText("STEERED-OK");
+          yield createResultMessage();
+          yield idleMessage();
+        }
+        return messageGenerator();
+      },
+      {
+        fileChangeReporter: {
+          request: vi.fn(),
+          report,
+          finish: vi.fn(),
+        },
+      },
+    );
 
     const turn = agent
       .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
@@ -15803,7 +17386,8 @@ describe("turn steering (_session/steering)", () => {
     // The steered continuation belongs to the turn the client is waiting on, so
     // all of it precedes that turn's response. A `prompt:` entry anywhere but
     // last is the bug: updates outlived the stopReason.
-    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "checkpoint", "prompt:end_turn"]);
+    expect(report).toHaveBeenCalledTimes(1);
     // Both cycles ran for this one prompt, so its usage covers both (2 × the
     // mock result's 10 in / 5 out) rather than stopping at the interrupt.
     expect(response.usage).toEqual({
@@ -16550,6 +18134,169 @@ describe("turn steering (_session/steering)", () => {
     expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
   });
 
+  // Issue #1114: the CLI never replays the steered message's echo, so the idle
+  // lane would swallow every idle and park the prompt. A result stamped with the
+  // steer's uuid proves the steered work ran: it settles the turn right there,
+  // and owes its trailing idle like any other settling result.
+  it("settles a steered turn at a result that names the steer, even with its echo missing", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+    let releaseIdle = () => {};
+    const idleReleased = new Promise<void>((resolve) => (releaseIdle = resolve));
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield { ...interruptedCycleResult(), user_message_uuid: u1.value.uuid };
+        // No echo for the steered message.
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: steered.value.uuid,
+          user_message_uuids: [steered.value.uuid],
+        };
+        await idleReleased;
+        yield idleMessage(); // the settling result's own trailer
+        // Held open: no teardown may rescue the turn.
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    // Settles before any idle arrives.
+    const response = await turn;
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(1);
+
+    releaseIdle();
+    await waitFor(() => agent.sessions["test-session"].owedTrailingIdles === 0);
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // Issue #1114's other hang, and #1063's: the steer aborts an autonomous
+  // followup, whose result counts a trailing idle that the abort then folds into
+  // the one idle spanning both cycles. Absorbing that idle as debt would starve
+  // the steered turn of the only signal it settles on.
+  it("settles a ready steered turn at an idle that owed-idle debt would absorb", async () => {
+    const agent = createMockAgent();
+    let releaseEnd = () => {};
+    const ended = new Promise<void>((resolve) => (releaseEnd = resolve));
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        // The aborted cycle is an autonomous followup: it owes a trailer.
+        yield { ...createResultMessage(), origin: { kind: "task-notification" } };
+        yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage(); // unstamped producer
+        yield idleMessage(); // the only idle
+        await ended;
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    releaseEnd();
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  // The guard the ready lane must keep: an owed idle arriving after the steered
+  // echo but before the steered cycle's result belongs to an earlier cycle. The
+  // outcome recorded by then is the interrupted cycle's, so settling on it would
+  // answer the prompt while the steered answer is still streaming.
+  it("does not settle a steered turn on a lagged owed idle before the steered result", async () => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        // An autonomous cycle finishes mid-turn; its trailer lags.
+        yield {
+          ...createResultMessage(),
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          origin: { kind: "task-notification" },
+        };
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        yield interruptedCycleResult();
+        yield userEcho(steered.value);
+        yield idleMessage(); // the autonomous cycle's lagged trailer
+        yield createAssistantText("STEERED-OK");
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "also handle X" }],
+    });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // Both cycles' usage, not just the interrupted one's.
+    expect(response.usage?.inputTokens).toBe(20);
+    expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+  });
+
   it("always injects at 'now' priority, ignoring any client-supplied priority", async () => {
     const agent = createMockAgent();
     const captured: any[] = [];
@@ -16653,8 +18400,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
-      agents: [],
-      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -16670,7 +18415,6 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       owedTrailingIdles: 0,
       messageIdToUuid: new Map(),
       sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-      fileChangeReportRequestIds: new Set(),
     };
     return { interrupt };
   }
@@ -17036,6 +18780,141 @@ describe("prompt response quota metadata (_meta.quota)", () => {
           ],
         ],
       ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("seeds the per-model baseline from a resumed session's first result", async () => {
+    // SDK 0.3.277+: a resumed session's `modelUsage` continues from the totals
+    // the transcript saved, so the first reading holds the pre-resume history.
+    // That turn reports its per-turn `usage` under the top-level model (the
+    // reading's spelling of it) instead of the whole history, and the second
+    // turn's increment is measured from the seeded baseline.
+    const agent = createAgent();
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield {
+            type: "stream_event",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            event: {
+              type: "message_start",
+              message: {
+                model: "claude-opus-5",
+                usage: {
+                  input_tokens: 10,
+                  output_tokens: 5,
+                  cache_read_input_tokens: 0,
+                  cache_creation_input_tokens: 0,
+                },
+              },
+            },
+          };
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-opus-5[1m]": modelRow({ inputTokens: 510, outputTokens: 205 }),
+              "claude-haiku-4-5": modelRow({ inputTokens: 900, outputTokens: 300 }),
+            },
+          });
+          yield idle();
+
+          const second = await iter.next();
+          yield userEcho(second.value);
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 15,
+              output_tokens: 7,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: {
+              "claude-opus-5[1m]": modelRow({ inputTokens: 525, outputTokens: 212 }),
+              "claude-haiku-4-5": modelRow({ inputTokens: 900, outputTokens: 300 }),
+            },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      // What createSession seeds for a `resume` (baseline unknown).
+      { lastModelUsageReading: undefined },
+    );
+
+    const first = await promptOnce(agent, "first");
+    expect(first._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 10, outputTokens: 5, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5[1m]",
+            { inputTokens: 10, outputTokens: 5, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+
+    const second = await promptOnce(agent, "second");
+    expect(second._meta).toEqual(
+      expectedQuotaMeta(
+        { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+        [
+          [
+            "claude-opus-5[1m]",
+            { inputTokens: 15, outputTokens: 7, cachedReadTokens: 0, cachedWriteTokens: 0 },
+          ],
+        ],
+      ),
+    );
+    await agent.sessions["test-session"]?.consumer;
+  });
+
+  it("lists no per-model rows for a resumed first result with no top-level model", async () => {
+    // Without an assistant message there is no model to attribute the per-turn
+    // usage to; an empty list beats charging the pre-resume history.
+    const agent = createAgent();
+    injectGeneratorSession(
+      agent,
+      (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const first = await iter.next();
+          yield userEcho(first.value);
+          yield successfulResultMessage({
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+            modelUsage: { "claude-opus-5": modelRow({ inputTokens: 510, outputTokens: 205 }) },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      },
+      { lastModelUsageReading: undefined },
+    );
+
+    const first = await promptOnce(agent, "first");
+    expect(first._meta).toEqual(
+      expectedQuotaMeta({
+        inputTokens: 10,
+        outputTokens: 5,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      }),
     );
     await agent.sessions["test-session"]?.consumer;
   });
@@ -18170,265 +20049,59 @@ describe("messageIdForGrouping", () => {
   });
 });
 
-describe("agent selection config option", () => {
-  const baseModes = { currentModeId: "default", availableModes: [] };
-  const baseModels = { currentModelId: "default", availableModels: [] };
+describe("buildConfigOptions model option resolved description", () => {
+  const modes = { currentModeId: "default", availableModes: [] };
+  const models = {
+    currentModelId: "default",
+    availableModels: [{ modelId: "default", name: "Default", description: "" }],
+  };
 
-  describe("discoverCustomAgents", () => {
-    it("filters out Claude Code's built-in subagents", async () => {
-      const q = {
-        supportedAgents: async () => [
-          { name: "claude", description: "catch-all" },
-          { name: "Explore", description: "search" },
-          { name: "general-purpose", description: "gp" },
-          { name: "Plan", description: "architect" },
-          { name: "statusline-setup", description: "status" },
-          { name: "my-reviewer", description: "Reviews code" },
-          { name: "my-writer", description: "Writes docs" },
-        ],
-      } as any;
-      const agents = await discoverCustomAgents(q);
-      expect(agents.map((a) => a.name)).toEqual(["my-reviewer", "my-writer"]);
-    });
-
-    it("excludes a custom agent named 'default' (reserved sentinel)", async () => {
-      const q = {
-        supportedAgents: async () => [
-          { name: "default", description: "collides with the synthetic Default entry" },
-          { name: "my-reviewer", description: "Reviews code" },
-        ],
-      } as any;
-      const agents = await discoverCustomAgents(q);
-      expect(agents.map((a) => a.name)).toEqual(["my-reviewer"]);
-    });
-
-    it("returns an empty list when discovery throws", async () => {
-      const q = {
-        supportedAgents: async () => {
-          throw new Error("control request failed");
-        },
-      } as any;
-      expect(await discoverCustomAgents(q)).toEqual([]);
-    });
-  });
-
-  describe("buildConfigOptions agent option", () => {
-    it("omits the agent option when no custom agents are configured", () => {
-      const options = buildConfigOptions(baseModes, baseModels, [], undefined, [], "default");
-      expect(options.find((o) => o.id === "agent")).toBeUndefined();
-    });
-
-    it("adds an agent option with a synthetic Default entry when custom agents exist", () => {
-      const agents = [
-        { name: "my-reviewer", description: "Reviews code" },
-        // empty description should normalize to undefined, not ""
-        { name: "my-writer", description: "" },
-      ];
-      const options = buildConfigOptions(
-        baseModes,
-        baseModels,
-        [],
-        undefined,
-        agents,
-        "my-reviewer",
-      );
-      const agentOption = options.find((o) => o.id === "agent");
-      expect(agentOption).toBeDefined();
-      expect(agentOption!.currentValue).toBe("my-reviewer");
-      expect(agentOption!.type).toBe("select");
-      const entries = (agentOption as any).options;
-      expect(entries.map((o: any) => o.value)).toEqual(["default", "my-reviewer", "my-writer"]);
-      expect(entries[2].description).toBeUndefined();
-    });
-  });
-
-  describe("buildConfigOptions model option resolved description", () => {
-    const modes = { currentModeId: "default", availableModes: [] };
-    const models = {
-      currentModelId: "default",
-      availableModels: [{ modelId: "default", name: "Default", description: "" }],
-    };
-
-    it("sets description to the named model's displayName when resolvedModel matches", () => {
-      const modelInfos = [
-        {
-          value: "default",
-          displayName: "Default",
-          description: "",
-          resolvedModel: "claude-sonnet-5",
-        },
-        {
-          value: "sonnet",
-          displayName: "Claude Sonnet 5",
-          description: "Balanced",
-          resolvedModel: "claude-sonnet-5",
-        },
-      ];
-      const options = buildConfigOptions(
-        modes,
-        models,
-        modelInfos as any,
-        undefined,
-        [],
-        "default",
-      );
-      const modelOption = options.find((o) => o.id === "model");
-      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-      expect(defaultEntry.description).toBe("Claude Sonnet 5");
-    });
-
-    it("falls back to resolvedModel itself when no named model shares it", () => {
-      const modelInfos = [
-        {
-          value: "default",
-          displayName: "Default",
-          description: "",
-          resolvedModel: "claude-opus-5-20251201",
-        },
-      ];
-      const options = buildConfigOptions(
-        modes,
-        models,
-        modelInfos as any,
-        undefined,
-        [],
-        "default",
-      );
-      const modelOption = options.find((o) => o.id === "model");
-      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-      expect(defaultEntry.description).toBe("claude-opus-5-20251201");
-    });
-
-    it("leaves description undefined when default model has no resolvedModel", () => {
-      const modelsNoDesc = {
-        currentModelId: "default",
-        availableModels: [{ modelId: "default", name: "Default" }],
-      };
-      const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
-      const options = buildConfigOptions(
-        modes,
-        modelsNoDesc,
-        modelInfos as any,
-        undefined,
-        [],
-        "default",
-      );
-      const modelOption = options.find((o) => o.id === "model");
-      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-      expect(defaultEntry.description).toBeUndefined();
-    });
-  });
-
-  describe("switching the agent", () => {
-    function createMockAgent() {
-      const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
-      return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    }
-
-    const agents = [{ name: "my-reviewer", description: "Reviews code" }];
-
-    function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
-      function* empty() {}
-      const applyFlagSettings = vi.fn(async () => {});
-      const gen = Object.assign(empty(), {
-        interrupt: vi.fn(),
-        close: vi.fn(),
-        applyFlagSettings,
-      });
-      agent.sessions[sessionId] = {
-        query: gen as any,
-        input: new Pushable(),
-        cancelled: false,
-        titles: new SessionTitles(agent, sessionId),
-        cwd: "/test",
-        sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-        modes: { currentModeId: "default", availableModes: [] },
-        models: { currentModelId: "default", availableModels: [] },
-        modelInfos: [],
-        settingsManager: { dispose: vi.fn() } as any,
-        accumulatedUsage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedReadTokens: 0,
-          cachedWriteTokens: 0,
-        },
-        configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
-        agents,
-        currentAgent: "default",
-        fastModeEnabled: false,
-        abortController: new AbortController(),
-        emitRawSDKMessages: false,
-        forwardSubagentText: false,
-        contextWindowSize: 200000,
-        contextWindowAuthoritative: false,
-        providerCacheKey: "default",
-        taskState: new Map(),
-        toolUseCache: {},
-        emittedToolCalls: new Set(),
-        liveBackgroundTasks: new Map(),
-        emittedAssistantText: false,
-        owedTrailingIdles: 0,
-        messageIdToUuid: new Map(),
-        sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
-        fileChangeReportRequestIds: new Set(),
-      };
-      return { session: agent.sessions[sessionId]!, applyFlagSettings };
-    }
-
-    it("applies the agent flag live without restarting the subprocess", async () => {
-      const agent = createMockAgent();
-      const { session, applyFlagSettings } = injectSession(agent, "s1");
-
-      const result = await agent.setSessionConfigOption({
-        sessionId: "s1",
-        configId: "agent",
-        value: "my-reviewer",
-      });
-
-      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: "my-reviewer" });
-      expect(session.currentAgent).toBe("my-reviewer");
-      // The whole point of the SDK >= 0.3.161 approach: no process teardown.
-      expect(session.query.interrupt).not.toHaveBeenCalled();
-      expect(session.abortController.signal.aborted).toBe(false);
-      expect(agent.sessions["s1"]).toBe(session);
-      const agentOption = result.configOptions.find((o) => o.id === "agent");
-      expect(agentOption?.currentValue).toBe("my-reviewer");
-    });
-
-    it("clears the flag (agent: null) when switching back to default", async () => {
-      const agent = createMockAgent();
-      const { session, applyFlagSettings } = injectSession(agent, "s2");
-      session.currentAgent = "my-reviewer";
-
-      await agent.setSessionConfigOption({
-        sessionId: "s2",
-        configId: "agent",
+  it("sets description to the named model's displayName when resolvedModel matches", () => {
+    const modelInfos = [
+      {
         value: "default",
-      });
+        displayName: "Default",
+        description: "",
+        resolvedModel: "claude-sonnet-5",
+      },
+      {
+        value: "sonnet",
+        displayName: "Claude Sonnet 5",
+        description: "Balanced",
+        resolvedModel: "claude-sonnet-5",
+      },
+    ];
+    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
+    const modelOption = options.find((o) => o.id === "model");
+    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+    expect(defaultEntry.description).toBe("Claude Sonnet 5");
+  });
 
-      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: null });
-      expect(session.currentAgent).toBe("default");
-    });
+  it("falls back to resolvedModel itself when no named model shares it", () => {
+    const modelInfos = [
+      {
+        value: "default",
+        displayName: "Default",
+        description: "",
+        resolvedModel: "claude-opus-5-20251201",
+      },
+    ];
+    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
+    const modelOption = options.find((o) => o.id === "model");
+    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+    expect(defaultEntry.description).toBe("claude-opus-5-20251201");
+  });
 
-    it("leaves tracked state untouched when the live switch is rejected", async () => {
-      const agent = createMockAgent();
-      const { session, applyFlagSettings } = injectSession(agent, "s3");
-      applyFlagSettings.mockRejectedValueOnce(new Error("control channel closed"));
-
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: "s3",
-          configId: "agent",
-          value: "my-reviewer",
-        }),
-      ).rejects.toThrow("control channel closed");
-
-      // The flag never applied, so neither currentAgent nor the config option
-      // moves — no desync with the agent the SDK is actually running.
-      expect(session.currentAgent).toBe("default");
-      const agentOption = session.configOptions.find((o) => o.id === "agent");
-      expect(agentOption?.currentValue).toBe("default");
-    });
+  it("leaves description undefined when default model has no resolvedModel", () => {
+    const modelsNoDesc = {
+      currentModelId: "default",
+      availableModels: [{ modelId: "default", name: "Default" }],
+    };
+    const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
+    const options = buildConfigOptions(modes, modelsNoDesc, modelInfos as any, undefined);
+    const modelOption = options.find((o) => o.id === "model");
+    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+    expect(defaultEntry.description).toBeUndefined();
   });
 });
 

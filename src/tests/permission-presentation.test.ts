@@ -103,7 +103,27 @@ describe("Claude permission ACP v1 presentation", () => {
     });
   });
 
-  it("uses the human command description as the permission title", () => {
+  it("forwards the CLI's defaultToNo hint in the permission record", () => {
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Bash",
+      input: { command: "rm -rf build" },
+      toolUseID: "tool-1",
+      defaultToNo: true,
+    });
+    expect(presentation._meta).toEqual({
+      permission: { version: 1, title: "rm -rf build", defaultToNo: true },
+    });
+    expect(
+      buildClaudePermissionPresentation({
+        toolName: "Bash",
+        input: { command: "rm -rf build" },
+        toolUseID: "tool-1",
+        defaultToNo: false,
+      })._meta,
+    ).toEqual({ permission: { version: 1, title: "rm -rf build" } });
+  });
+
+  it("keeps command descriptions and decision reasons in their presentation fields", () => {
     const input = { command: "npm test", description: "Run the tests" };
     const presentation = buildClaudePermissionPresentation({
       toolName: "Bash",
@@ -113,12 +133,8 @@ describe("Claude permission ACP v1 presentation", () => {
       description: "Run npm tests",
       decisionReason: "Needed to verify the change.",
     });
-    expect(presentation._meta).toEqual({
-      permission: {
-        version: 1,
-        title: "Run the tests",
-        description: "Reason: Needed to verify the change.",
-      },
+    expect(presentation._meta).toMatchObject({
+      permission: { description: "Reason: Needed to verify the change." },
     });
     expect(presentation.toolCall).toMatchObject({
       toolCallId: "tool-1",
@@ -126,30 +142,71 @@ describe("Claude permission ACP v1 presentation", () => {
       kind: "execute",
       status: "pending",
       rawInput: input,
-      title: "Run the tests",
     });
+    expect(presentation.toolCall.content).toEqual([
+      { type: "content", content: { type: "text", text: "Run the tests" } },
+    ]);
     expect(presentation.toolCall.rawInput).toBe(input);
   });
 
+  // `command` is required, so this only shows while the input is still
+  // streaming; both shells share the standard terminal card in that state.
   it.each(["Bash", "PowerShell"])(
-    "uses the %s tool name when no human command description is available",
+    "uses the Terminal fallback for %s when no command is available yet",
     (toolName) => {
-      const input = { command: "echo raw command" };
+      const input = {};
       const presentation = buildClaudePermissionPresentation({
         toolName,
         input,
         toolUseID: `tool-${toolName}`,
       });
 
-      expect(presentation._meta).toEqual({
-        permission: { version: 1, title: toolName },
-      });
-      expect(presentation.toolCall).toMatchObject({
-        title: toolName,
-        rawInput: input,
-      });
+      expect(presentation._meta).toEqual({ permission: { version: 1, title: "Terminal" } });
+      expect(presentation.toolCall).toMatchObject({ title: "Terminal", rawInput: input });
     },
   );
+
+  it.each([
+    ["Bash", "ls -la ~/.config/zed"],
+    ["PowerShell", "Get-ChildItem $HOME\\.config\\zed"],
+  ])(
+    "shows the exact %s command instead of its model-authored description",
+    (toolName, command) => {
+      const input = { command, description: "List files in current directory" };
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input,
+        toolUseID: `tool-${toolName}`,
+      });
+
+      expect(presentation._meta).toMatchObject({ permission: { title: command } });
+      expect(presentation.toolCall.title).toBe(command);
+    },
+  );
+
+  describe.each(["Bash", "PowerShell"])("%s command fidelity", (toolName) => {
+    it.each([
+      { label: "quoted spaces and tabs", command: 'echo "a  b\tc"' },
+      { label: "newlines after comments", command: "echo first # first command\necho second" },
+      { label: "surrounding whitespace", command: " \techo first\n" },
+      {
+        label: "commands longer than 4,000 characters",
+        command: `echo "${"x".repeat(4_001)}"\necho last`,
+      },
+    ])("preserves $label in the approval title", ({ command }) => {
+      const input = { command, description: "Run the requested command" };
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input,
+        toolUseID: `tool-${toolName}`,
+        supportsTerminalOutput: true,
+      });
+
+      expect(presentation._meta).toEqual({ permission: { version: 1, title: command } });
+      expect(presentation.toolCall.title).toBe(command);
+      expect(presentation.toolCall.rawInput).toBe(input);
+    });
+  });
 
   it("keeps the WebFetch URL in structured tool input", () => {
     const input = { url: "https://example.com/docs", prompt: "Read the API reference" };

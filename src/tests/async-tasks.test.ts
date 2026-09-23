@@ -100,6 +100,40 @@ describe("AsyncTaskRuntime", () => {
     });
   });
 
+  it("acknowledges a stop as a live notice for a client on the notice contract", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(
+      true,
+      "session",
+      async (notification) => {
+        published.push(notification);
+      },
+      { notices: true },
+    );
+
+    await runtime.taskStarted({
+      taskId: "task-1",
+      taskType: "local_workflow",
+      description: "Build generated assets",
+    });
+    await runtime.taskStopped("task-1");
+    await runtime.taskStopped("task-1");
+
+    // The acknowledgement of a user action is transient by nature: it need not
+    // become conversation history when the client can show it live.
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+      "notice",
+    ]);
+    expect(published.at(-1)?.update).toEqual({
+      sessionUpdate: "notice",
+      severity: "info",
+      title: "Task stopped by user",
+      description: "Build generated assets.",
+    });
+  });
+
   it("still announces a stop whose SDK notification landed first", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {

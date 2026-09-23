@@ -17,6 +17,7 @@ describe("Claude permission options and response mapping", () => {
     allowPersistentOptions = true,
     availableModes: readonly string[] = [],
     contextUsedPercent?: number,
+    prePlanMode?: string,
   ) =>
     buildClaudePermissionOptions({
       toolName,
@@ -27,7 +28,28 @@ describe("Claude permission options and response mapping", () => {
       allowPersistentOptions,
       availableModes,
       contextUsedPercent,
+      prePlanMode,
     });
+
+  it("leads with the reject options when the CLI defaults the ask to no", () => {
+    const changeSet = normalizeDurablePermissionChangeSet([
+      { type: "addRules", rules: [rule], behavior: "allow", destination: "localSettings" },
+    ]);
+    const context = {
+      toolName: "Bash",
+      input: { command: "npm test" },
+      cwd: "/workspace",
+      durableChangeSet: changeSet,
+    };
+    expect(buildClaudePermissionOptions(context).map((option) => option.kind)).toEqual([
+      "allow_once",
+      "allow_always",
+      "reject_once",
+    ]);
+    expect(
+      buildClaudePermissionOptions({ ...context, defaultToNo: true }).map((option) => option.kind),
+    ).toEqual(["reject_once", "allow_once", "allow_always"]);
+  });
 
   it("builds the native Bash static-suggestions option from the exact update bundle", () => {
     const changeSet = normalizeDurablePermissionChangeSet([
@@ -465,7 +487,7 @@ describe("Claude permission options and response mapping", () => {
     ]);
   });
 
-  it("offers only the highest-priority elevated ExitPlanMode choice", () => {
+  it("offers bypass alongside Auto when both modes are available", () => {
     const options = build("ExitPlanMode", undefined, {}, undefined, true, [
       "auto",
       "default",
@@ -475,9 +497,54 @@ describe("Claude permission options and response mapping", () => {
     expect(options).toMatchObject([
       { optionId: PERMISSION_OPTION_ID.exitPlanDefault, name: "Yes, manually approve edits" },
       { optionId: PERMISSION_OPTION_ID.exitPlanAuto, name: "Yes, and use auto mode" },
+      { optionId: PERMISSION_OPTION_ID.exitPlanBypass, name: "Yes, and bypass permissions" },
       { optionId: PERMISSION_OPTION_ID.reject, name: "No, keep planning" },
     ]);
     expect(options[2]?._meta).toBeUndefined();
+  });
+
+  it("leads with bypass when the session was in bypass before entering plan mode", () => {
+    const modes = ["auto", "default", "acceptEdits", "bypassPermissions"];
+    expect(
+      build("ExitPlanMode", undefined, {}, undefined, true, modes, undefined, "bypassPermissions"),
+    ).toMatchObject([
+      { optionId: PERMISSION_OPTION_ID.exitPlanDefault, name: "Yes, manually approve edits" },
+      { optionId: PERMISSION_OPTION_ID.exitPlanBypass, name: "Yes, and bypass permissions" },
+      { optionId: PERMISSION_OPTION_ID.exitPlanAuto, name: "Yes, and use auto mode" },
+      { optionId: PERMISSION_OPTION_ID.reject, name: "No, keep planning" },
+    ]);
+    expect(
+      build(
+        "ExitPlanMode",
+        undefined,
+        { plan: "Implement it" },
+        undefined,
+        true,
+        modes,
+        73,
+        "bypassPermissions",
+      ).map((option) => option.optionId),
+    ).toEqual(expect.arrayContaining([PERMISSION_OPTION_ID.exitPlanClearBypass]));
+  });
+
+  it("ignores a pre-plan bypass mode the session no longer advertises", () => {
+    expect(
+      build(
+        "ExitPlanMode",
+        undefined,
+        { plan: "Implement it" },
+        undefined,
+        true,
+        ["auto", "acceptEdits"],
+        73,
+        "bypassPermissions",
+      ).map((option) => option.optionId),
+    ).toEqual([
+      PERMISSION_OPTION_ID.exitPlanDefault,
+      PERMISSION_OPTION_ID.exitPlanClearAuto,
+      PERMISSION_OPTION_ID.exitPlanAuto,
+      PERMISSION_OPTION_ID.reject,
+    ]);
   });
 
   it.each([

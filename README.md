@@ -18,9 +18,18 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Client MCP servers
 - Session-scoped long-running goals through the provider-neutral [goal extension](docs/goal-extension.md)
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/session-failure-extension.md)
+- Concrete model and effort defaults through the opt-in [recommended config value extension](docs/recommended-config-values-extension.md)
 - Tool permission presentation, editable choices, and durable effects through the [permission extension](docs/permission-extension.md)
 
 Learn more about the [Agent Client Protocol](https://agentclientprotocol.com/).
+
+To try changes that have landed on `main` but are not released yet, install from the
+`preview` channel — every push to `main` publishes one. See
+[`docs/RELEASES.md`](docs/RELEASES.md#preview-releases).
+
+```sh
+npm install @agentclientprotocol/claude-agent-acp@preview
+```
 
 ### Subagent sessions
 

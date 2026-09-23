@@ -429,6 +429,32 @@ describe("providers", () => {
     );
   });
 
+  it("leaves the native Vertex base URL unset for the default endpoint", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "vertex",
+      baseUrl: "https://aiplatform.googleapis.com",
+      _meta: { claudeCode: { vertex: { projectId: "my-project", region: "global" } } },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          env: expect.objectContaining({
+            CLAUDE_CODE_USE_VERTEX: "1",
+            ANTHROPIC_VERTEX_BASE_URL: "",
+            ANTHROPIC_VERTEX_PROJECT_ID: "my-project",
+            CLOUD_ML_REGION: "global",
+          }),
+        }),
+      }),
+    );
+  });
+
   it("rejects vertex set without _meta project/region", async () => {
     const [agent] = await createAgentMock();
     await expect(

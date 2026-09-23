@@ -1,6 +1,7 @@
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
+import { noticeOrTranscriptUpdate } from "./session-notices.js";
 
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
 type TerminalSource = "event" | "level" | "shutdown";
@@ -96,6 +97,9 @@ export class AsyncTaskRuntime {
     readonly enabled: boolean,
     private readonly sessionId: string,
     private readonly publish: Publish,
+    /** `notices`: the client can present `notice` updates, so the stop
+     *  acknowledgement need not be a transcript line. */
+    private readonly options: { notices?: boolean } = {},
   ) {}
 
   async taskStarted(message: AsyncTaskStarted): Promise<void> {
@@ -354,9 +358,10 @@ export class AsyncTaskRuntime {
     // No terminal summary: a stopped task leaves the Async Tasks panel at once,
     // so anything said there is said to nobody.
     await this.finish(task, "stopped", undefined, "event");
-    // The transcript is where the acknowledgement has to land, and it is the
-    // only one the user gets -- the SDK injects nothing into the model's
-    // context for a stopped shell task.
+    // This acknowledgement is the only one the user gets -- the SDK injects
+    // nothing into the model's context for a stopped shell task. A client on
+    // the notice contract shows it as a live `notice`; otherwise the
+    // transcript is where it has to land.
     //
     // Terminal state deliberately does not gate this. The SDK's own
     // `task_notification` routinely wins the race against the `stopTask`
@@ -369,10 +374,10 @@ export class AsyncTaskRuntime {
     // its tool call), not whether the agent may answer a direct user action.
     await this.publish({
       sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `**Task stopped by user:** ${task.name}.` },
-      },
+      update: noticeOrTranscriptUpdate(
+        { severity: "info", title: "Task stopped by user", description: `${task.name}.` },
+        this.options.notices ?? false,
+      ),
     });
   }
 

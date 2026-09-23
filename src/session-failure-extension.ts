@@ -17,6 +17,7 @@ export function airSessionFailureCapabilityMeta(...additionalCapabilities: strin
 }
 
 export type ClaudeFailureKind =
+  | "access_denied"
   | "advisory"
   | "auth_required"
   | "bad_request"
@@ -93,6 +94,15 @@ const AIR_FAILURE_POLICY: Record<
     fallbackTitle: string;
   }
 > = {
+  // Account or credential blocks that signing in again cannot fix: the
+  // organization must complete verification, or the cloud provider's
+  // credentials must be refreshed outside Claude. No `login` action, and not
+  // sticky like `auth_required` (nothing clears at `auth_status`).
+  access_denied: {
+    category: "access",
+    actions: ["retry"],
+    fallbackTitle: "Claude could not access the account or provider credentials.",
+  },
   advisory: {
     category: "unknown",
     actions: [],
@@ -448,6 +458,15 @@ export function providerFailureCategory(
     case "billing_error":
     case "account_on_hold":
       return "quota_exhausted";
+    // 403 `permission_error` with error_code `verification_required` (the
+    // organization must verify at the console), and a Bedrock/Vertex/Foundry
+    // credential the CLI could not load (transient: it retries, and asks the
+    // user to check or refresh the credentials). Both are access failures
+    // `/login` does not repair, so they get their own lane rather than
+    // `auth_required`'s login action and sticky auth_status recovery.
+    case "verification_required":
+    case "cloud_credential_error":
+      return "access_denied";
     case "rate_limit":
       return "rate_limited";
     case "overloaded":

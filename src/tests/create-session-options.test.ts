@@ -7,6 +7,7 @@ import {
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import { ALLOW_BYPASS } from "../permissions/modes.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -33,6 +34,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
+        interrupt: async () => undefined,
+        close: () => {},
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -138,6 +141,17 @@ describe("createSession options merging", () => {
     });
   }
 
+  describe("allowDangerouslySkipPermissions", () => {
+    it("requests bypass capability by default and mirrors it in the mode catalog", async () => {
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.allowDangerouslySkipPermissions).toBe(ALLOW_BYPASS);
+      expect(response.modes!.availableModes.some((mode) => mode.id === "bypassPermissions")).toBe(
+        ALLOW_BYPASS,
+      );
+    });
+  });
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: process.cwd(),
@@ -165,6 +179,21 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
+  it("ignores the provider-specific main-thread agent option", async () => {
+    const response = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { agent: "reviewer" },
+        },
+      },
+    });
+
+    expect(capturedOptions).not.toHaveProperty("agent");
+    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -332,6 +361,36 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.tools).toEqual([]);
+  });
+
+  it("recreates a resumed Query with changed skills and the same session ID", async () => {
+    const created = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["pdf"] },
+        },
+      },
+    });
+    const initialQuery = agent.sessions[created.sessionId]!.query;
+    expect(capturedOptions!.skills).toEqual(["pdf"]);
+
+    await agent.resumeSession({
+      sessionId: created.sessionId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: { skills: ["docx"] },
+        },
+      },
+    });
+
+    expect(Object.keys(agent.sessions)).toEqual([created.sessionId]);
+    expect(agent.sessions[created.sessionId]!.query).not.toBe(initialQuery);
+    expect(capturedOptions!.resume).toBe(created.sessionId);
+    expect(capturedOptions!.skills).toEqual(["docx"]);
   });
 
   describe("subagent transcript forwarding", () => {
@@ -1120,9 +1179,22 @@ describe("createSession options merging", () => {
     ];
 
     let originalAnthropicModel: string | undefined;
+    let originalClaudeConfigDir: string | undefined;
+    let configDir: string;
     beforeEach(() => {
       originalAnthropicModel = process.env.ANTHROPIC_MODEL;
       delete process.env.ANTHROPIC_MODEL;
+      // These tests assert which model a fresh session lands on with no
+      // override in play, so both override tiers above the SDK's default have
+      // to be neutralized: ANTHROPIC_MODEL and `model` from the user
+      // settings tier. Without the second one, a developer whose own
+      // ~/.claude/settings.json pins a model (e.g. "opus[1m]") sees the
+      // session start on that model instead of models[0]. resolveSettings
+      // reads the user tier from CLAUDE_CONFIG_DIR at call time, so pointing
+      // it at an empty directory is enough.
+      originalClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      configDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-model-config-"));
+      process.env.CLAUDE_CONFIG_DIR = configDir;
     });
     afterEach(() => {
       if (originalAnthropicModel !== undefined) {
@@ -1130,6 +1202,12 @@ describe("createSession options merging", () => {
       } else {
         delete process.env.ANTHROPIC_MODEL;
       }
+      if (originalClaudeConfigDir !== undefined) {
+        process.env.CLAUDE_CONFIG_DIR = originalClaudeConfigDir;
+      } else {
+        delete process.env.CLAUDE_CONFIG_DIR;
+      }
+      fs.rmSync(configDir, { recursive: true, force: true });
     });
 
     it("tolerates a PreModelSwitch hook vetoing the fresh-session model pin", async () => {
@@ -1163,6 +1241,49 @@ describe("createSession options merging", () => {
 
       await expect(agent.newSession({ cwd: process.cwd(), mcpServers: [] })).rejects.toThrow(
         "transport exploded",
+      );
+    });
+
+    it("routes the PostCompact hook's summary into the session's compaction lifecycle", async () => {
+      // The retained summary only reaches the SDK stream framed as the
+      // model-facing continuation prompt; the hook is the adapter's source for
+      // the ACP compaction_update summary.
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const sessionId = response.sessionId;
+
+      const matchers = capturedOptions!.hooks?.PostCompact;
+      expect(matchers).toBeDefined();
+      const callback = (matchers!.at(-1) as any).hooks[0];
+      // The lifecycle belongs to the stream consumer, which the first prompt
+      // starts; a compaction can only ever fire while it is running.
+      (agent as any).ensureConsumer((agent as any).sessions[sessionId], sessionId);
+      const lifecycle = (agent as any).sessions[sessionId].contextCompaction;
+      expect(lifecycle).toBeDefined();
+      const recordSummary = vi.spyOn(lifecycle, "recordSummary");
+
+      const base = {
+        hook_event_name: "PostCompact",
+        session_id: sessionId,
+        transcript_path: "",
+        cwd: process.cwd(),
+        trigger: "manual",
+      };
+      // A subagent's compaction is not the root session's entity.
+      await callback(
+        { ...base, agent_id: "agent-1", compact_summary: "<summary>child</summary>" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      expect(recordSummary).not.toHaveBeenCalled();
+
+      const out = await callback(
+        { ...base, compact_summary: "<analysis>x</analysis><summary>Retained.</summary>" },
+        undefined,
+        { signal: new AbortController().signal },
+      );
+      expect(out).toEqual({ continue: true });
+      expect(recordSummary).toHaveBeenCalledWith(
+        "<analysis>x</analysis><summary>Retained.</summary>",
       );
     });
 
