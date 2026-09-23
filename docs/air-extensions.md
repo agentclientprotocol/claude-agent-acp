@@ -866,6 +866,19 @@ A subagent task (`local_agent`) is not an async task. Native subagent sessions r
 - The Bash `tool_call_update` of a backgrounded command carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
   The card then shows backgrounded work instead of finished work.
 
+### Tool call of a task
+
+The adapter sends `async_task_spawned` only after it knows the tool call that started the task.
+The SDK gives that id as `tool_use_id` of `task_started`, `task_progress`, or `task_notification`.
+The Bash result of a backgrounded command also gives it.
+Until the id arrives, the adapter holds the task. It sends no update of a held task.
+The progress and state updates of a held task follow its spawn, in their order.
+A held task gets its spawn without `toolCallId` when it ends first, or when the prompt result ends the turn.
+An id that arrives after such a spawn goes out as `toolCallId` in `async_task_progress`.
+The adapter never guesses the tool call from the command text.
+
+### Liveness
+
 The SDK background task list is authoritative for liveness.
 When an announced task leaves that list, the adapter reports `stopped`.
 A later terminal event can correct that state to `completed` or `failed`.

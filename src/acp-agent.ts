@@ -4878,6 +4878,7 @@ export class ClaudeAcpAgent {
                   summary: message.summary,
                   last_tool_name: message.last_tool_name,
                   usage: message.usage,
+                  tool_use_id: message.tool_use_id,
                 });
                 break;
               case "task_started":
@@ -4941,6 +4942,7 @@ export class ClaudeAcpAgent {
                   status: message.status,
                   summary: message.summary,
                   output_file: message.output_file,
+                  tool_use_id: message.tool_use_id,
                 });
                 if (message.tool_use_id) {
                   subagents.discardPending(message.tool_use_id);
@@ -5175,6 +5177,9 @@ export class ClaudeAcpAgent {
             }
             break;
           case "result": {
+            // The result ends the model turn. A background task that still
+            // waits for its tool call id gets its spawn now, without the id.
+            await asyncTasks.releaseHeld();
             // A result from an autonomous cycle — a task-notification
             // followup, or a peer/coordinator/observer message the model
             // handled on its own (see AUTONOMOUS_RESULT_ORIGINS) — is not
