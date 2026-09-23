@@ -8008,11 +8008,14 @@ export class ClaudeAcpAgent {
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
-    // Bypass is off for root outside a sandbox, and hosts may opt a session out.
-    // Decided once here: it gates the SDK flag, the spawn-time mode (the SDK
-    // rejects bypassPermissions without the flag), and the mode catalog.
+    // Bypass is off for root outside a sandbox, when settings disable it (the
+    // CLI refuses bypass then too), and hosts may opt a session out. Decided
+    // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
+    // bypassPermissions without the flag), and the mode catalog.
     const allowBypass =
-      ALLOW_BYPASS && sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
+      ALLOW_BYPASS &&
+      settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
+      sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
     const initialPermissionMode = resolvePermissionMode(
       creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
