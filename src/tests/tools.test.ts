@@ -30,6 +30,21 @@ import {
   taskStateToPlanEntries,
   TaskState,
 } from "../tools.js";
+import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
+
+/** An AIR client: it gets the ACP tool call contract (`docs/air-extensions.md`). */
+const AIR_CLIENT: ClientCapabilities = {
+  _meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+};
+
+/** The tool info that an AIR client gets. */
+function airToolInfo(toolUse: any, _supportsTerminalOutput = false, cwd?: string) {
+  return new AcpToolCallRenderer(ToolCallCapabilities.from(AIR_CLIENT)).toolInfo(
+    { id: toolUse?.id, name: toolUse?.name, input: toolUse?.input },
+    cwd,
+  );
+}
 
 describe("PostToolUse callback ownership", () => {
   it("clears only callbacks owned by the cancelled session", async () => {
@@ -57,10 +72,257 @@ describe("PostToolUse callback ownership", () => {
   });
 });
 
-describe("rawOutput in tool call updates", () => {
+describe("tool output in tool call updates", () => {
   const mockClient = {} as AcpClient;
   const mockLogger: Logger = { log: () => {}, error: () => {} };
 
+  it("sends Bash output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_123: {
+        type: "tool_use",
+        id: "toolu_123",
+        name: "Bash",
+        input: { command: "echo hello" },
+      },
+    };
+
+    const toolResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_123",
+      content: "hello\n",
+      is_error: false,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_123",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+
+  it("sends Read output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_456: {
+        type: "tool_use",
+        id: "toolu_456",
+        name: "Read",
+        input: { file_path: "/test/file.txt" },
+      },
+    };
+
+    // ToolResultBlockParam content can be string or array of TextBlockParam
+    const toolResult: ToolResultBlockParam = {
+      type: "tool_result",
+      tool_use_id: "toolu_456",
+      content: [{ type: "text", text: "Line 1\nLine 2\nLine 3" }],
+      is_error: false,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_456",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+
+  it("sends MCP string output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_789: {
+        type: "tool_use",
+        id: "toolu_789",
+        name: "mcp__server__tool",
+        input: { query: "test" },
+      },
+    };
+
+    // BetaMCPToolResultBlock content can be string or Array<BetaTextBlock>
+    const toolResult: BetaMCPToolResultBlock = {
+      type: "mcp_tool_result",
+      tool_use_id: "toolu_789",
+      content: '{"result": "success", "data": [1, 2, 3]}',
+      is_error: false,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_789",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+
+  it("sends MCP array output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_abc: {
+        type: "tool_use",
+        id: "toolu_abc",
+        name: "mcp__server__search",
+        input: { term: "test" },
+      },
+    };
+
+    // BetaTextBlock requires citations field
+    const arrayContent: BetaTextBlock[] = [
+      { type: "text", text: "Result 1", citations: null },
+      { type: "text", text: "Result 2", citations: null },
+    ];
+
+    const toolResult: BetaMCPToolResultBlock = {
+      type: "mcp_tool_result",
+      tool_use_id: "toolu_abc",
+      content: arrayContent,
+      is_error: false,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_abc",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+
+  it("sends web search output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_web: {
+        type: "tool_use",
+        id: "toolu_web",
+        name: "WebSearch",
+        input: { query: "test search" },
+      },
+    };
+
+    // BetaWebSearchResultBlock from SDK
+    const searchResults: BetaWebSearchResultBlock[] = [
+      {
+        type: "web_search_result",
+        url: "https://example.com",
+        title: "Example",
+        encrypted_content: "encrypted content here",
+        page_age: "2 days ago",
+      },
+    ];
+
+    const toolResult: BetaWebSearchToolResultBlock = {
+      type: "web_search_tool_result",
+      tool_use_id: "toolu_web",
+      content: searchResults,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_web",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+
+  it("sends code execution output once, in content, without rawOutput", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_bash: {
+        type: "tool_use",
+        id: "toolu_bash",
+        name: "Bash",
+        input: { command: "ls -la" },
+      },
+    };
+
+    // BetaBashCodeExecutionResultBlock from SDK
+    const bashResult: BetaBashCodeExecutionResultBlock = {
+      type: "bash_code_execution_result",
+      stdout: "file1.txt\nfile2.txt",
+      stderr: "",
+      return_code: 0,
+      content: [],
+    };
+
+    const toolResult: BetaBashCodeExecutionToolResultBlock = {
+      type: "bash_code_execution_tool_result",
+      tool_use_id: "toolu_bash",
+      content: bashResult,
+    };
+
+    const notifications = toAcpNotifications(
+      [toolResult],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].update).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "completed",
+      content: expect.any(Array),
+    });
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
   it("should include rawOutput with string content for tool_result", () => {
     const toolUseCache: ToolUseCache = {
       toolu_123: {
@@ -330,6 +592,40 @@ describe("rawOutput in tool call updates", () => {
       status: "failed",
       rawOutput: "command not found: invalid_command",
     });
+  });
+
+  it("keeps rawOutput for a result without content", () => {
+    const toolUseCache: ToolUseCache = {
+      toolu_edit: {
+        type: "tool_use",
+        id: "toolu_edit",
+        name: "Edit",
+        input: { file_path: "/a.ts", old_string: "a", new_string: "b" },
+      },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_edit",
+          content: "The file /a.ts has been updated successfully.",
+          is_error: false,
+        },
+      ],
+      "assistant",
+      "test-session",
+      toolUseCache,
+      mockClient,
+      mockLogger,
+      { clientCapabilities: AIR_CLIENT },
+    );
+
+    expect(notifications[0].update).toMatchObject({
+      status: "completed",
+      rawOutput: "The file /a.ts has been updated successfully.",
+    });
+    expect(notifications[0].update).not.toHaveProperty("content");
   });
 
   it("should not emit tool_call_update for TodoWrite (emits plan instead)", () => {
@@ -1214,9 +1510,6 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/file.ts",
           oldText: "context before\nold text\ncontext after",
           newText: "context before\nnew text\ncontext after",
-          _meta: {
-            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
-          },
         },
       ]);
       expect(hookUpdate.locations).toEqual([{ path: "/Users/test/project/file.ts", line: 5 }]);
@@ -1303,24 +1596,65 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/file.ts",
           oldText: "foo",
           newText: "bar",
-          _meta: {
-            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
-          },
         },
         {
           type: "diff",
           path: "/Users/test/project/file.ts",
           oldText: "foo",
           newText: "bar",
-          _meta: {
-            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
-          },
         },
       ]);
       expect(hookUpdate.locations).toEqual([
         { path: "/Users/test/project/file.ts", line: 3 },
         { path: "/Users/test/project/file.ts", line: 15 },
       ]);
+    });
+
+    it("sends no hook update without a diff or a marker for non-Edit tools", async () => {
+      const toolUseCache: ToolUseCache = {};
+
+      const hookUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AcpClient;
+
+      toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_bash_no_diff",
+            name: "Bash",
+            input: { command: "echo hi" },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+        { clientCapabilities: AIR_CLIENT },
+      );
+
+      const hook = createPostToolUseHook();
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "Bash",
+          tool_input: { command: "echo hi" },
+          tool_response: "hi",
+          tool_use_id: "toolu_bash_no_diff",
+          session_id: "test-session",
+          transcript_path: "/tmp/test",
+          cwd: "/tmp",
+        },
+        "toolu_bash_no_diff",
+        { signal: AbortSignal.abort() },
+      );
+
+      // No diff and no tool_response marker: the hook has nothing to add.
+      expect(hookUpdates).toHaveLength(0);
     });
 
     it("should not include content/locations for non-Edit tools", async () => {
@@ -1369,6 +1703,78 @@ describe("Bash terminal output", () => {
       const hookUpdate = hookUpdates[0].update;
       expect(hookUpdate.content).toBeUndefined();
       expect(hookUpdate.locations).toBeUndefined();
+    });
+
+    it("keeps only the async launch markers of a tool_response", async () => {
+      const hookUpdates: any[] = [];
+      const client = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AcpClient;
+      toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_async_agent",
+            name: "Agent",
+            input: { description: "Research", prompt: "Look around" },
+          },
+          {
+            type: "tool_use" as const,
+            id: "toolu_read_hook",
+            name: "Read",
+            input: { file_path: "/a.ts" },
+          },
+        ],
+        "assistant",
+        "test-session",
+        {},
+        client,
+        mockLogger,
+        { clientCapabilities: AIR_CLIENT },
+      );
+
+      const hook = createPostToolUseHook();
+      const fire = (toolUseId: string, toolName: string, toolResponse: unknown) =>
+        hook(
+          {
+            hook_event_name: "PostToolUse",
+            tool_name: toolName,
+            tool_input: {},
+            tool_response: toolResponse,
+            tool_use_id: toolUseId,
+            session_id: "test-session",
+            transcript_path: "/tmp/test",
+            cwd: "/tmp",
+          },
+          toolUseId,
+          { signal: AbortSignal.abort() },
+        );
+      await fire("toolu_async_agent", "Agent", {
+        status: "async_launched",
+        isAsync: true,
+        agentId: "agent-1",
+        description: "Research",
+        prompt: "Look around",
+        outputFile: "/tmp/agent-1.output",
+      });
+      await fire("toolu_read_hook", "Read", {
+        type: "text",
+        file: { filePath: "/a.ts", content: "whole file", numLines: 1 },
+      });
+
+      expect(hookUpdates).toHaveLength(1);
+      expect(hookUpdates[0].update).toEqual({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_async_agent",
+        _meta: {
+          claudeCode: {
+            toolName: "Agent",
+            toolResponse: { status: "async_launched", isAsync: true },
+          },
+        },
+      });
     });
 
     // Regression for issue #889: tool uses that never register a callback
@@ -1479,9 +1885,6 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/file.ts",
           oldText: "line1\nold line2\nline3",
           newText: "line1\nNEW line2\nline3",
-          _meta: {
-            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 1, removed: 1 } } },
-          },
         },
       ]);
       expect(hookUpdate.locations).toEqual([{ path: "/Users/test/project/file.ts", line: 1 }]);
@@ -1556,15 +1959,109 @@ describe("Bash terminal output", () => {
           path: "/Users/test/project/new.ts",
           oldText: null,
           newText: "first\nsecond",
-          _meta: {
-            jetbrains: { air: { version: 1, diffStats: { version: 1, added: 2, removed: 0 } } },
-          },
         },
       ]);
     });
   });
 
   describe("post-tool-use hook preserves terminal _meta", () => {
+    it("should send terminal_output and terminal_exit as separate notifications, and no hook update", async () => {
+      const clientCapabilities: ClientCapabilities = {
+        _meta: { terminal_output: true, ...AIR_CLIENT._meta },
+      };
+
+      const toolUseCache: ToolUseCache = {};
+
+      // Capture session updates sent by the hook callback
+      const hookUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AcpClient;
+
+      // Step 1: Process tool_use chunk — registers the PostToolUse hook callback
+      const toolUseChunk = {
+        type: "tool_use" as const,
+        id: "toolu_bash_hook",
+        name: "Bash",
+        input: { command: "ls -la" },
+      };
+      const toolUseNotifications = toAcpNotifications(
+        [toolUseChunk],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+        { clientCapabilities },
+      );
+
+      // The initial tool_call should include terminal_info in _meta
+      expect(toolUseNotifications).toHaveLength(1);
+      expect((toolUseNotifications[0].update as any)._meta).toMatchObject({
+        terminal_info: { terminal_id: "toolu_bash_hook" },
+      });
+
+      // Step 2: Process bash result — produces separate terminal_output and terminal_exit notifications
+      const bashResult: BetaBashCodeExecutionResultBlock = {
+        type: "bash_code_execution_result",
+        stdout: "file1.txt",
+        stderr: "",
+        return_code: 0,
+        content: [],
+      };
+      const toolResult: BetaBashCodeExecutionToolResultBlock = {
+        type: "bash_code_execution_tool_result",
+        tool_use_id: "toolu_bash_hook",
+        content: bashResult,
+      };
+      const resultNotifications = toAcpNotifications(
+        [toolResult],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+        { clientCapabilities },
+      );
+
+      // Should produce 2 notifications: terminal_output, then terminal_exit + completion
+      expect(resultNotifications).toHaveLength(2);
+
+      // First: terminal_output only
+      expect((resultNotifications[0].update as any)._meta).toEqual({
+        terminal_output: { terminal_id: "toolu_bash_hook", data: "file1.txt" },
+      });
+
+      // Second: terminal_exit + status
+      expect((resultNotifications[1].update as any)._meta).toMatchObject({
+        terminal_exit: { terminal_id: "toolu_bash_hook", exit_code: 0, signal: null },
+      });
+      expect((resultNotifications[1].update as any).status).toBe("completed");
+
+      // Step 3: Fire the PostToolUse hook (simulates what Claude Code SDK does)
+      const hook = createPostToolUseHook();
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "Bash",
+          tool_input: { command: "ls -la" },
+          tool_response: "file1.txt",
+          tool_use_id: "toolu_bash_hook",
+          session_id: "test-session",
+          transcript_path: "/tmp/test",
+          cwd: "/tmp",
+        },
+        "toolu_bash_hook",
+        { signal: AbortSignal.abort() },
+      );
+
+      // Step 4: The terminal events already carried the output, and the
+      // string tool_response has no marker, so the hook sends nothing.
+      expect(hookUpdates).toHaveLength(0);
+    });
+
     it("should send terminal_output and terminal_exit as separate notifications, and hook should only have claudeCode", async () => {
       const clientCapabilities: ClientCapabilities = {
         _meta: { terminal_output: true },
@@ -1668,6 +2165,79 @@ describe("Bash terminal output", () => {
       expect(hookMeta.terminal_info).toBeUndefined();
       expect(hookMeta.terminal_output).toBeUndefined();
       expect(hookMeta.terminal_exit).toBeUndefined();
+    });
+
+    it("sends no hook update when client lacks terminal_output support", async () => {
+      const toolUseCache: ToolUseCache = {};
+
+      const hookUpdates: any[] = [];
+      const mockClientWithUpdate = {
+        sessionUpdate: async (notification: any) => {
+          hookUpdates.push(notification);
+        },
+      } as unknown as AcpClient;
+
+      // Process tool_use (registers hook)
+      toAcpNotifications(
+        [
+          {
+            type: "tool_use" as const,
+            id: "toolu_bash_no_term",
+            name: "Bash",
+            input: { command: "echo hi" },
+          },
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+        { clientCapabilities: AIR_CLIENT },
+      );
+
+      // Process bash result
+      const bashResult: BetaBashCodeExecutionResultBlock = {
+        type: "bash_code_execution_result",
+        stdout: "hi",
+        stderr: "",
+        return_code: 0,
+        content: [],
+      };
+      toAcpNotifications(
+        [
+          {
+            type: "bash_code_execution_tool_result",
+            tool_use_id: "toolu_bash_no_term",
+            content: bashResult,
+          } as BetaBashCodeExecutionToolResultBlock,
+        ],
+        "assistant",
+        "test-session",
+        toolUseCache,
+        mockClientWithUpdate,
+        mockLogger,
+        { clientCapabilities: AIR_CLIENT },
+      );
+
+      // Fire hook
+      const hook = createPostToolUseHook();
+      await hook(
+        {
+          hook_event_name: "PostToolUse",
+          tool_name: "Bash",
+          tool_input: { command: "echo hi" },
+          tool_response: "hi",
+          tool_use_id: "toolu_bash_no_term",
+          session_id: "test-session",
+          transcript_path: "/tmp/test",
+          cwd: "/tmp",
+        },
+        "toolu_bash_no_term",
+        { signal: AbortSignal.abort() },
+      );
+
+      // The tool result already carried the output, so the hook sends nothing.
+      expect(hookUpdates).toHaveLength(0);
     });
 
     it("should not include terminal _meta in hook update when client lacks terminal_output support", async () => {
@@ -3674,8 +4244,29 @@ describe("Skill tool rendering", () => {
     });
   });
 
-  describe("_meta.claudeCode.skill in tool_call notification", () => {
-    it("includes skill name in _meta.claudeCode when Skill tool is invoked", () => {
+  describe("_meta.jetbrains.air.skill in tool_call notification", () => {
+    it("includes the skill name in _meta.jetbrains.air when Skill tool is invoked", () => {
+      const notifications = toAcpNotifications(
+        [
+          { type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } },
+        ] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+        { clientCapabilities: AIR_CLIENT },
+      );
+      expect(notifications[0]?.update).toMatchObject({
+        sessionUpdate: "tool_call",
+        _meta: {
+          claudeCode: { toolName: "Skill" },
+          jetbrains: { air: { skill: { name: "commits" } } },
+        },
+      });
+    });
+
+    it("sends no skill key to a client that is not AIR", () => {
       const notifications = toAcpNotifications(
         [
           { type: "tool_use", id: "toolu_5", name: "Skill", input: { skill: "commits", args: "" } },
@@ -3688,7 +4279,10 @@ describe("Skill tool rendering", () => {
       );
       expect(notifications[0]?.update).toMatchObject({
         sessionUpdate: "tool_call",
-        _meta: { claudeCode: { toolName: "Skill", skill: "commits" } },
+        _meta: { claudeCode: { toolName: "Skill" } },
+      });
+      expect((notifications[0]?.update as any)._meta).toEqual({
+        claudeCode: { toolName: "Skill" },
       });
     });
 
@@ -3704,6 +4298,20 @@ describe("Skill tool rendering", () => {
       const meta = (notifications[0]?.update as any)?._meta?.claudeCode;
       expect(meta).toBeDefined();
       expect(meta.skill).toBeUndefined();
+    });
+
+    it("omits the skill from _meta when the skill name is missing", () => {
+      const notifications = toAcpNotifications(
+        [{ type: "tool_use", id: "toolu_6", name: "Skill", input: {} }] as any,
+        "assistant",
+        "test-session",
+        {},
+        {} as AcpClient,
+        mockLogger,
+      );
+      const meta = (notifications[0]?.update as any)?._meta;
+      expect(meta.claudeCode).toEqual({ toolName: "Skill" });
+      expect(meta.jetbrains).toBeUndefined();
     });
   });
 
@@ -3751,7 +4359,7 @@ describe("Skill tool rendering", () => {
     });
   });
 
-  describe("_meta.claudeCode.skillPath", () => {
+  describe("_meta.jetbrains.air.skill.path", () => {
     const skillMeta = (skill: string, cwd?: string) =>
       (
         toAcpNotifications(
@@ -3761,9 +4369,9 @@ describe("Skill tool rendering", () => {
           {},
           {} as AcpClient,
           mockLogger,
-          cwd ? { cwd } : undefined,
+          { clientCapabilities: AIR_CLIENT, ...(cwd ? { cwd } : {}) },
         )[0]?.update as any
-      )?._meta?.claudeCode;
+      )?._meta?.jetbrains?.air?.skill;
 
     let root: string;
 
@@ -3785,33 +4393,99 @@ describe("Skill tool rendering", () => {
 
     it("resolves a project-level .claude/skills skill", () => {
       const file = writeSkill(".claude/skills/commits");
-      expect(skillMeta("commits", root).skillPath).toBe(file);
+      expect(skillMeta("commits", root).path).toBe(file);
     });
 
     it("resolves a project-level .agents/skills skill", () => {
       const file = writeSkill(".agents/skills/commits");
-      expect(skillMeta("commits", root).skillPath).toBe(file);
+      expect(skillMeta("commits", root).path).toBe(file);
     });
 
     it("resolves a directory-scoped skill spelled prefix:name", () => {
       const file = writeSkill("apps/web/.claude/skills/deploy");
-      expect(skillMeta("apps/web:deploy", root).skillPath).toBe(file);
+      expect(skillMeta("apps/web:deploy", root).path).toBe(file);
     });
 
     it("resolves a plugin skill spelled plugin:name", () => {
       const file = writeSkill(".claude/plugins/reviewer/skills/audit");
-      expect(skillMeta("reviewer:audit", root).skillPath).toBe(file);
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
     });
 
-    it("omits skillPath when no known layout holds the skill", () => {
+    it("omits the path when no known layout holds the skill", () => {
       const meta = skillMeta("nonexistent", root);
-      expect(meta.skill).toBe("nonexistent");
-      expect(meta.skillPath).toBeUndefined();
+      expect(meta).toEqual({ name: "nonexistent" });
     });
 
-    it("omits skillPath when the session has no cwd", () => {
+    it("omits the path when the session has no cwd", () => {
       writeSkill(".claude/skills/commits");
-      expect(skillMeta("commits").skillPath).toBeUndefined();
+      expect(skillMeta("commits").path).toBeUndefined();
     });
+  });
+});
+
+describe("NotebookEdit", () => {
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  it("shows the notebook, the cell, and the new source", () => {
+    expect(
+      airToolInfo(
+        {
+          name: "NotebookEdit",
+          input: {
+            notebook_path: "/work/analysis.ipynb",
+            cell_id: "cell-2",
+            new_source: "print(1)",
+          },
+        },
+        false,
+        "/work",
+      ),
+    ).toEqual({
+      title: "Edit cell cell-2 in analysis.ipynb",
+      kind: "edit",
+      content: [{ type: "content", content: { type: "text", text: "```\nprint(1)\n```" } }],
+      locations: [{ path: "/work/analysis.ipynb" }],
+    });
+    expect(
+      airToolInfo({
+        name: "NotebookEdit",
+        input: {
+          notebook_path: "/work/analysis.ipynb",
+          cell_id: "cell-2",
+          new_source: "",
+          edit_mode: "delete",
+        },
+      }),
+    ).toMatchObject({ title: "Delete cell cell-2 in /work/analysis.ipynb", content: [] });
+  });
+
+  it("does not send the result text that repeats the cell source", () => {
+    const toolUse = {
+      type: "tool_use" as const,
+      id: "toolu_notebook",
+      name: "NotebookEdit",
+      input: { notebook_path: "/work/a.ipynb", cell_id: "c1", new_source: "x = 1" },
+    };
+
+    const notifications = toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_notebook",
+          content: "Updated cell c1 with x = 1",
+        },
+      ],
+      "user",
+      "test-session",
+      { toolu_notebook: toolUse },
+      {} as AcpClient,
+      mockLogger,
+      { registerHooks: false, clientCapabilities: AIR_CLIENT },
+    );
+
+    // The tool call already shows the cell source: the result sends only the status.
+    expect(notifications[0].update).toMatchObject({ status: "completed" });
+    expect(notifications[0].update).not.toHaveProperty("content");
+    expect(notifications[0].update).not.toHaveProperty("rawOutput");
   });
 });

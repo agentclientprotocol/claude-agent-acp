@@ -3,7 +3,7 @@ import { structuredPatch } from "diff";
 import { readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { AIR_DIFF_PATCH_CAPABILITY, AIR_DIFF_STATS_KEY, withAirMeta } from "./air-extension.js";
+import { AIR_DIFF_PATCH_CAPABILITY, withAirMeta } from "./air-extension.js";
 
 /**
  * The largest file, in bytes, that the adapter turns into a git patch.
@@ -287,67 +287,17 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
 
   const content: ToolCallContent[] = [];
   const locations: ToolCallLocation[] = [];
-  let previousOldEnd = 0;
-  let previousNewEnd = 0;
-  let accumulatedDelta = 0;
-  let coordinatesRemainConsistent = true;
-
-  for (const { lines, oldStart, newStart, oldLines, newLines } of response.structuredPatch) {
+  for (const { lines, newStart } of response.structuredPatch) {
     const oldText: string[] = [];
     const newText: string[] = [];
-    let added = 0;
-    let removed = 0;
-    let validPrefixes = true;
-    let validEofMarkers = true;
-    const oldPosition = oldStart + (oldLines === 0 ? 1 : 0);
-    const newPosition = newStart + (newLines === 0 ? 1 : 0);
-    const oldEnd = oldPosition + oldLines;
-    const newEnd = newPosition + newLines;
-    const nextDelta = accumulatedDelta + newLines - oldLines;
-    const validCoordinates: boolean =
-      coordinatesRemainConsistent &&
-      Number.isSafeInteger(oldStart) &&
-      Number.isSafeInteger(newStart) &&
-      Number.isSafeInteger(oldLines) &&
-      Number.isSafeInteger(newLines) &&
-      oldStart >= (oldLines === 0 ? 0 : 1) &&
-      newStart >= (newLines === 0 ? 0 : 1) &&
-      oldLines >= 0 &&
-      newLines >= 0 &&
-      Number.isSafeInteger(oldPosition) &&
-      Number.isSafeInteger(newPosition) &&
-      Number.isSafeInteger(oldEnd) &&
-      Number.isSafeInteger(newEnd) &&
-      Number.isSafeInteger(nextDelta) &&
-      oldPosition >= previousOldEnd &&
-      newPosition >= previousNewEnd &&
-      newPosition - oldPosition === accumulatedDelta;
-    coordinatesRemainConsistent = validCoordinates;
-    if (validCoordinates) {
-      previousOldEnd = oldEnd;
-      previousNewEnd = newEnd;
-      accumulatedDelta = nextDelta;
-    }
-    for (const [index, line] of lines.entries()) {
+    for (const line of lines) {
       if (line.startsWith("-")) {
         oldText.push(line.slice(1));
-        removed++;
       } else if (line.startsWith("+")) {
         newText.push(line.slice(1));
-        added++;
-      } else if (line === "\\ No newline at end of file") {
-        const previousLine = lines[index - 1];
-        if (
-          typeof previousLine !== "string" ||
-          (!previousLine.startsWith("-") &&
-            !previousLine.startsWith("+") &&
-            !previousLine.startsWith(" "))
-        ) {
-          validEofMarkers = false;
-        }
+      } else if (line === NO_NEWLINE_MARKER) {
         continue;
       } else {
-        if (!line.startsWith(" ")) validPrefixes = false;
         oldText.push(line.slice(1));
         newText.push(line.slice(1));
       }
@@ -359,13 +309,6 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
         path: response.filePath,
         oldText: oldText.join("\n") || null,
         newText: newText.join("\n"),
-        ...(validCoordinates &&
-        validPrefixes &&
-        validEofMarkers &&
-        oldText.length === oldLines &&
-        newText.length === newLines
-          ? { _meta: withAirMeta(undefined, AIR_DIFF_STATS_KEY, { version: 1, added, removed }) }
-          : {}),
       });
     }
   }

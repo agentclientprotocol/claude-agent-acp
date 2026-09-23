@@ -1,3 +1,4 @@
+import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -10,6 +11,8 @@ import {
   previewPatchContent,
   toolUpdateFromDiffToolResponse,
 } from "../diff.js";
+import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
+import { toolInfoFromToolUse } from "../tools.js";
 
 const tempDirectories: string[] = [];
 
@@ -264,6 +267,27 @@ describe("approval patch previews", () => {
     expect(patch).toContain("@@ -1,3 +1,2 @@\n keep\n-drop\n keep\n");
     expect(all).toContain("@@ -1,2 +1 @@\n-x\n x\n");
   });
+
+  it("sends no content when there is no preview", async () => {
+    const missing = await temporaryFile();
+    const input = { file_path: missing, old_string: "old", new_string: "new" };
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Edit",
+      input,
+      toolUseID: "tool-edit",
+      capabilities: new ClientCapabilities(false, false, true, {
+        client: true,
+        rawInputRendering: false,
+        planContentDelta: false,
+        planFile: false,
+      }),
+      previewContent: await previewPatchContent("Edit", input),
+    });
+
+    // The tool_call already carries the standard diff.
+    expect(presentation.toolCall.content).toBeUndefined();
+    expect(presentation.toolCall.rawInput).toEqual({ file_path: missing });
+  });
 });
 
 describe("git patch headers", () => {
@@ -320,6 +344,85 @@ describe("git patch headers", () => {
 
     expect(toolCall).toBe(preview);
     expect(hook).toBe(preview);
+  });
+});
+
+describe("tool-call diff content", () => {
+  it("sends the standard diff for an Edit snippet in both modes", () => {
+    const toolUse = {
+      id: "edit",
+      name: "Edit",
+      input: { file_path: "/work/a.ts", old_string: "old", new_string: "new" },
+    };
+    const standard = [{ type: "diff", path: "/work/a.ts", oldText: "old", newText: "new" }];
+
+    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual(standard);
+    expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual(standard);
+  });
+
+  it("sends a Write creation patch only after negotiation", () => {
+    const toolUse = {
+      id: "write",
+      name: "Write",
+      input: { file_path: "/work/a.ts", content: "a\n" },
+    };
+
+    expect(patchText(toolInfoFromToolUse(toolUse, false, undefined, true).content)).toContain(
+      "new file mode 100644",
+    );
+    expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual([
+      { type: "diff", path: "/work/a.ts", oldText: null, newText: "a\n" },
+    ]);
+  });
+});
+
+describe("Write tool calls for an existing file", () => {
+  const air = new ClientCapabilities(false, false, true, {
+    client: true,
+    rawInputRendering: false,
+    planContentDelta: false,
+    planFile: false,
+  });
+
+  it("sends the standard diff of the current text, not a creation patch", async () => {
+    const filePath = await temporaryFile("before\n");
+    const toolUse = {
+      id: "write",
+      name: "Write",
+      input: { file_path: filePath, content: "after\n" },
+    };
+
+    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([
+      { type: "diff", path: filePath, oldText: "before\n", newText: "after\n" },
+    ]);
+  });
+
+  it("shows that the Write overwrites a file whose text is unknown", async () => {
+    const filePath = await temporaryFile(Buffer.from([0x61, 0x00, 0x62, 0x0a]));
+    const input = { file_path: filePath, content: "text\n" };
+    const toolUse = { id: "write", name: "Write", input };
+
+    const content = toolInfoFromToolUse(toolUse, false, undefined, true).content;
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Write",
+      input,
+      toolUseID: "write",
+      capabilities: air,
+      previewContent: await previewPatchContent("Write", input),
+    });
+
+    expect(content).toEqual([
+      {
+        type: "content",
+        content: {
+          type: "text",
+          text: `Overwrites the existing file \`${filePath}\`. The adapter cannot show its current content.`,
+        },
+      },
+    ]);
+    // The approval keeps the notice of the tool call, and rawInput keeps the text.
+    expect(presentation.toolCall.content).toBeUndefined();
+    expect(presentation.toolCall.rawInput).toEqual(input);
   });
 });
 
@@ -405,6 +508,20 @@ describe("PostToolUse hook patches", () => {
     ]);
 
     expect(results).toEqual(Array(results.length).fill(undefined));
+  });
+
+  it("maps structured hunks to the standard diff", () => {
+    expect(
+      toolUpdateFromDiffToolResponse({
+        filePath: "/file.ts",
+        structuredPatch: [
+          { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-old", "+new"] },
+        ],
+      }),
+    ).toEqual({
+      content: [{ type: "diff", path: "/file.ts", oldText: "old", newText: "new" }],
+      locations: [{ path: "/file.ts", line: 1 }],
+    });
   });
 
   it("leaves a created file to the tool-call content in the standard mapping", () => {

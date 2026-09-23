@@ -49,7 +49,8 @@ function control(
       status,
       rawInput: { description: "Investigate failure", prompt: "Find the cause" },
       _meta: {
-        claudeCode: { toolName: "Agent", subagent: true, parentToolUseId },
+        claudeCode: { toolName: "Agent", parentToolUseId },
+        jetbrains: { air: { version: 1, subagent: true } },
       },
     },
   } as AcpSessionNotification;
@@ -130,7 +131,10 @@ describe("NativeSubagentRuntime lifecycle", () => {
           sessionUpdate: "tool_call_update",
           toolCallId: "agent-tool",
           status: "failed",
-          _meta: { claudeCode: { toolName: "Agent", subagent: true } },
+          _meta: {
+            claudeCode: { toolName: "Agent" },
+            jetbrains: { air: { version: 1, subagent: true } },
+          },
         },
       } as AcpSessionNotification,
       async () => {},
