@@ -5728,17 +5728,18 @@ export class ClaudeAcpAgent {
             // next `result` can emit a usage_update tied to the right context
             // window. Subagent messages are excluded to keep the snapshot
             // aligned with what the user's current selection is producing.
-            // A synthetic spend-limit frame has an all-zero SDK usage object,
-            // but it is an error banner rather than a new model response. Do
-            // not let it erase the most recent real context measurement.
+            // Synthetic frames (spend limits, sign-in prompts, local command
+            // output) are CLI-local banners with an all-zero usage object, not
+            // model responses, so they must not erase the last real context
+            // measurement. A turn with no real frame leaves the snapshot null
+            // and the result emits no usage_update, keeping the client's value.
             if (message.type === "assistant" && message.parent_tool_use_id === null) {
-              const isUsageLimit = isSyntheticUsageLimitMessage(message.message);
-              if (!isUsageLimit || lastAssistantTotalUsage === null) {
+              if (message.message.model !== "<synthetic>") {
                 lastAssistantUsage = snapshotFromUsage(message.message.usage);
                 lastAssistantTotalUsage = totalTokens(lastAssistantUsage);
                 session.contextUsedTokens = lastAssistantTotalUsage;
               }
-              lastAssistantWasUsageLimit = isUsageLimit;
+              lastAssistantWasUsageLimit = isSyntheticUsageLimitMessage(message.message);
               if (message.error || lastAssistantWasUsageLimit) {
                 lastAssistantFailureTitle = assistantMessageText(message.message);
               }
