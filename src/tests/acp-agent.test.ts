@@ -65,7 +65,9 @@ import {
   type SDKControlGetUsageResponse,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash, randomUUID } from "crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   mockSessionState,
   successfulResultMessage,
@@ -2894,6 +2896,167 @@ describe("subagent transcript replay", () => {
     ).replaySessionHistory("s1");
     return updates;
   }
+
+  it("replays a subagent from its own transcript file", async () => {
+    // Claude keeps a subagent history in <session>/subagents/, and the SDK
+    // returns the main transcript without it and without parent_tool_use_id.
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-subagent-replay-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const sessionId = "11111111-1111-4111-8111-111111111111";
+      const directory = path.join(configDir, "projects", "-tmp-proj");
+      await mkdir(path.join(directory, sessionId, "subagents"), { recursive: true });
+      const base = {
+        sessionId,
+        cwd: "/tmp/proj",
+        version: "2.0.0",
+        userType: "external",
+        isSidechain: false,
+        timestamp: "2026-09-24T00:00:00.000Z",
+      };
+      const lines = (records: object[]) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      await writeFile(
+        path.join(directory, `${sessionId}.jsonl`),
+        lines([
+          {
+            ...base,
+            type: "user",
+            uuid: "u1",
+            parentUuid: null,
+            message: { role: "user", content: "Explore it" },
+          },
+          {
+            ...base,
+            type: "assistant",
+            uuid: "a1",
+            parentUuid: "u1",
+            message: {
+              id: "m1",
+              role: "assistant",
+              model: "claude-opus-5",
+              content: [
+                {
+                  type: "tool_use",
+                  id: "toolu_agent",
+                  name: "Agent",
+                  input: { description: "Explore", prompt: "Look around" },
+                },
+                {
+                  type: "tool_use",
+                  id: "toolu_lost",
+                  name: "Agent",
+                  input: { description: "Lost", prompt: "No file" },
+                },
+              ],
+            },
+          },
+          {
+            ...base,
+            type: "user",
+            uuid: "u2",
+            parentUuid: "a1",
+            message: {
+              role: "user",
+              content: [
+                { type: "tool_result", tool_use_id: "toolu_agent", content: "Found it." },
+                { type: "tool_result", tool_use_id: "toolu_lost", content: "Gone." },
+              ],
+            },
+          },
+          {
+            ...base,
+            type: "assistant",
+            uuid: "a2",
+            parentUuid: "u2",
+            message: {
+              id: "m2",
+              role: "assistant",
+              model: "claude-opus-5",
+              content: [{ type: "text", text: "Done." }],
+            },
+          },
+        ]),
+      );
+      const child = { ...base, isSidechain: true, agentId: "abc123" };
+      await writeFile(
+        path.join(directory, sessionId, "subagents", "agent-abc123.jsonl"),
+        lines([
+          {
+            ...child,
+            type: "user",
+            uuid: "c1",
+            parentUuid: null,
+            message: { role: "user", content: "Look around" },
+          },
+          {
+            ...child,
+            type: "assistant",
+            uuid: "c2",
+            parentUuid: "c1",
+            message: {
+              id: "m3",
+              role: "assistant",
+              model: "claude-haiku-4-5",
+              content: [{ type: "text", text: "Child report." }],
+            },
+          },
+        ]),
+      );
+      await writeFile(
+        path.join(directory, sessionId, "subagents", "agent-abc123.meta.json"),
+        JSON.stringify({
+          agentType: "general-purpose",
+          description: "Explore",
+          toolUseId: "toolu_agent",
+        }),
+      );
+
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: SessionNotification) =>
+            updates.push(update as AcpSessionNotification),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      (agent as any).clientCapabilities = { subagents: {} };
+      await (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory(sessionId);
+
+      const child1 = `${sessionId}:replay-subagent:toolu_agent`;
+      const child2 = `${sessionId}:replay-subagent:toolu_lost`;
+      expect(
+        updates.map(({ sessionId: target, update }) => [
+          target,
+          update.sessionUpdate,
+          (update as any).subagentSessionId ??
+            (update as any).content?.text ??
+            (update as any).state,
+        ]),
+      ).toEqual([
+        [sessionId, "user_message_chunk", "Explore it"],
+        [sessionId, "subagent_spawned", child1],
+        [child1, "user_message_chunk", "Look around"],
+        [child1, "agent_message_chunk", "Child report."],
+        // A launch without a subagent file still gets its child and its state.
+        [sessionId, "subagent_spawned", child2],
+        [sessionId, "agent_message_chunk", "Done."],
+        [sessionId, "subagent_state_update", child2],
+        [sessionId, "subagent_state_update", child1],
+      ]);
+      expect(
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate === "subagent_state_update" ? [(update as any).state] : [],
+        ),
+      ).toEqual(["completed", "completed"]);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
 
   it("replays an unattributed sidechain as a deterministic disconnected child", async () => {
     const updates = await replay("native");
