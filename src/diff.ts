@@ -8,9 +8,10 @@ import { AIR_DIFF_PATCH_CAPABILITY, AIR_DIFF_STATS_KEY, withAirMeta } from "./ai
 /**
  * The largest file, in bytes, that the adapter turns into a git patch.
  *
- * A larger file, or a larger new text, gets no patch. The tool call then keeps
- * its standard ACP content. The limit bounds the file read and the line diff
- * that run while Claude waits for an approval.
+ * A larger file, a larger new text, or an Edit whose result can be larger
+ * gets no patch. The tool call then keeps its standard ACP content. The limit
+ * bounds the file read, the replacement, and the line diff that run while
+ * Claude waits for an approval.
  */
 export const MAX_PATCH_FILE_BYTES = 1024 * 1024;
 
@@ -120,6 +121,9 @@ export async function previewPatchContent(
     if (oldText === null) return undefined;
     const occurrences = oldText.split(oldString).length - 1;
     if (occurrences === 0 || (edit.replace_all !== true && occurrences !== 1)) return undefined;
+    if (replacedTextBytesBound(oldText, oldString, newString, occurrences) > MAX_PATCH_FILE_BYTES) {
+      return undefined;
+    }
     const newText = replacedText(oldText, oldString, newString, edit.replace_all === true);
     return optionalContent(await filePatchContent(filePath, oldText, newText));
   }
@@ -174,6 +178,23 @@ function mayKeepEditInput(inputPath: string, filePath: string): boolean {
       candidate.includes("??") ||
       /^\/(?:net|network)(?:\/|$)/iu.test(path.posix.normalize(candidate.replaceAll("\\", "/"))),
   );
+}
+
+/**
+ * An upper bound of the UTF-8 size, in bytes, of {@link replacedText}.
+ *
+ * The caller checks the bound before it builds the text. A `replace_all` of
+ * many short matches with a long `newString` can otherwise build a text of
+ * gigabytes before the timed line diff starts.
+ */
+function replacedTextBytesBound(
+  fileText: string,
+  oldString: string,
+  newString: string,
+  occurrences: number,
+): number {
+  const growth = Buffer.byteLength(newString, "utf8") - Buffer.byteLength(oldString, "utf8");
+  return Buffer.byteLength(fileText, "utf8") + occurrences * Math.max(0, growth);
 }
 
 /**

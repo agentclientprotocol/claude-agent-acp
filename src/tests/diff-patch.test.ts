@@ -132,6 +132,27 @@ describe("approval patch previews", () => {
     expect(previews).toEqual(Array(previews.length).fill(undefined));
   });
 
+  it("returns no preview when a replace_all result can exceed the size limit", async () => {
+    const longText = "b".repeat(4096);
+    const small = await temporaryFile(`${"a".repeat(200)}\n`);
+    const over = await temporaryFile(`${"a".repeat(512)}\n`);
+    // Each of 1 MiB matches grows by 4 KiB: an unguarded replacement builds
+    // 4 GiB before the line diff starts.
+    const huge = await temporaryFile("a".repeat(MAX_PATCH_FILE_BYTES));
+
+    const edit = (file_path: string) =>
+      previewPatchContent("Edit", {
+        file_path,
+        old_string: "a",
+        new_string: longText,
+        replace_all: true,
+      });
+
+    expect(await edit(small)).toBeDefined();
+    expect(await edit(over)).toBeUndefined();
+    expect(await edit(huge)).toBeUndefined();
+  });
+
   it("builds a creation patch for an Edit with an empty old_string", async () => {
     const missing = await temporaryFile();
     const empty = await temporaryFile("");
