@@ -37,6 +37,7 @@ import {
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
   claudeCliPath,
+  computeSessionFingerprint,
   streamEventToAcpNotifications,
   messageIdForGrouping,
   buildConfigOptions,
@@ -9419,11 +9420,15 @@ describe("getOrCreateSession param change detection", () => {
       cwd?: string;
       mcpServers?: { name: string }[];
       skills?: Options["skills"];
+      options?: Options;
     } = {},
   ) {
     const cwd = opts.cwd ?? "/test";
     const mcpServers = (opts.mcpServers ?? []) as any[];
-    const skills = Array.isArray(opts.skills) ? [...new Set(opts.skills)].sort() : opts.skills;
+    const options = {
+      ...opts.options,
+      ...(opts.skills !== undefined && { skills: opts.skills }),
+    };
     function* empty() {}
     const gen = Object.assign(empty(), {
       interrupt: vi.fn(),
@@ -9436,10 +9441,10 @@ describe("getOrCreateSession param change detection", () => {
       cancelled: false,
       titles: new SessionTitles(agent, sessionId),
       cwd,
-      sessionFingerprint: JSON.stringify({
+      sessionFingerprint: computeSessionFingerprint({
         cwd,
-        mcpServers: [...mcpServers].sort((a: any, b: any) => a.name.localeCompare(b.name)),
-        ...(skills !== undefined && { skills }),
+        mcpServers,
+        _meta: { claudeCode: { options } },
       }),
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
@@ -9623,9 +9628,54 @@ describe("getOrCreateSession param change detection", () => {
     expect(session.settingsManager.dispose).not.toHaveBeenCalled();
   });
 
-  it("ignores unrelated Claude options when computing the fingerprint", async () => {
+  it("tears down the existing session when any other Claude option changes", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      options: { env: { CUSTOM_ENV: "original" } },
+    });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(new Error("mock"));
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        _meta: { claudeCode: { options: { env: { CUSTOM_ENV: "changed" } } } },
+      }),
+    ).rejects.toThrow("mock");
+
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(agent.sessions["s1"]).toBeUndefined();
+    expect(createSessionSpy).toHaveBeenCalled();
+  });
+
+  it("tears down the existing session when additionalDirectories change", async () => {
     const agent = createMockAgent();
     const session = injectSession(agent, "s1", { cwd: "/project" });
+    vi.spyOn(agent as any, "createSession").mockRejectedValue(new Error("mock"));
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        additionalDirectories: ["/other"],
+      }),
+    ).rejects.toThrow("mock");
+
+    expect(session.settingsManager.dispose).toHaveBeenCalled();
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("ignores option key order and per-call resume controls", async () => {
+    const agent = createMockAgent();
+    const session = injectSession(agent, "s1", {
+      cwd: "/project",
+      options: { maxTurns: 10, env: { A: "1", B: "2" } },
+    });
 
     await agent.resumeSession({
       sessionId: "s1",
@@ -9633,7 +9683,15 @@ describe("getOrCreateSession param change detection", () => {
       mcpServers: [],
       _meta: {
         claudeCode: {
-          options: { env: { CUSTOM_ENV: "changed" } },
+          options: {
+            env: { B: "2", A: "1" },
+            maxTurns: 10,
+            resume: "s1",
+            sessionId: "s1",
+            forkSession: false,
+            resumeSessionAt: "msg-1",
+            abortController: new AbortController(),
+          },
         },
       },
     });

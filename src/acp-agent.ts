@@ -1208,26 +1208,76 @@ function normalizeSkills(skills: Options["skills"]): Options["skills"] {
   return Array.isArray(skills) ? [...new Set(skills)].sort() : skills;
 }
 
+/** `_meta.claudeCode.options` keys that do not define the Query process: the
+ *  adapter manages or ignores them, or they only steer how one call attaches
+ *  to the stored conversation. */
+const UNFINGERPRINTED_OPTIONS = new Set<string>([
+  "abortController",
+  "agent",
+  "canUseTool",
+  "continue",
+  "cwd",
+  "executable",
+  "forkSession",
+  "includePartialMessages",
+  "permissionMode",
+  "resume",
+  "resumeSessionAt",
+  "sessionId",
+]);
+
+/** A JSON value with object keys sorted, so key order never changes a
+ *  fingerprint. Functions and class instances (hook callbacks, abort
+ *  controllers, in-process MCP servers) cannot cross JSON-RPC and have no
+ *  stable serialized form, so they are left out. */
+function canonicalJson(value: unknown): unknown {
+  if (typeof value === "function") return undefined;
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalJson((value as Record<string, unknown>)[key])])
+      .filter(([, entry]) => entry !== undefined),
+  );
+}
+
 /** Compute a stable fingerprint of the session-defining params so we can
  *  detect when a loadSession/resumeSession call requires tearing down and
- *  recreating the underlying Query process. MCP servers are sorted by name,
- *  and skills are normalized as a set, so ordering differences don't trigger
- *  unnecessary recreations. */
-function computeSessionFingerprint(params: {
+ *  recreating the underlying Query process. Almost every Query option is read
+ *  only when the process starts, so the whole `_meta.claudeCode.options` object
+ *  is covered (minus {@link UNFINGERPRINTED_OPTIONS}); a warm resume must never
+ *  silently keep stale values. MCP servers are sorted by name, and skills are
+ *  normalized as a set, so ordering differences don't trigger unnecessary
+ *  recreations. */
+export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
+  additionalDirectories?: NewSessionRequest["additionalDirectories"];
   _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
-  const options = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
-  const skills = normalizeSkills(options?.skills);
-  return JSON.stringify({
-    cwd: params.cwd,
-    mcpServers: servers,
-    ...(skills !== undefined && { skills }),
-    maxTurns: options?.maxTurns,
-    maxBudgetUsd: options?.maxBudgetUsd,
-  });
+  const meta = params._meta as (NewSessionMeta & Record<string, unknown>) | undefined;
+  const options: Record<string, unknown> = Object.fromEntries(
+    Object.entries(meta?.claudeCode?.options ?? {}).filter(
+      ([key]) => !UNFINGERPRINTED_OPTIONS.has(key),
+    ),
+  );
+  options.skills = normalizeSkills(options.skills as Options["skills"]);
+  return JSON.stringify(
+    canonicalJson({
+      cwd: params.cwd,
+      mcpServers: servers,
+      additionalDirectories: params.additionalDirectories,
+      additionalRoots: meta?.additionalRoots,
+      systemPrompt: meta?.systemPrompt,
+      disableBuiltInTools: meta?.disableBuiltInTools,
+      emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
+      options,
+    }),
+  );
 }
 
 export type SDKMessageFilter = {
