@@ -197,22 +197,26 @@ import {
 import {
   AGENT_FILE_CHANGE_REPORT_CAPABILITY,
   agentFileChangeReportMeta,
-  agentFileChangeReportRequestId,
-  containsFileChangeAuditMarker,
-  createFileChangeAuditSupport,
-  createFileChangeAuditTurnState,
-  FILE_CHANGE_AUDIT_SERVER_NAME,
-  type FileChangeAuditSupport,
-  type FileChangeAuditTurnState,
+  createNativeFileChangeReporter,
+  type FileChangeReportTurnState,
   type FileChangeReportUnavailableReason,
-  isFileChangeAuditReportPhase,
-  isFileChangeAuditTool,
+  type NativeFileChangeReporter,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
 import {
   ContextCompactionLifecycle,
+  clientSupportsCompactionUpdates,
   contextCompactionMetadataFromBoundary,
+  isCompactSummaryMessage,
 } from "./context-compaction.js";
+import {
+  clientSupportsNotices,
+  MAX_NOTICE_TITLE_LENGTH,
+  normalizeNoticeText,
+  noticeOrTranscriptUpdate,
+  sentenceCase,
+  splitNoticeText,
+} from "./session-notices.js";
 import {
   applyTaskCreate,
   applyTaskList,
@@ -230,10 +234,10 @@ import {
   TaskState,
   taskStateToPlanEntries,
   toolInfoFromToolUse,
-  toolUpdateFromDiffToolResponse,
   toolUpdateFromToolResult,
   unregisterHookCallback,
 } from "./tools.js";
+import { toolUpdateFromDiffToolResponse } from "./diff.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
@@ -273,8 +277,6 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const execFileAsync = promisify(execFile);
-
-const MAX_INLINE_FAILURE_TITLE_LENGTH = 256;
 
 /** Claude CLI emits this synthetic result when an interrupted cycle ends on
  *  queued user input before producing any assistant content. It is a hand-off
@@ -565,6 +567,14 @@ type Turn = {
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
   isLocalOnlyCommand: boolean;
+  /** Whitespace-normalized text this turn delivered as live `notice` updates
+   *  (SDK `informational` frames on the notice lane). A hook-blocked turn's
+   *  result repeats the block reason verbatim with zero output tokens; the
+   *  issue-#453 result-text fallback skips a result that only repeats one of
+   *  these, without the notice counting as the turn's answer. Recorded on the
+   *  queue head, not `activeTurn`: a UserPromptSubmit block arrives before
+   *  any echo, so the turn is only promoted when its result lands. */
+  noticeTexts?: string[];
   /** Structured presentation for an exact /usage command. The command still
    * runs through the normal SDK turn so ordering, cancellation, persistence,
    * and replay remain unchanged. Null means the experimental API failed and
@@ -576,13 +586,20 @@ type Turn = {
    * publish the structured replacement at most once. */
   usageMarkdownDelivered?: boolean;
   usageOriginalOutput?: string;
-  /** Optional hidden, model-authored file-change audit requested by the ACP
-   *  client for this turn. The state is turn-owned so a late tool call can
-   *  never be rebound to a newer prompt. */
-  fileChangeAudit?: FileChangeAuditTurnState;
+  /** Optional native checkpoint preview requested by the ACP client for this
+   *  turn. The state is turn-owned so a late control response can never be
+   *  rebound to a newer prompt. */
+  fileChangeReport?: FileChangeReportTurnState;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
+  /** Set while the terminal checkpoint preview is in flight. The consumer can
+   *  observe another terminal signal during that bounded await; only the first
+   *  one may continue into settlement. */
+  settling?: boolean;
+  /** Outcome captured before the checkpoint preview await, so cancel() can
+   *  preserve its usage and metadata while atomically winning that race. */
+  settlingOutcome?: PromptResponse;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -698,14 +715,8 @@ export type Session = {
   /** The turn whose messages the consumer is currently attributing output to
    *  (the head of `turnQueue` once its user message has been echoed). */
   activeTurn?: Turn | null;
-  /** Request ids already accepted for hidden agent file-change reports. Kept
-   *  for the session lifetime so a redelivered prompt cannot publish the same
-   *  audit twice or bind a late report to another turn. */
-  fileChangeReportRequestIds: Set<string>;
-  /** Session-owned publisher for negotiated file-change audits. Turn state
-   *  stays on each Turn; this controller supplies the single idempotent
-   *  unavailable terminal used by every non-report settlement path. */
-  fileChangeAuditSupport?: FileChangeAuditSupport;
+  /** Session-owned native checkpoint reporter. Turn state stays on each Turn. */
+  fileChangeReporter?: NativeFileChangeReporter;
   /** Optimistic goal state published for a submitted `/goal` command whose
    *  matching runtime update has not arrived yet. Runtime updates for the old
    *  goal are suppressed until this command is echoed or completes, otherwise
@@ -804,9 +815,15 @@ export type Session = {
   /** The last per-model reading seen on this query, autonomous cycles included.
    *  `result.modelUsage` is a running total for the whole query() call rather
    *  than a per-result figure, so consecutive readings are what a result's own
-   *  spend is derived from — this is not itself a turn tally. */
+   *  spend is derived from — this is not itself a turn tally. `undefined` on a
+   *  resumed session until its first result: the CLI continues the running
+   *  total from the totals the transcript saved (SDK 0.3.277+), so that first
+   *  reading is the baseline for later increments, not the first turn's spend
+   *  (see resumedFirstResultModelUsage). */
   lastModelUsageReading?: ModelTokenTally;
   modes: SessionModeState;
+  /** The mode the session left when it entered plan mode, if it is in plan. */
+  prePlanMode?: string;
   models: SessionModelState;
   modelInfos: ModelInfo[];
   /** Prevents the model-specific Auto fallback from spamming the transcript. */
@@ -996,6 +1013,9 @@ export type Session = {
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
+  /** The consumer's compaction lifecycle, exposed so the PostCompact hook can
+   *  hand it the retained summary. */
+  contextCompaction?: ContextCompactionLifecycle;
   /** Whether any top-level assistant text reached the client since the last
    *  stretch boundary. Set as a side effect of sending in the consumer's
    *  `sendUpdate`, never at an emission site; read at the terminal `result`
@@ -1295,6 +1315,10 @@ export type ToolUpdateMeta = {
     terminal_id: string;
   };
   terminal_output?: {
+    terminal_id: string;
+    data: string;
+  };
+  terminal_output_delta?: {
     terminal_id: string;
     data: string;
   };
@@ -1941,13 +1965,13 @@ export class ClaudeAcpAgent {
       },
       settleCancelledTurn: (original, session, turn) => {
         disarmForceCancel(session);
-        this.finishFileChangeAudit(session, turn, "cancelled");
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
         turn.settled = true;
         turn.resolve({ stopReason: "cancelled", usage: sessionUsage(original) });
       },
       settleFailedTurn: (session, turn, error) => {
         disarmForceCancel(session);
-        this.finishFileChangeAudit(session, turn, "providerError");
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
         turn.settled = true;
         turn.reject(error);
       },
@@ -1958,6 +1982,8 @@ export class ClaudeAcpAgent {
       updateConfigOption: (sessionId, configId, value) =>
         this.updateConfigOption(sessionId, configId, value),
       sessionUpdate: (params: SessionNotification) => this.client.sessionUpdate(params),
+      // Capabilities arrive at initialize, after this constructor runs.
+      supportsNotices: () => clientSupportsNotices(this.clientCapabilities),
       logError: (...args: unknown[]) => this.logger.error(...args),
     });
   }
@@ -2665,17 +2691,7 @@ export class ClaudeAcpAgent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
-    const fileChangeReportRequestId = supportsAgentFileChangeReport(this.clientCapabilities)
-      ? agentFileChangeReportRequestId(params._meta)
-      : undefined;
-    let fileChangeAudit: FileChangeAuditTurnState | undefined;
-    if (
-      fileChangeReportRequestId &&
-      !session.fileChangeReportRequestIds.has(fileChangeReportRequestId)
-    ) {
-      session.fileChangeReportRequestIds.add(fileChangeReportRequestId);
-      fileChangeAudit = createFileChangeAuditTurnState(fileChangeReportRequestId);
-    }
+    const fileChangeReport = session.fileChangeReporter?.request(params._meta);
 
     const isUsageCommand =
       params.prompt.length === 1 &&
@@ -2694,7 +2710,7 @@ export class ClaudeAcpAgent {
       isLocalOnlyCommand,
       ...(isUsageCommand ? { isUsageCommand: true } : {}),
       ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
-      ...(fileChangeAudit ? { fileChangeAudit } : {}),
+      ...(fileChangeReport ? { fileChangeReport } : {}),
       settled: false,
       resolve: () => {},
       reject: () => {},
@@ -3093,19 +3109,6 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Publish the audit terminal for every turn path that did not reach the
-   *  report tool. The support flips the turn state synchronously before its
-   *  transport await, so callers can stay fail-open and settle the ACP prompt
-   *  immediately without allowing a racing lifecycle path to publish twice. */
-  private finishFileChangeAudit(
-    session: Session,
-    turn: Turn,
-    reason: FileChangeReportUnavailableReason,
-  ): void {
-    if (!turn.fileChangeAudit || !session.fileChangeAuditSupport) return;
-    void session.fileChangeAuditSupport.finishUnavailable(turn.fileChangeAudit, reason);
-  }
-
   /** Lazily start the per-session consumer that drains the SDK query stream for
    *  the session's whole life. Idempotent: only the first `prompt()` starts it. */
   private ensureConsumer(session: Session, sessionId: string): void {
@@ -3188,13 +3191,30 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
     ));
+    // Adapter-composed advisories (hook feedback, model fallbacks) are live
+    // events, not something the model said. Clients on the notice contract get
+    // them as `notice` updates; the rest keep the bold-label transcript line.
+    const supportsNotices = clientSupportsNotices(this.clientCapabilities);
+    /** Tool uses whose progress already produced a notice: the SDK marks
+     *  repeated `informational` progress for one tool use with its
+     *  `tool_use_id` so hosts can collapse them; a notice has no lifecycle to
+     *  update, so only the first becomes one. */
+    const noticedToolUses = new Set<string>();
     const asyncTasks = (session.asyncTaskRuntime ??= new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       params.sessionId,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
+      { notices: supportsNotices },
     ));
 
-    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
+    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
+      sessionId: params.sessionId,
+      presentation: clientSupportsCompactionUpdates(this.clientCapabilities)
+        ? "compaction_update"
+        : "tool_call",
+      logError: (message, error) => this.logger.error(message, error),
+    });
+    session.contextCompaction = compaction;
     const sendUpdate = async (notification: AcpSessionNotification) => {
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
@@ -3218,16 +3238,6 @@ export class ClaudeAcpAgent {
         if (toolCallId && isNativeSubagentControlUpdate(update)) {
           session.emittedToolCalls.delete(toolCallId);
         }
-        return;
-      }
-      if (
-        isFileChangeAuditReportPhase(session.activeTurn?.fileChangeAudit) &&
-        (update.sessionUpdate === "agent_message_chunk" ||
-          update.sessionUpdate === "agent_thought_chunk" ||
-          update.sessionUpdate === "user_message_chunk" ||
-          update.sessionUpdate === "tool_call" ||
-          update.sessionUpdate === "tool_call_update")
-      ) {
         return;
       }
       if (update.sessionUpdate === "agent_message_chunk") {
@@ -3263,6 +3273,7 @@ export class ClaudeAcpAgent {
       asyncState: "failed" | "stopped",
       context: string,
     ): Promise<void> => {
+      await compaction.interrupt();
       await Promise.all([
         subagents
           .finishAll(nativeState, sendUpdate)
@@ -3397,6 +3408,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      compaction.resume();
       ensureUsageMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
@@ -3449,7 +3461,7 @@ export class ClaudeAcpAgent {
      *  a stamp naming an orphaned command consumes the result outright, and a
      *  stamp naming anything else positively refutes "this is a dead turn's
      *  result", so the dup-over-loss one-skip must not eat it. */
-    const ensureActiveTurn = (resultUserMessageUuid?: string) => {
+    const ensureActiveTurn = async (resultUserMessageUuid?: string) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -3471,7 +3483,7 @@ export class ClaudeAcpAgent {
         // promoted command's own delivery decision is not judged against the
         // held turn's followup text (issue #453) — the caller snapshots the
         // flag AFTER this runs.
-        settleActive(session.activeTurn.deferredSettle);
+        await settleActive(session.activeTurn.deferredSettle);
       }
       // Orphan accounting runs BEFORE the head check: an orphan's echo-less
       // result can arrive with an EMPTY queue (the common post-cancel
@@ -3637,10 +3649,10 @@ export class ClaudeAcpAgent {
     /** Settle the active turn's stored deferred outcome once none of its
      *  spawned subagents is live. The single drain rule shared by the
      *  followup-result and idle settle sites, so the two lanes can't drift. */
-    const settleDeferredIfDrained = () => {
+    const settleDeferredIfDrained = async () => {
       const turn = session.activeTurn;
       if (isHeldOpen(turn) && !turnAwaitingSubagents(turn)) {
-        settleActive(turn.deferredSettle);
+        await settleActive(turn.deferredSettle);
       }
     };
 
@@ -3650,7 +3662,7 @@ export class ClaudeAcpAgent {
      *  turn that can have spawned subagents must route through here: a site
      *  calling settleActive directly bypasses the hold and re-opens the
      *  out-of-turn permission deadlock (issue #866) through its lane. */
-    const settleOrDefer = (outcome: PromptResponse) => {
+    const settleOrDefer = async (outcome: PromptResponse) => {
       // No result ends a steered turn: the steer aborted the cycle this result
       // may belong to, and the steered one is still to come. Record the outcome
       // for the idle lane (see Turn.steeredEchoes); later cycles overwrite it,
@@ -3666,23 +3678,32 @@ export class ClaudeAcpAgent {
       ) {
         session.activeTurn.deferredSettle = outcome;
       } else {
-        settleActive(outcome);
+        await settleActive(outcome);
       }
     };
 
-    /** Settle the active turn's deferred exactly once, disarm the force-cancel
-     *  backstop (the turn is over), and drop it from the queue. */
-    const settleActive = (
+    /** At the actual turn boundary, preview its checkpoint, settle the active
+     *  turn exactly once, disarm the force-cancel backstop, and drop it from
+     *  the queue. Cancellation and provider failures skip checkpoint I/O. */
+    const settleActive = async (
       result: PromptResponse,
-      auditReason: FileChangeReportUnavailableReason = result.stopReason === "cancelled"
+      reportReason: FileChangeReportUnavailableReason = result.stopReason === "cancelled"
         ? "cancelled"
         : "notReported",
     ) => {
       const turn = session.activeTurn;
-      if (!turn || turn.settled) {
+      if (!turn || turn.settled || turn.settling) {
         return;
       }
-      this.finishFileChangeAudit(session, turn, auditReason);
+      turn.settling = true;
+      turn.settlingOutcome = result;
+      if (reportReason === "notReported") {
+        await session.fileChangeReporter?.report(turn, session.query);
+        // cancel() can settle a held turn while the bounded checkpoint preview
+        // is in flight. Its cancellation outcome wins; never settle twice.
+        if (turn.settled || session.activeTurn !== turn) return;
+      }
+      session.fileChangeReporter?.finish(turn.fileChangeReport, reportReason);
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
@@ -3720,7 +3741,7 @@ export class ClaudeAcpAgent {
         );
         return;
       }
-      this.finishFileChangeAudit(session, turn, "providerError");
+      session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -3752,6 +3773,9 @@ export class ClaudeAcpAgent {
       error: unknown,
       title?: string,
     ) => {
+      if (session.activeTurn && !session.activeTurn.settled) {
+        await compaction.interrupt();
+      }
       if (kind === "auth_required") {
         // One sign-out arrives twice — the synthetic login assistant message
         // and the turn's error-shaped result repeat the same text — and the
@@ -3789,7 +3813,10 @@ export class ClaudeAcpAgent {
         return;
       }
       sessionFailures.recordActive(failure);
-      settleActive(turnOutcome(session, "end_turn", sessionFailureMeta(failure)), "providerError");
+      await settleActive(
+        turnOutcome(session, "end_turn", sessionFailureMeta(failure)),
+        "providerError",
+      );
     };
 
     /** Reject every in-flight turn — used when the stream dies. */
@@ -3802,7 +3829,7 @@ export class ClaudeAcpAgent {
       session.turnQueue = [];
       for (const turn of turns) {
         if (!turn.settled) {
-          this.finishFileChangeAudit(session, turn, "providerError");
+          session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
           const wasHeld = isHeldOpen(turn);
           turn.settled = true;
           if (wasHeld) {
@@ -3892,7 +3919,8 @@ export class ClaudeAcpAgent {
               this.trackOrphanCommand(session, active.promptUuid, "started");
             }
           }
-          settleActive(turnOutcome(session, "cancelled"));
+          await compaction.interrupt();
+          await settleActive(turnOutcome(session, "cancelled"));
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
           // streamed text can't suppress the next turn's issue-#453 fallback.
@@ -3955,7 +3983,7 @@ export class ClaudeAcpAgent {
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
           );
-          settleActive(
+          await settleActive(
             session.cancelled
               ? turnOutcome(session, "cancelled")
               : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
@@ -3967,7 +3995,7 @@ export class ClaudeAcpAgent {
           // still here was enqueued afterward and was not part of the cancel.)
           for (const queued of [...(session.turnQueue ?? [])]) {
             if (!queued.settled) {
-              this.finishFileChangeAudit(session, queued, "providerError");
+              session.fileChangeReporter?.finish(queued.fileChangeReport, "providerError");
               queued.settled = true;
               queued.reject(RequestError.internalError(undefined, SESSION_ENDED_MESSAGE));
             }
@@ -4010,6 +4038,7 @@ export class ClaudeAcpAgent {
               const queued = findUnsettledTurn(frame.command_uuid);
               if (queued) {
                 queued.commandStarted = true;
+                compaction.resume();
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".
@@ -4136,11 +4165,11 @@ export class ClaudeAcpAgent {
                 break;
               case "status": {
                 if (message.status === "compacting") {
-                  await compaction.start(message.session_id, message.uuid);
+                  await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
-                  await compaction.finish(message.session_id, message.uuid, "completed");
+                  await compaction.finish(message.uuid, "completed");
                 } else if (message.compact_result === "failed") {
-                  await compaction.finish(message.session_id, message.uuid, "failed", {
+                  await compaction.finish(message.uuid, "failed", {
                     ...(message.compact_error ? { error: message.compact_error } : {}),
                   });
                 }
@@ -4164,7 +4193,6 @@ export class ClaudeAcpAgent {
                 //
                 const compactMetadata = message.compact_metadata;
                 await compaction.finish(
-                  message.session_id,
                   message.uuid,
                   "completed",
                   compactMetadata ? contextCompactionMetadataFromBoundary(compactMetadata) : {},
@@ -4258,8 +4286,7 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    compaction.reset();
-                    settleActive(turnOutcome(session, "cancelled"));
+                    await settleActive(turnOutcome(session, "cancelled"));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
                     // delivery stretch here: idle is the SDK's authoritative
@@ -4284,7 +4311,7 @@ export class ClaudeAcpAgent {
                     if (session.owedTrailingIdles > 0) {
                       session.owedTrailingIdles--;
                     }
-                    settleDeferredIfDrained();
+                    await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
                     // Absorb a settled turn's trailing idle. Also covers a
                     // cancel that landed between a turn's counted result and
@@ -4314,14 +4341,13 @@ export class ClaudeAcpAgent {
                       steered.deferredSettle = steered.steeredSettle;
                       steered.steeredEchoes = undefined;
                       steered.steeredSettle = undefined;
-                      settleDeferredIfDrained();
+                      await settleDeferredIfDrained();
                     }
                   } else if (
                     !session.cancelled &&
                     session.activeTurn &&
                     !session.activeTurn.settled
                   ) {
-                    compaction.reset();
                     // Deliberately only the ACTIVE turn: a queued turn that
                     // was never echoed is NOT failed here, because an idle
                     // can legitimately precede the SDK picking up freshly
@@ -4490,24 +4516,54 @@ export class ClaudeAcpAgent {
               case "informational": {
                 // Free-form notice from the SDK (e.g. why a UserPromptSubmit/Stop
                 // hook blocked continuation). Surface the text so the user sees it
-                // instead of a silent stop. ACP's agent_message_chunk has no
-                // severity field, so fold the level into the text for the more
-                // prominent levels ('info' is transcript-only noise — leave plain).
-                // Sending via sendUpdate also marks the notice as this stretch's
-                // delivered text: a hook-blocked turn's result repeats the block
-                // reason with zero output tokens, and the issue-#453 fallback
-                // must not emit it a second time.
-                const text =
+                // instead of a silent stop. Clients on the notice contract get it
+                // as a `notice` at the SDK's level: 'warning' is the only
+                // prominent one; 'notice' and 'suggestion' are gray status
+                // lines; 'info' shows only in Claude Code's transcript mode, so
+                // it is not worth a live notice at all. For the rest, ACP's
+                // agent_message_chunk has no severity field, so fold the level
+                // into the text for the more prominent levels ('info' is
+                // transcript-only noise — leave plain).
+                //
+                // A hook-blocked turn's result repeats the block reason with zero
+                // output tokens, and the issue-#453 fallback must not emit it a
+                // second time. The transcript line is the stretch's delivered
+                // text via sendUpdate; a notice is not an answer, so instead the
+                // turn remembers the text and the fallback skips a result that
+                // only repeats it (see `Turn.noticeTexts`).
+                if (supportsNotices) {
+                  if (message.level === "info") break;
+                  if (message.tool_use_id) {
+                    if (noticedToolUses.has(message.tool_use_id)) break;
+                    noticedToolUses.add(message.tool_use_id);
+                  }
+                }
+                const severity = message.level === "warning" ? "warning" : "info";
+                const transcriptText =
                   message.level === "info"
                     ? message.content
-                    : `**${message.level[0].toUpperCase()}${message.level.slice(1)}:** ${message.content}`;
+                    : `**${sentenceCase(message.level)}:** ${message.content}`;
                 await sendUpdate({
                   sessionId: message.session_id,
-                  update: {
-                    sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text },
-                  },
+                  update: noticeOrTranscriptUpdate(
+                    {
+                      severity,
+                      ...splitNoticeText(
+                        message.content,
+                        severity === "warning"
+                          ? "Claude reported a warning"
+                          : "Claude reported a notice",
+                      ),
+                    },
+                    supportsNotices,
+                    transcriptText,
+                    { claudeCode: { kind: "informational", level: message.level } },
+                  ),
                 });
+                const noticedTurn = session.activeTurn ?? session.turnQueue?.[0];
+                if (supportsNotices && noticedTurn) {
+                  (noticedTurn.noticeTexts ??= []).push(normalizeNoticeText(message.content));
+                }
                 break;
               }
               case "hook_started":
@@ -4699,27 +4755,35 @@ export class ClaudeAcpAgent {
                   ? `${fallbackSummary}\n\n${explanation}`
                   : fallbackSummary;
                 // A silent model swap is a session-level advisory, not something the model said.
-                // Clients that negotiated typed records get it as one; the rest keep the bold-label
-                // transcript line, which was the only way to flag it before.
-                if (supportsAirSessionFailures(this.clientCapabilities)) {
+                // Clients on the ACP notice contract get it as a `notice`; clients that negotiated
+                // AIR typed records get it as one of those; the rest keep the bold-label transcript
+                // line, which was the only way to flag it before.
+                if (!supportsNotices && supportsAirSessionFailures(this.clientCapabilities)) {
                   const useDetails =
                     explanation !== undefined &&
-                    fallbackSummary.length + 2 + explanation.length >
-                      MAX_INLINE_FAILURE_TITLE_LENGTH;
+                    fallbackSummary.length + 2 + explanation.length > MAX_NOTICE_TITLE_LENGTH;
                   await publishSessionFailure("advisory", {
                     title: useDetails ? fallbackSummary : fallbackNotice,
                     ...(useDetails ? { details: explanation } : {}),
                   });
                 } else {
+                  // A title must stand alone: the one-line summary when it is
+                  // short enough, else a generic title with everything in the
+                  // description (the same cap the AIR lane applies above).
+                  const notice =
+                    fallbackSummary.length > MAX_NOTICE_TITLE_LENGTH
+                      ? { title: "Model fallback", description: fallbackNotice }
+                      : {
+                          title: fallbackSummary,
+                          ...(explanation ? { description: explanation } : {}),
+                        };
                   await sendUpdate({
                     sessionId: message.session_id,
-                    update: {
-                      sessionUpdate: "agent_message_chunk",
-                      content: {
-                        type: "text",
-                        text: `**Model fallback:** ${fallbackNotice}`,
-                      },
-                    },
+                    update: noticeOrTranscriptUpdate(
+                      { severity: "warning", ...notice },
+                      supportsNotices,
+                      `**Model fallback:** ${fallbackNotice}`,
+                    ),
                   });
                 }
                 if (persistent) {
@@ -4838,7 +4902,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                ensureActiveTurn(message.user_message_uuid);
+                await ensureActiveTurn(message.user_message_uuid);
                 // Once the submitted goal command has produced its own result,
                 // no older runtime update can still precede it in the ordered
                 // SDK stream. Stop suppressing updates even when this runtime
@@ -4927,17 +4991,27 @@ export class ClaudeAcpAgent {
                   message.usage.cache_creation_input_tokens;
               }
 
+              const matchingModelUsage = lastAssistantModel
+                ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
+                : null;
+
               // The same tally split by model, for `_meta.quota.model_usage`.
               // `modelUsage` is a running total for the whole query() call, so
               // this result's own spend is what it added to the previous
               // reading. Advance the reading even for an autonomous result — it
               // is part of the running total the NEXT increment is measured
               // from — but leave the turn tally alone, exactly as above.
+              // A resumed session's first reading has no predecessor and
+              // already contains the pre-resume history, so it only seeds the
+              // baseline; that turn's rows come from the per-turn `usage`.
               const modelUsageReading = normalizeModelUsage(message.modelUsage);
-              const resultModelUsage = modelUsageIncrement(
-                modelUsageReading,
-                session.lastModelUsageReading ?? {},
-              );
+              const resultModelUsage =
+                session.lastModelUsageReading === undefined
+                  ? resumedFirstResultModelUsage(
+                      message.usage,
+                      matchingModelUsage?.key ?? lastAssistantModel,
+                    )
+                  : modelUsageIncrement(modelUsageReading, session.lastModelUsageReading);
               session.lastModelUsageReading = modelUsageReading;
               if (!isAutonomousResult) {
                 session.accumulatedModelUsage = addModelUsage(
@@ -4945,10 +5019,6 @@ export class ClaudeAcpAgent {
                   resultModelUsage,
                 );
               }
-
-              const matchingModelUsage = lastAssistantModel
-                ? getMatchingModelUsage(message.modelUsage, lastAssistantModel)
-                : null;
               // Only overwrite when we have an authoritative, sane value. A miss
               // (e.g. a turn with no top-level assistant message), or a
               // nonsensical non-positive/NaN window (observed from third-party
@@ -5033,7 +5103,19 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
-                settleDeferredIfDrained();
+                // CLI 2.1.274+ answers background-task completions that were
+                // already queued with ONE model call: every queued
+                // notification still gets its own result, but all except the
+                // last are placeholders — `num_turns: 0`, empty text, emitted
+                // BEFORE the shared followup runs. A placeholder is not the
+                // summary the hold waits for: settling on it would release
+                // session/prompt with the promised text still ahead, the
+                // out-of-turn delivery issues #864–#866 fixed. Hold through
+                // it; the real followup result (num_turns ≥ 1) or the drain
+                // idle settles the turn.
+                if (message.num_turns > 0) {
+                  await settleDeferredIfDrained();
+                }
                 // With no turn in flight OR QUEUED (also after the settle
                 // above), the stretch holds only autonomous prose — close
                 // it, so a replayed next prompt isn't silently suppressed by
@@ -5122,7 +5204,7 @@ export class ClaudeAcpAgent {
                   return;
                 }
                 stopReason = "cancelled";
-                settleOrDefer(turnOutcome(session, "cancelled"));
+                await settleOrDefer(turnOutcome(session, "cancelled"));
                 break;
               }
               if (pendingExitPlanModeInterruption) {
@@ -5155,7 +5237,7 @@ export class ClaudeAcpAgent {
                 // settling it out from under them would strand their output
                 // and permission requests out-of-turn (issue #866's deadlock,
                 // through the refusal lane).
-                settleOrDefer(turnOutcome(session, "refusal"));
+                await settleOrDefer(turnOutcome(session, "refusal"));
                 break;
               }
 
@@ -5169,7 +5251,7 @@ export class ClaudeAcpAgent {
                 isSteering(session.activeTurn) &&
                 session.activeTurn.steeredEchoes.size > 0
               ) {
-                settleOrDefer(turnOutcome(session, "end_turn"));
+                await settleOrDefer(turnOutcome(session, "end_turn"));
                 break;
               }
 
@@ -5236,7 +5318,10 @@ export class ClaudeAcpAgent {
                     session.activeTurn?.isLocalOnlyCommand ||
                     (!deliveredAssistantText &&
                       !deliveredCompactionOutput &&
-                      (message.usage.output_tokens ?? 0) === 0);
+                      (message.usage.output_tokens ?? 0) === 0 &&
+                      !session.activeTurn?.noticeTexts?.includes(
+                        normalizeNoticeText(message.result),
+                      ));
                   if (shouldForwardResult) {
                     const usageMarkdown = await takeUsageMarkdown(message.result);
                     if (usageMarkdown === null) break;
@@ -5343,29 +5428,47 @@ export class ClaudeAcpAgent {
               // then, so both branches no-op); cancellation is left to the
               // idle/abort path. settleActive is idempotent, so a duplicate
               // idle is a no-op.
+              //
+              // A result also closes this compaction lifecycle — before the
+              // settle, so a `cancelled` terminal for an entity the runtime
+              // left open lands inside the prompt response rather than after
+              // it (clients may stop consuming at the response). Reset here
+              // rather than at idle: an owed idle from this turn can arrive
+              // after the next turn has already started and must not erase
+              // that turn's compaction state.
+              if (!isAutonomousResult) {
+                await compaction.reset();
+              }
               if (!session.cancelled) {
-                settleOrDefer(turnOutcome(session, stopReason));
+                await settleOrDefer(turnOutcome(session, stopReason));
               }
             } finally {
               if (!isAutonomousResult) {
                 session.emittedAssistantText = false;
-                // A result closes this compaction lifecycle. Reset here rather
-                // than at idle: an owed idle from this turn can arrive after
-                // the next turn has already started and must not erase that
-                // turn's compaction state.
-                compaction.reset();
+                // The early exits above (cancelled guard, refusal) skip the
+                // pre-settle reset; idempotent, so a no-op on the normal path.
+                await compaction.reset();
               }
             }
             break;
           }
           case "stream_event": {
-            const isCompactionProgress =
-              (message.event.type === "content_block_start" &&
-                message.event.content_block.type === "compaction") ||
-              (message.event.type === "content_block_delta" &&
-                message.event.delta.type === "compaction_delta");
-            if (isCompactionProgress) {
-              await compaction.heartbeat(message.session_id, message.uuid);
+            // The API's compaction block streams the retained summary text;
+            // `content` is null on the opening block and on a failed compaction.
+            // Only the root conversation's compaction is the session's: a
+            // subagent compacting its own context must not touch it.
+            const compactionBlock =
+              message.parent_tool_use_id !== null
+                ? undefined
+                : message.event.type === "content_block_start" &&
+                    message.event.content_block.type === "compaction"
+                  ? message.event.content_block
+                  : message.event.type === "content_block_delta" &&
+                      message.event.delta.type === "compaction_delta"
+                    ? message.event.delta
+                    : undefined;
+            if (compactionBlock) {
+              await compaction.heartbeat(message.uuid, compactionBlock.content ?? undefined);
             }
             // `message_start` carries the Anthropic API message id; capture it
             // so the streamed chunks that follow (whose delta events don't carry
@@ -5547,7 +5650,7 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles++;
                       // Before activateTurn resets the accumulator, so the
                       // usage still belongs to the cancelled turn.
-                      settleActive(turnOutcome(session, "cancelled"));
+                      await settleActive(turnOutcome(session, "cancelled"));
                     } else if (isHeldOpen(session.activeTurn)) {
                       // A turn held open for its background subagents (see
                       // Turn.deferredSettle) hands off with the real outcome
@@ -5556,7 +5659,7 @@ export class ClaudeAcpAgent {
                       // subagent, but it must not rewrite the stop reason
                       // either. Its trailing-idle debt stands and is absorbed
                       // when the drain idle eventually arrives.
-                      settleActive(session.activeTurn.deferredSettle);
+                      await settleActive(session.activeTurn.deferredSettle);
                     } else if (
                       isSteering(session.activeTurn) &&
                       session.activeTurn.steeredSettle !== undefined
@@ -5573,9 +5676,9 @@ export class ClaudeAcpAgent {
                       // turn and false-fails it (issue #825). Harmless if it
                       // never comes: the debt absorbs one future idle.
                       session.owedTrailingIdles++;
-                      settleActive(session.activeTurn.steeredSettle);
+                      await settleActive(session.activeTurn.steeredSettle);
                     } else {
-                      settleActive(turnOutcome(session, "end_turn"));
+                      await settleActive(turnOutcome(session, "end_turn"));
                     }
                   }
                   // Unlike the no-result teardown lanes, this hand-off must
@@ -6102,6 +6205,10 @@ export class ClaudeAcpAgent {
       clearHookCallbacks(params.sessionId);
       return;
     }
+    // Echo-less commands such as /compact can still be in turnQueue while
+    // their compaction is running. Close it before ANY cancelled prompt
+    // resolves, not just the active-turn idle/backstop paths.
+    await session.contextCompaction?.interrupt();
     try {
       await session.nativeSubagentRuntime?.finishAll(
         "cancelled",
@@ -6141,7 +6248,7 @@ export class ClaudeAcpAgent {
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
         if (turn !== session.activeTurn && !turn.settled) {
-          this.finishFileChangeAudit(session, turn, "cancelled");
+          session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
           turn.settled = true;
           // Deliberately no `usage`: a queued turn never ran, so the session
           // accumulator (the active turn's tally) is not its spend.
@@ -6221,20 +6328,18 @@ export class ClaudeAcpAgent {
       }
     }
 
-    // A deferred active turn (see Turn.deferredSettle) already has its
-    // result — it is only held open for its background subagents, which the
-    // interrupt below tears down. Settle it "cancelled" NOW: during the hold
-    // the session is typically already in state idle (the CLI's trailer
-    // fired at the result), so the interrupt may produce no fresh idle for
-    // the consumer's cancelled-settle path to run on, and the cancel would
-    // otherwise stall until the force-cancel backstop. Any outstanding
-    // trailer debt is absorbed by the idle handler when its idle does come.
-    // The turn's own usage snapshot is reported per the cancelled-usage
-    // contract (issue #844).
+    // A deferred active turn (see Turn.deferredSettle) already has its result
+    // and is only held open for subagents. A settling turn likewise has its
+    // result but is awaiting the bounded checkpoint preview. Settle either one
+    // "cancelled" NOW: the consumer cannot process the interrupt's trailing
+    // idle while blocked in that preview, and a held turn may already be idle.
+    // The captured outcome preserves usage and metadata (issue #844), while
+    // reporter state makes a late checkpoint response harmless.
     {
       const active = session.activeTurn;
-      if (isHeldOpen(active)) {
-        this.finishFileChangeAudit(session, active, "cancelled");
+      const pendingOutcome = active?.deferredSettle ?? active?.settlingOutcome;
+      if (active && pendingOutcome && (isHeldOpen(active) || active.settling)) {
+        session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -6272,8 +6377,8 @@ export class ClaudeAcpAgent {
         // from it here.
         active.resolve({
           stopReason: "cancelled",
-          usage: active.deferredSettle.usage,
-          ...(active.deferredSettle._meta ? { _meta: active.deferredSettle._meta } : {}),
+          usage: pendingOutcome.usage,
+          ...(pendingOutcome._meta ? { _meta: pendingOutcome._meta } : {}),
         });
       }
     }
@@ -6406,6 +6511,7 @@ export class ClaudeAcpAgent {
     }
     session.queryClosed = true;
     session.consumer = undefined;
+    session.contextCompaction = undefined;
     session.settingsManager.dispose();
     session.input.end();
     session.query.close();
@@ -6597,14 +6703,8 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    // Stop-hook additionalContext is persisted as an internal user message.
-    // Once that marker (or the internal tool itself) appears, suppress the
-    // whole audit exchange until its tool result. This also hides a disobedient
-    // model's separate prose message, while an ordinary next user prompt safely
-    // ends an incomplete audit lane.
-    let replayingFileChangeAudit = false;
-    const replayFileChangeAuditToolUseIds = new Set<string>();
     const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
       string,
@@ -6797,62 +6897,31 @@ export class ClaudeAcpAgent {
         if (content === null) continue;
       }
 
-      const auditBlocks = Array.isArray(content)
-        ? content.filter(
-            (block): block is Record<string, unknown> =>
-              typeof block === "object" && block !== null,
-          )
-        : [];
-      const hasFileChangeAuditMarker =
-        (typeof content === "string" && containsFileChangeAuditMarker(content)) ||
-        auditBlocks.some(
-          (block) => typeof block.text === "string" && containsFileChangeAuditMarker(block.text),
+      // Claude persists the retained summary as a user message framed with
+      // continuation instructions for the model. Clients on the compaction
+      // contract get it materialized as the completed compaction entity at
+      // this transcript position (the boundary's own system record comes back
+      // from getSessionMessages without its metadata, so the summary message
+      // is the one durable marker); other clients keep the transcript text.
+      // The entity is keyed by the summary message's uuid, which differs from
+      // the live id (the `compacting` status uuid) — replay is terminal-first
+      // by the RFD, and no client merges a replay into a live entity store.
+      // A subagent's own compaction summary is not the root session's, and a
+      // summary whose framing is unrecognized stays visible as transcript
+      // text rather than vanishing behind a summary-less entity.
+      if (
+        replayCompactionUpdates &&
+        isCompactSummaryMessage(message) &&
+        parentToolUseId === null &&
+        typeof message.uuid === "string" &&
+        message.uuid.length > 0
+      ) {
+        const replayCompaction = new ContextCompactionLifecycle(
+          (notification) => this.client.sessionUpdate(notification),
+          { sessionId, presentation: "compaction_update" },
         );
-      const fileChangeAuditToolUseIds = auditBlocks.flatMap((block) =>
-        (block.type === "tool_use" ||
-          block.type === "server_tool_use" ||
-          block.type === "mcp_tool_use") &&
-        typeof block.name === "string" &&
-        isFileChangeAuditTool(block.name) &&
-        typeof block.id === "string"
-          ? [block.id]
-          : [],
-      );
-      const replayMessageRole = (message as unknown as { message?: { role?: unknown } }).message
-        ?.role;
-      if (hasFileChangeAuditMarker || fileChangeAuditToolUseIds.length > 0) {
-        replayingFileChangeAudit = true;
-        for (const toolUseId of fileChangeAuditToolUseIds) {
-          replayFileChangeAuditToolUseIds.add(toolUseId);
-        }
-        continue;
-      }
-      if (replayingFileChangeAudit) {
-        const toolResultIds = auditBlocks.flatMap((block) =>
-          (block.type === "tool_result" || block.type === "mcp_tool_result") &&
-          typeof block.tool_use_id === "string"
-            ? [block.tool_use_id]
-            : [],
-        );
-        let completedReport = false;
-        for (const toolUseId of toolResultIds) {
-          if (replayFileChangeAuditToolUseIds.delete(toolUseId)) completedReport = true;
-        }
-        if (completedReport && replayFileChangeAuditToolUseIds.size === 0) {
-          replayingFileChangeAudit = false;
-          continue;
-        }
-        // A denied attempt to call another tool is still part of the hidden
-        // lane. Its result must not end replay suppression before the report.
-        if (toolResultIds.length > 0) {
-          continue;
-        }
-        // The next real user prompt is already represented by the client and
-        // starts a new turn; do not let a missing audit result hide it or the
-        // rest of the replay.
-        if (replayMessageRole === "user") {
-          replayingFileChangeAudit = false;
-        } else {
+        if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
+          await replayCompaction.finish(message.uuid, "completed");
           continue;
         }
       }
@@ -7021,7 +7090,9 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
-    const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+    const supportsTerminalOutput =
+      this.clientCapabilities?._meta?.["terminal_output"] === true ||
+      this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
     const update = toolCallNotification(
       { id: toolCallId, name: toolName, input: toolInput },
       toolInput,
@@ -7067,35 +7138,17 @@ export class ClaudeAcpAgent {
         description,
         defaultToNo,
         suppressAlwaysAllowRule,
+        mcpServer,
       },
     ) => {
-      const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
+      const supportsTerminalOutput =
+        this.clientCapabilities?._meta?.["terminal_output"] === true ||
+        this.clientCapabilities?._meta?.["terminal_output_delta"] === true;
       const session = this.sessions[sessionId];
       if (!session) {
         return {
           behavior: "deny",
           message: "Session not found",
-        };
-      }
-
-      const fileChangeAudit = session.activeTurn?.fileChangeAudit;
-      if (isFileChangeAuditReportPhase(fileChangeAudit)) {
-        // The hidden continuation is an audit-only lane: it may submit the
-        // wrapper-owned report, but it must not run another command after the
-        // user-visible answer has already completed.
-        if (isFileChangeAuditTool(toolName) && fileChangeAudit?.phase === "collecting") {
-          return { behavior: "allow", updatedInput: toolInput };
-        }
-        return {
-          behavior: "deny",
-          message: "Only the internal file-change report is allowed during the audit.",
-        };
-      }
-      // The tool is intentionally unusable outside a negotiated audit turn.
-      if (isFileChangeAuditTool(toolName)) {
-        return {
-          behavior: "deny",
-          message: "No file-change report was requested for this turn.",
         };
       }
 
@@ -7178,9 +7231,19 @@ export class ClaudeAcpAgent {
         defaultToNo,
       });
 
-      if (parentToolUseId) {
+      // `mcpServer` (SDK 0.3.274+): which MCP server serves an `mcp__*` tool
+      // and where its definition came from. Forwarded verbatim so a client
+      // can key trust on `source` (`sdk` = a host-registered in-process
+      // server; anything else is configuration) instead of parsing the
+      // tool-name prefix. The name is the config key as authored — untrusted
+      // text, so it rides `_meta` rather than the title.
+      if (parentToolUseId || mcpServer) {
         presentation.toolCall._meta = {
-          claudeCode: { toolName, parentToolUseId },
+          claudeCode: {
+            toolName,
+            ...(parentToolUseId ? { parentToolUseId } : {}),
+            ...(mcpServer ? { mcpServer: { name: mcpServer.name, source: mcpServer.source } } : {}),
+          },
         };
       }
 
@@ -7193,6 +7256,7 @@ export class ClaudeAcpAgent {
         allowPersistentOptions: !noPersistentRule,
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
+        prePlanMode: session.prePlanMode,
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined
@@ -7230,6 +7294,21 @@ export class ClaudeAcpAgent {
       permissionResult = autoFallback.permissionResult;
       if (autoFallback.fallbackApplied) {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
+      }
+      if (toolName === "ExitPlanMode" && permissionResult.behavior === "allow") {
+        const modeUpdate = permissionResult.updatedPermissions?.find(
+          (update) => update.type === "setMode" && update.destination === "session",
+        );
+        if (modeUpdate?.type === "setMode") {
+          try {
+            await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
+            await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
+          } catch (error) {
+            // The user already approved the plan; a failed notification must not
+            // turn that approval into a failed permission request.
+            this.logger.error("Failed to publish mode after plan approval:", error);
+          }
+        }
       }
       const clearContextMode = decodedPermission.contextResetMode
         ? this.sessionModes.effectiveMode(session, decodedPermission.contextResetMode)
@@ -7713,20 +7792,24 @@ export class ClaudeAcpAgent {
     // The user asked for Fast mode and the SDK is telling us it can't serve it.
     // The description carries the same explanation, but a toggle silently
     // snapping back is the case worth saying out loud once, at the flip.
-    const explain = session.fastModeEnabled && !enabled && nextReason !== undefined;
+    const explanation =
+      nextReason !== undefined ? FAST_MODE_UNAVAILABLE_EXPLANATIONS[nextReason] : undefined;
+    const explain = session.fastModeEnabled && !enabled && explanation !== undefined;
     session.fastModeEnabled = enabled;
     session.fastModeDisabledReason = nextReason;
     this.refreshFastModeOption(session, enabled);
     if (explain) {
       await this.client.sessionUpdate({
         sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `**Fast mode turned off:** ${FAST_MODE_UNAVAILABLE_EXPLANATIONS[nextReason]}.`,
+        update: noticeOrTranscriptUpdate(
+          {
+            severity: "warning",
+            title: "Fast mode turned off",
+            description: `${sentenceCase(explanation)}.`,
           },
-        },
+          clientSupportsNotices(this.clientCapabilities),
+          `**Fast mode turned off:** ${explanation}.`,
+        ),
       });
     }
     await this.client.sessionUpdate({
@@ -7935,11 +8018,14 @@ export class ClaudeAcpAgent {
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
-    // Bypass is off for root outside a sandbox, and hosts may opt a session out.
-    // Decided once here: it gates the SDK flag, the spawn-time mode (the SDK
-    // rejects bypassPermissions without the flag), and the mode catalog.
+    // Bypass is off for root outside a sandbox, when settings disable it (the
+    // CLI refuses bypass then too), and hosts may opt a session out. Decided
+    // once here: it gates the SDK flag, the spawn-time mode (the SDK rejects
+    // bypassPermissions without the flag), and the mode catalog.
     const allowBypass =
-      ALLOW_BYPASS && sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
+      ALLOW_BYPASS &&
+      settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
+      sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
     const initialPermissionMode = resolvePermissionMode(
       creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
@@ -7993,8 +8079,8 @@ export class ClaudeAcpAgent {
     // the same Map that the streaming message handler will read from.
     const taskState: TaskState = new Map();
 
-    // Resolve every workspace root once. The hidden report tool uses this same
-    // set for lexical path validation, and the SDK receives it below.
+    // Resolve every workspace root once. The native checkpoint report uses
+    // this same set for lexical path validation, and the SDK receives it below.
     const acpAdditionalDirectories =
       params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
     const additionalDirectories = [
@@ -8002,11 +8088,10 @@ export class ClaudeAcpAgent {
       ...acpAdditionalDirectories,
     ];
 
-    const fileChangeAuditSupport = supportsAgentFileChangeReport(this.clientCapabilities)
-      ? createFileChangeAuditSupport({
+    const fileChangeReporter = supportsAgentFileChangeReport(this.clientCapabilities)
+      ? createNativeFileChangeReporter({
           cwd: params.cwd,
           additionalDirectories,
-          getActiveState: () => this.sessions[sessionId]?.activeTurn?.fileChangeAudit,
           publish: async (result) => {
             await this.client.sessionUpdate({
               sessionId,
@@ -8079,6 +8164,10 @@ export class ClaudeAcpAgent {
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
       ...userProvidedOptions,
+      // Claude Code uses the same checkpoint store for /rewind. Enable it only
+      // for clients that negotiated per-turn file-change reports; this avoids
+      // snapshot I/O for every other session.
+      ...(fileChangeReporter ? { enableFileCheckpointing: true } : {}),
       ...(settings && { settings }),
       env,
       // Override certain fields that must be controlled by ACP
@@ -8088,9 +8177,6 @@ export class ClaudeAcpAgent {
       mcpServers: {
         ...(userProvidedOptions?.mcpServers || {}),
         ...mcpServers,
-        ...(fileChangeAuditSupport
-          ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
-          : {}),
       },
       allowDangerouslySkipPermissions: allowBypass,
       permissionMode: initialPermissionMode,
@@ -8123,14 +8209,6 @@ export class ClaudeAcpAgent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
-        ...(fileChangeAuditSupport
-          ? {
-              PreToolUse: [
-                ...(userProvidedOptions?.hooks?.PreToolUse || []),
-                { hooks: [fileChangeAuditSupport.preToolUseHook] },
-              ],
-            }
-          : {}),
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -8182,14 +8260,26 @@ export class ClaudeAcpAgent {
             ],
           },
         ],
-        ...(fileChangeAuditSupport
-          ? {
-              Stop: [
-                ...(userProvidedOptions?.hooks?.Stop || []),
-                { hooks: [fileChangeAuditSupport.stopHook] },
-              ],
-            }
-          : {}),
+        // The retained summary reaches the SDK stream only as the persisted
+        // user message that frames it with model-facing continuation
+        // instructions; the hook carries the raw summary for the ACP
+        // compaction_update. The CLI awaits this hook before emitting the
+        // compaction's terminal frames, so the summary is normally recorded
+        // while the entity is still in progress and rides on the terminal
+        // update. Subagent compactions stay out of the root session's entity.
+        PostCompact: [
+          ...(userProvidedOptions?.hooks?.PostCompact || []),
+          {
+            hooks: [
+              async (input) => {
+                if (input.hook_event_name === "PostCompact" && !input.agent_id) {
+                  this.sessions[sessionId]?.contextCompaction?.recordSummary(input.compact_summary);
+                }
+                return { continue: true };
+              },
+            ],
+          },
+        ],
         TaskCreated: [
           ...(userProvidedOptions?.hooks?.TaskCreated || []),
           {
@@ -8446,7 +8536,9 @@ export class ClaudeAcpAgent {
           cachedWriteTokens: 0,
         },
         accumulatedModelUsage: {},
-        lastModelUsageReading: {},
+        // A resumed session's running total continues from the transcript's
+        // saved totals, so its first result is a baseline, not an increment.
+        lastModelUsageReading: creationOpts.resume !== undefined ? undefined : {},
         modes,
         models,
         modelInfos,
@@ -8487,8 +8579,7 @@ export class ClaudeAcpAgent {
         sessionFailureState: createSessionFailureState(),
         claudeSubscriptionGuard,
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
-        fileChangeReportRequestIds: new Set(),
-        fileChangeAuditSupport,
+        fileChangeReporter,
       };
       timing.phase("register");
 
@@ -8720,8 +8811,8 @@ function finiteCount(value: number | null | undefined): number {
 /** `current - previous` per model, dropping models with nothing to report so a
  *  turn only lists the models it actually ran on. A reading that fell BELOW the
  *  previous one means the running total restarted under us (a mid-session
- *  /clear, a resumed session starting fresh, a zeroed crash result): there is no
- *  usable reference left to subtract, so the reading itself is the increment. */
+ *  /clear, a zeroed crash result): there is no usable reference left to
+ *  subtract, so the reading itself is the increment. */
 function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally): ModelTokenTally {
   const increment: ModelTokenTally = {};
   for (const [model, usage] of Object.entries(current)) {
@@ -8741,6 +8832,36 @@ function modelUsageIncrement(current: ModelTokenTally, previous: ModelTokenTally
     }
   }
   return increment;
+}
+
+/** The per-model rows for the first result of a resumed session. Its
+ *  `modelUsage` reading continues from the totals the transcript saved (SDK
+ *  0.3.277+; older transcripts may hold none), so there is no earlier reading
+ *  to subtract from, and taking the reading itself would charge the whole
+ *  pre-resume history to this one turn. The result's own `usage` is per-turn
+ *  (main agent loop only, like the response's `usage`), so it stands in under
+ *  the turn's top-level model — `key` is that model's `modelUsage` spelling
+ *  when the reading has one, else the assistant message's own. Any subagent
+ *  spend on this one turn goes unlisted rather than over-listed. */
+function resumedFirstResultModelUsage(
+  usage: {
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    cache_read_input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+  },
+  key: string | null,
+): ModelTokenTally {
+  if (key === null) {
+    return {};
+  }
+  const row: AccumulatedUsage = {
+    inputTokens: finiteCount(usage.input_tokens),
+    outputTokens: finiteCount(usage.output_tokens),
+    cachedReadTokens: finiteCount(usage.cache_read_input_tokens),
+    cachedWriteTokens: finiteCount(usage.cache_creation_input_tokens),
+  };
+  return tallyTotal(row) > 0 ? { [key]: row } : {};
 }
 
 /** Fold `increment` into `base` per model — the per-model counterpart of the
@@ -9304,13 +9425,13 @@ function isTaskTool(toolName: string): boolean {
  *  permission-surfaced tool_call for them (see `ensureToolCallEmitted`) must be
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
-  return toolName !== "TodoWrite" && !isTaskTool(toolName) && !isFileChangeAuditTool(toolName);
+  return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
-/** Build the Claude Code-specific metadata for a tool call. Bash descriptions
- *  are kept out of ACP's standard `title`, which clients may use as the shell
- *  command preview, while still giving clients access to Claude's concise
- *  human-readable title. */
+/** Build the Claude Code-specific metadata for a tool call. Shell (Bash and
+ *  PowerShell) descriptions are kept out of ACP's standard `title`, which
+ *  clients may use as the shell command preview, while still giving clients
+ *  access to Claude's concise human-readable title. */
 function claudeCodeMetaFromToolUse(
   toolUse: {
     name: string;
@@ -9319,7 +9440,7 @@ function claudeCodeMetaFromToolUse(
   cwd?: string,
 ): NonNullable<ToolUpdateMeta["claudeCode"]> {
   const description =
-    toolUse.name === "Bash" &&
+    (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
     toolUse.input !== null &&
     typeof toolUse.input === "object" &&
     "description" in toolUse.input &&
@@ -9429,8 +9550,8 @@ function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
  *  notification for a tool_use. Shared by every site that surfaces a tool call:
  *  the streamed tool_use path (first encounter → tool_call, later encounter →
  *  refine) and the permission flow (`ensureToolCallEmitted`), so they can't
- *  drift. The initial `tool_call` carries `status: "pending"` and, for Bash, the
- *  `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
+ *  drift. The initial `tool_call` carries `status: "pending"` and, for shell tools,
+ *  the `terminal_info` _meta that the later `terminal_output`/`terminal_exit`
  *  updates key off of, and the programmatic tool `name` (ACP's tool-call-name
  *  RFD); a refining `tool_call_update` carries none of these. `name` is set
  *  once at first report — on a v1 update, omitting it means "unchanged", and
@@ -9454,7 +9575,7 @@ function toolCallNotification(
   return {
     _meta: {
       claudeCode: claudeCodeMetaFromToolUse(toolUse, cwd),
-      ...(toolUse.name === "Bash" && supportsTerminalOutput
+      ...((toolUse.name === "Bash" || toolUse.name === "PowerShell") && supportsTerminalOutput
         ? { terminal_info: { terminal_id: toolUse.id } }
         : {}),
     } satisfies ToolUpdateMeta,
@@ -9544,9 +9665,12 @@ export function toAcpNotifications(
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
-  const supportsTerminalOutput = options?.clientCapabilities?._meta?.["terminal_output"] === true;
+  const supportsTerminalOutputDelta =
+    options?.clientCapabilities?._meta?.["terminal_output_delta"] === true;
+  const supportsTerminalOutput =
+    supportsTerminalOutputDelta || options?.clientCapabilities?._meta?.["terminal_output"] === true;
   if (typeof content === "string") {
-    if (content.length === 0 || containsFileChangeAuditMarker(content)) {
+    if (content.length === 0) {
       return [];
     }
     const update: SessionNotification["update"] = {
@@ -9585,17 +9709,6 @@ export function toAcpNotifications(
   // Unlike `tool_use_result`, entries carry their own tool_use_id, so batched
   // messages need no single-block guard.
   const toolResultMeta = parseToolResultMeta(options?.toolResultMeta);
-  // A report-phase assistant message may contain a short text preface and the
-  // internal tool call in the same content array. Hide the whole message, not
-  // only the tool block, so it stays absent on session replay as well as live.
-  const containsFileChangeAuditToolUse = content.some(
-    (chunk) =>
-      (chunk.type === "tool_use" ||
-        chunk.type === "server_tool_use" ||
-        chunk.type === "mcp_tool_use") &&
-      isFileChangeAuditTool(chunk.name),
-  );
-
   const output = [];
   // Only handle the first chunk for streaming; extend as needed for batching
   for (const chunk of content) {
@@ -9603,11 +9716,7 @@ export function toAcpNotifications(
     switch (chunk.type) {
       case "text":
       case "text_delta": {
-        if (
-          chunk.text &&
-          !containsFileChangeAuditToolUse &&
-          !containsFileChangeAuditMarker(chunk.text)
-        ) {
+        if (chunk.text) {
           update = {
             sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
             content: {
@@ -9619,22 +9728,21 @@ export function toAcpNotifications(
         break;
       }
       case "image":
-        if (!containsFileChangeAuditToolUse)
-          update = {
-            sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
-            content: {
-              type: "image",
-              data: chunk.source.type === "base64" ? chunk.source.data : "",
-              mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
-              uri: chunk.source.type === "url" ? chunk.source.url : undefined,
-            },
-          };
+        update = {
+          sessionUpdate: role === "assistant" ? "agent_message_chunk" : "user_message_chunk",
+          content: {
+            type: "image",
+            data: chunk.source.type === "base64" ? chunk.source.data : "",
+            mimeType: chunk.source.type === "base64" ? chunk.source.media_type : "",
+            uri: chunk.source.type === "url" ? chunk.source.url : undefined,
+          },
+        };
         break;
       case "thinking":
       case "thinking_delta": {
         // Recent models default `thinking.display` to "omitted", which streams
         // signature-only thinking blocks whose text is empty.
-        if (chunk.thinking && !containsFileChangeAuditToolUse) {
+        if (chunk.thinking) {
           update = {
             sessionUpdate: "agent_thought_chunk",
             content: {
@@ -9650,10 +9758,7 @@ export function toAcpNotifications(
       case "mcp_tool_use": {
         const alreadyCached = chunk.id in toolUseCache;
         toolUseCache[chunk.id] = chunk;
-        if (isFileChangeAuditTool(chunk.name)) {
-          // Wrapper-owned audit protocol: never surface or register generic
-          // PostToolUse callbacks for the internal tool.
-        } else if (chunk.name === "TodoWrite") {
+        if (chunk.name === "TodoWrite") {
           // @ts-expect-error - sometimes input is empty object or undefined
           if (Array.isArray(chunk.input?.todos)) {
             update = {
@@ -9796,11 +9901,6 @@ export function toAcpNotifications(
           break;
         }
 
-        if (isFileChangeAuditTool(toolUse.name)) {
-          delete toolUseCache[chunk.tool_use_id];
-          break;
-        }
-
         // A permission request may have surfaced a plan-rendered (TodoWrite) or
         // suppressed (Task*) tool as a real tool_call so the request referenced
         // a tool call the client knows about (see `ensureToolCallEmitted`,
@@ -9882,19 +9982,25 @@ export function toAcpNotifications(
             toolUseCache[chunk.tool_use_id],
             supportsTerminalOutput,
             toolUseResult,
+            supportsTerminalOutputDelta,
           );
 
-          // When terminal output is supported, send terminal_output as a
+          const terminalOutput = toolMeta?.terminal_output_delta ?? toolMeta?.terminal_output;
+          const terminalOutputKey = toolMeta?.terminal_output_delta
+            ? "terminal_output_delta"
+            : "terminal_output";
+
+          // When terminal output is supported, send its payload as a
           // separate notification to match codex-acp's streaming lifecycle:
           //   1. tool_call       → _meta.terminal_info  (already sent above)
-          //   2. tool_call_update → _meta.terminal_output (sent here)
+          //   2. tool_call_update → terminal output      (sent here)
           //   3. tool_call_update → _meta.terminal_exit  (sent below with status)
-          if (toolMeta?.terminal_output) {
+          if (terminalOutput) {
             output.push({
               sessionId,
               update: {
                 _meta: {
-                  terminal_output: toolMeta.terminal_output,
+                  [terminalOutputKey]: terminalOutput,
                   ...(options?.parentToolUseId
                     ? { claudeCode: { parentToolUseId: options.parentToolUseId } }
                     : {}),
@@ -9916,10 +10022,10 @@ export function toAcpNotifications(
             toolCallId: chunk.tool_use_id,
             sessionUpdate: "tool_call_update",
             status: "is_error" in chunk && chunk.is_error ? "failed" : "completed",
-            // terminal_output already carried the exact bytes in the preceding
+            // The terminal output already carried the exact bytes in the preceding
             // update. Repeating them as rawOutput wastes bandwidth and lets a
             // client accidentally render the same output twice.
-            ...(toolMeta?.terminal_output
+            ...(terminalOutput
               ? {}
               : { rawOutput: exitPlanModeRawOutput(toolUse.name, chunk.content) }),
             ...toolUpdate,

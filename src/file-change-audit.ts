@@ -1,39 +1,29 @@
-import {
-  createSdkMcpServer,
-  type HookCallback,
-  type McpSdkServerConfigWithInstance,
-  type SdkMcpToolDefinition,
-} from "@anthropic-ai/claude-agent-sdk";
+import type { Query, RewindFilesResult } from "@anthropic-ai/claude-agent-sdk";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { z } from "zod";
 import { airExtensionMeta, clientSupportsAirCapability, withAirMeta } from "./air-extension.js";
 
 export const AGENT_FILE_CHANGE_REPORT_CAPABILITY = "agentFileChangeReport";
-export const FILE_CHANGE_AUDIT_SERVER_NAME = "claude_agent_acp";
-export const FILE_CHANGE_AUDIT_TOOL_NAME = "report_changed_files";
-export const FILE_CHANGE_AUDIT_WIRE_TOOL_NAME = `mcp__${FILE_CHANGE_AUDIT_SERVER_NAME}__${FILE_CHANGE_AUDIT_TOOL_NAME}`;
 
-const FILE_CHANGE_AUDIT_MARKER = "claude-agent-acp-file-change-audit";
 const MAX_REPORTED_PATHS = 1024;
 const MAX_REPORTED_PATH_LENGTH = 4096;
 export const AGENT_FILE_CHANGE_REPORT_MAX_BYTES = 256 * 1024;
+export const AGENT_FILE_CHANGE_REPORT_TIMEOUT_MS = 2_000;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 
-export type FileChangeAuditTurnState = {
+export type FileChangeReportTurnState = {
   requestId: string;
   phase: "requested" | "collecting" | "finished";
 };
 
-export type FileChangeAuditWorkspace = {
-  cwd: string;
-  additionalDirectories: string[];
+export type NativeFileChangeReportTurn = {
+  promptUuid: string;
+  fileChangeReport?: FileChangeReportTurnState;
 };
 
-export type AgentFileChangeReport = {
-  paths: string[];
-  complete: boolean;
-  uncertainty?: string;
+export type FileChangeReportWorkspace = {
+  cwd: string;
+  additionalDirectories: string[];
 };
 
 export type AgentFileChangeReportResult = {
@@ -45,7 +35,6 @@ export type AgentFileChangeReportResult = {
       paths: string[];
       declaredComplete: boolean;
       truncated: boolean;
-      uncertainty?: string;
     }
   | {
       status: "unavailable";
@@ -56,40 +45,24 @@ export type AgentFileChangeReportResult = {
 export type FileChangeReportUnavailableReason =
   "cancelled" | "timeout" | "invalidOutput" | "notReported" | "providerError";
 
-type FileChangeAuditSupportOptions = {
+type NativeFileChangeReporterOptions = {
   cwd: string;
   additionalDirectories: string[];
-  getActiveState: () => FileChangeAuditTurnState | undefined;
   publish: (result: AgentFileChangeReportResult) => Promise<void>;
   logError: (message: string) => void;
+  timeoutMs?: number;
 };
 
-export type FileChangeAuditSupport = {
-  mcpServer: McpSdkServerConfigWithInstance;
-  preToolUseHook: HookCallback;
-  stopHook: HookCallback;
-  finishUnavailable: (
-    state: FileChangeAuditTurnState,
+export type NativeFileChangeReporter = {
+  request(meta: unknown): FileChangeReportTurnState | undefined;
+  report(
+    turn: NativeFileChangeReportTurn | null | undefined,
+    query: Pick<Query, "rewindFiles">,
+  ): Promise<void>;
+  finish(
+    state: FileChangeReportTurnState | undefined,
     reason: FileChangeReportUnavailableReason,
-  ) => Promise<void>;
-};
-
-const reportInputSchema = {
-  paths: z
-    .array(z.string())
-    .describe(
-      "Workspace file paths changed during this turn. Use absolute paths or paths relative to cwd.",
-    ),
-  complete: z
-    .boolean()
-    .describe("True only when paths contains every workspace file changed during this turn."),
-  uncertainty: z
-    .string()
-    .trim()
-    .min(1)
-    .max(2000)
-    .optional()
-    .describe("Why the report may be incomplete or uncertain."),
+  ): void;
 };
 
 export function agentFileChangeReportRequestId(meta: unknown): string | undefined {
@@ -121,180 +94,106 @@ export function agentFileChangeReportMeta(
   return withAirMeta(undefined, AGENT_FILE_CHANGE_REPORT_CAPABILITY, result);
 }
 
-export function createFileChangeAuditTurnState(requestId: string): FileChangeAuditTurnState {
-  return {
-    requestId,
-    phase: "requested",
-  };
-}
-
-export function isFileChangeAuditReportPhase(state: FileChangeAuditTurnState | undefined): boolean {
-  return state?.phase === "collecting" || state?.phase === "finished";
-}
-
-export function isFileChangeAuditTool(toolName: string): boolean {
-  return toolName === FILE_CHANGE_AUDIT_WIRE_TOOL_NAME;
-}
-
-export function containsFileChangeAuditMarker(text: string): boolean {
-  return text.includes(`<${FILE_CHANGE_AUDIT_MARKER}>`);
-}
-
-export function createFileChangeAuditSupport(
-  options: FileChangeAuditSupportOptions,
-): FileChangeAuditSupport {
+export function createNativeFileChangeReporter(
+  options: NativeFileChangeReporterOptions,
+): NativeFileChangeReporter {
   const workspace = normalizeWorkspace(options.cwd, options.additionalDirectories);
+  const timeoutMs = options.timeoutMs ?? AGENT_FILE_CHANGE_REPORT_TIMEOUT_MS;
+  const requestIds = new Set<string>();
 
-  const finishUnavailable = async (
-    state: FileChangeAuditTurnState,
-    reason: FileChangeReportUnavailableReason,
-  ) => {
-    // Claim the terminal outcome before the first await. The report tool, a
-    // Stop hook, cancellation, and stream teardown can race, but only the
-    // winner may publish for this request id. Publication remains fail-open:
-    // an audit transport failure must never hold the user prompt open.
+  const publish = async (state: FileChangeReportTurnState, result: AgentFileChangeReportResult) => {
     if (state.phase === "finished") return;
     state.phase = "finished";
     try {
-      await options.publish({
-        version: 1,
-        requestId: state.requestId,
-        status: "unavailable",
-        reason,
-      });
+      await options.publish(result);
     } catch (error) {
-      options.logError(`Failed to publish unavailable report ${state.requestId}: ${error}`);
+      options.logError(`Failed to publish file-change report ${state.requestId}: ${error}`);
     }
   };
 
-  const tool: SdkMcpToolDefinition<typeof reportInputSchema> = {
-    name: FILE_CHANGE_AUDIT_TOOL_NAME,
-    description:
-      "Internal audit tool. Call it only when a stop-hook message explicitly requests the file-change audit.",
-    inputSchema: reportInputSchema,
-    _meta: {
-      "anthropic/alwaysLoad": true,
-      "claude/endTurn": true,
-    },
-    handler: async (report) => {
-      const state = options.getActiveState();
-      if (!state || state.phase !== "collecting") {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `<${FILE_CHANGE_AUDIT_MARKER}>No file-change audit is active.</${FILE_CHANGE_AUDIT_MARKER}>`,
-            },
-          ],
-        };
-      }
-
-      // Flip before publishing: a client transport failure must not make the
-      // model retry the report and produce duplicates. Delivery is audit-only
-      // and fail-open; the normal turn must still finish.
-      state.phase = "finished";
-      const normalized = normalizeReportedPaths(report.paths, workspace);
-      const result = fitReportedAgentFileChangeReport({
-        version: 1,
-        requestId: state.requestId,
-        status: "reported",
-        paths: normalized.paths,
-        declaredComplete: report.complete && !normalized.truncated,
-        truncated: normalized.truncated,
-        ...(report.uncertainty ? { uncertainty: report.uncertainty } : {}),
-      });
-      try {
-        await options.publish(result);
-      } catch (error) {
-        options.logError(`Failed to publish file-change report ${state.requestId}: ${error}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: `<${FILE_CHANGE_AUDIT_MARKER}>File-change audit recorded.</${FILE_CHANGE_AUDIT_MARKER}>`,
-          },
-        ],
-        structuredContent: result,
-      };
-    },
+  const finishUnavailable = async (
+    state: FileChangeReportTurnState,
+    reason: FileChangeReportUnavailableReason,
+  ) => {
+    await publish(state, {
+      version: 1,
+      requestId: state.requestId,
+      status: "unavailable",
+      reason,
+    });
   };
 
-  // canUseTool is not guaranteed to run for tools that the current permission
-  // mode auto-allows (notably bypassPermissions). A PreToolUse hook is the
-  // enforcement boundary that keeps the hidden continuation read-only in every
-  // mode: it can submit the report, but cannot inspect or mutate more files.
-  const preToolUseHook: HookCallback = async (input) => {
-    if (input.hook_event_name !== "PreToolUse") return {};
-    const state = options.getActiveState();
-    const isReportTool = isFileChangeAuditTool(input.tool_name);
-    if (!isReportTool && !isFileChangeAuditReportPhase(state)) return {};
-
-    const allowReport = state?.phase === "collecting" && isReportTool;
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: allowReport ? "allow" : "deny",
-        ...(!allowReport
-          ? {
-              permissionDecisionReason:
-                "Only the internal file-change report is allowed during the audit.",
-            }
-          : {}),
-      },
-    };
-  };
-
-  const stopHook: HookCallback = async (input) => {
-    if (input.hook_event_name !== "Stop") return {};
-    const state = options.getActiveState();
-    if (!state || state.phase === "finished") return {};
-    // A Stop can be only a pause while a background generator is still
-    // running. Keep the request pending so a later final Stop can include its
-    // writes instead of declaring a prematurely complete path set.
-    if (state.phase === "requested" && (input.background_tasks?.length ?? 0) > 0) return {};
-    if (state.phase === "collecting" || input.stop_hook_active) {
-      await finishUnavailable(state, "notReported");
-      return {};
-    }
-
-    // Set the phase before returning the continuation so every following SDK
-    // message is hidden even if the next stream starts immediately.
+  const report = async (
+    turn: NativeFileChangeReportTurn | null | undefined,
+    query: Pick<Query, "rewindFiles">,
+  ) => {
+    const state = turn?.fileChangeReport;
+    if (!state || state.phase !== "requested") return;
     state.phase = "collecting";
-    return {
-      hookSpecificOutput: {
-        hookEventName: "Stop",
-        additionalContext:
-          `<${FILE_CHANGE_AUDIT_MARKER}>` +
-          `Before stopping, call ${FILE_CHANGE_AUDIT_WIRE_TOOL_NAME} exactly once. ` +
-          "Report every workspace file changed during this user turn, including files changed " +
-          "by commands, generators, version-control operations, and child processes. " +
-          "Do not call any other tool and do not emit user-facing prose. " +
-          "Set complete to false and explain uncertainty when you are not sure the list is complete." +
-          `</${FILE_CHANGE_AUDIT_MARKER}>`,
-      },
-    };
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const previewPromise = query.rewindFiles(turn.promptUuid, { dryRun: true });
+    // A timed-out control request may still settle later. Observe it so a late
+    // rejection cannot become unhandled, but never let it publish a second terminal.
+    void previewPromise.catch(() => {});
+    try {
+      const preview = await Promise.race<RewindFilesResult | null>([
+        previewPromise,
+        new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+      if (preview === null) {
+        await finishUnavailable(state, "timeout");
+        return;
+      }
+      if (!preview.canRewind || !Array.isArray(preview.filesChanged)) {
+        await finishUnavailable(state, "invalidOutput");
+        return;
+      }
+
+      const normalized = normalizeReportedPaths(preview.filesChanged, workspace);
+      await publish(
+        state,
+        fitReportedAgentFileChangeReport({
+          version: 1,
+          requestId: state.requestId,
+          status: "reported",
+          paths: normalized.paths,
+          // Checkpoints cover Claude file tools, but not every mutation source
+          // (notably Bash and most subagents), so this list is never exhaustive.
+          declaredComplete: false,
+          truncated: normalized.truncated,
+        }),
+      );
+    } catch (error) {
+      options.logError(`Failed to inspect Claude file checkpoint ${turn.promptUuid}: ${error}`);
+      await finishUnavailable(state, "providerError");
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   };
 
   return {
-    mcpServer: createSdkMcpServer({
-      name: FILE_CHANGE_AUDIT_SERVER_NAME,
-      version: "1.0.0",
-      tools: [tool],
-      alwaysLoad: true,
-    }),
-    preToolUseHook,
-    stopHook,
-    finishUnavailable,
+    request(meta) {
+      const requestId = agentFileChangeReportRequestId(meta);
+      if (!requestId || requestIds.has(requestId)) return undefined;
+      requestIds.add(requestId);
+      return { requestId, phase: "requested" };
+    },
+    report,
+    finish(state, reason) {
+      if (!state) return;
+      void finishUnavailable(state, reason);
+    },
   };
 }
 
 function normalizeWorkspace(
   cwd: string,
   additionalDirectories: string[],
-): FileChangeAuditWorkspace {
+): FileChangeReportWorkspace {
   const normalizedCwd = canonicalizeWorkspaceRoot(path.resolve(cwd));
   const seen = new Set([pathKey(normalizedCwd)]);
   const normalizedAdditionalDirectories: string[] = [];
@@ -313,7 +212,7 @@ function normalizeWorkspace(
 
 function normalizeReportedPaths(
   reportedPaths: string[],
-  workspace: FileChangeAuditWorkspace,
+  workspace: FileChangeReportWorkspace,
 ): { paths: string[]; truncated: boolean } {
   const roots = [workspace.cwd, ...workspace.additionalDirectories];
   const seen = new Set<string>();
@@ -322,6 +221,7 @@ function normalizeReportedPaths(
   let truncated = false;
   for (const reportedPath of reportedPaths) {
     if (
+      typeof reportedPath !== "string" ||
       reportedPath.trim().length === 0 ||
       reportedPath.length > MAX_REPORTED_PATH_LENGTH ||
       hasControlCharacter(reportedPath)
@@ -349,9 +249,7 @@ function normalizeReportedPaths(
       truncated = true;
       continue;
     }
-    if (seen.has(key)) {
-      continue;
-    }
+    if (seen.has(key)) continue;
     const pathBytes = Buffer.byteLength(normalized, "utf8");
     if (
       result.length >= MAX_REPORTED_PATHS ||
@@ -367,7 +265,6 @@ function normalizeReportedPaths(
   return { paths: result, truncated };
 }
 
-/** Keep the complete serialized report within AIR's wire limit. */
 function fitReportedAgentFileChangeReport(
   report: Extract<AgentFileChangeReportResult, { status: "reported" }>,
 ): Extract<AgentFileChangeReportResult, { status: "reported" }> {
@@ -375,8 +272,6 @@ function fitReportedAgentFileChangeReport(
   let fitted = report;
   while (Buffer.byteLength(JSON.stringify(fitted), "utf8") > AGENT_FILE_CHANGE_REPORT_MAX_BYTES) {
     if (paths.length === 0) {
-      // The fixed fields and bounded uncertainty are far below the cap. Keep
-      // this loud if the wire contract changes without updating this helper.
       throw new Error("Agent file-change report exceeds the wire limit without paths");
     }
     paths.pop();
@@ -395,19 +290,10 @@ function isWithinRoot(candidate: string, root: string): boolean {
   return !path.isAbsolute(relative) && !relative.startsWith(`..${path.sep}`) && relative !== "..";
 }
 
-/**
- * Resolve filesystem aliases in a workspace root, including macOS' /tmp ->
- * /private/tmp alias. For a root that does not exist yet, resolve its nearest
- * existing ancestor and retain the missing suffix.
- */
 function canonicalizeWorkspaceRoot(value: string): string {
   return canonicalizeFromExistingAncestor(value);
 }
 
-/**
- * Canonicalize the parent but not the leaf itself. A changed path may be
- * deleted, or it may be a symlink whose node (rather than target) changed.
- */
 function canonicalizeReportedPath(value: string): string {
   const parent = canonicalizeFromExistingAncestor(path.dirname(value));
   return path.resolve(parent, path.basename(value));
@@ -417,7 +303,6 @@ function canonicalizeFromExistingAncestor(value: string): string {
   const original = path.resolve(value);
   let current = original;
   const missingSegments: string[] = [];
-
   while (true) {
     try {
       const canonical = fs.realpathSync.native(current);
@@ -425,7 +310,6 @@ function canonicalizeFromExistingAncestor(value: string): string {
     } catch (error) {
       if (!isMissingPathError(error)) return original;
     }
-
     const parent = path.dirname(current);
     if (parent === current) return original;
     missingSegments.push(path.basename(current));

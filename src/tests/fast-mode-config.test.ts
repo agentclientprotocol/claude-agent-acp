@@ -275,7 +275,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
 describe("syncFastModeState (SDK-driven state changes)", () => {
   const SESSION_ID = "fast-session";
 
-  function setup(opts: { fastModeEnabled: boolean; withOption: boolean }) {
+  function setup(opts: { fastModeEnabled: boolean; withOption: boolean; notices?: boolean }) {
     const sessionUpdates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -288,7 +288,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
 
     const agent = new ClaudeAcpAgent(client);
     (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
-      session: { configOptions: { boolean: {} } },
+      session: { configOptions: { boolean: {} }, ...(opts.notices ? { notices: {} } : {}) },
     };
 
     const session = {
@@ -396,6 +396,28 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     // The same report again changes nothing the user can see: no repeat notice.
     await sync(SESSION_ID, session, "off", "extra_usage_disabled");
     expect(sessionUpdates).toHaveLength(2);
+  });
+
+  it("explains the flip as a live notice to a client on the notice contract", async () => {
+    const { sync, session, sessionUpdates } = setup({
+      fastModeEnabled: true,
+      withOption: true,
+      notices: true,
+    });
+
+    await sync(SESSION_ID, session, "off", "free");
+
+    // An operational advisory, not something the model said: no transcript line.
+    expect(sessionUpdates.map((n) => n.update.sessionUpdate)).toEqual([
+      "notice",
+      "config_option_update",
+    ]);
+    expect(sessionUpdates[0].update).toEqual({
+      sessionUpdate: "notice",
+      severity: "warning",
+      title: "Fast mode turned off",
+      description: "Not available on the free plan.",
+    });
   });
 
   it("updates the description when only the reason changes", async () => {
