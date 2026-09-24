@@ -156,10 +156,12 @@ export async function previewPatchContent(
       ];
     }
     if (oldText === content) return undefined;
-    if (!isPatchableText(content)) {
-      return [{ type: "diff", path: write.file_path, oldText, newText: content }];
-    }
-    return optionalContent(await filePatchContent(filePath, oldText, content));
+    const standard: ToolCallContent[] = [
+      { type: "diff", path: write.file_path, oldText, newText: content },
+    ];
+    if (!isPatchableText(content)) return standard;
+    // A dense change can exceed the diff budget. The approval then shows the standard diff.
+    return optionalContent(await filePatchContent(filePath, oldText, content)) ?? standard;
   }
 
   return undefined;
@@ -244,6 +246,9 @@ export async function patchUpdateFromDiffToolResponse(
         ? response.originalFile
         : undefined;
   if (oldText === undefined) return undefined;
+  // The same size limit as the new side: a larger text gets the standard diff.
+  if (oldText !== null && Buffer.byteLength(oldText, "utf8") > MAX_PATCH_FILE_BYTES)
+    return undefined;
   const newText = await readPatchSource(response.filePath);
   if (typeof newText !== "string" || newText.startsWith("\uFEFF")) return undefined;
   if (response.type === "create" && newText !== response.content) return undefined;
