@@ -740,6 +740,15 @@ export async function* toolCall(
   });
   // The PostToolUse hook callback normally arrives after the tool_result.
   if (outcome.hookResponse !== undefined) {
+    // The CLI writes the file of a Write before the hook, and the hook patch reads it.
+    const written = outcome.hookResponse as { filePath?: unknown; content?: unknown };
+    if (
+      tool.name === "Write" &&
+      typeof written.filePath === "string" &&
+      typeof written.content === "string"
+    ) {
+      fs.writeFileSync(written.filePath, written.content);
+    }
     await ctx.postToolUse(tool.id, tool.name, tool.input, outcome.hookResponse);
   }
 }

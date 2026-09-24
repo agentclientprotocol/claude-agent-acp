@@ -863,8 +863,12 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
             .map((block: any) => block._meta?.jetbrains?.air?.diffPatch?.text)
             .filter((text: unknown) => text !== undefined),
         );
-      // Streamed: the Write of an existing file and the Edit before its approval.
-      expect(patches(toolCallReports(air("write-existing"), "toolu_write"))).toEqual([]);
+      // Streamed: the Write of an existing file gets only the update patch of
+      // its hook, and the Edit gets no patch before its approval.
+      const writePatches = patches(toolCallReports(air("write-existing"), "toolu_write"));
+      expect(writePatches).toHaveLength(1);
+      expect(writePatches[0]).not.toContain("new file mode");
+      expect(writePatches[0]).toContain("-export const x = 0;\n+export const x = 1;");
       const edit = air("edit-with-permission");
       const approval = edit.findIndex((record) => record.kind === "requestPermission");
       expect(approval).toBeGreaterThan(0);

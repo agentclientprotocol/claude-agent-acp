@@ -19,7 +19,11 @@ export interface ToolUseFacts {
   locations?: ToolCallLocation[];
   /** The file change that the input makes, as diff content. */
   change?: ToolCallContent[];
-  /** The input keys whose text {@link change} holds. `rawInput` leaves them out. */
+  /**
+   * The input keys whose text a diff holds: {@link change}, or for a Write of a
+   * client with diffPatch, the approval preview or the hook patch. `rawInput`
+   * leaves them out.
+   */
   fileTextKeys?: readonly string[];
   /**
    * A display copy of the input that the user reads: a plan, a subagent

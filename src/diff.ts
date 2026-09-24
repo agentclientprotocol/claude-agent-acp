@@ -1,6 +1,5 @@
 import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk";
 import { structuredPatch } from "diff";
-import { readFileSync, statSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { AIR_DIFF_PATCH_CAPABILITY, withAirMeta } from "./air-extension.js";
@@ -88,6 +87,10 @@ type FileChange = "create" | "update" | "delete";
  * an `old_string` that does not match exactly once, because Claude then
  * normalizes quotes or fails.
  *
+ * A Write always gets content that shows the change: the patch, the standard
+ * diff of a text that cannot have an exact patch, or a notice that the Write
+ * overwrites a file that the adapter cannot show.
+ *
  * The preview uses the tool input as it is. Claude can still remove the
  * trailing whitespace of a line before it writes. The PostToolUse hook then
  * sends the patch of the written file.
@@ -136,11 +139,26 @@ export async function previewPatchContent(
     if (typeof write.file_path !== "string" || typeof write.content !== "string") {
       return undefined;
     }
+    // The Write tool call shows no diff, so the approval is the only place that
+    // shows what the Write changes.
     const content = write.content;
-    if (!isPatchableText(content)) return undefined;
     const filePath = resolveToolPath(write.file_path, cwd);
     const oldText = await readPatchSource(filePath);
-    if (oldText === undefined || oldText === content) return undefined;
+    if (oldText === undefined) {
+      return [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: `Overwrites the existing file \`${write.file_path}\`. The adapter cannot show its current content.`,
+          },
+        },
+      ];
+    }
+    if (oldText === content) return undefined;
+    if (!isPatchableText(content)) {
+      return [{ type: "diff", path: write.file_path, oldText, newText: content }];
+    }
     return optionalContent(await filePatchContent(filePath, oldText, content));
   }
 
@@ -323,86 +341,6 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   if (content.length > 0) result.content = content;
   if (locations.length > 0) result.locations = locations;
   return result;
-}
-
-/**
- * The patch content for a Write that creates `filePath` with `content`.
- *
- * Returns undefined when the content is empty, too large, binary, or contains a
- * CR. Claude converts the line endings of a written file, so such a patch
- * would not be exact.
- */
-export function creationPatchContent(
-  filePath: string,
-  content: string,
-): ToolCallContent | undefined {
-  if (!isPatchableText(content)) return undefined;
-  const hunk = wholeFileHunk(content);
-  return hunk ? patchContent(filePath, gitPatchText(filePath, "create", [hunk])) : undefined;
-}
-
-/** The change of a Write tool call, and whether it holds the new file text. */
-export interface WriteChange {
-  change: ToolCallContent[];
-  holdsFileText: boolean;
-}
-
-/**
- * The change of a Write tool call for a client that negotiated `diffPatch`.
- *
- * A missing file gets a creation patch. An existing file gets the standard
- * diff from its current text, and the approval preview or the PostToolUse
- * hook later sends the exact patch. An existing file whose text the adapter
- * cannot read gets a notice that the Write overwrites it, and no diff: a diff
- * without old text would claim a creation. Returns undefined when the
- * adapter does not know if the file exists, or cannot build a creation
- * patch. The caller then sends the standard diff.
- *
- * The check runs while the tool call renders, so it reads the file
- * synchronously. The read is bounded by {@link MAX_PATCH_FILE_BYTES}.
- */
-export function writeToolUseChange(
-  filePath: string,
-  content: string,
-  cwd?: string,
-): WriteChange | undefined {
-  const resolvedPath = resolveToolPath(filePath, cwd);
-  let oldText: string | undefined;
-  try {
-    const stats = statSync(resolvedPath);
-    if (stats.isFile() && stats.size <= MAX_PATCH_FILE_BYTES) {
-      oldText = decodeFileText(readFileSync(resolvedPath));
-    }
-  } catch (error) {
-    if (!isMissingFileError(error)) return undefined;
-    const patch = creationPatchContent(filePath, content);
-    return patch ? { change: [patch], holdsFileText: true } : undefined;
-  }
-  if (oldText === undefined) {
-    return {
-      change: [
-        {
-          type: "content",
-          content: {
-            type: "text",
-            text: `Overwrites the existing file \`${filePath}\`. The adapter cannot show its current content.`,
-          },
-        },
-      ],
-      holdsFileText: false,
-    };
-  }
-  return {
-    change: [
-      {
-        type: "diff",
-        path: filePath,
-        oldText,
-        newText: content,
-      },
-    ],
-    holdsFileText: true,
-  };
 }
 
 /**

@@ -5,7 +5,6 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  creationPatchContent,
   gitPatchText,
   MAX_PATCH_FILE_BYTES,
   patchUpdateFromDiffToolResponse,
@@ -128,12 +127,18 @@ describe("approval patch previews", () => {
       previewPatchContent("Edit", { file_path: large, old_string: "x", new_string: "y" }),
       previewPatchContent("Edit", { file_path: unchanged, old_string: "b", new_string: "b" }),
       previewPatchContent("Edit", { file_path: unchanged, old_string: "", new_string: "b" }),
-      previewPatchContent("Write", { file_path: crlf, content: "one\n" }),
       previewPatchContent("Write", { file_path: unchanged, content: "before\n" }),
-      previewPatchContent("Write", { file_path: missing, content: "a\r\nb\r\n" }),
     ]);
 
     expect(previews).toEqual(Array(previews.length).fill(undefined));
+    // A Write always shows what it changes: a notice for a file that the
+    // adapter cannot show, and the standard diff of a text without an exact patch.
+    expect(await previewPatchContent("Write", { file_path: crlf, content: "one\n" })).toMatchObject(
+      [{ type: "content" }],
+    );
+    expect(
+      await previewPatchContent("Write", { file_path: missing, content: "a\r\nb\r\n" }),
+    ).toEqual([{ type: "diff", path: missing, oldText: null, newText: "a\r\nb\r\n" }]);
   });
 
   it("returns no preview when a replace_all result can exceed the size limit", async () => {
@@ -219,7 +224,6 @@ describe("approval patch previews", () => {
 
     expect(edit).toContain("-b\n+c  \n");
     expect(write).toContain("@@ -0,0 +1,2 @@\n+x \n+y\n");
-    expect(patchText(creationPatchContent(missing, "x \ny\n"))).toBe(write);
   });
 
   it("builds the patch of a Write that changes hundreds of lines of a large file", async () => {
@@ -345,12 +349,11 @@ describe("git patch headers", () => {
     );
   });
 
-  it("uses one header form for previews, tool calls, and hook patches", async () => {
+  it("uses one header form for previews and hook patches", async () => {
     const filePath = await temporaryFile();
     const preview = patchText(
       await previewPatchContent("Write", { file_path: filePath, content: "x\n" }),
     );
-    const toolCall = patchText(creationPatchContent(filePath, "x\n"));
     await writeFile(filePath, "x\n");
     const hook = patchText(
       (
@@ -364,7 +367,6 @@ describe("git patch headers", () => {
       )?.content,
     );
 
-    expect(toolCall).toBe(preview);
     expect(hook).toBe(preview);
   });
 });
@@ -382,16 +384,16 @@ describe("tool-call diff content", () => {
     expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual(standard);
   });
 
-  it("sends a Write creation patch only after negotiation", () => {
+  it("sends a Write diff at tool use only to a client without diffPatch", () => {
     const toolUse = {
       id: "write",
       name: "Write",
       input: { file_path: "/work/a.ts", content: "a\n" },
     };
 
-    expect(patchText(toolInfoFromToolUse(toolUse, false, undefined, true).content)).toContain(
-      "new file mode 100644",
-    );
+    // The input does not tell whether the file exists. The patch comes from the
+    // approval preview or from the PostToolUse hook.
+    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
     expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual([
       { type: "diff", path: "/work/a.ts", oldText: null, newText: "a\n" },
     ]);
@@ -406,7 +408,7 @@ describe("Write tool calls for an existing file", () => {
     planFile: false,
   });
 
-  it("sends the standard diff of the current text, not a creation patch", async () => {
+  it("does not read the file at tool use", async () => {
     const filePath = await temporaryFile("before\n");
     const toolUse = {
       id: "write",
@@ -414,17 +416,12 @@ describe("Write tool calls for an existing file", () => {
       input: { file_path: filePath, content: "after\n" },
     };
 
-    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([
-      { type: "diff", path: filePath, oldText: "before\n", newText: "after\n" },
-    ]);
+    expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
   });
 
-  it("shows that the Write overwrites a file whose text is unknown", async () => {
+  it("shows in the approval that the Write overwrites a file whose text is unknown", async () => {
     const filePath = await temporaryFile(Buffer.from([0x61, 0x00, 0x62, 0x0a]));
     const input = { file_path: filePath, content: "text\n" };
-    const toolUse = { id: "write", name: "Write", input };
-
-    const content = toolInfoFromToolUse(toolUse, false, undefined, true).content;
     const presentation = buildClaudePermissionPresentation({
       toolName: "Write",
       input,
@@ -433,7 +430,7 @@ describe("Write tool calls for an existing file", () => {
       previewContent: await previewPatchContent("Write", input),
     });
 
-    expect(content).toEqual([
+    expect(presentation.toolCall.content).toEqual([
       {
         type: "content",
         content: {
@@ -442,9 +439,15 @@ describe("Write tool calls for an existing file", () => {
         },
       },
     ]);
-    // The approval keeps the notice of the tool call, and rawInput keeps the text.
-    expect(presentation.toolCall.content).toBeUndefined();
-    expect(presentation.toolCall.rawInput).toEqual(input);
+  });
+
+  it("shows the standard diff in the approval of a Write whose text cannot have a patch", async () => {
+    const filePath = await temporaryFile("before\n");
+    const input = { file_path: filePath, content: "a\r\nb\r\n" };
+
+    expect(await previewPatchContent("Write", input)).toEqual([
+      { type: "diff", path: filePath, oldText: "before\n", newText: "a\r\nb\r\n" },
+    ]);
   });
 });
 

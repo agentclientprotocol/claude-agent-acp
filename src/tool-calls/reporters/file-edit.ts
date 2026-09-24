@@ -4,11 +4,7 @@ import type {
   NotebookEditInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import type { ToolCallContent } from "@agentclientprotocol/sdk";
-import {
-  patchUpdateFromDiffToolResponse,
-  toolUpdateFromDiffToolResponse,
-  writeToolUseChange,
-} from "../../diff.js";
+import { patchUpdateFromDiffToolResponse, toolUpdateFromDiffToolResponse } from "../../diff.js";
 import { markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
 import type {
   ToolReporter,
@@ -32,27 +28,24 @@ export class WriteReporter implements ToolReporter {
       locations: write?.file_path ? [{ path: write.file_path }] : [],
     };
     if (write?.file_path) {
-      // A negotiated client gets the creation patch that the PostToolUse hook
-      // would send for a new file, so that update can be skipped. An existing
-      // file never gets a creation patch. A replay does not read the file:
-      // the disk shows a later state than the history.
-      const negotiated =
-        capabilities.diffPatch && !replay && typeof write.content === "string"
-          ? writeToolUseChange(write.file_path, write.content, cwd)
-          : undefined;
-      facts.change = negotiated?.change ?? [
-        {
-          type: "diff",
-          path: write.file_path,
-          oldText: null,
-          // The content is absent until the input streams in. The diff still names the file.
-          newText: write.content as string,
-        },
-      ];
-      // A notice holds no file text, so rawInput keeps the content.
-      if (negotiated?.holdsFileText !== false && write.contentKey) {
-        facts.fileTextKeys = [write.contentKey];
+      // A negotiated client gets the exact patch from the approval preview or
+      // from the PostToolUse hook. The input does not tell whether the file
+      // exists, so the live tool call shows no diff: a diff without the old
+      // text would claim a creation. The adapter reads the file only for the
+      // preview. A replay has no preview and no hook, so it keeps the diff.
+      if (!capabilities.diffPatch || replay) {
+        facts.change = [
+          {
+            type: "diff",
+            path: write.file_path,
+            oldText: null,
+            // The content is absent until the input streams in. The diff still names the file.
+            newText: write.content as string,
+          },
+        ];
       }
+      // The patch holds the file text, so rawInput does not.
+      if (write.contentKey) facts.fileTextKeys = [write.contentKey];
     } else if (write?.content) {
       facts.display = [textContent(write.content)];
     }

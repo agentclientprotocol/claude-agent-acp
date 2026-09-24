@@ -388,10 +388,14 @@ The adapter sends no preview patch in these cases, and the tool call keeps its s
 
 An `Edit` input holds a snippet, not the file.
 The tool call therefore shows the standard diff of the snippet until a preview or the final patch replaces it.
-A `Write` tool call shows a creation patch of its content only when the file is missing.
-For an existing file, it shows the standard diff from the current text, and the preview or the final patch replaces it.
-A `Write` of a loaded session history shows the standard diff without old text, because the adapter does not read the file on disk.
-The disk shows a later state than the history.
+A live `Write` tool call shows the path and no diff, because its input does not tell whether the file exists.
+The adapter reads the file only for the approval preview, so a session without approvals reads no file before the Write.
+The approval shows the patch, the standard diff of a text that cannot have an exact patch,
+or a notice that the Write overwrites a file that the adapter cannot show.
+The PostToolUse hook then sends the patch of the written file.
+The `Write` tool call keeps the file text out of `rawInput`, because a patch holds it.
+A `Write` of a loaded session history shows the standard diff without old text, because it has no preview and no hook.
+The adapter does not read the file on disk for it: the disk shows a later state than the history.
 When the adapter cannot read the current text, the tool call shows a notice that the `Write` overwrites an existing file.
 The notice holds no file text, so `rawInput` keeps `content`.
 
