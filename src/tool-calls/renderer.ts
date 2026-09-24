@@ -535,14 +535,13 @@ export class AcpToolCallRenderer {
   }
 
   /**
-   * `rawInput`. For AIR, without the file text that the diff holds, and with
+   * `rawInput`. For AIR, without the file text that a diff holds, and with
    * the path of the plan file in place of the plan text.
    */
   rawInput(facts: ToolUseFacts, rawInput: unknown): unknown {
     if (facts.planFilePath) return planFileInput(rawInput, facts.planFilePath);
     if (
       !this.capabilities.air.client ||
-      !facts.change?.length ||
       !facts.fileTextKeys ||
       !rawInput ||
       typeof rawInput !== "object" ||

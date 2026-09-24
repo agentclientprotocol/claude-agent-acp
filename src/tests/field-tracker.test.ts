@@ -218,7 +218,7 @@ describe("tool call refinements", () => {
     expect(second[0].update).not.toHaveProperty("kind");
   });
 
-  it("does not resend a Write file that the tool call already carries", async () => {
+  it("sends the file text of a Write once, in the hook patch", async () => {
     const tracker = new ToolCallFieldTracker();
     const toolUseCache: ToolUseCache = {};
     const emittedToolCalls = new Set<string>();
@@ -267,13 +267,14 @@ describe("tool call refinements", () => {
       originalFile: null,
     });
 
-    // The diff holds the file text once. rawInput leaves it out.
-    expect(JSON.stringify(call).split("export const big").length - 1).toBe(100);
+    // The tool call holds no file text: the input does not tell whether the
+    // file exists. The hook sends the creation patch, which holds the file text once.
+    expect(JSON.stringify(call)).not.toContain("export const big");
     expect((call[0].update as any).rawInput).toEqual({ file_path: filePath });
     expect(refine).toEqual([]);
     expect(result[0].update).not.toHaveProperty("content");
-    // The hook builds the same creation patch, so it has nothing new to send.
-    expect(updates).toEqual([]);
+    expect(JSON.stringify(updates).split("export const big").length - 1).toBe(100);
+    expect(JSON.stringify(updates)).toContain("new file mode 100644");
     expect(tracker.size).toBe(0);
   });
 
