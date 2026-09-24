@@ -57,6 +57,7 @@ import {
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  getSubagentMessages,
   importSessionToStore,
   listSessions,
   PermissionUpdate,
@@ -94,6 +95,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     // actual transcripts keep working; unit tests override per-call with
     // `mockResolvedValueOnce`.
     getSessionMessages: vi.fn(actual.getSessionMessages),
+    getSubagentMessages: vi.fn(actual.getSubagentMessages),
     listSessions: vi.fn(actual.listSessions),
   };
 });
@@ -3060,9 +3062,16 @@ describe("subagent transcript replay", () => {
         { log: () => {}, error: () => {} },
       );
       (agent as any).clientCapabilities = { subagents: {} };
+      vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+      vi.mocked(getSubagentMessages).mockClear();
       await (
         agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
       ).replaySessionHistory(sessionId);
+
+      // The child is read once, in the project directory, without a search of every project.
+      expect(vi.mocked(getSubagentMessages).mock.calls).toEqual([
+        [sessionId, "abc123", { dir: "/tmp/proj" }],
+      ]);
 
       const child1 = `${sessionId}:replay-subagent:toolu_agent`;
       const child2 = `${sessionId}:replay-subagent:toolu_lost`;
