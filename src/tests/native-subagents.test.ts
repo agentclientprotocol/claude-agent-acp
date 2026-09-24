@@ -354,9 +354,10 @@ describe("NativeSubagentRuntime lifecycle", () => {
     // Generation 1 finishes, which cleans up parentByToolUse for launch-1
     await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
 
-    expect(
-      published.map(({ update }) => update.sessionUpdate),
-    ).toEqual(["subagent_spawned", "subagent_state_update"]);
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "subagent_spawned",
+      "subagent_state_update",
+    ]);
 
     // SendMessage resumes the subagent with the same toolUseId and taskId without a new Agent control frame
     await runtime.taskStarted(
@@ -382,5 +383,46 @@ describe("NativeSubagentRuntime lifecycle", () => {
     );
     expect(terminalIds).toEqual(["worker-1", "worker-1:generation:2"]);
   });
-});
 
+  it("announces a resumed nested subagent under a live ancestor when its parent has finished", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      true,
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    const launch = (toolCallId: string, parentToolUseId?: string) =>
+      ({
+        ...control("tool_call", "pending", parentToolUseId),
+        update: { ...control("tool_call", "pending", parentToolUseId).update, toolCallId },
+      }) as AcpSessionNotification;
+
+    await runtime.route(launch("launch-a"), async () => {});
+    await runtime.taskStarted(
+      { taskId: "agent-a", toolUseId: "launch-a", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.route(launch("launch-b", "launch-a"), async () => {});
+    await runtime.taskStarted(
+      { taskId: "agent-b", toolUseId: "launch-b", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.finishTask("agent-b", "completed", async () => {}, "launch-b");
+    await runtime.finishTask("agent-a", "completed", async () => {}, "launch-a");
+
+    // The root resumes B with SendMessage after A, B's original parent, is gone.
+    await runtime.taskStarted(
+      { taskId: "agent-b", toolUseId: "launch-b", subagentType: "Explore" },
+      async () => {},
+    );
+
+    expect(published.at(-1)).toMatchObject({
+      sessionId: "root",
+      update: { sessionUpdate: "subagent_spawned", subagentSessionId: "agent-b:generation:2" },
+    });
+  });
+});
