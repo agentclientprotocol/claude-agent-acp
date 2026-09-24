@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.81.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.1...v0.81.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* announce resumed subagent generations when they start ([#1173](https://github.com/agentclientprotocol/claude-agent-acp/issues/1173)) ([b495e55](https://github.com/agentclientprotocol/claude-agent-acp/commit/b495e55a2249f066dab76e56316080f151df99be))
+* continue clear-context plans approved in a background followup ([#1170](https://github.com/agentclientprotocol/claude-agent-acp/issues/1170)) ([a2c362c](https://github.com/agentclientprotocol/claude-agent-acp/commit/a2c362c948511b203b43982f13ab068ba14741ea))
+
 ## [0.81.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.0...v0.81.1) (2026-09-23)
 
 
