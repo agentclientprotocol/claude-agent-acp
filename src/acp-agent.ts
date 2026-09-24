@@ -1117,8 +1117,8 @@ export type Session = {
    *  naturally yields the turn-boundary uuid when one `msg_…` spans several
    *  content-block messages.
    *
-   *  NOT READ YET — recorded now so the mapping exists if/when we wire up
-   *  fork/rewind. */
+   *  `unstable_forkSession` reads it to find the fork point without a read of
+   *  the transcript. The map lives until the session closes. */
   messageIdToUuid: Map<string, string>;
   /** Durable-for-this-consumer failure state shared with session/load replay.
    *  Keeping it on the Session lets replay seed a failure that the persistent
@@ -6004,7 +6004,7 @@ export class ClaudeAcpAgent {
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
-            // for the id we hand clients. Not read yet (see messageIdToUuid).
+            // for the id we hand clients. Fork reads it (see messageIdToUuid).
             const mappedMessageId = messageIdForGrouping(message);
             if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
               session.messageIdToUuid.set(mappedMessageId, message.uuid);
