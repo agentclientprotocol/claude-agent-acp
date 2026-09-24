@@ -1532,8 +1532,12 @@ function supportsSubagentTranscript(capabilities?: ClientCapabilities | null): b
   return capabilities?._meta?.[SUBAGENT_TRANSCRIPT_CAPABILITY] === true;
 }
 
-/** The number of sessions in one page of session/list. */
-const SESSION_LIST_PAGE_SIZE = 100;
+/**
+ * The number of sessions in one page of session/list. The SDK scans the whole
+ * project directory for each page, so a page holds all sessions of a usual
+ * project.
+ */
+const SESSION_LIST_PAGE_SIZE = 1000;
 
 /** The offset that a session/list cursor names. */
 function sessionListOffset(cursor: string | null | undefined): number {
