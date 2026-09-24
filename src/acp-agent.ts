@@ -164,7 +164,7 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { subagentIdsByToolUse } from "./subagent-history.js";
+import { subagentHistory } from "./subagent-history.js";
 import {
   readResumedModel,
   readResumedSession,
@@ -7173,9 +7173,11 @@ export class ClaudeAcpAgent {
       return child.sessionId;
     };
 
-    const subagentIds = nativeReplayEnabled
-      ? await subagentIdsByToolUse(sessionId)
-      : new Map<string, string>();
+    // Only a history with an Agent or Task launch has subagent transcripts to read.
+    const subagents =
+      nativeReplayEnabled && replayChildren.size > 0
+        ? await subagentHistory(sessionId)
+        : { ids: new Map<string, string>() };
     const replayedSubagents = new Set<string>();
     const replayMessage = async (message: SessionMessage): Promise<void> => {
       if (
@@ -7319,12 +7321,19 @@ export class ClaudeAcpAgent {
       if (nativeReplayEnabled && message.type === "assistant") {
         for (const toolUseId of subagentLaunchIds(content)) {
           await announceReplayChild(toolUseId);
-          const agentId = subagentIds.get(toolUseId);
+          const agentId = subagents.ids.get(toolUseId);
           if (!agentId || replayedSubagents.has(agentId)) continue;
           replayedSubagents.add(agentId);
           let childMessages: SessionMessage[] = [];
           try {
-            childMessages = await getSubagentMessages(sessionId, agentId);
+            // With the project directory, the SDK skips its search of every project.
+            // A session opened from another directory falls back to that search.
+            if (subagents.dir) {
+              childMessages = await getSubagentMessages(sessionId, agentId, { dir: subagents.dir });
+            }
+            if (childMessages.length === 0) {
+              childMessages = await getSubagentMessages(sessionId, agentId);
+            }
           } catch (error) {
             this.logger.error(`Failed to read the history of subagent ${agentId}:`, error);
           }
