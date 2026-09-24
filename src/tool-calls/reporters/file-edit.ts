@@ -133,10 +133,31 @@ async function finalChange(
   toolResponse: unknown,
   { capabilities }: ToolUseContext,
 ): Promise<ToolResultFacts> {
-  return (
-    (capabilities.diffPatch ? await patchUpdateFromDiffToolResponse(toolResponse) : undefined) ??
-    toolUpdateFromDiffToolResponse(toolResponse)
-  );
+  if (!capabilities.diffPatch) return toolUpdateFromDiffToolResponse(toolResponse);
+  const patch = await patchUpdateFromDiffToolResponse(toolResponse);
+  if (patch) return patch;
+  const created = createdFileDiff(toolResponse);
+  return created ?? toolUpdateFromDiffToolResponse(toolResponse);
+}
+
+/**
+ * The standard diff of a file that a Write created, when it cannot have an
+ * exact patch. The Write tool call of a client with diffPatch shows no diff,
+ * so without it the client would never see the created file.
+ */
+function createdFileDiff(toolResponse: unknown): ToolResultFacts | undefined {
+  const response = toolResponse as { type?: unknown; filePath?: unknown; content?: unknown } | null;
+  if (
+    response?.type !== "create" ||
+    typeof response.filePath !== "string" ||
+    typeof response.content !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    content: [{ type: "diff", path: response.filePath, oldText: null, newText: response.content }],
+    locations: [{ path: response.filePath }],
+  };
 }
 
 /**
