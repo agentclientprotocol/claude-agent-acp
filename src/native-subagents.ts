@@ -162,9 +162,9 @@ export class NativeSubagentRuntime {
     const previous = this.children.get(task.taskId);
     if (previous && previous.terminalState === undefined) return;
 
-    const knownParentSessionId = task.toolUseId
-      ? this.parentByToolUse.get(task.toolUseId)
-      : undefined;
+    const knownParentSessionId =
+      (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
+      previous?.parentSessionId;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
     const child: NativeSubagent = {
       sessionId: this.nextChildSessionId(task.taskId, previous),

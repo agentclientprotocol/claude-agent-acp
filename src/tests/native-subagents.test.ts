@@ -322,4 +322,65 @@ describe("NativeSubagentRuntime lifecycle", () => {
     expect(spawnedIds).toEqual(["worker-1", "worker-1:generation:2"]);
     expect(terminalIds).toEqual(spawnedIds);
   });
+
+  it("announces resumed subagent generation immediately when SendMessage restarts the task (#1158)", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      true,
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    const launch = (toolCallId: string) =>
+      ({
+        ...control("tool_call", "pending"),
+        update: { ...control("tool_call", "pending").update, toolCallId },
+      }) as AcpSessionNotification;
+
+    // First generation starts from Agent tool call
+    await runtime.route(launch("launch-1"), async () => {});
+    await runtime.taskStarted(
+      {
+        taskId: "worker-1",
+        toolUseId: "launch-1",
+        subagentType: "Explore",
+        description: "First run",
+      },
+      async () => {},
+    );
+    // Generation 1 finishes, which cleans up parentByToolUse for launch-1
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+
+    expect(
+      published.map(({ update }) => update.sessionUpdate),
+    ).toEqual(["subagent_spawned", "subagent_state_update"]);
+
+    // SendMessage resumes the subagent with the same toolUseId and taskId without a new Agent control frame
+    await runtime.taskStarted(
+      {
+        taskId: "worker-1",
+        toolUseId: "launch-1",
+        subagentType: "Explore",
+        description: "Resumed run",
+      },
+      async () => {},
+    );
+
+    // Generation 2 must be announced immediately at taskStarted, not held until finishTask
+    const spawnedIds = published.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_spawned" ? [update.subagentSessionId] : [],
+    );
+    expect(spawnedIds).toEqual(["worker-1", "worker-1:generation:2"]);
+
+    // Terminal state then ends generation 2
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    const terminalIds = published.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_state_update" ? [update.subagentSessionId] : [],
+    );
+    expect(terminalIds).toEqual(["worker-1", "worker-1:generation:2"]);
+  });
 });
+
