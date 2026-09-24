@@ -315,8 +315,9 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
   // of a large existing file would render as creating it. Emit a truthful
   // replacement instead. Gated on `type` so Edit (whose output carries no
   // `type` and whose optimistic old/new diff is already truthful) keeps the
-  // empty-return behavior. A `create` needs nothing: the tool_use-time
-  // content already shows the created file.
+  // empty-return behavior. A `create` needs nothing here: the
+  // tool_use-time diff shows the created file, and a client with diffPatch
+  // gets it from the Write reporter.
   if (content.length === 0 && response.type === "update" && typeof response.content === "string") {
     locations.push({ path: response.filePath });
     content.push(

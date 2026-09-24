@@ -13,6 +13,7 @@ import {
 } from "../diff.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
 import { toolInfoFromToolUse } from "../tools.js";
+import { WriteReporter } from "../tool-calls/reporters/file-edit.js";
 
 const tempDirectories: string[] = [];
 
@@ -417,6 +418,20 @@ describe("Write tool calls for an existing file", () => {
     };
 
     expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
+  });
+
+  it("shows a created file that cannot have a patch in the hook result", async () => {
+    // No approval ran, and CRLF text has no exact patch, so the hook is the
+    // only report that shows the created file.
+    const filePath = await temporaryFile("a\r\nb\r\n");
+    const result = await new WriteReporter().hookResult(
+      { type: "create", filePath, content: "a\r\nb\r\n", structuredPatch: [], originalFile: null },
+      { capabilities: air },
+    );
+
+    expect(result.content).toEqual([
+      { type: "diff", path: filePath, oldText: null, newText: "a\r\nb\r\n" },
+    ]);
   });
 
   it("shows in the approval that the Write overwrites a file whose text is unknown", async () => {
