@@ -554,6 +554,20 @@ describe("session config options", () => {
       expect(serialized).toHaveProperty("effortLevel", null);
     });
 
+    it("turns UltraCode off in the same flag update when an ordinary effort is picked", async () => {
+      const session = (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
+      const effortOpt = session.configOptions.find((o: any) => o.id === "effort");
+      effortOpt.currentValue = "ultracode";
+
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "effort",
+        value: "low",
+      });
+
+      expect(applyFlagSettingsSpy).toHaveBeenCalledWith({ ultracode: false, effortLevel: "low" });
+    });
+
     it("updates effort currentValue in returned configOptions", async () => {
       const response = await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
