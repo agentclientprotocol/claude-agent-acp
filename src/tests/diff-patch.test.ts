@@ -420,6 +420,32 @@ describe("Write tool calls for an existing file", () => {
     expect(toolInfoFromToolUse(toolUse, false, undefined, true).content).toEqual([]);
   });
 
+  it("shows the standard diff in the approval of a Write whose diff exceeds the budget", async () => {
+    // Every line changes, so the line diff runs out of its time budget.
+    const oldText = Array.from({ length: 20_000 }, (_, index) => `old ${index}\n`).join("");
+    const newText = Array.from({ length: 20_000 }, (_, index) => `new ${index}\n`).join("");
+    const filePath = await temporaryFile(oldText);
+
+    const preview = await previewPatchContent("Write", { file_path: filePath, content: newText });
+
+    expect(preview).toBeDefined();
+    expect(preview!.length).toBeGreaterThan(0);
+  });
+
+  it("sends no hook patch when the previous text is larger than the limit", async () => {
+    const filePath = await temporaryFile("small\n");
+
+    const result = await patchUpdateFromDiffToolResponse({
+      type: "update",
+      filePath,
+      content: "small\n",
+      structuredPatch: [],
+      originalFile: "x".repeat(MAX_PATCH_FILE_BYTES + 1),
+    });
+
+    expect(result).toBeUndefined();
+  });
+
   it("shows a created file that cannot have a patch in the hook result", async () => {
     // No approval ran, and CRLF text has no exact patch, so the hook is the
     // only report that shows the created file.
