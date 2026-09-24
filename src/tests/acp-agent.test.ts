@@ -2849,19 +2849,19 @@ describe("session/list", () => {
 
   it("returns one page and a cursor while more sessions exist", async () => {
     vi.mocked(listSessions)
-      .mockResolvedValueOnce(Array.from({ length: 101 }, (_, index) => sdkSession(index)))
-      .mockResolvedValueOnce([sdkSession(100)]);
+      .mockResolvedValueOnce(Array.from({ length: 1001 }, (_, index) => sdkSession(index)))
+      .mockResolvedValueOnce([sdkSession(1000)]);
 
     const first = await agent().listSessions({ cwd: "/workspace" });
     const second = await agent().listSessions({ cwd: "/workspace", cursor: first.nextCursor });
 
-    expect(first.sessions).toHaveLength(100);
-    expect(first.nextCursor).toBe("offset:100");
-    expect(second.sessions.map((session) => session.sessionId)).toEqual(["session-100"]);
+    expect(first.sessions).toHaveLength(1000);
+    expect(first.nextCursor).toBe("offset:1000");
+    expect(second.sessions.map((session) => session.sessionId)).toEqual(["session-1000"]);
     expect(second.nextCursor).toBeUndefined();
     expect(vi.mocked(listSessions).mock.calls).toEqual([
-      [{ dir: "/workspace", limit: 101, offset: 0 }],
-      [{ dir: "/workspace", limit: 101, offset: 100 }],
+      [{ dir: "/workspace", limit: 1001, offset: 0 }],
+      [{ dir: "/workspace", limit: 1001, offset: 1000 }],
     ]);
   });
 
