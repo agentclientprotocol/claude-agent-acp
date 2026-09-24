@@ -162,9 +162,17 @@ export class NativeSubagentRuntime {
     const previous = this.children.get(task.taskId);
     if (previous && previous.terminalState === undefined) return;
 
-    const knownParentSessionId = task.toolUseId
-      ? this.parentByToolUse.get(task.toolUseId)
-      : undefined;
+    // A SendMessage resume reuses the finished generation's tool id, whose
+    // control state is already cleaned up. Keep its parent while that session
+    // is still live; a finished parent can no longer host the new generation.
+    const resumedParentSessionId =
+      previous &&
+      (this.isLiveSession(previous.parentSessionId)
+        ? previous.parentSessionId
+        : this.rootSessionId);
+    const knownParentSessionId =
+      (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
+      resumedParentSessionId;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
     const child: NativeSubagent = {
       sessionId: this.nextChildSessionId(task.taskId, previous),
@@ -301,6 +309,14 @@ export class NativeSubagentRuntime {
     this.identityByToolUse.delete(toolUseId);
     this.controlByToolUse.delete(toolUseId);
     this.parentByToolUse.delete(toolUseId);
+  }
+
+  private isLiveSession(sessionId: string): boolean {
+    if (sessionId === this.rootSessionId) return true;
+    for (const child of this.children.values()) {
+      if (child.sessionId === sessionId) return child.terminalState === undefined;
+    }
+    return false;
   }
 
   private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
