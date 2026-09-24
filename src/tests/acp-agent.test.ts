@@ -17386,6 +17386,41 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  it("delivers at the next tool boundary (priority 'next') when the Host opts in via _meta.steering.delivery", async () => {
+    const agent = createMockAgent();
+    const captured: any[] = [];
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        const steered = await iter.next();
+        captured.push(steered.value);
+        yield userEcho(steered.value);
+        yield createResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start" }],
+    });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+
+    const steerRes = await agent.steer({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "a group message" }],
+      _meta: { steering: { idleBehavior: "promptRequired", delivery: "next" } },
+    });
+
+    expect(steerRes.outcome).toBe("injected");
+    await expect(turn).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+    expect(captured).toHaveLength(1);
+    expect(captured[0].priority).toBe("next");
+  });
+
   it.each([
     {
       name: "a permission request",
