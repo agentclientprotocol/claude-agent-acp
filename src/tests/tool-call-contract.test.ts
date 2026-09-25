@@ -569,7 +569,7 @@ describe("task plans", () => {
     const hook = createTaskHook({
       taskState,
       onChange: async () => {
-        const entries = changedTaskPlanEntries(taskState);
+        const entries = changedTaskPlanEntries(taskState, true);
         if (entries) plans.push(entries);
       },
     });
