@@ -783,7 +783,7 @@ describe("authorization", () => {
         ]);
       });
 
-      it("publishes one session-scoped access failure for capable clients", async () => {
+      it("does not publish an access failure for capable clients", async () => {
         const [agent, updates] = createRecordingAgent(true);
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, {
@@ -794,20 +794,8 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
 
-        const failures = failuresIn(updates);
-        expect(failures).toHaveLength(1);
-        expect(failures[0]).toEqual(
-          expect.objectContaining({
-            category: "access",
-            severity: "error",
-            title: "Sign in to continue using Claude.",
-            details: MESSAGE,
-            reason: REASON,
-            actions: ["login"],
-          }),
-        );
-        expect(failures[0].turnId).toBeUndefined();
-        expect([...agent.sessions[sessionId].sessionFailureState.active.values()]).toHaveLength(1);
+        expect(failuresIn(updates)).toEqual([]);
+        expect([...agent.sessions[sessionId].sessionFailureState.active.values()]).toEqual([]);
       });
 
       it("gives a client without the capability the reason on the error only", async () => {
@@ -820,7 +808,7 @@ describe("authorization", () => {
         expect(failuresIn(updates)).toEqual([]);
       });
 
-      it("publishes one failure row for two concurrent prompts", async () => {
+      it("does not publish a failure row for two concurrent prompts", async () => {
         const [agent, updates] = createRecordingAgent(true);
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
@@ -835,7 +823,7 @@ describe("authorization", () => {
         for (const outcome of outcomes) {
           expect((outcome as PromiseRejectedResult).reason).toMatchObject(refusal);
         }
-        expect(failuresIn(updates)).toHaveLength(1);
+        expect(failuresIn(updates)).toEqual([]);
       });
 
       it("survives a cancel that races the refused prompt", async () => {
@@ -1052,9 +1040,7 @@ describe("authorization", () => {
         expect(mockQuery.mock.calls[1][0].options).toMatchObject({ resume: sessionId });
         // The refusal keeps the husk, so the client can sign in and retry here.
         expect(agent.sessions[sessionId]).toBeDefined();
-        expect(failuresIn(updates).filter((failure) => failure.kind !== "advisory")).toHaveLength(
-          1,
-        );
+        expect(failuresIn(updates).filter((failure) => failure.kind !== "advisory")).toEqual([]);
       });
 
       it("proceeds when the CLI now holds a key, on a clean failure state", async () => {
@@ -1474,7 +1460,7 @@ describe("authorization", () => {
       });
     });
 
-    describe("reason-aware failure dedupe", () => {
+    describe("auth refusal and existing failure state", () => {
       /** A controller on the session's own state, publishing through the same
        *  client, so its rows land in the same `updates` array the agent uses. */
       function controllerFor(agent: ClaudeAcpAgent, sessionId: string) {
@@ -1493,7 +1479,7 @@ describe("authorization", () => {
         prompt: [{ type: "text" as const, text: "hello" }],
       });
 
-      it("publishes the subscription row while a plain sign-out is active", async () => {
+      it("does not add a subscription row while a plain sign-out is active", async () => {
         const [agent, updates] = createRecordingAgent(true);
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
@@ -1503,12 +1489,11 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
 
         const failures = failuresIn(updates);
-        expect(failures).toHaveLength(2);
+        expect(failures).toHaveLength(1);
         expect(failures[0].reason).toBeUndefined();
-        expect(failures[1].reason).toBe(REASON);
       });
 
-      it("publishes a plain sign-out while the subscription row is active", async () => {
+      it("does not add a subscription row before a later sign-out", async () => {
         const [agent, updates] = createRecordingAgent(true);
         hideClaudeAuth();
         mockAccount(SIGNED_IN_WITH_KEY, { accountInfo: async () => ({ subscriptionType: "pro" }) });
@@ -1517,16 +1502,14 @@ describe("authorization", () => {
         await expect(agent.prompt(promptParams(sessionId))).rejects.toMatchObject(refusal);
 
         const controller = controllerFor(agent, sessionId);
-        // This is the check `failActiveWithSessionFailure` makes before it
-        // publishes a sign-out. The subscription row must not answer it.
+        // The guard does not change the session failure state.
         expect(controller.hasActiveSessionError("auth_required")).toBe(false);
-        expect(controller.hasActiveSessionError("auth_required", REASON)).toBe(true);
+        expect(controller.hasActiveSessionError("auth_required", REASON)).toBe(false);
         await controller.publish("auth_required", { sessionScoped: true });
 
         const failures = failuresIn(updates);
-        expect(failures).toHaveLength(2);
-        expect(failures[0].reason).toBe(REASON);
-        expect(failures[1].reason).toBeUndefined();
+        expect(failures).toHaveLength(1);
+        expect(failures[0].reason).toBeUndefined();
       });
     });
 
@@ -1565,12 +1548,11 @@ describe("authorization", () => {
 
           await expect(agent.unstable_disableProvider({ providerId: "main" })).resolves.toEqual({});
 
-          // The loop ran to the end: both sessions are gone and both reported.
+          // The loop ran to the end. Both sessions are gone.
           expect(agent.sessions[first.sessionId]).toBeUndefined();
           expect(agent.sessions[second.sessionId]).toBeUndefined();
           const failures = failuresIn(updates).filter((failure) => failure.reason === REASON);
-          expect(failures).toHaveLength(2);
-          expect(failures[0]).toMatchObject({ category: "access", details: MESSAGE });
+          expect(failures).toEqual([]);
 
           // `providerUpdate` is not poisoned: the next call reaches the guard
           // and reports the guard's own reason.

@@ -184,8 +184,6 @@ import {
 } from "./session-failure-extension.js";
 import {
   billsClaudeSubscription,
-  CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
-  CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
   claudeLoginRequiredError,
   type ClaudeSubscriptionGuardState,
   claudeSubscriptionNotSupportedError,
@@ -3122,15 +3120,6 @@ export class ClaudeAcpAgent {
       // The guard reads the account anyway; reuse that read to keep the
       // reported identity current, refusal or not.
       onAccount: (account) => this.publishSessionAccountIdentity(account),
-      sessionFailures: () =>
-        new SessionFailureController({
-          sessionId,
-          state: session.sessionFailureState,
-          capabilities: this.clientCapabilities,
-          isCurrent: () => this.sessions[sessionId] === session,
-          sendUpdate: (notification) => this.client.sessionUpdate(notification),
-          logger: this.logger,
-        }),
     });
   }
 
@@ -4000,12 +3989,7 @@ export class ClaudeAcpAgent {
      *  signal that starts the client's own auth flow (AIR parks the refused
      *  prompt, shows its method chooser, and resumes the prompt after sign-in),
      *  so replacing it with a successful `end_turn` would disable that flow.
-     *  Every client keeps the rejection; capable clients additionally receive
-     *  the signed-out *state* as one session-scoped failure whose `login`
-     *  action remains the way back in after the client's auth prompt is
-     *  dismissed. Its title stays the policy's client-neutral fallback — the
-     *  CLI's own text ("… Please run /login") is TUI advice, meaningless in an
-     *  ACP client, so it travels as expandable details instead. */
+     *  Every client keeps the rejection. The client owns the login UI. */
     const failActiveWithSessionFailure = async (
       kind: ClaudeFailureKind,
       error: unknown,
@@ -4015,22 +3999,10 @@ export class ClaudeAcpAgent {
         await compaction.interrupt();
       }
       if (kind === "auth_required") {
-        // One sign-out arrives twice — the synthetic login assistant message
-        // and the turn's error-shaped result repeat the same text — and the
-        // signed-out state does not change in between: publish once, and skip
-        // republishing while the previous sign-out is still active. A retry
-        // warning of the same kind is not a sign-out and must not suppress it.
-        if (!sessionFailures.hasActiveSessionError(kind)) {
-          await publishSessionFailure(kind, { turnScoped: false, details: title });
-        }
-        // Preserve legacy codes: only explicit `/login` signals trigger ACP's auth flow.
-        // The first delivery rejects the turn, so the second one finds it settled.
-        // That is the normal course here, not the lost-failure case `failActive`
-        // logs an error for.
-        if (session.activeTurn && !session.activeTurn.settled) failActive(error);
-        // The row is published and the turn is rejected. Under
-        // `--hide-claude-auth` the account cached at `initialize` is now
-        // wrong, so end the query and let the next turn recreate it.
+        // The auth error starts the client's login flow. Do not send an access
+        // failure as a second notification or render login text in the chat.
+        if (session.activeTurn && !session.activeTurn.settled)
+          failActive(RequestError.authRequired());
         this.markSessionForSignOutRespawn(params.sessionId, session);
         return;
       }
@@ -5567,9 +5539,7 @@ export class ClaudeAcpAgent {
                     // it reports a login the query process itself runs, and a
                     // client can sign the user in out of band (AIR runs
                     // `claude /login` in a terminal, in a separate process).
-                    // Without this a stale signed-out record would outlive the
-                    // sign-out and suppress the next one, which the
-                    // `auth_required` dedupe below reads.
+                    // Clear any older signed-out record after a real answer.
                     failure.recoveryPolicy === "auth_status" ||
                     (failure.severity === "warning" && failure.turnId === activeTurnId),
                 );
@@ -8959,9 +8929,7 @@ export class ClaudeAcpAgent {
     }
   }
 
-  /** Tell a capable client that a session died during a provider switch. The
-   *  session is already removed, so the failure is published on the state it
-   *  left behind, with the refusal reason when the error carries one. */
+  /** Tell a capable client when a non-auth error ends a session during a provider switch. */
   private reportSessionLostOnProviderUpdate(
     sessionId: string,
     session: Session,
@@ -8971,6 +8939,7 @@ export class ClaudeAcpAgent {
       `Session ${sessionId}: could not be recreated for the provider update: ${error}`,
     );
     const isAuthRequired = error instanceof RequestError && error.code === AUTH_REQUIRED_CODE;
+    if (isAuthRequired) return;
     const reason =
       error instanceof RequestError &&
       typeof error.data === "object" &&
@@ -8979,12 +8948,7 @@ export class ClaudeAcpAgent {
       typeof error.data.reason === "string"
         ? error.data.reason
         : undefined;
-    const details =
-      reason === CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON
-        ? CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE
-        : error instanceof Error
-          ? error.message
-          : String(error);
+    const details = error instanceof Error ? error.message : String(error);
     const controller = new SessionFailureController({
       sessionId,
       state: session.sessionFailureState,
@@ -8996,7 +8960,7 @@ export class ClaudeAcpAgent {
       logger: this.logger,
     });
     void controller
-      .publish(isAuthRequired ? "auth_required" : "internal_error", {
+      .publish("internal_error", {
         sessionScoped: true,
         details,
         ...(reason ? { reason } : {}),
