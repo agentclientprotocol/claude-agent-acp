@@ -1,7 +1,7 @@
 import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { access, open, readdir } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { claudeConfigDir } from "./paths.js";
 import { SessionTiming } from "./session-timing.js";
 
 /** The size of one backward read of a transcript. */
@@ -97,10 +97,7 @@ export async function readResumedModel(
 
 /** The local transcript of a session in any project directory, as the SDK looks it up. */
 export async function findTranscript(sessionId: string): Promise<string | undefined> {
-  const projects = path.join(
-    process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude"),
-    "projects",
-  );
+  const projects = path.join(claudeConfigDir(), "projects");
   let directories: string[];
   try {
     directories = await readdir(projects);

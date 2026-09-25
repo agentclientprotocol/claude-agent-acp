@@ -122,7 +122,7 @@ export async function previewPatchContent(
       if (oldText !== null && (oldText.trim() !== "" || oldText.includes("\uFEFF"))) {
         return undefined;
       }
-      return optionalContent(await filePatchContent(filePath, oldText, newString));
+      return optionalContent(filePatch(filePath, oldText, newString)?.content);
     }
     if (oldText === null) return undefined;
     const occurrences = oldText.split(oldString).length - 1;
@@ -131,7 +131,7 @@ export async function previewPatchContent(
       return undefined;
     }
     const newText = replacedText(oldText, oldString, newString, edit.replace_all === true);
-    return optionalContent(await filePatchContent(filePath, oldText, newText));
+    return optionalContent(filePatch(filePath, oldText, newText)?.content);
   }
 
   if (toolName === "Write") {
@@ -161,7 +161,7 @@ export async function previewPatchContent(
     ];
     if (!isPatchableText(content)) return standard;
     // A dense change can exceed the diff budget. The approval then shows the standard diff.
-    return optionalContent(await filePatchContent(filePath, oldText, content)) ?? standard;
+    return optionalContent(filePatch(filePath, oldText, content)?.content) ?? standard;
   }
 
   return undefined;
@@ -252,20 +252,15 @@ export async function patchUpdateFromDiffToolResponse(
   const newText = await readPatchSource(response.filePath);
   if (typeof newText !== "string" || newText.startsWith("\uFEFF")) return undefined;
   if (response.type === "create" && newText !== response.content) return undefined;
-  const hunks = await diffHunks(oldText, newText);
-  if (!hunks || hunks.length === 0) return undefined;
+  const patch = filePatch(response.filePath, oldText, newText);
+  if (!patch) return undefined;
   return {
-    content: [
-      patchContent(
-        response.filePath,
-        gitPatchText(response.filePath, oldText === null ? "create" : "update", hunks),
-      ),
-    ],
+    content: [patch.content],
     // A created file keeps the location of its Write tool call.
     locations:
       oldText === null
         ? [{ path: response.filePath }]
-        : hunks.map(({ newStart }) => ({ path: response.filePath!, line: newStart })),
+        : patch.hunks.map(({ newStart }) => ({ path: response.filePath!, line: newStart })),
   };
 }
 
@@ -447,10 +442,7 @@ function wholeFileHunk(text: string): PatchHunk | undefined {
  * The line-diff hunks between two texts. Returns undefined when the diff runs
  * out of its time budget.
  */
-async function diffHunks(
-  oldText: string | null,
-  newText: string,
-): Promise<PatchHunk[] | undefined> {
+function diffHunks(oldText: string | null, newText: string): PatchHunk[] | undefined {
   if (oldText === null) {
     const hunk = wholeFileHunk(newText);
     return hunk ? [hunk] : [];
@@ -492,17 +484,19 @@ function textLines(text: string): string[] {
   return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 }
 
-async function filePatchContent(
+/**
+ * The git patch of a file change and its hunks. Returns undefined when
+ * nothing changed or the diff runs out of its time budget.
+ */
+function filePatch(
   filePath: string,
   oldText: string | null,
   newText: string,
-): Promise<ToolCallContent | undefined> {
-  const hunks = await diffHunks(oldText, newText);
+): { content: ToolCallContent; hunks: PatchHunk[] } | undefined {
+  const hunks = diffHunks(oldText, newText);
   if (!hunks || hunks.length === 0) return undefined;
-  return patchContent(
-    filePath,
-    gitPatchText(filePath, oldText === null ? "create" : "update", hunks),
-  );
+  const change = oldText === null ? "create" : "update";
+  return { content: patchContent(filePath, gitPatchText(filePath, change, hunks)), hunks };
 }
 
 /**
