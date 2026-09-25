@@ -1,7 +1,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Fix the build","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_n","task":"Make the build pass"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Fix the build","prompt":"Make the build pass","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_n","task":"Make the build pass"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_native"}},"content":{"text":"Running t","type":"text"},"messageId":"msg_native_sub_1","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_native"}},"content":{"text":"he build.","type":"text"},"messageId":"msg_native_sub_1","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_native","toolName":"Grep"}},"content":[],"kind":"search","name":"Grep","sessionUpdate":"tool_call","status":"pending","title":"grep","toolCallId":"toolu_native_grep"}}}

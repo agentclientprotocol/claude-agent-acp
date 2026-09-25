@@ -29,6 +29,12 @@ export type SubagentSpawnedUpdate = {
   subagentSessionId: string;
   name: string;
   task: string;
+  /**
+   * Adapter extension: the exact prompt of the subagent. A client can show it
+   * as the first user message of the subagent session. It is absent when the
+   * adapter does not know the prompt.
+   */
+  prompt?: string;
   capabilities: SubagentSessionCapabilities;
   _meta?: Record<string, unknown> | null;
 };

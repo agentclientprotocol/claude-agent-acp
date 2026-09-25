@@ -7,6 +7,7 @@ import {
   NativeSubagentRuntime,
   NativeSubagentSession,
   resumedNativeSubagentId,
+  sendMessageResumePrompt,
 } from "../native-subagents.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -431,6 +432,66 @@ describe("NativeSubagentRuntime lifecycle", () => {
     });
   });
 
+  describe("the subagent prompt in subagent_spawned", () => {
+    async function spawned(
+      task: { prompt?: string },
+      rawInput?: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        true,
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+      );
+      const launch = control("tool_call", "pending");
+      await runtime.route(
+        { ...launch, update: { ...launch.update, rawInput } } as AcpSessionNotification,
+        async () => {},
+      );
+      await runtime.taskStarted(
+        {
+          taskId: "worker-1",
+          toolUseId: "agent-tool",
+          subagentType: "Explore",
+          description: "Investigate failure",
+          ...task,
+        },
+        async () => {},
+      );
+      const update = published.find(({ update }) => update.sessionUpdate === "subagent_spawned");
+      return update!.update as unknown as Record<string, unknown>;
+    }
+
+    it("carries the exact task_started prompt", async () => {
+      const update = await spawned(
+        { prompt: "  Trace the crash.\n\nReport the stack.\n" },
+        { description: "Investigate failure", prompt: "Find the cause" },
+      );
+
+      expect(update.prompt).toBe("  Trace the crash.\n\nReport the stack.\n");
+    });
+
+    it("falls back to the prompt of the Agent tool input", async () => {
+      const update = await spawned(
+        {},
+        { description: "Investigate failure", prompt: "Find the cause" },
+      );
+
+      expect(update.prompt).toBe("Find the cause");
+    });
+
+    it("omits the prompt when the adapter has none", async () => {
+      const update = await spawned({ prompt: "   " }, { description: "Investigate failure" });
+
+      expect(update).not.toHaveProperty("prompt");
+      expect(update.task).toBe("Investigate failure");
+    });
+  });
+
   describe("resume after a terminal state", () => {
     const output = (text: string) =>
       ({
@@ -525,6 +586,40 @@ describe("NativeSubagentRuntime lifecycle", () => {
       expect(resumedNativeSubagentId({ success: false, resumedAgentId: "worker-1" })).toBe(
         undefined,
       );
+    });
+
+    it("sends the SendMessage text as the prompt of the new generation", async () => {
+      const { runtime, published } = await finishedWorker("completed");
+
+      await runtime.taskResumed("worker-1", async () => {}, "Check the tests too");
+
+      expect(published.at(-1)?.update).toMatchObject({
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: "worker-1:generation:2",
+        prompt: "Check the tests too",
+      });
+    });
+
+    it("omits the prompt of a new generation without a SendMessage text", async () => {
+      const { runtime, published } = await finishedWorker("completed");
+
+      await runtime.taskResumed("worker-1", async () => {});
+
+      expect(published.at(-1)?.update).not.toHaveProperty("prompt");
+    });
+
+    it("finds the SendMessage text that resumed the agent", () => {
+      const toolUses = {
+        old: { name: "SendMessage", input: { to: "worker-1", message: "First" } },
+        other: { name: "SendMessage", input: { to: "worker-2", message: "Other" } },
+        latest: { name: "SendMessage", input: { to: "worker-1", message: "Second" } },
+        bash: { name: "Bash", input: { command: "ls" } },
+      };
+
+      expect(sendMessageResumePrompt(toolUses, "worker-1")).toBe("Second");
+      expect(sendMessageResumePrompt(toolUses, "worker-1", ["old"])).toBe("First");
+      expect(sendMessageResumePrompt(toolUses, "worker-1", ["bash"])).toBeUndefined();
+      expect(sendMessageResumePrompt(toolUses, "worker-3")).toBeUndefined();
     });
 
     it("ignores a late update of a completed child without a resume signal", async () => {

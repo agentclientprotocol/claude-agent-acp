@@ -7,6 +7,11 @@ export type NativeSubagent = {
   parentToolUseId?: string;
   name: string;
   task: string;
+  /**
+   * The exact prompt of this generation, sent as `prompt` in
+   * `subagent_spawned`. It is absent when the adapter has no prompt.
+   */
+  prompt?: string;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -196,6 +201,7 @@ export class NativeSubagentRuntime {
           identity?.prompt ?? task.prompt,
           identity?.description ?? task.description,
         ),
+        ...promptField(promptText(task.prompt) ?? identity?.prompt),
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
@@ -206,9 +212,10 @@ export class NativeSubagentRuntime {
    * Opens a new generation of a finished child when the SDK resumes the same
    * agent id. The SDK can resume a child without a new `task_started`, so a
    * running `task_updated` patch or a SendMessage `resumedAgentId` is the
-   * signal. A child that did not finish is not changed.
+   * signal. A child that did not finish is not changed. The `prompt` is the
+   * SendMessage text that resumed the child, when the adapter knows it.
    */
-  async taskResumed(taskId: string, deliver: Publish): Promise<void> {
+  async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
     if (!this.enabled) return;
     const previous = this.children.get(taskId);
     if (!previous) return;
@@ -223,6 +230,7 @@ export class NativeSubagentRuntime {
         parentToolUseId: previous.parentToolUseId,
         name: previous.name,
         task: previous.task,
+        ...promptField(promptText(prompt)),
       },
       true,
       deliver,
@@ -384,7 +392,10 @@ export class NativeSubagentRuntime {
   private async openGeneration(
     taskId: string,
     previous: NativeSubagent | undefined,
-    fields: Pick<NativeSubagent, "parentSessionId" | "parentToolUseId" | "name" | "task">,
+    fields: Pick<
+      NativeSubagent,
+      "parentSessionId" | "parentToolUseId" | "name" | "task" | "prompt"
+    >,
     announce: boolean,
     deliver: Publish,
   ): Promise<void> {
@@ -429,6 +440,7 @@ export async function announceNativeSubagent(
         subagentSessionId: child.sessionId,
         name: child.name,
         task: child.task,
+        ...promptField(child.prompt),
         capabilities: {},
       },
     });
@@ -479,6 +491,31 @@ export function resumedNativeSubagentId(toolUseResult: unknown): string | undefi
   if (typeof toolUseResult !== "object" || toolUseResult === null) return undefined;
   const result = toolUseResult as { success?: unknown; resumedAgentId?: unknown };
   return result.success === true ? nonBlankString(result.resumedAgentId) : undefined;
+}
+
+/**
+ * The SendMessage text that resumed the agent `agentId`. The tool uses of
+ * `resultToolUseIds` come first: they are the SendMessage calls whose result
+ * carried the resume. Otherwise the latest SendMessage call to `agentId` counts.
+ */
+export function sendMessageResumePrompt(
+  toolUses: Record<string, { name: string; input: unknown } | undefined>,
+  agentId: string,
+  resultToolUseIds: readonly string[] = [],
+): string | undefined {
+  for (const toolUseId of resultToolUseIds) {
+    const toolUse = toolUses[toolUseId];
+    if (toolUse?.name !== "SendMessage") continue;
+    const text = promptText((toolUse.input as { message?: unknown } | null)?.message);
+    if (text) return text;
+  }
+  if (resultToolUseIds.length > 0) return undefined;
+  for (const toolUse of Object.values(toolUses).reverse()) {
+    if (toolUse?.name !== "SendMessage") continue;
+    const input = toolUse.input as { to?: unknown; message?: unknown } | null;
+    if (input?.to === agentId) return promptText(input.message);
+  }
+  return undefined;
 }
 
 export function nativeSubagentState(status: unknown): SubagentState | undefined {
@@ -616,7 +653,7 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
   const identity: SubagentIdentity = {
     name: nonBlankString(value.name),
     description: nonBlankString(value.description),
-    prompt: nonBlankString(value.prompt),
+    prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
@@ -650,6 +687,16 @@ function applySubagentIdentity(
   if (identity.prompt || identity.description) {
     child.task = subagentDescription(identity.prompt, identity.description);
   }
+  child.prompt ??= identity.prompt;
+}
+
+/** The prompt text unchanged, or `undefined` when it is not a non-blank string. */
+function promptText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function promptField(prompt: string | undefined): { prompt?: string } {
+  return prompt === undefined ? {} : { prompt };
 }
 
 function nonBlankString(value: unknown): string | undefined {

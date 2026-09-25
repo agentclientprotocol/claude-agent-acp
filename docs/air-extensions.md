@@ -1140,6 +1140,10 @@ This section covers only the AIR bridge.
 - The agent advertises `nativeSubagentSessions` to AIR, and `agentCapabilities.sessionCapabilities.subagents` to every client.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
+- `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.
+  The source is the `task_started` prompt, else the Agent or Task input `prompt`.
+  A resumed generation gets the SendMessage `message` text.
+  The field is absent when the adapter has no prompt. The adapter does not truncate it.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.

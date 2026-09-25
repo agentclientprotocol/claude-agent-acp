@@ -16631,6 +16631,42 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await session.consumer;
     });
 
+    it("passes the SendMessage text as the prompt of the resumed generation", async () => {
+      const sendMessageCall = {
+        ...assistantText(""),
+        message: {
+          ...assistantText("").message,
+          stop_reason: "tool_use",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_send",
+              name: "SendMessage",
+              input: { to: "agent-1", message: "Check the tests too", summary: "tests" },
+            },
+          ],
+        },
+      };
+      const { agent, updates, release, start } = run(
+        [sendMessageCall, taskUpdated("running"), sendMessageResult()],
+        { subagents: true },
+      );
+      const { second } = await start();
+
+      const spawned = updates.flatMap((n) =>
+        n.update.sessionUpdate === "subagent_spawned" ? [n.update] : [],
+      );
+      expect(spawned.map((update) => update.subagentSessionId)).toEqual([
+        "agent-1",
+        "agent-1:generation:2",
+      ]);
+      expect(spawned[0]).not.toHaveProperty("prompt");
+      expect(spawned[1]).toMatchObject({ prompt: "Check the tests too" });
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      await agent.sessions["test-session"]?.consumer;
+    });
+
     it("ends the hold of the SendMessage turn at cancel()", async () => {
       const { agent, release, notified, start } = run([sendMessageResult()]);
       const { second } = await start();

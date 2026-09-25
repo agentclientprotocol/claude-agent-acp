@@ -1,7 +1,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Summarize","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_t","task":"Summarize the repo"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Summarize","prompt":"Summarize the repo","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_t","task":"Summarize the repo"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"Look at t","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_thought_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"he layout.","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_thought_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_t","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_transcript"}},"content":{"text":"The repo has ","type":"text"},"messageId":"msg_transcript_sub","sessionUpdate":"agent_message_chunk"}}}
