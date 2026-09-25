@@ -113,7 +113,7 @@ describe("tool output in tool call updates", () => {
     expect(notifications[0].update).not.toHaveProperty("rawOutput");
   });
 
-  it("sends Read output once, in content, without rawOutput", () => {
+  it("leaves the Read output of a file out for AIR", () => {
     const toolUseCache: ToolUseCache = {
       toolu_456: {
         type: "tool_use",
@@ -141,13 +141,14 @@ describe("tool output in tool call updates", () => {
       { clientCapabilities: AIR_CLIENT },
     );
 
+    // AIR shows a Read of a file as the viewed file, so the text stays out.
     expect(notifications).toHaveLength(1);
     expect(notifications[0].update).toMatchObject({
       sessionUpdate: "tool_call_update",
       toolCallId: "toolu_456",
       status: "completed",
-      content: expect.any(Array),
     });
+    expect(notifications[0].update).not.toHaveProperty("content");
     expect(notifications[0].update).not.toHaveProperty("rawOutput");
   });
 
