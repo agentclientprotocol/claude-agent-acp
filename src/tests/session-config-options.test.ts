@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SessionNotification } from "@agentclientprotocol/sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
-import { makeMockQuery } from "./helpers.js";
+import { initializeClient, makeMockQuery } from "./helpers.js";
 
 const { registerHookCallbackSpy } = vi.hoisted(() => ({
   registerHookCallbackSpy: vi.fn(),
@@ -625,9 +625,9 @@ describe("session config options", () => {
     });
 
     it("applies concrete defaults and re-seeds automatic effort from each model's settings", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       const session = agent.sessions[SESSION_ID];
       session.settingsManager.getSettings = () => ({
         modelSettings: { "claude-opus-4-5": { effortLevel: "high" } },
@@ -664,9 +664,9 @@ describe("session config options", () => {
     });
 
     it("re-seeds switches from retained programmatic settings before file settings", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       const session = agent.sessions[SESSION_ID];
       session.settingsManager.getSettings = () => ({ effortLevel: "high" });
       session.effortSettingsOverride = {
@@ -685,9 +685,9 @@ describe("session config options", () => {
     });
 
     it("clears an unsupported user pin before choosing the new model's concrete effort", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       const session = agent.sessions[SESSION_ID];
       session.modelInfos[0].supportedEffortLevels = ["low", "medium", "high", "max"];
       session.settingsManager.getSettings = () => ({ effortLevel: "low" });
@@ -748,9 +748,9 @@ describe("session config options", () => {
     });
 
     it("restores the last applied effort when recommended-value synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       const session = agent.sessions[SESSION_ID];
       session.configOptions.find((o) => o.id === "effort")!.currentValue = "low";
       session.appliedEffortLevel = "low";
@@ -769,9 +769,9 @@ describe("session config options", () => {
     });
 
     it("returns the new model state when effort synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
 
       const response = await agent.setSessionConfigOption({
@@ -788,9 +788,9 @@ describe("session config options", () => {
     });
 
     it("publishes the new model state when external-switch effort synchronization fails", async () => {
-      (agent as any).clientCapabilities = {
+      await initializeClient(agent, {
         _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-      };
+      });
       applyFlagSettingsSpy.mockRejectedValueOnce(new Error("effort sync failed"));
       const session = agent.sessions[SESSION_ID];
 

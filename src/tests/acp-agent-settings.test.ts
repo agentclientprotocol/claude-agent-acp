@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
-import { makeMockQuery } from "./helpers.js";
+import { initializeClient, makeMockQuery } from "./helpers.js";
 
 const { querySpy } = vi.hoisted(() => ({
   querySpy: vi.fn(),
@@ -130,9 +130,9 @@ describe("ClaudeAcpAgent settings", () => {
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent = new ClaudeAcpAgent(createMockClient());
       if (recommended) {
-        (agent as any).clientCapabilities = {
+        await initializeClient(agent, {
           _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-        };
+        });
       }
       const response = await (agent as any).createSession({
         cwd: tempDir,
@@ -182,9 +182,9 @@ describe("ClaudeAcpAgent settings", () => {
     );
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
     const agent = new ClaudeAcpAgent(createMockClient());
-    (agent as any).clientCapabilities = {
+    await initializeClient(agent, {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
-    };
+    });
 
     const response = await (agent as any).createSession({
       cwd: tempDir,

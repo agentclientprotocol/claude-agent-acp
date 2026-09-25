@@ -52,6 +52,7 @@ import {
 import { SessionTitles } from "../session-titles.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
+import { initializeClient } from "./helpers.js";
 import {
   deleteSession,
   forkSession,
@@ -2581,7 +2582,7 @@ describe("usage-limit failure replay", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = capable ? airCapabilities : {};
+    await initializeClient(agent, capable ? airCapabilities : {});
     agent.sessions.s1 = mockSessionState();
     vi.mocked(getSessionMessages).mockResolvedValueOnce(messages);
     await (
@@ -2807,7 +2808,7 @@ describe("usage-limit failure replay", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: (...args) => errors.push(args) },
     );
-    (agent as any).clientCapabilities = airCapabilities;
+    await initializeClient(agent, airCapabilities);
     agent.sessions.s1 = mockSessionState();
     vi.mocked(getSessionMessages).mockResolvedValueOnce([usageLimitMessage]);
 
@@ -2934,12 +2935,14 @@ describe("subagent transcript replay", () => {
         updates.push(update as AcpSessionNotification),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities =
+    await initializeClient(
+      agent,
       capability === "native"
-        ? { subagents: {} }
+        ? ({ subagents: {} } as ClientCapabilities)
         : capability === "legacy"
           ? { _meta: { "subagent-transcript": true } }
-          : {};
+          : {},
+    );
     vi.mocked(getSessionMessages).mockResolvedValueOnce(history);
 
     await (
@@ -3071,7 +3074,7 @@ describe("subagent transcript replay", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
-      (agent as any).clientCapabilities = { subagents: {} };
+      await initializeClient(agent, { subagents: {} } as ClientCapabilities);
       vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
       vi.mocked(getSubagentMessages).mockClear();
       await (
@@ -3833,7 +3836,7 @@ describe("permission request cancellation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, "session-1");
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
@@ -4058,7 +4061,7 @@ describe("permission request cancellation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, "session-1");
     const input = { file_path: "/outside/a.ts" };
 
@@ -4274,7 +4277,7 @@ describe("tool_call emitted before permission request", () => {
 
   it("emits the tool_call (then asks permission) when the stream hasn't yet", async () => {
     const { agent, events, updates, session } = setup();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     const result = await agent.canUseTool("session-1")(
       "Bash",
@@ -4304,7 +4307,7 @@ describe("tool_call emitted before permission request", () => {
 
   it("carries the PowerShell description in claudeCode meta like Bash", async () => {
     const { agent, updates } = setup();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     await agent.canUseTool("session-1")(
       "PowerShell",
@@ -4505,7 +4508,7 @@ describe("tool_call emitted before permission request", () => {
     // Terminal-capable client (e.g. Zed). The eager tool_call must carry
     // terminal_info.terminal_id, otherwise the later terminal_output/terminal_exit
     // updates (keyed by terminal_id) have nothing to attach to.
-    (agent as any).clientCapabilities = { _meta: { terminal_output: true } };
+    await initializeClient(agent, { _meta: { terminal_output: true } });
 
     await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
       signal: new AbortController().signal,
@@ -4668,7 +4671,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     agent.sessions["session-1"] = mockSessionState();
     agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
 
@@ -4702,7 +4705,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     agent.sessions["session-1"] = mockSessionState();
     agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
 
@@ -4775,7 +4778,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
   it("keeps the legacy child tool call before its root permission request", async () => {
     const { agent, updates, requests, session } = setup();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
       isSubagent: true,
@@ -4800,7 +4803,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
   it("forwards the MCP server provenance on the permission request", async () => {
     const { agent, requests } = setup();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     await agent.canUseTool("session-1")("mcp__github__create_issue", { title: "x" }, {
       signal: new AbortController().signal,
@@ -4828,7 +4831,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
   it("forwards child elicitation to the root when native subagents were not negotiated", async () => {
     const { agent, updates, requests, session } = setup();
-    (agent as any).clientCapabilities = { elicitation: { form: {} } };
+    await initializeClient(agent, { elicitation: { form: {} } });
     session.liveBackgroundTasks.set("agent-42", {
       parentToolUseId: "toolu_parent",
       isSubagent: true,
@@ -6594,7 +6597,7 @@ describe("stop reason propagation", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = { session: { configOptions: { boolean: {} } } };
+    await initializeClient(agent, { session: { configOptions: { boolean: {} } } });
 
     const input = new Pushable<any>();
 
@@ -6783,7 +6786,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (notification: any) => updates.push(notification),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -6858,7 +6861,7 @@ describe("stop reason propagation", () => {
       sessionUpdate: async (notification: any) => updates.push(notification),
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -6908,7 +6911,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
@@ -7233,7 +7236,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       {
         type: "system",
@@ -7293,7 +7296,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       {
         type: "system",
@@ -7339,7 +7342,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       {
         type: "system",
@@ -7456,7 +7459,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError(sdkError, "Claude request failed."),
       createResultMessage({
@@ -7490,7 +7493,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const priorAssistant = createAssistantError(undefined);
     priorAssistant.message.usage = {
       input_tokens: 170000,
@@ -7538,7 +7541,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createUsageLimitAssistantError(),
       createResultMessage({
@@ -7600,7 +7603,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createResultMessage({
         subtype,
@@ -7633,7 +7636,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Claude request failed."),
       createResultMessage({
@@ -7676,7 +7679,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Authentication required."),
       createResultMessage({
@@ -7723,7 +7726,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createAssistantError("authentication_failed", "Authentication required."),
       createResultMessage({
@@ -7772,7 +7775,7 @@ describe("stop reason propagation", () => {
         },
       },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     // The CLI reports one signed-out turn twice: the synthetic login assistant
     // message rejects the turn, then the result repeats the same text. One
     // session-scoped failure covers both; its title is the client-neutral
@@ -7824,7 +7827,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const answer = "A normal answer can quote: Please run /login.";
     injectSession(agent, [
       createAssistantError(undefined, answer),
@@ -7853,7 +7856,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const signedOut = () => {
       const message = createAssistantError("authentication_failed");
       message.message.model = "<synthetic>";
@@ -7928,7 +7931,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     // The 401 retry is the CLI's credential re-check. The sign-out that
     // follows is the signal, so the retry publishes nothing and the only
     // failure is the session-scoped error with the `login` action.
@@ -7980,7 +7983,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
@@ -8047,7 +8050,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
@@ -8107,7 +8110,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
@@ -8205,7 +8208,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       {
         type: "system",
@@ -8248,7 +8251,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     let reachedQuietTail!: () => void;
     const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
     let closeStream!: () => void;
@@ -8306,7 +8309,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     injectSession(agent, [
       createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
       {
@@ -8344,7 +8347,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     let reachedQuietTail!: () => void;
     const quietTail = new Promise<void>((resolve) => (reachedQuietTail = resolve));
     let closeOldStream!: () => void;
@@ -8400,7 +8403,7 @@ describe("stop reason propagation", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
-      (agent as any).clientCapabilities = airSessionFailureCapabilities;
+      await initializeClient(agent, airSessionFailureCapabilities);
       injectSession(agent, [
         createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false }),
         {
@@ -8440,7 +8443,7 @@ describe("stop reason propagation", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = airSessionFailureCapabilities;
+    await initializeClient(agent, airSessionFailureCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const iter = input[Symbol.asyncIterator]();
@@ -11057,7 +11060,7 @@ describe("usage_update computation", () => {
 
   it("compact_boundary uses post_tokens without waiting for getContextUsage", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     // No trailing idle: an idle with no preceding result now fails the turn as
     // abandoned (issue #825), and a real compaction turn always produces a
     // result. Here the stream simply ends, settling the prompt end_turn.
@@ -11934,7 +11937,7 @@ describe("assembled assistant text fallback", () => {
 
   it("forwards subagent text and thinking through the legacy transcript extension", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    await initializeClient(agent, { _meta: { "subagent-transcript": true } });
     injectSession(agent, [
       assistantMessage(
         "msg-subagent",
@@ -11965,7 +11968,7 @@ describe("assembled assistant text fallback", () => {
 
   it("does not repeat streamed subagent text in the consolidated message", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    await initializeClient(agent, { _meta: { "subagent-transcript": true } });
     const delta = (text: string) => ({
       type: "stream_event",
       parent_tool_use_id: "tool_use_1",
@@ -11989,7 +11992,7 @@ describe("assembled assistant text fallback", () => {
 
   it("drops the streamed text record of a finished subagent", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { _meta: { "subagent-transcript": true } };
+    await initializeClient(agent, { _meta: { "subagent-transcript": true } });
     injectSession(agent, [
       {
         type: "stream_event",
@@ -12139,7 +12142,7 @@ describe("assembled assistant text fallback", () => {
 
   it("does not forward the result text of a turn that only emitted compaction output", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     // `/compact` carries no echo, so it is promoted at its own result, and its
     // synthetic tool call is emitted directly rather than through the assistant
     // forwarding loops. It still counts as visible output, so the result must
@@ -12173,7 +12176,7 @@ describe("assembled assistant text fallback", () => {
 
   it("emits one compaction tool lifecycle and ignores duplicate terminal status", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, [
       {
         type: "system",
@@ -12245,7 +12248,7 @@ describe("assembled assistant text fallback", () => {
 
   it("does not repeat a failed compaction error delivered as an assistant message", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, [
       {
         type: "system",
@@ -12327,12 +12330,12 @@ describe("assembled assistant text fallback", () => {
   });
 
   /** An agent whose client advertises the ACP session-compaction contract. */
-  function compactionCapableAgent() {
+  async function compactionCapableAgent() {
     const capture = createMockAgentWithCapture();
-    (capture.agent as any).clientCapabilities = {
+    await initializeClient(capture.agent, {
       ...AIR_CLIENT_CAPABILITIES,
       session: { compaction: {} },
-    };
+    });
     return capture;
   }
 
@@ -12379,7 +12382,7 @@ describe("assembled assistant text fallback", () => {
   }
 
   it("emits the ACP compaction lifecycle for a client that advertises session.compaction", async () => {
-    const { agent, updates } = compactionCapableAgent();
+    const { agent, updates } = await compactionCapableAgent();
     injectSession(agent, [
       compactingStatus(),
       compactResult("success", "compact-completed"),
@@ -12442,7 +12445,7 @@ describe("assembled assistant text fallback", () => {
   });
 
   it("reports a failed compaction through compaction_update and swallows the duplicated stdout", async () => {
-    const { agent, updates } = compactionCapableAgent();
+    const { agent, updates } = await compactionCapableAgent();
     injectSession(agent, [
       compactingStatus(),
       compactResult("failed", "compact-failed-1", "summary rejected"),
@@ -12489,7 +12492,7 @@ describe("assembled assistant text fallback", () => {
   });
 
   it("closes a compaction the turn abandoned as cancelled, before the prompt settles", async () => {
-    const { agent, updates } = compactionCapableAgent();
+    const { agent, updates } = await compactionCapableAgent();
     injectSession(agent, [compactingStatus(), replayedResult(""), idle]);
 
     let updatesAtSettle: string[] | undefined;
@@ -12506,7 +12509,7 @@ describe("assembled assistant text fallback", () => {
   it.each(["echo", "dispatch", "no echo"] as const)(
     "closes compaction before a cancelled wedged prompt settles (%s)",
     async (boundary) => {
-      const { agent, updates } = compactionCapableAgent();
+      const { agent, updates } = await compactionCapableAgent();
       agent.forceCancelGraceMs = 20;
       let releaseGenerator!: () => void;
       const generatorReleased = new Promise<void>((resolve) => {
@@ -12574,7 +12577,7 @@ describe("assembled assistant text fallback", () => {
   it.each(["echo", "dispatch", "unattributed opening"] as const)(
     "discards force-cancelled compaction frames until the next %s",
     async (nextBoundary) => {
-      const { agent, updates } = compactionCapableAgent();
+      const { agent, updates } = await compactionCapableAgent();
       agent.forceCancelGraceMs = 20;
       let releaseGenerator!: () => void;
       const generatorReleased = new Promise<void>((resolve) => {
@@ -12690,7 +12693,7 @@ describe("assembled assistant text fallback", () => {
   ] as const)(
     "closes an active compaction before the SDK iterator %s",
     async (_description, shouldThrow) => {
-      const { agent, updates } = compactionCapableAgent();
+      const { agent, updates } = await compactionCapableAgent();
       injectGeneratorSession(agent, (input) => {
         async function* generator() {
           const iter = input[Symbol.asyncIterator]();
@@ -12733,7 +12736,7 @@ describe("assembled assistant text fallback", () => {
   );
 
   it("resets an active compaction before starting a fresh compaction lifecycle", async () => {
-    const { agent, updates } = compactionCapableAgent();
+    const { agent, updates } = await compactionCapableAgent();
     injectGeneratorSession(agent, (input) => {
       async function* generator() {
         const iter = input[Symbol.asyncIterator]();
@@ -12814,7 +12817,7 @@ describe("assembled assistant text fallback", () => {
     // The API block carries no terminal signal; without the CLI's compacting
     // status there is nothing to close an entity but the turn boundary, which
     // would misreport a successful compaction as cancelled.
-    const { agent, updates } = compactionCapableAgent();
+    const { agent, updates } = await compactionCapableAgent();
     const compactionDelta = (uuid: string, content: string, parentToolUseId: string | null) => ({
       type: "stream_event" as const,
       parent_tool_use_id: parentToolUseId,
@@ -12885,7 +12888,9 @@ describe("assembled assistant text fallback", () => {
       message: { role: "user", content: framedSummary },
     });
     const replay = async (capable: boolean, messages: unknown[]) => {
-      const { agent, updates } = capable ? compactionCapableAgent() : createMockAgentWithCapture();
+      const { agent, updates } = capable
+        ? await compactionCapableAgent()
+        : createMockAgentWithCapture();
       agent.sessions["test-session"] = mockSessionState();
       vi.mocked(getSessionMessages).mockResolvedValueOnce(messages as any);
       await (agent as any).replaySessionHistory("test-session");
@@ -12983,7 +12988,7 @@ describe("assembled assistant text fallback", () => {
 
   it("emits a completed compaction tool call for a terminal-only result", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectSession(agent, [
       {
         type: "system",
@@ -13187,7 +13192,7 @@ describe("assembled assistant text fallback", () => {
 
   it("delivers an informational frame as a notice and still owns the result text", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { session: { notices: {} } };
+    await initializeClient(agent, { session: { notices: {} } });
     injectSession(agent, [
       {
         type: "system",
@@ -13212,7 +13217,7 @@ describe("assembled assistant text fallback", () => {
 
   it("records the notice against the queued turn when the hook blocks before any echo", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { session: { notices: {} } };
+    await initializeClient(agent, { session: { notices: {} } });
     // Live frame order for a UserPromptSubmit block (CLI 2.1.x): no user echo
     // at all — the informational frame, then the 0-token result repeating it,
     // then idle. The turn is only promoted when the result lands.
@@ -13247,7 +13252,7 @@ describe("assembled assistant text fallback", () => {
 
   it("collapses repeated tool-use progress into one notice and drops transcript-only info", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { session: { notices: {} } };
+    await initializeClient(agent, { session: { notices: {} } });
     const progress = (content: string) => ({
       type: "system",
       subtype: "informational",
@@ -13281,7 +13286,7 @@ describe("assembled assistant text fallback", () => {
 
   it("still forwards a replayed answer that an info notice merely preceded", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { session: { notices: {} } };
+    await initializeClient(agent, { session: { notices: {} } });
     injectSession(agent, [
       {
         type: "system",
@@ -13302,7 +13307,7 @@ describe("assembled assistant text fallback", () => {
 
   it("maps the SDK's gray informational levels to info notices", async () => {
     const { agent, updates } = createMockAgentWithCapture();
-    (agent as any).clientCapabilities = { session: { notices: {} } };
+    await initializeClient(agent, { session: { notices: {} } });
     injectSession(agent, [
       {
         type: "system",
@@ -16472,9 +16477,9 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = {
+    await initializeClient(agent, {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    };
+    });
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -16526,9 +16531,9 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = {
+    await initializeClient(agent, {
       _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionFailure"] } } },
-    };
+    });
 
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
@@ -17237,7 +17242,7 @@ describe("turn steering (_session/steering)", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
@@ -17301,7 +17306,7 @@ describe("turn steering (_session/steering)", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
@@ -17362,7 +17367,7 @@ describe("turn steering (_session/steering)", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     injectGeneratorSession(agent, (input) => {
       async function* messageGenerator() {
         const iter = input[Symbol.asyncIterator]();
@@ -17678,8 +17683,8 @@ describe("turn steering (_session/steering)", () => {
     },
     {
       name: "an AskUserQuestion elicitation",
-      start: (agent: ClaudeAcpAgent, signal: AbortSignal) => {
-        (agent as any).clientCapabilities = { elicitation: { form: true, url: true } };
+      start: async (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        await initializeClient(agent, { elicitation: { form: {}, url: {} } });
         return agent.canUseTool("test-session")(
           "AskUserQuestion",
           {
@@ -17778,7 +17783,7 @@ describe("turn steering (_session/steering)", () => {
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
-    (agent as any).clientCapabilities = AIR_CLIENT_CAPABILITIES;
+    await initializeClient(agent, AIR_CLIENT_CAPABILITIES);
     const input = new Pushable<any>();
     agent.sessions["test-session"] = mockSessionState({
       input,
@@ -20807,7 +20812,7 @@ describe("tool_progress heartbeats", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    agent.clientCapabilities = options.clientCapabilities;
+    if (options.clientCapabilities) await initializeClient(agent, options.clientCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const { value, done } = await input[Symbol.asyncIterator]().next();
@@ -21021,7 +21026,7 @@ describe("permission_denied", () => {
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-    agent.clientCapabilities = clientCapabilities;
+    if (clientCapabilities) await initializeClient(agent, clientCapabilities);
     const input = new Pushable<any>();
     async function* messageGenerator() {
       const { value, done } = await input[Symbol.asyncIterator]().next();
