@@ -489,10 +489,13 @@ function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
 
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
- *  contract. `now` pre-empts the current generation, while `later` waits for a
- *  pending permission/elicitation callback to settle instead of cancelling its
- *  ACP request and hiding the client's user-input card (IJAI-1191). */
+ *  contract. `now` pre-empts the current generation, while `next` waits for the
+ *  current tool to finish and enters at the next model boundary. `later` waits
+ *  for a pending permission/elicitation callback to settle instead of
+ *  cancelling its ACP request and hiding the client's user-input card
+ *  (IJAI-1191). */
 const STEER_PRIORITY_NOW = "now" as const;
+const STEER_PRIORITY_NEXT = "next" as const;
 const STEER_PRIORITY_LATER = "later" as const;
 
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
@@ -501,6 +504,9 @@ type SteerMeta = {
   [key: string]: unknown;
   steering?: {
     idleBehavior?: "promptRequired";
+    /** Opt-in `next` delivers at the next tool boundary instead of pre-empting
+     *  the current generation. Absent keeps the agent-chosen priority. */
+    delivery?: "next";
   };
 };
 
@@ -544,6 +550,13 @@ function parseSteerRequest(params: unknown): SteerRequest {
       : undefined;
   if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
     throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  }
+  const delivery =
+    steering && typeof steering === "object"
+      ? (steering as Record<string, unknown>).delivery
+      : undefined;
+  if (delivery !== undefined && delivery !== "next") {
+    throw RequestError.invalidParams(undefined, "unsupported steering delivery");
   }
   return {
     sessionId,
@@ -3278,7 +3291,11 @@ export class ClaudeAcpAgent {
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
     userMessage.priority =
-      (session.pendingUserInputCount ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+      params._meta?.steering?.delivery === "next"
+        ? STEER_PRIORITY_NEXT
+        : (session.pendingUserInputCount ?? 0) > 0
+          ? STEER_PRIORITY_LATER
+          : STEER_PRIORITY_NOW;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
