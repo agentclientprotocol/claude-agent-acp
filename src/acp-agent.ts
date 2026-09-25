@@ -5087,8 +5087,18 @@ export class ClaudeAcpAgent {
             // the user's prompt's. Autonomous results must never touch the
             // user-turn lifecycle (stop reason, settles, failActive,
             // slash-command output forwarding), though their cost is real.
+            // Except when the cycle answered a prompt: one sent while a
+            // task-notification is being handled is folded into that cycle,
+            // whose single result keeps the notification's origin but names
+            // the prompt in user_message_uuid(s). Skipping it would leave the
+            // prompt unsettled forever.
+            const answeredUuids =
+              message.user_message_uuids ??
+              (message.user_message_uuid !== undefined ? [message.user_message_uuid] : []);
             const isAutonomousResult =
-              message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+              message.origin != null &&
+              AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind) &&
+              !answeredUuids.some((uuid) => findUnsettledTurn(uuid) !== undefined);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {

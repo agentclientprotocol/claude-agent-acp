@@ -13304,6 +13304,48 @@ describe("result origin handling", () => {
     expect(response.stopReason).toBe("end_turn");
   });
 
+  it("settles a prompt folded into a task-notification cycle at that cycle's result", async () => {
+    // A prompt sent while a background task's notification is being handled
+    // is folded into that cycle: the CLI echoes it (human origin) and the
+    // cycle's one result carries the notification's origin but names the
+    // prompt in user_message_uuid. That result is the prompt's answer.
+    const { agent } = createMockAgentWithCapture();
+    const input = new Pushable<any>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield createAssistantMessage();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        origin: { kind: "human" },
+        isReplay: true,
+      };
+      yield createAssistantMessage();
+      yield createResult({
+        origin: { kind: "task-notification" },
+        user_message_uuid: userMessage.uuid,
+        num_turns: 2,
+      });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      await new Promise(() => {});
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+
+    const response = await Promise.race([
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] }),
+      new Promise((resolve) => setTimeout(() => resolve("hung"), 2000)),
+    ]);
+
+    expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+  });
+
   it("user-prompted result with max_tokens still sets stopReason", async () => {
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [
