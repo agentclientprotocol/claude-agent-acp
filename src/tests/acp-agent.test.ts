@@ -574,7 +574,11 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
   }, 30000);
 
   it("/compact works", async () => {
-    const { client, connection, newSessionResponse } = await setupTestSession(__dirname);
+    // The contextCompaction key is an AIR key, so the client declares AIR.
+    const { client, connection, newSessionResponse } = await setupTestSession(
+      __dirname,
+      AIR_CLIENT_CAPABILITIES,
+    );
 
     const commands = await client.availableCommandsPromise;
 
@@ -607,13 +611,20 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     });
 
     expect(client.takeReceivedText()).toBe("");
-    const compactionUpdates = client.updates
+    const toolCallUpdates = client.updates
       .map((notification) => notification.update)
       .filter(
         (update) =>
-          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-          (update._meta as any)?.jetbrains?.air?.contextCompaction,
+          update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
       );
+    const start = toolCallUpdates.find(
+      (update) => (update._meta as any)?.jetbrains?.air?.contextCompaction,
+    );
+    // An AIR update carries only the _meta keys that changed, so the updates
+    // are found by the tool call id.
+    const compactionUpdates = toolCallUpdates.filter(
+      (update) => update.toolCallId === start?.toolCallId,
+    );
     expect(compactionUpdates[0]).toMatchObject({
       sessionUpdate: "tool_call",
       title: "Compact conversation",
@@ -627,18 +638,17 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     expect(terminal.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
       status: "completed",
-      _meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } },
     });
+    // The update leaves out the unchanged jetbrains.air.version. AIR reads it only in initialize.
     expect(compactionUpdates.at(-1)).toMatchObject({
       sessionUpdate: "tool_call_update",
-      _meta: {
-        jetbrains: { air: { version: 1, contextCompaction: { version: 1, trigger: "manual" } } },
-      },
+      _meta: { jetbrains: { air: { contextCompaction: { version: 1, trigger: "manual" } } } },
     });
   }, 90000);
 
   it("/compact reports the ACP compaction lifecycle to a capable client", async () => {
     const { client, connection, newSessionResponse } = await setupTestSession(__dirname, {
+      ...AIR_CLIENT_CAPABILITIES,
       session: { compaction: {} },
     });
 
