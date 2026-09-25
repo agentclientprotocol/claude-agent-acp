@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
 import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
-import { initializeClient } from "./helpers.js";
 import {
   buildConfigOptions,
   clientSupportsBooleanConfigOptions,
@@ -187,7 +186,7 @@ describe("buildConfigOptions Fast mode", () => {
 describe("setSessionConfigOption Fast mode toggle", () => {
   const SESSION_ID = "fast-session";
 
-  async function setup(opts: { useBooleanOption: boolean }) {
+  function setup(opts: { useBooleanOption: boolean }) {
     const sessionUpdates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -202,7 +201,8 @@ describe("setSessionConfigOption Fast mode toggle", () => {
     const clientCapabilities: ClientCapabilities = opts.useBooleanOption
       ? { session: { configOptions: { boolean: {} } } }
       : {};
-    await initializeClient(agent, clientCapabilities);
+    (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities =
+      clientCapabilities;
 
     const applyFlagSettings = vi.fn();
     (agent as unknown as { sessions: Record<string, unknown> }).sessions[SESSION_ID] = {
@@ -215,7 +215,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
   }
 
   it("toggles Fast mode on/off through a boolean value", async () => {
-    const { agent, applyFlagSettings } = await setup({ useBooleanOption: true });
+    const { agent, applyFlagSettings } = setup({ useBooleanOption: true });
 
     const onResponse = await agent.setSessionConfigOption({
       sessionId: SESSION_ID,
@@ -242,7 +242,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
   });
 
   it("toggles Fast mode through the on/off select fallback", async () => {
-    const { agent, applyFlagSettings } = await setup({ useBooleanOption: false });
+    const { agent, applyFlagSettings } = setup({ useBooleanOption: false });
 
     const response = await agent.setSessionConfigOption({
       sessionId: SESSION_ID,
@@ -254,7 +254,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
   });
 
   it("does not change session state when the SDK rejects the flag", async () => {
-    const { agent, applyFlagSettings } = await setup({ useBooleanOption: true });
+    const { agent, applyFlagSettings } = setup({ useBooleanOption: true });
     applyFlagSettings.mockRejectedValueOnce(new Error("nope"));
 
     await expect(
@@ -275,7 +275,7 @@ describe("setSessionConfigOption Fast mode toggle", () => {
 describe("syncFastModeState (SDK-driven state changes)", () => {
   const SESSION_ID = "fast-session";
 
-  async function setup(opts: { fastModeEnabled: boolean; withOption: boolean; notices?: boolean }) {
+  function setup(opts: { fastModeEnabled: boolean; withOption: boolean; notices?: boolean }) {
     const sessionUpdates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (n: SessionNotification) => {
@@ -287,9 +287,9 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     } as unknown as AcpClient;
 
     const agent = new ClaudeAcpAgent(client);
-    await initializeClient(agent, {
+    (agent as unknown as { clientCapabilities: ClientCapabilities }).clientCapabilities = {
       session: { configOptions: { boolean: {} }, ...(opts.notices ? { notices: {} } : {}) },
-    });
+    };
 
     const session = {
       query: {},
@@ -316,10 +316,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   }
 
   it("emits a config_option_update when the SDK reports a new state", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: false,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, "on");
 
@@ -336,10 +333,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("leaves the toggle on and quiet during a rate-limit cooldown", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: true,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
 
     // cooldown is a transient suspension of an already-enabled fast mode.
     await sync(SESSION_ID, session, "cooldown");
@@ -349,10 +343,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("never lets a stray cooldown spuriously enable a toggle the user has off", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: false,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, "cooldown");
 
@@ -361,10 +352,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("clears the toggle when the SDK reports off", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: true,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
 
     await sync(SESSION_ID, session, "off");
 
@@ -374,10 +362,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("is a no-op when the reported state is undefined or unchanged", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: false,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, undefined);
     await sync(SESSION_ID, session, "off");
@@ -389,10 +374,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("explains a blocking reason once when the SDK refuses a toggle the user turned on", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: true,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: true, withOption: true });
 
     await sync(SESSION_ID, session, "off", "extra_usage_disabled");
 
@@ -417,7 +399,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("explains the flip as a live notice to a client on the notice contract", async () => {
-    const { sync, session, sessionUpdates } = await setup({
+    const { sync, session, sessionUpdates } = setup({
       fastModeEnabled: true,
       withOption: true,
       notices: true,
@@ -439,10 +421,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("updates the description when only the reason changes", async () => {
-    const { sync, session, sessionUpdates } = await setup({
-      fastModeEnabled: false,
-      withOption: true,
-    });
+    const { sync, session, sessionUpdates } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, "off", "not_first_party");
 
@@ -457,7 +436,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
   });
 
   it("drops a retained reason once fast mode comes back on", async () => {
-    const { sync, session } = await setup({ fastModeEnabled: false, withOption: true });
+    const { sync, session } = setup({ fastModeEnabled: false, withOption: true });
 
     await sync(SESSION_ID, session, "off", "network_error");
     expect(session.fastModeDisabledReason).toBe("network_error");
@@ -473,12 +452,12 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
     // the user's intent. We must leave session.fastModeEnabled untouched so it's
     // correct when a supporting model is reselected — reconciling here was the
     // original intent-clobber bug.
-    const enabledCase = await setup({ fastModeEnabled: true, withOption: false });
+    const enabledCase = setup({ fastModeEnabled: true, withOption: false });
     await enabledCase.sync(SESSION_ID, enabledCase.session, "off");
     expect(enabledCase.session.fastModeEnabled).toBe(true);
     expect(enabledCase.sessionUpdates).toHaveLength(0);
 
-    const disabledCase = await setup({ fastModeEnabled: false, withOption: false });
+    const disabledCase = setup({ fastModeEnabled: false, withOption: false });
     await disabledCase.sync(SESSION_ID, disabledCase.session, "on");
     expect(disabledCase.session.fastModeEnabled).toBe(false);
     expect(disabledCase.sessionUpdates).toHaveLength(0);
