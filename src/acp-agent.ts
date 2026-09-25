@@ -7414,9 +7414,9 @@ export class ClaudeAcpAgent {
     params: RequestPermissionRequest,
     toolName: string,
     signal: AbortSignal,
-    parentToolUseId?: string,
-    ownerSessionId: string = params.sessionId,
-    toolInput: unknown = params.toolCall.rawInput,
+    parentToolUseId: string | undefined,
+    ownerSessionId: string,
+    toolInput: unknown,
     previewContent?: ToolCallContent[],
   ): Promise<RequestPermissionResponse> {
     if (signal.aborted) throw new Error("Tool use aborted");
@@ -7435,7 +7435,6 @@ export class ClaudeAcpAgent {
       signal,
       params.sessionId,
       previewContent,
-      previewContent !== undefined,
     );
     if (signal.aborted) throw new Error("Tool use aborted");
 
@@ -7475,7 +7474,6 @@ export class ClaudeAcpAgent {
     signal?: AbortSignal,
     notificationSessionId: string = sessionId,
     previewContent?: ToolCallContent[],
-    pinPreviewContent = false,
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
@@ -7484,7 +7482,7 @@ export class ClaudeAcpAgent {
     // The permission request shows an exact approval patch. The streamed
     // tool input must not replace it with the standard diff of the snippet.
     const pinPreview = () => {
-      if (pinPreviewContent && previewContent) {
+      if (previewContent) {
         toolCallFieldsOf(session).pinContent(toolCallId, previewContent);
       }
     };
