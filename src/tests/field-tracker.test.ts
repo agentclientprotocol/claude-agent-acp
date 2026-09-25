@@ -43,6 +43,14 @@ async function firePostToolUse(toolUseId: string, toolName: string, toolResponse
   );
 }
 
+/** Whether the tracker holds an entry: only then does it drop a repeated title. */
+function tracks(tracker: ToolCallFieldTracker, toolCallId: string): boolean {
+  const probe = () =>
+    tracker.apply({ sessionUpdate: "tool_call_update", toolCallId, title: "probe" });
+  probe();
+  return !probe();
+}
+
 const tempDirectories: string[] = [];
 
 afterEach(async () => {
@@ -152,11 +160,11 @@ describe("ToolCallFieldTracker", () => {
     tracker.finishResult("a", false);
     tracker.finishResult("b", true);
     tracker.finishHook("c");
-    expect(tracker.size).toBe(2);
+    expect(["a", "b", "c"].map((id) => tracks(tracker, id))).toEqual([false, true, true]);
 
     tracker.finishHook("b");
     tracker.finishResult("c", false);
-    expect(tracker.size).toBe(0);
+    expect(["b", "c"].map((id) => tracks(tracker, id))).toEqual([false, false]);
   });
 });
 
@@ -275,7 +283,7 @@ describe("tool call refinements", () => {
     expect(result[0].update).not.toHaveProperty("content");
     expect(JSON.stringify(updates).split("export const big").length - 1).toBe(100);
     expect(JSON.stringify(updates)).toContain("new file mode 100644");
-    expect(tracker.size).toBe(0);
+    expect(tracks(tracker, "toolu_write")).toBe(false);
   });
 
   it("lets the error of a rejected Edit replace a pinned approval patch", () => {

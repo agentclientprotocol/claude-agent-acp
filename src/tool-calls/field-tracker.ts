@@ -147,11 +147,6 @@ export class ToolCallFieldTracker {
   clear(): void {
     this.calls.clear();
   }
-
-  /** The number of open tool calls. */
-  get size(): number {
-    return this.calls.size;
-  }
 }
 
 /** The `_meta` namespaces that a client merges by key. */

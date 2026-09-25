@@ -337,11 +337,11 @@ const publishedTaskPlans = new WeakMap<TaskState, string>();
  * change has nothing new.
  *
  * Only an AIR client skips the repeated plan. Every other client gets every
- * plan, like upstream: pass `airClient` false.
+ * plan, like upstream.
  */
 export function changedTaskPlanEntries(
   state: TaskState,
-  airClient = true,
+  airClient: boolean,
 ): PlanEntry[] | undefined {
   const entries = taskStateToPlanEntries(state);
   if (!airClient) return entries;
