@@ -5,8 +5,6 @@ export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
 export const AIR_DIFF_PATCH_CAPABILITY = "diffPatch";
 /** AIR renders `rawInput` itself and needs no display copy of the input. */
 export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
-/** AIR appends the streamed text of a plan. */
-export const AIR_PLAN_CONTENT_DELTA_CAPABILITY = "planContentDelta";
 /**
  * The plan of an ExitPlanMode is a file. `rawInput.planFilePath` names the
  * file, and AIR reads the plan from it.

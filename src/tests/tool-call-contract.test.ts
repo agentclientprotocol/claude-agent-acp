@@ -30,7 +30,7 @@ const air: ClientCapabilities = {
     jetbrains: {
       air: {
         version: 1,
-        capabilities: ["diffPatch", "rawInputRendering", "planContentDelta", "planFile"],
+        capabilities: ["diffPatch", "rawInputRendering", "planFile"],
       },
     },
   },
@@ -77,14 +77,13 @@ describe("ClientCapabilities", () => {
       terminalOutput: true,
       terminalOutputDelta: true,
       diffPatch: true,
-      air: { client: true, rawInputRendering: true, planContentDelta: true, planFile: true },
+      air: { client: true, rawInputRendering: true, planFile: true },
     });
     expect(
       ToolCallCapabilities.from({ _meta: { rawInputRendering: true } } as ClientCapabilities).air,
     ).toEqual({
       client: false,
       rawInputRendering: false,
-      planContentDelta: false,
       planFile: false,
     });
   });

@@ -1,7 +1,6 @@
 import type { ClientCapabilities as AcpClientCapabilities } from "@agentclientprotocol/sdk";
 import {
   AIR_DIFF_PATCH_CAPABILITY,
-  AIR_PLAN_CONTENT_DELTA_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_RAW_INPUT_RENDERING_CAPABILITY,
   clientSupportsAirCapability,
@@ -41,10 +40,6 @@ export class ClientCapabilities {
           capabilities,
           AIR_RAW_INPUT_RENDERING_CAPABILITY,
         ),
-        planContentDelta: clientSupportsAirCapability(
-          capabilities,
-          AIR_PLAN_CONTENT_DELTA_CAPABILITY,
-        ),
         planFile: clientSupportsAirCapability(capabilities, AIR_PLAN_FILE_CAPABILITY),
       },
     );
@@ -66,11 +61,6 @@ export interface AirCapabilities {
    */
   readonly rawInputRendering: boolean;
   /**
-   * AIR appends `_meta.jetbrains.air.contentDelta` of a streamed plan. Claude
-   * does not stream a plan, so the adapter does not use it.
-   */
-  readonly planContentDelta: boolean;
-  /**
    * AIR reads the plan of an ExitPlanMode from the file that
    * `rawInput.planFilePath` names. A report then carries the path and not the
    * plan text, when the plan file exists.
@@ -81,6 +71,5 @@ export interface AirCapabilities {
 const NO_AIR: AirCapabilities = {
   client: false,
   rawInputRendering: false,
-  planContentDelta: false,
   planFile: false,
 };

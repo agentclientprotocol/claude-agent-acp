@@ -16,7 +16,7 @@ import { ClientCapabilities } from "./tool-calls/client-capabilities.js";
 import type { ToolResultBlock } from "./tool-calls/content.js";
 import { AcpToolCallRenderer, type RenderedResult } from "./tool-calls/renderer.js";
 
-export { markdownEscape, toDisplayPath, toolResponseMarkers } from "./tool-calls/content.js";
+export { markdownEscape, toDisplayPath } from "./tool-calls/content.js";
 
 /**
  * The title, kind, content, and locations of a tool use, for a client with the

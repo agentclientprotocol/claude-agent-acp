@@ -11,7 +11,6 @@ function airCapabilities(terminalOutput = false, terminalOutputDelta = false, di
   return new ClientCapabilities(terminalOutput, terminalOutputDelta, diffPatch, {
     client: true,
     rawInputRendering: false,
-    planContentDelta: false,
     planFile: false,
   });
 }
