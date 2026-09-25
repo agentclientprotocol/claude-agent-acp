@@ -351,6 +351,17 @@ export class AcpToolCallRenderer {
     options: { structured?: unknown; nonExecution?: Record<string, unknown> } = {},
   ): ToolCallUpdate[] {
     const { _meta: resultMeta, ...fields } = this.resultFields(toolUse, result, options.structured);
+    // AIR shows a read or a search that names a path as the list of viewed
+    // files. That view does not show the text of the result, so it stays out.
+    const viewedFiles =
+      this.capabilities.air.client && result.is_error !== true && this.namesViewedFile(toolUse);
+    if (viewedFiles) {
+      const content = fields.content?.filter(
+        (item) => !(item.type === "content" && item.content.type === "text"),
+      );
+      if (content?.length) fields.content = content;
+      else delete fields.content;
+    }
     const updates: ToolCallUpdate[] = [];
     const terminalOutput = resultMeta?.terminal_output_delta ?? resultMeta?.terminal_output;
     if (terminalOutput) {
@@ -370,7 +381,7 @@ export class AcpToolCallRenderer {
         : exitPlanModeRawOutput(toolUse.name, result.content)
       : "rawOutput" in fields
         ? fields.rawOutput
-        : terminalOutput || fields.content !== undefined
+        : viewedFiles || terminalOutput || fields.content !== undefined
           ? undefined
           : result.content;
     delete fields.rawOutput;
@@ -391,6 +402,18 @@ export class AcpToolCallRenderer {
       ...fields,
     });
     return updates;
+  }
+
+  /**
+   * Whether AIR shows [toolUse] as the list of viewed files: a read or a
+   * search with a path in its locations or in the `path` of its input.
+   */
+  private namesViewedFile(toolUse: ToolUse): boolean {
+    const facts = this.facts(toolUse);
+    if (facts.kind !== "read" && facts.kind !== "search") return false;
+    if (facts.locations?.some((location) => location.path)) return true;
+    const path = (toolUse.input as { path?: unknown } | undefined)?.path;
+    return typeof path === "string" && path.length > 0;
   }
 
   /**

@@ -5,7 +5,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"tool_call_update","title":"grep \"value\" src","toolCallId":"toolu_grep"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"rawInput":{"-n":true,"output_mode":"content","path":"src","pattern":"value"},"sessionUpdate":"tool_call_update","title":"grep -n \"value\" src","toolCallId":"toolu_grep"}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"content":[{"content":{"text":"src/app.ts:2:const value = 1;","type":"text"},"type":"content"}],"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"toolu_grep"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"tool_call_update","status":"completed","toolCallId":"toolu_grep"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Glob"}},"content":[],"kind":"search","locations":[],"name":"Glob","sessionUpdate":"tool_call","status":"pending","title":"Find","toolCallId":"toolu_glob"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"rawInput":{"pattern":"**/*.ts"},"sessionUpdate":"tool_call_update","title":"Find `**/*.ts`","toolCallId":"toolu_glob"}}}

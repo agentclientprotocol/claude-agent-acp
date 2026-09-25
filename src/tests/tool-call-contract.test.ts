@@ -142,7 +142,7 @@ describe("the ACP tool call contract", () => {
     });
   });
 
-  it("sends the Read text once, in content", () => {
+  it("leaves the Read text out for AIR, which shows the viewed file", () => {
     const { call, updates } = report(
       terminalAir,
       "Read",
@@ -150,10 +150,30 @@ describe("the ACP tool call contract", () => {
       { content: "x" },
     );
     expect(call).toMatchObject({ title: "Read a.ts", kind: "read", content: [] });
-    expect(updates[0].content).toEqual([
-      { type: "content", content: { type: "text", text: "```\nx\n```" } },
-    ]);
+    expect(updates[0]).not.toHaveProperty("content");
     expect(updates[0]).not.toHaveProperty("rawOutput");
+  });
+
+  it("leaves the Grep text out for AIR only when the input names a path", () => {
+    const withPath = report(air, "Grep", { pattern: "a", path: "/work/src" }, { content: "a.ts" });
+    expect(withPath.updates[0]).not.toHaveProperty("content");
+    expect(withPath.updates[0]).not.toHaveProperty("rawOutput");
+
+    const withoutPath = report(air, "Grep", { pattern: "a" }, { content: "a.ts" });
+    expect(withoutPath.updates[0].content).toEqual([
+      { type: "content", content: { type: "text", text: "a.ts" } },
+    ]);
+  });
+
+  it("keeps the Read error text for AIR", () => {
+    const { updates } = report(
+      terminalAir,
+      "Read",
+      { file_path: "/work/a.ts" },
+      { content: "File does not exist.", is_error: true },
+    );
+    expect(updates[0].status).toBe("failed");
+    expect(updates[0].content).toBeDefined();
   });
 
   it("keeps the Write file text only in the diff", () => {
@@ -212,19 +232,17 @@ describe("the ACP tool call contract", () => {
     expect(airReport.call.rawInput).toEqual(input);
   });
 
-  it("reports Grep and Glob hits as content", () => {
-    const grep = report(
-      terminalAir,
-      "Grep",
-      { pattern: "todo", path: "src" },
-      { content: "a.ts:1" },
-    );
-    expect(grep.call.title).toBe('grep "todo" src');
+  it("reports Grep and Glob hits without a path as content", () => {
+    const grep = report(terminalAir, "Grep", { pattern: "todo" }, { content: "a.ts:1" });
+    expect(grep.call.title).toBe('grep "todo"');
     expect(grep.updates[0].content).toEqual([
       { type: "content", content: { type: "text", text: "a.ts:1" } },
     ]);
     const glob = report(terminalAir, "Glob", { pattern: "*.ts" }, { content: "a.ts" });
     expect(glob.call.title).toBe("Find `*.ts`");
+    expect(glob.updates[0].content).toEqual([
+      { type: "content", content: { type: "text", text: "a.ts" } },
+    ]);
     expect(glob.updates[0]).not.toHaveProperty("rawOutput");
   });
 
