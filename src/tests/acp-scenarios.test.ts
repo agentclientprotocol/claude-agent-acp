@@ -11,7 +11,8 @@
  * - Plain and Zed: the same information as origin/main
  *   (`acp-scenarios/origin-main/<profile>/<scenario>.jsonl`). `compare.ts`
  *   allows only the documented differences. These profiles have no golden
- *   files of their own.
+ *   files of their own. `origin-main/zed/` holds a scenario only when its
+ *   recording differs from the plain client.
  * - Zed: the Zed conventions and the upstream `_meta` keys.
  * - AIR: the AIR extensions of `docs/air-extensions.md`, each fact once.
  *
@@ -184,15 +185,26 @@ function metaObjects(value: unknown, at = "$"): { at: string; meta: Record<strin
   ]);
 }
 
+/** The origin/main recording of a scenario. Zed has a file only where it differs from the plain client. */
+function readBaseline(profile: "plain" | "zed", scenario: string): string {
+  const file = (name: string) =>
+    path.join(here, "acp-scenarios", "origin-main", name, `${scenario}.jsonl`);
+  return fs.readFileSync(
+    profile === "zed" && !fs.existsSync(file("zed")) ? file("plain") : file(profile),
+    "utf8",
+  );
+}
+
 describe.runIf(baselineDir)("the origin/main baseline", () => {
   it("writes the recordings of the plain and Zed profiles", () => {
     for (const profile of ["plain", "zed"] as const) {
       fs.mkdirSync(path.join(baselineDir!, profile), { recursive: true });
       for (const scenario of SCENARIOS) {
-        fs.writeFileSync(
-          path.join(baselineDir!, profile, `${scenario.name}.jsonl`),
-          toJsonLines(run(profile, scenario.name).normalized),
-        );
+        const text = toJsonLines(run(profile, scenario.name).normalized);
+        if (profile === "zed" && text === toJsonLines(run("plain", scenario.name).normalized)) {
+          continue;
+        }
+        fs.writeFileSync(path.join(baselineDir!, profile, `${scenario.name}.jsonl`), text);
       }
     }
   });
@@ -357,12 +369,7 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     it.each(SCENARIOS.map((scenario) => scenario.name))(
       "%s carries the same information as origin/main",
       (scenario) => {
-        const baseline = fromJsonLines(
-          fs.readFileSync(
-            path.join(here, "acp-scenarios", "origin-main", profile, `${scenario}.jsonl`),
-            "utf8",
-          ),
-        );
+        const baseline = fromJsonLines(readBaseline(profile, scenario));
         expect(compareWithBaseline(baseline, run(profile, scenario).normalized)).toEqual([]);
       },
     );
