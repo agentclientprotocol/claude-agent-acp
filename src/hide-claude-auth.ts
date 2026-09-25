@@ -33,7 +33,6 @@
 
 import { RequestError } from "@agentclientprotocol/sdk";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
-import type { SessionFailureController } from "./session-failure-extension.js";
 
 export function shouldHideClaudeAuth(): boolean {
   return process.argv.includes("--hide-claude-auth");
@@ -144,7 +143,7 @@ export function claudeLoginRequiredError(): RequestError {
 
 /**
  * The state the guard keeps for one session. It lives on the session so that a
- * concurrent pair of turns shares one account read and one failure row, and so
+ * concurrent pair of turns shares one account read, and so
  * that each degraded-guard warning is logged once.
  */
 export type ClaudeSubscriptionGuardState = {
@@ -190,8 +189,6 @@ type GuardOptions = {
   sessionId: string;
   query: Pick<Query, "accountInfo">;
   guardState: ClaudeSubscriptionGuardState;
-  /** Built lazily: most turns pass and never need a controller. */
-  sessionFailures: () => SessionFailureController;
   logger: GuardLogger;
   /** Display hook: called with the account the guard just read, before the
    *  guard decides on it. It exists so a refused turn still reports which
@@ -219,8 +216,7 @@ type GuardOptions = {
  * mid-session. The refusal mirrors the signed-out path exactly (see
  * `failActiveWithSessionFailure` for `auth_required` in `acp-agent.ts`): every
  * client gets the `authRequired` JSON-RPC rejection that starts its own auth
- * flow, and a capable client additionally gets one session-scoped access
- * failure whose `login` action stays the way back in.
+ * flow. The guard sends no separate access message.
  *
  * Fails open when no account can be read at all: session creation already
  * refused every account without a usable credential, and an unavailable probe
@@ -241,8 +237,8 @@ export async function refuseClaudeSubscriptionTurn(options: GuardOptions): Promi
   }
 }
 
-/** Read the account, publish at most one failure row, and return the error the
- *  turn must be rejected with. Never throws: an unreadable account fails open. */
+/** Read the account and return the error for the refused turn.
+ *  Never throws: an unreadable account fails open. */
 async function evaluateGuard(options: GuardOptions): Promise<RequestError | undefined> {
   const account = await readGuardAccount(options);
   if (!account) {
@@ -259,14 +255,9 @@ async function evaluateGuard(options: GuardOptions): Promise<RequestError | unde
     );
   }
   if (billsClaudeSubscription(account)) {
-    await publishRefusal(options.sessionFailures(), {
-      details: CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_MESSAGE,
-      reason: CLAUDE_SUBSCRIPTION_NOT_SUPPORTED_REASON,
-    });
     return claudeSubscriptionNotSupportedError();
   }
   if (!holdsNonSubscriptionCredential(account)) {
-    await publishRefusal(options.sessionFailures(), { details: CLAUDE_LOGIN_REQUIRED_MESSAGE });
     return claudeLoginRequiredError();
   }
   return undefined;
@@ -292,20 +283,4 @@ async function readGuardAccount(options: GuardOptions): Promise<AccountInfo | un
     );
     return undefined;
   }
-}
-
-/** The refusal state does not change between turns: publish once, and skip a
- *  republish while the previous failure with this reason is still active. */
-async function publishRefusal(
-  sessionFailures: SessionFailureController,
-  failure: { details: string; reason?: string },
-): Promise<void> {
-  if (sessionFailures.hasActiveSessionError("auth_required", failure.reason)) {
-    return;
-  }
-  await sessionFailures.publish("auth_required", {
-    sessionScoped: true,
-    details: failure.details,
-    ...(failure.reason ? { reason: failure.reason } : {}),
-  });
 }

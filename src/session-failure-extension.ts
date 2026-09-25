@@ -99,7 +99,7 @@ const AIR_FAILURE_POLICY: Record<
   // credentials must be refreshed outside Claude. No `login` action, and not
   // sticky like `auth_required` (nothing clears at `auth_status`).
   access_denied: {
-    category: "access",
+    category: "service",
     actions: ["retry"],
     fallbackTitle: "Claude could not access the account or provider credentials.",
   },
