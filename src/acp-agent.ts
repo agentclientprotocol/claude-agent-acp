@@ -260,7 +260,8 @@ import {
   EFFORT_CONFIG_ID,
   mergeEffortSettings,
   settingsEffortForModel,
-  toSdkEffortLevel,
+  effortFlagSettings,
+  modelSupportsEffort,
 } from "./session-effort.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
@@ -7831,9 +7832,7 @@ export class ClaudeAcpAgent {
           ? currentEffort
           : pinnedEffort);
       const effortPinnedForNewModel =
-        effortWasPinned &&
-        newModelInfo?.supportsEffort === true &&
-        newModelInfo.supportedEffortLevels?.some((level) => level === pinnedEffort) === true;
+        effortWasPinned && modelSupportsEffort(newModelInfo, pinnedEffort);
       const seedEffort = effortPinnedForNewModel
         ? pinnedEffort
         : settingsEffortForModel(
@@ -7879,14 +7878,14 @@ export class ClaudeAcpAgent {
         const newEffort =
           typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
         try {
-          await session.query.applyFlagSettings({
-            // A legacy client's unpinned effort is display-only: the CLI
-            // resolves the persisted value for the new model. When an old
-            // user pin is no longer supported, clear the flag layer instead
-            // of replacing it with that displayed value. Opted-in clients
-            // deliberately apply their concrete displayed effort.
-            effortLevel: useRecommendedValue ? toSdkEffortLevel(newEffort) : null,
-          });
+          // A legacy client's unpinned effort is display-only: the CLI
+          // resolves the persisted value for the new model. When an old
+          // user pin is no longer supported, clear the flag layer instead
+          // of replacing it with that displayed value (UltraCode included).
+          // Opted-in clients deliberately apply their concrete displayed effort.
+          await session.query.applyFlagSettings(
+            effortFlagSettings(useRecommendedValue ? newEffort : undefined, currentEffort),
+          );
           session.effortPinnedLevel = effortPinnedForNewModel ? pinnedEffort : undefined;
           session.appliedEffortLevel =
             useRecommendedValue && newEffort !== "default" ? newEffort : undefined;
@@ -7938,9 +7937,12 @@ export class ClaudeAcpAgent {
     } else if (configId === EFFORT_CONFIG_ID) {
       // Apply first so a rejected control request cannot leave the displayed
       // value ahead of the SDK flag layer.
-      await session.query.applyFlagSettings({
-        effortLevel: toSdkEffortLevel(value),
-      });
+      const previousEffort = session.configOptions.find(
+        (o) => o.id === EFFORT_CONFIG_ID,
+      )?.currentValue;
+      await session.query.applyFlagSettings(
+        effortFlagSettings(value, typeof previousEffort === "string" ? previousEffort : undefined),
+      );
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -8769,7 +8771,7 @@ export class ClaudeAcpAgent {
       );
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
-        await q.applyFlagSettings({ effortLevel: toSdkEffortLevel(initialEffort.currentValue) });
+        await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, undefined));
       }
       // Seed the context window without extra IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),

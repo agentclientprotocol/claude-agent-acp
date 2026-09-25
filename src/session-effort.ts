@@ -12,6 +12,32 @@ export function toSdkEffortLevel(value: string | undefined): EffortLevel | null 
   return value === undefined || value === "default" ? null : (value as EffortLevel);
 }
 
+/** UltraCode is a session flag (xhigh effort plus standing dynamic-workflow
+ *  orchestration), not an EffortLevel. It is offered as one more row of the
+ *  effort picker on models that support `xhigh`. */
+export const ULTRACODE_EFFORT_ID = "ultracode";
+
+/** Flag-layer settings for an effort picker value. Enabling UltraCode clears a
+ *  stale ordinary effort pin; leaving it (`previous` was UltraCode) turns it
+ *  off in the same update as the new effort, so the two never run together.
+ *  Sessions that never touched UltraCode get the plain `effortLevel` update. */
+export function effortFlagSettings(
+  value: string | undefined,
+  previous: string | undefined,
+): { effortLevel: EffortLevel | null; ultracode?: boolean } {
+  if (value === ULTRACODE_EFFORT_ID) return { ultracode: true, effortLevel: null };
+  const effortLevel = toSdkEffortLevel(value);
+  return previous === ULTRACODE_EFFORT_ID ? { ultracode: false, effortLevel } : { effortLevel };
+}
+
+/** Whether a model can run a picker value: its own effort levels, plus
+ *  UltraCode wherever `xhigh` is supported. */
+export function modelSupportsEffort(modelInfo: ModelInfo | undefined, value: string): boolean {
+  if (modelInfo?.supportsEffort !== true) return false;
+  const levels = (modelInfo.supportedEffortLevels ?? []) as string[];
+  return levels.includes(value) || (value === ULTRACODE_EFFORT_ID && levels.includes("xhigh"));
+}
+
 function canonicalizeModelSettingsKey(value: string): string {
   return value
     .trim()
@@ -27,6 +53,7 @@ export function settingsEffortForModel(
   modelInfo: ModelInfo | undefined,
   modelId?: string,
 ): string | undefined {
+  if ((settings as { ultracode?: unknown }).ultracode === true) return ULTRACODE_EFFORT_ID;
   const modelSettings = settings.modelSettings;
   if (modelSettings) {
     for (const key of [modelInfo?.resolvedModel, modelInfo?.value, modelId]) {
@@ -78,6 +105,7 @@ export function buildEffortConfigOption(
     ? (currentModelInfo.supportedEffortLevels ?? [])
     : [];
   if (supportedLevels.length === 0) return undefined;
+  const supportsUltracode = (supportedLevels as string[]).includes("xhigh");
 
   const recommendedEffort = (supportedLevels as string[]).includes("medium")
     ? "medium"
@@ -91,9 +119,20 @@ export function buildEffortConfigOption(
         .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
         .join(" "),
     })),
+    ...(supportsUltracode
+      ? [
+          {
+            value: ULTRACODE_EFFORT_ID,
+            name: "UltraCode",
+            description: "Extra-high reasoning with dynamic workflow orchestration",
+          },
+        ]
+      : []),
   ];
   const includes = (level: string) =>
-    (!useRecommendedValue && level === "default") || (supportedLevels as string[]).includes(level);
+    (!useRecommendedValue && level === "default") ||
+    (supportedLevels as string[]).includes(level) ||
+    (supportsUltracode && level === ULTRACODE_EFFORT_ID);
   const currentValue =
     currentEffortLevel && includes(currentEffortLevel)
       ? currentEffortLevel
