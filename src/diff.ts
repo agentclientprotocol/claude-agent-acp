@@ -3,6 +3,7 @@ import { structuredPatch } from "diff";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { AIR_DIFF_PATCH_CAPABILITY, withAirMeta } from "./air-extension.js";
+import { normalizeWriteInput } from "./tool-calls/reporters/file-edit.js";
 
 /**
  * The largest file, in bytes, that the adapter turns into a git patch.
@@ -68,11 +69,6 @@ interface EditPreviewInput {
   replace_all?: unknown;
 }
 
-interface WritePreviewInput {
-  file_path?: unknown;
-  content?: unknown;
-}
-
 /** The kind of file change that a git patch describes. */
 type FileChange = "create" | "update";
 
@@ -135,8 +131,8 @@ export async function previewPatchContent(
   }
 
   if (toolName === "Write") {
-    const write = input as WritePreviewInput;
-    if (typeof write.file_path !== "string" || typeof write.content !== "string") {
+    const write = normalizeWriteInput(input);
+    if (typeof write?.file_path !== "string" || typeof write.content !== "string") {
       return undefined;
     }
     // The Write tool call shows no diff, so the approval is the only place that
