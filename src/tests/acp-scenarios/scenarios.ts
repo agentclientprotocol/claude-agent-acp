@@ -1152,7 +1152,7 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   compactionScenario("compaction-legacy"),
-  compactionScenario("compaction-update", { session: { compaction: {} } } as any),
+  compactionScenario("compaction-update", { session: { compaction: {} } }),
   {
     name: "compaction-failed-legacy",
     turns: [

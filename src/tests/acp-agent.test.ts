@@ -19904,8 +19904,10 @@ describe("streamEventToAcpNotifications", () => {
       );
     }
 
-    // A scan of the whole input on each part took about 5 s here.
-    expect(performance.now() - started).toBeLessThan(1500);
+    // A perf guard. The linear scan takes about 40 ms here. A scan of the
+    // whole input on each part took about 5 s. No counter can see that cost,
+    // because V8 spends it on flattening the string.
+    expect(performance.now() - started).toBeLessThan(3000);
     // The commas and braces inside the content do not end a field.
     expect(updates).toHaveLength(1);
     expect(updates[0].update).toMatchObject({

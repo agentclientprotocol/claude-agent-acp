@@ -540,19 +540,11 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       expect(usage.some((update) => update._meta?.["_claude/origin"])).toBe(true);
     });
 
-    it("keeps promptQueueing, steering, and the terminal-auth auth methods", () => {
+    it("keeps promptQueueing and steering", () => {
       const initialize = zed("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
       expect(initialize.agentCapabilities._meta.claudeCode).toEqual({ promptQueueing: true });
       expect(initialize._meta).toEqual({ steering: { supported: true } });
-      expect(initialize.authMethods.length).toBeGreaterThan(0);
-      for (const method of initialize.authMethods) {
-        expect(method._meta["terminal-auth"]).toMatchObject({
-          command: expect.any(String),
-          args: expect.arrayContaining(["--cli"]),
-          label: expect.any(String),
-        });
-      }
     });
 
     it("sends terminal-auth commands that rerun this adapter with --cli", () => {
