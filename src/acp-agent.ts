@@ -2391,9 +2391,10 @@ export class ClaudeAcpAgent {
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    const options = (params._meta as NewSessionMeta | undefined)?.claudeCode?.options;
     const response = await this.createSession(params, {
-      // Revisit these meta values once we support resume
-      resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
+      resume: options?.resume,
+      forkSession: options?.forkSession,
     });
     // Needs to happen after we return the session
     setTimeout(() => {
@@ -8208,7 +8209,7 @@ export class ClaudeAcpAgent {
 
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
-    let sessionId;
+    let sessionId: string;
     if (creationOpts.publicSessionId) {
       sessionId = creationOpts.publicSessionId;
     } else if (creationOpts.forkSession) {
@@ -8593,7 +8594,7 @@ export class ClaudeAcpAgent {
     // `_meta.claudeCode.options.additionalDirectories` (SDK pass-through).
     options.additionalDirectories = additionalDirectories;
 
-    if (creationOpts?.resume === undefined || creationOpts?.forkSession) {
+    if (creationOpts?.resume === undefined) {
       // Set our own session id if not resuming an existing session.
       options.sessionId = creationOpts.publicSessionId ? randomUUID() : sessionId;
     }
@@ -8626,6 +8627,11 @@ export class ClaudeAcpAgent {
           throw RequestError.resourceNotFound(sessionId);
         }
         throw error;
+      }
+      const initializedSessionId = (initializationResult as { session_id?: unknown }).session_id;
+      if (creationOpts.forkSession && typeof initializedSessionId === "string") {
+        // Claude mints the provider child id for --resume + --fork-session.
+        sessionId = initializedSessionId;
       }
       timing.phase("sdk-initialize");
 
