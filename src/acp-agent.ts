@@ -2405,11 +2405,29 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    return forkSession(params, {
+    const forked = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+
+    const response = await this.createSession(
+      { ...params, mcpServers: params.mcpServers ?? [] },
+      { resume: forked.sessionId },
+    );
+
+    // Match session/new and session/load: the fork result is immediately usable
+    // by clients that prompt the returned session id without an extra load/resume.
+    setTimeout(() => {
+      this.sendAvailableCommandsUpdate(forked.sessionId);
+      startMcpAuthentication(this, forked.sessionId, params.mcpServers ?? []);
+    }, 0);
+
+    return {
+      sessionId: forked.sessionId,
+      modes: response.modes,
+      configOptions: response.configOptions,
+    };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
