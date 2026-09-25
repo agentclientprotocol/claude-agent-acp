@@ -173,47 +173,60 @@ export class NativeSubagentRuntime {
     if (previous && previous.terminalState === undefined) return;
 
     // A SendMessage resume reuses the finished generation's tool id, whose
-    // control state is already cleaned up. Keep its parent while that session
-    // is still live; a finished parent can no longer host the new generation.
-    const resumedParentSessionId =
-      previous &&
-      (this.isLiveSession(previous.parentSessionId)
-        ? previous.parentSessionId
-        : this.rootSessionId);
+    // control state is already cleaned up.
     const knownParentSessionId =
       (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
-      resumedParentSessionId;
+      (previous && this.resumedParentSessionId(previous));
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
-    const child: NativeSubagent = {
-      sessionId: this.nextChildSessionId(task.taskId, previous),
-      parentSessionId: knownParentSessionId ?? this.rootSessionId,
-      parentToolUseId: task.toolUseId ?? undefined,
-      name: subagentDisplayName(
-        identity?.name,
-        identity?.description ?? task.description,
-        identity?.subagentType ?? task.subagentType,
-        task.taskId,
-      ),
-      task: subagentDescription(
-        identity?.prompt ?? task.prompt,
-        identity?.description ?? task.description,
-      ),
-    };
-    this.children.set(task.taskId, child);
-    if (task.toolUseId) {
-      this.taskByToolUse.set(task.toolUseId, task.taskId);
-      this.childByParentToolUse.set(task.toolUseId, child);
-      this.controlByToolUse.delete(task.toolUseId);
-    }
-
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
-    if (knownParentSessionId || !task.toolUseId) {
-      await announceNativeSubagent(child, this.publish);
-      for (const pending of task.toolUseId ? this.takePending(task.toolUseId) : []) {
-        await deliver(pending);
-      }
-    }
+    await this.openGeneration(
+      task.taskId,
+      previous,
+      {
+        parentSessionId: knownParentSessionId ?? this.rootSessionId,
+        parentToolUseId: task.toolUseId ?? undefined,
+        name: subagentDisplayName(
+          identity?.name,
+          identity?.description ?? task.description,
+          identity?.subagentType ?? task.subagentType,
+          task.taskId,
+        ),
+        task: subagentDescription(
+          identity?.prompt ?? task.prompt,
+          identity?.description ?? task.description,
+        ),
+      },
+      !!knownParentSessionId || !task.toolUseId,
+      deliver,
+    );
+  }
+
+  /**
+   * Opens a new generation of a finished child when the SDK resumes the same
+   * agent id. The SDK can resume a child without a new `task_started`, so a
+   * running `task_updated` patch or a SendMessage `resumedAgentId` is the
+   * signal. A child that did not finish is not changed.
+   */
+  async taskResumed(taskId: string, deliver: Publish): Promise<void> {
+    if (!this.enabled) return;
+    const previous = this.children.get(taskId);
+    if (!previous) return;
+    const finishing = this.taskFinishPromises.get(taskId) ?? previous.terminalPromise;
+    if (finishing) await finishing.catch(() => {});
+    if (this.children.get(taskId) !== previous || previous.terminalState === undefined) return;
+    await this.openGeneration(
+      taskId,
+      previous,
+      {
+        parentSessionId: this.resumedParentSessionId(previous),
+        parentToolUseId: previous.parentToolUseId,
+        name: previous.name,
+        task: previous.task,
+      },
+      true,
+      deliver,
+    );
   }
 
   async finishTask(
@@ -348,12 +361,47 @@ export class NativeSubagentRuntime {
     this.parentByToolUse.delete(toolUseId);
   }
 
+  /** The parent of a resumed generation: the old parent while it is live, else the root. */
+  private resumedParentSessionId(previous: NativeSubagent): string {
+    return this.isLiveSession(previous.parentSessionId)
+      ? previous.parentSessionId
+      : this.rootSessionId;
+  }
+
   private isLiveSession(sessionId: string): boolean {
     if (sessionId === this.rootSessionId) return true;
     for (const child of this.children.values()) {
       if (child.sessionId === sessionId) return child.terminalState === undefined;
     }
     return false;
+  }
+
+  /**
+   * Registers a new child session for the task and makes it the owner of its
+   * parent tool call. With `announce`, it publishes `subagent_spawned` and
+   * delivers the updates that waited for the child.
+   */
+  private async openGeneration(
+    taskId: string,
+    previous: NativeSubagent | undefined,
+    fields: Pick<NativeSubagent, "parentSessionId" | "parentToolUseId" | "name" | "task">,
+    announce: boolean,
+    deliver: Publish,
+  ): Promise<void> {
+    const child: NativeSubagent = {
+      sessionId: this.nextChildSessionId(taskId, previous),
+      ...fields,
+    };
+    const toolUseId = child.parentToolUseId;
+    this.children.set(taskId, child);
+    if (toolUseId) {
+      this.taskByToolUse.set(toolUseId, taskId);
+      this.childByParentToolUse.set(toolUseId, child);
+      this.controlByToolUse.delete(toolUseId);
+    }
+    if (!announce) return;
+    await announceNativeSubagent(child, this.publish);
+    for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
   }
 
   private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
@@ -421,6 +469,16 @@ export async function finishNativeSubagent(
   } finally {
     if (child.terminalPromise === finish) child.terminalPromise = undefined;
   }
+}
+
+/**
+ * The agent id that a successful SendMessage result resumed. The SDK puts it
+ * in `tool_use_result.resumedAgentId` when a finished agent runs again.
+ */
+export function resumedNativeSubagentId(toolUseResult: unknown): string | undefined {
+  if (typeof toolUseResult !== "object" || toolUseResult === null) return undefined;
+  const result = toolUseResult as { success?: unknown; resumedAgentId?: unknown };
+  return result.success === true ? nonBlankString(result.resumedAgentId) : undefined;
 }
 
 export function nativeSubagentState(status: unknown): SubagentState | undefined {

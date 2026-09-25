@@ -111,6 +111,7 @@ import {
   isNativeSubagentControlUpdate,
   NativeSubagent,
   NativeSubagentRuntime,
+  resumedNativeSubagentId,
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
@@ -4988,6 +4989,13 @@ export class ClaudeAcpAgent {
                   )?.parentToolUseId;
                   if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
                   session.liveBackgroundTasks.delete(message.task_id);
+                } else if (
+                  message.patch.status === "running" ||
+                  message.patch.status === "pending"
+                ) {
+                  // The SDK can resume a finished subagent under the same
+                  // agent id without a new task_started.
+                  await subagents.taskResumed(message.task_id, sendUpdate);
                 }
                 break;
               case "worker_shutting_down":
@@ -6302,6 +6310,8 @@ export class ClaudeAcpAgent {
                 session.toolUseCache,
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+              const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
+              if (resumedAgentId) await subagents.taskResumed(resumedAgentId, sendUpdate);
             }
 
             for (const notification of toAcpNotifications(

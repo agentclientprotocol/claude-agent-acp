@@ -5473,6 +5473,124 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(JSON.stringify(updates)).not.toContain("late");
   });
 
+  describe("a failed child that the SDK resumes", () => {
+    const childMessage = (text: string) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_parent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text },
+      },
+    });
+    const taskUpdated = (status: string) => ({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "agent-42",
+      patch: { status },
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const sendMessageResult = {
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      tool_use_result: {
+        success: true,
+        message: "Resuming agent agent-42",
+        resumedAgentId: "agent-42",
+      },
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_send",
+            content: "Resuming agent agent-42",
+          },
+        ],
+      },
+    };
+
+    async function run(resume: unknown[]) {
+      const updates: AcpSessionNotification[] = [];
+      const logged: string[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+          },
+        } as unknown as AcpClient,
+        { log: (message: string) => logged.push(message), error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities & {
+          subagents: Record<string, never>;
+        },
+      });
+      injectGeneratorSession(
+        agent,
+        makeGenerator([
+          { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+          childMessage("first"),
+          taskUpdated("failed"),
+          childMessage("stray"),
+          ...resume,
+          childMessage("resumed"),
+          taskUpdated("completed"),
+          successResult(),
+        ]),
+      );
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      const lifecycle = updates.flatMap(({ sessionId, update }) =>
+        update.sessionUpdate === "subagent_spawned" ||
+        update.sessionUpdate === "subagent_state_update" ||
+        update.sessionUpdate === "agent_message_chunk"
+          ? [
+              [
+                sessionId,
+                update.sessionUpdate,
+                "subagentSessionId" in update ? update.subagentSessionId : undefined,
+              ],
+            ]
+          : [],
+      );
+      return { updates, logged, lifecycle };
+    }
+
+    const expected = [
+      ["test-session", "subagent_spawned", "agent-42"],
+      ["agent-42", "agent_message_chunk", undefined],
+      ["test-session", "subagent_state_update", "agent-42"],
+      ["test-session", "subagent_spawned", "agent-42:generation:2"],
+      ["agent-42:generation:2", "agent_message_chunk", undefined],
+      ["test-session", "subagent_state_update", "agent-42:generation:2"],
+    ];
+
+    it("opens a new generation on a running task_updated patch", async () => {
+      const { updates, logged, lifecycle } = await run([taskUpdated("running")]);
+
+      expect(lifecycle).toEqual(expected);
+      expect(JSON.stringify(updates)).not.toContain("stray");
+      expect(JSON.stringify(updates)).toContain("resumed");
+      expect(
+        logged.filter((line) => line.includes("ignoring late update for terminal subagent")),
+      ).toHaveLength(1);
+    });
+
+    it("opens a new generation on a SendMessage result that resumed the agent", async () => {
+      const { updates, lifecycle } = await run([sendMessageResult, taskUpdated("running")]);
+
+      expect(lifecycle).toEqual(expected);
+      expect(JSON.stringify(updates)).not.toContain("stray");
+      expect(JSON.stringify(updates)).toContain("resumed");
+    });
+  });
+
   it("uses the immediate child as parent for a nested subagent", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
