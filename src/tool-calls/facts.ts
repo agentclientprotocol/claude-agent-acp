@@ -66,6 +66,11 @@ export interface ToolResultFacts {
   rawOutput?: unknown;
   /** The plan file of the tool use, as {@link ToolUseFacts.planFilePath} defines it. */
   planFilePath?: string;
+  /**
+   * The plan is done with its file: the user approved it and the session left
+   * Plan mode. AIR then gets the clear signal of the plan file.
+   */
+  planFileReleased?: boolean;
 }
 
 /** What a reporter reads besides the input of the tool use. */

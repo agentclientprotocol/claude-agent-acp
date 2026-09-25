@@ -350,6 +350,35 @@ describe("the ACP tool call contract", () => {
         expect(JSON.stringify([call, updates])).not.toContain("Do it");
       });
 
+      it("clears the plan file for AIR in a call of its own when the plan is approved", () => {
+        const { updates } = report(
+          planFileAir,
+          "ExitPlanMode",
+          { plan: "1. Do it", planFilePath },
+          { content: "User has approved your plan." },
+        );
+        expect(updates).toHaveLength(2);
+        expect(updates[1]).toEqual({
+          toolCallId: "t:plan-file-clear",
+          sessionUpdate: "tool_call",
+          title: "Exited Plan Mode",
+          kind: "switch_mode",
+          status: "completed",
+          rawInput: { planFilePath: "" },
+          content: [],
+        });
+      });
+
+      it("keeps the plan file when the plan is rejected", () => {
+        const { updates } = report(
+          planFileAir,
+          "ExitPlanMode",
+          { plan: "1. Do it", planFilePath },
+          { content: "```\nKeep the tests\n```", is_error: true },
+        );
+        expect(updates).toHaveLength(1);
+      });
+
       it("sends the plan file path with the rejection reason", () => {
         const { updates } = report(
           planFileAir,

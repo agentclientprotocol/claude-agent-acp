@@ -45,7 +45,7 @@ export class ExitPlanModeReporter implements ToolReporter {
     return {
       title: "Exited Plan Mode",
       rawOutput: undefined,
-      ...(planFilePath ? { planFilePath } : {}),
+      ...(planFilePath ? { planFilePath, planFileReleased: true } : {}),
     };
   }
 

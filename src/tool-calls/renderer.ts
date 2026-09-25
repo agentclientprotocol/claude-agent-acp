@@ -20,6 +20,9 @@ import { resolveSkillPath } from "./reporters/interaction.js";
 
 export type ToolCallUpdate = SessionNotification["update"];
 
+/** The id suffix of the call that clears the plan file of an approved plan for AIR. */
+const PLAN_FILE_CLEAR_SUFFIX = ":plan-file-clear";
+
 /** The `_meta` of a tool call report. */
 export type ToolUpdateMeta = {
   claudeCode?: {
@@ -93,6 +96,8 @@ export interface RenderedResult {
   rawOutput?: unknown;
   /** The plan file that `rawInput` names. See {@link ToolResultFacts.planFilePath}. */
   planFilePath?: string;
+  /** See {@link ToolResultFacts.planFileReleased}. */
+  planFileReleased?: boolean;
   _meta?: Pick<
     ToolUpdateMeta,
     "terminal_info" | "terminal_output" | "terminal_output_delta" | "terminal_exit"
@@ -389,6 +394,8 @@ export class AcpToolCallRenderer {
     // name it. The field tracker drops a path that the client holds.
     const planFilePath = fields.planFilePath;
     delete fields.planFilePath;
+    const planFileReleased = fields.planFileReleased === true;
+    delete fields.planFileReleased;
     updates.push({
       _meta: {
         claudeCode: { toolName: toolUse.name, ...(options.nonExecution ?? {}) },
@@ -401,6 +408,20 @@ export class AcpToolCallRenderer {
       ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,
     });
+    // AIR keeps the plan file button while the last reported path names a
+    // file, and a blank path is its clear signal. The clear goes as a call of
+    // its own, so the plan card of this call keeps its file.
+    if (planFilePath && planFileReleased && result.is_error !== true) {
+      updates.push({
+        toolCallId: `${toolUse.id}${PLAN_FILE_CLEAR_SUFFIX}`,
+        sessionUpdate: "tool_call",
+        title: "Exited Plan Mode",
+        kind: "switch_mode",
+        status: "completed",
+        rawInput: { planFilePath: "" },
+        content: [],
+      });
+    }
     return updates;
   }
 
