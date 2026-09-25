@@ -132,10 +132,9 @@ export class AsyncTaskRuntime {
       isBackgroundTask(
         field(message, "isBackgrounded", "is_backgrounded"),
         field(message, "taskType", "task_type"),
-      )
+      ) ||
+      task.held
     ) {
-      await this.announce(task);
-    } else if (task.held) {
       await this.announce(task);
     }
     if (

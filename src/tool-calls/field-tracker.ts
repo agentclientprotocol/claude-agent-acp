@@ -53,8 +53,9 @@ export class ToolCallFieldTracker {
    *
    * Returns false when the update carries nothing new: no replaced field
    * remains, `_meta` has no key besides `claudeCode` and `jetbrains`, and
-   * every `claudeCode` and `jetbrains.air` key repeats its value. The caller then skips the update. An update for a
-   * tool call that the tracker does not know passes through unchanged.
+   * every `claudeCode` and `jetbrains.air` key repeats its value. The caller
+   * then skips the update. An update for a tool call that the tracker does
+   * not know passes through unchanged.
    *
    * `replacePinnedContent` lets the final result of the tool replace an exact
    * approval patch (see {@link pinContent}).
@@ -159,27 +160,22 @@ function recordMergedMeta(
   meta: Record<string, unknown> | null | undefined,
 ): boolean {
   let changed = false;
+  const record = (key: string, value: unknown) => {
+    const json = JSON.stringify(value);
+    if (entry.mergedMeta.get(key) === json) return;
+    entry.mergedMeta.set(key, json);
+    changed = true;
+  };
   const merge = (prefix: string, values: unknown) => {
     if (!values || typeof values !== "object" || Array.isArray(values)) return;
-    for (const [key, value] of Object.entries(values)) {
-      const json = JSON.stringify(value);
-      if (entry.mergedMeta.get(prefix + key) === json) continue;
-      entry.mergedMeta.set(prefix + key, json);
-      changed = true;
-    }
+    for (const [key, value] of Object.entries(values)) record(prefix + key, value);
   };
   merge("claudeCode.", meta?.claudeCode);
   const jetbrains = meta?.jetbrains;
   if (jetbrains && typeof jetbrains === "object" && !Array.isArray(jetbrains)) {
     for (const [key, value] of Object.entries(jetbrains)) {
       if (key === "air") merge("jetbrains.air.", value);
-      else if (!entry.mergedMeta.has(`jetbrains.${key}`)) {
-        entry.mergedMeta.set(`jetbrains.${key}`, JSON.stringify(value));
-        changed = true;
-      } else if (entry.mergedMeta.get(`jetbrains.${key}`) !== JSON.stringify(value)) {
-        entry.mergedMeta.set(`jetbrains.${key}`, JSON.stringify(value));
-        changed = true;
-      }
+      else record(`jetbrains.${key}`, value);
     }
   }
   return changed;

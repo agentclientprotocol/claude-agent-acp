@@ -365,7 +365,7 @@ export class ContextCompactionLifecycle {
     await this.send(
       compactionToolCall.finished(
         state.compactionId,
-        opened ? status : firstTerminal ? status : undefined,
+        opened || firstTerminal ? status : undefined,
         metadata,
         opened,
         this.airClient,
@@ -401,11 +401,10 @@ export class ContextCompactionLifecycle {
   }
 }
 
-function withoutError(
-  metadata: Omit<ContextCompactionMetadata, "version">,
-): Omit<ContextCompactionMetadata, "version"> {
-  const facts = { ...metadata };
-  delete facts.error;
+function withoutError({
+  error: _error,
+  ...facts
+}: Omit<ContextCompactionMetadata, "version">): Omit<ContextCompactionMetadata, "version"> {
   return facts;
 }
 
