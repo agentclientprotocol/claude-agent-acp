@@ -16473,6 +16473,177 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  describe("a failed subagent that SendMessage resumes", () => {
+    const taskUpdated = (status: string) => ({
+      type: "system",
+      subtype: "task_updated",
+      task_id: "agent-1",
+      patch: { status },
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const sendMessageResult = () => ({
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      tool_use_result: {
+        success: true,
+        message: "Resuming agent agent-1",
+        resumedAgentId: "agent-1",
+      },
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_send", content: "Resuming agent agent-1" },
+        ],
+      },
+    });
+
+    /** Turn 1 spawns agent-1, which fails inside the turn. Turn 2 resumes it
+     *  with `resume` and holds at `gate` until the test releases it; then
+     *  agent-1 completes and the model sends its followup. */
+    function run(resume: unknown[], options: { subagents?: boolean } = {}) {
+      const updates: AcpSessionNotification[] = [];
+      const requests: RequestPermissionRequest[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (n: AcpSessionNotification) => {
+            updates.push(n);
+          },
+          requestPermission: async (params: RequestPermissionRequest) => {
+            requests.push(params);
+            return { outcome: { outcome: "selected", optionId: "allow-once" } };
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      let notified = false;
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: first } = await iter.next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield taskUpdated("failed");
+          yield resultMessage();
+          yield idle();
+          const { value: second } = await iter.next();
+          yield userEcho(second);
+          yield running();
+          for (const message of resume) yield message;
+          yield resultMessage();
+          yield idle();
+          await gate;
+          notified = true;
+          yield taskNotification("agent-1");
+          yield assistantText("resumed summary");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      const start = async () => {
+        if (options.subagents) {
+          await agent.initialize({
+            protocolVersion: 1,
+            clientCapabilities: { subagents: {} } as ClientCapabilities & {
+              subagents: Record<string, never>;
+            },
+          });
+        }
+        const first = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "explore" }],
+        });
+        expect(first.stopReason).toBe("end_turn");
+        const second = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "continue" }],
+        });
+        await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+        // Wrapped: an async function would unwrap and wait for the held prompt.
+        return { second };
+      };
+      return { agent, updates, requests, release, notified: () => notified, start };
+    }
+
+    it("holds the SendMessage turn until the resumed subagent settles", async () => {
+      const { agent, release, notified, start } = run([sendMessageResult()]);
+      const { second } = await start();
+      let resolved = false;
+      void second.then(() => (resolved = true));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(resolved).toBe(false);
+
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      expect(notified()).toBe(true);
+      expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-1")).toBe(false);
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("attributes a permission request of the resumed subagent to its parent tool call", async () => {
+      const { agent, updates, requests, release, start } = run([sendMessageResult()]);
+      const { second } = await start();
+
+      await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_sub",
+        agentID: "agent-1",
+      } as any);
+
+      expect(requests).toHaveLength(1);
+      expect(
+        updates.find(
+          (n) => n.update.sessionUpdate === "tool_call" && n.update.toolCallId === "toolu_sub",
+        )?.update,
+      ).toMatchObject({ _meta: { claudeCode: { parentToolUseId: "toolu_agent-1" } } });
+      release();
+      await second;
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("registers the subagent once for a repeated resume signal", async () => {
+      const { agent, updates, release, start } = run(
+        [taskUpdated("running"), sendMessageResult()],
+        { subagents: true },
+      );
+      const { second } = await start();
+      const session = agent.sessions["test-session"]!;
+
+      expect(session.activeTurn?.spawnedTaskIds).toEqual(new Set(["agent-1"]));
+      expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+      });
+      expect(
+        updates.flatMap((n) =>
+          n.update.sessionUpdate === "subagent_spawned" ? [n.update.subagentSessionId] : [],
+        ),
+      ).toEqual(["agent-1", "agent-1:generation:2"]);
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      await session.consumer;
+    });
+
+    it("ends the hold of the SendMessage turn at cancel()", async () => {
+      const { agent, release, notified, start } = run([sendMessageResult()]);
+      const { second } = await start();
+
+      await agent.cancel({ sessionId: "test-session" });
+
+      await expect(second).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(notified()).toBe(false);
+      release();
+      await agent.sessions["test-session"]?.consumer;
+    });
+  });
+
   it("does not fail a held turn when a followup errors while another subagent is live", async () => {
     // A followup's is_error must never touch the user-turn lifecycle: the
     // held turn's own result recorded a success.

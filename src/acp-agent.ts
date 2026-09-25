@@ -352,6 +352,9 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
+/** The number of settled subagents whose parent tool call a session keeps for
+ *  a later resume (see `resumableSubagents`). */
+const MAX_RESUMABLE_SUBAGENTS = 256;
 
 /** Best-effort structured presentation for a local `/usage` turn. The command
  * itself always runs through Claude Code; null tells the consumer to forward
@@ -634,6 +637,8 @@ type Turn = {
   /** Task ids of the background subagents launched while this turn was the
    *  active one — including during its held-open drain window, so an agent
    *  chain (a followup that launches another subagent) extends the hold.
+   *  A settled subagent that the SDK resumes while this turn is active (for
+   *  example through SendMessage) counts as a spawn of this turn.
    *  A turn only waits on its OWN spawned subagents: a long-running agent
    *  from an earlier turn must not stall every later prompt's settlement.
    *  Known residual: task_started carries no lineage, so a spawn made by a
@@ -1024,6 +1029,14 @@ export type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** The parent tool call of each subagent that a settle bookend removed from
+   *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
+   *  agent id without a new `task_started` (a running `task_updated` patch or
+   *  a SendMessage `resumedAgentId`). The resume signal puts the subagent back
+   *  into `liveBackgroundTasks` from this record, so the resuming turn holds
+   *  and its permission requests keep their attribution. Bounded by
+   *  `MAX_RESUMABLE_SUBAGENTS`, oldest first. */
+  resumableSubagents?: Map<string, { parentToolUseId?: string }>;
   /** Native ACP subagent sessions negotiated through PR #1992. Records are
    *  retained for the parent session lifetime so late child output cannot be
    *  rebound to another task after the SDK prunes its live-task registry. */
@@ -4002,6 +4015,47 @@ export class ClaudeAcpAgent {
       return markdown;
     };
 
+    /** Registers a live background task (see `liveBackgroundTasks`). A
+     *  subagent is also recorded on the active turn, so that turn holds until
+     *  the subagent settles (see `Turn.spawnedTaskIds`). */
+    const registerLiveTask = (
+      taskId: string,
+      parentToolUseId: string | undefined,
+      isSubagent: boolean,
+    ) => {
+      session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      session.resumableSubagents?.delete(taskId);
+      if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
+        (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
+      }
+    };
+
+    /** Removes a settled task from `liveBackgroundTasks`. A subagent keeps its
+     *  parent tool call in `resumableSubagents` for a later resume. */
+    const settleLiveTask = (taskId: string) => {
+      const record = session.liveBackgroundTasks.get(taskId);
+      if (!record) return;
+      session.liveBackgroundTasks.delete(taskId);
+      if (!record.isSubagent) return;
+      const resumable = (session.resumableSubagents ??= new Map());
+      resumable.delete(taskId);
+      resumable.set(taskId, { parentToolUseId: record.parentToolUseId });
+      if (resumable.size > MAX_RESUMABLE_SUBAGENTS) {
+        const oldest = resumable.keys().next().value;
+        if (oldest !== undefined) resumable.delete(oldest);
+      }
+    };
+
+    /** Registers a settled subagent again when the SDK resumes it without a
+     *  new `task_started`. The active turn is the one that resumed it, so it
+     *  holds until the subagent settles again. A repeated resume signal finds
+     *  the subagent live and changes nothing. */
+    const resumeLiveTask = (taskId: string) => {
+      if (session.liveBackgroundTasks.has(taskId)) return;
+      const settled = session.resumableSubagents?.get(taskId);
+      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true);
+    };
+
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
@@ -4920,10 +4974,7 @@ export class ClaudeAcpAgent {
                 // turn: a turn only ever waits on its own subagents, and a
                 // spawn during a held-open drain window (an agent chain)
                 // extends that turn's hold.
-                session.liveBackgroundTasks.set(message.task_id, {
-                  parentToolUseId: message.tool_use_id,
-                  isSubagent: !!message.subagent_type,
-                });
+                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type);
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
@@ -4944,9 +4995,6 @@ export class ClaudeAcpAgent {
                   skip_transcript: message.skip_transcript,
                   tool_use_id: message.tool_use_id,
                 });
-                if (message.subagent_type && session.activeTurn && !session.activeTurn.settled) {
-                  (session.activeTurn.spawnedTaskIds ??= new Set()).add(message.task_id);
-                }
                 break;
               case "task_notification":
                 // The task settled — no further tool calls can originate
@@ -4969,7 +5017,7 @@ export class ClaudeAcpAgent {
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
                 }
-                session.liveBackgroundTasks.delete(message.task_id);
+                settleLiveTask(message.task_id);
                 break;
               case "task_updated":
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
@@ -4988,13 +5036,14 @@ export class ClaudeAcpAgent {
                     message.task_id,
                   )?.parentToolUseId;
                   if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
-                  session.liveBackgroundTasks.delete(message.task_id);
+                  settleLiveTask(message.task_id);
                 } else if (
                   message.patch.status === "running" ||
                   message.patch.status === "pending"
                 ) {
                   // The SDK can resume a finished subagent under the same
                   // agent id without a new task_started.
+                  resumeLiveTask(message.task_id);
                   await subagents.taskResumed(message.task_id, sendUpdate);
                 }
                 break;
@@ -6311,7 +6360,10 @@ export class ClaudeAcpAgent {
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
-              if (resumedAgentId) await subagents.taskResumed(resumedAgentId, sendUpdate);
+              if (resumedAgentId) {
+                resumeLiveTask(resumedAgentId);
+                await subagents.taskResumed(resumedAgentId, sendUpdate);
+              }
             }
 
             for (const notification of toAcpNotifications(
