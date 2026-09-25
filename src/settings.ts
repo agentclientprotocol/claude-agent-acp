@@ -7,7 +7,7 @@ import {
   resolveSettings,
   type Settings,
 } from "@anthropic-ai/claude-agent-sdk";
-import { CLAUDE_CONFIG_DIR } from "./acp-agent.js";
+import { claudeConfigDir } from "./paths.js";
 
 /**
  * Permission rule format examples:
@@ -91,7 +91,7 @@ export class SettingsManager {
    */
   private getWatchedPaths(): string[] {
     return [
-      path.join(CLAUDE_CONFIG_DIR, "settings.json"),
+      path.join(claudeConfigDir(), "settings.json"),
       path.join(this.cwd, ".claude", "settings.json"),
       path.join(this.cwd, ".claude", "settings.local.json"),
       getManagedSettingsPath(),

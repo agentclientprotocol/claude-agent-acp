@@ -147,7 +147,6 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import packageJson from "../package.json" with { type: "json" };
@@ -285,9 +284,6 @@ export {
   MODEL_CONFIG_ID,
   resolveModelPreference,
 } from "./session-model.js";
-
-export const CLAUDE_CONFIG_DIR =
-  process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const execFileAsync = promisify(execFile);
 
@@ -9917,15 +9913,7 @@ export function toAcpNotifications(
     };
     applyMessageId(update, options?.messageId);
 
-    if (options?.parentToolUseId) {
-      update._meta = {
-        ...update._meta,
-        claudeCode: {
-          ...(update._meta?.claudeCode || {}),
-          parentToolUseId: options.parentToolUseId,
-        },
-      };
-    }
+    if (options?.parentToolUseId) stampParentToolUseId(update, options.parentToolUseId);
 
     return [{ sessionId, update }];
   }
@@ -10245,15 +10233,7 @@ export function toAcpNotifications(
         break;
     }
     if (update) {
-      if (options?.parentToolUseId) {
-        update._meta = {
-          ...update._meta,
-          claudeCode: {
-            ...(update._meta?.claudeCode || {}),
-            parentToolUseId: options.parentToolUseId,
-          },
-        };
-      }
+      if (options?.parentToolUseId) stampParentToolUseId(update, options.parentToolUseId);
       applyMessageId(update, options?.messageId);
       // A tool result is final, so it may replace a pinned approval patch,
       // for example with the error text of a rejected Edit.
@@ -10367,15 +10347,7 @@ export function streamEventToAcpNotifications(
         const update: SessionNotification["update"] = AcpToolCallRenderer.for(
           options?.clientCapabilities,
         ).partialRefinement(streamedInput, input, options?.cwd);
-        if (message.parent_tool_use_id) {
-          update._meta = {
-            ...update._meta,
-            claudeCode: {
-              ...(update._meta?.claudeCode || {}),
-              parentToolUseId: message.parent_tool_use_id,
-            },
-          };
-        }
+        if (message.parent_tool_use_id) stampParentToolUseId(update, message.parent_tool_use_id);
         applyMessageId(update, options?.messageId);
         // A refinement resends only what changed: rawInput grows with every
         // field, and title, kind, and locations usually stay the same.
