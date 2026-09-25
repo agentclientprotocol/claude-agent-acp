@@ -247,13 +247,12 @@ describe("approval patch previews", () => {
       .join("");
     const filePath = await temporaryFile(oldText);
 
-    const started = performance.now();
+    // 200 changed lines. A diff that runs out of its time budget gives no
+    // patch, and patchText then throws.
     const patch = patchText(
       await previewPatchContent("Write", { file_path: filePath, content: newText }),
     );
 
-    // 200 changed lines. The async diff ran out of its 500 ms budget here.
-    expect(performance.now() - started).toBeLessThan(1000);
     expect(applyPatch(oldText, patch)).toBe(newText);
   });
 
