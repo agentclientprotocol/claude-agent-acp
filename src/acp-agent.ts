@@ -119,7 +119,6 @@ import {
   AIR_GOAL_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   clientSupportsAirCapability,
-  isAirClient,
   withAirMeta,
 } from "./air-extension.js";
 import {
@@ -2221,6 +2220,8 @@ export class ClaudeAcpAgent {
   };
   client: AcpClient;
   clientCapabilities?: ClientCapabilities;
+  /** The tool call report choices, read once from {@link clientCapabilities} in `initialize`. */
+  private toolCallCapabilities = new ToolCallClientCapabilities();
   logger: Logger;
   private readonly sessionModes: SessionModeManager<Session>;
   gatewayAuthRequest?: GatewayAuthRequest;
@@ -2255,7 +2256,7 @@ export class ClaudeAcpAgent {
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
-    this.client = new ChangedMetaClient(client, () => isAirClient(this.clientCapabilities));
+    this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
     this.exitPlan = new ExitPlanCoordinator<Session, Turn>({
       currentSession: (id) => this.sessions[id],
@@ -2297,7 +2298,7 @@ export class ClaudeAcpAgent {
     });
     this.sessionModes = new SessionModeManager({
       getSession: (sessionId) => this.sessions[sessionId],
-      airClient: () => isAirClient(this.clientCapabilities),
+      airClient: () => this.toolCallCapabilities.air.client,
       sessionEndedMessage: SESSION_ENDED_MESSAGE,
       updateConfigOption: (sessionId, configId, value) =>
         this.updateConfigOption(sessionId, configId, value),
@@ -2310,6 +2311,7 @@ export class ClaudeAcpAgent {
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
+    this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities);
 
     // Learn the auth identity in the background: `initialize` never waits on
     // the CLI probe, and no snapshot rides in its response. When the probe
@@ -2481,7 +2483,7 @@ export class ClaudeAcpAgent {
       // Only AIR gets the AIR capabilities and the goal capability, under
       // `jetbrains.air`.
       _meta: {
-        ...(isAirClient(request.clientCapabilities)
+        ...(this.toolCallCapabilities.air.client
           ? withAirMeta(
               airSessionFailureCapabilityMeta(
                 AGENT_FILE_CHANGE_REPORT_CAPABILITY,
@@ -3270,7 +3272,7 @@ export class ClaudeAcpAgent {
       session.lastPublishedGoal = goal;
     }
     // The goal is an AIR extension: only AIR gets it.
-    if (!isAirClient(this.clientCapabilities)) return;
+    if (!this.toolCallCapabilities.air.client) return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
@@ -3281,7 +3283,7 @@ export class ClaudeAcpAgent {
   }
 
   private async publishTaskPlan(sessionId: string, taskState: TaskState): Promise<void> {
-    const entries = changedTaskPlanEntries(taskState, isAirClient(this.clientCapabilities));
+    const entries = changedTaskPlanEntries(taskState, this.toolCallCapabilities.air.client);
     if (!entries) return;
     await this.client.sessionUpdate({
       sessionId,
@@ -3514,7 +3516,7 @@ export class ClaudeAcpAgent {
     // subagent text without it: nested text then stays internal to the Agent
     // tool call. Every other client gets the streamed subagent text, like
     // upstream.
-    const airClient = isAirClient(this.clientCapabilities);
+    const airClient = this.toolCallCapabilities.air.client;
     const forwardsSubagentText = () =>
       session.forwardSubagentText ||
       supportsSubagentTranscript(this.clientCapabilities) ||
@@ -3562,7 +3564,7 @@ export class ClaudeAcpAgent {
 
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {
       sessionId: params.sessionId,
-      airClient: isAirClient(this.clientCapabilities),
+      airClient: this.toolCallCapabilities.air.client,
       presentation: clientSupportsCompactionUpdates(this.clientCapabilities)
         ? "compaction_update"
         : "tool_call",
@@ -4742,7 +4744,7 @@ export class ClaudeAcpAgent {
               case "memory_recall": {
                 await sendUpdate({
                   sessionId: params.sessionId,
-                  update: AcpToolCallRenderer.for(this.clientCapabilities).memoryRecall(message),
+                  update: new AcpToolCallRenderer(this.toolCallCapabilities).memoryRecall(message),
                 });
                 break;
               }
@@ -4816,7 +4818,7 @@ export class ClaudeAcpAgent {
                   // child tool call was not announced there.
                   break;
                 }
-                const denied = AcpToolCallRenderer.for(this.clientCapabilities).permissionDenied({
+                const denied = new AcpToolCallRenderer(this.toolCallCapabilities).permissionDenied({
                   toolCallId: message.tool_use_id,
                   toolName: message.tool_name,
                   parentToolUseId,
@@ -6371,10 +6373,10 @@ export class ClaudeAcpAgent {
             // falls back to the parent call, AIR gets the name of that call,
             // or no name. Every other client gets `tool_name`, like upstream.
             const toolName =
-              toolCallId !== message.tool_use_id && isAirClient(this.clientCapabilities)
+              toolCallId !== message.tool_use_id && this.toolCallCapabilities.air.client
                 ? session.toolUseCache[toolCallId]?.name
                 : message.tool_name;
-            const beat = AcpToolCallRenderer.for(this.clientCapabilities).progress({
+            const beat = new AcpToolCallRenderer(this.toolCallCapabilities).progress({
               toolCallId,
               toolName,
               parentToolUseId: subagentParentToolUseId,
@@ -7276,7 +7278,7 @@ export class ClaudeAcpAgent {
           {
             sessionId,
             presentation: "compaction_update",
-            airClient: isAirClient(this.clientCapabilities),
+            airClient: this.toolCallCapabilities.air.client,
           },
         );
         if (replayCompaction.recordSummary(assistantMessageText(message.message))) {
@@ -7492,7 +7494,7 @@ export class ClaudeAcpAgent {
     }
     session.emittedToolCalls.add(toolCallId);
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
-    const update = AcpToolCallRenderer.for(this.clientCapabilities).toolCall(
+    const update = new AcpToolCallRenderer(this.toolCallCapabilities).toolCall(
       { id: toolCallId, name: toolName, input: toolInput },
       { cwd: session.cwd, previewContent },
     );
@@ -7606,11 +7608,8 @@ export class ClaudeAcpAgent {
       // Artifact publishes).
       const noPersistentRule = matchedAskRule !== undefined || suppressAlwaysAllowRule === true;
       const durableChangeSet = normalizeDurablePermissionChangeSet(suggestions, noPersistentRule);
-      const supportsDiffPatch = clientSupportsAirCapability(
-        this.clientCapabilities,
-        AIR_DIFF_PATCH_CAPABILITY,
-      );
-      const previewContent = supportsDiffPatch
+      const capabilities = this.toolCallCapabilities;
+      const previewContent = capabilities.diffPatch
         ? await previewPatchContent(toolName, toolInput, session.cwd)
         : undefined;
       const presentation = buildClaudePermissionPresentation({
@@ -7618,7 +7617,7 @@ export class ClaudeAcpAgent {
         input: toolInput,
         toolUseID,
         cwd: session.cwd,
-        capabilities: ToolCallClientCapabilities.from(this.clientCapabilities),
+        capabilities,
         previewContent,
         blockedPath,
         title,
@@ -7636,7 +7635,7 @@ export class ClaudeAcpAgent {
       // text, so it rides `_meta` rather than the title.
       // AIR already holds the tool name and the parent tool call. Every
       // other client gets them again, like upstream.
-      const airClient = isAirClient(this.clientCapabilities);
+      const airClient = capabilities.air.client;
       if (mcpServer || (parentToolUseId && !airClient)) {
         presentation.toolCall._meta = {
           claudeCode: {
@@ -7795,7 +7794,7 @@ export class ClaudeAcpAgent {
       questions,
       sessionId,
       toolUseID,
-      isAirClient(this.clientCapabilities),
+      this.toolCallCapabilities.air.client,
     );
     let response;
     try {

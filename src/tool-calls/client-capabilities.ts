@@ -11,9 +11,10 @@ import {
 /**
  * The client choices that decide the shape of a tool call report.
  *
- * The adapter reads them once from `initialize.clientCapabilities`. The
- * {@link AcpToolCallRenderer} reads nothing else, so one object holds every
- * capability choice of a tool call report.
+ * The agent reads them once from `initialize.clientCapabilities`. The public
+ * `toAcpNotifications` functions take the ACP capabilities and read them on
+ * each call. The {@link AcpToolCallRenderer} reads nothing else, so one object
+ * holds every capability choice of a tool call report.
  */
 export class ClientCapabilities {
   constructor(
