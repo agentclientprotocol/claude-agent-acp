@@ -112,6 +112,18 @@ describe("approval patch previews", () => {
     );
   });
 
+  it("reads the Write alias keys that the CLI accepts", async () => {
+    const existing = await temporaryFile("before\n");
+
+    for (const input of [
+      { path: existing, content: "after\n" },
+      { file_path: existing, file_text: "after\n" },
+      { path: existing, file_content: "after\n" },
+    ]) {
+      expect(patchText(await previewPatchContent("Write", input))).toContain("-before\n+after\n");
+    }
+  });
+
   it("returns no preview when the patch would not be exact", async () => {
     const duplicate = await temporaryFile("same\nsame\n");
     const missing = await temporaryFile();
