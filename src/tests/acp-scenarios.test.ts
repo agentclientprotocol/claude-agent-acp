@@ -599,9 +599,7 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
           air: {
             version: 1,
             capabilities: expect.arrayContaining(
-              AIR_CAPABILITY_NAMES.filter(
-                (name) => name !== "rawInputRendering" && name !== "planContentDelta",
-              ),
+              AIR_CAPABILITY_NAMES.filter((name) => name !== "rawInputRendering"),
             ),
             goal: expect.objectContaining({ version: 1 }),
           },

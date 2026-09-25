@@ -74,7 +74,7 @@ interface WritePreviewInput {
 }
 
 /** The kind of file change that a git patch describes. */
-type FileChange = "create" | "update" | "delete";
+type FileChange = "create" | "update";
 
 /**
  * Builds the exact patch shown before Claude runs an Edit or Write tool.
@@ -348,8 +348,8 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
  * The text of one git patch for `filePath`.
  *
  * The headers follow `git diff`: the path loses its leading slash, gets the
- * `a/` and `b/` prefixes, and is quoted when git would quote it. A created or
- * deleted file gets its mode line and a `/dev/null` side.
+ * `a/` and `b/` prefixes, and is quoted when git would quote it. A created
+ * file gets its mode line and a `/dev/null` side.
  */
 export function gitPatchText(filePath: string, change: FileChange, hunks: PatchHunk[]): string {
   return [
@@ -370,9 +370,8 @@ function gitPatchHeader(filePath: string, change: FileChange): string[] {
   return [
     `diff --git ${oldName} ${newName}`,
     ...(change === "create" ? ["new file mode 100644"] : []),
-    ...(change === "delete" ? ["deleted file mode 100644"] : []),
     `--- ${change === "create" ? "/dev/null" : `${oldName}${tab}`}`,
-    `+++ ${change === "delete" ? "/dev/null" : `${newName}${tab}`}`,
+    `+++ ${newName}${tab}`,
   ];
 }
 

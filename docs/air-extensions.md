@@ -147,7 +147,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `planFile`               | yes        | Sends the path of the plan file in place of the plan text of an ExitPlanMode.           | [Plan file](#plan-file)                                 |
 | `rawInputRendering`      | no         | Sends no display copy of readable input in `content`. The client renders `rawInput`.    | [Tool call contract](#tool-call-contract)               |
 
-The adapter also reads `planContentDelta`, but the capability has no effect.
+The adapter ignores `planContentDelta`.
 Claude does not stream a plan, so the adapter never sends `contentDelta` (see [Plan file](#plan-file)).
 
 The goal extension has no client capability.

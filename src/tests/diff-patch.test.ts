@@ -305,7 +305,6 @@ describe("approval patch previews", () => {
       capabilities: new ClientCapabilities(false, false, true, {
         client: true,
         rawInputRendering: false,
-        planContentDelta: false,
         planFile: false,
       }),
       previewContent: await previewPatchContent("Edit", input),
@@ -341,12 +340,9 @@ describe("git patch headers", () => {
     );
   });
 
-  it("writes created and deleted file headers", () => {
+  it("writes a created file header", () => {
     expect(gitPatchText("/f", "create", [{ ...hunk, oldLines: 0, lines: ["+b"] }])).toBe(
       "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+b\n",
-    );
-    expect(gitPatchText("/f", "delete", [{ ...hunk, newLines: 0, lines: ["-a"] }])).toBe(
-      "diff --git a/f b/f\ndeleted file mode 100644\n--- a/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
     );
   });
 
@@ -405,7 +401,6 @@ describe("Write tool calls for an existing file", () => {
   const air = new ClientCapabilities(false, false, true, {
     client: true,
     rawInputRendering: false,
-    planContentDelta: false,
     planFile: false,
   });
 
