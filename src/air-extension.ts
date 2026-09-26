@@ -2,6 +2,7 @@ export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
+export const AIR_CUSTOM_INSTRUCTIONS_CAPABILITY = "customInstructions";
 export const AIR_DIFF_STATS_KEY = "diffStats";
 
 const JETBRAINS_META_KEY = "jetbrains";
@@ -68,6 +69,13 @@ export function clientSupportsAirCapability(capabilities: unknown, capability: s
     Array.isArray(advertised) &&
     advertised.includes(capability)
   );
+}
+
+/** Read custom instructions from `session/new` metadata. */
+export function airCustomInstructions(meta: unknown): string | undefined {
+  const air = airExtensionMeta(meta);
+  const instructions = air?.[AIR_CUSTOM_INSTRUCTIONS_CAPABILITY];
+  return typeof instructions === "string" ? instructions : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

@@ -449,6 +449,56 @@ describe("createSession options merging", () => {
       });
     });
 
+    it("appends AIR custom instructions to the claude_code preset", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: "Follow the project rules." },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Follow the project rules.",
+      });
+    });
+
+    it("ignores malformed AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: 42 },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+      });
+    });
+
+    it("gives the legacy system prompt precedence over AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          systemPrompt: "legacy prompt",
+          jetbrains: {
+            air: { customInstructions: "AIR instructions" },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("legacy prompt");
+    });
+
     it("replaces the preset when a string is provided", async () => {
       await agent.newSession({
         cwd: process.cwd(),
