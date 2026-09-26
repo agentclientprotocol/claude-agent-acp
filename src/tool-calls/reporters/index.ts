@@ -3,6 +3,7 @@ import { AgentReporter } from "./agent.js";
 import { BashReporter } from "./bash.js";
 import { EditReporter, NotebookEditReporter, WriteReporter } from "./file-edit.js";
 import {
+  AgentControlReporter,
   AskUserQuestionReporter,
   ExitPlanModeReporter,
   GenericReporter,
@@ -38,6 +39,12 @@ const reporters: Record<string, ToolReporter> = {
   AskUserQuestion: new AskUserQuestionReporter(),
   Skill: new SkillReporter(),
 };
+
+/** The tools that control a subagent or a background task. */
+const AGENT_CONTROL_TOOLS = ["SendMessage", "TaskStop", "ListAgents", "Monitor"] as const;
+for (const name of AGENT_CONTROL_TOOLS) {
+  reporters[name] = new AgentControlReporter(name);
+}
 
 /** The reporter of a tool. MCP tools and unknown tools get the generic reporter. */
 export function reporterFor(toolName: string): ToolReporter {

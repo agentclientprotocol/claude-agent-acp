@@ -291,6 +291,38 @@ describe("the ACP tool call contract", () => {
     });
   });
 
+  describe("agent control tools", () => {
+    const text = (value: string) => [{ type: "content", content: { type: "text", text: value } }];
+
+    it("sends the ListAgents result to AIR as plain text", () => {
+      const list = "This session is ultimate-f5.\n\nSubagents (1): reviewer";
+      const { updates } = report(air, "ListAgents", {}, { content: list });
+      expect(updates[0]).toMatchObject({ status: "completed", content: text(list) });
+      expect(updates[0]).not.toHaveProperty("rawOutput");
+    });
+
+    it("sends the exact SendMessage and TaskStop JSON to AIR", () => {
+      for (const name of ["SendMessage", "TaskStop"]) {
+        const json = '{"success":true,"message":"Message sent"}';
+        const { updates } = report(air, name, {}, { content: [{ type: "text", text: json }] });
+        expect(updates[0]).toMatchObject({ status: "completed", content: text(json) });
+      }
+    });
+
+    it("sends an error result to AIR without a fence", () => {
+      for (const name of ["SendMessage", "TaskStop", "ListAgents", "Monitor"]) {
+        const error = "Permission to use Bash was denied.";
+        const { updates } = report(air, name, {}, { content: error, is_error: true });
+        expect(updates[0]).toMatchObject({ status: "failed", content: text(error) });
+      }
+    });
+
+    it("keeps the fenced error result for a client that is not AIR", () => {
+      const { updates } = report({}, "Monitor", {}, { content: "Denied", is_error: true });
+      expect(updates[0]).toMatchObject({ status: "failed", content: text("```\nDenied\n```") });
+    });
+  });
+
   describe("ExitPlanMode", () => {
     const input = { plan: "1. Do it" };
 

@@ -9,7 +9,7 @@ import { existsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { exitPlanModeRawOutput } from "../../exit-plan.js";
-import { textContent } from "../content.js";
+import { textContent, toAcpContentUpdate } from "../content.js";
 import type {
   ToolReporter,
   ToolResultContext,
@@ -195,6 +195,18 @@ export class GenericReporter implements ToolReporter {
       kind: "other",
       display: [textContent(`\`\`\`json\n${json}\`\`\``)],
     };
+  }
+}
+
+/**
+ * An agent control tool (SendMessage, TaskStop, ListAgents, Monitor). AIR
+ * shows the result in its own frame and parses the JSON result of SendMessage
+ * and TaskStop. So AIR gets the error text as plain text, without a fence.
+ * A client that is not AIR gets the fenced error text.
+ */
+export class AgentControlReporter extends GenericReporter {
+  errorResult({ result, capabilities }: ToolResultContext): ToolResultFacts | undefined {
+    return capabilities.air.client ? toAcpContentUpdate(result.content, false) : undefined;
   }
 }
 
