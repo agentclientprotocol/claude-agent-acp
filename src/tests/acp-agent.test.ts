@@ -6169,6 +6169,149 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(bashUpdate).toMatchObject({ status: "completed" });
     expect(bashUpdate?._meta ?? {}).not.toHaveProperty("jetbrains");
   });
+
+  it("sends the background tasks of a subagent to its session and keeps a root task in the root", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities & { subagents: Record<string, never> },
+    });
+    const assistant = (parentToolUseId: string | null, content: unknown[]) => ({
+      type: "assistant",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: { role: "assistant", content, usage: SUBAGENT_TEST_USAGE },
+    });
+    const backgroundTask = (taskId: string, toolUseId: string, description: string) => ({
+      type: "system",
+      subtype: "task_started",
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      task_type: "local_bash",
+      description,
+      is_backgrounded: true,
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    const taskNotification = (taskId: string, toolUseId: string) => ({
+      type: "system",
+      subtype: "task_notification",
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      status: "completed",
+      output_file: "",
+      summary: "done",
+      uuid: randomUUID(),
+      session_id: "test-session",
+    });
+    let tasksStarted!: () => void;
+    const started = new Promise<void>((resolve) => (tasksStarted = resolve));
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    injectGeneratorSession(agent, (input) => {
+      async function* messages() {
+        const iter = input[Symbol.asyncIterator]();
+        const user = await iter.next();
+        yield userEcho(user.value);
+        yield assistant(null, [
+          {
+            type: "tool_use",
+            id: "toolu_agent",
+            name: "Agent",
+            input: { description: "Investigate", prompt: "Find the bug" },
+          },
+        ]);
+        yield { ...taskStarted("agent-1", "toolu_agent"), subagent_type: "Explore" };
+        yield assistant("toolu_agent", [
+          {
+            type: "tool_use",
+            id: "child-bash",
+            name: "Bash",
+            input: { command: "npm test", run_in_background: true },
+          },
+          {
+            type: "tool_use",
+            id: "child-monitor",
+            name: "Monitor",
+            input: { command: "tail -f build.log", description: "watch the build log" },
+          },
+        ]);
+        yield backgroundTask("shell-child", "child-bash", "npm test");
+        yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
+        yield assistant(null, [
+          {
+            type: "tool_use",
+            id: "root-bash",
+            name: "Bash",
+            input: { command: "npm run build", run_in_background: true },
+          },
+        ]);
+        yield backgroundTask("shell-root", "root-bash", "npm run build");
+        yield taskNotification("shell-child", "child-bash");
+        yield taskNotification("shell-root", "root-bash");
+        tasksStarted();
+        await released;
+        yield taskNotification("agent-1", "toolu_agent");
+        yield successResult();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      return messages();
+    });
+    const query = agent.sessions["test-session"].query as any;
+
+    const prompt = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await started;
+    // AIR stops a task with the root session id and the SDK task id.
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
+    ).resolves.toEqual({ stopped: true });
+    release();
+    await prompt;
+
+    expect(query.stopTask).toHaveBeenCalledWith("monitor-child");
+    const lifecycle = updates.flatMap(({ sessionId, update }) =>
+      "asyncTaskId" in update
+        ? [[sessionId, update.sessionUpdate, update.asyncTaskId, (update as any).state]]
+        : [],
+    );
+    expect(lifecycle).toEqual([
+      ["agent-1", "async_task_spawned", "shell-child", undefined],
+      ["agent-1", "async_task_spawned", "monitor-child", undefined],
+      ["test-session", "async_task_spawned", "shell-root", undefined],
+      ["agent-1", "async_task_state_update", "shell-child", "completed"],
+      ["test-session", "async_task_state_update", "shell-root", "completed"],
+      ["agent-1", "async_task_state_update", "monitor-child", "stopped"],
+    ]);
+    // The stop acknowledgement goes to the transcript that holds the task.
+    const stopAcknowledgement = updates.find(
+      ({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text" &&
+        update.content.text.includes("Task stopped by user"),
+    );
+    expect(stopAcknowledgement?.sessionId).toBe("agent-1");
+    // The tool call that started each task is in the same session as the task.
+    const toolCallSession = (toolCallId: string) =>
+      updates.find(
+        ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === toolCallId,
+      )?.sessionId;
+    expect(toolCallSession("child-bash")).toBe("agent-1");
+    expect(toolCallSession("child-monitor")).toBe("agent-1");
+    expect(toolCallSession("root-bash")).toBe("test-session");
+  });
 });
 
 describe("native subagent eager tool ownership", () => {

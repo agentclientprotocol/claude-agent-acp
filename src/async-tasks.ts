@@ -4,6 +4,8 @@ import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-e
 import { noticeOrTranscriptUpdate } from "./session-notices.js";
 
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
+/** Moves an update to its owner session, or drops it with `null`. */
+type Route = (notification: AcpSessionNotification) => AcpSessionNotification | null;
 type TerminalSource = "event" | "level" | "shutdown";
 
 type AsyncTask = {
@@ -14,6 +16,12 @@ type AsyncTask = {
   showInTranscript: boolean;
   outputFilePath?: string;
   toolCallId?: string;
+  /**
+   * The route to the session of the tool call that started the task. The
+   * spawn sets it, so every update of the task goes to one session. A task
+   * without a route stays in the root session.
+   */
+  route?: Route;
   announced: boolean;
   /**
    * Whether the spawn waits for the tool call id. The updates of a held task
@@ -110,8 +118,13 @@ export class AsyncTaskRuntime {
     private readonly sessionId: string,
     private readonly publish: Publish,
     /** `notices`: the client can present `notice` updates, so the stop
-     *  acknowledgement need not be a transcript line. */
-    private readonly options: { notices?: boolean } = {},
+     *  acknowledgement need not be a transcript line. `routeOf`: the route of
+     *  the tasks that a tool call in another session started, for example in
+     *  a native subagent session. */
+    private readonly options: {
+      notices?: boolean;
+      routeOf?: (toolCallId: string) => Route | undefined;
+    } = {},
   ) {}
 
   async taskStarted(message: AsyncTaskStarted): Promise<void> {
@@ -401,13 +414,13 @@ export class AsyncTaskRuntime {
     // `showInTranscript` does not gate it either: that flag decides whether the
     // task owns a transcript *card* (a background Bash task is already drawn as
     // its tool call), not whether the agent may answer a direct user action.
-    await this.publish({
-      sessionId: this.sessionId,
-      update: noticeOrTranscriptUpdate(
+    await this.send(
+      task,
+      noticeOrTranscriptUpdate(
         { severity: "info", title: "Task stopped by user", description: `${task.name}.` },
         this.options.notices ?? false,
       ),
-    });
+    );
   }
 
   /**
@@ -532,19 +545,17 @@ export class AsyncTaskRuntime {
       task.held = true;
       return;
     }
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_spawned",
-        asyncTaskId: task.id,
-        name: task.name,
-        taskType: task.taskType,
-        description: task.description,
-        showInTranscript: task.showInTranscript,
-        canStop: true,
-        ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
-        ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
-      },
+    if (task.toolCallId) task.route ??= this.options.routeOf?.(task.toolCallId);
+    await this.send(task, {
+      sessionUpdate: "async_task_spawned",
+      asyncTaskId: task.id,
+      name: task.name,
+      taskType: task.taskType,
+      description: task.description,
+      showInTranscript: task.showInTranscript,
+      canStop: true,
+      ...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
+      ...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
     });
     task.announced = true;
     task.held = false;
@@ -622,13 +633,10 @@ export class AsyncTaskRuntime {
   ): Promise<void> {
     const changed = changedFields(task, update);
     if (Object.keys(changed).length === 0) return;
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_progress",
-        asyncTaskId: task.id,
-        ...changed,
-      },
+    await this.send(task, {
+      sessionUpdate: "async_task_progress",
+      asyncTaskId: task.id,
+      ...changed,
     });
     recordPublished(task, changed);
   }
@@ -643,17 +651,21 @@ export class AsyncTaskRuntime {
       outputFilePath: task.outputFilePath,
       toolCallId: task.toolCallId,
     });
-    await this.publish({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: "async_task_state_update",
-        asyncTaskId: task.id,
-        state,
-        ...(summary ? { summary } : {}),
-        ...changed,
-      },
+    await this.send(task, {
+      sessionUpdate: "async_task_state_update",
+      asyncTaskId: task.id,
+      state,
+      ...(summary ? { summary } : {}),
+      ...changed,
     });
     recordPublished(task, changed);
+  }
+
+  /** Publishes an update of the task in the session that owns the task. */
+  private async send(task: AsyncTask, update: AcpSessionNotification["update"]): Promise<void> {
+    const notification: AcpSessionNotification = { sessionId: this.sessionId, update };
+    const routed = task.route ? task.route(notification) : notification;
+    if (routed) await this.publish(routed);
   }
 }
 

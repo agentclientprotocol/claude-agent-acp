@@ -3574,7 +3574,16 @@ export class ClaudeAcpAgent {
       clientSupportsAsyncTasks(this.clientCapabilities),
       params.sessionId,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
-      { notices: supportsNotices },
+      {
+        notices: supportsNotices,
+        // A task that a subagent tool call started belongs to the child
+        // session of that tool call, like the tool call itself.
+        routeOf: (toolCallId) =>
+          session.nativeSubagentRuntime?.routeOfToolCall(
+            toolCallId,
+            session.eagerToolCallSessions?.get(toolCallId),
+          ),
+      },
     ));
 
     const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification), {

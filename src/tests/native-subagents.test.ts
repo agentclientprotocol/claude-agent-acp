@@ -622,6 +622,66 @@ describe("NativeSubagentRuntime lifecycle", () => {
       expect(sendMessageResumePrompt(toolUses, "worker-3")).toBeUndefined();
     });
 
+    it("keeps the work of a child tool call in the generation that started it", async () => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        true,
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+      );
+      await runtime.route(
+        {
+          ...control("tool_call", "pending"),
+          update: { ...control("tool_call", "pending").update, toolCallId: "launch-1" },
+        } as AcpSessionNotification,
+        async () => {},
+      );
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        async () => {},
+      );
+      const childToolCall = {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "child-bash",
+          title: "npm test",
+          _meta: { claudeCode: { toolName: "Bash", parentToolUseId: "launch-1" } },
+        },
+      } as AcpSessionNotification;
+      await expect(runtime.route(childToolCall, async () => {})).resolves.toMatchObject({
+        sessionId: "worker-1",
+      });
+      const taskUpdate = {
+        sessionId: "root",
+        update: { sessionUpdate: "async_task_progress", asyncTaskId: "shell-1" },
+      } as AcpSessionNotification;
+
+      const route = runtime.routeOfToolCall("child-bash");
+      expect(route?.(taskUpdate)).toMatchObject({ sessionId: "worker-1" });
+      expect(runtime.routeOfToolCall("root-bash")).toBeUndefined();
+      // A permission request created this tool call in the child session.
+      expect(runtime.routeOfToolCall("eager-bash", "worker-1")?.(taskUpdate)).toMatchObject({
+        sessionId: "worker-1",
+      });
+      expect(runtime.routeOfToolCall("eager-bash", "root")).toBeUndefined();
+
+      await runtime.finishTask("worker-1", "completed", async () => {});
+      await runtime.taskResumed("worker-1", async () => {});
+
+      // The task started in the first generation: it never moves to the second.
+      expect(lifecycle(published).at(-1)).toEqual([
+        "root",
+        "subagent_spawned",
+        "worker-1:generation:2",
+      ]);
+      expect(route?.(taskUpdate)).toBeNull();
+    });
+
     it("ignores a late update of a completed child without a resume signal", async () => {
       const { runtime, published, logged } = await finishedWorker("completed");
 

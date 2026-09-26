@@ -140,16 +140,21 @@ export class NativeSubagentRuntime {
       return forcedSessionId ? { ...notification, sessionId: forcedSessionId } : null;
     }
 
-    // A permission request may have had to create the tool call before native
-    // child ownership was known. Keep every later update in that original ACP
-    // session; moving a lifecycle after its initial call creates an orphan in
-    // both transcripts.
-    if (forcedSessionId) return { ...notification, sessionId: forcedSessionId };
-
     const toolCallId =
       update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update"
         ? update.toolCallId
         : undefined;
+
+    // A permission request may have had to create the tool call before native
+    // child ownership was known. Keep every later update in that original ACP
+    // session; moving a lifecycle after its initial call creates an orphan in
+    // both transcripts.
+    if (forcedSessionId) {
+      const forcedChild = this.childOfSession(forcedSessionId);
+      if (toolCallId && forcedChild) this.rememberToolCallOwner(toolCallId, forcedChild);
+      return { ...notification, sessionId: forcedSessionId };
+    }
+
     const owner = toolCallId ? this.childByToolCall.get(toolCallId) : undefined;
     if (owner) return this.toChild(owner, notification, toolCallId);
 
@@ -312,15 +317,45 @@ export class NativeSubagentRuntime {
       );
       return null;
     }
-    if (toolCallId) {
-      this.childByToolCall.delete(toolCallId);
-      this.childByToolCall.set(toolCallId, child);
-      if (this.childByToolCall.size > MAX_CHILD_TOOL_CALLS) {
-        const oldest = this.childByToolCall.keys().next().value;
-        if (oldest !== undefined) this.childByToolCall.delete(oldest);
-      }
-    }
+    if (toolCallId) this.rememberToolCallOwner(toolCallId, child);
     return { ...notification, sessionId: child.sessionId };
+  }
+
+  /**
+   * The route of the work that a child tool call started, for example an async
+   * task. The route sends each update to the child generation that owned the
+   * tool call when the work started, and drops the update after that child
+   * finished. `undefined` means that the root session owns the tool call.
+   * `eagerSessionId` is the session where a permission request created the
+   * tool call before the stream routed it.
+   */
+  routeOfToolCall(
+    toolCallId: string,
+    eagerSessionId?: string,
+  ): ((notification: AcpSessionNotification) => AcpSessionNotification | null) | undefined {
+    if (!this.enabled) return undefined;
+    const owner =
+      this.childByToolCall.get(toolCallId) ??
+      (eagerSessionId ? this.childOfSession(eagerSessionId) : undefined);
+    return owner && ((notification) => this.toChild(owner, notification, undefined));
+  }
+
+  private rememberToolCallOwner(toolCallId: string, child: NativeSubagent): void {
+    this.childByToolCall.delete(toolCallId);
+    this.childByToolCall.set(toolCallId, child);
+    if (this.childByToolCall.size > MAX_CHILD_TOOL_CALLS) {
+      const oldest = this.childByToolCall.keys().next().value;
+      if (oldest !== undefined) this.childByToolCall.delete(oldest);
+    }
+  }
+
+  /** The child generation with the ACP session `sessionId`, if one exists. */
+  private childOfSession(sessionId: string): NativeSubagent | undefined {
+    if (sessionId === this.rootSessionId) return undefined;
+    for (const child of this.children.values()) {
+      if (child.sessionId === sessionId) return child;
+    }
+    return undefined;
   }
 
   clear(): void {

@@ -64,6 +64,59 @@ describe("AsyncTaskRuntime", () => {
     });
   });
 
+  it("sends every update of a task to the session that owned its tool call at the spawn", async () => {
+    const published: AcpSessionNotification[] = [];
+    let owner: string | undefined = "child";
+    const runtime = new AsyncTaskRuntime(
+      true,
+      "root",
+      async (notification) => {
+        published.push(notification);
+      },
+      {
+        routeOf: (toolCallId) => {
+          const sessionId = owner;
+          return toolCallId === "child-tool" && sessionId
+            ? (notification) => ({ ...notification, sessionId })
+            : undefined;
+        },
+      },
+    );
+
+    await runtime.taskStarted({
+      taskId: "child-task",
+      taskType: "local_bash",
+      isBackgrounded: true,
+      toolCallId: "child-tool",
+    });
+    await runtime.taskStarted({
+      taskId: "root-task",
+      taskType: "local_bash",
+      isBackgrounded: true,
+      toolCallId: "root-tool",
+    });
+    owner = "later-child";
+    await runtime.taskProgress({ taskId: "child-task", summary: "halfway" });
+    expect(runtime.claimStop("child-task")).toBe(true);
+    await runtime.taskStopped("child-task");
+    await runtime.taskNotification("root-task", "completed");
+
+    expect(
+      published.map(({ sessionId, update }) => [
+        sessionId,
+        update.sessionUpdate,
+        "asyncTaskId" in update ? update.asyncTaskId : undefined,
+      ]),
+    ).toEqual([
+      ["child", "async_task_spawned", "child-task"],
+      ["root", "async_task_spawned", "root-task"],
+      ["child", "async_task_progress", "child-task"],
+      ["child", "async_task_state_update", "child-task"],
+      ["child", "agent_message_chunk", undefined],
+      ["root", "async_task_state_update", "root-task"],
+    ]);
+  });
+
   it("publishes a stopped terminal after a task-specific stop", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
