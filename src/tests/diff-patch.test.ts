@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { applyPatch } from "diff";
 import { afterEach, describe, expect, it } from "vitest";
@@ -153,6 +154,18 @@ describe("approval patch previews", () => {
       await previewPatchContent("Write", { file_path: missing, content: "a\r\nb\r\n" }),
     ).toEqual([{ type: "diff", path: missing, oldText: null, newText: "a\r\nb\r\n" }]);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "returns no preview for a FIFO without waiting for a writer",
+    async () => {
+      const fifo = await temporaryFile(undefined, "pipe");
+      execFileSync("mkfifo", [fifo]);
+
+      expect(
+        await previewPatchContent("Edit", { file_path: fifo, old_string: "a", new_string: "b" }),
+      ).toBeUndefined();
+    },
+  );
 
   it("returns no preview when a replace_all result can exceed the size limit", async () => {
     const longText = "b".repeat(4096);

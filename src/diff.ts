@@ -1,6 +1,7 @@
 import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk";
 import { structuredPatch } from "diff";
-import { readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { type FileHandle, open } from "node:fs/promises";
 import path from "node:path";
 import { AIR_DIFF_PATCH_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { normalizeWriteInput } from "./tool-calls/reporters/file-edit.js";
@@ -503,13 +504,32 @@ function filePatch(
  * CR.
  */
 async function readPatchSource(filePath: string): Promise<string | null | undefined> {
+  let handle: FileHandle;
   try {
-    const stats = await stat(filePath);
-    if (!stats.isFile() || stats.size > MAX_PATCH_FILE_BYTES) return undefined;
-    const text = decodeFileText(await readFile(filePath));
-    return text?.includes("\r") ? undefined : text;
+    // O_NONBLOCK keeps the open of a FIFO from waiting for a writer. It does not change a regular file.
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (error) {
     return isMissingFileError(error) ? null : undefined;
+  }
+  try {
+    // The checks and the read use one open file, so a swap of the path between them has no effect.
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.size > MAX_PATCH_FILE_BYTES) return undefined;
+    // One byte more than the checked size shows a file that grew after the check.
+    const buffer = Buffer.alloc(stats.size + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > stats.size) return undefined;
+    const text = decodeFileText(buffer.subarray(0, length));
+    return text?.includes("\r") ? undefined : text;
+  } catch {
+    return undefined;
+  } finally {
+    await handle.close();
   }
 }
 
