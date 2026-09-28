@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.82.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.2...v0.82.0) (2026-09-28)
+
+
+### Features
+
+* AIR tool call contract, exact git patches, plan file, and fixes for every client ([#1153](https://github.com/agentclientprotocol/claude-agent-acp/issues/1153)) ([875d75f](https://github.com/agentclientprotocol/claude-agent-acp/commit/875d75f2a4941d9c6313ed51f89da0f42443ac2f))
+
+
+### Bug Fixes
+
+* use ACP auth errors without access updates ([#1179](https://github.com/agentclientprotocol/claude-agent-acp/issues/1179)) ([e6681d2](https://github.com/agentclientprotocol/claude-agent-acp/commit/e6681d2a5734857727352474c8c9aa848f9210ee))
+
 ## [0.81.2](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.1...v0.81.2) (2026-09-24)
 
 
