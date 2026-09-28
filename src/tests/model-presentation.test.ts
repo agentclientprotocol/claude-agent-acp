@@ -156,7 +156,7 @@ describe("versioned model display names", () => {
 // Account-dependent model availability requires the same authenticated environment
 // as the adapter. No prompt is sent: inspect only the SDK initialization response.
 it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
-  "the real SDK exposes one named Opus with the expected context suffix",
+  "the real SDK exposes one plain Opus row",
   async () => {
     let finishInput!: () => void;
     const inputGate = new Promise<void>((resolve) => {
@@ -178,12 +178,14 @@ it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
           /\bopus\b/i.test(`${model.value} ${model.resolvedModel} ${model.displayName}`),
       );
       expect(opusModels).toHaveLength(1);
+      // CLI 2.1.283 dropped the "[1m]" / "(1M context)" spelling from the Opus
+      // row: Opus is natively 1M, so the row names the plain model.
       expect(opusModels[0]).toMatchObject({
-        value: "opus[1m]",
-        displayName: "Opus (1M context)",
-        resolvedModel: expect.stringMatching(/^claude-opus-.*\[1m\]$/),
-        description: expect.stringContaining("1M context"),
+        value: "opus",
+        displayName: "Opus",
+        resolvedModel: expect.stringMatching(/^claude-opus-[\d-]+$/),
       });
+      expect(opusModels[0].description).not.toMatch(/\b1m\b/i);
     } finally {
       clearTimeout(timeout);
       finishInput();
