@@ -833,6 +833,9 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
+   *  init re-emit logs a plugin load failure once, not every turn. */
+  loggedPluginErrors?: string;
   /** The long-lived consumer task. Lazily started on the first `prompt()` and
    *  kept alive for the session so between-turn/background messages are still
    *  drained and forwarded. */
@@ -4589,6 +4592,20 @@ export class ClaudeAcpAgent {
                     // Advisory reconcile only — the client keeps its current
                     // (unfiltered) list; never fail the turn over it.
                     this.logger.error(`Failed to re-advertise slash commands: ${error}`);
+                  }
+                }
+                // Plugin load failures (CLI 2.1.283+) have no ACP surface;
+                // log them so a missing plugin isn't silent.
+                if (message.plugin_errors?.length) {
+                  const pluginErrors = JSON.stringify(message.plugin_errors);
+                  if (pluginErrors !== session.loggedPluginErrors) {
+                    session.loggedPluginErrors = pluginErrors;
+                    for (const error of message.plugin_errors) {
+                      this.logger.error(
+                        `Plugin ${error.plugin} failed to load (${error.type})` +
+                          `${error.path ? ` from ${error.path}` : ""}: ${error.message}`,
+                      );
+                    }
                   }
                 }
                 break;
@@ -8873,10 +8890,12 @@ export class ClaudeAcpAgent {
       }
 
       // Apply user's `availableModels` allowlist from settings.json before any
-      // downstream model handling. The SDK only enforces this allowlist in its
-      // own UI, not in `initializationResult.models`, so we filter here to keep
-      // configOptions, the current-model resolver, and the stored modelInfos
-      // consistent with what the user configured.
+      // downstream model handling. `initializationResult.models` is already
+      // policy-filtered by the CLI; we rebuild the picker from the allowlist
+      // so the user's exact spellings (and `modelOverrides` targets) are the
+      // values passed to `setModel`, keeping configOptions, the current-model
+      // resolver, and the stored modelInfos consistent with what the user
+      // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
       const allowedModels = Array.isArray(settingsAvailableModels)
@@ -8884,6 +8903,7 @@ export class ClaudeAcpAgent {
             initializationResult.models,
             settingsAvailableModels,
             settingsModelOverrides,
+            settingsManager.getManagedDeniedModels(),
           )
         : initializationResult.models;
 
@@ -10310,6 +10330,7 @@ export function toAcpNotifications(
       case "compaction_delta":
       case "advisor_tool_result":
       case "fallback":
+      case "mcp_tool_listing":
         break;
 
       default:

@@ -49,6 +49,7 @@ export interface SettingsManagerOptions {
 export class SettingsManager {
   private cwd: string;
   private effective: Settings = {};
+  private managedDeniedModels: string[] = [];
   private watchers: fs.FSWatcher[] = [];
   private onChange?: () => void;
   private logger: { log: (...args: any[]) => void; error: (...args: any[]) => void };
@@ -106,9 +107,14 @@ export class SettingsManager {
     try {
       const resolved = await resolveSettings({ cwd: this.cwd });
       this.effective = filterEscalatingDefaultMode(resolved);
+      // The CLI reads `deniedModels` from managed settings only.
+      this.managedDeniedModels = resolved.sources
+        .filter((entry) => entry.source === "managed")
+        .flatMap((entry) => entry.settings.deniedModels ?? []);
     } catch (error) {
       this.logger.error("Failed to resolve settings:", error);
       this.effective = {};
+      this.managedDeniedModels = [];
     }
   }
 
@@ -169,6 +175,14 @@ export class SettingsManager {
    */
   getSettings(): Settings {
     return this.effective;
+  }
+
+  /**
+   * `deniedModels` entries from the managed tier, the only tier the CLI
+   * honors them from.
+   */
+  getManagedDeniedModels(): string[] {
+    return this.managedDeniedModels;
   }
 
   /**

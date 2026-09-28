@@ -5,6 +5,7 @@ import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   resolveModelPreference,
   applyAvailableModelsAllowlist,
+  isDeniedModel,
   matchResumedModel,
 } from "../session-model.js";
 import { settingsEffortForModel } from "../session-effort.js";
@@ -231,6 +232,49 @@ describe("applyAvailableModelsAllowlist - modelOverrides", () => {
       supportsEffort: true,
       supportedEffortLevels: ["low", "high"],
     });
+  });
+});
+
+describe("applyAvailableModelsAllowlist - managed deniedModels", () => {
+  it("drops an allowlisted model that deniedModels blocks, keeping Default", () => {
+    const result = applyAvailableModelsAllowlist(
+      LIVE_SHAPED_MODELS,
+      ["claude-sonnet-5", "claude-opus-5-5"],
+      undefined,
+      ["claude-opus-5"],
+    );
+    expect(result.map((m) => m.value)).toEqual(["default", "claude-sonnet-5"]);
+  });
+
+  it("checks an alias entry against the row it resolves to", () => {
+    const result = applyAvailableModelsAllowlist(LIVE_SHAPED_MODELS, ["sonnet"], undefined, [
+      "claude-sonnet-5",
+    ]);
+    expect(result.map((m) => m.value)).toEqual(["default"]);
+  });
+});
+
+describe("isDeniedModel", () => {
+  it("blocks every spelling of a denied version and its later minors", () => {
+    const denied = ["claude-opus-5"];
+    expect(isDeniedModel("claude-opus-5", denied)).toBe(true);
+    expect(isDeniedModel("claude-opus-5-20260101", denied)).toBe(true);
+    expect(isDeniedModel("claude-opus-5[1m]", denied)).toBe(true);
+    expect(isDeniedModel("us.anthropic.claude-opus-5-v1:0", denied)).toBe(true);
+    expect(isDeniedModel("claude-opus-5-5", denied)).toBe(true);
+    expect(isDeniedModel("claude-opus-4-8", denied)).toBe(false);
+  });
+
+  it("blocks only that version when the entry names a minor", () => {
+    expect(isDeniedModel("claude-opus-5", ["claude-opus-5-5"])).toBe(false);
+    expect(isDeniedModel("claude-opus-5-5-fast", ["claude-opus-5-5"])).toBe(true);
+  });
+
+  it("blocks a whole family for a family alias and ignores settings-dependent aliases", () => {
+    expect(isDeniedModel("claude-haiku-4-5-20251001", ["haiku"])).toBe(true);
+    expect(isDeniedModel("haiku", ["haiku"])).toBe(true);
+    expect(isDeniedModel("claude-sonnet-5", ["haiku"])).toBe(false);
+    expect(isDeniedModel("claude-opus-5", ["default", "best", "opusplan"])).toBe(false);
   });
 });
 

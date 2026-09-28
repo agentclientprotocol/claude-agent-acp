@@ -260,6 +260,39 @@ function resolveSettingsModel(
   return resolveModelPreference(models, settingsModel);
 }
 
+const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
+
+/** A model id without the spellings `deniedModels` ignores: provider
+ *  prefixes, dates, version suffixes, `-fast` and context hints. */
+function normalizeDeniedModelId(value: string): string {
+  let id = stripContextHints(value.trim().toLowerCase());
+  const providerPrefix = id.lastIndexOf("anthropic.");
+  if (providerPrefix !== -1) id = id.slice(providerPrefix + "anthropic.".length);
+  return id
+    .replace(/@.*$/, "")
+    .replace(/-v\d+(?::\d+)?$/, "")
+    .replace(/-fast$/, "")
+    .replace(/-\d{8}$/, "");
+}
+
+/**
+ * Whether managed `deniedModels` blocks a model id, following the CLI's rules
+ * closely enough for the picker: a family alias blocks the whole family, and a
+ * model id blocks that version in every spelling plus the later minor versions
+ * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). The CLI stays
+ * the enforcer; this only keeps the picker from offering a refused row.
+ */
+export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
+  const id = normalizeDeniedModelId(modelId);
+  if (!id) return false;
+  return deniedModels.some((entry) => {
+    const denied = normalizeDeniedModelId(entry);
+    if (!denied) return false;
+    if (MODEL_FAMILY_ALIASES.has(denied)) return id === denied || id.includes(`-${denied}`);
+    return id === denied || id.startsWith(`${denied}-`);
+  });
+}
+
 /**
  * Restrict the SDK's model list to the user's `availableModels` allowlist
  * (already merged-and-deduped across settings sources by `SettingsManager`).
@@ -275,11 +308,14 @@ function resolveSettingsModel(
  * - `undefined` is handled by the caller (no allowlist applied).
  * - The Default option is unaffected by `availableModels` — it always remains
  *   available, even when the allowlist is `[]`.
+ * - Managed `deniedModels` wins over the allowlist, so a denied entry is
+ *   dropped even though the CLI would otherwise leave it unmatched.
  */
 export function applyAvailableModelsAllowlist(
   sdkModels: ModelInfo[],
   allowlist: string[],
   settingsModelOverrides?: Record<string, string>,
+  deniedModels: readonly string[] = [],
 ): ModelInfo[] {
   // Default is always preserved per the docs. Synthesize one if the SDK
   // didn't surface it so downstream code (e.g. `getAvailableModels` picking
@@ -310,6 +346,13 @@ export function applyAvailableModelsAllowlist(
     if (seen.has(effective)) continue;
 
     const sdkMatch = resolveModelPreference(sdkModelsWithoutDefault, trimmed);
+    if (
+      [trimmed, effective, sdkMatch?.resolvedModel].some(
+        (id) => id != null && isDeniedModel(id, deniedModels),
+      )
+    ) {
+      continue;
+    }
     if (sdkMatch) {
       result.push({ ...sdkMatch, value: effective });
     } else {
