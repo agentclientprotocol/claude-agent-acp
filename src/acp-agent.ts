@@ -76,6 +76,7 @@ import {
   Query,
   query,
   SDKAssistantMessageError,
+  type SDKRateLimitInfo,
   SDKActiveGoalMessage,
   SDKMessage,
   SDKMessageOrigin,
@@ -3614,7 +3615,24 @@ export class ClaudeAcpAgent {
       logError: (message, error) => this.logger.error(message, error),
     });
     session.contextCompaction = compaction;
+    // A rate-limit event can precede the first usage snapshot. Keep the latest
+    // one until an actual usage update can carry it to the client.
+    let pendingRateLimitInfo: SDKRateLimitInfo | null = null;
     const sendUpdate = async (notification: AcpSessionNotification) => {
+      const rateLimitInfo =
+        notification.sessionId === params.sessionId &&
+        notification.update.sessionUpdate === "usage_update"
+          ? pendingRateLimitInfo
+          : null;
+      if (rateLimitInfo !== null) {
+        notification = {
+          ...notification,
+          update: {
+            ...notification.update,
+            _meta: { ...notification.update._meta, "_claude/rateLimit": rateLimitInfo },
+          },
+        };
+      }
       const { update } = notification;
       const claudeMeta = update._meta?.claudeCode as
         { parentToolUseId?: string | null; toolName?: string } | undefined;
@@ -3653,6 +3671,9 @@ export class ClaudeAcpAgent {
         }
       }
       await this.client.sessionUpdate(routedNotification);
+      if (rateLimitInfo !== null && pendingRateLimitInfo === rateLimitInfo) {
+        pendingRateLimitInfo = null;
+      }
       if (
         toolCallId &&
         update.sessionUpdate === "tool_call_update" &&
@@ -6497,6 +6518,7 @@ export class ClaudeAcpAgent {
             break;
           }
           case "rate_limit_event": {
+            pendingRateLimitInfo = message.rate_limit_info;
             if (lastAssistantTotalUsage !== null) {
               await sendUpdate({
                 sessionId: params.sessionId,
@@ -6504,7 +6526,6 @@ export class ClaudeAcpAgent {
                   sessionUpdate: "usage_update",
                   used: lastAssistantTotalUsage,
                   size: session.contextWindowSize,
-                  _meta: { "_claude/rateLimit": message.rate_limit_info },
                 }),
               });
             }
