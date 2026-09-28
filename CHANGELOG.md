@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.83.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.82.0...v0.83.0) (2026-09-28)
+
+
+### Features
+
+* **deps:** Bump @anthropic-ai/claude-agent-sdk to 0.3.283 ([#1186](https://github.com/agentclientprotocol/claude-agent-acp/issues/1186)) ([49858b5](https://github.com/agentclientprotocol/claude-agent-acp/commit/49858b527397a08d343fe2c148a5fe9e3eb84547))
+
 ## [0.82.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.81.2...v0.82.0) (2026-09-28)
 
 
