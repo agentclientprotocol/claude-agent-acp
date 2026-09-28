@@ -1155,13 +1155,11 @@ describe("session config options", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[SESSION_ID];
     }
 
-    it("sets the window from text inference on model switch, without any getContextUsage IPC", async () => {
-      // getContextUsage stalls until the session's first prompt turn, so the
-      // switch path must never call it; the window is seeded from the text
-      // heuristic (here via the new model's resolvedModel) and later confirmed
-      // by result.modelUsage.
+    it("seeds the window from text inference on model switch", async () => {
+      // The window is seeded synchronously from the text heuristic (here via
+      // the new model's resolvedModel); the background refresh never answers.
       const session = getSession();
-      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      session.query.getContextUsage = vi.fn(() => new Promise<never>(() => {}));
       session.modelInfos = session.modelInfos.map((m: ModelInfo) =>
         m.value === "claude-sonnet-4-6" ? { ...m, resolvedModel: "claude-sonnet-5[1m]" } : m,
       );
@@ -1172,15 +1170,17 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
-      expect(session.query.getContextUsage).not.toHaveBeenCalled();
       expect(session.contextWindowSize).toBe(1_000_000);
+      expect(session.contextWindowAuthoritative).toBe(false);
     });
 
-    it("falls back to the default window when inference misses, without any getContextUsage IPC", async () => {
+    it("falls back to the default window when inference misses, then refines it in the background", async () => {
       const session = getSession();
       session.contextWindowSize = 1_000_000;
-      // Present but must NOT be called; the switch never consults it.
-      session.query.getContextUsage = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      let answer!: (usage: { rawMaxTokens: number }) => void;
+      session.query.getContextUsage = vi.fn(
+        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
+      );
       // claude-sonnet-4-6 carries no "1m" token in its id, resolvedModel,
       // displayName, or description, so inference misses → default window.
 
@@ -1190,22 +1190,40 @@ describe("session config options", () => {
         value: "claude-sonnet-4-6",
       });
 
-      expect(session.query.getContextUsage).not.toHaveBeenCalled();
+      // The switch resolved without waiting for getContextUsage.
+      expect(session.query.getContextUsage).toHaveBeenCalledOnce();
       expect(session.contextWindowSize).toBe(200000);
+
+      answer({ rawMaxTokens: 967000 });
+      await vi.waitFor(() => expect(session.contextWindowSize).toBe(967000));
+      expect(session.contextWindowAuthoritative).toBe(true);
     });
 
-    it("does not call getContextUsage even when switching to a fresh model", async () => {
+    it("drops a background answer that arrives after another switch", async () => {
       const session = getSession();
-      const spy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
-      session.query.getContextUsage = spy;
+      let answer!: (usage: { rawMaxTokens: number }) => void;
+      session.query.getContextUsage = vi.fn(
+        () => new Promise<{ rawMaxTokens: number }>((resolve) => (answer = resolve)),
+      );
 
       await agent.setSessionConfigOption({
         sessionId: SESSION_ID,
         configId: "model",
         value: "claude-sonnet-4-6",
       });
+      const staleAnswer = answer;
+      await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-5",
+      });
+      const windowAfterSecondSwitch = session.contextWindowSize;
 
-      expect(spy).not.toHaveBeenCalled();
+      staleAnswer({ rawMaxTokens: 967000 });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(session.contextWindowSize).toBe(windowAfterSecondSwitch);
+      expect(session.contextWindowAuthoritative).toBe(false);
     });
 
     it("keeps the learned window when re-asserting the current model", async () => {

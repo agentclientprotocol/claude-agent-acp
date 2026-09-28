@@ -931,16 +931,16 @@ export type Session = {
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
    *  session creation and on model switches from the per-model cache or the
-   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), then confirmed —
-   *  and the cache populated — by each result's modelUsage. No extra
-   *  `getContextUsage` IPC is on these paths: before the first turn it can add
-   *  tens of seconds to both fresh and resumed sessions (see the seeding call
-   *  sites and `contextWindowCache`). */
+   *  text heuristic (DEFAULT_CONTEXT_WINDOW when both miss), refined by a
+   *  background `getContextUsage` when that seed was a guess (see
+   *  `refreshContextWindowInBackground`), then confirmed — and the cache
+   *  populated — by each result's modelUsage. No awaited IPC is on these
+   *  paths (see the seeding call sites and `contextWindowCache`). */
   contextWindowSize: number;
   contextUsedTokens?: number;
   /** Whether `contextWindowSize` came from an authoritative source (the
-   *  cross-session cache or a `result.modelUsage`) rather than the text
-   *  heuristic / default. Guards the
+   *  cross-session cache, a `result.modelUsage`, or the background
+   *  `getContextUsage`) rather than the text heuristic / default. Guards the
    *  mid-stream `message_start` heuristic upgrade: an authoritative window that
    *  happens to equal DEFAULT_CONTEXT_WINDOW must not be mistaken for "unseeded"
    *  and clobbered by a "1m" text match. */
@@ -8000,6 +8000,41 @@ export class ClaudeAcpAgent {
     });
   }
 
+  /**
+   * Replace a heuristic context window with `getContextUsage().rawMaxTokens`
+   * without blocking the caller. The text heuristic misses natively-1M models
+   * whose picker rows carry no "1m" token (`sonnet`, and since CLI 2.1.283
+   * `opus`/`default`), which would otherwise report 200k until the first
+   * result's modelUsage. Never awaited: SDK control requests are serialized,
+   * so an awaited call would delay session/new or a model switch (before the
+   * first turn it took ~15s on older CLIs, issues #886/#880; ~0.5s on 2.1.283).
+   * Not written to `contextWindowCache` — that stays keyed to the
+   * `result.modelUsage` spellings — and a result still overwrites it.
+   */
+  private refreshContextWindowInBackground(sessionId: string, session: Session): void {
+    if (session.contextWindowAuthoritative) return;
+    const { query } = session;
+    const modelId = session.models.currentModelId;
+    const stillCurrent = () =>
+      this.sessions[sessionId] === session &&
+      session.query === query &&
+      session.models.currentModelId === modelId;
+    // A synchronous throw must not fail the caller either.
+    Promise.resolve()
+      .then(() => query.getContextUsage())
+      .then(
+        (usage) => {
+          if (!stillCurrent() || session.contextWindowAuthoritative) return;
+          if (!(usage.rawMaxTokens > 0)) return;
+          session.contextWindowSize = usage.rawMaxTokens;
+          session.contextWindowAuthoritative = true;
+        },
+        (error) => {
+          if (stillCurrent()) this.logger.error("Failed to read the context window:", error);
+        },
+      );
+  }
+
   private async applyConfigOptionValue(
     sessionId: string,
     session: Session,
@@ -8014,19 +8049,16 @@ export class ClaudeAcpAgent {
       // context window for semantic aliases (e.g. `default`) whose ID alone
       // carries no "1m" token.
       const newModelInfo = session.modelInfos.find((m) => m.value === value);
-      if (session.models.currentModelId !== value) {
-        // Seed the new model's context window WITHOUT any IPC on the switch
-        // path: cached authoritative value if we've already learned it (from a
-        // prior turn's `result.modelUsage`), else the text heuristic, else the
-        // default. We deliberately do NOT call `getContextUsage` here — before
-        // a fresh session's first prompt turn that control request is not
-        // serviced (~15s stall, issues #886/#880), and (because SDK control
-        // requests are serialized over one channel) it would drag the awaited
-        // `setModel` down with it. The authoritative window arrives on the
-        // first `result.modelUsage` for the model and is cached from there;
-        // until then a switched-to alias that has never run a turn shows the
-        // heuristic/default window, which self-corrects on its first response
-        // (matches pre-0.59.0 behavior).
+      const modelChanged = session.models.currentModelId !== value;
+      if (modelChanged) {
+        // Seed the new model's context window WITHOUT awaited IPC on the
+        // switch path: cached authoritative value if we've already learned it
+        // (from a prior turn's `result.modelUsage`), else the text heuristic,
+        // else the default. SDK control requests are serialized over one
+        // channel, so an awaited `getContextUsage` here would delay the rest
+        // of the switch (issues #886/#880); a guessed seed is instead refined
+        // in the background once the switch is done
+        // (`refreshContextWindowInBackground`).
         const seeded = immediateContextWindow(session.providerCacheKey, value, newModelInfo);
         session.contextWindowSize = seeded.size;
         session.contextWindowAuthoritative = seeded.authoritative;
@@ -8168,6 +8200,8 @@ export class ClaudeAcpAgent {
       if (modeDowngraded) {
         await this.sessionModes.publishFallbackState(sessionId, session);
       }
+      // Last, so the switch's own control requests don't queue behind it.
+      if (modelChanged) this.refreshContextWindowInBackground(sessionId, session);
     } else if (configId === EFFORT_CONFIG_ID) {
       // Apply first so a rejected control request cannot leave the displayed
       // value ahead of the SDK flag layer.
@@ -9007,21 +9041,17 @@ export class ClaudeAcpAgent {
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
         await q.applyFlagSettings({ effortLevel: toSdkEffortLevel(initialEffort.currentValue) });
       }
-      // Seed the context window without extra IPC. The cached authoritative
+      // Seed the context window without awaited IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),
-      // then the text heuristic, then the default. We deliberately do NOT issue
-      // a getContextUsage call here: before the first prompt turn that control
-      // request can take tens of seconds, on resumed as well as fresh sessions.
-      // The authoritative window arrives on the first `result.modelUsage` and
-      // is cached from there.
+      // then the text heuristic, then the default. A guessed seed is refined
+      // by a background getContextUsage once the session is registered
+      // (`refreshContextWindowInBackground`); the authoritative window then
+      // arrives on the first `result.modelUsage` and is cached from there.
       //
       // Text inference alone misses aliases that resolve to extended-context
       // models with no "1m" token anywhere in their id or description (e.g.
-      // `sonnet` → claude-sonnet-5, natively ~1M): those stream
-      // `usage_update.size: 200000` until the first result's modelUsage corrects
-      // it — but the cache means only the FIRST session to ever run a turn on such
-      // a model eats that window, not every fresh session after a process
-      // restart (issue #596).
+      // `sonnet` → claude-sonnet-5, and `opus`/`default` since CLI 2.1.283,
+      // all natively ~1M) — the background refresh covers those (issue #596).
       //
       // The inference fallback is deliberately keyed to the allowlisted entry: a
       // fallback-resolved sibling's resolvedModel/displayName/description can
@@ -9097,6 +9127,7 @@ export class ClaudeAcpAgent {
         fileChangeReporter,
       };
       timing.phase("register");
+      this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
       return {
         sessionId,
@@ -10603,10 +10634,9 @@ function commonPrefixLength(a: string, b: string) {
  *  "claude-opus-4-8[1m]", "Opus 4.7 (1M context)"), so callers pass those too.
  *  This text scan can't catch every model — some resolve to extended-context
  *  models with no "1m" anywhere (e.g. `sonnet` → claude-sonnet-5, natively
- *  ~1M). Such a miss falls back to the default window and is corrected by
- *  `result.modelUsage` (and cached) within one turn. We do NOT consult the
- *  SDK's `getContextUsage` to close that gap: before the first prompt turn it
- *  can take tens of seconds (issues #886/#880, see `contextWindowCache`). */
+ *  ~1M). Such a miss falls back to the default window, is refined by the
+ *  background `getContextUsage` (`refreshContextWindowInBackground`), and is
+ *  corrected by `result.modelUsage` (and cached) within one turn. */
 function inferContextWindowFromModel(...texts: Array<string | undefined>): number | null {
   if (texts.some((text) => text != null && /\b1m\b/i.test(text))) return 1_000_000;
   return null;
@@ -10627,11 +10657,10 @@ function inferContextWindowFromModel(...texts: Array<string | undefined>): numbe
  *  verbatim live id (rows without `resolvedModel`) can hit too.
  *
  *  Populated authoritatively by each `result.modelUsage` a turn confirms (see
- *  the consumer's result handler). We deliberately never populate it from a
- *  fresh session's `getContextUsage`: before that session's first prompt turn
- *  has run the control request is not serviced (it stalls ~15s, and serializes
- *  ahead of an awaited `setModel` — issues #886/#880, regressed in 0.59.0), so
- *  it can neither beat the first `result` nor be issued cheaply before one.
+ *  the consumer's result handler). We deliberately never populate it from
+ *  `getContextUsage`: its `model` spelling and `rawMaxTokens` can differ from
+ *  the `result.modelUsage` key and window (e.g. 967000 vs 1000000 for sonnet),
+ *  so it only refines the live session (`refreshContextWindowInBackground`).
  *  Cleared on `logout`: 1M-context entitlement can differ per account/tier, so
  *  windows learned under one login must not seed sessions under the next. */
 const contextWindowCache = new Map<string, number>();

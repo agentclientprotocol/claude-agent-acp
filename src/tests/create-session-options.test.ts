@@ -852,25 +852,39 @@ describe("createSession options merging", () => {
       return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
     }
 
-    it("does not call getContextUsage during session creation", async () => {
-      // getContextUsage stalls until the session's first prompt turn has run
-      // (it is not serviced pre-turn), so session/new must never call it —
+    it("does not wait for getContextUsage during session creation", async () => {
+      // SDK control requests are serialized and getContextUsage used to stall
+      // until the first prompt turn, so session/new only kicks it off —
       // awaiting it inline is what regressed session/new latency in 0.59.0.
-      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 967000 }));
+      const ctxSpy = vi.fn(() => new Promise<never>(() => {}));
       contextUsageResult = ctxSpy;
 
-      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
 
-      expect(ctxSpy).not.toHaveBeenCalled();
+      expect(ctxSpy).toHaveBeenCalledOnce();
+      expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
-    it("seeds contextWindowSize from text inference, falling back to the default when it misses", async () => {
+    it("refines a guessed window from getContextUsage in the background", async () => {
       // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
-      // no "1m" token anywhere, so inference misses and the window falls back to
-      // the default; the authoritative value arrives later via result.modelUsage.
+      // no "1m" token anywhere, so inference misses and the seed is the default
+      // until the background getContextUsage answers.
       contextUsageResult = async () => ({ rawMaxTokens: 967000 });
 
       const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+    });
+
+    it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
+      const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
+      contextUsageResult = ctxSpy;
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalled());
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(sessionFor(response.sessionId).contextWindowSize).toBe(200000);
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
@@ -918,7 +932,7 @@ describe("createSession options merging", () => {
       expect(response.configOptions?.find((option) => option.id === "model")?.currentValue).toBe(
         "haiku",
       );
-      expect(ctxSpy).not.toHaveBeenCalled();
+      // Kicked off in the background, never awaited: it never answers here.
       expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
