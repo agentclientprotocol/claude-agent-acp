@@ -68,6 +68,11 @@ The adapter leaves out only repeated data for such a client:
 - Streamed subagent text is not sent again in full when the complete message arrives, for a client that gets the complete message.
 - A compaction summary is not sent again in full when the chunks that went out before it hold the same text.
 
+Every client gets `session/list` in pages of at most 1000 sessions.
+A page with more sessions after it has a `nextCursor`, as ACP defines.
+A client that does not follow `nextCursor` sees only the newest 1000 sessions of the directory.
+An unknown cursor gives an `invalidParams` error.
+
 `src/tests/acp-scenarios.test.ts` compares the traffic of a plain client and of Zed with recordings of origin/main.
 
 ## Negotiation
@@ -1011,16 +1016,16 @@ Without it, the existing JSON-RPC errors and transcript text stay unchanged.
 }
 ```
 
-| Field      | Required | Type                 | Meaning                                                                                            |
-| ---------- | -------: | -------------------- | -------------------------------------------------------------------------------------------------- |
-| `id`       |      yes | non-empty string     | Stable identity of one incident.                                                                   |
-| `revision` |      yes | positive integer     | Increasing version of that incident.                                                               |
-| `category` |      yes | category             | Broad visual group.                                                                                |
-| `severity` |      yes | `warning` or `error` | Inline warning or error presentation.                                                              |
-| `title`    |      yes | string               | The complete user-facing text.                                                                     |
-| `details`  |       no | string               | Long text that does not fit in `title`.                                                            |
-| `reason`   |       no | string               | A machine-readable refinement, for example of the `--hide-claude-auth` guard on a sign-in failure. |
-| `actions`  |      yes | ordered string array | Recovery actions that the adapter recommends.                                                      |
+| Field      | Required | Type                 | Meaning                                            |
+| ---------- | -------: | -------------------- | -------------------------------------------------- |
+| `id`       |      yes | non-empty string     | Stable identity of one incident.                   |
+| `revision` |      yes | positive integer     | Increasing version of that incident.               |
+| `category` |      yes | category             | Broad visual group.                                |
+| `severity` |      yes | `warning` or `error` | Inline warning or error presentation.              |
+| `title`    |      yes | string               | The complete user-facing text.                     |
+| `details`  |       no | string               | Long text that does not fit in `title`.            |
+| `reason`   |       no | string               | A machine-readable refinement of the failure kind. |
+| `actions`  |      yes | ordered string array | Recovery actions that the adapter recommends.      |
 
 The record has no `phase`, `source`, `safeMessage`, `retryable`, `retryAfterMs`, `turnId`, retry counter, or provider code.
 Retry progress goes in `title` when Claude supplies it.
@@ -1056,21 +1061,22 @@ It does not publish a clear record, and it does not delete or rewrite the entry.
 
 ### Categories and actions
 
-| Claude condition                                                              | Category     | Severity | Actions                |
-| ----------------------------------------------------------------------------- | ------------ | -------- | ---------------------- |
-| `authentication_failed`, `oauth_org_not_allowed`, the synthetic login message | `access`     | error    | `login`                |
-| `verification_required`, `cloud_credential_error`                             | `access`     | error    | `retry`                |
-| `billing_error`, `account_on_hold`, a usage or spend limit                    | `limit`      | error    | none                   |
-| `rate_limit`                                                                  | `limit`      | error    | `retry`                |
-| `max_output_tokens`, a turn limit                                             | `limit`      | error    | `new_session`          |
-| a configured session budget                                                   | `limit`      | error    | `new_session`          |
-| `invalid_request`, `model_not_found`                                          | `request`    | error    | none                   |
-| `overloaded`                                                                  | `service`    | error    | `retry`                |
-| `server_error`, an unknown provider error                                     | `service`    | error    | `retry`                |
-| an adapter internal error                                                     | `service`    | error    | `retry`, `new_session` |
-| transport loss, worker shutdown                                               | `connection` | error    | `new_session`          |
-| an API retry (`api_retry`), `connection` when no HTTP response came           | as above     | warning  | none                   |
-| a model fallback notice                                                       | `unknown`    | warning  | none                   |
+| Claude condition                                                    | Category     | Severity | Actions                |
+| ------------------------------------------------------------------- | ------------ | -------- | ---------------------- |
+| `verification_required`, `cloud_credential_error`                   | `service`    | error    | `retry`                |
+| `billing_error`, `account_on_hold`, a usage or spend limit          | `limit`      | error    | none                   |
+| `rate_limit`                                                        | `limit`      | error    | `retry`                |
+| `max_output_tokens`, a turn limit                                   | `limit`      | error    | `new_session`          |
+| a configured session budget                                         | `limit`      | error    | `new_session`          |
+| `invalid_request`, `model_not_found`                                | `request`    | error    | none                   |
+| `overloaded`                                                        | `service`    | error    | `retry`                |
+| `server_error`, an unknown provider error                           | `service`    | error    | `retry`                |
+| an adapter internal error                                           | `service`    | error    | `retry`, `new_session` |
+| transport loss, worker shutdown                                     | `connection` | error    | `new_session`          |
+| an API retry (`api_retry`), `connection` when no HTTP response came | as above     | warning  | none                   |
+| a model fallback notice                                             | `unknown`    | warning  | none                   |
+
+`authentication_failed`, `oauth_org_not_allowed`, and the synthetic login message get no session failure. The prompt ends with the ACP `authRequired` error.
 
 An unknown SDK error kind becomes `service`. It never becomes a success.
 The category drives only the icon and a generic accessibility label.
@@ -1097,7 +1103,7 @@ This rule applies also when the client declares `sessionFailure`.
 `title` is the complete normal text: what happened, the retry progress when present, and a short next step.
 The adapter copies the title from the user-facing text that Claude already sent:
 
-- the top-level assistant error text, including the synthetic usage-limit and login messages;
+- the top-level assistant error text, including the synthetic usage-limit message;
 - otherwise the terminal SDK result or error text;
 - the exact model-fallback notice for a warning.
 
@@ -1111,7 +1117,6 @@ It is not a place for status text, retry counters, provider payloads, or diagnos
 Recovery is internal adapter state and is not sent:
 
 - a restored quota failure stays active until a real model answer;
-- a sign-in failure stays active until a successful `auth_status`;
 - transport loss and worker shutdown stay active until the runtime is replaced;
 - another turn failure stops being active at a later confirmed attempt;
 - a generic success does not clear a notice.
