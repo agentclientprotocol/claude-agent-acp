@@ -14064,6 +14064,7 @@ describe("result origin handling", () => {
       );
     try {
       await processed.promise;
+      await vi.waitFor(() => expect(response).toBeDefined());
       expect(response).toEqual(expect.objectContaining({ stopReason }));
     } finally {
       finish.resolve();
@@ -14118,6 +14119,7 @@ describe("result origin handling", () => {
         expect(response).toBeUndefined();
         continueTurn.resolve();
         await userProcessed.promise;
+        await vi.waitFor(() => expect(response).toBeDefined());
         expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
       } finally {
         continueTurn.resolve();
@@ -14201,10 +14203,12 @@ describe("result origin handling", () => {
       });
       try {
         await firstProcessed.promise;
+        await vi.waitFor(() => expect(responses[0]).toBeDefined());
         expect.soft(responses[0]).toEqual(firstOutcome);
         expect(responses[1]).toBeUndefined();
         continueTurn.resolve();
         await processed.promise;
+        await vi.waitFor(() => expect(responses[1]).toBeDefined());
         expect(responses[0]).toEqual(firstOutcome);
         expect(responses[1]).toEqual(
           expect.objectContaining({
@@ -14306,6 +14310,7 @@ describe("result origin handling", () => {
         expect(response).toBeUndefined();
         continueTurn.resolve();
         await processed.promise;
+        await vi.waitFor(() => expect(response).toBeDefined());
         const tokens = {
           inputTokens: 30,
           outputTokens: 12,
@@ -14384,6 +14389,7 @@ describe("result origin handling", () => {
         await processed.promise;
         expect(responses[1]).toBeUndefined();
         if (chronological) {
+          await vi.waitFor(() => expect(responses[0]).toBeDefined());
           expect(responses[0]).toEqual(
             expect.objectContaining({
               stopReason: "end_turn",
@@ -14499,10 +14505,12 @@ describe("result origin handling", () => {
     try {
       await secondPushed.promise;
       await agent.cancel({ sessionId: "test-session" });
+      await vi.waitFor(() => expect(responses[1]).toBeDefined());
       expect(responses[0]).toBeUndefined();
       expect(responses[1]).toEqual({ stopReason: "cancelled" });
       continueTurn.resolve();
       await processed.promise;
+      await vi.waitFor(() => expect(responses[0]).toBeDefined());
       expect.soft(responses[0]).toEqual(
         expect.objectContaining({
           stopReason: "cancelled",
