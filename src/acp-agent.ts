@@ -357,6 +357,22 @@ const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
  *  a later resume (see `resumableSubagents`). */
 const MAX_RESUMABLE_SUBAGENTS = 256;
 
+/** Removes a settled task from `liveBackgroundTasks`. A subagent keeps its
+ *  parent tool call in `resumableSubagents` for a later resume. */
+function settleLiveBackgroundTask(session: Session, taskId: string): void {
+  const record = session.liveBackgroundTasks.get(taskId);
+  if (!record) return;
+  session.liveBackgroundTasks.delete(taskId);
+  if (!record.isSubagent) return;
+  const resumable = (session.resumableSubagents ??= new Map());
+  resumable.delete(taskId);
+  resumable.set(taskId, { parentToolUseId: record.parentToolUseId });
+  if (resumable.size > MAX_RESUMABLE_SUBAGENTS) {
+    const oldest = resumable.keys().next().value;
+    if (oldest !== undefined) resumable.delete(oldest);
+  }
+}
+
 /** Best-effort structured presentation for a local `/usage` turn. The command
  * itself always runs through Claude Code; null tells the consumer to forward
  * its original output unchanged. The timeout prevents an unstable control
@@ -3831,7 +3847,7 @@ export class ClaudeAcpAgent {
             continue;
           }
           if (record.endedPerLevel === "sweep-armed") {
-            session.liveBackgroundTasks.delete(taskId);
+            settleLiveBackgroundTask(session, taskId);
           } else {
             record.endedPerLevel = "sweep-armed";
           }
@@ -4040,21 +4056,7 @@ export class ClaudeAcpAgent {
       }
     };
 
-    /** Removes a settled task from `liveBackgroundTasks`. A subagent keeps its
-     *  parent tool call in `resumableSubagents` for a later resume. */
-    const settleLiveTask = (taskId: string) => {
-      const record = session.liveBackgroundTasks.get(taskId);
-      if (!record) return;
-      session.liveBackgroundTasks.delete(taskId);
-      if (!record.isSubagent) return;
-      const resumable = (session.resumableSubagents ??= new Map());
-      resumable.delete(taskId);
-      resumable.set(taskId, { parentToolUseId: record.parentToolUseId });
-      if (resumable.size > MAX_RESUMABLE_SUBAGENTS) {
-        const oldest = resumable.keys().next().value;
-        if (oldest !== undefined) resumable.delete(oldest);
-      }
-    };
+    const settleLiveTask = (taskId: string) => settleLiveBackgroundTask(session, taskId);
 
     /** Registers a settled subagent again when the SDK resumes it without a
      *  new `task_started`. The active turn is the one that resumed it, so it

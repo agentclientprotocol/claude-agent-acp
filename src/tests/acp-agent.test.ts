@@ -17396,6 +17396,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     expect(third.stopReason).toBe("end_turn");
     // The second activation deletes it (growth bound for lost bookends).
     expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-1")).toBe(false);
+    // A later SendMessage resume can still register the swept subagent again.
+    expect(agent.sessions["test-session"]!.resumableSubagents?.has("agent-1")).toBe(true);
     await agent.sessions["test-session"]?.consumer;
   });
 
