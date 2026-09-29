@@ -590,6 +590,10 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
+  /** Tools surfaced during this turn, awaiting completion or an explicit
+   *  background handoff. Intersect with emittedToolCalls at settlement so
+   *  tool_result counts even when a presentation hook is still pending. */
+  foregroundToolCallIds?: Set<string>;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -3639,6 +3643,26 @@ export class ClaudeAcpAgent {
         }
         return;
       }
+      if (
+        toolCallId &&
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
+      ) {
+        if (
+          claudeMeta?.parentToolUseId ||
+          routedNotification.sessionId !== params.sessionId ||
+          update.status === "completed" ||
+          update.status === "failed"
+        ) {
+          // A later stream frame can attribute an eager permission call to a
+          // child. It must no longer count as this turn's foreground work.
+          forgetForegroundToolCall(session, toolCallId);
+        } else if (
+          update.sessionUpdate === "tool_call" &&
+          session.emittedToolCalls.has(toolCallId)
+        ) {
+          recordForegroundToolCall(session, toolCallId);
+        }
+      }
       if (update.sessionUpdate === "agent_message_chunk") {
         if (
           !claudeMeta?.parentToolUseId &&
@@ -4053,6 +4077,7 @@ export class ClaudeAcpAgent {
       isSubagent: boolean,
     ) => {
       session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
@@ -4143,6 +4168,62 @@ export class ClaudeAcpAgent {
       const turn = session.activeTurn;
       if (!turn || turn.settled || turn.settling) {
         return;
+      }
+      // Both a result and EOF can end the turn here. Preserve cancellation
+      // and existing errors instead of replacing them with this check.
+      if (result.stopReason === "end_turn" && reportReason === "notReported") {
+        // A confirmed background task is allowed to outlive the turn.
+        const backgroundTools = new Set(
+          [...session.liveBackgroundTasks.values()].map((task) => task.parentToolUseId),
+        );
+        // Check only this turn's tools. A tool_result removes its id from
+        // emittedToolCalls even when its PostToolUse hook has not arrived yet.
+        const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
+          (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
+        );
+        if (unfinished.length > 0) {
+          const message = `Claude ended the turn without returning results for tool calls: ${unfinished.join(", ")}`;
+          this.logger.error(
+            `Session ${params.sessionId}, turn ${turn.promptUuid}, stopReason=${result.stopReason}: ${message}`,
+          );
+          // Fail every unfinished tool before reporting one error for the prompt.
+          for (const toolCallId of unfinished) {
+            // A late hook must not overwrite the failure we are about to send.
+            unregisterHookCallback(toolCallId);
+            session.emittedToolCalls.delete(toolCallId);
+            delete session.toolUseCache[toolCallId];
+            session.toolCallFields?.delete(toolCallId);
+            await sendUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId,
+                status: "failed",
+                content: [
+                  {
+                    type: "content",
+                    content: {
+                      type: "text",
+                      text: "Claude ended the turn without returning a result for this tool.",
+                    },
+                  },
+                ],
+              },
+            });
+            // Cancellation can arrive while we await the client update.
+            if (turn.settled || session.activeTurn !== turn) return;
+            if (session.cancelled) {
+              await settleActive({ ...result, stopReason: "cancelled" });
+              return;
+            }
+          }
+          await failActiveWithSessionFailure(
+            "internal_error",
+            RequestError.internalError(errorKindData("incomplete_tool_call"), message),
+            message,
+          );
+          return;
+        }
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -7598,6 +7679,15 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    // SandboxNetworkAccess is a permission-only callback, not an executing
+    // tool: the SDK does not send a tool_result for its synthetic id.
+    if (
+      !parentToolUseId &&
+      notificationSessionId === sessionId &&
+      toolName !== "SandboxNetworkAccess"
+    ) {
+      recordForegroundToolCall(session, toolCallId);
+    }
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
     const update = new AcpToolCallRenderer(this.toolCallCapabilities).toolCall(
       { id: toolCallId, name: toolName, input: toolInput },
@@ -9438,7 +9528,7 @@ function totalTokens(usage: UsageSnapshot): number {
 /** Error kinds this adapter invents itself, alongside the SDK's categorical
  *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
  *  over without ever emitting its result (issue #825). */
-type AgentErrorKind = SDKAssistantMessageError | "no_result";
+type AgentErrorKind = SDKAssistantMessageError | "no_result" | "incomplete_tool_call";
 
 /**
  * Build the `data` payload attached to a `RequestError.internalError` when we
@@ -9972,6 +10062,17 @@ function isTaskTool(toolName: string): boolean {
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+/** Streamed and permission-surfaced tools can precede the SDK's user echo. */
+function recordForegroundToolCall(session: Session, toolCallId: string): void {
+  const turn = session.activeTurn ?? session.turnQueue?.find((queued) => !queued.settled);
+  if (turn && !turn.settled) (turn.foregroundToolCallIds ??= new Set()).add(toolCallId);
+}
+
+function forgetForegroundToolCall(session: Session, toolCallId: string): void {
+  session.activeTurn?.foregroundToolCallIds?.delete(toolCallId);
+  for (const turn of session.turnQueue ?? []) turn.foregroundToolCallIds?.delete(toolCallId);
 }
 
 /** The tool-call field tracker of a session, created on first use. */
