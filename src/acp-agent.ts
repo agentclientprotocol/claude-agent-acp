@@ -2537,6 +2537,7 @@ export class ClaudeAcpAgent {
           : {}),
         steering: {
           supported: true,
+          idlePromptRequired: true,
         },
       },
     };
