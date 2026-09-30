@@ -451,6 +451,34 @@ function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
   return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
 }
 
+/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
+ *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
+ *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
+ *  adapter handles the command itself and answers with the session URL. */
+type RemoteControlQuery = Query & {
+  enableRemoteControl(
+    enabled: boolean,
+    name?: string,
+  ): Promise<{ session_url?: string; connect_url?: string }>;
+};
+
+function supportsRemoteControl(query: Query): query is RemoteControlQuery {
+  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
+}
+
+const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
+const REMOTE_CONTROL_COMMAND_ALIASES = new Set(["remote-control", "rc"]);
+
+/** Parses `/remote-control [name]` (or `/rc`) from a single-text prompt. */
+function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): { name?: string } | null {
+  const [first] = prompt;
+  if (prompt.length !== 1 || first?.type !== "text") return null;
+  const match = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(first.text.trim());
+  if (!match || !REMOTE_CONTROL_COMMAND_ALIASES.has(match[1])) return null;
+  const name = match[2]?.trim();
+  return name ? { name } : {};
+}
+
 /** Wait for a polling interval, resolving false when the session is aborted. */
 function waitUnlessAborted(milliseconds: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false);
@@ -3045,6 +3073,11 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    const remoteControlCommand = parseRemoteControlCommand(params.prompt);
+    if (remoteControlCommand && supportsRemoteControl(session.query)) {
+      return this.startRemoteControl(params.sessionId, session.query, remoteControlCommand.name);
+    }
+
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
     if (subscriptionGuard) await subscriptionGuard;
 
@@ -3111,6 +3144,28 @@ export class ClaudeAcpAgent {
     this.ensureConsumer(session, params.sessionId);
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
     return response;
+  }
+
+  private async startRemoteControl(
+    sessionId: string,
+    query: RemoteControlQuery,
+    name: string | undefined,
+  ): Promise<PromptResponse> {
+    let text: string;
+    try {
+      const result = await query.enableRemoteControl(true, name);
+      text = result.session_url
+        ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}`
+        : "Remote Control is active, but Claude Code did not return a session URL.";
+    } catch (error) {
+      this.logger.error(`Failed to enable Remote Control: ${error}`);
+      text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    });
+    return { stopReason: "end_turn" };
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -4846,6 +4901,7 @@ export class ClaudeAcpAgent {
                     availableCommands: getAvailableSlashCommands(
                       message.commands,
                       session.terminalSlashCommands,
+                      session.query,
                     ),
                   },
                 });
@@ -7976,7 +8032,11 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands, session.terminalSlashCommands),
+        availableCommands: getAvailableSlashCommands(
+          commands,
+          session.terminalSlashCommands,
+          session.query,
+        ),
       },
     });
   }
@@ -9767,6 +9827,7 @@ function getAvailableSlashCommands(
   // the CLI's own terminal, which ACP clients aren't) — filtered alongside
   // the static list. Raw CLI names, matched before the MCP rename.
   terminalCommands?: readonly string[],
+  query?: Query,
 ): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "clear",
@@ -9779,7 +9840,19 @@ function getAvailableSlashCommands(
     "todos",
   ];
 
-  return commands
+  const remoteControlCommands: AvailableCommand[] =
+    query && supportsRemoteControl(query)
+      ? [
+          {
+            name: REMOTE_CONTROL_COMMAND_NAME,
+            description:
+              "Continue this session from claude.ai/code or the Claude mobile app (optional name)",
+            input: { hint: "[session name]" },
+          },
+        ]
+      : [];
+
+  const available = commands
     .filter((command) => !terminalCommands?.includes(command.name))
     .map((command) => {
       const input = command.argumentHint
@@ -9800,6 +9873,13 @@ function getAvailableSlashCommands(
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+
+  return [
+    ...available,
+    ...remoteControlCommands.filter(
+      (command) => !available.some((existing) => existing.name === command.name),
+    ),
+  ];
 }
 
 function formatUriAsLink(uri: string): string {
