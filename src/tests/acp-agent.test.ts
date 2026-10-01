@@ -2481,7 +2481,7 @@ describe("synthetic login message (issue #863)", () => {
     expect(JSON.stringify(updates)).not.toContain("system-reminder");
   });
 
-  it("loadSession replay skips turns the harness injected, keeping what the user typed", async () => {
+  it("loadSession replay tags turns the harness injected with their origin", async () => {
     const updates: SessionNotification[] = [];
     const client = {
       sessionUpdate: async (u: SessionNotification) => {
@@ -2538,12 +2538,20 @@ describe("synthetic login message (issue #863)", () => {
       agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
     ).replaySessionHistory("s1");
 
-    const userTexts = updates.flatMap((u) =>
+    const userTurns = updates.flatMap((u) =>
       u.update.sessionUpdate === "user_message_chunk" && u.update.content.type === "text"
-        ? [u.update.content.text]
+        ? [
+            {
+              text: u.update.content.text,
+              origin: (u.update._meta?.["_claude/origin"] as { kind?: string } | undefined)?.kind,
+            },
+          ]
         : [],
     );
-    expect(userTexts).toEqual(["research bot detection"]);
+    // What the user typed replays untagged…
+    expect(userTurns[0]).toEqual({ text: "research bot detection", origin: undefined });
+    // …and the injected turns replay tagged, so a client can show them as notices.
+    expect(userTurns.slice(1).map((turn) => turn.origin)).toEqual(["peer", "task-notification"]);
   });
 
   it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
