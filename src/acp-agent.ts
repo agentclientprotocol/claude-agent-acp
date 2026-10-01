@@ -6829,6 +6829,18 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    await this.cancelTurns(params, { awaitInterrupt: true });
+  }
+
+  /** Cancel the session's turns and interrupt the SDK query. With
+   *  `awaitInterrupt: false` the interrupt is sent, but its reply is not
+   *  awaited. `teardownSession` uses that: it closes the query right after, and
+   *  the reply can queue behind a slow control request, such as the background
+   *  `getContextUsage` of a fresh session. */
+  private async cancelTurns(
+    params: CancelNotification,
+    options: { awaitInterrupt: boolean },
+  ): Promise<void> {
     this.exitPlan.cancel(params.sessionId);
     const session = this.sessions[params.sessionId];
     if (!session) {
@@ -7063,7 +7075,14 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
-    const receipt = await session.query.interrupt();
+    const interrupt = session.query.interrupt();
+    if (!options.awaitInterrupt) {
+      // The caller closes the query next, which rejects the pending reply.
+      // The receipt only adjusts orphan accounting of a live session.
+      Promise.resolve(interrupt).catch(() => {});
+      return;
+    }
+    const receipt = await interrupt;
     // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
     // lists exactly which queued messages survive the interrupt and will still
     // run. An orphaned turn whose uuid is absent was dropped by the interrupt
@@ -7169,7 +7188,7 @@ export class ClaudeAcpAgent {
       return;
     }
     try {
-      await this.cancel({ sessionId });
+      await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
     } catch (error) {
       this.logger.error(`Session ${sessionId}: cancellation failed during teardown`, error);
     }
