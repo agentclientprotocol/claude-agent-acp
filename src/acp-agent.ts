@@ -706,10 +706,14 @@ type Turn = {
   deferredSettle?: PromptResponse;
   /** Uuids of `steer()`-injected messages the SDK has not replayed back yet.
    *
-   *  A steer is normally delivered at priority `now`, so the CLI ABORTS
-   *  the running cycle: it emits its own human-origin `result` —
-   *  indistinguishable from a turn's terminal one — and the steered message runs
-   *  as a SECOND cycle. Settling at that result would answer `session/prompt`
+   *  A steer is normally delivered at priority `now`. When it lands during
+   *  generation the CLI ABORTS the running cycle: it emits its own human-origin
+   *  `result` — indistinguishable from a turn's terminal one — and the steered
+   *  message runs as a SECOND cycle. When it lands during a foreground tool call
+   *  (CLI 2.1.286) the CLI moves the tool to the background instead and either
+   *  joins the steer into the running cycle (ONE result stamped with both
+   *  uuids) or still ends that cycle early and runs the steer as a second one.
+   *  Settling at an interrupted cycle's result would answer `session/prompt`
    *  mid-work, so a steered turn's results only RECORD their outcome
    *  (`steeredSettle`) until one provably answers the steer.
    *
@@ -3414,9 +3418,12 @@ export class ClaudeAcpAgent {
    *  prompt (IJAI-1191). The steered message's own output streams via
    *  `session/update`, not this response.
    *
-   *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
-   *  own and the steered message runs as a second one, so the turn is marked
-   *  (`Turn.steeredEchoes`) to settle only once a result answers the steer.
+   *  Pre-empting generation means ABORTING: the interrupted cycle emits a
+   *  `result` of its own and the steered message runs as a second one. A steer
+   *  during a foreground tool call moves that tool (Bash, Agent, MCP) to the
+   *  background instead, and may join the running cycle (CLI 2.1.286). Either
+   *  way the turn is marked (`Turn.steeredEchoes`) to settle only once a result
+   *  answers the steer.
    *
    *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
    *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content

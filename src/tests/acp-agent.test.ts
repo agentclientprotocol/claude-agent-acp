@@ -19383,6 +19383,59 @@ describe("turn steering (_session/steering)", () => {
     await agent.sessions["test-session"]?.consumer;
   });
 
+  // CLI 2.1.286: a steer that lands during a foreground tool call moves the tool
+  // to the background and joins the running cycle instead of aborting it, so
+  // the turn ends in ONE result stamped with both the prompt and the steer.
+  it.each([
+    { name: "without an echo", echo: false },
+    { name: "with a mid-cycle echo", echo: true },
+  ])("settles a steer that joined the running cycle $name", async ({ echo }) => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        if (echo) yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: u1.value.uuid,
+          user_message_uuids: [u1.value.uuid, steered.value.uuid],
+        };
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // One cycle ran, so usage is the single result's.
+    expect(response.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+    expect(agent.sessions["test-session"].owedTrailingIdles ?? 0).toBe(0);
+  });
+
   // Issue #1114's other hang, and #1063's: the steer aborts an autonomous
   // followup, whose result counts a trailing idle that the abort then folds into
   // the one idle spanning both cycles. Absorbing that idle as debt would starve
