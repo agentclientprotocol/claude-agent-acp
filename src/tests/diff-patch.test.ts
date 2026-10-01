@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { applyPatch } from "diff";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -260,13 +260,32 @@ describe("approval patch previews", () => {
       .join("");
     const filePath = await temporaryFile(oldText);
 
-    // 200 changed lines. A diff that runs out of its time budget gives no
-    // patch, and patchText then throws.
-    const patch = patchText(
-      await previewPatchContent("Write", { file_path: filePath, content: newText }),
-    );
+    // Verify the 200-line patch independently of the runner's speed. The
+    // timeout fallback is exercised separately with an advancing clock.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const patch = patchText(
+        await previewPatchContent("Write", { file_path: filePath, content: newText }),
+      );
+      expect(applyPatch(oldText, patch)).toBe(newText);
+    } finally {
+      clock.mockRestore();
+    }
+  });
 
-    expect(applyPatch(oldText, patch)).toBe(newText);
+  it("falls back to the standard Write diff when the patch budget expires", async () => {
+    const oldText = "before\n";
+    const newText = "after\n";
+    const filePath = await temporaryFile(oldText);
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
+    try {
+      expect(await previewPatchContent("Write", { file_path: filePath, content: newText })).toEqual([
+        { type: "diff", path: filePath, oldText, newText },
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("builds patches that turn the old text into the new text", async () => {
