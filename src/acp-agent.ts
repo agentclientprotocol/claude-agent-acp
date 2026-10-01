@@ -2835,11 +2835,16 @@ export class ClaudeAcpAgent {
     }
     timing.phase("replay");
 
-    // Send available commands after replay so it doesn't interleave with history
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(params.sessionId);
-      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
-    }, 0);
+    // Send available commands after replay (so it doesn't interleave with
+    // history) and before we return (so it doesn't arrive after the
+    // `session/load` response -- see ACP-LOAD-002 / docs/protocol/v1/
+    // session-setup.mdx L2,L3,L5). The previous `setTimeout(0)` deferred
+    // this past `return result` under event-loop load, which is exactly
+    // what the requirement forbids. `startMcpAuthentication` stays
+    // fire-and-forget -- it already runs in the background on its own
+    // (an interactive OAuth flow must never block this response).
+    await this.sendAvailableCommandsUpdate(params.sessionId);
+    startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
 
     return result;
   }
@@ -7559,7 +7564,21 @@ export class ClaudeAcpAgent {
     if (this.sessions[params.sessionId]) {
       await this.teardownSession(params.sessionId);
     }
-    await deleteSession(params.sessionId);
+    try {
+      await deleteSession(params.sessionId);
+    } catch (error) {
+      // The SDK's `deleteSession` throws when there is no persisted,
+      // non-empty transcript to remove -- a session created but never
+      // prompted (ACP-DELETE-001), or a sessionId that was never valid or
+      // never created at all (ACP-DELETE-002, "Invalid sessionId: ..."). The
+      // spec treats deleting such an id as a no-op success, not a failure
+      // (docs/protocol/v1/session-delete.mdx D2), so only rethrow genuine
+      // storage failures.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/^(Invalid sessionId|Session .* not found)/.test(message)) {
+        throw error;
+      }
+    }
     return {};
   }
 
