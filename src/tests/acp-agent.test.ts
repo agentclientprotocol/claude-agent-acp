@@ -34,6 +34,7 @@ import {
   toAcpNotifications,
   promptToClaude,
   isLocalCommandMetadata,
+  isReplayHiddenMetaMessage,
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
@@ -1948,6 +1949,17 @@ describe("stripLocalCommandMetadata", () => {
     ).toBeNull();
   });
 
+  it("strips a persisted task notification, keeping what the user typed", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<task-notification>\n<task-id>bg1</task-id>\n</task-notification>\nwhat now?",
+      ),
+    ).toBe("\nwhat now?");
+    expect(
+      stripLocalCommandMetadata("<task-notification><task-id>bg1</task-id></task-notification>"),
+    ).toBeNull();
+  });
+
   it("drops reminder-only blocks from mixed arrays, keeping real blocks", () => {
     expect(
       stripLocalCommandMetadata([
@@ -2524,6 +2536,365 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(true);
     // …but the TUI-specific "/login" instruction never reaches the client.
     expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+});
+
+describe("task notification replay", () => {
+  type History = Awaited<ReturnType<typeof getSessionMessages>>;
+  const record = (fields: Record<string, unknown>) =>
+    ({
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      ...fields,
+    }) as unknown as History[number];
+  const notificationText = (status: string, toolUseId = "toolu_bash") =>
+    "<task-notification>\n<task-id>bg1</task-id>\n" +
+    `<tool-use-id>${toolUseId}</tool-use-id>\n` +
+    "<output-file>/tmp/tasks/bg1.output</output-file>\n" +
+    `<status>${status}</status>\n` +
+    '<summary>Background command "npm test" finished</summary>\n' +
+    "<note>A task-notification fires each time the task stops.</note>\n" +
+    "<result><status>failed</status></result>\n</task-notification>";
+  const notification = (status: string, fields: Record<string, unknown> = {}) =>
+    record({
+      type: "user",
+      uuid: `notification-${status}`,
+      message: { role: "user", content: notificationText(status) },
+      origin: { kind: "task-notification" },
+      ...fields,
+    });
+  const bashLaunch = [
+    record({ type: "user", uuid: "u1", message: { role: "user", content: "run the tests" } }),
+    record({
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        id: "m1",
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Bash",
+            input: { command: "npm test", run_in_background: true },
+          },
+        ],
+      },
+    }),
+    record({
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_bash",
+            content: "Command running in background with ID: bg1.",
+          },
+        ],
+      },
+    }),
+  ];
+
+  async function replay(
+    history: History,
+    capabilities: ClientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+    },
+  ): Promise<AcpSessionNotification[]> {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) =>
+          updates.push(update as AcpSessionNotification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(history);
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return updates;
+  }
+
+  const userChunks = (updates: AcpSessionNotification[]) =>
+    updates.flatMap(({ update }) =>
+      update.sessionUpdate === "user_message_chunk" && update.content.type === "text"
+        ? [update.content.text]
+        : [],
+    );
+  const asyncTaskUpdates = (updates: AcpSessionNotification[]) =>
+    updates.flatMap(({ update }) =>
+      update.sessionUpdate.startsWith("async_task_") ? [update] : [],
+    );
+
+  it("hides the notification and restores the task state like the live frame", async () => {
+    const updates = await replay([...bashLaunch, notification("completed")]);
+
+    expect(userChunks(updates)).toEqual(["run the tests"]);
+    expect(JSON.stringify(updates)).not.toContain("task-notification");
+    expect(asyncTaskUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "bg1",
+        name: "npm test",
+        taskType: "shell",
+        description: "npm test",
+        showInTranscript: true,
+        canStop: true,
+        outputFilePath: "/tmp/tasks/bg1.output",
+        toolCallId: "toolu_bash",
+      },
+      {
+        sessionUpdate: "async_task_state_update",
+        asyncTaskId: "bg1",
+        state: "completed",
+        summary: 'Background command "npm test" finished',
+      },
+    ]);
+  });
+
+  it("detects a notification without an origin by its text and maps killed to stopped", async () => {
+    const updates = await replay([...bashLaunch, notification("killed", { origin: undefined })]);
+
+    expect(userChunks(updates)).toEqual(["run the tests"]);
+    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({
+      sessionUpdate: "async_task_state_update",
+      asyncTaskId: "bg1",
+      state: "stopped",
+    });
+  });
+
+  it.each(["server_tool_use", "mcp_tool_use"])(
+    "restores a background task launched by a %s block",
+    async (type) => {
+      const launch = record({
+        ...bashLaunch[1],
+        message: {
+          role: "assistant",
+          content: [{ type, id: "toolu_bash", name: "Bash", input: { command: "npm test" } }],
+        },
+      });
+      const updates = await replay([
+        bashLaunch[0],
+        launch,
+        bashLaunch[2],
+        notification("completed"),
+      ]);
+
+      expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "async_task_state_update",
+      ]);
+      expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "completed" });
+    },
+  );
+
+  it("routes a task to the session of its launching tool even when the root receives the stop", async () => {
+    const updates = await replay(
+      [
+        ...bashLaunch.map((message, index) =>
+          index === 0 ? message : record({ ...message, parent_tool_use_id: "toolu_agent" }),
+        ),
+        notification("completed"),
+      ],
+      {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities,
+    );
+
+    const tasks = updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"));
+    expect(tasks).toHaveLength(2);
+    expect(tasks.map(({ sessionId }) => sessionId)).toEqual([
+      "s1:replay-subagent:toolu_agent",
+      "s1:replay-subagent:toolu_agent",
+    ]);
+  });
+
+  it("keeps the user text next to an embedded notification", async () => {
+    const updates = await replay([
+      ...bashLaunch,
+      record({
+        type: "user",
+        uuid: "u3",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: notificationText("failed") },
+            { type: "text", text: "why did it fail?" },
+          ],
+        },
+      }),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["run the tests", "why did it fail?"]);
+    expect(JSON.stringify(updates)).not.toContain("task-notification");
+    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "failed" });
+  });
+
+  it("sends nothing for a task that no tool call in the history started", async () => {
+    const updates = await replay([
+      record({ type: "user", uuid: "u1", message: { role: "user", content: "hi" } }),
+      notification("completed"),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["hi"]);
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+  });
+
+  it("sends one terminal state for a repeated notification", async () => {
+    const updates = await replay([
+      ...bashLaunch,
+      notification("completed"),
+      notification("completed", { uuid: "notification-again" }),
+    ]);
+
+    expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+  });
+
+  it("restores the notified state of a background Agent after its launch result", async () => {
+    const updates = await replay(
+      [
+        record({
+          type: "assistant",
+          uuid: "a1",
+          message: {
+            id: "m1",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_agent",
+                name: "Agent",
+                input: { description: "Explore", prompt: "Look around", run_in_background: true },
+              },
+            ],
+          },
+        }),
+        record({
+          type: "user",
+          uuid: "u2",
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_agent", content: "Async agent launched." },
+            ],
+          },
+        }),
+        record({
+          type: "user",
+          uuid: "u3",
+          message: { role: "user", content: notificationText("killed", "toolu_agent") },
+          origin: { kind: "task-notification" },
+        }),
+      ],
+      {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities,
+    );
+
+    expect(userChunks(updates)).toEqual([]);
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      subagentSessionId: "s1:replay-subagent:toolu_agent",
+      state: "cancelled",
+    });
+  });
+
+  it("keeps a task-notification delivery with a subkind as a prompt", async () => {
+    const updates = await replay([
+      record({
+        type: "user",
+        uuid: "u1",
+        message: { role: "user", content: "Run the nightly report" },
+        origin: { kind: "task-notification", subkind: "scheduled-trigger" },
+      }),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["Run the nightly report"]);
+  });
+});
+
+describe("meta messages from other agents, sessions and channels", () => {
+  // The shape SDK 0.3.284 getSessionMessages returns for a host-injected peer
+  // message (live probe): is_meta plus origin, content is the full framing.
+  const peerMessage = {
+    type: "user",
+    uuid: "peer-1",
+    session_id: "s1",
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+    is_meta: true,
+    origin: { kind: "peer", from: "uds:/tmp/fake.sock", hostInjected: true },
+    message: {
+      role: "user",
+      content:
+        'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/fake.sock">enveloped hi</cross-session-message>\n\nThis came from another Claude session — not typed by your user.',
+    },
+  };
+
+  it("isReplayHiddenMetaMessage matches only meta messages with an inter-agent origin", () => {
+    expect(isReplayHiddenMetaMessage(peerMessage)).toBe(true);
+    for (const kind of ["channel", "observer", "observer-activity", "slack-ping"]) {
+      expect(isReplayHiddenMetaMessage({ ...peerMessage, origin: { kind } })).toBe(true);
+    }
+    // Not meta: an un-framed message persisted as a normal user turn.
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, is_meta: undefined })).toBe(false);
+    // Meta without an inter-agent origin, such as a compact summary.
+    expect(
+      isReplayHiddenMetaMessage({ ...peerMessage, origin: undefined, isCompactSummary: true }),
+    ).toBe(false);
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, origin: { kind: "human" } })).toBe(false);
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, type: "assistant" })).toBe(false);
+    expect(isReplayHiddenMetaMessage(undefined)).toBe(false);
+  });
+
+  it("loadSession replay skips them but keeps the user's own prompt", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "hi, say one word" }] },
+      },
+      peerMessage,
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text.includes("hi, say one word"),
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(updates)).not.toContain("cross-session-message");
+    expect(JSON.stringify(updates)).not.toContain("Another Claude session");
   });
 });
 
@@ -19308,6 +19679,59 @@ describe("turn steering (_session/steering)", () => {
     await waitFor(() => agent.sessions["test-session"].owedTrailingIdles === 0);
     releaseEnd();
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.286: a steer that lands during a foreground tool call moves the tool
+  // to the background and joins the running cycle instead of aborting it, so
+  // the turn ends in ONE result stamped with both the prompt and the steer.
+  it.each([
+    { name: "without an echo", echo: false },
+    { name: "with a mid-cycle echo", echo: true },
+  ])("settles a steer that joined the running cycle $name", async ({ echo }) => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        if (echo) yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: u1.value.uuid,
+          user_message_uuids: [u1.value.uuid, steered.value.uuid],
+        };
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // One cycle ran, so usage is the single result's.
+    expect(response.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+    expect(agent.sessions["test-session"].owedTrailingIdles ?? 0).toBe(0);
   });
 
   // Issue #1114's other hang, and #1063's: the steer aborts an autonomous

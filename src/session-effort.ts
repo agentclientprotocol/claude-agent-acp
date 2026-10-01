@@ -12,6 +12,18 @@ export function toSdkEffortLevel(value: string | undefined): EffortLevel | null 
   return value === undefined || value === "default" ? null : (value as EffortLevel);
 }
 
+// Since CLI 2.1.284 an `effortLevel` that changes the level, sent without an
+// `ultracode` key, turns ultracode off. The CLI's own effort control keeps
+// ultracode on at any level, so carry a settings-requested ultracode along
+// with every effort apply.
+export function effortFlagSettings(
+  value: string | undefined,
+  settings: Settings,
+): { effortLevel: EffortLevel | null; ultracode?: true } {
+  const effortLevel = toSdkEffortLevel(value);
+  return settings.ultracode === true ? { effortLevel, ultracode: true } : { effortLevel };
+}
+
 function canonicalizeModelSettingsKey(value: string): string {
   return value
     .trim()
