@@ -455,6 +455,13 @@ The CLI adds them only when the plan file exists.
 The adapter keeps the plan text for its own use.
 The clear-context choice continues the turn with the plan text.
 
+### Edits before approval
+
+The user may edit the plan file between the request and the approval.
+On approval, the adapter reads the file again.
+When its text differs from `plan`, the approval carries the file's text as `updatedInput.plan`, so Claude implements the edited plan, and the clear-context choice continues with it.
+When the file cannot be read, the approval stands with the plan as written, and the adapter logs the error.
+
 ### ExitPlanMode reports
 
 For a `planFile` client, each ExitPlanMode report that carries `rawInput` has the path and no plan text:

@@ -253,6 +253,7 @@ import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
+  editedPlan,
   ExitPlanCoordinator,
   isExitPlanInterruptionResult,
   observeExitPlanToolResults,
@@ -7802,6 +7803,18 @@ export class ClaudeAcpAgent {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
       }
       if (toolName === "ExitPlanMode" && permissionResult.behavior === "allow") {
+        try {
+          const plan = await editedPlan(toolInput);
+          if (plan !== undefined) {
+            permissionResult = {
+              ...permissionResult,
+              updatedInput: { ...(permissionResult.updatedInput ?? toolInput), plan },
+            };
+          }
+        } catch (error) {
+          // The user approved; an unreadable file must not undo that approval.
+          this.logger.error("Failed to read the plan file; approving the plan as written:", error);
+        }
         const modeUpdate = permissionResult.updatedPermissions?.find(
           (update) => update.type === "setMode" && update.destination === "session",
         );
@@ -7820,7 +7833,11 @@ export class ClaudeAcpAgent {
         ? this.sessionModes.effectiveMode(session, decodedPermission.contextResetMode)
         : undefined;
       if (toolName === "ExitPlanMode" && clearContextMode) {
-        const plan = typeof toolInput.plan === "string" ? toolInput.plan.trim() : "";
+        const approvedInput =
+          permissionResult.behavior === "allow"
+            ? (permissionResult.updatedInput ?? toolInput)
+            : toolInput;
+        const plan = typeof approvedInput.plan === "string" ? approvedInput.plan.trim() : "";
         if (!plan) throw new Error("ExitPlanMode clear-context selection requires a plan");
         session.pendingExitPlanContextReset = {
           toolUseId: toolUseID,
