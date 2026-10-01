@@ -1,7 +1,8 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Explore code","prompt":"Find the parser","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_1","task":"Find the parser"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"description":"Find the parser","sessionId":"agent_1","sessionUpdate":"subagent_update","title":"Explore code"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"content":[{"text":"Find the parser","type":"text"}],"messageId":"prompt","recipientSessionId":"agent_1","senderSessionId":"<session>","sessionUpdate":"session_message"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_task"}},"content":{"text":"Looking for","type":"text"},"messageId":"msg_sub_1","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_task"}},"content":{"text":" the parser.","type":"text"},"messageId":"msg_sub_1","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_task","toolName":"Read"}},"content":[],"kind":"read","locations":[],"name":"Read","sessionUpdate":"tool_call","status":"pending","title":"Read File","toolCallId":"toolu_sub_read"}}}
@@ -22,6 +23,6 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_task"}},"content":{"text":"Foun","type":"text"},"messageId":"msg_sub_2","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_1","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_task"}},"content":{"text":"d it.","type":"text"},"messageId":"msg_sub_2","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Task","toolResponse":{"status":"completed"}}},"sessionUpdate":"tool_call_update","toolCallId":"toolu_task"}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"subagent_state_update","state":"completed","subagentSessionId":"agent_1"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionId":"agent_1","sessionUpdate":"subagent_update","state":{"state":"idle","stopReason":"end_turn"}}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"cost":{"amount":0,"currency":"USD"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"promptResponse","payload":{"_meta":{"quota":{"model_usage":[],"token_count":{"cachedInputTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":0}}},"stopReason":"end_turn","usage":{"cachedReadTokens":0,"cachedWriteTokens":0,"inputTokens":0,"outputTokens":0,"totalTokens":0}}}

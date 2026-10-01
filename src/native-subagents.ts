@@ -1,5 +1,40 @@
-import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
+import type { AcpSessionNotification, SubagentWorkState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+import { unreachable } from "./utils.js";
+
+/**
+ * Internal bookkeeping only -- not a wire-level state since RFD #1992's
+ * rework removed the terminal `subagent_state_update` notification (see
+ * "Why remove the terminal disconnected state?" in docs/rfds/subagents.mdx).
+ * `toSubagentWorkState` below maps each value to the `subagent_update.state`
+ * snapshot actually sent on the wire.
+ */
+export type SubagentState = "completed" | "failed" | "cancelled" | "disconnected";
+
+/**
+ * Maps this generation's finish reason to the wire-level work-state snapshot.
+ * `idle` with `stopReason` covers normal completion and cancellation, per the
+ * RFD ("Cancellation uses idle with stopReason: cancelled, not a terminal
+ * child state"). `failed` has no accurate `StopReason` value -- omitting it
+ * is honest; inventing one would misreport why the child stopped.
+ * `disconnected` no longer has a wire equivalent; lost observability is
+ * reported as `unknown`, matching "Connection loss" in the RFD.
+ */
+export function toSubagentWorkState(state: SubagentState): SubagentWorkState {
+  switch (state) {
+    case "completed":
+      return { state: "idle", stopReason: "end_turn" };
+    case "cancelled":
+      return { state: "idle", stopReason: "cancelled" };
+    case "failed":
+      return { state: "idle" };
+    case "disconnected":
+      return { state: "unknown" };
+    default:
+      unreachable(state);
+      return { state: "unknown" };
+  }
+}
 
 export type NativeSubagent = {
   sessionId: string;
@@ -468,17 +503,35 @@ export async function announceNativeSubagent(
   if (child.announced) return;
   if (child.announcePromise) return child.announcePromise;
   const announce = Promise.resolve().then(async () => {
+    // The association MUST go out before any traffic bearing the child's own
+    // session ID, including the prompt delivery below (see "Announcing and
+    // updating an association" in docs/rfds/subagents.mdx).
     await publish({
       sessionId: child.parentSessionId,
       update: {
-        sessionUpdate: "subagent_spawned",
-        subagentSessionId: child.sessionId,
-        name: child.name,
-        task: child.task,
-        ...promptField(child.prompt),
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        title: child.name,
+        description: child.task,
         capabilities: {},
       },
     });
+    if (child.prompt !== undefined) {
+      // The old `subagent_spawned.prompt` adapter extension is gone in the
+      // reworked RFD; a directed `session_message` on the child's own stream
+      // is the replacement (see "Session-directed messages"). One stable,
+      // transcript-local id: exactly one prompt-delivery message per child.
+      await publish({
+        sessionId: child.sessionId,
+        update: {
+          sessionUpdate: "session_message",
+          messageId: "prompt",
+          senderSessionId: child.parentSessionId,
+          recipientSessionId: child.sessionId,
+          content: [{ type: "text", text: child.prompt }],
+        },
+      });
+    }
     child.announced = true;
   });
   child.announcePromise = announce;
@@ -503,9 +556,9 @@ export async function finishNativeSubagent(
     await publish({
       sessionId: child.parentSessionId,
       update: {
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: child.sessionId,
-        state,
+        sessionUpdate: "subagent_update",
+        sessionId: child.sessionId,
+        state: toSubagentWorkState(state),
       },
     });
     child.terminalState = state;

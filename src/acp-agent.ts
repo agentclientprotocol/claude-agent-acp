@@ -113,6 +113,7 @@ import {
   NativeSubagentRuntime,
   resumedNativeSubagentId,
   sendMessageResumePrompt,
+  toSubagentWorkState,
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
@@ -7272,10 +7273,10 @@ export class ClaudeAcpAgent {
           asSdkSessionNotification({
             sessionId: parentSessionId,
             update: {
-              sessionUpdate: "subagent_spawned",
-              subagentSessionId: child.sessionId,
-              name: child.name,
-              task: child.task,
+              sessionUpdate: "subagent_update",
+              sessionId: child.sessionId,
+              title: child.name,
+              description: child.task,
               capabilities: {},
             },
           }),
@@ -7470,11 +7471,11 @@ export class ClaudeAcpAgent {
           asSdkSessionNotification({
             sessionId: parentSessionId,
             update: {
-              sessionUpdate: "subagent_state_update",
-              subagentSessionId: child.sessionId,
-              state: child.reconstructable
-                ? (child.terminalState ?? "disconnected")
-                : "disconnected",
+              sessionUpdate: "subagent_update",
+              sessionId: child.sessionId,
+              state: toSubagentWorkState(
+                child.reconstructable ? (child.terminalState ?? "disconnected") : "disconnected",
+              ),
             },
           }),
         );

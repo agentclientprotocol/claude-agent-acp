@@ -75,7 +75,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
     expect(publish).toHaveBeenCalledTimes(1);
     release.resolve();
     await Promise.all([first, second]);
-    expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_spawned"]);
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_update"]);
   });
 
   it("publishes a raced terminal exactly once after the spawn", async () => {
@@ -85,7 +85,12 @@ describe("NativeSubagentRuntime lifecycle", () => {
     const session = sessionWith(value);
     const publish = vi.fn(async (notification: AcpSessionNotification) => {
       published.push(notification);
-      if (notification.update.sessionUpdate === "subagent_spawned") await releaseSpawn.promise;
+      if (
+        notification.update.sessionUpdate === "subagent_update" &&
+        "title" in notification.update
+      ) {
+        await releaseSpawn.promise;
+      }
     });
 
     const first = finishNativeSubagent(session, value.sessionId, "completed", publish);
@@ -94,10 +99,12 @@ describe("NativeSubagentRuntime lifecycle", () => {
     await Promise.all([first, second]);
 
     expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
-      "subagent_spawned",
-      "subagent_state_update",
+      "subagent_update",
+      "subagent_update",
     ]);
-    expect(published[1]?.update).toMatchObject({ state: "completed" });
+    expect(published[1]?.update).toMatchObject({
+      state: { state: "idle", stopReason: "end_turn" },
+    });
   });
 
   it("falls back to one ordinary failed tool call when no child ever starts", async () => {
@@ -197,12 +204,14 @@ describe("NativeSubagentRuntime lifecycle", () => {
       async () => {},
     );
 
-    expect(published.at(-1)).toMatchObject({
+    // -2, not -1: the rawInput's "Review again" prompt also sends a
+    // session_message to the child right after this announce.
+    expect(published.at(-2)).toMatchObject({
       sessionId: "root",
       update: {
-        sessionUpdate: "subagent_spawned",
-        subagentSessionId: "reused-child",
-        name: "Fresh identity",
+        sessionUpdate: "subagent_update",
+        sessionId: "reused-child",
+        title: "Fresh identity",
       },
     });
   });
@@ -252,7 +261,9 @@ describe("NativeSubagentRuntime lifecycle", () => {
     });
 
     expect(delivered).toEqual([]);
-    expect(published).toHaveLength(1);
+    // Announce + the session_message prompt delivery (control()'s default
+    // rawInput always carries a prompt).
+    expect(published).toHaveLength(2);
   });
 
   it("creates a distinct ACP lifecycle when the SDK restarts the same task id", async () => {
@@ -311,7 +322,9 @@ describe("NativeSubagentRuntime lifecycle", () => {
     ).resolves.toMatchObject({ sessionId: "worker-1:generation:2" });
     await runtime.finishTask("worker-1", "failed", async () => {}, "launch-1");
     expect(
-      published.filter(({ update }) => update.sessionUpdate === "subagent_state_update"),
+      published.filter(
+        ({ update }) => update.sessionUpdate === "subagent_update" && "state" in update,
+      ),
     ).toHaveLength(1);
     await expect(
       runtime.route(output("launch-2", "still running"), async () => {}),
@@ -320,10 +333,10 @@ describe("NativeSubagentRuntime lifecycle", () => {
     await runtime.finishTask("worker-1", "completed", async () => {}, "launch-2");
 
     const spawnedIds = published.flatMap(({ update }) =>
-      update.sessionUpdate === "subagent_spawned" ? [update.subagentSessionId] : [],
+      update.sessionUpdate === "subagent_update" && "title" in update ? [update.sessionId] : [],
     );
     const terminalIds = published.flatMap(({ update }) =>
-      update.sessionUpdate === "subagent_state_update" ? [update.subagentSessionId] : [],
+      update.sessionUpdate === "subagent_update" && "state" in update ? [update.sessionId] : [],
     );
     expect(spawnedIds).toEqual(["worker-1", "worker-1:generation:2"]);
     expect(terminalIds).toEqual(spawnedIds);
@@ -361,8 +374,10 @@ describe("NativeSubagentRuntime lifecycle", () => {
     await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
 
     expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
-      "subagent_spawned",
-      "subagent_state_update",
+      "subagent_update",
+      // `launch()`'s default `control()` rawInput always carries a prompt.
+      "session_message",
+      "subagent_update",
     ]);
 
     // SendMessage resumes the subagent with the same toolUseId and taskId without a new Agent control frame
@@ -378,14 +393,14 @@ describe("NativeSubagentRuntime lifecycle", () => {
 
     // Generation 2 must be announced immediately at taskStarted, not held until finishTask
     const spawnedIds = published.flatMap(({ update }) =>
-      update.sessionUpdate === "subagent_spawned" ? [update.subagentSessionId] : [],
+      update.sessionUpdate === "subagent_update" && "title" in update ? [update.sessionId] : [],
     );
     expect(spawnedIds).toEqual(["worker-1", "worker-1:generation:2"]);
 
     // Terminal state then ends generation 2
     await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
     const terminalIds = published.flatMap(({ update }) =>
-      update.sessionUpdate === "subagent_state_update" ? [update.subagentSessionId] : [],
+      update.sessionUpdate === "subagent_update" && "state" in update ? [update.sessionId] : [],
     );
     expect(terminalIds).toEqual(["worker-1", "worker-1:generation:2"]);
   });
@@ -428,15 +443,26 @@ describe("NativeSubagentRuntime lifecycle", () => {
 
     expect(published.at(-1)).toMatchObject({
       sessionId: "root",
-      update: { sessionUpdate: "subagent_spawned", subagentSessionId: "agent-b:generation:2" },
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-b:generation:2",
+        title: expect.any(String),
+      },
     });
   });
 
-  describe("the subagent prompt in subagent_spawned", () => {
+  describe("the subagent prompt as a session_message to the child", () => {
+    // RFD #1992's rework dropped the `subagent_spawned.prompt` adapter
+    // extension; "Session-directed messages" is the replacement, so the
+    // prompt now arrives as a `session_message` on the child's own stream,
+    // sent right after the announcing `subagent_update`.
     async function spawned(
       task: { prompt?: string },
       rawInput?: Record<string, unknown>,
-    ): Promise<Record<string, unknown>> {
+    ): Promise<{
+      announce: Record<string, unknown>;
+      message: Record<string, unknown> | undefined;
+    }> {
       const published: AcpSessionNotification[] = [];
       const runtime = new NativeSubagentRuntime(
         true,
@@ -462,33 +488,47 @@ describe("NativeSubagentRuntime lifecycle", () => {
         },
         async () => {},
       );
-      const update = published.find(({ update }) => update.sessionUpdate === "subagent_spawned");
-      return update!.update as unknown as Record<string, unknown>;
+      const announce = published.find(
+        ({ update }) => update.sessionUpdate === "subagent_update" && "title" in update,
+      );
+      const message = published.find(({ update }) => update.sessionUpdate === "session_message");
+      return {
+        announce: announce!.update as unknown as Record<string, unknown>,
+        message: message?.update as unknown as Record<string, unknown> | undefined,
+      };
     }
 
     it("carries the exact task_started prompt", async () => {
-      const update = await spawned(
+      const { message } = await spawned(
         { prompt: "  Trace the crash.\n\nReport the stack.\n" },
         { description: "Investigate failure", prompt: "Find the cause" },
       );
 
-      expect(update.prompt).toBe("  Trace the crash.\n\nReport the stack.\n");
+      expect(message).toMatchObject({
+        sessionUpdate: "session_message",
+        senderSessionId: "root",
+        recipientSessionId: "worker-1",
+        content: [{ type: "text", text: "  Trace the crash.\n\nReport the stack.\n" }],
+      });
     });
 
     it("falls back to the prompt of the Agent tool input", async () => {
-      const update = await spawned(
+      const { message } = await spawned(
         {},
         { description: "Investigate failure", prompt: "Find the cause" },
       );
 
-      expect(update.prompt).toBe("Find the cause");
+      expect(message).toMatchObject({ content: [{ type: "text", text: "Find the cause" }] });
     });
 
-    it("omits the prompt when the adapter has none", async () => {
-      const update = await spawned({ prompt: "   " }, { description: "Investigate failure" });
+    it("sends no session_message when the adapter has no prompt, but still announces a description", async () => {
+      const { announce, message } = await spawned(
+        { prompt: "   " },
+        { description: "Investigate failure" },
+      );
 
-      expect(update).not.toHaveProperty("prompt");
-      expect(update.task).toBe("Investigate failure");
+      expect(message).toBeUndefined();
+      expect(announce.description).toBe("Investigate failure");
     });
   });
 
@@ -535,11 +575,18 @@ describe("NativeSubagentRuntime lifecycle", () => {
       return { runtime, published, logged };
     }
 
+    // Both announce and terminal-state are now the same `subagent_update` wire
+    // type (RFD #1992's rework), so distinguish them here by shape for the
+    // sequence assertions below instead of relying on separate literals.
     const lifecycle = (published: AcpSessionNotification[]) =>
       published.map(({ sessionId, update }) => [
         sessionId,
-        update.sessionUpdate,
-        "subagentSessionId" in update ? update.subagentSessionId : undefined,
+        update.sessionUpdate === "subagent_update"
+          ? "state" in update && update.state !== undefined
+            ? "subagent_update:state"
+            : "subagent_update:announce"
+          : update.sessionUpdate,
+        "sessionId" in update ? update.sessionId : undefined,
       ]);
 
     it("opens a new generation when a failed child runs again", async () => {
@@ -553,14 +600,19 @@ describe("NativeSubagentRuntime lifecycle", () => {
       await runtime.finishTask("worker-1", "completed", async () => {});
 
       expect(lifecycle(published)).toEqual([
-        ["root", "subagent_spawned", "worker-1"],
-        ["root", "subagent_state_update", "worker-1"],
-        ["root", "subagent_spawned", "worker-1:generation:2"],
-        ["root", "subagent_state_update", "worker-1:generation:2"],
+        ["root", "subagent_update:announce", "worker-1"],
+        // `finishedWorker`'s default `control()` rawInput always carries a
+        // prompt, so generation 1 also gets a `session_message` delivery.
+        // Generation 2 resumes via `taskResumed` with no prompt argument, so
+        // it gets none.
+        ["worker-1", "session_message", undefined],
+        ["root", "subagent_update:state", "worker-1"],
+        ["root", "subagent_update:announce", "worker-1:generation:2"],
+        ["root", "subagent_update:state", "worker-1:generation:2"],
       ]);
-      expect(published[2]?.update).toMatchObject({
-        name: "Investigate failure",
-        task: "Find the cause",
+      expect(published[3]?.update).toMatchObject({
+        title: "Investigate failure",
+        description: "Find the cause",
       });
     });
 
@@ -580,7 +632,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
       });
       expect(lifecycle(published).at(-1)).toEqual([
         "root",
-        "subagent_spawned",
+        "subagent_update:announce",
         "worker-1:generation:2",
       ]);
       expect(resumedNativeSubagentId({ success: false, resumedAgentId: "worker-1" })).toBe(
@@ -588,24 +640,35 @@ describe("NativeSubagentRuntime lifecycle", () => {
       );
     });
 
-    it("sends the SendMessage text as the prompt of the new generation", async () => {
+    it("sends the SendMessage text as a session_message to the new generation", async () => {
       const { runtime, published } = await finishedWorker("completed");
 
       await runtime.taskResumed("worker-1", async () => {}, "Check the tests too");
 
       expect(published.at(-1)?.update).toMatchObject({
-        sessionUpdate: "subagent_spawned",
-        subagentSessionId: "worker-1:generation:2",
-        prompt: "Check the tests too",
+        sessionUpdate: "session_message",
+        senderSessionId: "root",
+        recipientSessionId: "worker-1:generation:2",
+        content: [{ type: "text", text: "Check the tests too" }],
       });
     });
 
-    it("omits the prompt of a new generation without a SendMessage text", async () => {
+    it("sends no session_message for a new generation without a SendMessage text", async () => {
+      // `finishedWorker`'s own first generation does get one (its default
+      // `control()` rawInput carries a prompt) -- only the resumed
+      // generation below is under test, so compare what the resume itself
+      // adds, not the total count.
       const { runtime, published } = await finishedWorker("completed");
+      const beforeResume = published.length;
 
       await runtime.taskResumed("worker-1", async () => {});
 
-      expect(published.at(-1)?.update).not.toHaveProperty("prompt");
+      expect(published.at(-1)?.update.sessionUpdate).toBe("subagent_update");
+      expect(
+        published
+          .slice(beforeResume)
+          .filter(({ update }) => update.sessionUpdate === "session_message"),
+      ).toHaveLength(0);
     });
 
     it("finds the SendMessage text that resumed the agent", () => {
@@ -676,7 +739,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
       // The task started in the first generation: it never moves to the second.
       expect(lifecycle(published).at(-1)).toEqual([
         "root",
-        "subagent_spawned",
+        "subagent_update:announce",
         "worker-1:generation:2",
       ]);
       expect(route?.(taskUpdate)).toBeNull();
@@ -689,8 +752,9 @@ describe("NativeSubagentRuntime lifecycle", () => {
       await runtime.taskResumed("unknown-task", async () => {});
 
       expect(lifecycle(published)).toEqual([
-        ["root", "subagent_spawned", "worker-1"],
-        ["root", "subagent_state_update", "worker-1"],
+        ["root", "subagent_update:announce", "worker-1"],
+        ["worker-1", "session_message", undefined],
+        ["root", "subagent_update:state", "worker-1"],
       ]);
       expect(logged).toEqual(["Session root: ignoring late update for terminal subagent worker-1"]);
     });
