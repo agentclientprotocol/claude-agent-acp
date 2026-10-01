@@ -2785,11 +2785,28 @@ export class ClaudeAcpAgent {
 
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    return forkSession(params, {
+    const forked = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+    // The forked id is a brand-new SDK session that `this.sessions` does not
+    // know about yet, so a bare `session/prompt` on it fails with "Session not
+    // found" (see #1110). Route it through the same path `resumeSession` uses
+    // so the reply is self-sufficient (modes, configOptions) and the session
+    // is live, matching the session-fork RFD and restoring pre-#1046 behavior.
+    const result = await this.getOrCreateSession({
+      sessionId: forked.sessionId,
+      cwd: params.cwd,
+      mcpServers: params.mcpServers,
+      additionalDirectories: params.additionalDirectories,
+    });
+    // Needs to happen after we return the session
+    setTimeout(() => {
+      this.sendAvailableCommandsUpdate(result.sessionId);
+      startMcpAuthentication(this, result.sessionId, params.mcpServers ?? []);
+    }, 0);
+    return result;
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {

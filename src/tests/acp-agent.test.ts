@@ -10060,26 +10060,71 @@ describe("logout", () => {
 });
 
 describe("session/fork", () => {
-  beforeEach(() => {
+  // #1110: the fork reply now routes through `getOrCreateSession`, same as
+  // `resumeSession`, so it validates `cwd` like any other session-creating
+  // call. The fixtures below assert on the SDK calls' `dir` argument, so this
+  // needs a real directory, not the fictional "/workspace" string.
+  let forkCwd: string;
+
+  beforeEach(async () => {
     vi.mocked(forkSession).mockClear();
     vi.mocked(getSessionMessages).mockClear();
     vi.mocked(importSessionToStore).mockClear();
+    forkCwd = await mkdtemp(path.join(os.tmpdir(), "claude-acp-fork-test-"));
   });
+
+  afterEach(async () => {
+    await rm(forkCwd, { recursive: true, force: true });
+  });
+
+  // `getOrCreateSession` only skips the real SDK call when it finds a
+  // registered session whose fingerprint already matches, so pre-seed the
+  // forked id the mock will return -- these stay unit tests, not integration
+  // tests, the same way the rest of this file avoids a real Claude process.
+  function injectForkTarget(
+    agent: ClaudeAcpAgent,
+    sessionId: string,
+    cwd: string,
+    additionalDirectories: string[] = [],
+  ) {
+    async function* empty() {}
+    agent.sessions[sessionId] = mockSessionState(
+      {
+        // `unstable_forkSession` schedules the same post-return work
+        // `resumeSession` does (`sendAvailableCommandsUpdate`,
+        // `startMcpAuthentication`), so the double needs `supportedCommands`
+        // too -- `wrapQuery` alone doesn't carry it.
+        query: Object.assign(wrapQuery(empty()), {
+          supportedCommands: vi.fn().mockResolvedValue([]),
+        }),
+        input: new Pushable(),
+        cwd,
+        sessionFingerprint: computeSessionFingerprint({
+          cwd,
+          mcpServers: [],
+          additionalDirectories,
+        }),
+      },
+      agent,
+      sessionId,
+    );
+  }
 
   it("forks the latest turn in the requested workspace", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    injectForkTarget(agent, "fork-id", forkCwd, ["/workspace/extra"]);
 
     const response = await agent.unstable_forkSession({
       sessionId: "source-id",
-      cwd: "/workspace",
+      cwd: forkCwd,
       additionalDirectories: ["/workspace/extra"],
       mcpServers: [],
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(forkSession).toHaveBeenCalledWith("source-id", { dir: forkCwd });
   });
 
   it("forks at an AIR message id through the current SDK", async () => {
@@ -10108,22 +10153,23 @@ describe("session/fork", () => {
       },
     ]);
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    injectForkTarget(agent, "fork-id", forkCwd, ["/workspace/extra"]);
     const meta = {
       jetbrains: { air: { fork: { version: 1, messageId: "msg_123:segment:0" } } },
     };
     const response = await agent.unstable_forkSession({
       sessionId: "source-id",
-      cwd: "/workspace",
+      cwd: forkCwd,
       additionalDirectories: ["/workspace/extra"],
       mcpServers: [],
       _meta: meta,
     });
 
     expect(response.sessionId).toBe("fork-id");
-    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(getSessionMessages).toHaveBeenCalledWith("source-id", { dir: forkCwd });
     expect(importSessionToStore).not.toHaveBeenCalled();
     expect(forkSession).toHaveBeenCalledWith("source-id", {
-      dir: "/workspace",
+      dir: forkCwd,
       upToMessageId: "assistant-uuid",
     });
   });
@@ -10227,10 +10273,11 @@ describe("session/fork", () => {
       ]);
     });
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    injectForkTarget(agent, "fork-id", forkCwd, []);
 
     const response = await agent.unstable_forkSession({
       sessionId: "source-id",
-      cwd: "/workspace",
+      cwd: forkCwd,
       additionalDirectories: [],
       mcpServers: [],
       _meta: {
@@ -10249,11 +10296,11 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(importSessionToStore).toHaveBeenLastCalledWith("source-id", expect.any(Object), {
-      dir: "/workspace",
+      dir: forkCwd,
       includeSubagents: false,
     });
     expect(forkSession).toHaveBeenLastCalledWith("source-id", {
-      dir: "/workspace",
+      dir: forkCwd,
       upToMessageId: "inactive-assistant-uuid",
     });
   });
