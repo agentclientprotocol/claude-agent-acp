@@ -271,9 +271,9 @@ import {
 import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
+  effortFlagSettings,
   mergeEffortSettings,
   settingsEffortForModel,
-  toSdkEffortLevel,
 } from "./session-effort.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
@@ -1940,6 +1940,41 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
     block.type === "text" &&
     typeof block.text === "string" &&
     block.text.includes("Please run /login")
+  );
+}
+
+/** Origin kinds of the meta user messages `getSessionMessages` returns since
+ *  SDK 0.3.284 (messages from other agents, sessions and channels). */
+const REPLAY_HIDDEN_META_ORIGIN_KINDS = new Set([
+  "peer",
+  "channel",
+  "observer",
+  "observer-activity",
+  "slack-ping",
+]);
+
+/**
+ * True for a transcript message delivered to the model from another agent,
+ * session or channel. Since SDK 0.3.284 `getSessionMessages` returns these as
+ * `is_meta` user messages whose content is the full harness framing (envelope
+ * XML plus the "not typed by your user" preamble). The live prompt loop never
+ * renders them, so replay skips them too rather than presenting them as text
+ * the user typed. Other `is_meta` messages (compact summaries) are kept.
+ *
+ * `is_meta` and `origin` are runtime fields not declared on `SessionMessage`.
+ */
+export function isReplayHiddenMetaMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const { type, is_meta, origin } = message as {
+    type?: unknown;
+    is_meta?: unknown;
+    origin?: { kind?: unknown } | null;
+  };
+  return (
+    type === "user" &&
+    is_meta === true &&
+    typeof origin?.kind === "string" &&
+    REPLAY_HIDDEN_META_ORIGIN_KINDS.has(origin.kind)
   );
 }
 
@@ -7292,6 +7327,9 @@ export class ClaudeAcpAgent {
         : { ids: new Map<string, string>() };
     const replayedSubagents = new Set<string>();
     const replayMessage = async (message: SessionMessage): Promise<void> => {
+      if (isReplayHiddenMetaMessage(message)) {
+        return;
+      }
       if (
         message.type === "user" &&
         message.parent_tool_use_id === null &&
@@ -8144,14 +8182,20 @@ export class ClaudeAcpAgent {
         const newEffort =
           typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
         try {
-          await session.query.applyFlagSettings({
+          await session.query.applyFlagSettings(
             // A legacy client's unpinned effort is display-only: the CLI
             // resolves the persisted value for the new model. When an old
             // user pin is no longer supported, clear the flag layer instead
             // of replacing it with that displayed value. Opted-in clients
             // deliberately apply their concrete displayed effort.
-            effortLevel: useRecommendedValue ? toSdkEffortLevel(newEffort) : null,
-          });
+            effortFlagSettings(
+              useRecommendedValue ? newEffort : undefined,
+              mergeEffortSettings(
+                session.settingsManager.getSettings(),
+                session.effortSettingsOverride,
+              ),
+            ),
+          );
           session.effortPinnedLevel = effortPinnedForNewModel ? pinnedEffort : undefined;
           session.appliedEffortLevel =
             useRecommendedValue && newEffort !== "default" ? newEffort : undefined;
@@ -8205,9 +8249,15 @@ export class ClaudeAcpAgent {
     } else if (configId === EFFORT_CONFIG_ID) {
       // Apply first so a rejected control request cannot leave the displayed
       // value ahead of the SDK flag layer.
-      await session.query.applyFlagSettings({
-        effortLevel: toSdkEffortLevel(value),
-      });
+      await session.query.applyFlagSettings(
+        effortFlagSettings(
+          value,
+          mergeEffortSettings(
+            session.settingsManager.getSettings(),
+            session.effortSettingsOverride,
+          ),
+        ),
+      );
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -9023,15 +9073,15 @@ export class ClaudeAcpAgent {
       // and persisted settings; automatic values re-seed on every model switch.
       // Legacy clients still leave effort resolution entirely to the CLI.
       const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
+      const effortSettings = mergeEffortSettings(
+        settingsManager.getSettings(),
+        configuredSettingsObject,
+      );
       const configOptions = buildConfigOptions(
         modes,
         models,
         modelInfos,
-        userProvidedOptions?.effort ??
-          settingsEffortForModel(
-            mergeEffortSettings(settingsManager.getSettings(), configuredSettingsObject),
-            currentModelInfo,
-          ),
+        userProvidedOptions?.effort ?? settingsEffortForModel(effortSettings, currentModelInfo),
         fastMode,
         {
           useRecommendedValue,
@@ -9039,7 +9089,7 @@ export class ClaudeAcpAgent {
       );
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
-        await q.applyFlagSettings({ effortLevel: toSdkEffortLevel(initialEffort.currentValue) });
+        await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, effortSettings));
       }
       // Seed the context window without awaited IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),
