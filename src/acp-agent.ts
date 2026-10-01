@@ -3528,7 +3528,10 @@ export class ClaudeAcpAgent {
     try {
       // `resume` names the Claude session, which shares the ACP session id, so
       // the new query continues the same conversation under the same id.
-      await this.createSession(creationParams, { resume: sessionId });
+      await this.createSession(creationParams, {
+        resume: sessionId,
+        permissionMode: session.modes.currentModeId as PermissionMode,
+      });
     } catch (error) {
       if (error instanceof RequestError && error.code === RequestError.resourceNotFound().code) {
         // The CLI never wrote this conversation, because the very first turn
@@ -8916,6 +8919,8 @@ export class ClaudeAcpAgent {
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
+    // A recreated live session keeps its mode, not the mode of the transcript.
+    const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
       if (fingerprint === existingSession.sessionFingerprint) {
@@ -8942,6 +8947,7 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
+        permissionMode: livePermissionMode,
         ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
       },
     );
@@ -9718,7 +9724,10 @@ export class ClaudeAcpAgent {
         this.closeQueryStream(session);
         delete this.sessions[sessionId];
         try {
-          await this.createSession(session.creationParams, { resume: sessionId });
+          await this.createSession(session.creationParams, {
+            resume: sessionId,
+            permissionMode: session.modes.currentModeId as PermissionMode,
+          });
         } catch (error) {
           // One session that cannot come back must not abort the switch. The
           // `--hide-claude-auth` guard makes this a normal outcome of

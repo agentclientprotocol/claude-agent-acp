@@ -400,14 +400,15 @@ describe("ClaudeAcpAgent settings", () => {
   });
 
   describe("on resume", () => {
-    async function resume(records: unknown[], meta: object = {}) {
+    const sessionId = "resumed-mode-session";
+
+    async function setup(records: unknown[]) {
       await fs.promises.writeFile(
         path.join(tempDir, "settings.json"),
         JSON.stringify({ permissions: { defaultMode: "plan" } }),
       );
       const projectDir = path.join(tempDir, "project");
       await fs.promises.mkdir(projectDir, { recursive: true });
-      const sessionId = "resumed-mode-session";
       const transcriptDir = path.join(tempDir, "projects", "-project");
       await fs.promises.mkdir(transcriptDir, { recursive: true });
       await fs.promises.writeFile(
@@ -419,6 +420,11 @@ describe("ClaudeAcpAgent settings", () => {
       const { ClaudeAcpAgent } = await import("../acp-agent.js");
       const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
       (agent as any).logger = { log: () => {}, error: () => {} };
+      return { agent, projectDir, getCapturedOptions };
+    }
+
+    async function resume(records: unknown[], meta: object = {}) {
+      const { agent, projectDir, getCapturedOptions } = await setup(records);
       const response = await (agent as any).createSession(
         { cwd: projectDir, mcpServers: [], _meta: { disableBuiltInTools: true, ...meta } },
         { resume: sessionId },
@@ -426,11 +432,23 @@ describe("ClaudeAcpAgent settings", () => {
       return { permissionMode: getCapturedOptions().permissionMode, response };
     }
 
-    const user = (permissionMode?: string) => ({
-      type: "user",
-      message: { role: "user", content: "hello" },
-      ...(permissionMode ? { permissionMode } : {}),
-    });
+    let previousUuid: string | null = null;
+    const user = (permissionMode?: string) => {
+      const uuid = crypto.randomUUID();
+      const record = {
+        type: "user",
+        uuid,
+        parentUuid: previousUuid,
+        sessionId,
+        timestamp: new Date().toISOString(),
+        isSidechain: false,
+        origin: { kind: "human" },
+        message: { role: "user", content: "hello" },
+        ...(permissionMode ? { permissionMode } : {}),
+      };
+      previousUuid = uuid;
+      return record;
+    };
 
     it("continues in the last permission mode of the transcript", async () => {
       const { permissionMode, response } = await resume([user("plan"), user("acceptEdits")]);
@@ -453,6 +471,39 @@ describe("ClaudeAcpAgent settings", () => {
 
       expect(permissionMode).toBe("plan");
       expect(response.modes.currentModeId).toBe("plan");
+    });
+
+    it("continues in the last permission mode on session/load", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([
+        user("plan"),
+        user("acceptEdits"),
+      ]);
+
+      const response = await agent.loadSession({
+        sessionId,
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(getCapturedOptions().permissionMode).toBe("acceptEdits");
+      expect(response.modes?.currentModeId).toBe("acceptEdits");
+    });
+
+    it("keeps the live mode when it recreates the session", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([user("acceptEdits")]);
+      const params = { sessionId, cwd: projectDir, _meta: { disableBuiltInTools: true } };
+      await agent.resumeSession({ ...params, mcpServers: [] });
+      await agent.setSessionMode({ sessionId, modeId: "default" });
+
+      // Other MCP servers change the fingerprint, so the agent recreates the query.
+      const response = await agent.resumeSession({
+        ...params,
+        mcpServers: [{ name: "other", command: "true", args: [], env: [] }],
+      });
+
+      expect(getCapturedOptions().permissionMode).toBe("default");
+      expect(response.modes?.currentModeId).toBe("default");
     });
   });
 

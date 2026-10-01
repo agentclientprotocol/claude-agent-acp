@@ -151,6 +151,51 @@ describe("readResumedModel", () => {
     expect((await readResumedTail("early-mode")).permissionMode).toBe("acceptEdits");
   });
 
+  it("reads a permission-mode record of a mode change between prompts", async () => {
+    await transcript("mode-change", [
+      prompt("first", { permissionMode: "default", origin: { kind: "human" } }),
+      record("claude-opus-5"),
+      { type: "permission-mode", permissionMode: "auto", sessionId: "mode-change" },
+    ]);
+
+    expect((await readResumedTail("mode-change")).permissionMode).toBe("auto");
+  });
+
+  it("gives no plan mode when a plan exit follows it", async () => {
+    const planExit = { type: "attachment", attachment: { type: "plan_mode_exit" } };
+    await transcript("plan-exit", [
+      prompt("plan it", { permissionMode: "plan", origin: { kind: "human" } }),
+      record("claude-opus-5"),
+      planExit,
+      record("claude-opus-5"),
+    ]);
+    await transcript("plan-exit-then-mode", [
+      prompt("plan it", { permissionMode: "plan", origin: { kind: "human" } }),
+      planExit,
+      { type: "permission-mode", permissionMode: "acceptEdits" },
+      record("claude-opus-5"),
+    ]);
+
+    expect(await readResumedTail("plan-exit")).toEqual({ model: "claude-opus-5" });
+    expect((await readResumedTail("plan-exit-then-mode")).permissionMode).toBe("acceptEdits");
+  });
+
+  it("stops the mode search at the last human prompt without a mode", async () => {
+    await transcript("bounded", [
+      prompt("old", { permissionMode: "bypassPermissions", origin: { kind: "human" } }),
+      prompt("new", { origin: { kind: "human" } }),
+      record("claude-opus-5"),
+    ]);
+    await transcript("compacted", [
+      prompt("old", { permissionMode: "bypassPermissions", origin: { kind: "human" } }),
+      prompt("summary", { isCompactSummary: true }),
+      record("claude-opus-5"),
+    ]);
+
+    expect(await readResumedTail("bounded")).toEqual({ model: "claude-opus-5" });
+    expect(await readResumedTail("compacted")).toEqual({ model: "claude-opus-5" });
+  });
+
   it("returns no permission mode when the transcript records none", async () => {
     await transcript("no-mode", [userLine("hello"), record("claude-opus-5")]);
 

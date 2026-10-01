@@ -71,7 +71,7 @@ export async function readResumedSession(
 /** What a resume restores from the end of the local transcript. */
 export type ResumedTail = {
   model?: string;
-  /** The permission mode of the last main-thread user record. */
+  /** The last permission mode of the main thread. See {@link TailScan}. */
   permissionMode?: string;
 };
 
@@ -80,7 +80,7 @@ export type ResumedTail = {
  * of its local transcript.
  *
  * A resume needs only these two values, not the messages. The transcript file
- * is read backwards until both are found, so the cost does not grow with the
+ * is read backwards until both are known, so the cost does not grow with the
  * length of the session. A session without a local transcript file falls back
  * to {@link readResumedSession} for the model.
  *
@@ -139,16 +139,11 @@ export async function findTranscript(sessionId: string): Promise<string | undefi
   return undefined;
 }
 
-/** The model of the last real assistant record and the permission mode of the
- * last user record of the main thread in a JSONL transcript. */
+/** The model of the last real assistant record and the last permission mode
+ * of the main thread in a JSONL transcript. */
 async function lastTailRecords(filePath: string, withModel: boolean): Promise<ResumedTail> {
   const handle = await open(filePath, "r");
-  const tail: ResumedTail = {};
-  const visit = (line: Buffer): boolean => {
-    if (withModel) tail.model ??= assistantModelOfLine(line);
-    tail.permissionMode ??= permissionModeOfLine(line);
-    return (!withModel || tail.model !== undefined) && tail.permissionMode !== undefined;
-  };
+  const scan = new TailScan(withModel);
   try {
     let end = (await handle.stat()).size;
     // The bytes of the line whose start is not read yet, in file order.
@@ -158,15 +153,15 @@ async function lastTailRecords(filePath: string, withModel: boolean): Promise<Re
       let chunk = Buffer.alloc(end - start);
       await handle.read(chunk, 0, chunk.length, start);
       for (let at = chunk.lastIndexOf(0x0a); at >= 0; at = chunk.lastIndexOf(0x0a)) {
-        if (visit(Buffer.concat([chunk.subarray(at + 1), ...pending]))) return tail;
+        if (scan.visit(Buffer.concat([chunk.subarray(at + 1), ...pending]))) return scan.tail;
         pending = [];
         chunk = chunk.subarray(0, at);
       }
       pending.unshift(chunk);
       end = start;
     }
-    visit(Buffer.concat(pending));
-    return tail;
+    scan.visit(Buffer.concat(pending));
+    return scan.tail;
   } finally {
     await handle.close();
   }
@@ -174,35 +169,90 @@ async function lastTailRecords(filePath: string, withModel: boolean): Promise<Re
 
 type TranscriptRecord = {
   type?: unknown;
+  subtype?: unknown;
   isSidechain?: unknown;
+  isCompactSummary?: unknown;
   message?: { model?: unknown };
   permissionMode?: unknown;
+  origin?: { kind?: unknown };
+  attachment?: { type?: unknown };
 };
 
-/** The parsed main-thread record of one line, if the line has `marker`. */
-function mainThreadRecord(line: Buffer, marker: string): TranscriptRecord | undefined {
-  // Most lines do not have the marker. The check skips their JSON parse.
-  if (line.indexOf(marker) < 0) return undefined;
+/**
+ * Reads the lines of a transcript from the end and keeps what a resume needs.
+ *
+ * Claude Code records the permission mode on a prompt record of type `user`,
+ * and on a `permission-mode` record when the mode changes between prompts.
+ * The SDK writes no record when it leaves plan mode through ExitPlanMode.
+ * It writes a `plan_mode_exit` attachment only, without the new mode. Thus a
+ * `plan` mode before a later plan exit is not the current mode, and the scan
+ * gives no mode.
+ *
+ * The mode search stops at the last human prompt, at a compaction, or at the
+ * first mode record. Each human prompt of a current Claude Code has the mode,
+ * so a prompt without it means that the transcript does not record modes.
+ */
+class TailScan {
+  readonly tail: ResumedTail = {};
+  private modeDone = false;
+  private planExited = false;
+
+  constructor(private readonly withModel: boolean) {}
+
+  /** Visit the previous line. Return true when the scan has all it needs. */
+  visit(line: Buffer): boolean {
+    let parsed: TranscriptRecord | null | undefined;
+    // Most lines have no marker of interest. The check skips their JSON parse.
+    const record = (marker: string): TranscriptRecord | undefined => {
+      if (line.indexOf(marker) < 0) return undefined;
+      if (parsed === undefined) parsed = parseMainThreadRecord(line);
+      return parsed ?? undefined;
+    };
+    if (this.withModel && this.tail.model === undefined) {
+      const entry = record('"assistant"');
+      if (entry?.type === "assistant") this.tail.model = concreteModel(entry.message?.model);
+    }
+    if (!this.modeDone) this.visitForMode(record);
+    return (!this.withModel || this.tail.model !== undefined) && this.modeDone;
+  }
+
+  private visitForMode(record: (marker: string) => TranscriptRecord | undefined): void {
+    const modeEntry = record('"permissionMode"');
+    if (
+      (modeEntry?.type === "user" || modeEntry?.type === "permission-mode") &&
+      typeof modeEntry.permissionMode === "string" &&
+      modeEntry.permissionMode.trim() !== ""
+    ) {
+      const mode = modeEntry.permissionMode.trim();
+      this.modeDone = true;
+      if (!(this.planExited && mode === "plan")) this.tail.permissionMode = mode;
+      return;
+    }
+    if (record('"plan_mode_exit"')?.attachment?.type === "plan_mode_exit") {
+      this.planExited = true;
+      return;
+    }
+    const human = record('"human"');
+    const compaction = record('"isCompactSummary"') ?? record('"compact_boundary"');
+    if (
+      (human?.type === "user" && human.origin?.kind === "human") ||
+      (compaction?.type === "user" && compaction.isCompactSummary === true) ||
+      (compaction?.type === "system" && compaction.subtype === "compact_boundary")
+    ) {
+      this.modeDone = true;
+    }
+  }
+}
+
+/** The parsed record of one line, or null for a subagent record or a bad line. */
+function parseMainThreadRecord(line: Buffer): TranscriptRecord | null {
   let entry: unknown;
   try {
     entry = JSON.parse(line.toString("utf8"));
   } catch {
-    return undefined;
+    return null;
   }
-  if (!entry || typeof entry !== "object") return undefined;
+  if (!entry || typeof entry !== "object") return null;
   const record = entry as TranscriptRecord;
-  return record.isSidechain === true ? undefined : record;
-}
-
-function assistantModelOfLine(line: Buffer): string | undefined {
-  const record = mainThreadRecord(line, '"assistant"');
-  if (record?.type !== "assistant") return undefined;
-  return concreteModel(record.message?.model);
-}
-
-/** Claude Code records the permission mode of the turn on a user record. */
-function permissionModeOfLine(line: Buffer): string | undefined {
-  const record = mainThreadRecord(line, '"permissionMode"');
-  if (record?.type !== "user" || typeof record.permissionMode !== "string") return undefined;
-  return record.permissionMode.trim() || undefined;
+  return record.isSidechain === true ? null : record;
 }
