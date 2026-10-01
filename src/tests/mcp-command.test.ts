@@ -8,6 +8,7 @@ import {
   formatMcpStatus,
   isMcpCommandText,
   MCP_AVAILABLE_COMMAND,
+  parseMcpCommand,
 } from "../mcp-command.js";
 import { Pushable } from "../utils.js";
 import { initializeClient } from "./helpers.js";
@@ -31,13 +32,31 @@ const SERVERS: McpServerStatus[] = [
   { name: "old", status: "disabled", scope: "user" },
 ];
 
-/** The SDK message shapes that carry the text of a local command. `idle`
- *  ends the turn with an idle state and no result, as after an interrupt. */
+/** The SDK message shapes that carry the text of a local command. Claude
+ *  Code 2.1.286 sends `assistant` and then `result`. `system` is the
+ *  dedicated shape of other builds. `idle` ends the turn with an idle state
+ *  and no result, as after an interrupt. */
 type OutputShape = "system" | "assistant" | "result" | "idle";
 
-/** The terminal text of the Claude Code `/mcp` for the prompt `text`. */
-const cliText = (text: string) =>
-  `CLI output of ${text}. Use \`/mcp\` in the terminal for details.`;
+/** The text that Claude Code 2.1.286 sends in SDK mode for an action. */
+const UNAVAILABLE = "Reconnect, enable, and disable aren't available in this session.";
+
+/** The text of Claude Code in SDK mode for the prompt `text`. Claude Code
+ *  does not run an action. It only refuses it. */
+function cliText(text: string, statuses: McpServerStatus[]): string {
+  const [command, action, ...rest] = text.split(/\s+/);
+  if (command !== "/mcp" || !/^(reconnect|enable|disable)?$/.test(action ?? "")) {
+    return `CLI output of ${text}.`;
+  }
+  if (action === undefined) {
+    return `${statuses.length} MCP server(s): ${statuses.map((status) => status.name).join(", ")}. Use \`/mcp\` in the terminal for details.`;
+  }
+  const server = rest.join(" ");
+  if (server !== "" && server !== "all" && !statuses.some((status) => status.name === server)) {
+    return `There's no MCP server named "${server}". Run \`/mcp\` in the terminal to see configured servers.`;
+  }
+  return UNAVAILABLE;
+}
 
 function syntheticAssistant(text: string) {
   return {
@@ -62,19 +81,23 @@ function syntheticAssistant(text: string) {
   };
 }
 
-/** An agent with one session. Its fake Claude Code runs each prompt as a
- *  local command: it applies the command to `statuses`, then sends the CLI
- *  text in each of `shapes`. The query reports `statuses`, unless `query`
- *  replaces a method. `events` records the command runs, the status reads,
- *  and the answers in order. */
+/** An agent with one session. Its fake Claude Code answers each prompt as
+ *  Claude Code does in SDK mode: it changes nothing and sends its text in
+ *  each of `shapes`. `beforeShape` can hold a shape back. The query reports
+ *  `statuses`, and its control API changes them, unless `query` replaces a
+ *  method. `acpServers` are the MCP servers of the ACP session request.
+ *  `events` records the CLI runs, the status reads, the control calls, and
+ *  the answers in order. */
 function setup(
   options: {
     query?: Record<string, unknown>;
     client?: Record<string, unknown>;
     shapes?: OutputShape[];
+    beforeShape?: (shape: OutputShape) => Promise<void>;
+    acpServers?: string[];
   } = {},
 ) {
-  const shapes = options.shapes ?? ["system"];
+  const shapes = options.shapes ?? ["assistant", "result"];
   const statuses = SERVERS.map((status) => ({ ...status }));
   const updates: SessionNotification[] = [];
   const events: string[] = [];
@@ -97,27 +120,24 @@ function setup(
       const text = user.message.content.map((block: any) => block.text).join(" ");
       forwarded.push(text);
       yield userEcho(user);
-      // Claude Code runs the command before it sends the text.
-      const [, action, server] = text.split(/\s+/);
-      const target = statuses.find((status) => status.name === server);
-      if (target && action === "reconnect") target.status = "connected";
-      if (target && action === "disable") target.status = "disabled";
       events.push(`run ${text}`);
+      const output = cliText(text, statuses);
       for (const shape of shapes) {
+        await options.beforeShape?.(shape);
         if (shape === "system") {
           yield {
             type: "system",
             subtype: "local_command_output",
-            content: cliText(text),
+            content: output,
             uuid: randomUUID(),
             session_id: "test-session",
           };
         } else if (shape === "assistant") {
-          yield syntheticAssistant(cliText(text));
+          yield syntheticAssistant(output);
         } else if (shape === "idle") {
           yield { type: "system", subtype: "session_state_changed", state: "idle" };
         } else {
-          yield successfulResultMessage({ result: cliText(text) });
+          yield successfulResultMessage({ result: output });
         }
       }
       if (!shapes.includes("result") && !shapes.includes("idle")) {
@@ -125,14 +145,40 @@ function setup(
       }
     }
   }
+  const find = (name: string) => {
+    const status = statuses.find((candidate) => candidate.name === name);
+    if (!status) throw new Error(`Server not found: ${name}`);
+    return status;
+  };
   const sdkQuery = Object.assign(wrapQuery(messages()), {
     mcpServerStatus: vi.fn(async () => {
       events.push("status");
       return statuses.map((status) => ({ ...status }));
     }),
+    reconnectMcpServer: vi.fn(async (name: string) => {
+      events.push(`reconnect ${name}`);
+      const status = find(name);
+      if (status.status !== "needs-auth") status.status = "connected";
+    }),
+    toggleMcpServer: vi.fn(async (name: string, enabled: boolean) => {
+      events.push(`${enabled ? "enable" : "disable"} ${name}`);
+      find(name).status = enabled ? "connected" : "disabled";
+    }),
     ...options.query,
   });
-  agent.sessions["test-session"] = mockSessionState({ query: sdkQuery, input });
+  agent.sessions["test-session"] = mockSessionState({
+    query: sdkQuery,
+    input,
+    creationParams: {
+      cwd: "/test",
+      mcpServers: (options.acpServers ?? []).map((name) => ({
+        name,
+        command: "server",
+        args: [],
+        env: [],
+      })),
+    },
+  });
   const text = () =>
     updates
       .filter((update) => update.update.sessionUpdate === "agent_message_chunk")
@@ -142,6 +188,31 @@ function setup(
     agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: command }] });
   return { agent, sdkQuery, statuses, forwarded, events, text, prompt };
 }
+
+/** The server list after a change of `changes` to {@link SERVERS}. */
+function listAfter(changes: Record<string, McpServerStatus["status"]>): string {
+  return formatMcpStatus(
+    SERVERS.map((status) =>
+      changes[status.name] ? { ...status, status: changes[status.name]! } : status,
+    ),
+  );
+}
+
+describe("parseMcpCommand", () => {
+  it("parses the action, the server, and all", () => {
+    expect(parseMcpCommand("/mcp")).toEqual({ action: "status" });
+    expect(parseMcpCommand("/mcp reconnect")).toEqual({ action: "reconnect", all: true });
+    expect(parseMcpCommand("/mcp reconnect all")).toEqual({ action: "reconnect", all: true });
+    expect(parseMcpCommand("/mcp Reconnect my server")).toEqual({
+      action: "reconnect",
+      all: false,
+      server: "my server",
+    });
+    expect(parseMcpCommand("/mcp disable all")).toEqual({ action: "disable", all: true });
+    expect(parseMcpCommand("/mcp enable")).toEqual({ action: "enable", all: false });
+    expect(parseMcpCommand("/mcp help")).toBeNull();
+  });
+});
 
 describe("isMcpCommandText", () => {
   it("accepts the forms that Claude Code runs itself", () => {
@@ -390,7 +461,7 @@ describe("cleanMcpError", () => {
 
 describe("/mcp", () => {
   it("sends /mcp to Claude Code and replaces its text with the list", async () => {
-    const { forwarded, text, prompt } = setup();
+    const { sdkQuery, forwarded, text, prompt } = setup();
 
     const response = await prompt("/mcp");
 
@@ -398,6 +469,8 @@ describe("/mcp", () => {
     expect(forwarded).toEqual(["/mcp"]);
     expect(text()).toBe(formatMcpStatus(SERVERS));
     expect(text()).not.toContain("terminal");
+    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
+    expect(sdkQuery.toggleMcpServer).not.toHaveBeenCalled();
   });
 
   it("says when no MCP server is configured", async () => {
@@ -408,42 +481,155 @@ describe("/mcp", () => {
     expect(text()).toBe("No MCP servers are configured.");
   });
 
-  it.each(["reconnect db", "enable db", "disable db", "reconnect all"])(
-    "sends /mcp %s to Claude Code and reads the list after the command",
-    async (args) => {
-      const { forwarded, events, text, prompt, statuses } = setup();
-
-      await prompt(`/mcp ${args}`);
-
-      expect(forwarded).toEqual([`/mcp ${args}`]);
-      expect(events).toEqual([`run /mcp ${args}`, "status", "answer"]);
-      expect(text()).toBe(formatMcpStatus(statuses));
-    },
-  );
-
-  it("shows the state that the CLI command made", async () => {
-    const { text, prompt } = setup();
+  it("reconnects a server through the control API after the text of Claude Code", async () => {
+    const { sdkQuery, forwarded, events, text, prompt } = setup();
 
     await prompt("/mcp reconnect db");
 
-    expect(text()).toContain("**Connected**\n- `github`: 2 tools\n- `db`");
-    expect(text()).not.toContain("**Failed**");
+    expect(forwarded).toEqual(["/mcp reconnect db"]);
+    expect(events).toEqual(["run /mcp reconnect db", "status", "reconnect db", "status", "answer"]);
+    expect(sdkQuery.reconnectMcpServer).toHaveBeenCalledWith("db");
+    expect(text()).toBe(`- Reconnected \`db\`\n\n${listAfter({ db: "connected" })}`);
+    expect(text()).not.toContain("aren't available");
   });
 
-  it("keeps the text of Claude Code when the status read fails", async () => {
+  it.each([
+    ["disable github", "github", false, "- Disabled `github`", { github: "disabled" }],
+    ["enable old", "old", true, "- Enabled `old`", { old: "connected" }],
+  ] as const)(
+    "runs /mcp %s through the control API",
+    async (args, server, enabled, line, changes) => {
+      const { sdkQuery, text, prompt } = setup();
+
+      await prompt(`/mcp ${args}`);
+
+      expect(sdkQuery.toggleMcpServer).toHaveBeenCalledExactlyOnceWith(server, enabled);
+      expect(text()).toBe(`${line}\n\n${listAfter(changes)}`);
+    },
+  );
+
+  it.each(["/mcp reconnect all", "/mcp reconnect"])(
+    "%s reconnects every server that is not connected and not disabled",
+    async (command) => {
+      const { sdkQuery, text, prompt } = setup();
+
+      await prompt(command);
+
+      expect(sdkQuery.reconnectMcpServer.mock.calls).toEqual([["linear"], ["db"], ["docs"]]);
+      expect(text()).toBe(
+        [
+          "- Reconnected `linear`\n- Reconnected `db`\n- Reconnected `docs`",
+          listAfter({ db: "connected", docs: "connected" }),
+        ].join("\n\n"),
+      );
+    },
+  );
+
+  it("disables every enabled server and enables every disabled server for all", async () => {
+    const { sdkQuery, prompt } = setup();
+
+    await prompt("/mcp disable all");
+    expect(sdkQuery.toggleMcpServer.mock.calls).toEqual([
+      ["github", false],
+      ["linear", false],
+      ["db", false],
+      ["docs", false],
+    ]);
+
+    sdkQuery.toggleMcpServer.mockClear();
+    await prompt("/mcp enable all");
+    expect(sdkQuery.toggleMcpServer.mock.calls).toEqual([
+      ["github", true],
+      ["linear", true],
+      ["db", true],
+      ["docs", true],
+      ["old", true],
+    ]);
+  });
+
+  it("says when a reconnect of all has nothing to reconnect", async () => {
+    const { sdkQuery, text, prompt } = setup({
+      query: {
+        mcpServerStatus: vi.fn(async () => [{ name: "github", status: "connected" }]),
+      },
+    });
+
+    await prompt("/mcp reconnect all");
+
+    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
+    expect(text()).toBe(
+      "Every MCP server is connected or disabled. There is nothing to reconnect.\n\n" +
+        formatMcpStatus([{ name: "github", status: "connected" }]),
+    );
+  });
+
+  it("asks for a server name for an enable without a name", async () => {
+    const { sdkQuery, text, prompt } = setup();
+
+    await prompt("/mcp disable");
+
+    expect(sdkQuery.toggleMcpServer).not.toHaveBeenCalled();
+    expect(text()).toBe(
+      `Name a server or \`all\`, for example \`/mcp disable <server>\`.\n\n${formatMcpStatus(SERVERS)}`,
+    );
+  });
+
+  it("keeps the unknown-server sentence of Claude Code and drops the terminal sentence", async () => {
+    const { sdkQuery, text, prompt } = setup();
+
+    await prompt("/mcp reconnect nosuch");
+
+    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
+    expect(text()).toBe(`There's no MCP server named "nosuch".\n\n${formatMcpStatus(SERVERS)}`);
+  });
+
+  it("isolates a control API error to its server", async () => {
     const { text, prompt } = setup({
       query: {
-        mcpServerStatus: vi.fn(async () => {
-          throw new Error("control channel closed");
+        reconnectMcpServer: vi.fn(async (name: string) => {
+          if (name === "db") throw new Error("MCP startup failed: spawn db-mcp ENOENT");
         }),
       },
     });
 
-    const response = await prompt("/mcp");
+    await prompt("/mcp reconnect all");
 
-    expect(response.stopReason).toBe("end_turn");
-    expect(text()).toBe(cliText("/mcp"));
+    expect(text()).toBe(
+      [
+        "- Reconnected `linear`\n- Couldn't reconnect `db`: spawn db-mcp ENOENT\n- Reconnected `docs`",
+        formatMcpStatus(SERVERS),
+      ].join("\n\n"),
+    );
   });
+
+  it("keeps the text of Claude Code when the control API is missing", async () => {
+    const { text, prompt } = setup({
+      query: { reconnectMcpServer: undefined, toggleMcpServer: undefined },
+    });
+
+    await prompt("/mcp reconnect db");
+
+    expect(text()).toBe(UNAVAILABLE);
+  });
+
+  it.each(["/mcp", "/mcp reconnect db"])(
+    "keeps the text of Claude Code for %s when the status read fails",
+    async (command) => {
+      const { sdkQuery, text, prompt } = setup({
+        query: {
+          mcpServerStatus: vi.fn(async () => {
+            throw new Error("control channel closed");
+          }),
+        },
+      });
+
+      const response = await prompt(command);
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(text()).toBe(cliText(command, SERVERS));
+      expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     [["system", "assistant"]],
@@ -451,14 +637,15 @@ describe("/mcp", () => {
     [["system", "result"]],
     [["assistant", "result"]],
   ] as OutputShape[][][])(
-    "sends the list once when Claude Code mirrors its text as %j",
+    "runs the action and sends the result once when Claude Code mirrors its text as %j",
     async (shapes) => {
       const { sdkQuery, text, prompt } = setup({ shapes });
 
-      await prompt("/mcp");
+      await prompt("/mcp reconnect db");
 
-      expect(text()).toBe(formatMcpStatus(SERVERS));
-      expect(sdkQuery.mcpServerStatus).toHaveBeenCalledOnce();
+      expect(text()).toBe(`- Reconnected \`db\`\n\n${listAfter({ db: "connected" })}`);
+      expect(sdkQuery.reconnectMcpServer).toHaveBeenCalledOnce();
+      expect(sdkQuery.mcpServerStatus).toHaveBeenCalledTimes(2);
     },
   );
 
@@ -486,93 +673,172 @@ describe("/mcp", () => {
     // The adapter rewrites an MCP prompt command into the Claude Code form.
     expect(forwarded).toEqual(["/github:prompt (MCP)", "/mcp help", "/mcp more"]);
     expect(text()).toBe(
-      [cliText("/github:prompt (MCP)"), cliText("/mcp help"), cliText("/mcp more")].join(""),
+      ["/github:prompt (MCP)", "/mcp help", "/mcp more"]
+        .map((command) => cliText(command, SERVERS))
+        .join(""),
     );
     expect(sdkQuery.mcpServerStatus).not.toHaveBeenCalled();
   });
 
-  it("publishes nothing when a cancel comes during the status read", async () => {
+  // Claude Code ends an interrupted turn with an idle state.
+  it.each([[["assistant", "result", "idle"]], [["result", "idle"]]] as OutputShape[][][])(
+    "publishes nothing when a cancel comes during the status read with %j",
+    async (shapes) => {
+      let started!: () => void;
+      const reading = new Promise<void>((resolve) => (started = resolve));
+      const { agent, text, prompt } = setup({
+        shapes,
+        query: {
+          mcpServerStatus: vi.fn(
+            () =>
+              new Promise<McpServerStatus[]>(() => {
+                started();
+              }),
+          ),
+        },
+      });
+
+      const response = prompt("/mcp");
+      await reading;
+      await agent.cancel({ sessionId: "test-session" });
+
+      expect((await response).stopReason).toBe("cancelled");
+      expect(text()).toBe("");
+    },
+  );
+
+  it("stops the actions and publishes nothing when a cancel comes during a reconnect", async () => {
     let started!: () => void;
-    const reading = new Promise<void>((resolve) => (started = resolve));
+    const reconnecting = new Promise<void>((resolve) => (started = resolve));
+    const reconnectMcpServer = vi.fn(
+      () =>
+        new Promise<void>(() => {
+          started();
+        }),
+    );
     const { agent, text, prompt } = setup({
-      shapes: ["system", "idle"],
-      query: {
-        mcpServerStatus: vi.fn(
-          () =>
-            new Promise<McpServerStatus[]>(() => {
-              started();
-            }),
-        ),
-      },
+      shapes: ["assistant", "result", "idle"],
+      query: { reconnectMcpServer },
     });
 
-    const response = prompt("/mcp");
-    await reading;
+    const response = prompt("/mcp reconnect all");
+    await reconnecting;
     await agent.cancel({ sessionId: "test-session" });
 
     expect((await response).stopReason).toBe("cancelled");
     expect(text()).toBe("");
+    expect(reconnectMcpServer).toHaveBeenCalledOnce();
   });
 });
 
 describe("/mcp and MCP OAuth", () => {
-  it("starts the MCP OAuth flow once for a server that needs authentication", async () => {
-    const mcpAuthenticate = vi.fn(async () => ({
-      requiresUserAction: false,
-      callbackExpected: false,
-    }));
-    const { agent, text, prompt } = setup({
-      query: { mcpAuthenticate },
-      shapes: ["system", "assistant", "result"],
-    });
-    await initializeClient(agent, { elicitation: { url: {} } } as any);
+  const authenticated = () =>
+    vi.fn(async (_server: string) => ({ requiresUserAction: false, callbackExpected: false }));
 
-    await prompt("/mcp");
+  async function oauthSetup(options: Parameters<typeof setup>[0] = {}) {
+    const mcpAuthenticate = authenticated();
+    const harness = setup({ ...options, query: { mcpAuthenticate, ...options.query } });
+    await initializeClient(harness.agent, { elicitation: { url: {} } } as any);
+    return { ...harness, mcpAuthenticate };
+  }
+
+  it("starts the MCP OAuth flow after an explicit reconnect of an ACP server", async () => {
+    const { mcpAuthenticate, text, prompt } = await oauthSetup({ acpServers: ["linear"] });
+
+    await prompt("/mcp reconnect linear");
 
     await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
     expect(mcpAuthenticate).toHaveBeenCalledWith("linear");
-    expect(text()).toBe(formatMcpStatus(SERVERS));
+    expect(text()).toBe(`- Reconnected \`linear\`\n\n${formatMcpStatus(SERVERS)}`);
+  });
+
+  it("starts the MCP OAuth flow only for the ACP servers of a reconnect of all", async () => {
+    const statuses: McpServerStatus[] = [
+      { name: "acp", status: "needs-auth" },
+      { name: "user", status: "needs-auth" },
+    ];
+    const { mcpAuthenticate, prompt } = await oauthSetup({
+      acpServers: ["acp"],
+      query: { mcpServerStatus: vi.fn(async () => statuses), reconnectMcpServer: vi.fn() },
+    });
+
+    await prompt("/mcp reconnect all");
+
+    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
+    expect(mcpAuthenticate).toHaveBeenCalledWith("acp");
+  });
+
+  it("does not start the MCP OAuth flow for a plain /mcp", async () => {
+    const { mcpAuthenticate, sdkQuery, prompt } = await oauthSetup({ acpServers: ["linear"] });
+
+    await prompt("/mcp");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(sdkQuery.mcpServerStatus).toHaveBeenCalledOnce();
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
+  });
+
+  it("does not start the MCP OAuth flow for a server that is not from the ACP request", async () => {
+    const { mcpAuthenticate, prompt } = await oauthSetup();
+
+    await prompt("/mcp reconnect linear");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
+  });
+
+  it("does not start the MCP OAuth flow when the turn was cancelled", async () => {
+    let releaseResult!: () => void;
+    const resultHeld = new Promise<void>((resolve) => (releaseResult = resolve));
+    const { agent, mcpAuthenticate, text, prompt } = await oauthSetup({
+      acpServers: ["linear"],
+      shapes: ["assistant", "result", "idle"],
+      beforeShape: (shape) => (shape === "result" ? resultHeld : Promise.resolve()),
+    });
+
+    const response = prompt("/mcp reconnect linear");
+    await vi.waitFor(() => expect(text()).toContain("Reconnected `linear`"));
+    await agent.cancel({ sessionId: "test-session" });
+    releaseResult();
+
+    expect((await response).stopReason).toBe("cancelled");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
   });
 
   it("does not hold the turn while the MCP OAuth flow runs", async () => {
     const mcpAuthenticate = vi.fn(() => new Promise<never>(() => {}));
-    const { agent, prompt } = setup({ query: { mcpAuthenticate } });
+    const { agent, prompt } = setup({ query: { mcpAuthenticate }, acpServers: ["linear"] });
     await initializeClient(agent, { elicitation: { url: {} } } as any);
 
-    const response = await prompt("/mcp");
+    const response = await prompt("/mcp reconnect linear");
 
     expect(response.stopReason).toBe("end_turn");
     await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
   });
 
   it("does not start the MCP OAuth flow without URL elicitation", async () => {
-    const mcpAuthenticate = vi.fn(async () => ({
-      requiresUserAction: false,
-      callbackExpected: false,
-    }));
-    const { prompt, sdkQuery } = setup({ query: { mcpAuthenticate } });
+    const mcpAuthenticate = authenticated();
+    const { prompt } = setup({ query: { mcpAuthenticate }, acpServers: ["linear"] });
 
-    await prompt("/mcp");
-    await Promise.resolve();
+    await prompt("/mcp reconnect linear");
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(sdkQuery.mcpServerStatus).toHaveBeenCalledOnce();
     expect(mcpAuthenticate).not.toHaveBeenCalled();
   });
 
-  it("does not start the MCP OAuth flow when the list fell back to the CLI text", async () => {
-    const mcpAuthenticate = vi.fn();
-    const { agent, prompt } = setup({
+  it("does not start the MCP OAuth flow when the result fell back to the CLI text", async () => {
+    const { mcpAuthenticate, prompt } = await oauthSetup({
+      acpServers: ["linear"],
       query: {
-        mcpAuthenticate,
         mcpServerStatus: vi.fn(async () => {
           throw new Error("control channel closed");
         }),
       },
     });
-    await initializeClient(agent, { elicitation: { url: {} } } as any);
 
-    await prompt("/mcp");
-    await Promise.resolve();
+    await prompt("/mcp reconnect linear");
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(mcpAuthenticate).not.toHaveBeenCalled();
   });

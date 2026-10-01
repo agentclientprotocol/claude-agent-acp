@@ -2,8 +2,9 @@ import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import type { McpServerStatus, Query } from "@anthropic-ai/claude-agent-sdk";
 import { escapeMarkdown } from "./usage-markdown.js";
 
-/** The `/mcp` entry of `available_commands_update`. Claude Code runs `/mcp`,
- *  and the adapter replaces its terminal text with a list of the servers. */
+/** The `/mcp` entry of `available_commands_update`. The adapter shows the
+ *  servers as a list, and runs a reconnect, an enable, or a disable through
+ *  the SDK control API. */
 export const MCP_AVAILABLE_COMMAND: AvailableCommand = {
   name: "mcp",
   description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
@@ -13,13 +14,35 @@ export const MCP_AVAILABLE_COMMAND: AvailableCommand = {
 /** The time that the status read after a `/mcp` command can take. */
 const MCP_STATUS_TIMEOUT_MS = 5_000;
 
-/** True for a prompt that is exactly `/mcp`, or `/mcp reconnect`, `/mcp enable`,
- *  or `/mcp disable` with an optional server name or `all`. Claude Code runs
- *  these commands itself. Any other `/mcp` argument gets no replacement. */
-export function isMcpCommandText(text: string): boolean {
+/** The time that one reconnect, enable, or disable can take. */
+const MCP_ACTION_TIMEOUT_MS = 30_000;
+
+/** A `/mcp` prompt that gets a replacement for its Claude Code text. `all` is
+ *  true for `all` and for a reconnect without a server name, as in Claude
+ *  Code. `server` is undefined for an enable or a disable without a name. */
+export type McpCommand =
+  | { action: "status" }
+  | { action: "reconnect" | "enable" | "disable"; all: boolean; server?: string };
+
+/** Parse a prompt that is exactly `/mcp`, or `/mcp reconnect`, `/mcp enable`,
+ *  or `/mcp disable` with an optional server name or `all`. Any other `/mcp`
+ *  argument gives null, and the prompt gets no replacement. */
+export function parseMcpCommand(text: string): McpCommand | null {
   const words = text.trim().split(/\s+/);
-  if (words[0] !== "/mcp") return false;
-  return words.length === 1 || /^(reconnect|enable|disable)$/i.test(words[1] ?? "");
+  if (words[0] !== "/mcp") return null;
+  if (words.length === 1) return { action: "status" };
+  const action = words[1]?.toLowerCase();
+  if (action !== "reconnect" && action !== "enable" && action !== "disable") return null;
+  const server = words.slice(2).join(" ");
+  if (server === "all" || (server === "" && action === "reconnect")) {
+    return { action, all: true };
+  }
+  return server === "" ? { action, all: false } : { action, all: false, server };
+}
+
+/** True for a prompt that {@link parseMcpCommand} accepts. */
+export function isMcpCommandText(text: string): boolean {
+  return parseMcpCommand(text) !== null;
 }
 
 /** Read the MCP server status for the list after a `/mcp` command. Resolves
@@ -271,4 +294,158 @@ export function formatMcpStatus(statuses: McpServerStatus[]): string {
     );
   }
   return blocks.join("\n\n");
+}
+
+/** The SDK query methods that `/mcp` uses. The control methods are optional,
+ *  because an older SDK or a test double can lack them. */
+export type McpControlQuery = Pick<Query, "mcpServerStatus"> &
+  Partial<Pick<Query, "reconnectMcpServer" | "toggleMcpServer">>;
+
+/** The result of {@link runMcpCommand}. `markdown` is null when the turn
+ *  keeps the text of Claude Code. `reconnected` holds the servers that the
+ *  adapter tried to reconnect. */
+export type McpCommandOutcome = { markdown: string | null; reconnected: string[] };
+
+type CallResult = { type: "done" } | { type: "failed"; error: string } | { type: "aborted" };
+
+/** Wait for one control call. The wait stops when `signal` aborts or the
+ *  call takes more than {@link MCP_ACTION_TIMEOUT_MS}. */
+async function awaitCall(call: () => Promise<void>, signal: AbortSignal): Promise<CallResult> {
+  if (signal.aborted) return { type: "aborted" };
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      call().then((): CallResult => ({ type: "done" })),
+      new Promise<CallResult>((resolve) => {
+        timeout = setTimeout(
+          () => resolve({ type: "failed", error: "The request timed out." }),
+          MCP_ACTION_TIMEOUT_MS,
+        );
+        timeout.unref?.();
+      }),
+      new Promise<CallResult>((resolve) => {
+        onAbort = () => resolve({ type: "aborted" });
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } catch (error) {
+    return signal.aborted
+      ? { type: "aborted" }
+      : { type: "failed", error: error instanceof Error ? error.message : String(error) };
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+const ACTION_DONE = { reconnect: "Reconnected", enable: "Enabled", disable: "Disabled" };
+
+/** The Claude Code sentence that refuses an action in SDK mode. */
+const UNAVAILABLE_SENTENCE = /aren't available in this session/i;
+
+/** A Claude Code sentence that points to a terminal, which an ACP client
+ *  does not have. */
+function isTerminalSentence(sentence: string): boolean {
+  return /in the terminal/i.test(sentence) || sentence.includes("`/mcp reconnect all` here");
+}
+
+function sentences(text: string): string[] {
+  return text
+    .trim()
+    .split(/(?<=[.!?])\s+/)
+    .filter((sentence) => sentence !== "");
+}
+
+/** The servers that the action changes. A named server is always a target,
+ *  so the control API reports its own error. */
+function actionTargets(
+  command: Extract<McpCommand, { all: boolean }>,
+  statuses: McpServerStatus[],
+): string[] {
+  if (!command.all) return command.server === undefined ? [] : [command.server];
+  const names = statuses
+    .filter((status) => {
+      if (command.action === "reconnect") return needsReconnect(status);
+      if (command.action === "enable") return status.status === "disabled";
+      return status.status !== "disabled";
+    })
+    .map((status) => status.name);
+  return [...new Set(names)];
+}
+
+function nothingToDoLine(action: McpCommand["action"]): string {
+  if (action === "enable") return "Every MCP server is already enabled.";
+  if (action === "disable") return "Every MCP server is already disabled.";
+  return "Every MCP server is connected or disabled. There is nothing to reconnect.";
+}
+
+/** Run a `/mcp` command after Claude Code sent `originalOutput`, its text for
+ *  the command. Claude Code refuses a reconnect, an enable, and a disable in
+ *  SDK mode, so the adapter runs them through the SDK control API. The result
+ *  of each server goes above the server list. An error of one server does
+ *  not stop the others. When the control API is missing, the first status
+ *  read fails, or `signal` aborts, the turn keeps the text of Claude Code. */
+export async function runMcpCommand(
+  query: McpControlQuery,
+  command: McpCommand,
+  originalOutput: string,
+  signal: AbortSignal,
+  logError: (message: string) => void,
+): Promise<McpCommandOutcome> {
+  const reconnected: string[] = [];
+  const keep: McpCommandOutcome = { markdown: null, reconnected };
+  if (command.action === "status") {
+    // The list replaces the Claude Code summary line.
+    const statuses = await readMcpServerStatus(query, signal, logError);
+    return { markdown: statuses ? formatMcpStatus(statuses) : null, reconnected };
+  }
+  const { reconnectMcpServer, toggleMcpServer } = query;
+  if (typeof reconnectMcpServer !== "function" || typeof toggleMcpServer !== "function") {
+    return keep;
+  }
+  const before = await readMcpServerStatus(query, signal, logError);
+  if (!before) return keep;
+
+  const cliSentences = sentences(originalOutput).filter(
+    (sentence) => !isTerminalSentence(sentence),
+  );
+  const cliNamesUnknown = cliSentences.some((sentence) => /no MCP server named/i.test(sentence));
+  const results: string[] = [];
+  if (!command.all && command.server === undefined) {
+    results.push(`Name a server or \`all\`, for example \`/mcp ${command.action} <server>\`.`);
+  }
+  const known = new Set(before.map((status) => status.name));
+  const targets = actionTargets(command, before);
+  if (command.all && targets.length === 0) results.push(nothingToDoLine(command.action));
+  for (const server of targets) {
+    if (!known.has(server)) {
+      // Claude Code checks the name first. Its sentence then stays.
+      if (!cliNamesUnknown) results.push(`There's no MCP server named ${codeSpan(server)}.`);
+      continue;
+    }
+    if (command.action === "reconnect") reconnected.push(server);
+    const call =
+      command.action === "reconnect"
+        ? () => reconnectMcpServer.call(query, server)
+        : () => toggleMcpServer.call(query, server, command.action === "enable");
+    const result = await awaitCall(call, signal);
+    if (result.type === "aborted") return keep;
+    if (result.type === "done") {
+      results.push(`- ${ACTION_DONE[command.action]} ${codeSpan(server)}`);
+    } else {
+      const error = cleanMcpError(result.error);
+      const failure = `- Couldn't ${command.action} ${codeSpan(server)}`;
+      results.push(error === "" ? failure : `${failure}: ${escapeMarkdown(error)}`);
+    }
+  }
+
+  const blocks: string[] = [];
+  const kept = cliSentences.filter((sentence) => !UNAVAILABLE_SENTENCE.test(sentence));
+  if (kept.length > 0) blocks.push(kept.join(" "));
+  if (results.length > 0) blocks.push(results.join("\n"));
+  const after = await readMcpServerStatus(query, signal, logError);
+  if (signal.aborted) return keep;
+  if (after) blocks.push(formatMcpStatus(after));
+  return { markdown: blocks.join("\n\n"), reconnected };
 }
