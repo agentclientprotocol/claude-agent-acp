@@ -169,9 +169,7 @@ async function lastTailRecords(filePath: string, withModel: boolean): Promise<Re
 
 type TranscriptRecord = {
   type?: unknown;
-  subtype?: unknown;
   isSidechain?: unknown;
-  isCompactSummary?: unknown;
   message?: { model?: unknown };
   permissionMode?: unknown;
   origin?: { kind?: unknown };
@@ -181,16 +179,18 @@ type TranscriptRecord = {
 /**
  * Reads the lines of a transcript from the end and keeps what a resume needs.
  *
- * Claude Code records the permission mode on a prompt record of type `user`,
- * and on a `permission-mode` record when the mode changes between prompts.
+ * Claude Code records the permission mode on each prompt record of type `user`.
+ * The `permission-mode` records of the CLI metadata block are not used: they
+ * can disagree with the prompts, and the SDK does not write them.
  * The SDK writes no record when it leaves plan mode through ExitPlanMode.
  * It writes a `plan_mode_exit` attachment only, without the new mode. Thus a
  * `plan` mode before a later plan exit is not the current mode, and the scan
  * gives no mode.
  *
- * The mode search stops at the last human prompt, at a compaction, or at the
- * first mode record. Each human prompt of a current Claude Code has the mode,
- * so a prompt without it means that the transcript does not record modes.
+ * The mode search stops at the first mode record or at the last human prompt.
+ * Each human prompt of a current Claude Code has the mode, so a prompt without
+ * it means that the transcript does not record modes. A compaction does not
+ * stop the search: the mode of the prompt before it is still current.
  */
 class TailScan {
   readonly tail: ResumedTail = {};
@@ -219,7 +219,7 @@ class TailScan {
   private visitForMode(record: (marker: string) => TranscriptRecord | undefined): void {
     const modeEntry = record('"permissionMode"');
     if (
-      (modeEntry?.type === "user" || modeEntry?.type === "permission-mode") &&
+      modeEntry?.type === "user" &&
       typeof modeEntry.permissionMode === "string" &&
       modeEntry.permissionMode.trim() !== ""
     ) {
@@ -233,14 +233,7 @@ class TailScan {
       return;
     }
     const human = record('"human"');
-    const compaction = record('"isCompactSummary"') ?? record('"compact_boundary"');
-    if (
-      (human?.type === "user" && human.origin?.kind === "human") ||
-      (compaction?.type === "user" && compaction.isCompactSummary === true) ||
-      (compaction?.type === "system" && compaction.subtype === "compact_boundary")
-    ) {
-      this.modeDone = true;
-    }
+    if (human?.type === "user" && human.origin?.kind === "human") this.modeDone = true;
   }
 }
 

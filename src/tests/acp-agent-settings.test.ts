@@ -505,6 +505,34 @@ describe("ClaudeAcpAgent settings", () => {
       expect(getCapturedOptions().permissionMode).toBe("default");
       expect(response.modes?.currentModeId).toBe("default");
     });
+
+    it("keeps the live mode when a sign-out respawn starts a fresh conversation", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([user("acceptEdits")]);
+      await agent.resumeSession({
+        sessionId,
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+      await agent.setSessionMode({ sessionId, modeId: "default" });
+      const { RequestError } = await import("@agentclientprotocol/sdk");
+      const createSession = (agent as any).createSession.bind(agent);
+      const creations: object[] = [];
+      (agent as any).createSession = async (params: object, options: { resume?: string }) => {
+        creations.push(options);
+        // The CLI never wrote the conversation, so the resume fails.
+        if (options.resume) throw RequestError.resourceNotFound(sessionId);
+        return createSession(params, options);
+      };
+
+      await (agent as any).recreateSignedOutQuery(sessionId, (agent as any).sessions[sessionId]);
+
+      expect(creations).toEqual([
+        { resume: sessionId, permissionMode: "default" },
+        { reuseSessionId: sessionId, permissionMode: "default" },
+      ]);
+      expect(getCapturedOptions().permissionMode).toBe("default");
+    });
   });
 
   it("falls back to 'default' when permissions.defaultMode is invalid", async () => {

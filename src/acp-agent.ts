@@ -3542,7 +3542,10 @@ export class ClaudeAcpAgent {
           `session ${sessionId} was never persisted; starting a fresh query under the same id`,
         );
         try {
-          await this.createSession(creationParams, { reuseSessionId: sessionId });
+          await this.createSession(creationParams, {
+            reuseSessionId: sessionId,
+            permissionMode: session.modes.currentModeId as PermissionMode,
+          });
           return;
         } catch (fallbackError) {
           if (!this.sessions[sessionId]) {

@@ -151,14 +151,14 @@ describe("readResumedModel", () => {
     expect((await readResumedTail("early-mode")).permissionMode).toBe("acceptEdits");
   });
 
-  it("reads a permission-mode record of a mode change between prompts", async () => {
-    await transcript("mode-change", [
-      prompt("first", { permissionMode: "default", origin: { kind: "human" } }),
+  it("ignores the permission-mode records of the CLI metadata block", async () => {
+    await transcript("metadata-mode", [
+      prompt("first", { permissionMode: "bypassPermissions", origin: { kind: "human" } }),
       record("claude-opus-5"),
-      { type: "permission-mode", permissionMode: "auto", sessionId: "mode-change" },
+      { type: "permission-mode", permissionMode: "auto", sessionId: "metadata-mode" },
     ]);
 
-    expect((await readResumedTail("mode-change")).permissionMode).toBe("auto");
+    expect((await readResumedTail("metadata-mode")).permissionMode).toBe("bypassPermissions");
   });
 
   it("gives no plan mode when a plan exit follows it", async () => {
@@ -172,7 +172,7 @@ describe("readResumedModel", () => {
     await transcript("plan-exit-then-mode", [
       prompt("plan it", { permissionMode: "plan", origin: { kind: "human" } }),
       planExit,
-      { type: "permission-mode", permissionMode: "acceptEdits" },
+      prompt("go", { permissionMode: "acceptEdits", origin: { kind: "human" } }),
       record("claude-opus-5"),
     ]);
 
@@ -186,14 +186,19 @@ describe("readResumedModel", () => {
       prompt("new", { origin: { kind: "human" } }),
       record("claude-opus-5"),
     ]);
+
+    expect(await readResumedTail("bounded")).toEqual({ model: "claude-opus-5" });
+  });
+
+  it("reads the mode of the prompt before a compaction", async () => {
     await transcript("compacted", [
-      prompt("old", { permissionMode: "bypassPermissions", origin: { kind: "human" } }),
+      prompt("old", { permissionMode: "plan", origin: { kind: "human" } }),
+      { type: "system", subtype: "compact_boundary" },
       prompt("summary", { isCompactSummary: true }),
       record("claude-opus-5"),
     ]);
 
-    expect(await readResumedTail("bounded")).toEqual({ model: "claude-opus-5" });
-    expect(await readResumedTail("compacted")).toEqual({ model: "claude-opus-5" });
+    expect((await readResumedTail("compacted")).permissionMode).toBe("plan");
   });
 
   it("returns no permission mode when the transcript records none", async () => {
