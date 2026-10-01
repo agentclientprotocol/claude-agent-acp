@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { claudeCliPath, runAcp } from "./acp-agent.js";
+import { claudeCliPath } from "./acp-agent.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
-import { EXPERIMENTAL_ACP_V2_ENV, runAcpWithExperimentalV2 } from "./v2/run.js";
+import { serveAcp } from "./serve.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -83,15 +83,10 @@ if (process.argv.includes("--cli")) {
     : undefined;
   logger?.log("Claude ACP started");
 
-  // The draft ACP v2 is opt-in. Without the flag the adapter serves ACP v1
-  // alone, as it always has.
-  const acp =
-    process.env[EXPERIMENTAL_ACP_V2_ENV] === "1"
-      ? runAcpWithExperimentalV2(logger)
-      : (() => {
-          const { connection, agent } = runAcp(logger);
-          return { closed: connection.closed, dispose: () => agent.dispose() };
-        })();
+  // The draft ACP v2 is opt-in while it is a draft.
+  const acp = serveAcp(logger, {
+    experimentalV2: process.env.CLAUDE_AGENT_ACP_EXPERIMENTAL_V2 === "1",
+  });
 
   async function shutdown() {
     await acp.dispose().catch((err) => {
