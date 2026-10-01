@@ -1,5 +1,6 @@
 import {
   agent as acpAgent,
+  AgentApp,
   AgentContext,
   AuthenticateRequest,
   AuthMethod,
@@ -10855,21 +10856,25 @@ export async function runPromptWithCancellation(
   }
 }
 
-export function runAcp(logger?: Logger) {
-  const input = nodeToWebWritable(process.stdout);
-  const output = nodeToWebReadable(process.stdin);
-
-  const stream = ndJsonStream(input, output);
-
-  // `connect(...)` returns a connection-scoped peer handle (`connection.client`)
-  // that stays valid for the whole connection, so the agent captures it once.
-  // Handlers close over `agent`, which is assigned synchronously right after
-  // `connect()` returns — before the connection processes any inbound message.
-  // It cannot be `const`: its value depends on `connection.client`, which does
-  // not exist until `connect()` has been called.
-  // eslint-disable-next-line prefer-const
-  let agent: ClaudeAcpAgent;
-  const connection = acpAgent({ name: "claude-code-acp" })
+/**
+ * The ACP v1 surface of the adapter, for one connection.
+ *
+ * The agent of the connection is created when the connection opens, from the
+ * connection-scoped peer handle (`connection.client`), which stays valid for
+ * the whole connection. Connect handlers run before the connection processes
+ * any inbound message, so every handler below sees the agent. `onAgent`
+ * receives it for the owner of the process (shutdown).
+ */
+export function v1AgentApp(
+  logger: Logger | undefined,
+  onAgent: (agent: ClaudeAcpAgent) => void,
+): AgentApp {
+  let agent!: ClaudeAcpAgent;
+  return acpAgent({ name: "claude-code-acp" })
+    .onConnect((connection) => {
+      agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
+      onAgent(agent);
+    })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
@@ -10903,10 +10908,15 @@ export function runAcp(logger?: Logger) {
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
-    )
-    .connect(stream);
+    );
+}
 
-  agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
+/** Serves ACP v1 on stdio. */
+export function runAcp(logger?: Logger) {
+  const stream = ndJsonStream(nodeToWebWritable(process.stdout), nodeToWebReadable(process.stdin));
+  let agent!: ClaudeAcpAgent;
+  // `connect` runs the connect handlers before it returns, so `agent` is set.
+  const connection = v1AgentApp(logger, (created) => (agent = created)).connect(stream);
   return { connection, agent };
 }
 

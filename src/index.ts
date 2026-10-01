@@ -2,6 +2,7 @@
 
 import { claudeCliPath, runAcp } from "./acp-agent.js";
 import { applyManagedPolicyEnv } from "./managed-policy.js";
+import { EXPERIMENTAL_ACP_V2_ENV, runAcpWithExperimentalV2 } from "./v2/run.js";
 import packageJson from "../package.json" with { type: "json" };
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -82,10 +83,18 @@ if (process.argv.includes("--cli")) {
     : undefined;
   logger?.log("Claude ACP started");
 
-  const { connection, agent } = runAcp(logger);
+  // The draft ACP v2 is opt-in. Without the flag the adapter serves ACP v1
+  // alone, as it always has.
+  const acp =
+    process.env[EXPERIMENTAL_ACP_V2_ENV] === "1"
+      ? runAcpWithExperimentalV2(logger)
+      : (() => {
+          const { connection, agent } = runAcp(logger);
+          return { closed: connection.closed, dispose: () => agent.dispose() };
+        })();
 
   async function shutdown() {
-    await agent.dispose().catch((err) => {
+    await acp.dispose().catch((err) => {
       console.error("Error during cleanup:", err);
     });
     process.exit(0);
@@ -94,7 +103,7 @@ if (process.argv.includes("--cli")) {
   // Exit cleanly when the ACP connection closes (e.g. stdin EOF, transport
   // error). Without this, `process.stdin.resume()` keeps the event loop
   // alive indefinitely, causing orphan process accumulation in oneshot mode.
-  connection.closed.then(shutdown);
+  acp.closed.then(shutdown);
 
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
