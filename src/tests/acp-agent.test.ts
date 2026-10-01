@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from "vitest";
 import { spawn, spawnSync } from "child_process";
 import {
   AvailableCommand,
@@ -9820,6 +9820,116 @@ describe("terminal slash command filtering", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
     expect(supportedCommands).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("skill commands in available_commands_update", () => {
+  let cwd: string;
+  let skillPath: string;
+
+  beforeEach(async () => {
+    cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-commands-"));
+    skillPath = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(skillPath), { recursive: true });
+    await writeFile(skillPath, "# review\n");
+  });
+
+  afterEach(async () => {
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  async function advertisedCommands(clientCapabilities: Record<string, unknown>) {
+    const sessionUpdate = vi.fn(async () => {});
+    const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities });
+    async function* generator(input: Pushable<any>) {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: userMessage } = await iter.next();
+      yield {
+        type: "user",
+        message: userMessage.message,
+        parent_tool_use_id: null,
+        uuid: userMessage.uuid,
+        session_id: "test-session",
+        isReplay: true,
+      };
+      yield {
+        type: "system",
+        subtype: "commands_changed",
+        session_id: "test-session",
+        commands: [
+          { name: "review", description: "Review the diff", argumentHint: "" },
+          {
+            name: "compact",
+            description: "Compact the conversation",
+            argumentHint: "",
+            builtin: true,
+          },
+          { name: "missing", description: "No SKILL.md", argumentHint: "" },
+          { name: "review (MCP)", description: "An MCP prompt", argumentHint: "" },
+        ],
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        stop_reason: null,
+        is_error: false,
+        result: "",
+        errors: [],
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 1,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    }
+    injectGeneratorSession(agent, generator, { cwd });
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
+    const commandsUpdate = updates.find((u) => u.sessionUpdate === "available_commands_update");
+    expect(commandsUpdate).toBeDefined();
+    return commandsUpdate.availableCommands as Array<{ name: string; _meta?: unknown }>;
+  }
+
+  it("marks a skill with a SKILL.md on disk for an AIR client", async () => {
+    const commands = await advertisedCommands(AIR_CLIENT_CAPABILITIES);
+
+    expect(commands.find((c) => c.name === "review")?._meta).toEqual({
+      jetbrains: { air: { version: 1, kind: "skill", skillPath } },
+    });
+    expect(commands.filter((c) => c.name !== "review").map((c) => [c.name, c._meta])).toEqual([
+      ["compact", undefined],
+      ["missing", undefined],
+      ["mcp:review", undefined],
+      ["mcp", undefined],
+    ]);
+  });
+
+  it("gives a client that is not AIR no _meta", async () => {
+    const commands = await advertisedCommands({});
+
+    expect(commands.map((c) => [c.name, c._meta])).toEqual([
+      ["review", undefined],
+      ["compact", undefined],
+      ["missing", undefined],
+      ["mcp:review", undefined],
+      ["mcp", undefined],
+    ]);
   });
 });
 

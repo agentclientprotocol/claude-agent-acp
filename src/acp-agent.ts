@@ -122,7 +122,9 @@ import {
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
+  AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
@@ -253,6 +255,7 @@ import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
+import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
 import {
   acceptedPlanToolResult,
@@ -5125,6 +5128,7 @@ export class ClaudeAcpAgent {
                     availableCommands: getAvailableSlashCommands(
                       message.commands,
                       session.terminalSlashCommands,
+                      this.toolCallCapabilities.air.client ? session.cwd : undefined,
                     ),
                   },
                 });
@@ -8375,7 +8379,11 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands, session.terminalSlashCommands),
+        availableCommands: getAvailableSlashCommands(
+          commands,
+          session.terminalSlashCommands,
+          this.toolCallCapabilities.air.client ? session.cwd : undefined,
+        ),
       },
     });
   }
@@ -10181,6 +10189,9 @@ function getAvailableSlashCommands(
   // the CLI's own terminal, which ACP clients aren't) — filtered alongside
   // the static list. Raw CLI names, matched before the MCP rename.
   terminalCommands?: readonly string[],
+  // The session cwd of an AIR client, or undefined for every other client.
+  // AIR gets the kind and the SKILL.md path of each skill command.
+  airSkillCwd?: string,
 ): AvailableCommand[] {
   const UNSUPPORTED_COMMANDS = [
     "clear",
@@ -10205,13 +10216,27 @@ function getAvailableSlashCommands(
           }
         : null;
       let name = command.name;
-      if (command.name.endsWith(" (MCP)")) {
+      const mcpPrompt = command.name.endsWith(" (MCP)");
+      if (mcpPrompt) {
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
+      const skillPath =
+        airSkillCwd && !command.builtin && !mcpPrompt
+          ? resolveSkillPath(command.name, airSkillCwd)
+          : undefined;
       return {
         name,
         description: command.description || "",
         input,
+        ...(skillPath
+          ? {
+              _meta: withAirMeta(
+                withAirMeta(undefined, AIR_KIND_KEY, "skill"),
+                AIR_SKILL_PATH_KEY,
+                skillPath,
+              ),
+            }
+          : {}),
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
