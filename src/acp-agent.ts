@@ -1525,14 +1525,22 @@ function unstreamedRemainder<Block extends { type: string }>(
     // was already delivered, at least partly. A non-empty streamed text is
     // required so an empty or aborted streamed block does not swallow it.
     const streamed = streamedBlocks[streamPos];
+    // Claude removes cc-memory wrappers in consolidated messages, but leaves
+    // stream deltas unchanged. Prefer the exact prefix when it still matches;
+    // otherwise compare the same known transformation across accumulated deltas.
+    const streamedText =
+      streamed && full.startsWith(streamed.text)
+        ? streamed.text
+        : streamed?.text.replace(/<\/?cc-memory\b[^>]*>/g, "");
     if (
       streamed &&
       streamed.type === item.type &&
       streamed.text.length > 0 &&
-      full.startsWith(streamed.text)
+      streamedText !== undefined &&
+      full.startsWith(streamedText)
     ) {
       streamPos++;
-      const remainder = full.slice(streamed.text.length);
+      const remainder = full.slice(streamedText.length);
       if (remainder.length === 0) continue;
       kept.push({ ...item, [item.type === "text" ? "text" : "thinking"]: remainder });
       continue;
