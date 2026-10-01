@@ -10127,6 +10127,34 @@ describe("session/fork", () => {
     expect(forkSession).toHaveBeenCalledWith("source-id", { dir: forkCwd });
   });
 
+  it("forwards the request's _meta so claudeCode options survive a fork", async () => {
+    // `getOrCreateSession` reads `_meta.claudeCode.options` (skills, env,
+    // tools, system prompt) when creating and fingerprinting the live query.
+    // Reconstructing the params without `_meta` would silently drop those
+    // options from `session/fork`, unlike the pre-#1046 `createSession`
+    // path. Spied directly (not through `injectForkTarget`'s cache-hit path)
+    // because its fingerprint doesn't account for `_meta`, so passing one
+    // here would otherwise fall through to a real, unmocked SDK call.
+    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    const getOrCreateSessionSpy = vi
+      .spyOn(agent as any, "getOrCreateSession")
+      .mockResolvedValue({ sessionId: "fork-id" });
+
+    const meta = { claudeCode: { options: { skills: ["my-skill"] } } };
+    await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: forkCwd,
+      mcpServers: [],
+      _meta: meta,
+    });
+
+    expect(getOrCreateSessionSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "fork-id", _meta: meta }),
+    );
+  });
+
   it("forks at an AIR message id through the current SDK", async () => {
     const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });

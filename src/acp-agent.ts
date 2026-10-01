@@ -2800,6 +2800,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
     });
     // Needs to happen after we return the session
     setTimeout(() => {
