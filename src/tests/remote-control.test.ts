@@ -73,6 +73,64 @@ describe("/remote-control", () => {
     );
   });
 
+  it("disconnects when the command is run again while Remote Control is active", async () => {
+    const enableRemoteControl = vi.fn(async (enabled: boolean) =>
+      enabled ? { session_url: "https://claude.ai/code/s" } : {},
+    );
+    const { agent, sessionUpdate } = createAgent({ enableRemoteControl });
+
+    await agent.prompt(prompt("/remote-control"));
+    const response = await agent.prompt(prompt("/rc"));
+
+    expect(response.stopReason).toBe("end_turn");
+    expect(enableRemoteControl).toHaveBeenNthCalledWith(2, false);
+    expect(sessionUpdate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          content: { type: "text", text: expect.stringContaining("Remote Control is off") },
+        }),
+      }),
+    );
+
+    await agent.prompt(prompt("/rc"));
+    expect(enableRemoteControl).toHaveBeenNthCalledWith(3, true, undefined);
+  });
+
+  it("stays off after a failed start, so the next run retries", async () => {
+    const enableRemoteControl = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({ session_url: "https://claude.ai/code/s" });
+    const { agent } = createAgent({ enableRemoteControl });
+
+    await agent.prompt(prompt("/rc"));
+    await agent.prompt(prompt("/rc"));
+
+    expect(enableRemoteControl).toHaveBeenNthCalledWith(2, true, undefined);
+  });
+
+  it("stays active after a failed disconnect, so the next run retries", async () => {
+    const enableRemoteControl = vi
+      .fn()
+      .mockResolvedValueOnce({ session_url: "https://claude.ai/code/s" })
+      .mockRejectedValueOnce(new Error("network"))
+      .mockResolvedValueOnce({});
+    const { agent, sessionUpdate } = createAgent({ enableRemoteControl });
+
+    await agent.prompt(prompt("/rc"));
+    await agent.prompt(prompt("/rc"));
+    expect(sessionUpdate).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          content: { type: "text", text: expect.stringContaining("Could not stop Remote Control") },
+        }),
+      }),
+    );
+    await agent.prompt(prompt("/rc"));
+
+    expect(enableRemoteControl).toHaveBeenNthCalledWith(3, false);
+  });
+
   it("advertises the command only when the query supports it", async () => {
     const supportedCommands = async () => [{ name: "compact", description: "", argumentHint: "" }];
     const supported = createAgent({ enableRemoteControl: vi.fn(), supportedCommands });

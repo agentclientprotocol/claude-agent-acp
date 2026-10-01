@@ -914,6 +914,9 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
+  /** Whether `/remote-control` last connected this session, so running the
+   *  command again disconnects instead of reconnecting. */
+  remoteControlActive?: boolean;
   /** The non-default effort the user picked through the ACP picker this
    *  session. A pin lives at the SDK's flag layer, which overrides the CLI's
    *  persisted effort (including the per-model `modelSettings` entries), so it
@@ -3075,7 +3078,12 @@ export class ClaudeAcpAgent {
 
     const remoteControlCommand = parseRemoteControlCommand(params.prompt);
     if (remoteControlCommand && supportsRemoteControl(session.query)) {
-      return this.startRemoteControl(params.sessionId, session.query, remoteControlCommand.name);
+      return this.toggleRemoteControl(
+        params.sessionId,
+        session,
+        session.query,
+        remoteControlCommand.name,
+      );
     }
 
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
@@ -3146,20 +3154,35 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  private async startRemoteControl(
+  /** Starts Remote Control, or stops it when this session already has it on.
+   *  A failed request leaves the tracked state alone so the next run retries. */
+  private async toggleRemoteControl(
     sessionId: string,
+    session: Session,
     query: RemoteControlQuery,
     name: string | undefined,
   ): Promise<PromptResponse> {
     let text: string;
-    try {
-      const result = await query.enableRemoteControl(true, name);
-      text = result.session_url
-        ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}`
-        : "Remote Control is active, but Claude Code did not return a session URL.";
-    } catch (error) {
-      this.logger.error(`Failed to enable Remote Control: ${error}`);
-      text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+    if (session.remoteControlActive) {
+      try {
+        await query.enableRemoteControl(false);
+        session.remoteControlActive = false;
+        text = "Remote Control is off. Run /remote-control to reconnect.";
+      } catch (error) {
+        this.logger.error(`Failed to disable Remote Control: ${error}`);
+        text = `Could not stop Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    } else {
+      try {
+        const result = await query.enableRemoteControl(true, name);
+        session.remoteControlActive = true;
+        text = result.session_url
+          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control again to disconnect.`
+          : "Remote Control is active, but Claude Code did not return a session URL.";
+      } catch (error) {
+        this.logger.error(`Failed to enable Remote Control: ${error}`);
+        text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
     }
     await this.client.sessionUpdate({
       sessionId,
@@ -9846,7 +9869,7 @@ function getAvailableSlashCommands(
           {
             name: REMOTE_CONTROL_COMMAND_NAME,
             description:
-              "Continue this session from claude.ai/code or the Claude mobile app (optional name)",
+              "Continue this session from claude.ai/code or the Claude mobile app; run again to disconnect (optional name)",
             input: { hint: "[session name]" },
           },
         ]
