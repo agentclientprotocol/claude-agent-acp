@@ -1948,6 +1948,17 @@ describe("stripLocalCommandMetadata", () => {
     ).toBeNull();
   });
 
+  it("strips a persisted task notification, keeping what the user typed", () => {
+    expect(
+      stripLocalCommandMetadata(
+        "<task-notification>\n<task-id>bg1</task-id>\n</task-notification>\nwhat now?",
+      ),
+    ).toBe("\nwhat now?");
+    expect(
+      stripLocalCommandMetadata("<task-notification><task-id>bg1</task-id></task-notification>"),
+    ).toBeNull();
+  });
+
   it("drops reminder-only blocks from mixed arrays, keeping real blocks", () => {
     expect(
       stripLocalCommandMetadata([
@@ -2524,6 +2535,246 @@ describe("synthetic login message (issue #863)", () => {
     ).toBe(true);
     // …but the TUI-specific "/login" instruction never reaches the client.
     expect(JSON.stringify(updates)).not.toContain("/login");
+  });
+});
+
+describe("task notification replay", () => {
+  type History = Awaited<ReturnType<typeof getSessionMessages>>;
+  const record = (fields: Record<string, unknown>) =>
+    ({
+      session_id: "s1",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      ...fields,
+    }) as unknown as History[number];
+  const notificationText = (status: string, toolUseId = "toolu_bash") =>
+    "<task-notification>\n<task-id>bg1</task-id>\n" +
+    `<tool-use-id>${toolUseId}</tool-use-id>\n` +
+    "<output-file>/tmp/tasks/bg1.output</output-file>\n" +
+    `<status>${status}</status>\n` +
+    '<summary>Background command "npm test" finished</summary>\n' +
+    "<note>A task-notification fires each time the task stops.</note>\n" +
+    "<result><status>failed</status></result>\n</task-notification>";
+  const notification = (status: string, fields: Record<string, unknown> = {}) =>
+    record({
+      type: "user",
+      uuid: `notification-${status}`,
+      message: { role: "user", content: notificationText(status) },
+      origin: { kind: "task-notification" },
+      ...fields,
+    });
+  const bashLaunch = [
+    record({ type: "user", uuid: "u1", message: { role: "user", content: "run the tests" } }),
+    record({
+      type: "assistant",
+      uuid: "a1",
+      message: {
+        id: "m1",
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Bash",
+            input: { command: "npm test", run_in_background: true },
+          },
+        ],
+      },
+    }),
+    record({
+      type: "user",
+      uuid: "u2",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_bash",
+            content: "Command running in background with ID: bg1.",
+          },
+        ],
+      },
+    }),
+  ];
+
+  async function replay(
+    history: History,
+    capabilities: ClientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+    },
+  ): Promise<AcpSessionNotification[]> {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) =>
+          updates.push(update as AcpSessionNotification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(history);
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    return updates;
+  }
+
+  const userChunks = (updates: AcpSessionNotification[]) =>
+    updates.flatMap(({ update }) =>
+      update.sessionUpdate === "user_message_chunk" && update.content.type === "text"
+        ? [update.content.text]
+        : [],
+    );
+  const asyncTaskUpdates = (updates: AcpSessionNotification[]) =>
+    updates.flatMap(({ update }) =>
+      update.sessionUpdate.startsWith("async_task_") ? [update] : [],
+    );
+
+  it("hides the notification and restores the task state like the live frame", async () => {
+    const updates = await replay([...bashLaunch, notification("completed")]);
+
+    expect(userChunks(updates)).toEqual(["run the tests"]);
+    expect(JSON.stringify(updates)).not.toContain("task-notification");
+    expect(asyncTaskUpdates(updates)).toEqual([
+      {
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "bg1",
+        name: "npm test",
+        taskType: "shell",
+        description: "npm test",
+        showInTranscript: true,
+        canStop: true,
+        outputFilePath: "/tmp/tasks/bg1.output",
+        toolCallId: "toolu_bash",
+      },
+      {
+        sessionUpdate: "async_task_state_update",
+        asyncTaskId: "bg1",
+        state: "completed",
+        summary: 'Background command "npm test" finished',
+      },
+    ]);
+  });
+
+  it("detects a notification without an origin by its text and maps killed to stopped", async () => {
+    const updates = await replay([...bashLaunch, notification("killed", { origin: undefined })]);
+
+    expect(userChunks(updates)).toEqual(["run the tests"]);
+    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({
+      sessionUpdate: "async_task_state_update",
+      asyncTaskId: "bg1",
+      state: "stopped",
+    });
+  });
+
+  it("keeps the user text next to an embedded notification", async () => {
+    const updates = await replay([
+      ...bashLaunch,
+      record({
+        type: "user",
+        uuid: "u3",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: notificationText("failed") },
+            { type: "text", text: "why did it fail?" },
+          ],
+        },
+      }),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["run the tests", "why did it fail?"]);
+    expect(JSON.stringify(updates)).not.toContain("task-notification");
+    expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "failed" });
+  });
+
+  it("sends nothing for a task that no tool call in the history started", async () => {
+    const updates = await replay([
+      record({ type: "user", uuid: "u1", message: { role: "user", content: "hi" } }),
+      notification("completed"),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["hi"]);
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+  });
+
+  it("sends one terminal state for a repeated notification", async () => {
+    const updates = await replay([
+      ...bashLaunch,
+      notification("completed"),
+      notification("completed", { uuid: "notification-again" }),
+    ]);
+
+    expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
+      "async_task_spawned",
+      "async_task_state_update",
+    ]);
+  });
+
+  it("restores the notified state of a background Agent after its launch result", async () => {
+    const updates = await replay(
+      [
+        record({
+          type: "assistant",
+          uuid: "a1",
+          message: {
+            id: "m1",
+            role: "assistant",
+            model: "claude-opus-5",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_agent",
+                name: "Agent",
+                input: { description: "Explore", prompt: "Look around", run_in_background: true },
+              },
+            ],
+          },
+        }),
+        record({
+          type: "user",
+          uuid: "u2",
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "toolu_agent", content: "Async agent launched." },
+            ],
+          },
+        }),
+        record({
+          type: "user",
+          uuid: "u3",
+          message: { role: "user", content: notificationText("killed", "toolu_agent") },
+          origin: { kind: "task-notification" },
+        }),
+      ],
+      {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities,
+    );
+
+    expect(userChunks(updates)).toEqual([]);
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "subagent_state_update",
+      subagentSessionId: "s1:replay-subagent:toolu_agent",
+      state: "cancelled",
+    });
+  });
+
+  it("keeps a task-notification delivery with a subkind as a prompt", async () => {
+    const updates = await replay([
+      record({
+        type: "user",
+        uuid: "u1",
+        message: { role: "user", content: "Run the nightly report" },
+        origin: { kind: "task-notification", subkind: "scheduled-trigger" },
+      }),
+    ]);
+
+    expect(userChunks(updates)).toEqual(["Run the nightly report"]);
   });
 });
 

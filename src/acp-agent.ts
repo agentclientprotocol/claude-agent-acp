@@ -105,12 +105,14 @@ import {
   asSdkSessionNotification,
   clientSupportsSubagents,
   SubagentAwareSessionCapabilities,
+  type SubagentState,
 } from "./acp-subagents.js";
 import {
   isNativeSubagentControlTool,
   isNativeSubagentControlUpdate,
   NativeSubagent,
   NativeSubagentRuntime,
+  nativeSubagentState,
   resumedNativeSubagentId,
   sendMessageResumePrompt,
 } from "./native-subagents.js";
@@ -1801,8 +1803,12 @@ const LOCAL_COMMAND_MARKERS = [
 // whatever the user typed. Nobody wrote it and no client sees it live — the
 // prompt loop's user-message skip covers the whole message — but it is
 // persisted alongside that prose, so replay would hand the client a prompt
-// with instructions in it the user never gave.
-const INJECTED_CONTEXT_MARKERS = ["system-reminder"].map((tag) => ({
+// with instructions in it the user never gave. A `task-notification` tells the
+// model that a background task stopped; live, the SDK `task_notification`
+// frame reports the same stop, so replay restores the task state from it (see
+// taskNotificationsOf) instead of showing it.
+const TASK_NOTIFICATION_TAG = "task-notification";
+const INJECTED_CONTEXT_MARKERS = ["system-reminder", TASK_NOTIFICATION_TAG].map((tag) => ({
   open: `<${tag}>`,
   close: `</${tag}>`,
 }));
@@ -1908,6 +1914,69 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
 
 export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
+}
+
+/** The fields of a persisted `<task-notification>`, in the shape of the SDK
+ *  `task_notification` frame that reported the same stop live. */
+type PersistedTaskNotification = {
+  task_id: string;
+  status: string;
+  tool_use_id?: string;
+  summary?: string;
+  output_file?: string;
+};
+
+/**
+ * Returns each `<task-notification>` in user-message content (a string or its
+ * text blocks). The `<result>` body is model context that the live frame does
+ * not carry, so the scan stops at it and a tag quoted in it cannot match.
+ */
+function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
+  const texts =
+    typeof content === "string"
+      ? [content]
+      : Array.isArray(content)
+        ? content.flatMap((block) =>
+            block?.type === "text" && typeof block.text === "string" ? [block.text as string] : [],
+          )
+        : [];
+  const open = `<${TASK_NOTIFICATION_TAG}>`;
+  const close = `</${TASK_NOTIFICATION_TAG}>`;
+  const notifications: PersistedTaskNotification[] = [];
+  for (const text of texts) {
+    let start = text.indexOf(open);
+    while (start !== -1) {
+      const end = text.indexOf(close, start + open.length);
+      if (end === -1) break;
+      const body = text.slice(start + open.length, end).split("<result>", 1)[0];
+      const field = (tag: string) => markerTagText(body, tag)?.trim() || undefined;
+      const taskId = field("task-id");
+      const status = field("status");
+      if (taskId && status) {
+        notifications.push({
+          task_id: taskId,
+          status,
+          tool_use_id: field("tool-use-id"),
+          summary: field("summary"),
+          output_file: field("output-file"),
+        });
+      }
+      start = text.indexOf(open, end + close.length);
+    }
+  }
+  return notifications;
+}
+
+/**
+ * True for a user record that the CLI wrote to tell the model that a
+ * background task stopped. A `subkind` marks the delivery of a prompt, for
+ * example a scheduled routine or a message from another session. Such a
+ * delivery stays in the transcript like any other prompt.
+ */
+function isTaskNotificationRecord(message: unknown): boolean {
+  const origin = (message as { origin?: unknown }).origin as
+    { kind?: unknown; subkind?: unknown } | null | undefined;
+  return origin?.kind === "task-notification" && origin.subkind === undefined;
 }
 
 /**
@@ -7171,6 +7240,9 @@ export class ClaudeAcpAgent {
         reconstructable: boolean;
         announced: boolean;
         terminalState?: "completed" | "failed" | "cancelled";
+        /** The state of the last persisted task notification of the child.
+         *  It comes after the launch tool_result, so it wins. */
+        notifiedState?: SubagentState;
       }
     >();
 
@@ -7291,6 +7363,58 @@ export class ClaudeAcpAgent {
         ? await subagentHistory(sessionId)
         : { ids: new Map<string, string>() };
     const replayedSubagents = new Set<string>();
+
+    // History persists no task_started frame, so a background task gets its
+    // spawn from the notification of its stop, with the tool call that
+    // started it. A task still running at the end of the history gets no
+    // card, because the process that ran it is gone.
+    const replayTaskSessions = new Map<string, string>();
+    // The tool cache forgets a tool use at its result, but a notification
+    // comes later and needs the tool use that started the task.
+    const replayToolUses = new Map<string, { name: string; input: unknown }>();
+    const replayAsyncTasks = new AsyncTaskRuntime(
+      clientSupportsAsyncTasks(this.clientCapabilities),
+      sessionId,
+      async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
+      {
+        routeOf: (toolCallId) => {
+          const target = replayTaskSessions.get(toolCallId);
+          return target && target !== sessionId
+            ? (notification) => ({ ...notification, sessionId: target })
+            : undefined;
+        },
+      },
+    );
+    // The replay counterpart of the live `task_notification` frame.
+    const restoreTaskNotification = async (
+      notification: PersistedTaskNotification,
+      targetSessionId: string,
+    ): Promise<void> => {
+      const toolUseId = notification.tool_use_id;
+      if (!toolUseId) return;
+      const child = replayChildren.get(toolUseId);
+      const toolUse = replayToolUses.get(toolUseId);
+      if (child || (toolUse && isNativeSubagentControlTool(toolUse.name))) {
+        const state = nativeSubagentState(notification.status);
+        if (child && state) child.notifiedState = state;
+        return;
+      }
+      // Like live, a task that no tool call started stays unknown.
+      if (!toolUse) return;
+      const input = toolUse.input as { command?: unknown } | null | undefined;
+      replayTaskSessions.set(toolUseId, targetSessionId);
+      await replayAsyncTasks.taskBackgrounded({
+        task_id: notification.task_id,
+        ...(toolUse.name === "Bash"
+          ? { task_type: "local_bash", description: input?.command }
+          : {}),
+        is_backgrounded: true,
+        output_file: notification.output_file,
+        tool_use_id: toolUseId,
+      });
+      await replayAsyncTasks.taskNotification(notification);
+    };
+
     const replayMessage = async (message: SessionMessage): Promise<void> => {
       if (
         message.type === "user" &&
@@ -7357,8 +7481,18 @@ export class ClaudeAcpAgent {
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
-        content = stripLocalCommandMetadata(content);
+        for (const notification of taskNotificationsOf(content)) {
+          await restoreTaskNotification(notification, replayTargetSessionId);
+        }
+        // Live, the prompt loop skips this record and the SDK frame reports the stop.
+        content = isTaskNotificationRecord(message) ? null : stripLocalCommandMetadata(content);
         if (content === null) return;
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === "tool_use" && typeof block.id === "string") {
+            replayToolUses.set(block.id, { name: String(block.name), input: block.input });
+          }
+        }
       }
 
       // Claude persists the retained summary as a user message framed with
@@ -7473,7 +7607,7 @@ export class ClaudeAcpAgent {
               sessionUpdate: "subagent_state_update",
               subagentSessionId: child.sessionId,
               state: child.reconstructable
-                ? (child.terminalState ?? "disconnected")
+                ? (child.notifiedState ?? child.terminalState ?? "disconnected")
                 : "disconnected",
             },
           }),
