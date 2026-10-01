@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect a server","input":{"hint":"reconnect [server]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Bash"},"terminal_info":{"terminal_id":"toolu_denied"}},"content":[{"terminalId":"toolu_denied","type":"terminal"}],"kind":"execute","name":"Bash","sessionUpdate":"tool_call","status":"pending","title":"Terminal","toolCallId":"toolu_denied"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}

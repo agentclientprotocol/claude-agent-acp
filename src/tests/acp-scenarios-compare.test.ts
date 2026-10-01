@@ -60,4 +60,39 @@ describe("compareWithBaseline", () => {
       expect.stringMatching(/^origin\/main did not send /u),
     ]);
   });
+
+  describe("available_commands_update", () => {
+    const commands = (...names: string[]) =>
+      update({
+        sessionUpdate: "available_commands_update",
+        availableCommands: names.map((name) => ({ name, description: name })),
+      });
+
+    it("accepts the mcp command of the adapter", () => {
+      expect(compareWithBaseline([commands("compact")], [commands("compact", "mcp")])).toEqual([]);
+      expect(compareWithBaseline([commands()], [commands("mcp")])).toEqual([]);
+    });
+
+    it("reports any other extra command", () => {
+      expect(compareWithBaseline([commands()], [commands("mcp", "other")])).toContainEqual(
+        expect.stringMatching(/but the adapter sent .*"name":"other"/u),
+      );
+    });
+
+    it("reports a dropped command", () => {
+      expect(compareWithBaseline([commands("compact")], [commands("mcp")])).toContainEqual(
+        expect.stringMatching(/^origin\/main sent .*"name":"compact"/u),
+      );
+    });
+
+    it("reports a changed mcp command that origin/main listed", () => {
+      const changed = update({
+        sessionUpdate: "available_commands_update",
+        availableCommands: [{ name: "mcp", description: "other" }],
+      });
+      expect(compareWithBaseline([commands("mcp")], [changed])).toContainEqual(
+        expect.stringMatching(/but the adapter sent .*"description":"other"/u),
+      );
+    });
+  });
 });

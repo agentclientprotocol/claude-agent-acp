@@ -262,6 +262,8 @@ import {
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
+import { MCP_AVAILABLE_COMMAND } from "./mcp-command.js";
+import { McpCommandRunner, type PromptAdmission } from "./mcp-command-runner.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
@@ -1800,6 +1802,7 @@ const REPLAY_HIDDEN_COMMANDS = new Set([
   ...LOCAL_ONLY_COMMANDS,
   "/compact",
   "/model",
+  "/mcp",
   "/status",
   "/usage",
 ]);
@@ -2283,27 +2286,34 @@ async function authenticateMcpServers(
 
 /** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
  *  Claude opens and owns the localhost callback listener; the ACP client only
- *  needs to present the returned authorization URL. */
+ *  needs to present the returned authorization URL. The optional `signal`
+ *  stops the flow early, as the session abort does. Resolves true when the
+ *  server is authenticated. */
 async function authenticateMcpServer(
   host: McpAuthenticationHost,
   sessionId: string,
   query: McpOAuthQuery,
   serverName: string,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<boolean> {
   const session = host.sessions[sessionId];
-  if (!session) return;
+  if (!session) return false;
 
   const login = await query.mcpAuthenticate(serverName);
-  if (!login.requiresUserAction) return;
+  if (!login.requiresUserAction) return true;
   if (!login.authUrl) {
     throw new Error("Claude Code requested user action without returning an authorization URL");
   }
 
   const elicitationId = `mcp-oauth-${randomUUID()}`;
   const flowAbort = new AbortController();
-  const abortFlow = () => flowAbort.abort(session.abortController.signal.reason);
-  session.abortController.signal.addEventListener("abort", abortFlow, { once: true });
-  if (session.abortController.signal.aborted) abortFlow();
+  const stopSignals = [session.abortController.signal, ...(signal ? [signal] : [])];
+  const abortFlow = () =>
+    flowAbort.abort(stopSignals.find((stopSignal) => stopSignal.aborted)?.reason);
+  for (const stopSignal of stopSignals) {
+    stopSignal.addEventListener("abort", abortFlow, { once: true });
+  }
+  if (stopSignals.some((stopSignal) => stopSignal.aborted)) abortFlow();
 
   try {
     const completed = waitForMcpAuthentication(
@@ -2329,12 +2339,10 @@ async function authenticateMcpServer(
     ]);
 
     if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
-      return;
+      return false;
     }
 
-    if (first.type === "elicitation") {
-      await completed;
-    }
+    const authenticated = first.type === "elicitation" ? await completed : first.authenticated;
     try {
       await host.client.completeElicitation({ elicitationId });
     } catch (error) {
@@ -2342,9 +2350,12 @@ async function authenticateMcpServer(
         host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
       }
     }
+    return authenticated;
   } finally {
     flowAbort.abort();
-    session.abortController.signal.removeEventListener("abort", abortFlow);
+    for (const stopSignal of stopSignals) {
+      stopSignal.removeEventListener("abort", abortFlow);
+    }
   }
 }
 
@@ -2409,6 +2420,7 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  private readonly mcpCommands: McpCommandRunner;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -2462,6 +2474,14 @@ export class ClaudeAcpAgent {
       // Capabilities arrive at initialize, after this constructor runs.
       supportsNotices: () => clientSupportsNotices(this.clientCapabilities),
       logError: (...args: unknown[]) => this.logger.error(...args),
+    });
+    this.mcpCommands = new McpCommandRunner({
+      sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      logError: (message) => this.logger.error(message),
+      mcpOAuth: (sessionId, query) =>
+        this.clientCapabilities?.elicitation?.url && supportsMcpOAuth(query)
+          ? (server, signal) => authenticateMcpServer(this, sessionId, query, server, signal)
+          : undefined,
     });
   }
 
@@ -3169,6 +3189,17 @@ export class ClaudeAcpAgent {
    * before this resolves.
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
+    const response = await this.mcpCommands.admit(params.sessionId, params.prompt, (admission) =>
+      this.admittedStartTurn(params, events, admission),
+    );
+    if (response) events.ended(response);
+  }
+
+  private async admittedStartTurn(
+    params: PromptRequest,
+    events: TurnEvents,
+    admission: PromptAdmission,
+  ): Promise<PromptResponse | void> {
     if (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
@@ -3198,6 +3229,15 @@ export class ClaudeAcpAgent {
     if (session.autoModeFallbackWarningPending) {
       await this.sessionModes.publishFallbackWarning(params.sessionId, session);
     }
+
+    // A provider update during the awaits above can replace the query.
+    const mcpResponse = this.mcpCommands.run(
+      params.sessionId,
+      this.sessions[params.sessionId] ?? session,
+      params.prompt,
+      admission.signal,
+    );
+    if (mcpResponse) return mcpResponse;
 
     if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
       await this.publishTaskPlan(params.sessionId, session.taskState);
@@ -3252,6 +3292,7 @@ export class ClaudeAcpAgent {
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
     session.input.push(userMessage);
+    admission.release();
     this.ensureConsumer(session, params.sessionId);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
@@ -6888,6 +6929,7 @@ export class ClaudeAcpAgent {
     options: { awaitInterrupt: boolean },
   ): Promise<void> {
     this.exitPlan.cancel(params.sessionId);
+    this.mcpCommands.cancel(params.sessionId);
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
@@ -9518,9 +9560,12 @@ export class ClaudeAcpAgent {
     const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
     const update = previous.then(async () => {
       const sessions = Object.entries(this.sessions);
-      const activeTurns = sessions.flatMap(([, session]) =>
-        (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
-      );
+      const activeTurns = [
+        ...sessions.flatMap(([, session]) =>
+          (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+        ),
+        ...this.mcpCommands.inProgress(),
+      ];
       if (activeTurns.length > 0) {
         this.logger.log(
           `Waiting for ${activeTurns.length} active Claude turn(s) before provider update`,
@@ -10148,8 +10193,9 @@ function getAvailableSlashCommands(
     "todos",
   ];
 
-  return commands
-    .filter((command) => !terminalCommands?.includes(command.name))
+  // The adapter answers `/mcp` itself, even when Claude Code tags it terminal-bound.
+  const advertised = commands
+    .filter((command) => command.name !== "mcp" && !terminalCommands?.includes(command.name))
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -10169,6 +10215,7 @@ function getAvailableSlashCommands(
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+  return [...advertised, MCP_AVAILABLE_COMMAND];
 }
 
 function formatUriAsLink(uri: string): string {

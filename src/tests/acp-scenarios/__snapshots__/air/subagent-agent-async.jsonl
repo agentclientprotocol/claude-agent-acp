@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect a server","input":{"hint":"reconnect [server]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Agent","toolResponse":{"isAsync":true,"status":"async_launched"}}},"sessionUpdate":"tool_call_update","toolCallId":"toolu_agent"}}}

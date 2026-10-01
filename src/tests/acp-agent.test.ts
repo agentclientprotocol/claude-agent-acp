@@ -9751,8 +9751,10 @@ describe("terminal slash command filtering", () => {
     const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
     const commandsUpdate = updates.find((u) => u.sessionUpdate === "available_commands_update");
     expect(commandsUpdate).toBeDefined();
+    // `mcp` is the adapter's own entry, advertised after the CLI's commands.
     expect(commandsUpdate.availableCommands.map((c: { name: string }) => c.name)).toEqual([
       "compact",
+      "mcp",
     ]);
   });
 
