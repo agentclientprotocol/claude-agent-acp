@@ -280,9 +280,9 @@ describe("approval patch previews", () => {
     let now = 0;
     const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
     try {
-      expect(await previewPatchContent("Write", { file_path: filePath, content: newText })).toEqual([
-        { type: "diff", path: filePath, oldText, newText },
-      ]);
+      expect(await previewPatchContent("Write", { file_path: filePath, content: newText })).toEqual(
+        [{ type: "diff", path: filePath, oldText, newText }],
+      );
     } finally {
       clock.mockRestore();
     }

@@ -2669,6 +2669,53 @@ describe("task notification replay", () => {
     });
   });
 
+  it.each(["server_tool_use", "mcp_tool_use"])(
+    "restores a background task launched by a %s block",
+    async (type) => {
+      const launch = record({
+        ...bashLaunch[1],
+        message: {
+          role: "assistant",
+          content: [{ type, id: "toolu_bash", name: "Bash", input: { command: "npm test" } }],
+        },
+      });
+      const updates = await replay([
+        bashLaunch[0],
+        launch,
+        bashLaunch[2],
+        notification("completed"),
+      ]);
+
+      expect(asyncTaskUpdates(updates).map((update) => update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "async_task_state_update",
+      ]);
+      expect(asyncTaskUpdates(updates).at(-1)).toMatchObject({ state: "completed" });
+    },
+  );
+
+  it("routes a task to the session of its launching tool even when the root receives the stop", async () => {
+    const updates = await replay(
+      [
+        ...bashLaunch.map((message, index) =>
+          index === 0 ? message : record({ ...message, parent_tool_use_id: "toolu_agent" }),
+        ),
+        notification("completed"),
+      ],
+      {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities,
+    );
+
+    const tasks = updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"));
+    expect(tasks).toHaveLength(2);
+    expect(tasks.map(({ sessionId }) => sessionId)).toEqual([
+      "s1:replay-subagent:toolu_agent",
+      "s1:replay-subagent:toolu_agent",
+    ]);
+  });
+
   it("keeps the user text next to an embedded notification", async () => {
     const updates = await replay([
       ...bashLaunch,

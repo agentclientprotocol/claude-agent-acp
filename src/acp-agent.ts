@@ -7491,17 +7491,16 @@ export class ClaudeAcpAgent {
     // spawn from the notification of its stop, with the tool call that
     // started it. A task still running at the end of the history gets no
     // card, because the process that ran it is gone.
-    const replayTaskSessions = new Map<string, string>();
     // The tool cache forgets a tool use at its result, but a notification
     // comes later and needs the tool use that started the task.
-    const replayToolUses = new Map<string, { name: string; input: unknown }>();
+    const replayToolUses = new Map<string, { name: string; input: unknown; sessionId: string }>();
     const replayAsyncTasks = new AsyncTaskRuntime(
       clientSupportsAsyncTasks(this.clientCapabilities),
       sessionId,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       {
         routeOf: (toolCallId) => {
-          const target = replayTaskSessions.get(toolCallId);
+          const target = replayToolUses.get(toolCallId)?.sessionId;
           return target && target !== sessionId
             ? (notification) => ({ ...notification, sessionId: target })
             : undefined;
@@ -7511,7 +7510,6 @@ export class ClaudeAcpAgent {
     // The replay counterpart of the live `task_notification` frame.
     const restoreTaskNotification = async (
       notification: PersistedTaskNotification,
-      targetSessionId: string,
     ): Promise<void> => {
       const toolUseId = notification.tool_use_id;
       if (!toolUseId) return;
@@ -7525,7 +7523,6 @@ export class ClaudeAcpAgent {
       // Like live, a task that no tool call started stays unknown.
       if (!toolUse) return;
       const input = toolUse.input as { command?: unknown } | null | undefined;
-      replayTaskSessions.set(toolUseId, targetSessionId);
       await replayAsyncTasks.taskBackgrounded({
         task_id: notification.task_id,
         ...(toolUse.name === "Bash"
@@ -7608,15 +7605,22 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         for (const notification of taskNotificationsOf(content)) {
-          await restoreTaskNotification(notification, replayTargetSessionId);
+          await restoreTaskNotification(notification);
         }
         // Live, the prompt loop skips this record and the SDK frame reports the stop.
         content = isTaskNotificationRecord(message) ? null : stripLocalCommandMetadata(content);
         if (content === null) return;
       } else if (Array.isArray(content)) {
         for (const block of content) {
-          if (block?.type === "tool_use" && typeof block.id === "string") {
-            replayToolUses.set(block.id, { name: String(block.name), input: block.input });
+          if (
+            ["tool_use", "server_tool_use", "mcp_tool_use"].includes(block?.type) &&
+            typeof block.id === "string"
+          ) {
+            replayToolUses.set(block.id, {
+              name: String(block.name),
+              input: block.input,
+              sessionId: replayTargetSessionId,
+            });
           }
         }
       }
