@@ -273,9 +273,9 @@ import {
 import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
+  effortFlagSettings,
   mergeEffortSettings,
   settingsEffortForModel,
-  toSdkEffortLevel,
 } from "./session-effort.js";
 
 export { EFFORT_CONFIG_ID, settingsEffortForModel } from "./session-effort.js";
@@ -592,6 +592,10 @@ type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. */
   promptUuid: string;
+  /** Tools surfaced during this turn, awaiting completion or an explicit
+   *  background handoff. Intersect with emittedToolCalls at settlement so
+   *  tool_result counts even when a presentation hook is still pending. */
+  foregroundToolCallIds?: Set<string>;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -708,10 +712,14 @@ type Turn = {
   deferredSettle?: PromptResponse;
   /** Uuids of `steer()`-injected messages the SDK has not replayed back yet.
    *
-   *  A steer is normally delivered at priority `now`, so the CLI ABORTS
-   *  the running cycle: it emits its own human-origin `result` —
-   *  indistinguishable from a turn's terminal one — and the steered message runs
-   *  as a SECOND cycle. Settling at that result would answer `session/prompt`
+   *  A steer is normally delivered at priority `now`. When it lands during
+   *  generation the CLI ABORTS the running cycle: it emits its own human-origin
+   *  `result` — indistinguishable from a turn's terminal one — and the steered
+   *  message runs as a SECOND cycle. When it lands during a foreground tool call
+   *  (CLI 2.1.286) the CLI moves the tool to the background instead and either
+   *  joins the steer into the running cycle (ONE result stamped with both
+   *  uuids) or still ends that cycle early and runs the steer as a second one.
+   *  Settling at an interrupted cycle's result would answer `session/prompt`
    *  mid-work, so a steered turn's results only RECORD their outcome
    *  (`steeredSettle`) until one provably answers the steer.
    *
@@ -2009,6 +2017,41 @@ export function isSyntheticLoginMessage(apiMessage: unknown): boolean {
     block.type === "text" &&
     typeof block.text === "string" &&
     block.text.includes("Please run /login")
+  );
+}
+
+/** Origin kinds of the meta user messages `getSessionMessages` returns since
+ *  SDK 0.3.284 (messages from other agents, sessions and channels). */
+const REPLAY_HIDDEN_META_ORIGIN_KINDS = new Set([
+  "peer",
+  "channel",
+  "observer",
+  "observer-activity",
+  "slack-ping",
+]);
+
+/**
+ * True for a transcript message delivered to the model from another agent,
+ * session or channel. Since SDK 0.3.284 `getSessionMessages` returns these as
+ * `is_meta` user messages whose content is the full harness framing (envelope
+ * XML plus the "not typed by your user" preamble). The live prompt loop never
+ * renders them, so replay skips them too rather than presenting them as text
+ * the user typed. Other `is_meta` messages (compact summaries) are kept.
+ *
+ * `is_meta` and `origin` are runtime fields not declared on `SessionMessage`.
+ */
+export function isReplayHiddenMetaMessage(message: unknown): boolean {
+  if (!message || typeof message !== "object") return false;
+  const { type, is_meta, origin } = message as {
+    type?: unknown;
+    is_meta?: unknown;
+    origin?: { kind?: unknown } | null;
+  };
+  return (
+    type === "user" &&
+    is_meta === true &&
+    typeof origin?.kind === "string" &&
+    REPLAY_HIDDEN_META_ORIGIN_KINDS.has(origin.kind)
   );
 }
 
@@ -3448,9 +3491,12 @@ export class ClaudeAcpAgent {
    *  prompt (IJAI-1191). The steered message's own output streams via
    *  `session/update`, not this response.
    *
-   *  Pre-empting means ABORTING: the interrupted cycle emits a `result` of its
-   *  own and the steered message runs as a second one, so the turn is marked
-   *  (`Turn.steeredEchoes`) to settle only once a result answers the steer.
+   *  Pre-empting generation means ABORTING: the interrupted cycle emits a
+   *  `result` of its own and the steered message runs as a second one. A steer
+   *  during a foreground tool call moves that tool (Bash, Agent, MCP) to the
+   *  background instead, and may join the running cycle (CLI 2.1.286). Either
+   *  way the turn is marked (`Turn.steeredEchoes`) to settle only once a result
+   *  answers the steer.
    *
    *  When the session is idle, the opt-in path returns `promptRequired` WITHOUT
    *  calling `prompt()`, pushing SDK input, or mutating `turnQueue`: the content
@@ -3707,6 +3753,26 @@ export class ClaudeAcpAgent {
           session.emittedToolCalls.delete(toolCallId);
         }
         return;
+      }
+      if (
+        toolCallId &&
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
+      ) {
+        if (
+          claudeMeta?.parentToolUseId ||
+          routedNotification.sessionId !== params.sessionId ||
+          update.status === "completed" ||
+          update.status === "failed"
+        ) {
+          // A later stream frame can attribute an eager permission call to a
+          // child. It must no longer count as this turn's foreground work.
+          forgetForegroundToolCall(session, toolCallId);
+        } else if (
+          update.sessionUpdate === "tool_call" &&
+          session.emittedToolCalls.has(toolCallId)
+        ) {
+          recordForegroundToolCall(session, toolCallId);
+        }
       }
       if (update.sessionUpdate === "agent_message_chunk") {
         if (
@@ -4122,6 +4188,7 @@ export class ClaudeAcpAgent {
       isSubagent: boolean,
     ) => {
       session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
@@ -4212,6 +4279,62 @@ export class ClaudeAcpAgent {
       const turn = session.activeTurn;
       if (!turn || turn.settled || turn.settling) {
         return;
+      }
+      // Both a result and EOF can end the turn here. Preserve cancellation
+      // and existing errors instead of replacing them with this check.
+      if (result.stopReason === "end_turn" && reportReason === "notReported") {
+        // A confirmed background task is allowed to outlive the turn.
+        const backgroundTools = new Set(
+          [...session.liveBackgroundTasks.values()].map((task) => task.parentToolUseId),
+        );
+        // Check only this turn's tools. A tool_result removes its id from
+        // emittedToolCalls even when its PostToolUse hook has not arrived yet.
+        const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
+          (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
+        );
+        if (unfinished.length > 0) {
+          const message = `Claude ended the turn without returning results for tool calls: ${unfinished.join(", ")}`;
+          this.logger.error(
+            `Session ${params.sessionId}, turn ${turn.promptUuid}, stopReason=${result.stopReason}: ${message}`,
+          );
+          // Fail every unfinished tool before reporting one error for the prompt.
+          for (const toolCallId of unfinished) {
+            // A late hook must not overwrite the failure we are about to send.
+            unregisterHookCallback(toolCallId);
+            session.emittedToolCalls.delete(toolCallId);
+            delete session.toolUseCache[toolCallId];
+            session.toolCallFields?.delete(toolCallId);
+            await sendUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId,
+                status: "failed",
+                content: [
+                  {
+                    type: "content",
+                    content: {
+                      type: "text",
+                      text: "Claude ended the turn without returning a result for this tool.",
+                    },
+                  },
+                ],
+              },
+            });
+            // Cancellation can arrive while we await the client update.
+            if (turn.settled || session.activeTurn !== turn) return;
+            if (session.cancelled) {
+              await settleActive({ ...result, stopReason: "cancelled" });
+              return;
+            }
+          }
+          await failActiveWithSessionFailure(
+            "internal_error",
+            RequestError.internalError(errorKindData("incomplete_tool_call"), message),
+            message,
+          );
+          return;
+        }
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -7416,6 +7539,9 @@ export class ClaudeAcpAgent {
     };
 
     const replayMessage = async (message: SessionMessage): Promise<void> => {
+      if (isReplayHiddenMetaMessage(message)) {
+        return;
+      }
       if (
         message.type === "user" &&
         message.parent_tool_use_id === null &&
@@ -7732,6 +7858,15 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    // SandboxNetworkAccess is a permission-only callback, not an executing
+    // tool: the SDK does not send a tool_result for its synthetic id.
+    if (
+      !parentToolUseId &&
+      notificationSessionId === sessionId &&
+      toolName !== "SandboxNetworkAccess"
+    ) {
+      recordForegroundToolCall(session, toolCallId);
+    }
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
     const update = new AcpToolCallRenderer(this.toolCallCapabilities).toolCall(
       { id: toolCallId, name: toolName, input: toolInput },
@@ -8278,14 +8413,20 @@ export class ClaudeAcpAgent {
         const newEffort =
           typeof newEffortOpt?.currentValue === "string" ? newEffortOpt.currentValue : undefined;
         try {
-          await session.query.applyFlagSettings({
+          await session.query.applyFlagSettings(
             // A legacy client's unpinned effort is display-only: the CLI
             // resolves the persisted value for the new model. When an old
             // user pin is no longer supported, clear the flag layer instead
             // of replacing it with that displayed value. Opted-in clients
             // deliberately apply their concrete displayed effort.
-            effortLevel: useRecommendedValue ? toSdkEffortLevel(newEffort) : null,
-          });
+            effortFlagSettings(
+              useRecommendedValue ? newEffort : undefined,
+              mergeEffortSettings(
+                session.settingsManager.getSettings(),
+                session.effortSettingsOverride,
+              ),
+            ),
+          );
           session.effortPinnedLevel = effortPinnedForNewModel ? pinnedEffort : undefined;
           session.appliedEffortLevel =
             useRecommendedValue && newEffort !== "default" ? newEffort : undefined;
@@ -8339,9 +8480,15 @@ export class ClaudeAcpAgent {
     } else if (configId === EFFORT_CONFIG_ID) {
       // Apply first so a rejected control request cannot leave the displayed
       // value ahead of the SDK flag layer.
-      await session.query.applyFlagSettings({
-        effortLevel: toSdkEffortLevel(value),
-      });
+      await session.query.applyFlagSettings(
+        effortFlagSettings(
+          value,
+          mergeEffortSettings(
+            session.settingsManager.getSettings(),
+            session.effortSettingsOverride,
+          ),
+        ),
+      );
       session.configOptions = session.configOptions.map((o) =>
         o.id === configId && typeof o.currentValue === "string" ? { ...o, currentValue: value } : o,
       );
@@ -9157,15 +9304,15 @@ export class ClaudeAcpAgent {
       // and persisted settings; automatic values re-seed on every model switch.
       // Legacy clients still leave effort resolution entirely to the CLI.
       const useRecommendedValue = clientSupportsRecommendedConfigValue(this.clientCapabilities);
+      const effortSettings = mergeEffortSettings(
+        settingsManager.getSettings(),
+        configuredSettingsObject,
+      );
       const configOptions = buildConfigOptions(
         modes,
         models,
         modelInfos,
-        userProvidedOptions?.effort ??
-          settingsEffortForModel(
-            mergeEffortSettings(settingsManager.getSettings(), configuredSettingsObject),
-            currentModelInfo,
-          ),
+        userProvidedOptions?.effort ?? settingsEffortForModel(effortSettings, currentModelInfo),
         fastMode,
         {
           useRecommendedValue,
@@ -9173,7 +9320,7 @@ export class ClaudeAcpAgent {
       );
       const initialEffort = configOptions.find((option) => option.id === EFFORT_CONFIG_ID);
       if (useRecommendedValue && typeof initialEffort?.currentValue === "string") {
-        await q.applyFlagSettings({ effortLevel: toSdkEffortLevel(initialEffort.currentValue) });
+        await q.applyFlagSettings(effortFlagSettings(initialEffort.currentValue, effortSettings));
       }
       // Seed the context window without awaited IPC. The cached authoritative
       // window from a prior turn wins (`result.modelUsage`, cross-session),
@@ -9572,7 +9719,7 @@ function totalTokens(usage: UsageSnapshot): number {
 /** Error kinds this adapter invents itself, alongside the SDK's categorical
  *  `SDKAssistantMessageError` kinds: `no_result` marks a turn the SDK declared
  *  over without ever emitting its result (issue #825). */
-type AgentErrorKind = SDKAssistantMessageError | "no_result";
+type AgentErrorKind = SDKAssistantMessageError | "no_result" | "incomplete_tool_call";
 
 /**
  * Build the `data` payload attached to a `RequestError.internalError` when we
@@ -10106,6 +10253,17 @@ function isTaskTool(toolName: string): boolean {
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+/** Streamed and permission-surfaced tools can precede the SDK's user echo. */
+function recordForegroundToolCall(session: Session, toolCallId: string): void {
+  const turn = session.activeTurn ?? session.turnQueue?.find((queued) => !queued.settled);
+  if (turn && !turn.settled) (turn.foregroundToolCallIds ??= new Set()).add(toolCallId);
+}
+
+function forgetForegroundToolCall(session: Session, toolCallId: string): void {
+  session.activeTurn?.foregroundToolCallIds?.delete(toolCallId);
+  for (const turn of session.turnQueue ?? []) turn.foregroundToolCallIds?.delete(toolCallId);
 }
 
 /** The tool-call field tracker of a session, created on first use. */

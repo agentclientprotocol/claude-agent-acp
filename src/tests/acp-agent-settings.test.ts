@@ -154,6 +154,51 @@ describe("ClaudeAcpAgent settings", () => {
     },
   );
 
+  it("keeps a settings-requested ultracode on when applying effort", async () => {
+    // Since CLI 2.1.284 an effortLevel apply without an ultracode key turns
+    // ultracode off; the CLI's own effort control keeps it on.
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ ultracode: true }),
+    );
+    const applyFlagSettings = vi.fn();
+    querySpy.mockReturnValue(
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "default",
+              displayName: "Default",
+              description: "",
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high"],
+            },
+          ],
+        }),
+        applyFlagSettings,
+      }),
+    );
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+    };
+
+    const response = await (agent as any).createSession({
+      cwd: tempDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "medium", ultracode: true });
+
+    await agent.setSessionConfigOption({
+      sessionId: response.sessionId,
+      configId: "effort",
+      value: "high",
+    });
+    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "high", ultracode: true });
+  });
+
   it("seeds effort from higher-priority programmatic model settings", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),

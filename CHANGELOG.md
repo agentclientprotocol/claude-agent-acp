@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.85.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.84.0...v0.85.0) (2026-10-01)
+
+
+### Features
+
+* **deps:** Bump @anthropic-ai/claude-agent-sdk to 0.3.286 ([#1211](https://github.com/agentclientprotocol/claude-agent-acp/issues/1211)) ([f53b0d7](https://github.com/agentclientprotocol/claude-agent-acp/commit/f53b0d7f40bcd0e9bddace85f123ff4851afcb1f))
+
+
+### Bug Fixes
+
+* Adapt to SDK 0.3.284 replay and ultracode changes ([#1208](https://github.com/agentclientprotocol/claude-agent-acp/issues/1208)) ([4af8079](https://github.com/agentclientprotocol/claude-agent-acp/commit/4af807968c7f0813bcb20fe2bcab2370320e9074))
+* send the legacy custom answer key to AIR ([#1210](https://github.com/agentclientprotocol/claude-agent-acp/issues/1210)) ([af0b43d](https://github.com/agentclientprotocol/claude-agent-acp/commit/af0b43de944e36f81343f40b7aa1a96cd48c3218))
+
 ## [0.84.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.83.0...v0.84.0) (2026-09-28)
 
 

@@ -1204,6 +1204,10 @@ For AIR, the companion field carries `_meta.jetbrains.air.customAnswer`:
 `questionId` names the select field of the same question.
 A client can render the companion as the free-text choice of that question.
 
+For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
+Released AIR versions read only that key.
+A client that is not AIR gets neither key.
+
 ## Session fork point
 
 AIR can fork a session at one agent message.
@@ -1255,12 +1259,11 @@ The adapter sends the key only to an AIR client.
 
 These keys moved into the AIR namespace. The adapter sends the new key only to AIR, and the old key to no client.
 
-| Old key                                                   | New key                                        |
-| --------------------------------------------------------- | ---------------------------------------------- |
-| `initialize._meta.goal`, `session_info_update._meta.goal` | `_meta.jetbrains.air.goal`, same shape         |
-| mode `_meta.kind`, config option value `_meta.kind`       | `_meta.jetbrains.air.kind`                     |
-| elicitation property `_meta._askUserQuestionCustomAnswer` | `_meta.jetbrains.air.customAnswer`, same value |
-| tool call `_meta.contextCompaction`                       | `_meta.jetbrains.air.contextCompaction`        |
+| Old key                                                   | New key                                 |
+| --------------------------------------------------------- | --------------------------------------- |
+| `initialize._meta.goal`, `session_info_update._meta.goal` | `_meta.jetbrains.air.goal`, same shape  |
+| mode `_meta.kind`, config option value `_meta.kind`       | `_meta.jetbrains.air.kind`              |
+| tool call `_meta.contextCompaction`                       | `_meta.jetbrains.air.contextCompaction` |
 
 The adapter does not send `_meta.claudeCode.title`, `claudeCode.subagent`, `claudeCode.skill`, or `claudeCode.skillPath` to any client.
 AIR reads `_meta.jetbrains.air.commandTitle`, `subagent`, and `skill` instead.

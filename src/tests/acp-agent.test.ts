@@ -34,6 +34,7 @@ import {
   toAcpNotifications,
   promptToClaude,
   isLocalCommandMetadata,
+  isReplayHiddenMetaMessage,
   isSyntheticLoginMessage,
   stripLocalCommandMetadata,
   ClaudeAcpAgent,
@@ -2775,6 +2776,78 @@ describe("task notification replay", () => {
     ]);
 
     expect(userChunks(updates)).toEqual(["Run the nightly report"]);
+  });
+});
+
+describe("meta messages from other agents, sessions and channels", () => {
+  // The shape SDK 0.3.284 getSessionMessages returns for a host-injected peer
+  // message (live probe): is_meta plus origin, content is the full framing.
+  const peerMessage = {
+    type: "user",
+    uuid: "peer-1",
+    session_id: "s1",
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+    is_meta: true,
+    origin: { kind: "peer", from: "uds:/tmp/fake.sock", hostInjected: true },
+    message: {
+      role: "user",
+      content:
+        'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/fake.sock">enveloped hi</cross-session-message>\n\nThis came from another Claude session — not typed by your user.',
+    },
+  };
+
+  it("isReplayHiddenMetaMessage matches only meta messages with an inter-agent origin", () => {
+    expect(isReplayHiddenMetaMessage(peerMessage)).toBe(true);
+    for (const kind of ["channel", "observer", "observer-activity", "slack-ping"]) {
+      expect(isReplayHiddenMetaMessage({ ...peerMessage, origin: { kind } })).toBe(true);
+    }
+    // Not meta: an un-framed message persisted as a normal user turn.
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, is_meta: undefined })).toBe(false);
+    // Meta without an inter-agent origin, such as a compact summary.
+    expect(
+      isReplayHiddenMetaMessage({ ...peerMessage, origin: undefined, isCompactSummary: true }),
+    ).toBe(false);
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, origin: { kind: "human" } })).toBe(false);
+    expect(isReplayHiddenMetaMessage({ ...peerMessage, type: "assistant" })).toBe(false);
+    expect(isReplayHiddenMetaMessage(undefined)).toBe(false);
+  });
+
+  it("loadSession replay skips them but keeps the user's own prompt", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        message: { role: "user", content: [{ type: "text", text: "hi, say one word" }] },
+      },
+      peerMessage,
+    ] as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    expect(
+      updates.some(
+        (u) =>
+          u.update.sessionUpdate === "user_message_chunk" &&
+          u.update.content.type === "text" &&
+          u.update.content.text.includes("hi, say one word"),
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(updates)).not.toContain("cross-session-message");
+    expect(JSON.stringify(updates)).not.toContain("Another Claude session");
   });
 });
 
@@ -19559,6 +19632,59 @@ describe("turn steering (_session/steering)", () => {
     await waitFor(() => agent.sessions["test-session"].owedTrailingIdles === 0);
     releaseEnd();
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  // CLI 2.1.286: a steer that lands during a foreground tool call moves the tool
+  // to the background and joins the running cycle instead of aborting it, so
+  // the turn ends in ONE result stamped with both the prompt and the steer.
+  it.each([
+    { name: "without an echo", echo: false },
+    { name: "with a mid-cycle echo", echo: true },
+  ])("settles a steer that joined the running cycle $name", async ({ echo }) => {
+    const timeline: string[] = [];
+    const agent = new ClaudeAcpAgent(timelineClient(timeline), {
+      log: () => {},
+      error: () => {},
+    });
+
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const u1 = await iter.next();
+        yield userEcho(u1.value);
+        yield createAssistantText("working on it");
+        const steered = await iter.next();
+        if (echo) yield userEcho(steered.value);
+        yield createAssistantText("STEERED-OK");
+        yield {
+          ...createResultMessage(),
+          user_message_uuid: u1.value.uuid,
+          user_message_uuids: [u1.value.uuid, steered.value.uuid],
+        };
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "start" }] })
+      .then((response) => {
+        timeline.push(`prompt:${response.stopReason}`);
+        return response;
+      });
+    await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+    await expect(
+      agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also handle X" }] }),
+    ).resolves.toEqual({ outcome: "injected" });
+
+    const response = await turn;
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(timeline).toEqual(["working on it", "STEERED-OK", "prompt:end_turn"]);
+    // One cycle ran, so usage is the single result's.
+    expect(response.usage?.inputTokens).toBe(10);
+    expect(agent.sessions["test-session"].turnQueue).toHaveLength(0);
+    expect(agent.sessions["test-session"].owedTrailingIdles ?? 0).toBe(0);
   });
 
   // Issue #1114's other hang, and #1063's: the steer aborts an autonomous
