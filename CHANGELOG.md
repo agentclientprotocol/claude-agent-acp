@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.85.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.0...v0.85.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* answer session/close without waiting for the interrupt reply ([#1216](https://github.com/agentclientprotocol/claude-agent-acp/issues/1216)) ([0c862e2](https://github.com/agentclientprotocol/claude-agent-acp/commit/0c862e29496bb018e7a4400697bd2315dfd5b845))
+* fail turns with unfinished tools ([#1212](https://github.com/agentclientprotocol/claude-agent-acp/issues/1212)) ([7f8d547](https://github.com/agentclientprotocol/claude-agent-acp/commit/7f8d5471e24b981b129b3c9c2d6736c4ba3f8011))
+* restore background task stops on replay instead of showing them as prompts ([#1205](https://github.com/agentclientprotocol/claude-agent-acp/issues/1205)) ([4ffa625](https://github.com/agentclientprotocol/claude-agent-acp/commit/4ffa625977af7e85526b9a3098f4dee5844467b4))
+
 ## [0.85.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.84.0...v0.85.0) (2026-10-01)
 
 
