@@ -171,12 +171,12 @@ import {
 import { forkSession } from "./fork-session.js";
 import { subagentHistory } from "./subagent-history.js";
 import {
-  readResumedModel,
   readResumedSession,
+  readResumedTail,
   type ResumedSessionSnapshot,
 } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
+import { ALLOW_BYPASS } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
@@ -271,7 +271,11 @@ import {
   MCP_AVAILABLE_COMMAND,
   readMcpServerStatus,
 } from "./mcp-command.js";
-import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
+import {
+  MODE_CONFIG_ID,
+  resolveInitialPermissionMode,
+  SessionModeManager,
+} from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
@@ -794,6 +798,21 @@ type Turn = {
   reject: (error: unknown) => void;
   /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
+};
+
+/** The part of a {@link Session} that a history replay reads and writes.
+ *  A session/load creates it before the CLI starts, so that the replay runs
+ *  while the CLI starts. The session record then takes the same objects. */
+type ReplayState = Pick<
+  Session,
+  "cwd" | "taskState" | "forwardSubagentText" | "messageIdToUuid" | "sessionFailureState"
+>;
+
+/** A replay that runs before its session record exists. */
+type PendingReplay = {
+  state: ReplayState;
+  /** Set when the session creation fails. The replay then sends no more updates. */
+  stopped: boolean;
 };
 
 export type Session = {
@@ -2711,6 +2730,64 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /**
+   * Start the CLI of a loaded session, and replay the history while the CLI
+   * starts. The CLI start takes most of the load time, and the replay needs
+   * only the transcript and the {@link ReplayState}. An invalid `cwd` fails
+   * before the first update. A failed CLI start stops the replay.
+   */
+  private async createSessionWhileReplaying(
+    params: LoadSessionRequest,
+    timing: SessionTiming,
+  ): Promise<NewSessionResponse> {
+    await this.validateCwd(params.cwd);
+    const pending: PendingReplay = {
+      state: {
+        cwd: params.cwd,
+        taskState: new Map(),
+        forwardSubagentText: this.forwardsSubagentText(params._meta),
+        messageIdToUuid: new Map(),
+        sessionFailureState: createSessionFailureState(),
+      },
+      stopped: false,
+    };
+    const transcript = readResumedSession(params.sessionId, this.logger);
+    const replay = transcript
+      .then(({ messages }) => this.replaySessionHistory(params.sessionId, messages, pending))
+      .then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+    let response: NewSessionResponse;
+    try {
+      response = await this.createSession(
+        {
+          cwd: params.cwd,
+          mcpServers: params.mcpServers ?? [],
+          additionalDirectories: params.additionalDirectories,
+          _meta: params._meta,
+        },
+        {
+          resume: params.sessionId,
+          resumedModelHint: transcript.then(({ model }) => model),
+          replayState: pending.state,
+        },
+      );
+    } catch (error) {
+      pending.stopped = true;
+      await replay;
+      throw error;
+    }
+    timing.phase("session-ready");
+    const replayed = await replay;
+    if (!replayed.ok) throw replayed.error;
+    return {
+      sessionId: response.sessionId,
+      modes: response.modes,
+      configOptions: response.configOptions,
+    };
+  }
+
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
     return forkSession(params, {
@@ -2735,11 +2812,15 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const resumedSession = await readResumedSession(params.sessionId, this.logger);
-    const result = await this.getOrCreateSession(params, resumedSession);
-    timing.phase("session-ready");
-
-    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    let result: NewSessionResponse;
+    if (this.sessions[params.sessionId]) {
+      const resumedSession = await readResumedSession(params.sessionId, this.logger);
+      result = await this.getOrCreateSession(params, resumedSession);
+      timing.phase("session-ready");
+      await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    } else {
+      result = await this.createSessionWhileReplaying(params, timing);
+    }
     timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
@@ -7456,6 +7537,7 @@ export class ClaudeAcpAgent {
   private async replaySessionHistory(
     sessionId: string,
     resumedMessages?: SessionMessage[],
+    pending?: PendingReplay,
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
@@ -7464,7 +7546,9 @@ export class ClaudeAcpAgent {
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
     );
-    const session = this.sessions[sessionId];
+    // A pending replay has no session record yet. It uses the state that the record takes later.
+    const replayState = (): ReplayState | undefined => pending?.state ?? this.sessions[sessionId];
+    const session = replayState();
     // A replay rebuilds the client view, so its plan goes out again.
     if (session?.taskState) forgetPublishedTaskPlan(session.taskState);
     const forwardSubagentText =
@@ -7477,7 +7561,11 @@ export class ClaudeAcpAgent {
             sessionId,
             state: session.sessionFailureState,
             capabilities: this.clientCapabilities,
-            isCurrent: () => this.sessions[sessionId] === session,
+            isCurrent: () => {
+              const live = this.sessions[sessionId];
+              if (!live) return pending !== undefined && !pending.stopped;
+              return live.sessionFailureState === session.sessionFailureState;
+            },
             sendUpdate: (notification) => this.client.sessionUpdate(notification),
             logger: this.logger,
           })
@@ -7669,7 +7757,7 @@ export class ClaudeAcpAgent {
     };
 
     const replayMessage = async (message: SessionMessage): Promise<void> => {
-      if (isReplayHiddenMetaMessage(message)) {
+      if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
       if (
@@ -7685,7 +7773,7 @@ export class ClaudeAcpAgent {
       // a client-supplied id without an extra getSessionMessages read. Not read
       // yet (see Session.messageIdToUuid).
       const replayMessageId = messageIdForGrouping(message);
-      const replaySession = this.sessions[sessionId];
+      const replaySession = replayState();
       if (replaySession && replayMessageId && message.uuid) {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
@@ -7804,8 +7892,8 @@ export class ClaudeAcpAgent {
           registerHooks: false,
           replay: true,
           clientCapabilities: this.clientCapabilities,
-          cwd: this.sessions[sessionId]?.cwd,
-          taskState: this.sessions[sessionId]?.taskState,
+          cwd: replayState()?.cwd,
+          taskState: replayState()?.taskState,
           messageId: replayMessageId,
           parentToolUseId,
         },
@@ -7853,7 +7941,7 @@ export class ClaudeAcpAgent {
     };
     for (const message of messages) await replayMessage(message);
 
-    if (nativeReplayEnabled) {
+    if (nativeReplayEnabled && !pending?.stopped) {
       // Claude history persists sidechain messages and Agent/Task tool uses,
       // but not task_started/task_updated lifecycle frames. Recover terminal
       // state from the launch tool_result. Missing results and malformed or
@@ -8835,10 +8923,6 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
-    const resumedModelHint = resumedSession
-      ? resumedSession.model
-      : await readResumedModel(params.sessionId, this.logger);
-
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -8848,7 +8932,7 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
-        resumedModelHint,
+        ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
       },
     );
 
@@ -8888,6 +8972,15 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Whether the session forwards the text and the thinking of a subagent. */
+  private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
+    return (
+      clientSupportsSubagents(this.clientCapabilities) ||
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      (meta as NewSessionMeta | undefined)?.claudeCode?.options?.forwardSubagentText === true
+    );
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: {
@@ -8903,7 +8996,9 @@ export class ClaudeAcpAgent {
       /** Concrete model id from the resumed transcript's last real assistant
        *  message. Claude Code restores from this same record, so it lets us
        *  report the live model without a slow getContextUsage control request. */
-      resumedModelHint?: string;
+      resumedModelHint?: string | Promise<string | undefined>;
+      /** The state that a replay on the same session uses before this record exists. */
+      replayState?: ReplayState;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -8940,12 +9035,14 @@ export class ClaudeAcpAgent {
     // sign-out respawn, provider rerouting), so fill the same fast local hint
     // here when the caller did not provide it. Never fall back to the slow
     // getContextUsage control request.
+    // The same tail read gives the permission mode of the resumed session.
     let resumedModelHint = creationOpts.resumedModelHint;
-    if (
-      creationOpts.resume !== undefined &&
-      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
-    ) {
-      resumedModelHint = await readResumedModel(creationOpts.resume, this.logger);
+    let resumedPermissionMode: string | undefined;
+    if (creationOpts.resume !== undefined) {
+      const withModel = !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint");
+      const tail = await readResumedTail(creationOpts.resume, this.logger, withModel);
+      if (withModel) resumedModelHint = tail.model;
+      resumedPermissionMode = tail.permissionMode;
       timing.phase("resume-transcript");
     }
 
@@ -9014,8 +9111,12 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
       sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
-    const initialPermissionMode = resolvePermissionMode(
-      creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
+    const initialPermissionMode = resolveInitialPermissionMode(
+      {
+        explicit: creationOpts.permissionMode,
+        resumed: resumedPermissionMode,
+        defaultMode: settingsManager.getSettings().permissions?.defaultMode,
+      },
       this.logger,
       allowBypass,
     );
@@ -9027,10 +9128,7 @@ export class ClaudeAcpAgent {
     // ACP contract. Ignore the provider-specific option instead of forwarding
     // hidden state that the Client cannot inspect or change.
     if (userProvidedOptions) delete userProvidedOptions.agent;
-    const forwardSubagentText =
-      clientSupportsSubagents(this.clientCapabilities) ||
-      supportsSubagentTranscript(this.clientCapabilities) ||
-      userProvidedOptions?.forwardSubagentText === true;
+    const forwardSubagentText = this.forwardsSubagentText(params._meta);
 
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
@@ -9064,7 +9162,7 @@ export class ClaudeAcpAgent {
     // Per-session task state. Created here (rather than in the session record
     // below) so the TaskCreated/TaskCompleted hook callbacks can close over
     // the same Map that the streaming message handler will read from.
-    const taskState: TaskState = new Map();
+    const taskState: TaskState = creationOpts.replayState?.taskState ?? new Map();
 
     // Resolve every workspace root once. The native checkpoint report uses
     // this same set for lexical path validation, and the SDK receives it below.
@@ -9390,7 +9488,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        resumedModelHint,
+        await resumedModelHint,
       );
       timing.phase("models");
 
@@ -9561,8 +9659,9 @@ export class ClaudeAcpAgent {
         nativeSubagentParentByToolUseId: new Map(),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
-        messageIdToUuid: new Map(),
-        sessionFailureState: createSessionFailureState(),
+        messageIdToUuid: creationOpts.replayState?.messageIdToUuid ?? new Map(),
+        sessionFailureState:
+          creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
         fileChangeReporter,
