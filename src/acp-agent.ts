@@ -8006,8 +8006,8 @@ export class ClaudeAcpAgent {
    * whose picker rows carry no "1m" token (`sonnet`, and since CLI 2.1.283
    * `opus`/`default`), which would otherwise report 200k until the first
    * result's modelUsage. Never awaited: SDK control requests are serialized,
-   * so an awaited call would delay session/new or a model switch (before the
-   * first turn it took ~15s on older CLIs, issues #886/#880; ~0.5s on 2.1.283).
+   * so even a background full-detail call delays the next request. Summary
+   * returns rawMaxTokens without per-category token-count API calls (#1192).
    * Not written to `contextWindowCache` — that stays keyed to the
    * `result.modelUsage` spellings — and a result still overwrites it.
    */
@@ -8021,7 +8021,7 @@ export class ClaudeAcpAgent {
       session.models.currentModelId === modelId;
     // A synchronous throw must not fail the caller either.
     Promise.resolve()
-      .then(() => query.getContextUsage())
+      .then(() => query.getContextUsage({ detail: "summary" }))
       .then(
         (usage) => {
           if (!stillCurrent() || session.contextWindowAuthoritative) return;
