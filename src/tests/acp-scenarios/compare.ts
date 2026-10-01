@@ -18,7 +18,7 @@
  *   of the same message that went out before it hold the same text.
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
- *   `mcp`. The adapter answers `/mcp` itself for every client.
+ *   `mcp`. The adapter replaces the text of `/mcp` for every client.
  */
 import type { Recorded } from "./harness.js";
 

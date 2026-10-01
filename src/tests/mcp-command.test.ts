@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
@@ -5,8 +6,8 @@ import { ClaudeAcpAgent, stripLocalCommandMetadata, type AcpClient } from "../ac
 import {
   cleanMcpError,
   formatMcpStatus,
+  isMcpCommandText,
   MCP_AVAILABLE_COMMAND,
-  parseMcpCommand,
 } from "../mcp-command.js";
 import { Pushable } from "../utils.js";
 import { initializeClient } from "./helpers.js";
@@ -30,10 +31,51 @@ const SERVERS: McpServerStatus[] = [
   { name: "old", status: "disabled", scope: "user" },
 ];
 
-/** An agent with one session. Its query reports `SERVERS`, unless `query`
- *  replaces a method, and records every prompt that reaches Claude Code.
- *  `events` records each forwarded prompt and each `/mcp` answer in order. */
-function setup(query: Record<string, unknown> = {}, client: Record<string, unknown> = {}) {
+/** The SDK message shapes that carry the text of a local command. `idle`
+ *  ends the turn with an idle state and no result, as after an interrupt. */
+type OutputShape = "system" | "assistant" | "result" | "idle";
+
+/** The terminal text of the Claude Code `/mcp` for the prompt `text`. */
+const cliText = (text: string) =>
+  `CLI output of ${text}. Use \`/mcp\` in the terminal for details.`;
+
+function syntheticAssistant(text: string) {
+  return {
+    type: "assistant",
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      id: `local-${randomUUID()}`,
+      type: "message",
+      role: "assistant",
+      model: "<synthetic>",
+      content: [{ type: "text", text }],
+      stop_reason: "stop_sequence",
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+    },
+  };
+}
+
+/** An agent with one session. Its fake Claude Code runs each prompt as a
+ *  local command: it applies the command to `statuses`, then sends the CLI
+ *  text in each of `shapes`. The query reports `statuses`, unless `query`
+ *  replaces a method. `events` records the command runs, the status reads,
+ *  and the answers in order. */
+function setup(
+  options: {
+    query?: Record<string, unknown>;
+    client?: Record<string, unknown>;
+    shapes?: OutputShape[];
+  } = {},
+) {
+  const shapes = options.shapes ?? ["system"];
+  const statuses = SERVERS.map((status) => ({ ...status }));
   const updates: SessionNotification[] = [];
   const events: string[] = [];
   const agent = new ClaudeAcpAgent(
@@ -44,7 +86,7 @@ function setup(query: Record<string, unknown> = {}, client: Record<string, unkno
       },
       createElicitation: vi.fn(async () => ({ action: "accept" })),
       completeElicitation: vi.fn(async () => {}),
-      ...client,
+      ...options.client,
     } as unknown as AcpClient,
     { log: () => {}, error: () => {} },
   );
@@ -54,15 +96,41 @@ function setup(query: Record<string, unknown> = {}, client: Record<string, unkno
     for await (const user of input) {
       const text = user.message.content.map((block: any) => block.text).join(" ");
       forwarded.push(text);
-      events.push(`forward ${text}`);
       yield userEcho(user);
-      yield successfulResultMessage();
+      // Claude Code runs the command before it sends the text.
+      const [, action, server] = text.split(/\s+/);
+      const target = statuses.find((status) => status.name === server);
+      if (target && action === "reconnect") target.status = "connected";
+      if (target && action === "disable") target.status = "disabled";
+      events.push(`run ${text}`);
+      for (const shape of shapes) {
+        if (shape === "system") {
+          yield {
+            type: "system",
+            subtype: "local_command_output",
+            content: cliText(text),
+            uuid: randomUUID(),
+            session_id: "test-session",
+          };
+        } else if (shape === "assistant") {
+          yield syntheticAssistant(cliText(text));
+        } else if (shape === "idle") {
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        } else {
+          yield successfulResultMessage({ result: cliText(text) });
+        }
+      }
+      if (!shapes.includes("result") && !shapes.includes("idle")) {
+        yield successfulResultMessage();
+      }
     }
   }
   const sdkQuery = Object.assign(wrapQuery(messages()), {
-    mcpServerStatus: vi.fn(async () => SERVERS),
-    reconnectMcpServer: vi.fn(async () => {}),
-    ...query,
+    mcpServerStatus: vi.fn(async () => {
+      events.push("status");
+      return statuses.map((status) => ({ ...status }));
+    }),
+    ...options.query,
   });
   agent.sessions["test-session"] = mockSessionState({ query: sdkQuery, input });
   const text = () =>
@@ -72,34 +140,25 @@ function setup(query: Record<string, unknown> = {}, client: Record<string, unkno
       .join("");
   const prompt = (command: string) =>
     agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: command }] });
-  return { agent, sdkQuery, forwarded, events, text, prompt };
+  return { agent, sdkQuery, statuses, forwarded, events, text, prompt };
 }
 
-/** A status read that waits until the test calls the returned `release`. */
-function blockedStatus() {
-  const releases: (() => void)[] = [];
-  const read = vi.fn(
-    () => new Promise<McpServerStatus[]>((resolve) => releases.push(() => resolve(SERVERS))),
-  );
-  return { read, release: () => releases.shift()?.() };
-}
-
-describe("parseMcpCommand", () => {
-  it("parses the status and reconnect forms", () => {
-    expect(parseMcpCommand(" /mcp ")).toEqual({ action: "status" });
-    expect(parseMcpCommand("/mcp reconnect")).toEqual({ action: "reconnect" });
-    expect(parseMcpCommand("/mcp reconnect all")).toEqual({ action: "reconnect" });
-    expect(parseMcpCommand("/mcp Reconnect github")).toEqual({
-      action: "reconnect",
-      server: "github",
-    });
+describe("isMcpCommandText", () => {
+  it("accepts the forms that Claude Code runs itself", () => {
+    expect(isMcpCommandText(" /mcp ")).toBe(true);
+    expect(isMcpCommandText("/mcp reconnect")).toBe(true);
+    expect(isMcpCommandText("/mcp reconnect all")).toBe(true);
+    expect(isMcpCommandText("/mcp Reconnect github")).toBe(true);
+    expect(isMcpCommandText("/mcp enable github")).toBe(true);
+    expect(isMcpCommandText("/mcp disable all")).toBe(true);
   });
 
-  it("leaves every other prompt to Claude Code", () => {
-    expect(parseMcpCommand("/mcp enable github")).toBeNull();
-    expect(parseMcpCommand("/mcp:github:prompt")).toBeNull();
-    expect(parseMcpCommand("/mcpx")).toBeNull();
-    expect(parseMcpCommand("please run /mcp")).toBeNull();
+  it("rejects every other prompt", () => {
+    expect(isMcpCommandText("/mcp:github:prompt")).toBe(false);
+    expect(isMcpCommandText("/mcp help")).toBe(false);
+    expect(isMcpCommandText("/mcp list")).toBe(false);
+    expect(isMcpCommandText("/mcpx")).toBe(false);
+    expect(isMcpCommandText("please run /mcp")).toBe(false);
   });
 });
 
@@ -249,18 +308,6 @@ describe("formatMcpStatus", () => {
     expect(markdown).toContain("- ``a`b``\n");
     expect(markdown).toContain("**Disabled:** `` `edge ``");
   });
-
-  it("puts a label above the reconnect results", () => {
-    const markdown = formatMcpStatus([{ name: "db", status: "connected" }], {
-      results: [
-        { server: "db", outcome: "reconnected" },
-        { server: "ws", outcome: "failed", error: " " },
-      ],
-    });
-    expect(markdown).toMatch(
-      /^\*\*Reconnect:\*\*\n- `db`: reconnected\.\n- `ws`: the reconnect failed\.\n\n\*\*MCP servers:\*\*/,
-    );
-  });
 });
 
 describe("cleanMcpError", () => {
@@ -342,57 +389,92 @@ describe("cleanMcpError", () => {
 });
 
 describe("/mcp", () => {
-  it("answers in the adapter without a Claude Code turn", async () => {
+  it("sends /mcp to Claude Code and replaces its text with the list", async () => {
     const { forwarded, text, prompt } = setup();
 
     const response = await prompt("/mcp");
 
     expect(response.stopReason).toBe("end_turn");
-    expect(forwarded).toEqual([]);
+    expect(forwarded).toEqual(["/mcp"]);
     expect(text()).toBe(formatMcpStatus(SERVERS));
     expect(text()).not.toContain("terminal");
   });
 
   it("says when no MCP server is configured", async () => {
-    const { text, prompt } = setup({ mcpServerStatus: vi.fn(async () => []) });
+    const { text, prompt } = setup({ query: { mcpServerStatus: vi.fn(async () => []) } });
 
     await prompt("/mcp");
 
     expect(text()).toBe("No MCP servers are configured.");
   });
 
-  it("reports a status read failure in the chat", async () => {
+  it.each(["reconnect db", "enable db", "disable db", "reconnect all"])(
+    "sends /mcp %s to Claude Code and reads the list after the command",
+    async (args) => {
+      const { forwarded, events, text, prompt, statuses } = setup();
+
+      await prompt(`/mcp ${args}`);
+
+      expect(forwarded).toEqual([`/mcp ${args}`]);
+      expect(events).toEqual([`run /mcp ${args}`, "status", "answer"]);
+      expect(text()).toBe(formatMcpStatus(statuses));
+    },
+  );
+
+  it("shows the state that the CLI command made", async () => {
+    const { text, prompt } = setup();
+
+    await prompt("/mcp reconnect db");
+
+    expect(text()).toContain("**Connected**\n- `github`: 2 tools\n- `db`");
+    expect(text()).not.toContain("**Failed**");
+  });
+
+  it("keeps the text of Claude Code when the status read fails", async () => {
     const { text, prompt } = setup({
-      mcpServerStatus: vi.fn(async () => {
-        throw new Error("control channel closed");
-      }),
+      query: {
+        mcpServerStatus: vi.fn(async () => {
+          throw new Error("control channel closed");
+        }),
+      },
     });
 
     const response = await prompt("/mcp");
 
     expect(response.stopReason).toBe("end_turn");
-    expect(text()).toContain("The MCP server status is not available. control channel closed");
+    expect(text()).toBe(cliText("/mcp"));
   });
 
-  it("waits for an earlier turn, so the answer follows its output", async () => {
-    const { agent, forwarded, text, prompt } = setup();
-    const order: string[] = [];
+  it.each([
+    [["system", "assistant"]],
+    [["assistant", "system"]],
+    [["system", "result"]],
+    [["assistant", "result"]],
+  ] as OutputShape[][][])(
+    "sends the list once when Claude Code mirrors its text as %j",
+    async (shapes) => {
+      const { sdkQuery, text, prompt } = setup({ shapes });
 
-    const first = prompt("hello").then(() => order.push("hello"));
-    const status = prompt("/mcp").then(() => order.push("/mcp"));
-    await Promise.all([first, status]);
+      await prompt("/mcp");
 
-    expect(forwarded).toEqual(["hello"]);
-    expect(order).toEqual(["hello", "/mcp"]);
-    expect(text()).toContain("**MCP servers:** 5");
-    expect(agent.sessions["test-session"].turnQueue?.every((turn) => turn.settled)).toBe(true);
+      expect(text()).toBe(formatMcpStatus(SERVERS));
+      expect(sdkQuery.mcpServerStatus).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("replaces the result text when no other shape carries it", async () => {
+    const { text, prompt } = setup({ shapes: ["result"] });
+
+    await prompt("/mcp");
+
+    expect(text()).toBe(formatMcpStatus(SERVERS));
   });
 
-  it("leaves other /mcp prompts to Claude Code", async () => {
-    const { agent, forwarded, prompt } = setup();
+  it("leaves the text of other /mcp prompts unchanged", async () => {
+    const { agent, sdkQuery, forwarded, text, prompt } = setup();
 
-    await prompt("/mcp enable github");
     await prompt("/mcp:github:prompt");
+    await prompt("/mcp help");
     await agent.prompt({
       sessionId: "test-session",
       prompt: [
@@ -402,286 +484,97 @@ describe("/mcp", () => {
     });
 
     // The adapter rewrites an MCP prompt command into the Claude Code form.
-    expect(forwarded).toEqual(["/mcp enable github", "/github:prompt (MCP)", "/mcp more"]);
-  });
-
-  it("cancels a prompt that waits behind /mcp", async () => {
-    const status = blockedStatus();
-    const { agent, forwarded, prompt } = setup({ mcpServerStatus: status.read });
-
-    const mcp = prompt("/mcp");
-    await vi.waitFor(() => expect(status.read).toHaveBeenCalled());
-    const later = prompt("hello");
-    await agent.cancel({ sessionId: "test-session" });
-    status.release();
-
-    expect((await mcp).stopReason).toBe("cancelled");
-    expect((await later).stopReason).toBe("cancelled");
-    expect(forwarded).toEqual([]);
-  });
-
-  it("cancels at once while the status read is still blocked", async () => {
-    const status = blockedStatus();
-    const { agent, forwarded, text, prompt } = setup({ mcpServerStatus: status.read });
-
-    const mcp = prompt("/mcp");
-    await vi.waitFor(() => expect(status.read).toHaveBeenCalled());
-    const waiting = prompt("hello");
-    await agent.cancel({ sessionId: "test-session" });
-
-    // The status read does not return here. The cancel alone ends both prompts.
-    expect((await waiting).stopReason).toBe("cancelled");
-    expect((await mcp).stopReason).toBe("cancelled");
-
-    // A prompt sent after the cancel goes to Claude Code at once.
-    expect((await prompt("after")).stopReason).toBe("end_turn");
-    expect(forwarded).toEqual(["after"]);
-
-    status.release();
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(text()).toBe("");
-  });
-
-  it("answers from the query of a session that a provider update replaced", async () => {
-    const answers: string[] = [];
-    let replace = () => {};
-    const { agent, sdkQuery, prompt } = setup(
-      {},
-      {
-        sessionUpdate: async (notification: SessionNotification) => {
-          // The first update is the fallback warning, which waits for the client.
-          replace();
-          replace = () => {};
-          if (notification.update.sessionUpdate === "agent_message_chunk") {
-            answers.push((notification.update.content as any).text);
-          }
-        },
-      },
+    expect(forwarded).toEqual(["/github:prompt (MCP)", "/mcp help", "/mcp more"]);
+    expect(text()).toBe(
+      [cliText("/github:prompt (MCP)"), cliText("/mcp help"), cliText("/mcp more")].join(""),
     );
-    const replacementStatus = vi.fn(async (): Promise<McpServerStatus[]> => [
-      { name: "replacement", status: "connected" },
-    ]);
-    // The fallback warning is an await between the provider wait and the /mcp answer.
-    agent.sessions["test-session"].autoModeFallbackWarningPending = true;
-    replace = () => {
-      agent.sessions["test-session"] = mockSessionState({
-        query: Object.assign(wrapQuery((async function* () {})()), {
-          mcpServerStatus: replacementStatus,
-        }),
-        input: new Pushable<any>(),
-      });
-    };
-
-    expect((await prompt("/mcp")).stopReason).toBe("end_turn");
-
     expect(sdkQuery.mcpServerStatus).not.toHaveBeenCalled();
-    expect(replacementStatus).toHaveBeenCalledOnce();
-    expect(answers.join("")).toContain("replacement");
   });
 
-  it("answers two /mcp prompts and a later prompt in order", async () => {
-    const status = blockedStatus();
-    const { events, prompt } = setup({ mcpServerStatus: status.read });
+  it("publishes nothing when a cancel comes during the status read", async () => {
+    let started!: () => void;
+    const reading = new Promise<void>((resolve) => (started = resolve));
+    const { agent, text, prompt } = setup({
+      shapes: ["system", "idle"],
+      query: {
+        mcpServerStatus: vi.fn(
+          () =>
+            new Promise<McpServerStatus[]>(() => {
+              started();
+            }),
+        ),
+      },
+    });
 
-    const first = prompt("/mcp");
-    await vi.waitFor(() => expect(status.read).toHaveBeenCalledTimes(1));
-    const second = prompt("/mcp");
-    const later = prompt("hello");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    // The second /mcp waits for the first one.
-    expect(status.read).toHaveBeenCalledTimes(1);
-    status.release();
-    await vi.waitFor(() => expect(status.read).toHaveBeenCalledTimes(2));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    // The later prompt waits for the second /mcp.
-    expect(events).toEqual(["answer"]);
-    status.release();
-    await Promise.all([first, second, later]);
+    const response = prompt("/mcp");
+    await reading;
+    await agent.cancel({ sessionId: "test-session" });
 
-    expect(events).toEqual(["answer", "answer", "forward hello"]);
-  });
-
-  it("holds a provider update until the /mcp answer ends", async () => {
-    const status = blockedStatus();
-    const { agent, prompt } = setup({ mcpServerStatus: status.read });
-
-    const mcp = prompt("/mcp");
-    await vi.waitFor(() => expect(status.read).toHaveBeenCalled());
-    let updated = false;
-    const update = agent
-      .unstable_setProvider({
-        providerId: "main",
-        apiType: "anthropic",
-        baseUrl: "https://gateway.example.com",
-      } as any)
-      .then(() => (updated = true));
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(updated).toBe(false);
-    status.release();
-
-    expect((await mcp).stopReason).toBe("end_turn");
-    await update;
-    expect(updated).toBe(true);
+    expect((await response).stopReason).toBe("cancelled");
+    expect(text()).toBe("");
   });
 });
 
-describe("/mcp reconnect", () => {
-  it("reconnects the named server and shows the updated list", async () => {
-    let reconnected = false;
-    const { sdkQuery, forwarded, text, prompt } = setup({
-      mcpServerStatus: vi.fn(async () =>
-        SERVERS.map((server) =>
-          server.name === "db" && reconnected
-            ? { ...server, status: "connected", error: undefined, tools: [{ name: "query" }] }
-            : server,
-        ),
-      ),
-      reconnectMcpServer: vi.fn(async () => {
-        reconnected = true;
-      }),
-    });
-
-    const response = await prompt("/mcp reconnect db");
-
-    expect(response.stopReason).toBe("end_turn");
-    expect(forwarded).toEqual([]);
-    expect(sdkQuery.reconnectMcpServer).toHaveBeenCalledExactlyOnceWith("db");
-    expect(text()).toContain("- `db`: reconnected.");
-    expect(text()).toContain("**Reconnect:**\n- `db`: reconnected.\n\n**MCP servers:** 5");
-    expect(text()).toContain("**Connected**\n- `github`: 2 tools\n- `db`: 1 tool");
-  });
-
-  it("reconnects every server that is not connected and not disabled", async () => {
-    const { sdkQuery, text, prompt } = setup();
-
-    await prompt("/mcp reconnect");
-
-    // The client has no URL elicitation, so `linear` gets a plain reconnect.
-    expect(sdkQuery.reconnectMcpServer.mock.calls.map(([name]: [string]) => name)).toEqual([
-      "linear",
-      "db",
-      "docs",
-    ]);
-    expect(text()).toContain(
-      "- `linear`: reconnected.\n- `db`: reconnected.\n- `docs`: reconnected.",
-    );
-    expect(text()).toContain("**Failed**\n- `db`: spawn db-mcp ENOENT");
-  });
-
-  it("says when there is nothing to reconnect", async () => {
-    const { sdkQuery, text, prompt } = setup({
-      mcpServerStatus: vi.fn(async () => SERVERS.filter((server) => server.name === "github")),
-    });
-
-    await prompt("/mcp reconnect");
-
-    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
-    expect(text()).toContain(
-      "Every MCP server is connected or disabled. There is nothing to reconnect.",
-    );
-  });
-
-  it("names the known servers for an unknown server", async () => {
-    const { sdkQuery, text, prompt } = setup();
-
-    const response = await prompt("/mcp reconnect nope");
-
-    expect(response.stopReason).toBe("end_turn");
-    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
-    expect(text()).toBe(
-      "There is no MCP server named `nope`.\n" +
-        "Known servers: `github`, `linear`, `db`, `docs`, `old`.",
-    );
-  });
-
-  it("does not reconnect a disabled server", async () => {
-    const { sdkQuery, text, prompt } = setup();
-
-    await prompt("/mcp reconnect old");
-
-    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
-    expect(text()).toContain("`old` is disabled. A reconnect does not apply to a disabled server.");
-  });
-
-  it("keeps going after one server fails", async () => {
-    const { sdkQuery, text, prompt } = setup({
-      reconnectMcpServer: vi.fn(async (name: string) => {
-        if (name === "db") throw new Error("spawn db-mcp ENOENT");
-      }),
-    });
-
-    const response = await prompt("/mcp reconnect");
-
-    expect(response.stopReason).toBe("end_turn");
-    expect(sdkQuery.reconnectMcpServer).toHaveBeenCalledTimes(3);
-    expect(text()).toContain("- `db`: the reconnect failed. spawn db-mcp ENOENT");
-    expect(text()).toContain("- `docs`: reconnected.");
-  });
-
-  it("runs a prompt sent during a reconnect after the reconnect", async () => {
-    let release!: () => void;
-    const { events, prompt } = setup({
-      reconnectMcpServer: vi.fn(() => new Promise<void>((resolve) => (release = resolve))),
-    });
-
-    const reconnect = prompt("/mcp reconnect db");
-    await vi.waitFor(() => expect(release).toBeDefined());
-    const later = prompt("hello");
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(events).toEqual([]);
-    release();
-    await Promise.all([reconnect, later]);
-
-    expect(events).toEqual(["answer", "forward hello"]);
-  });
-
-  it("runs the MCP OAuth flow for a server that needs authentication", async () => {
+describe("/mcp and MCP OAuth", () => {
+  it("starts the MCP OAuth flow once for a server that needs authentication", async () => {
     const mcpAuthenticate = vi.fn(async () => ({
       requiresUserAction: false,
       callbackExpected: false,
     }));
-    const { agent, sdkQuery, text, prompt } = setup({ mcpAuthenticate });
+    const { agent, text, prompt } = setup({
+      query: { mcpAuthenticate },
+      shapes: ["system", "assistant", "result"],
+    });
     await initializeClient(agent, { elicitation: { url: {} } } as any);
 
-    await prompt("/mcp reconnect linear");
+    await prompt("/mcp");
 
-    expect(mcpAuthenticate).toHaveBeenCalledExactlyOnceWith("linear");
-    expect(sdkQuery.reconnectMcpServer).not.toHaveBeenCalled();
-    expect(text()).toContain("- `linear`: authenticated.");
+    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
+    expect(mcpAuthenticate).toHaveBeenCalledWith("linear");
+    expect(text()).toBe(formatMcpStatus(SERVERS));
   });
 
-  it("says when the user declines the MCP OAuth flow", async () => {
-    const mcpAuthenticate = vi.fn(async () => ({
-      requiresUserAction: true,
-      callbackExpected: true,
-      authUrl: "https://auth.example.com/authorize",
-    }));
-    const createElicitation = vi.fn(async () => ({ action: "decline" }));
-    const { agent, text, prompt } = setup({ mcpAuthenticate }, { createElicitation });
+  it("does not hold the turn while the MCP OAuth flow runs", async () => {
+    const mcpAuthenticate = vi.fn(() => new Promise<never>(() => {}));
+    const { agent, prompt } = setup({ query: { mcpAuthenticate } });
     await initializeClient(agent, { elicitation: { url: {} } } as any);
 
-    const response = await prompt("/mcp reconnect linear");
+    const response = await prompt("/mcp");
 
     expect(response.stopReason).toBe("end_turn");
-    expect(createElicitation).toHaveBeenCalledOnce();
-    expect(text()).toContain(
-      "- `linear`: not authenticated. The authentication flow did not finish.",
-    );
+    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
   });
 
-  it("stops on cancel and answers cancelled", async () => {
-    let release!: () => void;
-    const { agent, text, prompt } = setup({
-      reconnectMcpServer: vi.fn(() => new Promise<void>((resolve) => (release = resolve))),
+  it("does not start the MCP OAuth flow without URL elicitation", async () => {
+    const mcpAuthenticate = vi.fn(async () => ({
+      requiresUserAction: false,
+      callbackExpected: false,
+    }));
+    const { prompt, sdkQuery } = setup({ query: { mcpAuthenticate } });
+
+    await prompt("/mcp");
+    await Promise.resolve();
+
+    expect(sdkQuery.mcpServerStatus).toHaveBeenCalledOnce();
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
+  });
+
+  it("does not start the MCP OAuth flow when the list fell back to the CLI text", async () => {
+    const mcpAuthenticate = vi.fn();
+    const { agent, prompt } = setup({
+      query: {
+        mcpAuthenticate,
+        mcpServerStatus: vi.fn(async () => {
+          throw new Error("control channel closed");
+        }),
+      },
     });
+    await initializeClient(agent, { elicitation: { url: {} } } as any);
 
-    const response = prompt("/mcp reconnect db");
-    await vi.waitFor(() => expect(release).toBeDefined());
-    await agent.cancel({ sessionId: "test-session" });
-    release();
+    await prompt("/mcp");
+    await Promise.resolve();
 
-    expect((await response).stopReason).toBe("cancelled");
-    expect(text()).toBe("");
+    expect(mcpAuthenticate).not.toHaveBeenCalled();
   });
 });
 

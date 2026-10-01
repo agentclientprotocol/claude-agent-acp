@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect a server","input":{"hint":"reconnect [server]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<server>|all]]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"name":"Check the logs","prompt":"Check logs","sessionUpdate":"subagent_spawned","subagentSessionId":"agent_late","task":"Check logs"}}}

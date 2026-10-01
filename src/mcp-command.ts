@@ -1,42 +1,64 @@
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
-import type { McpServerStatus } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerStatus, Query } from "@anthropic-ai/claude-agent-sdk";
 import { escapeMarkdown } from "./usage-markdown.js";
 
-/** A `/mcp` prompt that the adapter answers itself. Claude Code's own `/mcp`
- *  points the user to a terminal, which an ACP client does not have. */
-export type McpCommand = { action: "status" } | { action: "reconnect"; server?: string };
-
-/** The `/mcp` entry of `available_commands_update`. The adapter answers
- *  `/mcp` itself, so this entry replaces the Claude Code entry. */
+/** The `/mcp` entry of `available_commands_update`. Claude Code runs `/mcp`,
+ *  and the adapter replaces its terminal text with a list of the servers. */
 export const MCP_AVAILABLE_COMMAND: AvailableCommand = {
   name: "mcp",
-  description: "Show the MCP servers and their status, or reconnect a server",
-  input: { hint: "reconnect [server]" },
+  description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+  input: { hint: "[reconnect|enable|disable [<server>|all]]" },
 };
 
-/** Parse a prompt that is exactly `/mcp`, `/mcp reconnect`, or
- *  `/mcp reconnect <server>`. `/mcp reconnect all` means every server, as in
- *  Claude Code. Any other `/mcp` argument stays with Claude Code. */
-export function parseMcpCommand(text: string): McpCommand | null {
+/** The time that the status read after a `/mcp` command can take. */
+const MCP_STATUS_TIMEOUT_MS = 5_000;
+
+/** True for a prompt that is exactly `/mcp`, or `/mcp reconnect`, `/mcp enable`,
+ *  or `/mcp disable` with an optional server name or `all`. Claude Code runs
+ *  these commands itself. Any other `/mcp` argument gets no replacement. */
+export function isMcpCommandText(text: string): boolean {
   const words = text.trim().split(/\s+/);
-  if (words[0] !== "/mcp") return null;
-  if (words.length === 1) return { action: "status" };
-  if (words[1]?.toLowerCase() !== "reconnect") return null;
-  const server = words.slice(2).join(" ");
-  if (server === "" || server === "all") return { action: "reconnect" };
-  return { action: "reconnect", server };
+  if (words[0] !== "/mcp") return false;
+  return words.length === 1 || /^(reconnect|enable|disable)$/i.test(words[1] ?? "");
 }
 
-/** The result of one reconnect attempt, shown above the server list. */
-export type McpReconnectResult =
-  | { server: string; outcome: "reconnected" }
-  | { server: string; outcome: "authenticated" }
-  | { server: string; outcome: "not-authenticated" }
-  | { server: string; outcome: "failed"; error: string };
-
-/** Why a `/mcp reconnect` did not try a server, shown above the server list. */
-export type McpReconnectNote =
-  { kind: "disabled"; server: string } | { kind: "nothing-to-reconnect" };
+/** Read the MCP server status for the list after a `/mcp` command. Resolves
+ *  to null when the read fails, takes too long, or `signal` aborts. Then the
+ *  turn keeps the text of Claude Code. */
+export async function readMcpServerStatus(
+  query: Pick<Query, "mcpServerStatus">,
+  signal: AbortSignal,
+  logError: (message: string) => void,
+): Promise<McpServerStatus[] | null> {
+  if (signal.aborted) return null;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    const statuses = await Promise.race([
+      query.mcpServerStatus(),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), MCP_STATUS_TIMEOUT_MS);
+        timeout.unref?.();
+      }),
+      new Promise<null>((resolve) => {
+        onAbort = () => resolve(null);
+        signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+    if (statuses === null && !signal.aborted) {
+      logError("The MCP server status read timed out; keeping the Claude Code text of /mcp");
+    }
+    return statuses;
+  } catch (error) {
+    if (!signal.aborted) {
+      logError(`The MCP server status read failed; keeping the Claude Code text of /mcp: ${error}`);
+    }
+    return null;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
 
 /** The known statuses in the order of the groups and of the summary counts.
  *  A disabled server is not a group. It is on one line at the end. */
@@ -65,7 +87,7 @@ const MAX_ERROR_LENGTH = 160;
 const MAX_WRAPPER_LENGTH = 60;
 
 /** True for a server that a `/mcp reconnect` without a name must retry. */
-export function needsReconnect(status: McpServerStatus): boolean {
+function needsReconnect(status: McpServerStatus): boolean {
   return (
     status.status === "failed" || status.status === "pending" || status.status === "needs-auth"
   );
@@ -212,56 +234,17 @@ function unknownStatuses(statuses: McpServerStatus[]): string[] {
   ];
 }
 
-function resultLine(result: McpReconnectResult): string {
-  const name = codeSpan(result.server);
-  switch (result.outcome) {
-    case "failed": {
-      const error = cleanMcpError(result.error);
-      return error === ""
-        ? `- ${name}: the reconnect failed.`
-        : `- ${name}: the reconnect failed. ${escapeMarkdown(error)}`;
-    }
-    case "authenticated":
-      return `- ${name}: authenticated.`;
-    case "not-authenticated":
-      return `- ${name}: not authenticated. The authentication flow did not finish.`;
-    default:
-      return `- ${name}: reconnected.`;
-  }
-}
-
-function noteLine(note: McpReconnectNote): string {
-  return note.kind === "disabled"
-    ? `${codeSpan(note.server)} is disabled. A reconnect does not apply to a disabled server.`
-    : "Every MCP server is connected or disabled. There is nothing to reconnect.";
-}
-
 /** The group title of a status that the adapter does not know. It starts with a capital letter, as a known title does. */
 function unknownTitle(state: string): string {
   return escapeMarkdown(state.charAt(0).toUpperCase() + state.slice(1));
 }
 
-/** Markdown for `/mcp`: the reconnect note and results (if any), a summary
- *  line, one group of servers for each status, and the disabled servers on
- *  one line. A list reads better than a table in a narrow chat. */
-export function formatMcpStatus(
-  statuses: McpServerStatus[],
-  options: { results?: McpReconnectResult[]; note?: McpReconnectNote } = {},
-): string {
+/** Markdown for `/mcp`: a summary line, one group of servers for each
+ *  status, and the disabled servers on one line. A list reads better than a
+ *  table in a narrow chat. */
+export function formatMcpStatus(statuses: McpServerStatus[]): string {
+  if (statuses.length === 0) return "No MCP servers are configured.";
   const blocks: string[] = [];
-  const results = options.results ?? [];
-  if (results.length > 0 || options.note) {
-    blocks.push(
-      [
-        ...(options.note ? [noteLine(options.note)] : []),
-        ...(results.length > 0 ? ["**Reconnect:**", ...results.map(resultLine)] : []),
-      ].join("\n"),
-    );
-  }
-  if (statuses.length === 0) {
-    blocks.push("No MCP servers are configured.");
-    return blocks.join("\n\n");
-  }
   const names = statuses.map((status) => status.name);
   const duplicates = new Set(names.filter((name, index) => names.indexOf(name) !== index));
   blocks.push(summaryLine(statuses));
@@ -288,20 +271,4 @@ export function formatMcpStatus(
     );
   }
   return blocks.join("\n\n");
-}
-
-/** Markdown for `/mcp reconnect <server>` when no server has that name. */
-export function formatUnknownMcpServer(server: string, statuses: McpServerStatus[]): string {
-  const lines = [`There is no MCP server named ${codeSpan(server)}.`];
-  if (statuses.length === 0) {
-    lines.push("No MCP servers are configured.");
-  } else {
-    lines.push(`Known servers: ${statuses.map((status) => codeSpan(status.name)).join(", ")}.`);
-  }
-  return lines.join("\n");
-}
-
-/** Markdown for `/mcp` when the MCP server status cannot be read. */
-export function formatMcpStatusUnavailable(error: string): string {
-  return `The MCP server status is not available. ${escapeMarkdown(error)}`;
 }

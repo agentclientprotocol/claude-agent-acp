@@ -265,8 +265,12 @@ import {
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
-import { MCP_AVAILABLE_COMMAND } from "./mcp-command.js";
-import { McpCommandRunner, type PromptAdmission } from "./mcp-command-runner.js";
+import {
+  formatMcpStatus,
+  isMcpCommandText,
+  MCP_AVAILABLE_COMMAND,
+  readMcpServerStatus,
+} from "./mcp-command.js";
 import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
@@ -380,6 +384,18 @@ function settleLiveBackgroundTask(session: Session, taskId: string): void {
     if (oldest !== undefined) resumable.delete(oldest);
   }
 }
+
+/** The structured replacement for the text of a local command that Claude
+ *  Code runs itself, such as `/usage` or `/mcp`. */
+type LocalCommandMarkdown = {
+  /** True when `produce` starts at turn activation. Otherwise it starts when
+   *  the command output arrives, so Claude Code has finished the command. */
+  startsAtActivation: boolean;
+  /** The replacement, or null to keep the original text of Claude Code. */
+  produce(query: Query, signal: AbortSignal): Promise<string | null>;
+  /** Runs once when the turn ends after it delivered the replacement. */
+  afterDelivery?(): void;
+};
 
 /** Best-effort structured presentation for a local `/usage` turn. The command
  * itself always runs through Claude Code; null tells the consumer to forward
@@ -625,17 +641,17 @@ type Turn = {
    *  queue head, not `activeTurn`: a UserPromptSubmit block arrives before
    *  any echo, so the turn is only promoted when its result lands. */
   noticeTexts?: string[];
-  /** Structured presentation for an exact /usage command. The command still
-   * runs through the normal SDK turn so ordering, cancellation, persistence,
-   * and replay remain unchanged. Null means the experimental API failed and
-   * every output path must preserve Claude Code's original text. */
-  isUsageCommand?: boolean;
-  usageMarkdown?: Promise<string | null>;
-  usageMarkdownAbort?: AbortController;
+  /** Structured presentation for an exact /usage or /mcp command. The command
+   * still runs through the normal SDK turn so ordering, cancellation,
+   * persistence, and replay remain unchanged. A null result means the request
+   * failed and every output path must preserve Claude Code's original text. */
+  localCommand?: LocalCommandMarkdown;
+  localCommandMarkdown?: Promise<string | null>;
+  localCommandAbort?: AbortController;
   /** The SDK can expose a local command through more than one message shape;
    * publish the structured replacement at most once. */
-  usageMarkdownDelivered?: boolean;
-  usageOriginalOutput?: string;
+  localCommandDelivered?: boolean;
+  localCommandOriginalOutput?: string;
   /** Optional native checkpoint preview requested by the ACP client for this
    *  turn. The state is turn-owned so a late control response can never be
    *  rebound to a newer prompt. */
@@ -2242,12 +2258,23 @@ function startMcpAuthentication(
   sessionId: string,
   mcpServers: NewSessionRequest["mcpServers"],
 ): void {
-  if (!host.clientCapabilities?.elicitation?.url || mcpServers.length === 0) return;
+  if (mcpServers.length === 0) return;
+  startMcpServerAuthentication(host, sessionId, new Set(mcpServers.map((server) => server.name)));
+}
+
+/** Start OAuth in the background for the servers in `requestedServers` that
+ *  Claude reports as needing authentication. Startup and `/mcp` use it. It
+ *  does nothing while another OAuth run of the session is in progress. */
+function startMcpServerAuthentication(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  requestedServers: Set<string>,
+): void {
+  if (!host.clientCapabilities?.elicitation?.url) return;
 
   const session = host.sessions[sessionId];
   if (!session || mcpAuthentications.has(session)) return;
 
-  const requestedServers = new Set(mcpServers.map((server) => server.name));
   const authentication = authenticateMcpServers(host, sessionId, session.query, requestedServers)
     .catch((error) => {
       if (!session.abortController.signal.aborted) {
@@ -2289,34 +2316,27 @@ async function authenticateMcpServers(
 
 /** Bridge Claude Code's startup MCP OAuth control to ACP URL elicitation.
  *  Claude opens and owns the localhost callback listener; the ACP client only
- *  needs to present the returned authorization URL. The optional `signal`
- *  stops the flow early, as the session abort does. Resolves true when the
- *  server is authenticated. */
+ *  needs to present the returned authorization URL. */
 async function authenticateMcpServer(
   host: McpAuthenticationHost,
   sessionId: string,
   query: McpOAuthQuery,
   serverName: string,
-  signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<void> {
   const session = host.sessions[sessionId];
-  if (!session) return false;
+  if (!session) return;
 
   const login = await query.mcpAuthenticate(serverName);
-  if (!login.requiresUserAction) return true;
+  if (!login.requiresUserAction) return;
   if (!login.authUrl) {
     throw new Error("Claude Code requested user action without returning an authorization URL");
   }
 
   const elicitationId = `mcp-oauth-${randomUUID()}`;
   const flowAbort = new AbortController();
-  const stopSignals = [session.abortController.signal, ...(signal ? [signal] : [])];
-  const abortFlow = () =>
-    flowAbort.abort(stopSignals.find((stopSignal) => stopSignal.aborted)?.reason);
-  for (const stopSignal of stopSignals) {
-    stopSignal.addEventListener("abort", abortFlow, { once: true });
-  }
-  if (stopSignals.some((stopSignal) => stopSignal.aborted)) abortFlow();
+  const abortFlow = () => flowAbort.abort(session.abortController.signal.reason);
+  session.abortController.signal.addEventListener("abort", abortFlow, { once: true });
+  if (session.abortController.signal.aborted) abortFlow();
 
   try {
     const completed = waitForMcpAuthentication(
@@ -2342,10 +2362,12 @@ async function authenticateMcpServer(
     ]);
 
     if (first.type === "elicitation" && !CreateElicitationResponse.isAccept(first.response)) {
-      return false;
+      return;
     }
 
-    const authenticated = first.type === "elicitation" ? await completed : first.authenticated;
+    if (first.type === "elicitation") {
+      await completed;
+    }
     try {
       await host.client.completeElicitation({ elicitationId });
     } catch (error) {
@@ -2353,12 +2375,9 @@ async function authenticateMcpServer(
         host.logger.error(`Failed to complete MCP OAuth elicitation: ${error}`);
       }
     }
-    return authenticated;
   } finally {
     flowAbort.abort();
-    for (const stopSignal of stopSignals) {
-      stopSignal.removeEventListener("abort", abortFlow);
-    }
+    session.abortController.signal.removeEventListener("abort", abortFlow);
   }
 }
 
@@ -2423,7 +2442,6 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
-  private readonly mcpCommands: McpCommandRunner;
 
   constructor(client: AcpClient, logger?: Logger) {
     this.sessions = {};
@@ -2477,14 +2495,6 @@ export class ClaudeAcpAgent {
       // Capabilities arrive at initialize, after this constructor runs.
       supportsNotices: () => clientSupportsNotices(this.clientCapabilities),
       logError: (...args: unknown[]) => this.logger.error(...args),
-    });
-    this.mcpCommands = new McpCommandRunner({
-      sessionUpdate: (notification) => this.client.sessionUpdate(notification),
-      logError: (message) => this.logger.error(message),
-      mcpOAuth: (sessionId, query) =>
-        this.clientCapabilities?.elicitation?.url && supportsMcpOAuth(query)
-          ? (server, signal) => authenticateMcpServer(this, sessionId, query, server, signal)
-          : undefined,
     });
   }
 
@@ -3166,6 +3176,42 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** The structured replacement for a prompt that is exactly `/usage` or a
+   *  `/mcp` command. Claude Code runs the command, and the replacement takes
+   *  the place of its text. The `/mcp` list reads the status after Claude Code
+   *  finished the command, so a reconnect, an enable, or a disable shows. */
+  private localCommandMarkdown(params: PromptRequest): LocalCommandMarkdown | undefined {
+    const text =
+      params.prompt.length === 1 && params.prompt[0]?.type === "text"
+        ? params.prompt[0].text
+        : undefined;
+    if (text === undefined) return undefined;
+    if (isUsageCommandText(text)) {
+      return {
+        startsAtActivation: true,
+        produce: (query, signal) => structuredUsageMarkdown(query, signal, this.logger),
+      };
+    }
+    if (!isMcpCommandText(text)) return undefined;
+    const needsAuth = new Set<string>();
+    return {
+      startsAtActivation: false,
+      produce: async (query, signal) => {
+        const statuses = await readMcpServerStatus(query, signal, (message) =>
+          this.logger.error(message),
+        );
+        if (!statuses) return null;
+        for (const status of statuses) {
+          if (status.status === "needs-auth") needsAuth.add(status.name);
+        }
+        return formatMcpStatus(statuses);
+      },
+      afterDelivery: () => {
+        if (needsAuth.size > 0) startMcpServerAuthentication(this, params.sessionId, needsAuth);
+      },
+    };
+  }
+
   /**
    * Serves an ACP v1 `session/prompt`, which answers when the turn ends. The
    * outcome of a turn is field for field a v1 prompt response.
@@ -3192,17 +3238,6 @@ export class ClaudeAcpAgent {
    * before this resolves.
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
-    const response = await this.mcpCommands.admit(params.sessionId, params.prompt, (admission) =>
-      this.admittedStartTurn(params, events, admission),
-    );
-    if (response) events.ended(response);
-  }
-
-  private async admittedStartTurn(
-    params: PromptRequest,
-    events: TurnEvents,
-    admission: PromptAdmission,
-  ): Promise<PromptResponse | void> {
     if (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
@@ -3233,15 +3268,6 @@ export class ClaudeAcpAgent {
       await this.sessionModes.publishFallbackWarning(params.sessionId, session);
     }
 
-    // A provider update during the awaits above can replace the query.
-    const mcpResponse = this.mcpCommands.run(
-      params.sessionId,
-      this.sessions[params.sessionId] ?? session,
-      params.prompt,
-      admission.signal,
-    );
-    if (mcpResponse) return mcpResponse;
-
     if (Array.from(session.taskState.values()).some((task) => task.status !== "completed")) {
       await this.publishTaskPlan(params.sessionId, session.taskState);
     }
@@ -3258,11 +3284,8 @@ export class ClaudeAcpAgent {
 
     const fileChangeReport = session.fileChangeReporter?.request(params._meta);
 
-    const isUsageCommand =
-      params.prompt.length === 1 &&
-      params.prompt[0]?.type === "text" &&
-      isUsageCommandText(params.prompt[0].text);
-    const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+    const localCommand = this.localCommandMarkdown(params);
+    const localCommandAbort = localCommand ? new AbortController() : undefined;
 
     session.titles.onPrompt(params.prompt);
 
@@ -3275,8 +3298,8 @@ export class ClaudeAcpAgent {
       promptUuid,
       events,
       isLocalOnlyCommand,
-      ...(isUsageCommand ? { isUsageCommand: true } : {}),
-      ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
+      ...(localCommand ? { localCommand } : {}),
+      ...(localCommandAbort ? { localCommandAbort } : {}),
       ...(fileChangeReport ? { fileChangeReport } : {}),
       settled: false,
       completion: new Promise<void>((resolve) => {
@@ -3295,7 +3318,6 @@ export class ClaudeAcpAgent {
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
     session.input.push(userMessage);
-    admission.release();
     this.ensureConsumer(session, params.sessionId);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
@@ -3992,14 +4014,13 @@ export class ClaudeAcpAgent {
         supportsAirSessionFailures(this.clientCapabilities) ? undefined : rawDetail,
       );
 
-    const ensureUsageMarkdown = (turn: Turn): Promise<string | null> | undefined => {
-      if (!turn.isUsageCommand || !turn.usageMarkdownAbort) return undefined;
-      turn.usageMarkdown ??= structuredUsageMarkdown(
+    const ensureLocalCommandMarkdown = (turn: Turn): Promise<string | null> | undefined => {
+      if (!turn.localCommand || !turn.localCommandAbort) return undefined;
+      turn.localCommandMarkdown ??= turn.localCommand.produce(
         session.query,
-        turn.usageMarkdownAbort.signal,
-        this.logger,
+        turn.localCommandAbort.signal,
       );
-      return turn.usageMarkdown;
+      return turn.localCommandMarkdown;
     };
 
     const resetTurnScratch = () => {
@@ -4044,7 +4065,7 @@ export class ClaudeAcpAgent {
       session.activeTurn = turn;
       session.cancelled = false;
       compaction.resume();
-      ensureUsageMarkdown(turn);
+      if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -4246,26 +4267,27 @@ export class ClaudeAcpAgent {
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
     /** Claim the structured replacement for the turn currently producing a
-     * local-command output. Undefined means this is not a structured usage
-     * turn (or its request failed), null means another SDK message shape
-     * already delivered it, and string is the one replacement to publish. */
-    const takeUsageMarkdown = async (
+     * local-command output. Undefined means this is not a structured
+     * local-command turn (or its request failed), null means another SDK
+     * message shape already delivered it, and string is the one replacement
+     * to publish. */
+    const takeLocalCommandMarkdown = async (
       originalOutput: string,
     ): Promise<string | null | undefined> => {
       const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
       if (!turn) return undefined;
-      const usageMarkdown = ensureUsageMarkdown(turn);
-      if (!usageMarkdown) return undefined;
-      const markdown = await usageMarkdown;
+      const pending = ensureLocalCommandMarkdown(turn);
+      if (!pending) return undefined;
+      const markdown = await pending;
       if (markdown === null) return undefined;
-      if (turn.usageMarkdownDelivered) {
+      if (turn.localCommandDelivered) {
         // Different SDK message shapes can mirror the same local-command
         // output. Suppress an exact mirror, but let a later, distinct frame
         // (for example an interruption diagnostic) follow the normal path.
-        return turn.usageOriginalOutput === originalOutput ? null : undefined;
+        return turn.localCommandOriginalOutput === originalOutput ? null : undefined;
       }
-      turn.usageMarkdownDelivered = true;
-      turn.usageOriginalOutput = originalOutput;
+      turn.localCommandDelivered = true;
+      turn.localCommandOriginalOutput = originalOutput;
       return markdown;
     };
 
@@ -4438,7 +4460,8 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
-      turn.usageMarkdownAbort?.abort();
+      turn.localCommandAbort?.abort();
+      if (turn.localCommandDelivered) turn.localCommand?.afterDelivery?.();
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -4944,15 +4967,15 @@ export class ClaudeAcpAgent {
                 if (compaction.consumeDuplicateErrorOutput(message.content)) {
                   break;
                 }
-                const usageTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
-                const usageMarkdown = await takeUsageMarkdown(message.content);
-                if (usageTurn?.isUsageCommand && session.cancelled) break;
-                if (usageMarkdown === null) break;
+                const commandTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                const commandMarkdown = await takeLocalCommandMarkdown(message.content);
+                if (commandTurn?.localCommand && session.cancelled) break;
+                if (commandMarkdown === null) break;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: usageMarkdown ?? message.content },
+                    content: { type: "text", text: commandMarkdown ?? message.content },
                   },
                 });
                 break;
@@ -6086,10 +6109,10 @@ export class ClaudeAcpAgent {
                         normalizeNoticeText(message.result),
                       ));
                   if (shouldForwardResult) {
-                    const usageMarkdown = await takeUsageMarkdown(message.result);
-                    if (usageMarkdown === null) break;
+                    const commandMarkdown = await takeLocalCommandMarkdown(message.result);
+                    if (commandMarkdown === null) break;
                     for (const notification of toAcpNotifications(
-                      usageMarkdown ?? message.result,
+                      commandMarkdown ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -6539,20 +6562,20 @@ export class ClaudeAcpAgent {
             // Depending on the Claude Code build, a local command can arrive
             // as the dedicated system message above or as a synthetic
             // assistant message. Replace only the output owned by the exact
-            // /usage turn; no content signatures or text parsing are involved.
+            // /usage or /mcp turn; no content signatures or text parsing are involved.
             if (
               message.type === "assistant" &&
               message.parent_tool_use_id === null &&
               message.message.model === "<synthetic>"
             ) {
-              const usageMarkdown = await takeUsageMarkdown(
+              const commandMarkdown = await takeLocalCommandMarkdown(
                 assistantMessageText(message.message) ?? "",
               );
               if (session.cancelled) break;
-              if (usageMarkdown !== undefined) {
-                if (usageMarkdown !== null) {
+              if (commandMarkdown !== undefined) {
+                if (commandMarkdown !== null) {
                   for (const notification of toAcpNotifications(
-                    usageMarkdown,
+                    commandMarkdown,
                     "assistant",
                     params.sessionId,
                     session.toolUseCache,
@@ -6933,13 +6956,12 @@ export class ClaudeAcpAgent {
     options: { awaitInterrupt: boolean },
   ): Promise<void> {
     this.exitPlan.cancel(params.sessionId);
-    this.mcpCommands.cancel(params.sessionId);
     const session = this.sessions[params.sessionId];
     if (!session) {
       return;
     }
     session.cancelled = true;
-    for (const turn of session.turnQueue ?? []) turn.usageMarkdownAbort?.abort();
+    for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
@@ -9568,12 +9590,9 @@ export class ClaudeAcpAgent {
     const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
     const update = previous.then(async () => {
       const sessions = Object.entries(this.sessions);
-      const activeTurns = [
-        ...sessions.flatMap(([, session]) =>
-          (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
-        ),
-        ...this.mcpCommands.inProgress(),
-      ];
+      const activeTurns = sessions.flatMap(([, session]) =>
+        (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      );
       if (activeTurns.length > 0) {
         this.logger.log(
           `Waiting for ${activeTurns.length} active Claude turn(s) before provider update`,
@@ -10204,7 +10223,8 @@ function getAvailableSlashCommands(
     "todos",
   ];
 
-  // The adapter answers `/mcp` itself, even when Claude Code tags it terminal-bound.
+  // Claude Code runs `/mcp` and the adapter replaces its terminal text, even
+  // when Claude Code tags the command terminal-bound.
   const advertised = commands
     .filter((command) => command.name !== "mcp" && !terminalCommands?.includes(command.name))
     .map((command) => {
