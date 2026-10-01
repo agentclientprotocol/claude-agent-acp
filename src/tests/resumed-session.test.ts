@@ -3,7 +3,11 @@ import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { readResumedModel, resumedModelFromTranscript } from "../resumed-session.js";
+import {
+  readResumedModel,
+  readResumedTail,
+  resumedModelFromTranscript,
+} from "../resumed-session.js";
 
 function assistant(
   model: unknown,
@@ -116,5 +120,40 @@ describe("readResumedModel", () => {
     await transcript("none", [userLine("hello"), record("<synthetic>")]);
 
     expect(await readResumedModel("none")).toBeUndefined();
+  });
+
+  const prompt = (text: string, extra: object = {}) => ({ ...userLine(text), ...extra });
+
+  it("reads the permission mode of the last main-thread user record", async () => {
+    await transcript("mode", [
+      prompt("first", { permissionMode: "plan" }),
+      record("claude-opus-5"),
+      prompt("second", { permissionMode: "bypassPermissions" }),
+      record("claude-opus-5"),
+      prompt("nested", { permissionMode: "default", isSidechain: true }),
+      { type: "mode", mode: "normal" },
+      userLine("tool result without a mode"),
+    ]);
+
+    expect(await readResumedTail("mode")).toEqual({
+      model: "claude-opus-5",
+      permissionMode: "bypassPermissions",
+    });
+  });
+
+  it("reads a permission mode that is before the last model", async () => {
+    await transcript("early-mode", [
+      prompt("first", { permissionMode: "acceptEdits" }),
+      ...Array.from({ length: 200 }, () => userLine("x".repeat(1000))),
+      record("claude-opus-5"),
+    ]);
+
+    expect((await readResumedTail("early-mode")).permissionMode).toBe("acceptEdits");
+  });
+
+  it("returns no permission mode when the transcript records none", async () => {
+    await transcript("no-mode", [userLine("hello"), record("claude-opus-5")]);
+
+    expect(await readResumedTail("no-mode")).toEqual({ model: "claude-opus-5" });
   });
 });

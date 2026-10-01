@@ -68,31 +68,54 @@ export async function readResumedSession(
   }
 }
 
+/** What a resume restores from the end of the local transcript. */
+export type ResumedTail = {
+  model?: string;
+  /** The permission mode of the last main-thread user record. */
+  permissionMode?: string;
+};
+
 /**
- * Read the resume model of a session from the end of its local transcript.
+ * Read the resume model and the permission mode of a session from the end
+ * of its local transcript.
  *
- * A resume needs only the model, not the messages. The transcript file is
- * read backwards until the last real assistant record of the main thread, so
- * the cost does not grow with the length of the session. A session without a
- * local transcript file falls back to {@link readResumedSession}.
+ * A resume needs only these two values, not the messages. The transcript file
+ * is read backwards until both are found, so the cost does not grow with the
+ * length of the session. A session without a local transcript file falls back
+ * to {@link readResumedSession} for the model.
+ *
+ * A caller that already has the model passes `withModel: false`. The read then
+ * looks for the permission mode only and has no fallback.
  */
-export async function readResumedModel(
+export async function readResumedTail(
   sessionId: string,
   logger?: ResumeLogger,
-): Promise<string | undefined> {
+  withModel = true,
+): Promise<ResumedTail> {
   const timing = new SessionTiming(logger, "models", sessionId);
   try {
     const filePath = await findTranscript(sessionId);
     if (filePath) {
-      const model = await lastAssistantModel(filePath);
-      timing.phase("read-transcript-tail", ` model=${model ?? "unknown"}`);
-      return model;
+      const tail = await lastTailRecords(filePath, withModel);
+      timing.phase(
+        "read-transcript-tail",
+        ` model=${tail.model ?? "unknown"} permissionMode=${tail.permissionMode ?? "unknown"}`,
+      );
+      return tail;
     }
   } catch (error) {
     timing.phase("read-transcript-tail", " outcome=error");
     logger?.error(`Failed to read the transcript tail of resumed session ${sessionId}:`, error);
   }
-  return (await readResumedSession(sessionId, logger)).model;
+  return withModel ? { model: (await readResumedSession(sessionId, logger)).model } : {};
+}
+
+/** The resume model of a session. See {@link readResumedTail}. */
+export async function readResumedModel(
+  sessionId: string,
+  logger?: ResumeLogger,
+): Promise<string | undefined> {
+  return (await readResumedTail(sessionId, logger)).model;
 }
 
 /** The local transcript of a session in any project directory, as the SDK looks it up. */
@@ -116,9 +139,16 @@ export async function findTranscript(sessionId: string): Promise<string | undefi
   return undefined;
 }
 
-/** The model of the last real assistant record of the main thread in a JSONL transcript. */
-async function lastAssistantModel(filePath: string): Promise<string | undefined> {
+/** The model of the last real assistant record and the permission mode of the
+ * last user record of the main thread in a JSONL transcript. */
+async function lastTailRecords(filePath: string, withModel: boolean): Promise<ResumedTail> {
   const handle = await open(filePath, "r");
+  const tail: ResumedTail = {};
+  const visit = (line: Buffer): boolean => {
+    if (withModel) tail.model ??= assistantModelOfLine(line);
+    tail.permissionMode ??= permissionModeOfLine(line);
+    return (!withModel || tail.model !== undefined) && tail.permissionMode !== undefined;
+  };
   try {
     let end = (await handle.stat()).size;
     // The bytes of the line whose start is not read yet, in file order.
@@ -128,23 +158,31 @@ async function lastAssistantModel(filePath: string): Promise<string | undefined>
       let chunk = Buffer.alloc(end - start);
       await handle.read(chunk, 0, chunk.length, start);
       for (let at = chunk.lastIndexOf(0x0a); at >= 0; at = chunk.lastIndexOf(0x0a)) {
-        const model = assistantModelOfLine(Buffer.concat([chunk.subarray(at + 1), ...pending]));
-        if (model) return model;
+        if (visit(Buffer.concat([chunk.subarray(at + 1), ...pending]))) return tail;
         pending = [];
         chunk = chunk.subarray(0, at);
       }
       pending.unshift(chunk);
       end = start;
     }
-    return assistantModelOfLine(Buffer.concat(pending));
+    visit(Buffer.concat(pending));
+    return tail;
   } finally {
     await handle.close();
   }
 }
 
-function assistantModelOfLine(line: Buffer): string | undefined {
-  // Most lines are not assistant records. The check skips their JSON parse.
-  if (line.indexOf('"assistant"') < 0) return undefined;
+type TranscriptRecord = {
+  type?: unknown;
+  isSidechain?: unknown;
+  message?: { model?: unknown };
+  permissionMode?: unknown;
+};
+
+/** The parsed main-thread record of one line, if the line has `marker`. */
+function mainThreadRecord(line: Buffer, marker: string): TranscriptRecord | undefined {
+  // Most lines do not have the marker. The check skips their JSON parse.
+  if (line.indexOf(marker) < 0) return undefined;
   let entry: unknown;
   try {
     entry = JSON.parse(line.toString("utf8"));
@@ -152,7 +190,19 @@ function assistantModelOfLine(line: Buffer): string | undefined {
     return undefined;
   }
   if (!entry || typeof entry !== "object") return undefined;
-  const record = entry as { type?: unknown; isSidechain?: unknown; message?: { model?: unknown } };
-  if (record.type !== "assistant" || record.isSidechain === true) return undefined;
+  const record = entry as TranscriptRecord;
+  return record.isSidechain === true ? undefined : record;
+}
+
+function assistantModelOfLine(line: Buffer): string | undefined {
+  const record = mainThreadRecord(line, '"assistant"');
+  if (record?.type !== "assistant") return undefined;
   return concreteModel(record.message?.model);
+}
+
+/** Claude Code records the permission mode of the turn on a user record. */
+function permissionModeOfLine(line: Buffer): string | undefined {
+  const record = mainThreadRecord(line, '"permissionMode"');
+  if (record?.type !== "user" || typeof record.permissionMode !== "string") return undefined;
+  return record.permissionMode.trim() || undefined;
 }

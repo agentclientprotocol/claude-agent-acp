@@ -399,6 +399,63 @@ describe("ClaudeAcpAgent settings", () => {
     expect(response.modes.currentModeId).toBe("default");
   });
 
+  describe("on resume", () => {
+    async function resume(records: unknown[], meta: object = {}) {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ permissions: { defaultMode: "plan" } }),
+      );
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      const sessionId = "resumed-mode-session";
+      const transcriptDir = path.join(tempDir, "projects", "-project");
+      await fs.promises.mkdir(transcriptDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(transcriptDir, `${sessionId}.jsonl`),
+        records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+      );
+
+      const { getCapturedOptions } = mockQuery();
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+      (agent as any).logger = { log: () => {}, error: () => {} };
+      const response = await (agent as any).createSession(
+        { cwd: projectDir, mcpServers: [], _meta: { disableBuiltInTools: true, ...meta } },
+        { resume: sessionId },
+      );
+      return { permissionMode: getCapturedOptions().permissionMode, response };
+    }
+
+    const user = (permissionMode?: string) => ({
+      type: "user",
+      message: { role: "user", content: "hello" },
+      ...(permissionMode ? { permissionMode } : {}),
+    });
+
+    it("continues in the last permission mode of the transcript", async () => {
+      const { permissionMode, response } = await resume([user("plan"), user("acceptEdits")]);
+
+      expect(permissionMode).toBe("acceptEdits");
+      expect(response.modes.currentModeId).toBe("acceptEdits");
+    });
+
+    it("uses permissions.defaultMode when the transcript has no mode", async () => {
+      const { permissionMode, response } = await resume([user()]);
+
+      expect(permissionMode).toBe("plan");
+      expect(response.modes.currentModeId).toBe("plan");
+    });
+
+    it("uses permissions.defaultMode when bypass is not available now", async () => {
+      const { permissionMode, response } = await resume([user("bypassPermissions")], {
+        claudeCode: { options: { allowDangerouslySkipPermissions: false } },
+      });
+
+      expect(permissionMode).toBe("plan");
+      expect(response.modes.currentModeId).toBe("plan");
+    });
+  });
+
   it("falls back to 'default' when permissions.defaultMode is invalid", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
