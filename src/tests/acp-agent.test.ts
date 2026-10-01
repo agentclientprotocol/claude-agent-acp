@@ -2481,6 +2481,71 @@ describe("synthetic login message (issue #863)", () => {
     expect(JSON.stringify(updates)).not.toContain("system-reminder");
   });
 
+  it("loadSession replay skips turns the harness injected, keeping what the user typed", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        origin: { kind: "human" },
+        message: { role: "user", content: "research bot detection" },
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        is_meta: true,
+        origin: { kind: "peer", from: "a1" },
+        message: {
+          role: "user",
+          content:
+            'Another Claude session sent a message:\n<agent-message from="a1">report</agent-message>',
+        },
+      },
+      {
+        type: "user",
+        uuid: "u3",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        isQueuedCommand: true,
+        origin: { kind: "task-notification" },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<task-notification>\n<task-id>a1</task-id>\n</task-notification>",
+            },
+          ],
+        },
+      },
+    ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    const userTexts = updates.flatMap((u) =>
+      u.update.sessionUpdate === "user_message_chunk" && u.update.content.type === "text"
+        ? [u.update.content.text]
+        : [],
+    );
+    expect(userTexts).toEqual(["research bot detection"]);
+  });
+
   it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
     const updates: SessionNotification[] = [];
     const client = {

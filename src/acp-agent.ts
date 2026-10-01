@@ -1194,6 +1194,27 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
   "observer-activity",
 ]);
 
+/** Whether a replayed message is a text-only turn the harness injected for an
+ *  autonomous cycle — a subagent hand-back (`peer`) or a task notification —
+ *  rather than one the user typed. The live prompt loop never forwards these,
+ *  so replay skips them too. Tool results stay: only text turns are injected. */
+function isInjectedUserTurn(message: SessionMessage): boolean {
+  if (message.type !== "user") return false;
+  const kind = (message as { origin?: { kind?: unknown } }).origin?.kind;
+  if (
+    typeof kind !== "string" ||
+    !AUTONOMOUS_RESULT_ORIGINS.has(kind as SDKMessageOrigin["kind"])
+  ) {
+    return false;
+  }
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  return (
+    typeof content === "string" ||
+    (Array.isArray(content) &&
+      content.every((block) => (block as { type?: unknown } | null)?.type === "text"))
+  );
+}
+
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
@@ -7355,6 +7376,7 @@ export class ClaudeAcpAgent {
       ) {
         content = stripSubagentTextAndThinking(content);
       }
+      if (isInjectedUserTurn(message)) return;
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         content = stripLocalCommandMetadata(content);
