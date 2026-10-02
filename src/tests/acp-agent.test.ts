@@ -9838,7 +9838,12 @@ describe("skill commands in available_commands_update", () => {
     await rm(cwd, { recursive: true, force: true });
   });
 
-  async function advertisedCommands(clientCapabilities: Record<string, unknown>) {
+  /** The commands of the last available_commands_update. With `change`, the
+   *  CLI sends a second commands_changed after `change` runs. */
+  async function advertisedCommands(
+    clientCapabilities: Record<string, unknown>,
+    change?: () => Promise<void>,
+  ) {
     const sessionUpdate = vi.fn(async () => {});
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
       log: () => {},
@@ -9856,7 +9861,7 @@ describe("skill commands in available_commands_update", () => {
         session_id: "test-session",
         isReplay: true,
       };
-      yield {
+      const commandsChanged = {
         type: "system",
         subtype: "commands_changed",
         session_id: "test-session",
@@ -9872,6 +9877,11 @@ describe("skill commands in available_commands_update", () => {
           { name: "review (MCP)", description: "An MCP prompt", argumentHint: "" },
         ],
       };
+      yield commandsChanged;
+      if (change) {
+        await change();
+        yield commandsChanged;
+      }
       yield {
         type: "result",
         subtype: "success",
@@ -9901,7 +9911,7 @@ describe("skill commands in available_commands_update", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
     const updates = sessionUpdate.mock.calls.map((c: any[]) => (c[0] as { update: any }).update);
-    const commandsUpdate = updates.find((u) => u.sessionUpdate === "available_commands_update");
+    const commandsUpdate = updates.findLast((u) => u.sessionUpdate === "available_commands_update");
     expect(commandsUpdate).toBeDefined();
     return commandsUpdate.availableCommands as Array<{ name: string; _meta?: unknown }>;
   }
@@ -9918,6 +9928,18 @@ describe("skill commands in available_commands_update", () => {
       ["mcp:review", undefined],
       ["mcp", undefined],
     ]);
+  });
+
+  it("resolves the SKILL.md paths again after a commands_changed", async () => {
+    const missingPath = path.join(cwd, ".claude", "skills", "missing", "SKILL.md");
+    const commands = await advertisedCommands(AIR_CLIENT_CAPABILITIES, async () => {
+      await mkdir(path.dirname(missingPath), { recursive: true });
+      await writeFile(missingPath, "# missing\n");
+    });
+
+    expect(commands.find((c) => c.name === "missing")?._meta).toEqual({
+      jetbrains: { air: { version: 1, kind: "skill", skillPath: missingPath } },
+    });
   });
 
   it("gives a client that is not AIR no _meta", async () => {

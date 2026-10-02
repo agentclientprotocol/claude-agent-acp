@@ -886,6 +886,10 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
+   *  the command name. A `commands_changed` clears it, because the skill
+   *  files can have changed then. */
+  skillPaths?: Map<string, string | undefined>;
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -5233,6 +5237,7 @@ export class ClaudeAcpAgent {
                 // list with this payload. Forward message.commands directly —
                 // it's authoritative, and re-querying supportedCommands()
                 // would just return the same list with an extra round-trip.
+                session.skillPaths = new Map();
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -5241,6 +5246,7 @@ export class ClaudeAcpAgent {
                       message.commands,
                       session.terminalSlashCommands,
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
+                      session.skillPaths,
                     ),
                   },
                 });
@@ -8503,6 +8509,7 @@ export class ClaudeAcpAgent {
           commands,
           session.terminalSlashCommands,
           this.toolCallCapabilities.air.client ? session.cwd : undefined,
+          (session.skillPaths ??= new Map()),
         ),
       },
     });
@@ -10326,7 +10333,17 @@ function getAvailableSlashCommands(
   // The session cwd of an AIR client, or undefined for every other client.
   // AIR gets the kind and the SKILL.md path of each skill command.
   airSkillCwd?: string,
+  // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
+  skillPaths?: Map<string, string | undefined>,
 ): AvailableCommand[] {
+  const skillPath = (name: string, cwd: string): string | undefined => {
+    const key = `${cwd}\0${name}`;
+    if (skillPaths?.has(key)) return skillPaths.get(key);
+    const resolved = resolveSkillPath(name, cwd);
+    skillPaths?.set(key, resolved);
+    return resolved;
+  };
+
   const UNSUPPORTED_COMMANDS = [
     "clear",
     "cost",
@@ -10355,20 +10372,20 @@ function getAvailableSlashCommands(
       if (mcpPrompt) {
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
-      const skillPath =
+      const skillMdPath =
         airSkillCwd && !command.builtin && !mcpPrompt
-          ? resolveSkillPath(command.name, airSkillCwd)
+          ? skillPath(command.name, airSkillCwd)
           : undefined;
       return {
         name,
         description: command.description || "",
         input,
-        ...(skillPath
+        ...(skillMdPath
           ? {
               _meta: withAirMeta(
                 withAirMeta(undefined, AIR_KIND_KEY, "skill"),
                 AIR_SKILL_PATH_KEY,
-                skillPath,
+                skillMdPath,
               ),
             }
           : {}),
