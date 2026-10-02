@@ -4,6 +4,8 @@
  * `ClaudeAcpAgent` speaks ACP v1 types. This surface translates each v2
  * request into the v1 request that the agent serves, and each v1 message that
  * the agent sends into its v2 form, so v1 and v2 share one implementation.
+ * Where the versions differ, it maps the agent's own types instead: a prompt
+ * is served through the agent's turn events (see `prompt.ts`).
  */
 import type {
   CompleteElicitationNotification,
@@ -14,6 +16,7 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
+import { v2Prompt } from "./prompt.js";
 import {
   v1NewSessionRequest,
   v1ResumeSessionRequest,
@@ -36,10 +39,12 @@ export function v2AgentApp(
   onAgent: (agent: ClaudeAcpAgent) => void,
 ): v2.AgentApp {
   let agent!: ClaudeAcpAgent;
+  let client!: V2ClientConnection;
   return v2
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
-      agent = new ClaudeAcpAgent(new V2ClientConnection(connection.client), logger);
+      client = new V2ClientConnection(connection.client, logger ?? console);
+      agent = new ClaudeAcpAgent(client, logger);
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
@@ -61,18 +66,37 @@ export function v2AgentApp(
         v1SetSessionConfigOptionRequest(params),
       );
       return { ...response, configOptions: v2ConfigOptions(configOptions) };
-    });
+    })
+    .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
+      v2Prompt(agent, params, (update) => {
+        void client.send({ sessionId: params.sessionId, update });
+      }),
+    )
+    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
 }
 
 /**
  * The {@link AcpClient} of an ACP v2 connection: it sends the v1 messages of
  * the agent as v2 messages.
  *
- * The v2 surface does not serve prompts yet, so permission requests, which
- * only a prompt turn makes, still reject.
+ * Permission requests still reject until the v2 surface translates them.
  */
 class V2ClientConnection implements AcpClient {
-  constructor(private readonly ctx: v2.AgentContext) {}
+  constructor(
+    private readonly ctx: v2.AgentContext,
+    private readonly logger: Logger,
+  ) {}
+
+  /**
+   * Sends a v2 session update, and logs rather than rejects when that fails.
+   * Updates go out in the order of the calls, whether they come from the
+   * agent or from the v2 surface itself.
+   */
+  send(notification: v2.UpdateSessionNotification): Promise<void> {
+    return this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
+      this.logger.error(`Failed to send a ${notification.update.sessionUpdate} update:`, error);
+    });
+  }
 
   extNotification(method: string, params: Record<string, unknown>): Promise<void> {
     if (!isExtensionMethod(method)) {

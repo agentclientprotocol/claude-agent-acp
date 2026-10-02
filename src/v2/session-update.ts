@@ -25,6 +25,16 @@ export function v2SessionUpdate(
     case "usage_update":
     case "notice":
       return update;
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "user_message_chunk": {
+      // v2 requires the id of the message a chunk belongs to; v1 allows none.
+      const { messageId, ...chunk } = update;
+      if (!messageId) {
+        throw new Error(`An ACP v2 ${update.sessionUpdate} needs a messageId`);
+      }
+      return { ...chunk, messageId };
+    }
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

@@ -4,13 +4,14 @@
  * response, session update, and elicitation it receives against the v2
  * schema, so a malformed v2 message fails the test.
  */
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
-import type { Options } from "@anthropic-ai/claude-agent-sdk";
+import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { acpProtocolRouter } from "../serve.js";
@@ -29,6 +30,11 @@ vi.mock("node:child_process", async () => {
 /** What the mocked Claude Agent SDK saw and answers. Reset before each test. */
 const sdk = vi.hoisted(() => ({
   queryOptions: [] as Options[],
+  /** What Claude Code sends, given the prompts it receives (see `scriptTurns`). */
+  run: async function* (
+    _prompts: AsyncIterable<SDKUserMessage>,
+    _options: Options,
+  ): AsyncGenerator<Record<string, unknown>> {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
   mcpAuthenticate: async (
     _serverName: string,
@@ -46,9 +52,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
   const { makeMockQuery } = await import("./helpers.js");
   return {
     ...actual,
-    query: ({ options }: { options: Options }) => {
+    query: ({ prompt, options }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) => {
       sdk.queryOptions.push(options);
-      return makeMockQuery({
+      // The agent reads the query with `next()`, so it is the generator itself.
+      const messages = sdk.run(prompt, options);
+      const controls = makeMockQuery({
+        [Symbol.asyncIterator]: () => messages,
         initializationResult: async () => ({
           models: [
             {
@@ -65,6 +74,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
       });
+      return Object.assign(messages, controls);
     },
     listSessions: vi.fn(async () => [
       {
@@ -246,21 +256,6 @@ describe("ACP protocol routing", () => {
       expect((method as v2.AuthMethodTerminal).args?.[0]).toBe("--cli");
     }
   });
-
-  it("rejects v2 prompts, which the v2 surface does not serve yet", async () => {
-    const { app, authUpdate } = v2Client();
-    await app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      await expect(
-        agent.request(v2.methods.agent.session.prompt, {
-          sessionId,
-          prompt: [{ type: "text", text: "hello" }],
-        }),
-      ).rejects.toMatchObject({ code: -32601 });
-      await authUpdate(1);
-    });
-  });
 });
 
 describe("ACP v2 sessions", () => {
@@ -417,6 +412,310 @@ describe("ACP v2 sessions", () => {
   });
 });
 
+/** Claude Code's side of one prompt, after it echoed the prompt. */
+type TurnScript = (options: Options) => AsyncGenerator<Record<string, unknown>>;
+
+/**
+ * Claude Code takes in each prompt it receives in order, echoes it, and runs
+ * the next of `turns` for it. Returns the uuids of the echoed prompts.
+ */
+function scriptTurns(...turns: TurnScript[]): string[] {
+  const echoed: string[] = [];
+  sdk.run = async function* (prompts, options) {
+    const input = prompts[Symbol.asyncIterator]();
+    for (const turn of turns) {
+      const { value, done } = await input.next();
+      if (done) return;
+      echoed.push(value.uuid!);
+      yield {
+        type: "user",
+        message: value.message,
+        parent_tool_use_id: null,
+        uuid: value.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      yield* turn(options);
+    }
+    await input.next();
+  };
+  return echoed;
+}
+
+function assistantText(options: Options, text: string) {
+  return {
+    type: "assistant",
+    message: {
+      id: "msg_answer",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{ type: "text", text }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 3, output_tokens: 2 },
+    },
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+function result(options: Options, overrides: Record<string, unknown> = {}) {
+  return {
+    type: "result",
+    subtype: "success",
+    stop_reason: "end_turn",
+    is_error: false,
+    result: "",
+    errors: [],
+    duration_ms: 0,
+    duration_api_ms: 0,
+    num_turns: 1,
+    total_cost_usd: 0,
+    usage: {
+      input_tokens: 3,
+      output_tokens: 2,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    },
+    modelUsage: {},
+    permission_denials: [],
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...overrides,
+  };
+}
+
+/** The turn of a session as the client saw it: messages, states, and notices. */
+function turnTrace(updates: v2.UpdateSessionNotification[]): string[] {
+  return updates.flatMap(({ update }) => {
+    if (update.sessionUpdate === "state_update") {
+      const { state, stopReason } = update as { state: string; stopReason?: string };
+      return [stopReason ? `${state} ${stopReason}` : state];
+    }
+    return ["user_message", "agent_message_chunk", "notice"].includes(update.sessionUpdate)
+      ? [update.sessionUpdate]
+      : [];
+  });
+}
+
+const text = (value: string) => [{ type: "text" as const, text: value }];
+
+describe("ACP v2 prompts", () => {
+  it("answers a prompt once Claude Code takes it in, then reports the turn as state", async () => {
+    const answer = Promise.withResolvers<void>();
+    const echoed = scriptTurns(async function* (options) {
+      await answer.promise;
+      yield assistantText(options, "Hello!");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const response = await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+
+      // Answered while the turn still runs.
+      expect(response).toEqual({ messageId: echoed[0] });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running"]),
+      );
+      answer.resolve();
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+        ]),
+      );
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("user_message")).toEqual([
+      { sessionUpdate: "user_message", messageId: echoed[0], content: text("hi") },
+    ]);
+    expect(client.updates("agent_message_chunk")).toEqual([
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg_answer",
+        content: { type: "text", text: "Hello!" },
+      },
+    ]);
+    expect(client.updates("state_update").at(-1)).toMatchObject({
+      state: "idle",
+      stopReason: "end_turn",
+      usage: { inputTokens: 3, outputTokens: 2 },
+    });
+  });
+
+  it("reports waiting on a question as requires_action", async () => {
+    scriptTurns(async function* (options) {
+      await options.onElicitation!(
+        {
+          serverName: "linear",
+          message: "Which team?",
+          mode: "form",
+          requestedSchema: { type: "object", properties: { team: { type: "string" } } },
+        },
+        { signal: new AbortController().signal } as Parameters<
+          NonNullable<Options["onElicitation"]>
+        >[1],
+      );
+      yield assistantText(options, "Thanks.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "requires_action",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("cancels the running turn, and a queued prompt with -32800", async () => {
+    const release = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Working on it");
+      await release.promise;
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      agents[0].forceCancelGraceMs = 10;
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+      );
+      const queued = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("second"),
+      });
+      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+      await expect(queued).rejects.toMatchObject({ code: -32800 });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+      release.resolve();
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
+
+  it("reports a turn that fails after it was taken in as an error notice, then idle", async () => {
+    scriptTurns(async function* (options) {
+      yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "notice",
+      "idle end_turn",
+    ]);
+    expect(client.updates("notice")[0]).toMatchObject({
+      severity: "error",
+      title: expect.stringContaining("API Error: 529 Overloaded"),
+    });
+  });
+
+  it("gives a messageId to the chunks that the agent builds from a command's output and a result", async () => {
+    const outputId = randomUUID();
+    const resultId = randomUUID();
+    scriptTurns(
+      async function* (options) {
+        yield {
+          type: "system",
+          subtype: "local_command_output",
+          content: "Total cost: $0.00",
+          uuid: outputId,
+          session_id: options.sessionId,
+        };
+        yield result(options);
+      },
+      async function* (options) {
+        // A result that answers without a streamed answer is forwarded (issue #453).
+        yield result(options, {
+          result: "Done.",
+          uuid: resultId,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        });
+      },
+    );
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      for (const prompt of ["/cost", "again"]) {
+        const idles = turnTrace(client.sessionUpdates).filter((s) => s.startsWith("idle")).length;
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text(prompt) });
+        await vi.waitFor(() =>
+          expect(turnTrace(client.sessionUpdates).filter((s) => s.startsWith("idle"))).toHaveLength(
+            idles + 1,
+          ),
+        );
+      }
+      await client.authUpdate(1);
+    });
+
+    expect(
+      client.updates("agent_message_chunk").map(({ messageId, content }) => [messageId, content]),
+    ).toEqual([
+      [outputId, { type: "text", text: "Total cost: $0.00" }],
+      [resultId, { type: "text", text: "Done." }],
+    ]);
+  });
+
+  it("rejects a prompt with a content block that v1 cannot express", async () => {
+    const echoed = scriptTurns();
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await expect(
+        agent.request(v2.methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: "_acme/widget", spec: 1 }],
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+      await authUpdate(1);
+    });
+    expect(echoed).toEqual([]);
+  });
+});
+
 describe("ACP v2 session translation", () => {
   it("renames the group id of grouped select options", () => {
     expect(
@@ -455,6 +754,12 @@ describe("ACP v2 session translation", () => {
     expect(() =>
       v2SessionUpdate({ sessionUpdate: "tool_call", toolCallId: "t", title: "Read" }),
     ).toThrow("does not translate tool_call session updates yet");
+  });
+
+  it("fails on a message chunk without a messageId, which v2 requires", () => {
+    expect(() =>
+      v2SessionUpdate({ sessionUpdate: "agent_message_chunk", content: text("hi")[0] }),
+    ).toThrow("An ACP v2 agent_message_chunk needs a messageId");
   });
 });
 

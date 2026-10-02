@@ -4909,6 +4909,7 @@ export class ClaudeAcpAgent {
                   update: {
                     sessionUpdate: "agent_message_chunk",
                     content: { type: "text", text: usageMarkdown ?? message.content },
+                    messageId: messageIdForGrouping(message),
                   },
                 });
                 break;
@@ -5948,6 +5949,7 @@ export class ClaudeAcpAgent {
                     update: {
                       sessionUpdate: "agent_message_chunk",
                       content: { type: "text", text: lastRefusalExplanation },
+                      messageId: messageIdForGrouping(message),
                     },
                   });
                 }
@@ -6050,6 +6052,7 @@ export class ClaudeAcpAgent {
                       session.toolUseCache,
                       routedNotificationClient,
                       this.logger,
+                      { messageId: messageIdForGrouping(message) },
                     )) {
                       await sendUpdate(notification);
                     }
