@@ -13,7 +13,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
-let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let contextUsageResult:
+  | ((options?: {
+      detail?: "full" | "summary";
+    }) => Promise<{ rawMaxTokens: number; model?: string }>)
+  | undefined;
 let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
@@ -47,8 +51,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           return initializationResponse();
         },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
-        getContextUsage: () =>
-          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        getContextUsage: (options?: { detail?: "full" | "summary" }) =>
+          contextUsageResult ? contextUsageResult(options) : Promise.resolve(DEFAULT_CONTEXT_USAGE),
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
@@ -913,6 +917,24 @@ describe("createSession options merging", () => {
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(false);
     });
 
+    it("uses summary context usage to avoid token-count work before the first request", async () => {
+      const ctxSpy = vi.fn(async (options?: { detail?: "full" | "summary" }) => {
+        // Full detail asks the CLI for per-category token counts. The window alone
+        // is available in summary mode without those serialized API requests.
+        if (options?.detail !== "summary") throw new Error("Unexpected full token count");
+        return { rawMaxTokens: 1_000_000 };
+      });
+      contextUsageResult = ctxSpy;
+
+      const response = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(ctxSpy).toHaveBeenCalledWith({ detail: "summary" }));
+      await vi.waitFor(() =>
+        expect(sessionFor(response.sessionId).contextWindowSize).toBe(1_000_000),
+      );
+      expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+    });
+
     it("refines a guessed window from getContextUsage in the background", async () => {
       // The mock model ("claude-sonnet-4-6" / "Claude Sonnet" / "Fast") carries
       // no "1m" token anywhere, so inference misses and the seed is the default
@@ -980,6 +1002,7 @@ describe("createSession options merging", () => {
         "haiku",
       );
       // Kicked off in the background, never awaited: it never answers here.
+      expect(ctxSpy).toHaveBeenCalledWith({ detail: "summary" });
       expect(sessionFor("resumed-model-probe").contextWindowAuthoritative).toBe(false);
       expect(getSessionMessages).toHaveBeenCalledTimes(1);
       expect(getSessionMessages).toHaveBeenCalledWith("resumed-model-probe");
