@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AcpSessionNotification, SubagentWorkState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 import { unreachable } from "./utils.js";
@@ -47,6 +48,7 @@ export type NativeSubagent = {
    * `subagent_spawned`. It is absent when the adapter has no prompt.
    */
   prompt?: string;
+  promptMessageId?: string;
   announced?: boolean;
   terminalState?: SubagentState;
   /** Connection-local single-flight state; never serialized on the wire. */
@@ -105,7 +107,6 @@ export class NativeSubagentRuntime {
    */
   private readonly childByToolCall = new Map<string, NativeSubagent>();
   private readonly taskFinishPromises = new Map<string, Promise<void>>();
-  private readonly generationByTaskId = new Map<string, number>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
 
@@ -221,7 +222,7 @@ export class NativeSubagentRuntime {
     // control state is already cleaned up.
     const knownParentSessionId =
       (task.toolUseId ? this.parentByToolUse.get(task.toolUseId) : undefined) ??
-      (previous && this.resumedParentSessionId(previous));
+      previous?.parentSessionId;
     const identity = task.toolUseId ? this.identityByToolUse.get(task.toolUseId) : undefined;
     // A nested child must wait for the spawning Agent/Task frame to establish
     // its immediate parent. Root children without a tool id can be announced.
@@ -266,7 +267,7 @@ export class NativeSubagentRuntime {
       taskId,
       previous,
       {
-        parentSessionId: this.resumedParentSessionId(previous),
+        parentSessionId: previous.parentSessionId,
         parentToolUseId: previous.parentToolUseId,
         name: previous.name,
         task: previous.task,
@@ -402,7 +403,6 @@ export class NativeSubagentRuntime {
     this.controlByToolUse.clear();
     this.childByParentToolUse.clear();
     this.taskFinishPromises.clear();
-    this.generationByTaskId.clear();
     this.pending.clear();
     this.pendingCount = 0;
   }
@@ -439,21 +439,6 @@ export class NativeSubagentRuntime {
     this.parentByToolUse.delete(toolUseId);
   }
 
-  /** The parent of a resumed generation: the old parent while it is live, else the root. */
-  private resumedParentSessionId(previous: NativeSubagent): string {
-    return this.isLiveSession(previous.parentSessionId)
-      ? previous.parentSessionId
-      : this.rootSessionId;
-  }
-
-  private isLiveSession(sessionId: string): boolean {
-    if (sessionId === this.rootSessionId) return true;
-    for (const child of this.children.values()) {
-      if (child.sessionId === sessionId) return child.terminalState === undefined;
-    }
-    return false;
-  }
-
   /**
    * Registers a new child session for the task and makes it the owner of its
    * parent tool call. With `announce`, it publishes `subagent_spawned` and
@@ -470,8 +455,10 @@ export class NativeSubagentRuntime {
     deliver: Publish,
   ): Promise<void> {
     const child: NativeSubagent = {
-      sessionId: this.nextChildSessionId(taskId, previous),
+      sessionId: previous?.sessionId ?? taskId,
       ...fields,
+      parentSessionId: previous?.parentSessionId ?? fields.parentSessionId,
+      promptMessageId: previous ? `prompt:${randomUUID()}` : "prompt",
     };
     const toolUseId = child.parentToolUseId;
     this.children.set(taskId, child);
@@ -483,16 +470,6 @@ export class NativeSubagentRuntime {
     if (!announce) return;
     await announceNativeSubagent(child, this.publish);
     for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
-  }
-
-  private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
-    if (!previous) {
-      this.generationByTaskId.set(taskId, 1);
-      return taskId;
-    }
-    const generation = (this.generationByTaskId.get(taskId) ?? 1) + 1;
-    this.generationByTaskId.set(taskId, generation);
-    return `${taskId}:generation:${generation}`;
   }
 }
 
@@ -514,6 +491,7 @@ export async function announceNativeSubagent(
         title: child.name,
         description: child.task,
         capabilities: {},
+        state: { state: "running" },
       },
     });
     if (child.prompt !== undefined) {
@@ -525,7 +503,7 @@ export async function announceNativeSubagent(
         sessionId: child.sessionId,
         update: {
           sessionUpdate: "session_message",
-          messageId: "prompt",
+          messageId: child.promptMessageId ?? "prompt",
           senderSessionId: child.parentSessionId,
           recipientSessionId: child.sessionId,
           content: [{ type: "text", text: child.prompt }],
