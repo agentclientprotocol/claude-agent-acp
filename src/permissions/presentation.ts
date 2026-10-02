@@ -3,13 +3,26 @@ import { AIR_PERMISSION_KEY, withAirMeta } from "../air-extension.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 
+/**
+ * A permission request as the agent builds it. For a v2 client it also
+ * carries the heading and the explanation of the prompt, which ACP v2 sends as
+ * the request's `title` and `description`. v1 has no field for them; AIR gets
+ * them in `_meta`.
+ */
+export type AcpPermissionRequest = RequestPermissionRequest & {
+  /** The heading of the prompt. It is not the title of the tool call. */
+  title?: string;
+  /** Why the permission is asked. */
+  description?: string;
+};
+
 export interface ClaudePermissionPresentationInput {
   toolName: string;
   input: Record<string, unknown>;
   toolUseID: string;
   cwd?: string;
   capabilities?: ClientCapabilities;
-  /** The exact patch of the change to approve, for a negotiated `diffPatch` client. */
+  /** The exact patch of the change to approve, for a negotiated `diffPatch` client or a v2 client. */
   previewContent?: ToolCallContent[];
   blockedPath?: string;
   title?: string;
@@ -50,10 +63,13 @@ function compactText(value: unknown): string | undefined {
  * adapter emits the `tool_call` before the request, so the client already
  * holds the rest. The request adds only what it shows new: the exact preview
  * patch, and the blocked path when the tool call has no such location.
+ *
+ * The heading and the explanation of the prompt go to AIR in `_meta`, and to a
+ * v2 client as `title` and `description`.
  */
 export function buildClaudePermissionPresentation(
   value: ClaudePermissionPresentationInput,
-): Pick<RequestPermissionRequest, "toolCall" | "_meta"> {
+): Pick<AcpPermissionRequest, "toolCall" | "_meta" | "title" | "description"> {
   const capabilities = value.capabilities ?? new ClientCapabilities();
   const renderer = new AcpToolCallRenderer(capabilities);
   const toolUse = { id: value.toolUseID, name: value.toolName, input: value.input };
@@ -116,5 +132,6 @@ export function buildClaudePermissionPresentation(
           }),
         }
       : {}),
+    ...(capabilities.v2 ? { title, ...(description ? { description } : {}) } : {}),
   };
 }

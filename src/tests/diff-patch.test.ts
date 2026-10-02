@@ -556,6 +556,29 @@ describe("ACP v2 diffs", () => {
     });
   });
 
+  it("previews a change in v2 form", async () => {
+    const filePath = await temporaryFile("a\n");
+    expect(
+      await previewPatchContent("Write", { file_path: filePath, content: "b\n" }, undefined, "v2"),
+    ).toEqual([
+      v2Diff(
+        filePath,
+        "modify",
+        `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n@@ -1 +1 @@\n-a\n+b\n`,
+      ),
+    ]);
+    // A text that cannot have an exact patch: the change alone, where v1 gets
+    // the standard diff.
+    expect(
+      await previewPatchContent(
+        "Write",
+        { file_path: filePath, content: "b\r\n" },
+        undefined,
+        "v2",
+      ),
+    ).toEqual([v2Diff(filePath, "modify")]);
+  });
+
   it("sends no diff where the operation is unknown or nothing changed", async () => {
     const filePath = await temporaryFile("x\n");
     // An Edit with an empty old_string created the file or filled an empty one.

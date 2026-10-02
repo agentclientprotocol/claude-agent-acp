@@ -312,12 +312,7 @@ export async function runScenario(
     },
     async requestPermission(request: RequestPermissionRequest) {
       record("requestPermission", request);
-      const wanted = scenario.permission ?? "allow_once";
-      const option =
-        request.options.find((o) => o.kind === wanted) ??
-        request.options.find((o) => o.kind.startsWith(wanted.split("_")[0])) ??
-        request.options[0];
-      return { outcome: { outcome: "selected", optionId: option.optionId } };
+      return permissionAnswer(scenario, request.options);
     },
     async createElicitation(request: CreateElicitationRequest) {
       record("createElicitation", request);
@@ -399,6 +394,22 @@ function elicitationAnswer(request: unknown): {
     if (Array.isArray(values) && values.length > 0) content[key] = values[0];
   }
   return { action: "accept", content };
+}
+
+/**
+ * The answer of a client to a permission request: the option of the kind that
+ * the scenario selects, or of its allow or reject group, or the first option.
+ */
+function permissionAnswer(
+  scenario: Scenario,
+  options: readonly { optionId: string; kind: string }[],
+) {
+  const wanted = scenario.permission ?? "allow_once";
+  const option =
+    options.find((o) => o.kind === wanted) ??
+    options.find((o) => o.kind.startsWith(wanted.split("_")[0])) ??
+    options[0];
+  return { outcome: { outcome: "selected" as const, optionId: option.optionId } };
 }
 
 /** One JSON-RPC message that the agent sent to a v2 client. */
@@ -491,6 +502,9 @@ export async function runScenarioV2(
       }
       if (update.sessionUpdate === "notice" && update.title) notices.push(update.title);
     })
+    .onRequest(v2.methods.client.session.requestPermission, ({ params }) =>
+      permissionAnswer(scenario, params.options),
+    )
     .onRequest(v2.methods.client.elicitation.create, ({ params }) => elicitationAnswer(params))
     .onNotification(v2.methods.client.elicitation.complete, () => {})
     .onNotification(

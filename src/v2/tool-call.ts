@@ -1,6 +1,6 @@
 /**
  * The v2 form of the tool call reports that `ClaudeAcpAgent` sends as v1
- * `tool_call` and `tool_call_update` updates.
+ * `tool_call` and `tool_call_update` updates, and in permission requests.
  */
 import type { ToolCall, ToolCallContent, ToolCallUpdate } from "@agentclientprotocol/sdk";
 import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
@@ -27,15 +27,22 @@ type V2ToolCallUpdate = v2.ToolCallUpdate & { sessionUpdate: "tool_call_update" 
  * `docs/acp-v2.md`).
  */
 export function v2ToolCallUpdate(report: V1ToolCallReport): V2ToolCallUpdate {
+  return { ...v2ToolCallPatch(report), sessionUpdate: "tool_call_update" };
+}
+
+/**
+ * The v2 form of the fields of a v1 tool call report, which a session update
+ * and the subject of a permission request carry. See {@link v2ToolCallUpdate}.
+ */
+export function v2ToolCallPatch(toolCall: ToolCall | ToolCallUpdate): v2.ToolCallUpdate {
   const patch = Object.fromEntries(
-    Object.entries(report).filter(
+    Object.entries(toolCall).filter(
       ([key, value]) => value !== null && key !== "sessionUpdate" && key !== "content",
     ),
-  ) as Omit<V2ToolCallUpdate, "sessionUpdate" | "content">;
+  ) as Omit<v2.ToolCallUpdate, "content">;
   return {
     ...patch,
-    sessionUpdate: "tool_call_update",
-    ...(report.content != null ? { content: report.content.map(v2ToolCallContent) } : {}),
+    ...(toolCall.content != null ? { content: toolCall.content.map(v2ToolCallContent) } : {}),
   };
 }
 

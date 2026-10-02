@@ -11,11 +11,14 @@ import type {
   CompleteElicitationNotification,
   CreateElicitationRequest,
   CreateElicitationResponse,
+  RequestPermissionResponse,
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
+import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
+import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Prompt } from "./prompt.js";
 import {
   v1NewSessionRequest,
@@ -78,8 +81,6 @@ export function v2AgentApp(
 /**
  * The {@link AcpClient} of an ACP v2 connection: it sends the v1 messages of
  * the agent as v2 messages.
- *
- * Permission requests still reject until the v2 surface translates them.
  */
 class V2ClientConnection implements AcpClient {
   constructor(
@@ -119,10 +120,16 @@ class V2ClientConnection implements AcpClient {
     }
   }
 
-  requestPermission(): Promise<never> {
-    return Promise.reject(
-      new Error("The ACP v2 surface does not serve session/request_permission yet"),
+  async requestPermission(
+    params: AcpPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<RequestPermissionResponse> {
+    const response = await this.ctx.request(
+      v2.methods.client.session.requestPermission,
+      v2PermissionRequest(params),
+      { cancellationSignal: signal },
     );
+    return v1PermissionResponse(response);
   }
 
   // Elicitation is the same in v1 and v2.

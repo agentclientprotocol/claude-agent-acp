@@ -108,8 +108,8 @@ type V2DiffContent = v2.Diff & { type: "diff" };
  * normalizes quotes or fails.
  *
  * A Write always gets content that shows the change: the patch, the standard
- * diff of a text that cannot have an exact patch, or a notice that the Write
- * overwrites a file that the adapter cannot show.
+ * diff (in v2, the change alone) of a text that cannot have an exact patch, or
+ * a notice that the Write overwrites a file that the adapter cannot show.
  *
  * The preview uses the tool input as it is. Claude can still remove the
  * trailing whitespace of a line before it writes. The PostToolUse hook then
@@ -119,6 +119,7 @@ export async function previewPatchContent(
   toolName: string,
   input: Record<string, unknown>,
   cwd?: string,
+  form: PatchForm = "air",
 ): Promise<ToolCallContent[] | undefined> {
   if (toolName === "Edit") {
     const edit = input as EditPreviewInput;
@@ -142,7 +143,7 @@ export async function previewPatchContent(
       if (oldText !== null && (oldText.trim() !== "" || oldText.includes("\uFEFF"))) {
         return undefined;
       }
-      return airPatch(filePath, oldText, newString);
+      return exactPatch(filePath, oldText, newString, form);
     }
     if (oldText === null) return undefined;
     const occurrences = oldText.split(oldString).length - 1;
@@ -151,7 +152,7 @@ export async function previewPatchContent(
       return undefined;
     }
     const newText = replacedText(oldText, oldString, newString, edit.replace_all === true);
-    return airPatch(filePath, oldText, newText);
+    return exactPatch(filePath, oldText, newText, form);
   }
 
   if (toolName === "Write") {
@@ -177,11 +178,13 @@ export async function previewPatchContent(
     }
     if (oldText === content) return undefined;
     const standard: ToolCallContent[] = [
-      { type: "diff", path: write.file_path, oldText, newText: content },
+      form === "v2"
+        ? v2DiffContent(filePath, oldText === null ? "create" : "update")
+        : { type: "diff", path: write.file_path, oldText, newText: content },
     ];
     if (!isPatchableText(content)) return standard;
     // A dense change can exceed the diff budget. The approval then shows the standard diff.
-    return airPatch(filePath, oldText, content) ?? standard;
+    return exactPatch(filePath, oldText, content, form) ?? standard;
   }
 
   return undefined;
@@ -276,11 +279,7 @@ export async function patchUpdateFromDiffToolResponse(
   const patch = filePatch(oldText, newText);
   if (!patch) return undefined;
   return {
-    content: [
-      form === "v2"
-        ? v2DiffContent(response.filePath, patch.change, patch.hunks)
-        : airPatchContent(response.filePath, patch),
-    ],
+    content: [patchContent(response.filePath, patch, form)],
     // A created file keeps the location of its Write tool call.
     locations:
       oldText === null
@@ -633,14 +632,22 @@ function isPatchableText(text: string): boolean {
   );
 }
 
-/** The AIR patch content of a change, or undefined when it has no patch. */
-function airPatch(
+/** The exact patch content of a change, or undefined when it has no patch. */
+function exactPatch(
   filePath: string,
   oldText: string | null,
   newText: string,
+  form: PatchForm,
 ): ToolCallContent[] | undefined {
   const patch = filePatch(oldText, newText);
-  return patch && [airPatchContent(filePath, patch)];
+  return patch && [patchContent(filePath, patch, form)];
+}
+
+/** The content that carries a patch, in the given form. */
+function patchContent(filePath: string, patch: FilePatch, form: PatchForm): ToolCallContent {
+  return form === "v2"
+    ? v2DiffContent(filePath, patch.change, patch.hunks)
+    : airPatchContent(filePath, patch);
 }
 
 /**

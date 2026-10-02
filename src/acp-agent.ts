@@ -179,7 +179,10 @@ import { SessionTiming } from "./session-timing.js";
 import { ALLOW_BYPASS } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
-import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
+import {
+  type AcpPermissionRequest,
+  buildClaudePermissionPresentation,
+} from "./permissions/presentation.js";
 import { decodeClaudePermissionResponse } from "./permissions/response.js";
 import { SettingsManager } from "./settings.js";
 import {
@@ -2114,7 +2117,7 @@ export interface AcpClient {
    *  permission request so the client can dismiss its prompt (and settle our
    *  await) instead of leaving the dialog open after the turn was cancelled. */
   requestPermission(
-    params: RequestPermissionRequest,
+    params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse>;
   readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse>;
@@ -2200,7 +2203,7 @@ class ChangedMetaClient implements AcpClient {
   }
 
   requestPermission(
-    params: RequestPermissionRequest,
+    params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
     return this.inner.requestPermission(params, signal);
@@ -8123,7 +8126,7 @@ export class ClaudeAcpAgent {
    *  ignores it. A `cancelled` outcome, request rejection, and local abort all
    *  surface the same "Tool use aborted" the callers already expect. */
   private async requestPermissionFromClient(
-    params: RequestPermissionRequest,
+    params: AcpPermissionRequest,
     toolName: string,
     signal: AbortSignal,
     parentToolUseId: string | undefined,
@@ -8328,9 +8331,15 @@ export class ClaudeAcpAgent {
       const noPersistentRule = matchedAskRule !== undefined || suppressAlwaysAllowRule === true;
       const durableChangeSet = normalizeDurablePermissionChangeSet(suggestions, noPersistentRule);
       const capabilities = this.toolCallCapabilities;
-      const previewContent = capabilities.diffPatch
-        ? await previewPatchContent(toolName, toolInput, session.cwd)
-        : undefined;
+      const previewContent =
+        capabilities.diffPatch || capabilities.v2
+          ? await previewPatchContent(
+              toolName,
+              toolInput,
+              session.cwd,
+              capabilities.v2 ? "v2" : "air",
+            )
+          : undefined;
       const presentation = buildClaudePermissionPresentation({
         toolName,
         input: toolInput,

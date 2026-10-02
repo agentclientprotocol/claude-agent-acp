@@ -17,6 +17,7 @@ import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { v2DiffContent } from "../diff.js";
 import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
+import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
@@ -147,13 +148,19 @@ function connectRouter(): v2.Stream {
 
 /**
  * A v2 client app that collects every `_auth/status_update`, session update,
- * and elicitation it receives, and accepts every elicitation.
+ * elicitation, and permission request it receives, accepts every elicitation,
+ * and answers permission requests with `answerPermission`.
  */
-function v2Client() {
+function v2Client({
+  answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
+}: {
+  answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+} = {}) {
   const authUpdates: AuthStatusUpdateNotification[] = [];
   const sessionUpdates: v2.UpdateSessionNotification[] = [];
   const elicitations: v2.CreateElicitationRequest[] = [];
   const completedElicitations: v2.CompleteElicitationNotification[] = [];
+  const permissionRequests: v2.RequestPermissionRequest[] = [];
   let notifyAuthUpdate = () => {};
   const app = v2
     .client({ name: V2_CLIENT_INFO.name })
@@ -174,6 +181,10 @@ function v2Client() {
     })
     .onNotification(v2.methods.client.elicitation.complete, ({ params }) => {
       completedElicitations.push(params);
+    })
+    .onRequest(v2.methods.client.session.requestPermission, ({ params }) => {
+      permissionRequests.push(params);
+      return answerPermission(params);
     });
   /** Resolves once the client has received `count` auth status updates. */
   const authUpdate = (count: number) =>
@@ -193,7 +204,15 @@ function v2Client() {
         (update): update is Extract<v2.SessionUpdate, { sessionUpdate: Kind }> =>
           update.sessionUpdate === kind,
       );
-  return { app, authUpdate, sessionUpdates, updates, elicitations, completedElicitations };
+  return {
+    app,
+    authUpdate,
+    sessionUpdates,
+    updates,
+    elicitations,
+    completedElicitations,
+    permissionRequests,
+  };
 }
 
 async function initializeV2(agent: v2.ClientContext, capabilities: v2.ClientCapabilities = {}) {
@@ -621,6 +640,96 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("asks for permission with a title of its own, and reads the answer back", async () => {
+    const decisions: unknown[] = [];
+    scriptTurns(async function* (options) {
+      // Claude Code asks about each Bash tool use, then returns its result.
+      for (const toolUseID of ["toolu_allow", "toolu_reject", "toolu_custom"]) {
+        yield {
+          type: "assistant",
+          message: {
+            id: `msg_${toolUseID}`,
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4-6",
+            content: [{ type: "tool_use", id: toolUseID, name: "Bash", input: { command: "ls" } }],
+            stop_reason: "tool_use",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        const decision = await options.canUseTool!("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          toolUseID,
+          suggestions: [],
+        } as unknown as Parameters<NonNullable<Options["canUseTool"]>>[2]).catch(
+          (error: Error) => error.message,
+        );
+        decisions.push(decision);
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: toolUseID,
+                content: "done",
+                is_error: (decision as { behavior?: string }).behavior !== "allow",
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+      }
+      yield result(options);
+    });
+    const answers: v2.RequestPermissionResponse[] = [
+      { outcome: { outcome: "selected", optionId: "allow-once" } },
+      { outcome: { outcome: "selected", optionId: "reject" } },
+      // The draft says an outcome that the agent does not know is no approval.
+      { outcome: { outcome: "_later" } },
+    ];
+    const client = v2Client({ answerPermission: () => answers.shift()! });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(client.permissionRequests[0]).toMatchObject({
+      title: "ls",
+      subject: { type: "tool_call", toolCall: { toolCallId: "toolu_allow", title: "ls" } },
+      options: [
+        { optionId: "allow-once", kind: "allow_once" },
+        { optionId: "reject", kind: "reject_once" },
+      ],
+    });
+    expect(decisions).toEqual([
+      expect.objectContaining({ behavior: "allow" }),
+      expect.objectContaining({ behavior: "deny" }),
+      "Tool use aborted",
+    ]);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "requires_action",
+      "running",
+      "requires_action",
+      "running",
+      "requires_action",
+      "running",
+      "idle end_turn",
+    ]);
+  });
+
   it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {
     const firstAnswer = Promise.withResolvers<void>();
     const echoed = scriptTurns(
@@ -984,6 +1093,32 @@ describe("ACP v2 session translation", () => {
     expect(
       v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [diff] }),
     ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [diff] });
+  });
+
+  it("fails on a permission request without the title that v2 requires", () => {
+    const request = {
+      sessionId: "s",
+      toolCall: { toolCallId: "t", title: "ls" },
+      options: [{ optionId: "allow-once", name: "Yes", kind: "allow_once" as const }],
+    };
+    expect(() => v2PermissionRequest(request)).toThrow(
+      "An ACP v2 permission request needs a title",
+    );
+    expect(v2PermissionRequest({ ...request, title: "Run ls?" })).toEqual({
+      sessionId: "s",
+      title: "Run ls?",
+      subject: { type: "tool_call", toolCall: { toolCallId: "t", title: "ls" } },
+      options: request.options,
+    });
+  });
+
+  it("reads an unknown permission outcome as cancelled, never as approval", () => {
+    expect(v1PermissionResponse({ outcome: { outcome: "_later" } })).toEqual({
+      outcome: { outcome: "cancelled" },
+    });
+    expect(v1PermissionResponse({ outcome: { outcome: "selected", optionId: "o" } })).toEqual({
+      outcome: { outcome: "selected", optionId: "o" },
+    });
   });
 
   it("fails on tool call content that v2 cannot take", () => {
