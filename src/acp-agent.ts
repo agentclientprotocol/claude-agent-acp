@@ -53,9 +53,9 @@ import {
   DeleteSessionResponse,
   WriteTextFileRequest,
   WriteTextFileResponse,
-  StopReason,
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
+import type { StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,
   CanUseTool,
@@ -584,15 +584,26 @@ function parseSteerRequest(params: unknown): SteerRequest {
   };
 }
 
-/** One in-flight `prompt()` call. A persistent per-session consumer (see
- *  `runConsumer`) drains the SDK query stream for the whole session and settles
- *  each Turn's deferred when that turn's outcome is known, so `prompt()` itself
- *  holds no loop. Turns are processed FIFO: the SDK echoes queued user messages
- *  back in submission order, so `turnQueue[0]` is the turn currently running. */
+/** One in-flight turn, started by `startTurn()`. A persistent per-session
+ *  consumer (see `runConsumer`) drains the SDK query stream for the whole
+ *  session and settles each Turn when that turn's outcome is known, so
+ *  `startTurn()` itself holds no loop. Turns are processed FIFO: the SDK echoes
+ *  queued user messages back in submission order, so `turnQueue[0]` is the turn
+ *  currently running. */
 type Turn = {
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
-   *  consumer can match the replayed user message to this turn. */
+   *  consumer can match the replayed user message to this turn. It is also the
+   *  id of the user message the turn reports as inserted. */
   promptUuid: string;
+  /** Where the turn reports how it progresses (see {@link TurnEvents}). */
+  events: TurnEvents;
+  /** Set once `events.inserted` has been reported. A clear-context restart
+   *  activates the same turn again in the fresh session, which must not report
+   *  it twice. */
+  insertedReported?: boolean;
+  /** Set between `events.awaitingUser` and `events.resumed`, so the two stay
+   *  paired although the pending-input count is session-wide. */
+  awaitingUser?: boolean;
   /** Tools surfaced during this turn, awaiting completion or an explicit
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
@@ -633,7 +644,7 @@ type Turn = {
   settling?: boolean;
   /** Outcome captured before the checkpoint preview await, so cancel() can
    *  preserve its usage and metadata while atomically winning that race. */
-  settlingOutcome?: PromptResponse;
+  settlingOutcome?: TurnOutcome;
   /** Set when a `command_lifecycle` "started" frame arrives for this turn's
    *  uuid (msg_lifecycle_v1 CLIs): the SDK dispatched the command into a turn.
    *  Read by cancel() to seed the orphan's state — a started orphan's turn may
@@ -710,7 +721,7 @@ type Turn = {
    *  streams — degrading to post-turn delivery for it, never worse than the
    *  pre-hold behavior (pending wakes are not countable: notifications can
    *  batch into one followup). */
-  deferredSettle?: PromptResponse;
+  deferredSettle?: TurnOutcome;
   /** Uuids of `steer()`-injected messages the SDK has not replayed back yet.
    *
    *  A steer is normally delivered at priority `now`. When it lands during
@@ -753,14 +764,14 @@ type Turn = {
   steeredAwaitingResult?: boolean;
   /** What a steered turn settles with once its steered work has run: the outcome
    *  of its latest result, so its usage covers every cycle the turn ran. */
-  steeredSettle?: PromptResponse;
+  steeredSettle?: TurnOutcome;
   carriedUsage?: AccumulatedUsage;
   /** `carriedUsage`'s per-model counterpart, so a turn that survives a
    *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
   carriedModelUsage?: ModelTokenTally;
-  resolve: (response: PromptResponse) => void;
+  resolve: (outcome: TurnOutcome) => void;
   reject: (error: unknown) => void;
-  /** Settles after the ACP prompt request completes, regardless of outcome. */
+  /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
 };
 
@@ -1209,9 +1220,7 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
  *  lanes and cancel(). */
-function isHeldOpen(
-  turn: Turn | null | undefined,
-): turn is Turn & { deferredSettle: PromptResponse } {
+function isHeldOpen(turn: Turn | null | undefined): turn is Turn & { deferredSettle: TurnOutcome } {
   return turn != null && turn.deferredSettle !== undefined && !turn.settled;
 }
 
@@ -1226,7 +1235,7 @@ function isSteering(turn: Turn | null | undefined): turn is Turn & { steeredEcho
  *  (see Turn.steeredAwaitingResult), so the next idle can settle it. */
 function isSteeredSettleReady(
   turn: Turn | null | undefined,
-): turn is Turn & { steeredEchoes: Set<string>; steeredSettle: PromptResponse } {
+): turn is Turn & { steeredEchoes: Set<string>; steeredSettle: TurnOutcome } {
   return (
     isSteering(turn) &&
     turn.steeredEchoes.size === 0 &&
@@ -3134,7 +3143,31 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /**
+   * Serves an ACP v1 `session/prompt`, which answers when the turn ends. The
+   * outcome of a turn is field for field a v1 prompt response.
+   */
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    let events!: TurnEvents;
+    const outcome = new Promise<TurnOutcome>((resolve, reject) => {
+      events = {
+        inserted() {},
+        awaitingUser() {},
+        resumed() {},
+        ended: resolve,
+        failed: reject,
+      };
+    });
+    await this.startTurn(params, events);
+    return outcome;
+  }
+
+  /**
+   * Starts a turn for a prompt. Resolves once the prompt is queued for Claude
+   * Code, and rejects when the prompt is refused before that. From then on,
+   * `events` reports how the turn goes (see {@link TurnEvents}).
+   */
+  async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
     if (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
@@ -3189,41 +3222,37 @@ export class ClaudeAcpAgent {
 
     session.titles.onPrompt(params.prompt);
 
-    // Each prompt is a Turn whose deferred the persistent consumer settles once
-    // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
-    // turn, pushes the user message onto the streaming input, makes sure the
-    // consumer is running, and awaits the deferred.
+    // Each prompt is a Turn that the persistent consumer settles once the
+    // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
+    // turn, pushes the user message onto the streaming input, and makes sure
+    // the consumer is running.
+    let completeTurn!: () => void;
     const turn: Turn = {
       promptUuid,
+      events,
       isLocalOnlyCommand,
       ...(isUsageCommand ? { isUsageCommand: true } : {}),
       ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
       ...(fileChangeReport ? { fileChangeReport } : {}),
       settled: false,
-      resolve: () => {},
-      reject: () => {},
+      completion: new Promise<void>((resolve) => {
+        completeTurn = resolve;
+      }),
+      resolve: (outcome) => {
+        events.ended(outcome);
+        completeTurn();
+      },
+      reject: (error) => {
+        events.failed(error);
+        completeTurn();
+      },
     };
-    let completeTurn!: () => void;
-    turn.completion = new Promise<void>((resolve) => {
-      completeTurn = resolve;
-    });
-    const response = new Promise<PromptResponse>((resolve, reject) => {
-      turn.resolve = (result) => {
-        resolve(result);
-        completeTurn();
-      };
-      turn.reject = (error) => {
-        reject(error);
-        completeTurn();
-      };
-    });
 
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
-    return response;
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -3993,6 +4022,12 @@ export class ClaudeAcpAgent {
         }
       }
       resetTurnScratch();
+      // Activation is when Claude Code takes the prompt in: its echo, or for an
+      // echo-less command, its result. That inserts it into the conversation.
+      if (!turn.insertedReported) {
+        turn.insertedReported = true;
+        turn.events.inserted(turn.promptUuid);
+      }
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -4247,7 +4282,7 @@ export class ClaudeAcpAgent {
      *  turn that can have spawned subagents must route through here: a site
      *  calling settleActive directly bypasses the hold and re-opens the
      *  out-of-turn permission deadlock (issue #866) through its lane. */
-    const settleOrDefer = async (outcome: PromptResponse) => {
+    const settleOrDefer = async (outcome: TurnOutcome) => {
       // No result ends a steered turn: the steer aborted the cycle this result
       // may belong to, and the steered one is still to come. Record the outcome
       // for the idle lane (see Turn.steeredEchoes); later cycles overwrite it,
@@ -4272,7 +4307,7 @@ export class ClaudeAcpAgent {
      *  turn exactly once, disarm the force-cancel backstop, and drop it from
      *  the queue. Cancellation and provider failures skip checkpoint I/O. */
     const settleActive = async (
-      result: PromptResponse,
+      result: TurnOutcome,
       reportReason: FileChangeReportUnavailableReason = result.stopReason === "cancelled"
         ? "cancelled"
         : "notReported",
@@ -7783,15 +7818,25 @@ export class ClaudeAcpAgent {
   /** Mark a client request as blocking on user input for exactly the lifetime
    *  of its promise. Steering consults this session-local count synchronously,
    *  so a message arriving while any permission/elicitation card is open uses
-   *  non-interrupting SDK delivery. */
+   *  non-interrupting SDK delivery. The active turn reports that it awaits the
+   *  user while any such request is open (see {@link TurnEvents}). */
   private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
     session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
+    const turn = session.activeTurn?.settled === false ? session.activeTurn : undefined;
+    if (turn && !turn.awaitingUser) {
+      turn.awaitingUser = true;
+      turn.events.awaitingUser();
+    }
     try {
       return await request();
     } finally {
       session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
+      if (session.pendingUserInputCount === 0 && turn?.awaitingUser && !turn.settled) {
+        turn.awaitingUser = false;
+        turn.events.resumed();
+      }
     }
   }
 
@@ -9578,7 +9623,7 @@ function turnOutcome(
   session: Session,
   stopReason: StopReason,
   extraMeta?: Record<string, unknown>,
-): PromptResponse {
+): TurnOutcome {
   return {
     stopReason,
     usage: sessionUsage(session),
