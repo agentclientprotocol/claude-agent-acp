@@ -11,7 +11,11 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
-import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getSessionMessages,
+  type Options,
+  type SDKUserMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { v2DiffContent } from "../diff.js";
@@ -363,11 +367,12 @@ describe("ACP v2 sessions", () => {
       expect(resumed).not.toHaveProperty("modes");
       expect(resumed.configOptions?.[0].configId).toBe("mode");
 
+      // v1 replays only from the start.
       await expect(
         agent.request(v2.methods.agent.session.resume, {
           sessionId,
           cwd,
-          replayFrom: { type: "start" },
+          replayFrom: { type: "_message", messageId: "m" },
         }),
       ).rejects.toMatchObject({ code: -32602 });
 
@@ -473,6 +478,11 @@ function scriptTurns(...turns: TurnScript[]): string[] {
   return echoed;
 }
 
+/** An entry of a Claude Code transcript, as `getSessionMessages` returns it. */
+function transcriptEntry(type: "user" | "assistant", uuid: string, message: unknown) {
+  return { type, uuid, session_id: "session", parent_tool_use_id: null, message };
+}
+
 function stream(options: Options, event: Record<string, unknown>) {
   return {
     type: "stream_event",
@@ -493,11 +503,11 @@ function idleState(options: Options) {
   };
 }
 
-function assistantText(options: Options, text: string) {
+function assistantText(options: Options, text: string, id = "msg_answer") {
   return {
     type: "assistant",
     message: {
-      id: "msg_answer",
+      id,
       type: "message",
       role: "assistant",
       model: "claude-sonnet-4-6",
@@ -728,6 +738,68 @@ describe("ACP v2 prompts", () => {
       "running",
       "idle end_turn",
     ]);
+  });
+
+  it("replays the history before it answers session/resume, clearing each message first", async () => {
+    const echoed = scriptTurns(
+      async function* (options) {
+        yield assistantText(options, "Hello!");
+        yield result(options);
+      },
+      async function* (options) {
+        yield assistantText(options, "Again.", "msg_again");
+        yield result(options);
+      },
+    );
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const { messageId } = await agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("hi"),
+      });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+
+      // Claude Code keeps the uuid of the prompt's user message in the transcript.
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("user", echoed[0], { role: "user", content: text("hi") }),
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_answer",
+          role: "assistant",
+          content: text("Hello!"),
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      const replayed = client.sessionUpdates.slice(before).map(({ update }) => update);
+      // The prompt's user message replays under the id that its response returned.
+      expect(replayed).toEqual([
+        { sessionUpdate: "user_message", messageId, content: [] },
+        { sessionUpdate: "user_message_chunk", messageId, content: text("hi")[0] },
+        { sessionUpdate: "agent_message", messageId: "msg_answer", content: [] },
+        {
+          sessionUpdate: "agent_message_chunk",
+          messageId: "msg_answer",
+          content: text("Hello!")[0],
+        },
+      ]);
+
+      // Live chunks after the replay get no clear.
+      const afterReplay = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates.slice(afterReplay))).toContain("idle end_turn"),
+      );
+      expect(
+        client.sessionUpdates.slice(afterReplay).map(({ update }) => update.sessionUpdate),
+      ).not.toContain("agent_message");
+      await client.authUpdate(1);
+    });
   });
 
   it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {

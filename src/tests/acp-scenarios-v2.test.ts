@@ -2,10 +2,9 @@
  * Every scenario of `acp-scenarios/scenarios.ts` on the experimental ACP v2
  * surface: through the protocol router, with the SDK's v2 client.
  *
- * - Status: each scenario either passes, every prompt turn ending with a stop
- *   reason, or stops for the reason in {@link V2_STATUS}. A step of the v2
- *   support that translates more of the agent's messages turns scenarios from
- *   stopped into passing, and updates the table.
+ * - Status: each scenario passes, every prompt turn ending with a stop reason,
+ *   unless {@link V2_STOPS} names why it stops. Every scenario passes today;
+ *   a scenario that the v2 surface cannot run yet goes in the table.
  * - Schema: every message the agent sends, also in a scenario that stops, is
  *   valid against the draft v2 schema of the SDK.
  * - Tool calls: the first report of each tool call has a title. v2 has no
@@ -59,55 +58,14 @@ vi.mock("node:crypto", async (importOriginal) => {
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 const PASSES = "passes";
-/** Step 4 of `docs/acp-v2.md`. */
-const REPLAY = "Invalid params: The ACP v2 surface does not replay session history yet";
 
 /**
- * How each scenario runs on the v2 surface: it passes, or stops for a reason
- * that names the step of `docs/acp-v2.md` that removes it.
+ * The scenarios that stop on the v2 surface, each with the reason, which names
+ * the step of `docs/acp-v2.md` that removes it. Every other scenario passes.
  */
-const V2_STATUS: Record<string, string> = {
-  "session-setup": PASSES,
-  "text-and-thinking": PASSES,
-  "bash-foreground": PASSES,
-  "bash-error": PASSES,
-  "bash-background": PASSES,
-  "async-task-held-until-tool-id": PASSES,
-  "async-task-ends-before-tool-id": PASSES,
-  "async-task-released-at-turn-end": PASSES,
-  read: PASSES,
-  "write-new": PASSES,
-  "write-existing": PASSES,
-  "edit-with-permission": PASSES,
-  "edit-rejected": PASSES,
-  "notebook-edit": PASSES,
-  "grep-and-glob": PASSES,
-  "web-fetch-and-search": PASSES,
-  "subagent-task-legacy": PASSES,
-  "subagent-agent-async": PASSES,
-  "subagent-native-sessions": PASSES,
-  "subagent-nested": PASSES,
-  "subagent-late-child-update": PASSES,
-  "subagent-transcript-extension": PASSES,
-  "todo-write": PASSES,
-  "task-create-update": PASSES,
-  goal: PASSES,
-  "network-permission": PASSES,
-  "exit-plan-approve": PASSES,
-  "exit-plan-reject": PASSES,
-  "ask-user-question": PASSES,
-  skill: PASSES,
-  "mcp-tool": PASSES,
-  "task-output-and-stop": PASSES,
-  "memory-recall": PASSES,
-  "permission-denied": PASSES,
-  "tool-progress": PASSES,
-  "rate-limit-and-origin": PASSES,
-  "compaction-legacy": PASSES,
-  "compaction-update": PASSES,
-  "compaction-failed-legacy": PASSES,
-  "session-load-replay": REPLAY,
-};
+const V2_STOPS: Record<string, string> = {};
+
+const statusOf = (scenario: string) => V2_STOPS[scenario] ?? PASSES;
 
 const runs = new Map<string, ScenarioRunV2>();
 let configDir: string;
@@ -156,10 +114,10 @@ function toJsonLines(recorded: WireRecorded[]): string {
 }
 
 describe("ACP v2 scenarios", () => {
-  it("run as the status table says", () => {
-    expect(
-      Object.fromEntries(SCENARIOS.map((scenario) => [scenario.name, run(scenario.name).status])),
-    ).toEqual(V2_STATUS);
+  it("pass, or stop as the table says", () => {
+    const table = (status: (scenario: string) => string) =>
+      Object.fromEntries(SCENARIOS.map((scenario) => [scenario.name, status(scenario.name)]));
+    expect(table((scenario) => run(scenario).status)).toEqual(table(statusOf));
   });
 
   describe("schema check", () => {
@@ -202,7 +160,7 @@ describe("ACP v2 scenarios", () => {
 
   describe("v2 golden files", () => {
     const passing = SCENARIOS.map((scenario) => scenario.name).filter(
-      (scenario) => V2_STATUS[scenario] === PASSES,
+      (scenario) => statusOf(scenario) === PASSES,
     );
     it.each(passing)("%s", async (scenario) => {
       await expect(toJsonLines(run(scenario).normalized)).toMatchFileSnapshot(

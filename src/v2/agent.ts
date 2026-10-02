@@ -22,7 +22,7 @@ import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Prompt } from "./prompt.js";
 import {
   v1NewSessionRequest,
-  v1ResumeSessionRequest,
+  v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
   v2ConfigOptions,
   v2NewSessionResponse,
@@ -59,9 +59,14 @@ export function v2AgentApp(
       v2NewSessionResponse(await agent.newSession(v1NewSessionRequest(params))),
     )
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
-    .onRequest(v2.methods.agent.session.resume, async ({ params }) =>
-      v2ResumeSessionResponse(await agent.resumeSession(v1ResumeSessionRequest(params))),
-    )
+    .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
+      const restore = v1RestoreSessionRequest(params);
+      return v2ResumeSessionResponse(
+        restore.method === "resume"
+          ? await agent.resumeSession(restore.request)
+          : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
+      );
+    })
     .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
     .onRequest(v2.methods.agent.session.setConfigOption, async ({ params }) => {
@@ -83,10 +88,33 @@ export function v2AgentApp(
  * the agent as v2 messages.
  */
 class V2ClientConnection implements AcpClient {
+  /**
+   * The sessions whose history replays, each with the messages that the
+   * replay has cleared so far.
+   */
+  private readonly replays = new Map<string, Set<string>>();
+
   constructor(
     private readonly ctx: v2.AgentContext,
     private readonly logger: Logger,
   ) {}
+
+  /**
+   * Runs `restore`, which replays the history of `sessionId`.
+   *
+   * The agent replays messages as chunks. A v2 client may still hold a
+   * replayed message, and chunks append, so before the first replayed chunk of
+   * each message the client gets the message with no content, which clears it,
+   * as v2 requires of a message replayed as chunks.
+   */
+  async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
+    this.replays.set(sessionId, new Set());
+    try {
+      return await restore();
+    } finally {
+      this.replays.delete(sessionId);
+    }
+  }
 
   /**
    * Sends a v2 session update, and logs rather than rejects when that fails.
@@ -112,12 +140,32 @@ class V2ClientConnection implements AcpClient {
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
     const v2Update = v2SessionUpdate(update);
-    if (v2Update) {
-      await this.ctx.notify(v2.methods.client.session.update, {
-        ...notification,
-        update: v2Update,
-      });
-    }
+    if (!v2Update) return;
+    const clear = this.replayClear(notification.sessionId, v2Update);
+    // Both go to the connection before either is awaited, so a chunk that
+    // another call sends meanwhile cannot come between them.
+    await Promise.all([
+      ...(clear
+        ? [this.ctx.notify(v2.methods.client.session.update, { ...notification, update: clear })]
+        : []),
+      this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
+    ]);
+  }
+
+  /**
+   * The update that clears the message of a replayed chunk, when it is the
+   * first replayed chunk of that message (see {@link replaying}).
+   */
+  private replayClear(sessionId: string, update: v2.SessionUpdate): v2.SessionUpdate | undefined {
+    const cleared = this.replays.get(sessionId);
+    if (!cleared) return undefined;
+    const kind = MESSAGE_OF_CHUNK.get(update.sessionUpdate);
+    if (!kind) return undefined;
+    const { messageId } = update as { messageId: string };
+    const key = `${kind} ${messageId}`;
+    if (cleared.has(key)) return undefined;
+    cleared.add(key);
+    return emptyMessage(kind, messageId);
   }
 
   async requestPermission(
@@ -159,6 +207,28 @@ class V2ClientConnection implements AcpClient {
 
   writeTextFile(): Promise<never> {
     return Promise.reject(new Error("ACP v2 has no client file system"));
+  }
+}
+
+/** The message update of each message chunk. */
+const MESSAGE_OF_CHUNK = new Map<string, "user_message" | "agent_message" | "agent_thought">([
+  ["user_message_chunk", "user_message"],
+  ["agent_message_chunk", "agent_message"],
+  ["agent_thought_chunk", "agent_thought"],
+]);
+
+function emptyMessage(
+  kind: "user_message" | "agent_message" | "agent_thought",
+  messageId: string,
+): v2.SessionUpdate {
+  const message = { messageId, content: [] };
+  switch (kind) {
+    case "user_message":
+      return { ...message, sessionUpdate: kind };
+    case "agent_message":
+      return { ...message, sessionUpdate: kind };
+    default:
+      return { ...message, sessionUpdate: kind };
   }
 }
 

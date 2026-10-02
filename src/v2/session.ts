@@ -6,6 +6,7 @@
 import {
   RequestError,
   type AvailableCommand,
+  type LoadSessionRequest,
   type McpServer,
   type NewSessionRequest,
   type NewSessionResponse,
@@ -25,18 +26,36 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
 }
 
 /**
- * `replayFrom` is rejected until the v2 surface can translate the replayed
- * history, which needs the message and tool call updates.
+ * The v1 request that a v2 `session/resume` means.
+ *
+ * v2 restores a session with `session/resume` and replays its history only
+ * when `replayFrom` asks for it. v1 has two methods: `session/resume`, which
+ * never replays, and `session/load`, which replays the whole history before it
+ * responds. `replayFrom: { type: "start" }` is the second; a cursor that
+ * starts elsewhere is rejected.
  */
-export function v1ResumeSessionRequest(params: v2.ResumeSessionRequest): ResumeSessionRequest {
+export function v1RestoreSessionRequest(
+  params: v2.ResumeSessionRequest,
+):
+  | { method: "resume"; request: ResumeSessionRequest }
+  | { method: "load"; request: LoadSessionRequest } {
   const { replayFrom, mcpServers, ...request } = params;
-  if (replayFrom != null) {
+  if (replayFrom == null) {
+    return {
+      method: "resume",
+      request: { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) },
+    };
+  }
+  if (replayFrom.type !== "start") {
     throw RequestError.invalidParams(
       { replayFrom },
-      "The ACP v2 surface does not replay session history yet",
+      `Replaying from a ${replayFrom.type} cursor is not supported`,
     );
   }
-  return { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) };
+  return {
+    method: "load",
+    request: { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) },
+  };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */
