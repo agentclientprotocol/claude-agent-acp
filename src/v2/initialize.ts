@@ -26,8 +26,10 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
       // reads, writes, and runs commands itself.
       fs: { readTextFile: false, writeTextFile: false },
       terminal: false,
-      // Every v2 client handles boolean config options; v1 asks for a marker.
-      session: { configOptions: { boolean: {} } },
+      // Every v2 client handles boolean config options and notices; v1 asks
+      // for a marker. With notices, the agent reports advisories as notices
+      // rather than as transcript messages.
+      session: { configOptions: { boolean: {} }, notices: {} },
       // v1 marks terminal auth support with a boolean, v2 with an object.
       auth: {
         terminal: capabilities?.auth?.terminal != null,

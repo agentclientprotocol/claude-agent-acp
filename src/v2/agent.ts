@@ -5,9 +5,24 @@
  * request into the v1 request that the agent serves, and each v1 message that
  * the agent sends into its v2 form, so v1 and v2 share one implementation.
  */
+import type {
+  CompleteElicitationNotification,
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+} from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
+import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
+import {
+  v1NewSessionRequest,
+  v1ResumeSessionRequest,
+  v1SetSessionConfigOptionRequest,
+  v2ConfigOptions,
+  v2NewSessionResponse,
+  v2ResumeSessionResponse,
+} from "./session.js";
+import { v2SessionUpdate } from "./session-update.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -31,16 +46,30 @@ export function v2AgentApp(
       v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
     )
     .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
-    .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params));
+    .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))
+    .onRequest(v2.methods.agent.session.new, async ({ params }) =>
+      v2NewSessionResponse(await agent.newSession(v1NewSessionRequest(params))),
+    )
+    .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
+    .onRequest(v2.methods.agent.session.resume, async ({ params }) =>
+      v2ResumeSessionResponse(await agent.resumeSession(v1ResumeSessionRequest(params))),
+    )
+    .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
+    .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
+    .onRequest(v2.methods.agent.session.setConfigOption, async ({ params }) => {
+      const { configOptions, ...response } = await agent.setSessionConfigOption(
+        v1SetSessionConfigOptionRequest(params),
+      );
+      return { ...response, configOptions: v2ConfigOptions(configOptions) };
+    });
 }
 
 /**
  * The {@link AcpClient} of an ACP v2 connection: it sends the v1 messages of
  * the agent as v2 messages.
  *
- * The v2 surface serves no sessions yet, so only connection-level messages
- * reach it, such as the `_auth/status_update` extension notification. Every
- * session-scoped method rejects until the v2 surface serves sessions.
+ * The v2 surface does not serve prompts yet, so permission requests, which
+ * only a prompt turn makes, still reject.
  */
 class V2ClientConnection implements AcpClient {
   constructor(private readonly ctx: v2.AgentContext) {}
@@ -52,20 +81,34 @@ class V2ClientConnection implements AcpClient {
     return this.ctx.notify(method, params);
   }
 
-  sessionUpdate(): Promise<void> {
-    return noV2Sessions("session/update");
+  async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+    const v2Update = v2SessionUpdate(update);
+    if (v2Update) {
+      await this.ctx.notify(v2.methods.client.session.update, {
+        ...notification,
+        update: v2Update,
+      });
+    }
   }
 
   requestPermission(): Promise<never> {
-    return noV2Sessions("session/request_permission");
+    return Promise.reject(
+      new Error("The ACP v2 surface does not serve session/request_permission yet"),
+    );
   }
 
-  createElicitation(): Promise<never> {
-    return noV2Sessions("elicitation/create");
+  // Elicitation is the same in v1 and v2.
+  createElicitation(
+    params: CreateElicitationRequest,
+    signal?: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    return this.ctx.request(v2.methods.client.elicitation.create, params, {
+      cancellationSignal: signal,
+    });
   }
 
-  completeElicitation(): Promise<void> {
-    return noV2Sessions("elicitation/complete");
+  completeElicitation(params: CompleteElicitationNotification): Promise<void> {
+    return this.ctx.notify(v2.methods.client.elicitation.complete, params);
   }
 
   // v2 has no client file system. The agent never calls these on v2, because
@@ -81,8 +124,4 @@ class V2ClientConnection implements AcpClient {
 
 function isExtensionMethod(method: string): method is v2.ExtensionMethod {
   return method.startsWith("_");
-}
-
-function noV2Sessions(method: string): Promise<never> {
-  return Promise.reject(new Error(`The ACP v2 surface does not serve sessions yet (${method})`));
 }
