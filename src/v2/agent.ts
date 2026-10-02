@@ -102,9 +102,14 @@ class V2ClientConnection implements AcpClient {
     params: CreateElicitationRequest,
     signal?: AbortSignal,
   ): Promise<CreateElicitationResponse> {
-    return this.ctx.request(v2.methods.client.elicitation.create, params, {
-      cancellationSignal: signal,
-    });
+    return this.ctx.request(
+      v2.methods.client.elicitation.create,
+      // The v1 types accept a property schema with any tag; the v2 types accept
+      // one only in a received value. As on v1, an MCP server's schema is
+      // relayed here unchanged, so this cast does not check it.
+      params as v2.CreateElicitationRequest,
+      { cancellationSignal: signal },
+    );
   }
 
   completeElicitation(params: CompleteElicitationNotification): Promise<void> {
