@@ -2806,9 +2806,9 @@ describe("task notification replay", () => {
     expect(userChunks(updates)).toEqual([]);
     expect(asyncTaskUpdates(updates)).toEqual([]);
     expect(updates.at(-1)?.update).toMatchObject({
-      sessionUpdate: "subagent_state_update",
-      subagentSessionId: "s1:replay-subagent:toolu_agent",
-      state: "cancelled",
+      sessionUpdate: "subagent_update",
+      sessionId: "s1:replay-subagent:toolu_agent",
+      state: { state: "idle", stopReason: "cancelled" },
     });
   });
 
@@ -3463,26 +3463,29 @@ describe("subagent transcript replay", () => {
         updates.map(({ sessionId: target, update }) => [
           target,
           update.sessionUpdate,
-          (update as any).subagentSessionId ??
-            (update as any).content?.text ??
-            (update as any).state,
+          (update as any).sessionId ?? (update as any).content?.text,
         ]),
       ).toEqual([
         [sessionId, "user_message_chunk", "Explore it"],
-        [sessionId, "subagent_spawned", child1],
+        [sessionId, "subagent_update", child1],
         [child1, "user_message_chunk", "Look around"],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
-        [sessionId, "subagent_spawned", child2],
+        [sessionId, "subagent_update", child2],
         [sessionId, "agent_message_chunk", "Done."],
-        [sessionId, "subagent_state_update", child2],
-        [sessionId, "subagent_state_update", child1],
+        [sessionId, "subagent_update", child2],
+        [sessionId, "subagent_update", child1],
       ]);
       expect(
         updates.flatMap(({ update }) =>
-          update.sessionUpdate === "subagent_state_update" ? [(update as any).state] : [],
+          update.sessionUpdate === "subagent_update" && "state" in update && update.state
+            ? [update.state]
+            : [],
         ),
-      ).toEqual(["completed", "completed"]);
+      ).toEqual([
+        { state: "idle", stopReason: "end_turn" },
+        { state: "idle", stopReason: "end_turn" },
+      ]);
     } finally {
       if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
@@ -3493,16 +3496,18 @@ describe("subagent transcript replay", () => {
   it("replays an unattributed sidechain as a deterministic disconnected child", async () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
-      ["s1", "subagent_spawned"],
+      ["s1", "subagent_update"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
-      ["s1", "subagent_state_update"],
+      ["s1", "subagent_update"],
     ]);
     expect(updates[0]?.update).toMatchObject({
-      subagentSessionId: "s1:replay-subagent:parent-agent-call",
-      name: "Disconnected agent",
+      sessionId: "s1:replay-subagent:parent-agent-call",
+      title: "Disconnected agent",
     });
-    expect(updates.at(-1)?.update).toMatchObject({ state: "disconnected" });
+    // RFD #1992's rework removed the wire-level "disconnected" terminal
+    // state; lost observability is reported as `unknown`.
+    expect(updates.at(-1)?.update).toMatchObject({ state: { state: "unknown" } });
   });
 
   it("reconstructs a persisted Agent launch before child updates", async () => {
@@ -3531,13 +3536,13 @@ describe("subagent transcript replay", () => {
     const updates = await replay("native", [launch, ...replayHistory, agentResult(false, "done")]);
 
     expect(updates[0]?.update).toMatchObject({
-      sessionUpdate: "subagent_spawned",
-      name: "Reviewer",
-      task: "Review the implementation",
+      sessionUpdate: "subagent_update",
+      title: "Reviewer",
+      description: "Review the implementation",
     });
     expect(updates.at(-1)?.update).toMatchObject({
-      sessionUpdate: "subagent_state_update",
-      state: "completed",
+      sessionUpdate: "subagent_update",
+      state: { state: "idle", stopReason: "end_turn" },
     });
     expect(
       updates.some(
@@ -3549,9 +3554,13 @@ describe("subagent transcript replay", () => {
   });
 
   it.each([
-    { content: "subagent failed", state: "failed" },
-    { content: "Request interrupted by user", state: "cancelled" },
-  ])("restores a persisted $state Agent result", async ({ content, state }) => {
+    { content: "subagent failed", state: "failed", wireState: { state: "idle" } },
+    {
+      content: "Request interrupted by user",
+      state: "cancelled",
+      wireState: { state: "idle", stopReason: "cancelled" },
+    },
+  ])("restores a persisted $state Agent result", async ({ content, wireState }) => {
     const launch = {
       type: "assistant" as const,
       uuid: "launch-message",
@@ -3577,8 +3586,8 @@ describe("subagent transcript replay", () => {
 
     const updates = await replay("native", [launch, ...replayHistory, agentResult(true, content)]);
     expect(updates.at(-1)?.update).toMatchObject({
-      sessionUpdate: "subagent_state_update",
-      state,
+      sessionUpdate: "subagent_update",
+      state: wireState,
     });
   });
 
@@ -3608,8 +3617,10 @@ describe("subagent transcript replay", () => {
 
     const updates = await replay("native", [launch, ...replayHistory]);
     expect(updates.at(-1)?.update).toMatchObject({
-      sessionUpdate: "subagent_state_update",
-      state: "disconnected",
+      sessionUpdate: "subagent_update",
+      // RFD #1992's rework removed the wire-level "disconnected" terminal
+      // state (lost observability is `unknown`, not an invented outcome).
+      state: { state: "unknown" },
     });
   });
 
@@ -3640,12 +3651,17 @@ describe("subagent transcript replay", () => {
     ] as Awaited<ReturnType<typeof getSessionMessages>>);
 
     expect(
-      updates.filter(({ update }) => update.sessionUpdate === "subagent_spawned"),
+      updates.filter(
+        ({ update }) => update.sessionUpdate === "subagent_update" && "title" in update,
+      ),
     ).toHaveLength(2);
     expect(
       updates.some(
         ({ update }) =>
-          update.sessionUpdate === "subagent_state_update" && update.state === "disconnected",
+          update.sessionUpdate === "subagent_update" &&
+          "state" in update &&
+          update.state &&
+          update.state.state === "unknown",
       ),
     ).toBe(true);
   });
@@ -5609,13 +5625,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(
-      updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "subagent_spawned" ||
-          update.sessionUpdate === "subagent_state_update",
-      ),
-    ).toBe(false);
+    expect(updates.some(({ update }) => update.sessionUpdate === "subagent_update")).toBe(false);
     // A client that is not AIR gets the streamed subagent text, like upstream.
     expect(
       updates.some(({ update }) => JSON.stringify(update).includes("hidden child output")),
@@ -5686,13 +5696,7 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(
-      updates.some(
-        ({ update }) =>
-          update.sessionUpdate === "subagent_spawned" ||
-          update.sessionUpdate === "subagent_state_update",
-      ),
-    ).toBe(false);
+    expect(updates.some(({ update }) => update.sessionUpdate === "subagent_update")).toBe(false);
     // For AIR, nested text stays internal without negotiation, streamed or
     // consolidated. A client that is not AIR gets the streamed text, like upstream.
     expect(
@@ -5750,16 +5754,17 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.map((notification) => notification.update)).toEqual(
       expect.arrayContaining([
         {
-          sessionUpdate: "subagent_spawned",
-          subagentSessionId: "agent-42",
-          name: "Investigate",
-          task: "Investigate",
+          sessionUpdate: "subagent_update",
+          sessionId: "agent-42",
+          title: "Investigate",
+          description: "Investigate",
           capabilities: {},
+          state: { state: "running" },
         },
         {
-          sessionUpdate: "subagent_state_update",
-          subagentSessionId: "agent-42",
-          state: "completed",
+          sessionUpdate: "subagent_update",
+          sessionId: "agent-42",
+          state: { state: "idle", stopReason: "end_turn" },
         },
       ]),
     );
@@ -5835,11 +5840,11 @@ describe("subagent permission attribution (issue #851)", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
-      ["test-session", "subagent_spawned"],
+      ["test-session", "subagent_update"],
       ["agent-42", "agent_message_chunk"],
       ["agent-42", "tool_call"],
       ["agent-42", "agent_message_chunk"],
-      ["test-session", "subagent_state_update"],
+      ["test-session", "subagent_update"],
     ]);
     expect(JSON.stringify(updates)).not.toContain("late");
   });
@@ -5918,14 +5923,16 @@ describe("subagent permission attribution (issue #851)", () => {
       );
       await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
       const lifecycle = updates.flatMap(({ sessionId, update }) =>
-        update.sessionUpdate === "subagent_spawned" ||
-        update.sessionUpdate === "subagent_state_update" ||
-        update.sessionUpdate === "agent_message_chunk"
+        update.sessionUpdate === "subagent_update" || update.sessionUpdate === "agent_message_chunk"
           ? [
               [
                 sessionId,
-                update.sessionUpdate,
-                "subagentSessionId" in update ? update.subagentSessionId : undefined,
+                update.sessionUpdate === "subagent_update"
+                  ? "title" in update
+                    ? "subagent_update:running"
+                    : "subagent_update:idle"
+                  : update.sessionUpdate,
+                "sessionId" in update ? update.sessionId : undefined,
               ],
             ]
           : [],
@@ -5934,12 +5941,12 @@ describe("subagent permission attribution (issue #851)", () => {
     }
 
     const expected = [
-      ["test-session", "subagent_spawned", "agent-42"],
+      ["test-session", "subagent_update:running", "agent-42"],
       ["agent-42", "agent_message_chunk", undefined],
-      ["test-session", "subagent_state_update", "agent-42"],
-      ["test-session", "subagent_spawned", "agent-42:generation:2"],
-      ["agent-42:generation:2", "agent_message_chunk", undefined],
-      ["test-session", "subagent_state_update", "agent-42:generation:2"],
+      ["test-session", "subagent_update:idle", "agent-42"],
+      ["test-session", "subagent_update:running", "agent-42"],
+      ["agent-42", "agent_message_chunk", undefined],
+      ["test-session", "subagent_update:idle", "agent-42"],
     ];
 
     it("opens a new generation on a running task_updated patch", async () => {
@@ -6036,21 +6043,25 @@ describe("subagent permission attribution (issue #851)", () => {
 
     const nestedSpawn = updates.find(
       ({ update }) =>
-        update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-inner",
+        update.sessionUpdate === "subagent_update" &&
+        "title" in update &&
+        update.sessionId === "agent-inner",
     );
     expect(nestedSpawn?.sessionId).toBe("agent-outer");
     expect(nestedSpawn?.update).toMatchObject({
-      name: "toolu_inner-name",
-      task: "toolu_inner full prompt",
+      title: "toolu_inner-name",
+      description: "toolu_inner full prompt",
     });
     expect(
       updates.find(
         ({ update }) =>
-          update.sessionUpdate === "subagent_spawned" && update.subagentSessionId === "agent-outer",
+          update.sessionUpdate === "subagent_update" &&
+          "title" in update &&
+          update.sessionId === "agent-outer",
       )?.update,
     ).toMatchObject({
-      name: "toolu_outer-name",
-      task: "toolu_outer full prompt",
+      title: "toolu_outer-name",
+      description: "toolu_outer full prompt",
     });
     expect(
       updates.filter(
@@ -6090,9 +6101,10 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.at(-1)).toEqual({
       sessionId: "test-session",
       update: {
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: "agent-42",
-        state: "failed",
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        // No StopReason value accurately describes a generic failure.
+        state: { state: "idle" },
       },
     });
   });
@@ -6133,9 +6145,9 @@ describe("subagent permission attribution (issue #851)", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
     expect(updates.at(-1)?.update).toEqual({
-      sessionUpdate: "subagent_state_update",
-      subagentSessionId: "agent-42",
-      state: "cancelled",
+      sessionUpdate: "subagent_update",
+      sessionId: "agent-42",
+      state: { state: "idle", stopReason: "cancelled" },
     });
   });
 
@@ -6181,16 +6193,17 @@ describe("subagent permission attribution (issue #851)", () => {
 
     expect(updates.slice(-2).map(({ update }) => update)).toEqual([
       {
-        sessionUpdate: "subagent_spawned",
-        subagentSessionId: "agent-42",
-        name: "Investigate",
-        task: "Investigate",
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        title: "Investigate",
+        description: "Investigate",
         capabilities: {},
+        state: { state: "running" },
       },
       {
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: "agent-42",
-        state: "cancelled",
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-42",
+        state: { state: "idle", stopReason: "cancelled" },
       },
     ]);
   });
@@ -6856,7 +6869,7 @@ describe("native subagent eager tool ownership", () => {
     expect(routed).toEqual(control);
     expect(published[0]).toMatchObject({
       sessionId: "root",
-      update: { sessionUpdate: "subagent_spawned", subagentSessionId: "agent-1" },
+      update: { sessionUpdate: "subagent_update", sessionId: "agent-1" },
     });
   });
 
@@ -17137,9 +17150,11 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       });
       expect(
         updates.flatMap((n) =>
-          n.update.sessionUpdate === "subagent_spawned" ? [n.update.subagentSessionId] : [],
+          n.update.sessionUpdate === "subagent_update" && "title" in n.update
+            ? [n.update.sessionId]
+            : [],
         ),
-      ).toEqual(["agent-1", "agent-1:generation:2"]);
+      ).toEqual(["agent-1", "agent-1"]);
       release();
       await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
       await session.consumer;
@@ -17168,14 +17183,21 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       const { second } = await start();
 
       const spawned = updates.flatMap((n) =>
-        n.update.sessionUpdate === "subagent_spawned" ? [n.update] : [],
+        n.update.sessionUpdate === "subagent_update" && "title" in n.update ? [n.update] : [],
       );
-      expect(spawned.map((update) => update.subagentSessionId)).toEqual([
-        "agent-1",
-        "agent-1:generation:2",
-      ]);
-      expect(spawned[0]).not.toHaveProperty("prompt");
-      expect(spawned[1]).toMatchObject({ prompt: "Check the tests too" });
+      expect(spawned.map((update) => update.sessionId)).toEqual(["agent-1", "agent-1"]);
+      // The prompt is no longer a field on the announcement itself (RFD
+      // #1992's rework); it arrives as a `session_message` on the child's
+      // own stream right after its announce.
+      const messages = updates.flatMap((n) =>
+        n.update.sessionUpdate === "session_message" ? [n] : [],
+      );
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.sessionId).toBe("agent-1");
+      expect(messages[0]?.update).toMatchObject({
+        recipientSessionId: "agent-1",
+        content: [{ type: "text", text: "Check the tests too" }],
+      });
       release();
       await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
       await agent.sessions["test-session"]?.consumer;

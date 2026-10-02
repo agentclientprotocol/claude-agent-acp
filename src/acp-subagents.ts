@@ -1,7 +1,9 @@
 import type {
   ClientCapabilities,
+  ContentBlock,
   SessionCapabilities,
   SessionNotification,
+  StopReason,
 } from "@agentclientprotocol/sdk";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -14,37 +16,81 @@ export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
  * Temporary typed surface for agentclientprotocol/agent-client-protocol#1992.
  *
  * The wire contract is already defined by the ACP draft, but the published
- * TypeScript SDK does not contain it yet. Keep the compatibility boundary in
- * this file so it can be replaced by SDK exports without changing lifecycle
- * code when the draft ships.
+ * TypeScript SDK does not contain it yet (`unstable_subagents`, merged
+ * 2026-09-15 in the Rust schema, isn't in a published `@agentclientprotocol/sdk`
+ * release). Keep the compatibility boundary in this file so it can be replaced
+ * by SDK exports without changing lifecycle code when the draft ships.
+ *
+ * This reflects the reworked RFD (one upsert-style `subagent_update` plus
+ * `session_message`/`session_message_chunk`), not the original two-notification
+ * shape (`subagent_spawned` + `subagent_state_update`) #1017 implemented before
+ * the rework landed.
  */
-export type SubagentSessionCapabilities = {
-  cancel?: boolean;
-  close?: boolean;
+export type SubagentCapabilities = {
+  /** Omitted or `null` means unsupported; an object (including `{}`) means supported. */
+  cancel?: Record<string, unknown> | null;
   _meta?: Record<string, unknown> | null;
 };
 
-export type SubagentSpawnedUpdate = {
-  sessionUpdate: "subagent_spawned";
-  subagentSessionId: string;
-  name: string;
-  task: string;
-  /**
-   * Adapter extension: the exact prompt of the subagent. A client can show it
-   * as the first user message of the subagent session. It is absent when the
-   * adapter does not know the prompt.
-   */
-  prompt?: string;
-  capabilities: SubagentSessionCapabilities;
+/**
+ * The child's current foreground-work snapshot, mirrored onto the parent's
+ * `subagent_update.state`. Same shape as v2's `state_update`. A whole-object
+ * replacement, not a nested patch -- see `SubagentUpdate.state`.
+ */
+export type SubagentWorkState =
+  | { state: "running"; _meta?: Record<string, unknown> | null }
+  | { state: "requires_action"; _meta?: Record<string, unknown> | null }
+  | { state: "unknown"; _meta?: Record<string, unknown> | null }
+  | {
+      state: "idle";
+      /** Omitted or `null` means not reported. */
+      stopReason?: StopReason | null;
+      _meta?: Record<string, unknown> | null;
+    };
+
+/**
+ * Notifies the Client that the enclosing parent session created and owns a
+ * child session. The first update for an unknown `sessionId` announces the
+ * association; later updates patch its metadata without creating a new child
+ * or transferring ownership.
+ *
+ * Only `sessionId` is required. Every other field is a nullable patch:
+ * omitted means unchanged, `null` clears it, a concrete value replaces it
+ * wholesale (see `docs/rfds/subagents.mdx`).
+ */
+export type SubagentUpdate = {
+  sessionUpdate: "subagent_update";
+  sessionId: string;
+  title?: string | null;
+  description?: string | null;
+  capabilities?: SubagentCapabilities | null;
+  state?: SubagentWorkState | null;
   _meta?: Record<string, unknown> | null;
 };
 
-export type SubagentState = "completed" | "failed" | "cancelled" | "disconnected";
+/**
+ * Reports a session's outgoing or incoming message to or from another
+ * session -- not a response to the human user, not a tool call. An upsert:
+ * supplying `content` replaces all content accumulated for `messageId` so
+ * far; omitting it leaves prior content in place (for a metadata-only patch
+ * or a later chunk to append to).
+ */
+export type SessionMessageUpdate = {
+  sessionUpdate: "session_message";
+  messageId: string;
+  senderSessionId?: string | null;
+  recipientSessionId?: string | null;
+  content?: ContentBlock[] | null;
+  _meta?: Record<string, unknown> | null;
+};
 
-export type SubagentStateUpdate = {
-  sessionUpdate: "subagent_state_update";
-  subagentSessionId: string;
-  state: SubagentState;
+/** Appends one content block to an in-progress `session_message`. */
+export type SessionMessageChunkUpdate = {
+  sessionUpdate: "session_message_chunk";
+  messageId: string;
+  senderSessionId?: string | null;
+  recipientSessionId?: string | null;
+  content: ContentBlock;
   _meta?: Record<string, unknown> | null;
 };
 
@@ -91,8 +137,9 @@ export type AsyncTaskStateUpdate = {
 
 export type AcpSessionUpdate =
   | SessionNotification["update"]
-  | SubagentSpawnedUpdate
-  | SubagentStateUpdate
+  | SubagentUpdate
+  | SessionMessageUpdate
+  | SessionMessageChunkUpdate
   | AsyncTaskSpawnedUpdate
   | AsyncTaskProgressUpdate
   | AsyncTaskStateUpdate;

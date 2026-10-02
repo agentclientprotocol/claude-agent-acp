@@ -342,7 +342,7 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
 
   describe.each(profiles.map((profile) => profile.name))("%s session ids", (profile) => {
     // Only AIR negotiates native subagent sessions. There a child session
-    // gets updates after its parent announced it with `subagent_spawned`.
+    // gets updates after its parent announced it with `subagent_update`.
     const nativeSubagents = profile === "air";
     it.each(SCENARIOS.map((scenario) => scenario.name))(
       "%s sends every session/update to the ACP session",
@@ -357,8 +357,8 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
             wrong.push(`${payload.sessionId}: ${payload.update.sessionUpdate}`);
             continue;
           }
-          if (nativeSubagents && payload.update.sessionUpdate === "subagent_spawned") {
-            sessions.add(payload.update.subagentSessionId);
+          if (nativeSubagents && payload.update.sessionUpdate === "subagent_update") {
+            sessions.add(payload.update.sessionId);
           }
         }
         expect(wrong).toEqual([]);
@@ -816,12 +816,11 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
 
     it("drops every update of a tool call of a finished child session", () => {
       const recorded = air("subagent-late-child-update");
-      const finished = recorded.findIndex(
-        (record) =>
-          record.kind === "sessionUpdate" &&
-          (record.payload as { update: Record<string, any> }).update.sessionUpdate ===
-            "subagent_state_update",
-      );
+      const finished = recorded.findIndex((record) => {
+        if (record.kind !== "sessionUpdate") return false;
+        const { update } = record.payload as { update: Record<string, any> };
+        return update.sessionUpdate === "subagent_update" && update.state?.state === "idle";
+      });
       expect(finished).toBeGreaterThan(0);
       const late = recorded
         .slice(finished)
