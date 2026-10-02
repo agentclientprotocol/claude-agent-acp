@@ -40,11 +40,6 @@ export function parseMcpCommand(text: string): McpCommand | null {
   return server === "" ? { action, all: false } : { action, all: false, server };
 }
 
-/** True for a prompt that {@link parseMcpCommand} accepts. */
-export function isMcpCommandText(text: string): boolean {
-  return parseMcpCommand(text) !== null;
-}
-
 /** Read the MCP server status for the list after a `/mcp` command. Resolves
  *  to null when the read fails, takes too long, or `signal` aborts. Then the
  *  turn keeps the text of Claude Code. */
@@ -296,10 +291,11 @@ export function formatMcpStatus(statuses: McpServerStatus[]): string {
   return blocks.join("\n\n");
 }
 
-/** The SDK query methods that `/mcp` uses. The control methods are optional,
- *  because an older SDK or a test double can lack them. */
-export type McpControlQuery = Pick<Query, "mcpServerStatus"> &
-  Partial<Pick<Query, "reconnectMcpServer" | "toggleMcpServer">>;
+/** The SDK query methods that `/mcp` uses. */
+export type McpControlQuery = Pick<
+  Query,
+  "mcpServerStatus" | "reconnectMcpServer" | "toggleMcpServer"
+>;
 
 /** The result of {@link runMcpCommand}. `markdown` is null when the turn
  *  keeps the text of Claude Code. `reconnected` holds the servers that the
@@ -384,8 +380,8 @@ function nothingToDoLine(action: McpCommand["action"]): string {
  *  the command. Claude Code refuses a reconnect, an enable, and a disable in
  *  SDK mode, so the adapter runs them through the SDK control API. The result
  *  of each server goes above the server list. An error of one server does
- *  not stop the others. When the control API is missing, the first status
- *  read fails, or `signal` aborts, the turn keeps the text of Claude Code. */
+ *  not stop the others. When the first status read fails or `signal`
+ *  aborts, the turn keeps the text of Claude Code. */
 export async function runMcpCommand(
   query: McpControlQuery,
   command: McpCommand,
@@ -399,10 +395,6 @@ export async function runMcpCommand(
     // The list replaces the Claude Code summary line.
     const statuses = await readMcpServerStatus(query, signal, logError);
     return { markdown: statuses ? formatMcpStatus(statuses) : null, reconnected };
-  }
-  const { reconnectMcpServer, toggleMcpServer } = query;
-  if (typeof reconnectMcpServer !== "function" || typeof toggleMcpServer !== "function") {
-    return keep;
   }
   const before = await readMcpServerStatus(query, signal, logError);
   if (!before) return keep;
@@ -427,8 +419,8 @@ export async function runMcpCommand(
     if (command.action === "reconnect") reconnected.push(server);
     const call =
       command.action === "reconnect"
-        ? () => reconnectMcpServer.call(query, server)
-        : () => toggleMcpServer.call(query, server, command.action === "enable");
+        ? () => query.reconnectMcpServer(server)
+        : () => query.toggleMcpServer(server, command.action === "enable");
     const result = await awaitCall(call, signal);
     if (result.type === "aborted") return keep;
     if (result.type === "done") {

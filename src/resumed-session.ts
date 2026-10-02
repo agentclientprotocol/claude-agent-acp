@@ -110,14 +110,6 @@ export async function readResumedTail(
   return withModel ? { model: (await readResumedSession(sessionId, logger)).model } : {};
 }
 
-/** The resume model of a session. See {@link readResumedTail}. */
-export async function readResumedModel(
-  sessionId: string,
-  logger?: ResumeLogger,
-): Promise<string | undefined> {
-  return (await readResumedTail(sessionId, logger)).model;
-}
-
 /** The local transcript of a session in any project directory, as the SDK looks it up. */
 export async function findTranscript(sessionId: string): Promise<string | undefined> {
   const projects = path.join(claudeConfigDir(), "projects");

@@ -3,11 +3,7 @@ import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import {
-  readResumedModel,
-  readResumedTail,
-  resumedModelFromTranscript,
-} from "../resumed-session.js";
+import { readResumedTail, resumedModelFromTranscript } from "../resumed-session.js";
 
 function assistant(
   model: unknown,
@@ -55,7 +51,7 @@ describe("resumedModelFromTranscript", () => {
   });
 });
 
-describe("readResumedModel", () => {
+describe("readResumedTail", () => {
   let configDir: string;
   let originalConfigDir: string | undefined;
 
@@ -98,7 +94,7 @@ describe("readResumedModel", () => {
       record("claude-haiku-4-5", { isSidechain: true }),
     ]);
 
-    expect(await readResumedModel("long")).toBe("claude-opus-5");
+    expect((await readResumedTail("long")).model).toBe("claude-opus-5");
   });
 
   it("reads a record that is longer than one backward read", async () => {
@@ -107,19 +103,19 @@ describe("readResumedModel", () => {
       userLine("after"),
     ]);
 
-    expect(await readResumedModel("wide")).toBe("claude-opus-5");
+    expect((await readResumedTail("wide")).model).toBe("claude-opus-5");
   });
 
   it("reads the first line of the file", async () => {
     await transcript("single", [record("claude-opus-5")]);
 
-    expect(await readResumedModel("single")).toBe("claude-opus-5");
+    expect((await readResumedTail("single")).model).toBe("claude-opus-5");
   });
 
   it("returns undefined when no real model is recorded", async () => {
     await transcript("none", [userLine("hello"), record("<synthetic>")]);
 
-    expect(await readResumedModel("none")).toBeUndefined();
+    expect((await readResumedTail("none")).model).toBeUndefined();
   });
 
   const prompt = (text: string, extra: object = {}) => ({ ...userLine(text), ...extra });

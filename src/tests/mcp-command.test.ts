@@ -6,7 +6,6 @@ import { ClaudeAcpAgent, stripLocalCommandMetadata, type AcpClient } from "../ac
 import {
   cleanMcpError,
   formatMcpStatus,
-  isMcpCommandText,
   MCP_AVAILABLE_COMMAND,
   parseMcpCommand,
 } from "../mcp-command.js";
@@ -210,26 +209,19 @@ describe("parseMcpCommand", () => {
     });
     expect(parseMcpCommand("/mcp disable all")).toEqual({ action: "disable", all: true });
     expect(parseMcpCommand("/mcp enable")).toEqual({ action: "enable", all: false });
-    expect(parseMcpCommand("/mcp help")).toBeNull();
-  });
-});
-
-describe("isMcpCommandText", () => {
-  it("accepts the forms that Claude Code runs itself", () => {
-    expect(isMcpCommandText(" /mcp ")).toBe(true);
-    expect(isMcpCommandText("/mcp reconnect")).toBe(true);
-    expect(isMcpCommandText("/mcp reconnect all")).toBe(true);
-    expect(isMcpCommandText("/mcp Reconnect github")).toBe(true);
-    expect(isMcpCommandText("/mcp enable github")).toBe(true);
-    expect(isMcpCommandText("/mcp disable all")).toBe(true);
+    expect(parseMcpCommand(" /mcp ")).toEqual({ action: "status" });
   });
 
   it("rejects every other prompt", () => {
-    expect(isMcpCommandText("/mcp:github:prompt")).toBe(false);
-    expect(isMcpCommandText("/mcp help")).toBe(false);
-    expect(isMcpCommandText("/mcp list")).toBe(false);
-    expect(isMcpCommandText("/mcpx")).toBe(false);
-    expect(isMcpCommandText("please run /mcp")).toBe(false);
+    for (const text of [
+      "/mcp:github:prompt",
+      "/mcp help",
+      "/mcp list",
+      "/mcpx",
+      "please run /mcp",
+    ]) {
+      expect(parseMcpCommand(text)).toBeNull();
+    }
   });
 });
 
@@ -600,16 +592,6 @@ describe("/mcp", () => {
         formatMcpStatus(SERVERS),
       ].join("\n\n"),
     );
-  });
-
-  it("keeps the text of Claude Code when the control API is missing", async () => {
-    const { text, prompt } = setup({
-      query: { reconnectMcpServer: undefined, toggleMcpServer: undefined },
-    });
-
-    await prompt("/mcp reconnect db");
-
-    expect(text()).toBe(UNAVAILABLE);
   });
 
   it.each(["/mcp", "/mcp reconnect db"])(
