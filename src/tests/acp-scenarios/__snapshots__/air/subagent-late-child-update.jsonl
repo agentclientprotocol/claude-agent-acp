@@ -1,7 +1,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"description":"Check logs","sessionId":"agent_late","sessionUpdate":"subagent_update","title":"Check the logs"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"description":"Check logs","sessionId":"agent_late","sessionUpdate":"subagent_update","state":{"state":"running"},"title":"Check the logs"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_late","update":{"content":[{"text":"Check logs","type":"text"}],"messageId":"prompt","recipientSessionId":"agent_late","senderSessionId":"<session>","sessionUpdate":"session_message"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_late","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_late","toolName":"Read"}},"content":[],"kind":"read","locations":[],"name":"Read","sessionUpdate":"tool_call","status":"pending","title":"Read File","toolCallId":"toolu_late_read"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_late","update":{"locations":[{"line":1,"path":"/var/log/app.log"}],"rawInput":{"file_path":"/var/log/app.log"},"sessionUpdate":"tool_call_update","title":"Read /var/log/app.log","toolCallId":"toolu_late_read"}}}

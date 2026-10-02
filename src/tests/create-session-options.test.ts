@@ -18,6 +18,8 @@ let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
+let interruptImpl: (() => Promise<undefined>) | undefined;
+let closeSpy: ReturnType<typeof vi.fn<() => void>>;
 let mcpServerStatusResult: () => Promise<Array<{ name: string; status: string }>>;
 let mcpAuthenticateImpl: (serverName: string) => Promise<{
   authUrl?: string;
@@ -34,8 +36,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
-        interrupt: async () => undefined,
-        close: () => {},
+        interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
+        close: () => closeSpy(),
         initializationResult: async () => ({
           models: initModels ?? [
             {
@@ -86,6 +88,8 @@ describe("createSession options merging", () => {
     vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
     setModelImpl = undefined;
+    interruptImpl = undefined;
+    closeSpy = vi.fn<() => void>();
     mcpServerStatusResult = async () => [];
     mcpAuthenticateImpl = async () => ({
       requiresUserAction: false,
@@ -844,6 +848,36 @@ describe("createSession options merging", () => {
 
       expect(capturedOptions!.disallowedTools).toContain("WebSearch");
       expect(capturedOptions!.disallowedTools).not.toContain("AskUserQuestion");
+    });
+  });
+
+  describe("session/close right after session/new", () => {
+    it("answers at once and closes the query", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await agent.closeSession({ sessionId });
+
+      expect(closeSpy).toHaveBeenCalledOnce();
+      expect((agent as unknown as { sessions: Record<string, unknown> }).sessions[sessionId]).toBe(
+        undefined,
+      );
+    });
+
+    it("does not wait for an interrupt queued behind the background getContextUsage", async () => {
+      // SDK control requests are serialized. On a fresh session the background
+      // getContextUsage is still in flight, so a real CLI answers an interrupt
+      // only after it, which took ~3s and timed out the client's close.
+      contextUsageResult = () => new Promise<never>(() => {});
+      interruptImpl = () => new Promise<never>(() => {});
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      const closed = await Promise.race([
+        agent.closeSession({ sessionId }).then(() => "closed"),
+        new Promise((resolve) => setTimeout(() => resolve("timed out"), 500)),
+      ]);
+
+      expect(closed).toBe("closed");
+      expect(closeSpy).toHaveBeenCalledOnce();
     });
   });
 

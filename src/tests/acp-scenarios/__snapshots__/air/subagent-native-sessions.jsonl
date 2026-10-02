@@ -1,7 +1,7 @@
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":3}}}
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"description":"Make the build pass","sessionId":"agent_n","sessionUpdate":"subagent_update","title":"Fix the build"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"capabilities":{},"description":"Make the build pass","sessionId":"agent_n","sessionUpdate":"subagent_update","state":{"state":"running"},"title":"Fix the build"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"content":[{"text":"Make the build pass","type":"text"}],"messageId":"prompt","recipientSessionId":"agent_n","senderSessionId":"<session>","sessionUpdate":"session_message"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_native"}},"content":{"text":"Running t","type":"text"},"messageId":"msg_native_sub_1","sessionUpdate":"agent_message_chunk"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"agent_n","update":{"_meta":{"claudeCode":{"parentToolUseId":"toolu_native"}},"content":{"text":"he build.","type":"text"},"messageId":"msg_native_sub_1","sessionUpdate":"agent_message_chunk"}}}
