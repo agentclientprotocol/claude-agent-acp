@@ -513,6 +513,86 @@ describe("turn events", () => {
     ]);
   });
 
+  it("ends a held turn cancelled mid-followup after the output its interrupt flushes", async () => {
+    const trace: string[] = [];
+    onSessionUpdate = ({ update }) => {
+      if (
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text" &&
+        update.messageId?.startsWith("msg_")
+      ) {
+        trace.push(`chunk ${update.content.text}`);
+      }
+    };
+    const interrupted = Promise.withResolvers<void>();
+    const controls = {
+      interrupt: async () => {
+        trace.push("interrupt");
+        interrupted.resolve();
+      },
+    };
+    scriptQuery(async function* (input, options) {
+      const sessionId = options.sessionId!;
+      const idle = () => system("session_state_changed", sessionId, { state: "idle" });
+      const running = () => system("session_state_changed", sessionId, { state: "running" });
+      const first = (await input.next()).value;
+      yield echo(first, sessionId);
+      yield running();
+      yield system("task_started", sessionId, {
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        description: "Explore the project",
+        subagent_type: "Explore",
+      });
+      yield result(sessionId); // held for the subagent
+      yield idle();
+      yield system("task_notification", sessionId, {
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        status: "completed",
+        output_file: "",
+        summary: "done",
+      });
+      // The followup cycle writes the promised summary when the cancel comes.
+      yield running();
+      yield* streamedText("msg_followup", "Summary so far", sessionId);
+      await interrupted.promise;
+      yield stream(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ", stopped" } },
+        sessionId,
+      );
+      yield { ...result(sessionId), origin: { kind: "task-notification" } };
+      yield idle();
+      // A wedged next turn: an idle without a result is the issue #825 signal,
+      // which a leaked trailer debt would absorb.
+      const second = (await input.next()).value;
+      yield echo(second, sessionId);
+      yield idle();
+      yield result(sessionId);
+      await input.next();
+    }, controls);
+    const sessionId = await newSession();
+    const first = recordEvents(trace, "first");
+    const second = recordEvents(trace, "second");
+
+    await agent.startTurn(prompt(sessionId, "explore"), first.events);
+    await vi.waitFor(() => expect(trace).toContain("chunk Summary so far"));
+    await agent.cancel({ sessionId });
+    await first.done;
+    await agent.startTurn(prompt(sessionId, "next"), second.events);
+    await second.done;
+
+    expect(trace).toEqual([
+      expect.stringMatching(/^first inserted /),
+      "chunk Summary so far",
+      "interrupt",
+      "chunk , stopped",
+      "first ended cancelled",
+      expect.stringMatching(/^second inserted /),
+      expect.stringMatching(/^second failed /),
+    ]);
+  });
+
   it("does not insert a turn that a cancel ended while the previous turn was handed off", async () => {
     scriptTurns([
       async function* (options) {

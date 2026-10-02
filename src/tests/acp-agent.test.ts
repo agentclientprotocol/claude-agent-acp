@@ -17705,13 +17705,21 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
     await agent.cancel({ sessionId: "test-session" });
-    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    // The followup is live, so the turn ends at the interrupt's trailer, or,
+    // as here where that trailer lags, at the next prompt's echo.
     releaseAfterCancel();
 
     const second = await agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "next" }],
     });
+    // With the usage its own result recorded (issue #844).
+    await expect(first).resolves.toEqual(
+      expect.objectContaining({
+        stopReason: "cancelled",
+        usage: expect.objectContaining({ totalTokens: 15 }),
+      }),
+    );
     expect(second.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });
@@ -17998,13 +18006,15 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
     await agent.cancel({ sessionId: "test-session" });
-    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    // A live cycle, so the turn ends at the interrupt's trailer, or here, where
+    // that trailer lags, at the next prompt's echo.
     releaseAfterCancel();
 
     const second = await agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "next" }],
     });
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
     expect(second.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });

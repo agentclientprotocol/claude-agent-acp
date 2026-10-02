@@ -4756,7 +4756,7 @@ export class ClaudeAcpAgent {
             }
           }
           await compaction.interrupt();
-          await settleActive(turnOutcome(session, "cancelled"));
+          await settleActive(cancelledOutcome(session, session.activeTurn));
           // The cancelled turn's result may never come (that's why the
           // backstop fired) — close its delivery stretch here so partial
           // streamed text can't suppress the next turn's issue-#453 fallback.
@@ -4821,7 +4821,7 @@ export class ClaudeAcpAgent {
           );
           await settleActive(
             session.cancelled
-              ? turnOutcome(session, "cancelled")
+              ? cancelledOutcome(session, inFlight)
               : (inFlight?.deferredSettle ?? turnOutcome(session, stopReason)),
           );
           // Queued turns the SDK never started never ran, so reject them rather
@@ -5146,7 +5146,13 @@ export class ClaudeAcpAgent {
                   // the interrupted turn's tokens entirely (issue #844). Zero
                   // when the cancel pre-empted the result (wedge/force-cancel).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
-                    await settleActive(turnOutcome(session, "cancelled"));
+                    // A held turn's result passed long ago; this idle is the
+                    // trailer of the followup cycle the cancel interrupted,
+                    // whose result (an autonomous one) recorded it as owed.
+                    if (isHeldOpen(session.activeTurn) && session.owedTrailingIdles > 0) {
+                      session.owedTrailingIdles--;
+                    }
+                    await settleActive(cancelledOutcome(session, session.activeTurn));
                     // An interrupt can pre-empt the turn's result entirely
                     // (nothing ran the result-case `finally`), so close the
                     // delivery stretch here: idle is the SDK's authoritative
@@ -6560,7 +6566,7 @@ export class ClaudeAcpAgent {
                       session.owedTrailingIdles++;
                       // Before activateTurn resets the accumulator, so the
                       // usage still belongs to the cancelled turn.
-                      await settleActive(turnOutcome(session, "cancelled"));
+                      await settleActive(cancelledOutcome(session, session.activeTurn));
                     } else if (isHeldOpen(session.activeTurn)) {
                       // A turn held open for its background subagents (see
                       // Turn.deferredSettle) hands off with the real outcome
@@ -7257,15 +7263,26 @@ export class ClaudeAcpAgent {
 
     // A deferred active turn (see Turn.deferredSettle) already has its result
     // and is only held open for subagents. A settling turn likewise has its
-    // result but is awaiting the bounded checkpoint preview. Settle either one
-    // "cancelled" NOW: the consumer cannot process the interrupt's trailing
-    // idle while blocked in that preview, and a held turn may already be idle.
-    // The captured outcome preserves usage and metadata (issue #844), while
-    // reporter state makes a late checkpoint response harmless.
+    // result but is awaiting the bounded checkpoint preview. Settle it
+    // "cancelled" NOW where the consumer cannot: it cannot process the
+    // interrupt's trailing idle while blocked in that preview, and a held turn
+    // whose session sits idle gets no trailing idle (the interrupt emits
+    // nothing; with no state events consumed yet, the same is assumed).
+    // A held turn whose followup cycle is live (running, or blocked on a
+    // permission request) is left to that idle, like any live turn: the
+    // interrupt still flushes the cycle's output, which must reach the client
+    // before the turn ends cancelled. The captured outcome preserves usage and
+    // metadata (issue #844), while reporter state makes a late checkpoint
+    // response harmless.
     {
       const active = session.activeTurn;
-      const pendingOutcome = active?.deferredSettle ?? active?.settlingOutcome;
-      if (active && pendingOutcome && (isHeldOpen(active) || active.settling)) {
+      const followupLive =
+        session.lastSessionState === "running" || session.lastSessionState === "requires_action";
+      if (
+        active &&
+        (active.settling || (isHeldOpen(active) && !followupLive)) &&
+        (active.deferredSettle ?? active.settlingOutcome)
+      ) {
         session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
@@ -7279,17 +7296,16 @@ export class ClaudeAcpAgent {
         // text since the last boundary was its followups', and left latched
         // it would suppress a following replayed turn's issue-#453 fallback.
         session.emittedAssistantText = false;
-        // When the interrupt below pre-empts a live cycle — running, or
-        // blocked on a permission request (requires_action, the #866 shape
-        // users cancel out of) — it produces a trailer idle with no counted
-        // result; with the hold's own trailer typically already absorbed,
-        // that idle would be un-owed and could lag past the next prompt's
-        // echo — read as the fresh turn ending without a result (issue #825
-        // false-fail). Pre-count it unless the session sits idle: there the
-        // interrupt emits nothing, and a debt that never drains would mask
-        // one future #825 detection. (lastSessionState is last-CONSUMED, so
-        // both stale reads exist and both are accepted one-cycle windows: a
-        // running transition still in the backlog reads as stale idle and
+        // When the interrupt below pre-empts a live cycle (a settling turn's,
+        // or one no state event reported), it produces a trailer idle with no
+        // counted result; that idle would be un-owed and could lag past the
+        // next prompt's echo — read as the fresh turn ending without a result
+        // (issue #825 false-fail).
+        // Pre-count it unless the session sits idle: there the interrupt
+        // emits nothing, and a debt that never drains would mask one future
+        // #825 detection. (lastSessionState is last-CONSUMED, so both stale
+        // reads exist and both are accepted one-cycle windows: a running
+        // transition still in the backlog reads as stale idle and
         // under-counts — that false-fail additionally needs the trailer to
         // lag past the next echo — while a cycle already completed into the
         // backlog reads as stale non-idle and over-counts, masking one
@@ -7299,14 +7315,7 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        // Carries the held outcome's `_meta` too: a deferred outcome's only
-        // metadata is its quota breakdown, the counterpart of the usage taken
-        // from it here.
-        active.resolve({
-          stopReason: "cancelled",
-          usage: pendingOutcome.usage,
-          ...(pendingOutcome._meta ? { _meta: pendingOutcome._meta } : {}),
-        });
+        active.resolve(cancelledOutcome(session, active));
       }
     }
 
@@ -9904,6 +9913,20 @@ function turnOutcome(
     stopReason,
     usage: sessionUsage(session),
     _meta: { ...turnQuotaMeta(session), ...extraMeta },
+  };
+}
+
+/** The outcome of `turn` when a cancel ends it. A turn that already has its
+ *  result, because it is held open for its background subagents (see
+ *  Turn.deferredSettle) or is settling (see Turn.settlingOutcome), keeps the
+ *  usage and metadata that result recorded (issue #844). */
+function cancelledOutcome(session: Session, turn: Turn | null | undefined): TurnOutcome {
+  const recorded = turn?.deferredSettle ?? turn?.settlingOutcome;
+  if (!recorded) return turnOutcome(session, "cancelled");
+  return {
+    stopReason: "cancelled",
+    usage: recorded.usage,
+    ...(recorded._meta ? { _meta: recorded._meta } : {}),
   };
 }
 
