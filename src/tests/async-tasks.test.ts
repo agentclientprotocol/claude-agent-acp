@@ -395,6 +395,11 @@ describe("AsyncTaskRuntime", () => {
     expect(clientSupportsAsyncTasks({})).toBe(false);
   });
 
+  it("lets a client without AIR opt in through the async-tasks meta key", () => {
+    expect(clientSupportsAsyncTasks({ _meta: { "async-tasks": true } })).toBe(true);
+    expect(clientSupportsAsyncTasks({ _meta: { "async-tasks": "yes" } })).toBe(false);
+  });
+
   it("publishes one durable lifecycle with progress and a terminal state", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
