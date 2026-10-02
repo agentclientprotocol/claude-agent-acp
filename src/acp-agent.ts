@@ -8156,8 +8156,10 @@ export class ClaudeAcpAgent {
     // Do not rely on every ACP client settling requestPermission after the
     // cancellation signal. The local race guarantees that Claude's tool call
     // is released even when an older or broken client ignores $/cancel_request.
+    // The request goes to a subagent's child session for a tool call of that
+    // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(params.sessionId, () =>
+      return await this.withPendingUserInput(ownerSessionId, () =>
         raceWithAbort(this.client.requestPermission(params, signal), signal),
       );
     } catch (error) {
@@ -8313,7 +8315,13 @@ export class ClaudeAcpAgent {
           signal,
           permissionSessionId,
         );
-        return this.handleAskUserQuestion(permissionSessionId, toolInput, toolUseID, signal);
+        return this.handleAskUserQuestion(
+          sessionId,
+          permissionSessionId,
+          toolInput,
+          toolUseID,
+          signal,
+        );
       }
 
       // Do not auto-allow here based on the session's advertised mode. Claude
@@ -8506,9 +8514,12 @@ export class ClaudeAcpAgent {
    * Present the built-in AskUserQuestion tool's questions as an ACP form
    * elicitation and return the answers as the tool's `updatedInput`. Called from
    * `canUseTool` since that is where the SDK routes the tool's permission check.
+   * The elicitation goes to `requestSessionId`, a subagent's child session for
+   * a question it asks, and blocks the turn of `sessionId`.
    */
   private async handleAskUserQuestion(
     sessionId: string,
+    requestSessionId: string,
     toolInput: Record<string, unknown>,
     toolUseID: string,
     signal: AbortSignal,
@@ -8520,7 +8531,7 @@ export class ClaudeAcpAgent {
 
     const createRequest = askUserQuestionsToCreateRequest(
       questions,
-      sessionId,
+      requestSessionId,
       toolUseID,
       this.toolCallCapabilities.air.client,
     );

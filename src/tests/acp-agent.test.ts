@@ -18767,6 +18767,23 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  /** Gives test-session a native subagent, agent-42, whose child session the client knows. */
+  function announceChildSession(agent: ClaudeAcpAgent): void {
+    agent.sessions["test-session"].nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "child-session",
+          parentSessionId: "test-session",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+        },
+      ],
+    ]);
+  }
+
   it.each([
     {
       name: "a permission request",
@@ -18800,6 +18817,47 @@ describe("turn steering (_session/steering)", () => {
       response: { action: "accept", content: { question_0: "Blue" } },
     },
     {
+      name: "a permission request of a native subagent, sent to its child session",
+      start: async (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+        announceChildSession(agent);
+        return agent.canUseTool("test-session")("Bash", { command: "npm test" }, {
+          signal,
+          suggestions: [],
+          toolUseID: "tool-child-permission",
+          agentID: "agent-42",
+        } as any);
+      },
+      requestSessionId: "child-session",
+      response: { outcome: { outcome: "selected", optionId: "allow-once" } },
+    },
+    {
+      name: "an AskUserQuestion of a native subagent, sent to its child session",
+      start: async (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        await initializeClient(agent, {
+          subagents: {},
+          elicitation: { form: {}, url: {} },
+        } as ClientCapabilities);
+        announceChildSession(agent);
+        return agent.canUseTool("test-session")(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Pick a color",
+                header: "Color",
+                options: [{ label: "Blue", description: "Use blue" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          { signal, suggestions: [], toolUseID: "tool-child-question", agentID: "agent-42" } as any,
+        );
+      },
+      requestSessionId: "child-session",
+      response: { action: "accept", content: { question_0: "Blue" } },
+    },
+    {
       name: "an MCP elicitation",
       start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
         (agent as any).handleMcpElicitation("test-session", { form: true, url: true })(
@@ -18828,49 +18886,63 @@ describe("turn steering (_session/steering)", () => {
         ),
       response: { action: "accept", content: { choice: "retry_fallback" } },
     },
-  ])("uses priority:'later' while $name is pending", async ({ start, response }) => {
-    let resolveUserInput!: (response: any) => void;
-    const userInputResponse = new Promise<any>((resolve) => (resolveUserInput = resolve));
-    const userInputRequest = vi.fn(() => userInputResponse);
-    const input = new Pushable<any>();
-    const inputPush = vi.spyOn(input, "push");
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async () => {},
-        requestPermission: userInputRequest,
-        createElicitation: userInputRequest,
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    agent.sessions["test-session"] = mockSessionState({
-      input,
-      turnQueue: [
+  ])(
+    "uses priority:'later' while $name is pending",
+    async ({
+      start,
+      response,
+      requestSessionId = "test-session",
+    }: {
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) => Promise<unknown>;
+      response: unknown;
+      requestSessionId?: string;
+    }) => {
+      let resolveUserInput!: (response: any) => void;
+      const userInputResponse = new Promise<any>((resolve) => (resolveUserInput = resolve));
+      const userInputRequest = vi.fn(() => userInputResponse);
+      const input = new Pushable<any>();
+      const inputPush = vi.spyOn(input, "push");
+      const agent = new ClaudeAcpAgent(
         {
-          promptUuid: "running",
-          isLocalOnlyCommand: false,
-          settled: false,
-          resolve: () => {},
-          reject: () => {},
-        },
-      ],
-    });
+          sessionUpdate: async () => {},
+          requestPermission: userInputRequest,
+          createElicitation: userInputRequest,
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      agent.sessions["test-session"] = mockSessionState({
+        input,
+        turnQueue: [
+          {
+            promptUuid: "running",
+            isLocalOnlyCommand: false,
+            settled: false,
+            resolve: () => {},
+            reject: () => {},
+          },
+        ],
+      });
 
-    const pending = start(agent, new AbortController().signal);
-    await waitFor(() => userInputRequest.mock.calls.length === 1);
+      const pending = start(agent, new AbortController().signal);
+      await waitFor(() => userInputRequest.mock.calls.length === 1);
+      expect((userInputRequest.mock.calls[0] as unknown[])[0]).toMatchObject({
+        sessionId: requestSessionId,
+      });
 
-    await expect(
-      agent.steer({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "also handle this" }],
-      }),
-    ).resolves.toEqual({ outcome: "injected" });
-    expect(inputPush).toHaveBeenCalledTimes(1);
-    expect(inputPush.mock.calls[0][0].priority).toBe("later");
+      await expect(
+        agent.steer({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "also handle this" }],
+        }),
+      ).resolves.toEqual({ outcome: "injected" });
+      expect(inputPush).toHaveBeenCalledTimes(1);
+      expect(inputPush.mock.calls[0][0].priority).toBe("later");
 
-    resolveUserInput(response);
-    await pending;
-    expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
-  });
+      resolveUserInput(response);
+      await pending;
+      expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
+    },
+  );
 
   it("publishes an optimistic goal update for a steered goal replacement", async () => {
     const updates: any[] = [];
