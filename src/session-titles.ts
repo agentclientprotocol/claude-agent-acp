@@ -18,8 +18,7 @@ import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
 
-/** AIR ignores a session title longer than 160 characters. */
-const MAX_TITLE_LENGTH = 160;
+const MAX_TITLE_LENGTH = 256;
 
 /** How much session text the title is generated from. The CLI caps its own
  *  title input at the same 1000 trailing characters. */
