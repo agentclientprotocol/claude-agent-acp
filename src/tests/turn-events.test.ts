@@ -4,7 +4,7 @@
  * Claude Code: it echoes each prompt, then runs the turn's script.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
+import type { RequestPermissionRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import type { TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
@@ -133,17 +133,24 @@ function recordEvents() {
 describe("turn events", () => {
   let agent: ClaudeAcpAgent;
   let permissionRequests: RequestPermissionRequest[];
+  /** The user answers a request for this tool call only once it resolves. */
+  let backgroundAnswer: PromiseWithResolvers<void>;
+  /** Sees each session update; the agent waits until it returns. */
+  let onSessionUpdate: (notification: SessionNotification) => Promise<void> | void;
 
   beforeEach(async () => {
     vi.resetModules();
     permissionRequests = [];
+    backgroundAnswer = Promise.withResolvers<void>();
+    onSessionUpdate = () => {};
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
     agent = new ClaudeAcpAgent({
-      sessionUpdate: async () => {},
+      sessionUpdate: async (notification: SessionNotification) => onSessionUpdate(notification),
       extNotification: async () => {},
       requestPermission: async (request: RequestPermissionRequest) => {
         permissionRequests.push(request);
         await new Promise((resolve) => setTimeout(resolve, 1));
+        if (request.toolCall.toolCallId === "toolu_background") await backgroundAnswer.promise;
         const allow = request.options.find((option) => option.kind === "allow_once");
         return { outcome: { outcome: "selected", optionId: allow!.optionId } };
       },
@@ -210,6 +217,62 @@ describe("turn events", () => {
     expect(turn.log.slice(1)).toEqual(["awaitingUser", "resumed", "ended end_turn"]);
   });
 
+  it("awaits the user while any request in the session is open, also one opened before the turn", async () => {
+    const first = recordEvents();
+    const second = recordEvents();
+    let backgroundRequest: Promise<unknown> | undefined;
+    let atStart: string[] = [];
+    let afterOwnAnswer: string[] | undefined;
+    scriptTurns([
+      async function* (options) {
+        yield result(options.sessionId!);
+        await first.done;
+        // A request that no active turn opened, such as a background task's.
+        backgroundRequest = options.canUseTool(
+          "Bash",
+          { command: "sleep 60" },
+          { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
+        );
+      },
+      async function* (options) {
+        atStart = [...second.log];
+        await options.canUseTool(
+          "Bash",
+          { command: "ls" },
+          { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_ls" },
+        );
+        afterOwnAnswer = [...second.log];
+        await backgroundRequest;
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_ls", content: "README.md" }],
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId!,
+        };
+        yield result(options.sessionId!);
+      },
+    ]);
+    const sessionId = await newSession();
+
+    await agent.startTurn(prompt(sessionId, "start a background task"), first.events);
+    await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
+    await agent.startTurn(prompt(sessionId, "list files"), second.events);
+    await vi.waitFor(() => expect(afterOwnAnswer).toBeDefined());
+    backgroundAnswer.resolve();
+    await second.done;
+
+    expect(first.log.slice(1)).toEqual(["ended end_turn"]);
+    // Waiting from insertion, through its own answered request, until the
+    // earlier request is answered too.
+    expect(atStart.slice(1)).toEqual(["awaitingUser"]);
+    expect(afterOwnAnswer!.slice(1)).toEqual(["awaitingUser"]);
+    expect(second.log.slice(1)).toEqual(["awaitingUser", "resumed", "ended end_turn"]);
+  });
+
   it("ends a queued turn that is cancelled before it is inserted, without inserting it", async () => {
     const release = Promise.withResolvers<void>();
     scriptTurns([
@@ -248,6 +311,60 @@ describe("turn events", () => {
 
     expect(first.log).toEqual([expect.stringMatching(/^inserted /), "ended cancelled"]);
     expect(queued.log).toEqual(["ended cancelled"]);
+  });
+
+  it("does not insert a turn that a cancel ended while the previous turn was handed off", async () => {
+    scriptTurns([
+      async function* (options) {
+        // The turn ends with a tool call that never got its result.
+        yield {
+          type: "assistant",
+          message: {
+            id: "msg_tool",
+            type: "message",
+            role: "assistant",
+            model: "default",
+            content: [
+              { type: "tool_use", id: "toolu_open", name: "Bash", input: { command: "ls" } },
+            ],
+            stop_reason: "tool_use",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId!,
+        };
+      },
+      async function* () {},
+    ]);
+    agent.forceCancelGraceMs = 10;
+    // The hand-off to the second turn fails the open tool call; hold that update.
+    const failedToolCall = Promise.withResolvers<void>();
+    const releaseUpdate = Promise.withResolvers<void>();
+    onSessionUpdate = async ({ update }) => {
+      if (update.sessionUpdate === "tool_call_update" && update.status === "failed") {
+        failedToolCall.resolve();
+        await releaseUpdate.promise;
+      }
+    };
+    const sessionId = await newSession();
+    const first = recordEvents();
+    const second = recordEvents();
+
+    await agent.startTurn(prompt(sessionId, "first"), first.events);
+    await vi.waitFor(() => expect(first.log).toHaveLength(1));
+    await agent.startTurn(prompt(sessionId, "second"), second.events);
+    await failedToolCall.promise;
+    const cancelling = agent.cancel({ sessionId });
+    await vi.waitFor(() => expect(second.log).toEqual(["ended cancelled"]));
+    releaseUpdate.resolve();
+    await Promise.all([cancelling, first.done]);
+    // The hand-off then activates the second turn in promise continuations,
+    // which all run before a timer.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(second.log).toEqual(["ended cancelled"]);
   });
 
   it("fails a queued turn without inserting it when the query ends", async () => {

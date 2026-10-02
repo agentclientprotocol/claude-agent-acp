@@ -5,26 +5,39 @@
  * maps the events to its own messages. ACP v1 answers `session/prompt` when the
  * turn ends or fails. ACP v2 answers it when the prompt is inserted, and
  * reports the rest as session state.
+ *
+ * The agent calls these synchronously while it updates its own state, so a
+ * handler must not throw, nor call back into the agent before it returns.
  */
 export interface TurnEvents {
   /**
-   * The prompt is now the user message `messageId` of the conversation, and
-   * the agent works on it. Reported at most once per turn, and never after
-   * {@link ended} or {@link failed}.
+   * Claude Code took the prompt in as the user message `messageId` of the
+   * conversation. Reported at most once per turn, and never after
+   * {@link ended} or {@link failed}. For a prompt Claude Code echoes, that is
+   * the echo; for a command it does not echo (such as `/compact`), it is the
+   * command's result, after any output the command streamed.
    */
   inserted(messageId: string): void;
-  /** The turn waits for the user to answer a permission request or a question. */
+  /**
+   * The turn waits for the user: a permission request or a question is open in
+   * the session. Requests do not say which prompt they are for, so this
+   * includes one opened before the turn was inserted. Only reported after
+   * {@link inserted}.
+   */
   awaitingUser(): void;
-  /** The turn works again: the user answered every open request. */
+  /**
+   * The turn works again: no request is open any more. A turn that ends or
+   * fails while it waits reports that instead.
+   */
   resumed(): void;
   /**
    * The turn ended. A queued turn that is cancelled before it is inserted
-   * ends too, without {@link inserted}.
+   * ends too, without {@link inserted}; Claude Code may still run its prompt.
    */
   ended(outcome: TurnOutcome): void;
   /**
-   * The turn failed. Without {@link inserted} before, the prompt never
-   * reached the conversation.
+   * The turn failed. Without {@link inserted} before, Claude Code was not seen
+   * taking the prompt in.
    */
   failed(error: unknown): void;
 }

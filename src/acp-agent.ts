@@ -601,8 +601,8 @@ type Turn = {
    *  activates the same turn again in the fresh session, which must not report
    *  it twice. */
   insertedReported?: boolean;
-  /** Set between `events.awaitingUser` and `events.resumed`, so the two stay
-   *  paired although the pending-input count is session-wide. */
+  /** Whether the turn last reported that it awaits the user, so that
+   *  `syncAwaitingUser` reports only changes. */
   awaitingUser?: boolean;
   /** Tools surfaced during this turn, awaiting completion or an explicit
    *  background handoff. Intersect with emittedToolCalls at settlement so
@@ -3164,8 +3164,9 @@ export class ClaudeAcpAgent {
 
   /**
    * Starts a turn for a prompt. Resolves once the prompt is queued for Claude
-   * Code, and rejects when the prompt is refused before that. From then on,
-   * `events` reports how the turn goes (see {@link TurnEvents}).
+   * Code, and rejects only when the prompt is refused before that. From then
+   * on, `events` reports how the turn goes (see {@link TurnEvents}), possibly
+   * before this resolves.
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
     if (this.providerUpdate) await this.providerUpdate;
@@ -3252,7 +3253,11 @@ export class ClaudeAcpAgent {
     session.turnQueue.push(turn);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
-    await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid);
+    // The prompt is queued, so its turn goes ahead even if the client misses
+    // the goal it sets; the turn's events report the outcome.
+    await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
+      this.logger.error(`Session ${params.sessionId}: failed to publish the prompt's goal:`, error),
+    );
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -4024,10 +4029,15 @@ export class ClaudeAcpAgent {
       resetTurnScratch();
       // Activation is when Claude Code takes the prompt in: its echo, or for an
       // echo-less command, its result. That inserts it into the conversation.
-      if (!turn.insertedReported) {
+      // A turn can be settled by now: an echo hand-off awaits settling the
+      // previous turn, and a cancel in that window settles the queued one.
+      if (!turn.insertedReported && !turn.settled) {
         turn.insertedReported = true;
         turn.events.inserted(turn.promptUuid);
       }
+      // A request can already be open: Claude Code asks for a queued prompt
+      // before the consumer reaches its echo.
+      this.syncAwaitingUser(session);
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -7819,25 +7829,34 @@ export class ClaudeAcpAgent {
    *  of its promise. Steering consults this session-local count synchronously,
    *  so a message arriving while any permission/elicitation card is open uses
    *  non-interrupting SDK delivery. The active turn reports that it awaits the
-   *  user while any such request is open (see {@link TurnEvents}). */
+   *  user while any such request is open (see `syncAwaitingUser`). */
   private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
     session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
-    const turn = session.activeTurn?.settled === false ? session.activeTurn : undefined;
-    if (turn && !turn.awaitingUser) {
-      turn.awaitingUser = true;
-      turn.events.awaitingUser();
-    }
+    this.syncAwaitingUser(session);
     try {
       return await request();
     } finally {
       session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
-      if (session.pendingUserInputCount === 0 && turn?.awaitingUser && !turn.settled) {
-        turn.awaitingUser = false;
-        turn.events.resumed();
-      }
+      this.syncAwaitingUser(session);
     }
+  }
+
+  /** Report whether the session's active turn awaits the user: exactly while
+   *  a permission request or question is open in the session. A request does
+   *  not say which prompt it is for, and Claude Code can ask for a queued
+   *  prompt before the consumer activates it, so a request is not tied to the
+   *  turn that was active when it opened. Called when the count changes and
+   *  when a turn activates. */
+  private syncAwaitingUser(session: Session): void {
+    const turn = session.activeTurn;
+    if (!turn || turn.settled || !turn.insertedReported) return;
+    const waiting = (session.pendingUserInputCount ?? 0) > 0;
+    if (waiting === (turn.awaitingUser ?? false)) return;
+    turn.awaitingUser = waiting;
+    if (waiting) turn.events.awaitingUser();
+    else turn.events.resumed();
   }
 
   /** Forward a permission request to the client, wiring the tool call's

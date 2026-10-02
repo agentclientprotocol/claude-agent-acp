@@ -16683,11 +16683,25 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         },
       );
 
+      // The fresh query activates the same turn again; it is inserted once.
+      const inserted: string[] = [];
+      const startTurn = agent.startTurn.bind(agent);
+      vi.spyOn(agent, "startTurn").mockImplementation((params, events) =>
+        startTurn(params, {
+          ...events,
+          inserted: (messageId) => {
+            inserted.push(messageId);
+            events.inserted(messageId);
+          },
+        }),
+      );
+
       const response = await agent.prompt({
         sessionId: "test-session",
         prompt: [{ type: "text", text: "plan" }],
       });
 
+      expect(inserted).toHaveLength(1);
       expect(createSession).toHaveBeenCalledWith(
         expect.objectContaining({ cwd: "/test" }),
         expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
