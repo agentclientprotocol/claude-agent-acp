@@ -4714,11 +4714,16 @@ export class ClaudeAcpAgent {
           .then((result) => ({ kind: "message" as const, result }));
         const nextMessage = pendingNext;
         // Fresh abort listener per iteration, removed when next() wins, so a
-        // long-lived session doesn't accumulate listeners on one signal.
+        // long-lived session doesn't accumulate listeners on one signal. An
+        // abort that fired while the consumer was busy elsewhere, such as
+        // sending an update, still wakes it: a listener added to an aborted
+        // signal never fires. The consumer re-arms after each abort it
+        // handles, so an aborted signal here is always an unhandled abort.
         let onAbort!: () => void;
         const abortRace = new Promise<"abort">((resolve) => {
           onAbort = () => resolve("abort");
-          cancelController.signal.addEventListener("abort", onAbort, { once: true });
+          if (cancelController.signal.aborted) onAbort();
+          else cancelController.signal.addEventListener("abort", onAbort, { once: true });
         });
         const raced = await Promise.race([nextMessage, abortRace]);
         cancelController.signal.removeEventListener("abort", onAbort);

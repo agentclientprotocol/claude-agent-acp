@@ -513,6 +513,39 @@ describe("turn events", () => {
     ]);
   });
 
+  it("ends a cancelled turn when the force-cancel fires while an update is being sent", async () => {
+    // Claude Code streams an answer, then wedges: no result, no idle, even
+    // after the interrupt (issue #680). Only the force-cancel can end the turn.
+    const promptUuids = scriptTurns([
+      async function* (options) {
+        for (const message of streamedText("msg_answer", "Hi", options.sessionId!)) {
+          yield message;
+        }
+        await new Promise(() => {});
+      },
+    ]);
+    const sessionId = await newSession();
+    agent.forceCancelGraceMs = 10;
+    const turn = recordEvents();
+    // The client takes the answer's text slowly, so the consumer is still
+    // sending it when the force-cancel fires.
+    const chunkSeen = Promise.withResolvers<void>();
+    onSessionUpdate = async ({ update }) => {
+      if (update.sessionUpdate !== "agent_message_chunk" || update.messageId !== "msg_answer") {
+        return;
+      }
+      chunkSeen.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    };
+
+    await agent.startTurn(prompt(sessionId, "hello"), turn.events);
+    await chunkSeen.promise;
+    await agent.cancel({ sessionId });
+    await Promise.race([turn.done, new Promise((resolve) => setTimeout(resolve, 1_000))]);
+
+    expect(turn.log).toEqual([`inserted ${promptUuids[0]}`, "ended cancelled"]);
+  });
+
   it("ends a held turn cancelled mid-followup after the output its interrupt flushes", async () => {
     const trace: string[] = [];
     onSessionUpdate = ({ update }) => {
