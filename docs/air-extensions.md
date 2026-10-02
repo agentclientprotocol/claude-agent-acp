@@ -46,7 +46,7 @@ Each extension is shaped so that it can become a first-class ACP API later.
 ## Compatibility rule
 
 An AIR client declares `initialize.clientCapabilities._meta.jetbrains.air` (see [Client declaration](#client-declaration)).
-Every extension in this document applies only to an AIR client.
+Every extension in this document except [Goal](#goal) applies only to an AIR client.
 
 A client that does not declare `_meta.jetbrains.air` is not AIR. Zed is such a client.
 It gets the same information in the same fields as from the upstream adapter:
@@ -56,7 +56,7 @@ It gets the same information in the same fields as from the upstream adapter:
 - the keys of other teams: `steering`, `quota`, `authStatus`, and `gateway`.
 
 It gets no key that exists only for AIR.
-It gets no `_meta.jetbrains.air` key at all, and none of the removed upstream copies of an AIR key (see [Removed keys](#removed-keys)).
+It gets no `_meta.jetbrains.air` key at all. A client that opts into the goal extension receives the provider-neutral top-level `_meta.goal`; other removed upstream copies of AIR keys remain absent (see [Removed keys](#removed-keys)).
 
 The adapter leaves out only repeated data for such a client:
 
@@ -104,6 +104,12 @@ The adapter accepts a capability only when all of these are true:
 
 A malformed declaration enables no capability.
 
+A non-AIR client opts into the goal extension with an empty top-level marker:
+
+```json
+{ "clientCapabilities": { "_meta": { "goal": {} } } }
+```
+
 ### Agent declaration
 
 The `initialize` response of an AIR client carries the agent side of the extension:
@@ -137,7 +143,7 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 
 The agent list does not depend on the capabilities that AIR declares.
 An extension is active only when the client declared its capability.
-The response to a client that is not AIR has no `_meta.jetbrains` key.
+The response to a client that is not AIR has no `_meta.jetbrains` key. An opted-in non-AIR client receives the same `goal` capability at top-level `_meta.goal`.
 
 ### Capabilities
 
@@ -155,8 +161,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 The adapter ignores `planContentDelta`.
 Claude does not stream a plan, so the adapter never sends `contentDelta` (see [Plan file](#plan-file)).
 
-The goal extension has no client capability.
-The agent advertises the `goal` object, and the client uses the control method when it wants to.
+AIR receives the goal extension without a separate capability. A non-AIR client must opt in with `clientCapabilities._meta.goal: {}`.
 
 ## AIR metadata keys
 
@@ -707,11 +712,11 @@ The goal extension exposes a long-running, session-scoped objective.
 It is shaped like a possible future first-class ACP API.
 The payload has no provider-specific fields.
 
-The goal extension applies only to an AIR client.
+The goal extension applies to AIR and to a non-AIR client that declares `clientCapabilities._meta.goal: {}`.
 
 ### Capability
 
-The `initialize` response to AIR advertises the goal support:
+The `initialize` response advertises goal support at `_meta.jetbrains.air.goal` for AIR and at `_meta.goal` for an opted-in non-AIR client:
 
 ```json
 { "version": 1, "controlMethod": "_session/goal", "actions": ["set", "clear"] }
@@ -733,7 +738,7 @@ Cancelling a turn does not clear the goal. A client uses the control method to r
 
 ### Session state
 
-The adapter publishes the current snapshot in `session_info_update._meta.jetbrains.air.goal`.
+The adapter publishes the current snapshot in `session_info_update._meta.jetbrains.air.goal` for AIR and `session_info_update._meta.goal` for an opted-in non-AIR client.
 Clearing a goal publishes `goal: null`.
 
 ```json
@@ -1259,13 +1264,13 @@ The adapter sends the key only to an AIR client.
 
 ## Removed keys
 
-These keys moved into the AIR namespace. The adapter sends the new key only to AIR, and the old key to no client.
+These keys moved into the AIR namespace. Goal is also available at the old top-level key when a non-AIR client opts in.
 
-| Old key                                                   | New key                                 |
-| --------------------------------------------------------- | --------------------------------------- |
-| `initialize._meta.goal`, `session_info_update._meta.goal` | `_meta.jetbrains.air.goal`, same shape  |
-| mode `_meta.kind`, config option value `_meta.kind`       | `_meta.jetbrains.air.kind`              |
-| tool call `_meta.contextCompaction`                       | `_meta.jetbrains.air.contextCompaction` |
+| Old key                                                   | New key                                                                   |
+| --------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `initialize._meta.goal`, `session_info_update._meta.goal` | `_meta.jetbrains.air.goal` for AIR; retained for opted-in non-AIR clients |
+| mode `_meta.kind`, config option value `_meta.kind`       | `_meta.jetbrains.air.kind`                                                |
+| tool call `_meta.contextCompaction`                       | `_meta.jetbrains.air.contextCompaction`                                   |
 
 The adapter does not send `_meta.claudeCode.title`, `claudeCode.subagent`, `claudeCode.skill`, or `claudeCode.skillPath` to any client.
 AIR reads `_meta.jetbrains.air.commandTitle`, `subagent`, and `skill` instead.

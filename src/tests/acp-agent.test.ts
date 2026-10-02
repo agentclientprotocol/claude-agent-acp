@@ -18308,6 +18308,54 @@ describe("turn steering (_session/steering)", () => {
     });
   });
 
+  it("advertises and publishes goals for an opted-in non-AIR client", async () => {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const response = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: { _meta: { goal: {} } },
+    });
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const prompt = await input[Symbol.asyncIterator]().next();
+        yield userEcho(prompt.value);
+        yield createResultMessage();
+        yield idleMessage();
+      }
+      return messageGenerator();
+    });
+
+    expect(response._meta?.goal).toEqual({
+      version: 1,
+      controlMethod: GOAL_CONTROL_METHOD,
+      actions: ["set", "clear"],
+    });
+    expect(response._meta).not.toHaveProperty("jetbrains");
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "/goal Ship the change" }],
+    });
+    expect(updates).toContainEqual({
+      sessionId: "test-session",
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: {
+          goal: {
+            objective: "Ship the change",
+            status: "active",
+            controlMethod: GOAL_CONTROL_METHOD,
+          },
+        },
+      },
+    });
+  });
+
   it("submits set and clear through the session prompt queue when the session is idle", async () => {
     const agent = createMockAgent();
     const prompt = vi.spyOn(agent, "prompt").mockResolvedValue({ stopReason: "end_turn" });

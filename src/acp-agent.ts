@@ -95,6 +95,7 @@ import {
   GoalRequest,
   GoalControlResponse,
   GoalSnapshot,
+  goalMeta,
   goalUpdateFromPrompt,
   parseGoalRequest,
   toGoalSnapshot,
@@ -121,7 +122,6 @@ import {
   AIR_ASYNC_TASKS_CAPABILITY,
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
-  AIR_GOAL_KEY,
   AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   AIR_SKILL_PATH_KEY,
@@ -2700,27 +2700,25 @@ export class ClaudeAcpAgent {
       // Top-level `_meta` (sibling of `agentCapabilities`), per the existing ACP
       // steering extension contract: advertises the `_session/steering` request
       // so clients know they may inject a follow-up into a running turn.
-      // Only AIR gets the AIR capabilities and the goal capability, under
-      // `jetbrains.air`.
       _meta: {
-        ...(this.toolCallCapabilities.air.client
-          ? withAirMeta(
-              airSessionFailureCapabilityMeta(
+        ...goalMeta(
+          this.clientCapabilities,
+          {
+            version: GOAL_EXTENSION_VERSION,
+            controlMethod: GOAL_CONTROL_METHOD,
+            actions: [...GOAL_ACTIONS],
+          } satisfies GoalCapability,
+          this.toolCallCapabilities.air.client
+            ? airSessionFailureCapabilityMeta(
                 AGENT_FILE_CHANGE_REPORT_CAPABILITY,
                 AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
                 AIR_ASYNC_TASKS_CAPABILITY,
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
-              ),
-              AIR_GOAL_KEY,
-              {
-                version: GOAL_EXTENSION_VERSION,
-                controlMethod: GOAL_CONTROL_METHOD,
-                actions: [...GOAL_ACTIONS],
-              } satisfies GoalCapability,
-            )
-          : {}),
+              )
+            : undefined,
+        ),
         steering: {
           supported: true,
         },
@@ -3624,13 +3622,13 @@ export class ClaudeAcpAgent {
     if (session) {
       session.lastPublishedGoal = goal;
     }
-    // The goal is an AIR extension: only AIR gets it.
-    if (!this.toolCallCapabilities.air.client) return;
+    const meta = goalMeta(this.clientCapabilities, goal);
+    if (!meta) return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "session_info_update",
-        _meta: withAirMeta(undefined, AIR_GOAL_KEY, goal),
+        _meta: meta,
       },
     });
   }
