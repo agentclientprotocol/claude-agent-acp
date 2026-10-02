@@ -12399,6 +12399,66 @@ describe("assembled assistant text fallback", () => {
     expect(messageChunkTexts(updates)).toEqual(["hello ", "world"]);
   });
 
+  it.each([
+    [
+      "complete tag",
+      ['Before <cc-memory filenames="MEMORY.md">memory</cc-memory> after'],
+      "Before memory after",
+      "",
+    ],
+    [
+      "split tag",
+      ["Before <cc-", 'memory filenames="MEMORY.md">memory</cc-', "memory> after"],
+      "Before memory after",
+      "",
+    ],
+    ["partial answer", ["Before <cc-memory>memory</cc-memory>"], "Before memory after", " after"],
+    ["literal tag", ["`<cc-memory>`"], "``", ""],
+    ["only tags", ["<cc-memory></cc-memory>"], "", ""],
+    ["different content", ["<cc-memory>first</cc-memory>"], "second", "second"],
+    ["similar tag", ["<cc-memoryExtra>first</cc-memoryExtra>"], "first", "first"],
+    ["untransformed message", ["<cc-memory>first</cc-memory>"], "<cc-memory>first</cc-memory>", ""],
+  ])(
+    "dedupes cc-memory text without losing the remainder: %s",
+    async (_label, chunks, full, tail) => {
+      const { agent, updates } = createMockAgentWithCapture();
+      injectSession(agent, [
+        messageStart("msg-memory"),
+        ...(chunks as string[]).map(textDelta),
+        assistantMessage("msg-memory", [{ type: "text", text: full }]),
+        result(),
+        idle,
+      ]);
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+      expect(messageChunkTexts(updates)).toEqual([
+        ...(chunks as string[]),
+        ...(tail ? [tail] : []),
+      ]);
+    },
+  );
+
+  it("dedupes cc-memory transformations in thinking and text independently", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      messageStart("msg-memory-mixed"),
+      thinkingDelta("<cc-memory>reason</cc-memory>"),
+      textDelta("<cc-memory>answer</cc-memory>"),
+      assistantMessage("msg-memory-mixed", [
+        { type: "thinking", thinking: "reason" },
+        { type: "text", text: "answer and tail" },
+      ]),
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+
+    expect(thoughtChunkTexts(updates)).toEqual(["<cc-memory>reason</cc-memory>"]);
+    expect(messageChunkTexts(updates)).toEqual(["<cc-memory>answer</cc-memory>", " and tail"]);
+  });
+
   it("dedupes streamed text even when the stream arrives before the user echo", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     // Production ordering: the SDK emits the assistant's stream events before it
