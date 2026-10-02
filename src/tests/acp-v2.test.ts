@@ -1036,9 +1036,19 @@ describe("ACP v2 session translation", () => {
   });
 
   it("fails on session updates that it does not translate yet", () => {
-    expect(() => v2SessionUpdate({ sessionUpdate: "plan", entries: [] })).toThrow(
-      "does not translate plan session updates yet",
-    );
+    expect(() =>
+      v2SessionUpdate({ sessionUpdate: "compaction_update", compactionId: "c", status: "started" }),
+    ).toThrow("does not translate compaction_update session updates yet");
+  });
+
+  it("reports the plan of the session as one v2 plan", () => {
+    const entries = [{ content: "Test", priority: "high" as const, status: "pending" as const }];
+    const meta = { claudeCode: { parentToolUseId: "toolu_agent" } };
+    expect(v2SessionUpdate({ sessionUpdate: "plan", entries, _meta: meta })).toEqual({
+      sessionUpdate: "plan_update",
+      plan: { type: "items", planId: "plan", entries },
+      _meta: meta,
+    });
   });
 
   it("reports a new tool call with an upserting tool_call_update", () => {

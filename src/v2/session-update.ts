@@ -8,6 +8,13 @@ import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
 import { v2ToolCallUpdate } from "./tool-call.js";
 
 /**
+ * The id of the plan of a session. v1 has one plan per session, which every
+ * plan update replaces whole, from TodoWrite and from the Task tools alike.
+ * v2 tracks plans by id, so that plan gets one.
+ */
+export const SESSION_PLAN_ID = "plan";
+
+/**
  * The v2 form of a v1 session update, or `undefined` when v2 has no
  * counterpart and the update tells a v2 client nothing new.
  *
@@ -39,6 +46,13 @@ export function v2SessionUpdate(
     case "tool_call":
     case "tool_call_update":
       return v2ToolCallUpdate(update);
+    case "plan":
+      // A v2 plan of items is replaced whole as well.
+      return {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: SESSION_PLAN_ID, entries: update.entries },
+        ...(update._meta != null ? { _meta: update._meta } : {}),
+      };
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

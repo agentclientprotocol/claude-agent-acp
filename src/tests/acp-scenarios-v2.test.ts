@@ -61,8 +61,6 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PASSES = "passes";
 /** Step 4 of `docs/acp-v2.md`. */
 const REPLAY = "Invalid params: The ACP v2 surface does not replay session history yet";
-/** Step 5 of `docs/acp-v2.md`. */
-const PLANS = "The ACP v2 surface does not translate plan session updates yet";
 
 /**
  * How each scenario runs on the v2 surface: it passes, or stops for a reason
@@ -91,8 +89,8 @@ const V2_STATUS: Record<string, string> = {
   "subagent-nested": PASSES,
   "subagent-late-child-update": PASSES,
   "subagent-transcript-extension": PASSES,
-  "todo-write": PLANS,
-  "task-create-update": PLANS,
+  "todo-write": PASSES,
+  "task-create-update": PASSES,
   goal: PASSES,
   "network-permission": PASSES,
   "exit-plan-approve": PASSES,
