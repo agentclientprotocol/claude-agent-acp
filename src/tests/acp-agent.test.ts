@@ -10753,6 +10753,142 @@ describe("getOrCreateSession param change detection", () => {
   });
 });
 
+// Regression test for https://github.com/agentclientprotocol/claude-agent-acp/issues/1011:
+// two session/load (or session/resume) calls racing for the same sessionId
+// must not both decide to tear down and recreate it, which would spawn two
+// Claude Agent subprocesses and orphan whichever one loses the race to
+// overwrite `agent.sessions[sessionId]` last.
+describe("getOrCreateSession concurrency (issue #1011)", () => {
+  function createMockAgent() {
+    const mockClient = {
+      sessionUpdate: async () => {},
+    } as unknown as AcpClient;
+    return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+  }
+
+  function injectStaleSession(agent: ClaudeAcpAgent, sessionId: string, cwd: string) {
+    function* empty() {}
+    const gen = Object.assign(empty(), {
+      interrupt: vi.fn(),
+      close: vi.fn(),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+    });
+    agent.sessions[sessionId] = {
+      query: gen as any,
+      input: new Pushable(),
+      cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
+      cwd,
+      sessionFingerprint: computeSessionFingerprint({ cwd, mcpServers: [], _meta: undefined }),
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      configOptions: [],
+      fastModeEnabled: false,
+      abortController: new AbortController(),
+      emitRawSDKMessages: false,
+      forwardSubagentText: false,
+      contextWindowSize: 200000,
+      contextWindowAuthoritative: false,
+      providerCacheKey: "default",
+      taskState: new Map(),
+      toolUseCache: {},
+      emittedToolCalls: new Set(),
+      liveBackgroundTasks: new Map(),
+      emittedAssistantText: false,
+      owedTrailingIdles: 0,
+      messageIdToUuid: new Map(),
+      sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
+    };
+  }
+
+  it("serializes two concurrent recreations instead of spawning one each", async () => {
+    const agent = createMockAgent();
+    injectStaleSession(agent, "s1", "/old");
+
+    let createSessionCalls = 0;
+    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(
+      (params: any) =>
+        new Promise((resolve) => {
+          createSessionCalls += 1;
+          // Yield to the microtask queue so a second, unserialized caller
+          // would have a window to also observe the torn-down session and
+          // also call createSession, the way the real SDK spawn's await
+          // points do.
+          setTimeout(() => {
+            // The real createSession registers a brand-new, fully-formed
+            // session (current main reads `modes` off the existing one when
+            // it recreates), so re-inject a complete one rather than patching
+            // the already torn-down previous object.
+            injectStaleSession(agent, "s1", params.cwd);
+            resolve({
+              sessionId: "s1",
+              modes: { currentModeId: "default", availableModes: [] },
+              configOptions: [],
+            });
+          }, 5);
+        }),
+    );
+
+    await Promise.all([
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+    ]);
+
+    expect(agent.sessions["s1"]?.cwd).toBe("/new");
+    // The whole point of the lock: only one of the two racing calls actually
+    // recreates the session. Without it, this is 2, and the first-created
+    // session object is orphaned the instant the second overwrites
+    // `agent.sessions["s1"]`.
+    expect(createSessionCalls).toBe(1);
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes closeSession against a concurrent recreation for the same id", async () => {
+    const agent = createMockAgent();
+    injectStaleSession(agent, "s1", "/old");
+
+    const createSessionSpy = vi.spyOn(agent as any, "createSession").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            // The real createSession registers a brand-new, fully-formed
+            // session; re-inject one rather than patching the (possibly
+            // already torn-down) previous object.
+            injectStaleSession(agent, "s1", "/new");
+            resolve({
+              sessionId: "s1",
+              modes: { currentModeId: "default", availableModes: [] },
+              configOptions: [],
+            });
+          }, 5);
+        }),
+    );
+
+    const resumePromise = agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] });
+    // Fired while the resume above is still mid-recreation: without the
+    // shared lock this reads `agent.sessions["s1"]` in whatever half-torn-down
+    // state the resume left it in, instead of waiting its turn.
+    const closePromise = agent.closeSession({ sessionId: "s1" });
+
+    await resumePromise;
+    await closePromise;
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
+    // The close that ran after the resume settled should have torn the
+    // freshly-created session down, not thrown "Session not found" from
+    // catching it mid-recreation nor silently no-op'd on a stale reference.
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+});
+
 describe("usage_update computation", () => {
   function createAssistantMessage(overrides: {
     model: string;
