@@ -2421,6 +2421,15 @@ export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
   };
+  /** Serializes create/teardown for one `sessionId` so two racing calls (a
+   *  client retry after a reconnect whose response never arrived, `session/load`
+   *  racing `session/close`, etc.) can't both decide to tear down and recreate
+   *  the same session concurrently. Without this, both recreations spawn their
+   *  own Claude Agent subprocess, the second overwrites the first in
+   *  `this.sessions`, and the first is never reachable again to close -- an
+   *  orphan outliving even the SDK's own kill escalation.
+   *  See https://github.com/agentclientprotocol/claude-agent-acp/issues/1011. */
+  private sessionLifecycleLocks = new Map<string, Promise<void>>();
   client: AcpClient;
   clientCapabilities?: ClientCapabilities;
   /** The tool call report choices, read once from {@link clientCapabilities} in `initialize`. */
@@ -7379,6 +7388,28 @@ export class ClaudeAcpAgent {
    *  is a lightweight husk (its heavy resources are released here) and is evicted
    *  on the next closeSession/deleteSession or when the connection's `dispose()`
    *  runs. */
+  /** Runs `fn` after any lifecycle operation already in flight for `sessionId`
+   *  settles, and lets the next one wait on this one in turn. Reentrant calls
+   *  for the same `sessionId` from inside an already-locked `fn` would deadlock
+   *  (the queue would wait on itself), so this must only be called from a
+   *  top-level request handler, never from `teardownSession` or other helpers
+   *  it already calls internally. */
+  private withSessionLifecycleLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sessionLifecycleLocks.get(sessionId) ?? Promise.resolve();
+    const current = previous.then(fn, fn);
+    const settled = current.then(
+      () => {},
+      () => {},
+    );
+    this.sessionLifecycleLocks.set(sessionId, settled);
+    void settled.then(() => {
+      if (this.sessionLifecycleLocks.get(sessionId) === settled) {
+        this.sessionLifecycleLocks.delete(sessionId);
+      }
+    });
+    return current;
+  }
+
   private closeQueryStream(session: Session): void {
     if (session.queryClosed) {
       return;
@@ -7432,21 +7463,28 @@ export class ClaudeAcpAgent {
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
-    if (!this.sessions[params.sessionId]) {
-      throw new Error("Session not found");
-    }
-    await this.teardownSession(params.sessionId);
-    return {};
+    // Same lock as getOrCreateSession: a close racing a concurrent load/resume
+    // for this sessionId must not interleave with it (see the lock's doc
+    // comment).
+    return this.withSessionLifecycleLock(params.sessionId, async () => {
+      if (!this.sessions[params.sessionId]) {
+        throw new Error("Session not found");
+      }
+      await this.teardownSession(params.sessionId);
+      return {};
+    });
   }
 
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    // Tear down any active in-memory state first so the on-disk file isn't
-    // recreated by an outstanding query writing to it.
-    if (this.sessions[params.sessionId]) {
-      await this.teardownSession(params.sessionId);
-    }
-    await deleteSession(params.sessionId);
-    return {};
+    return this.withSessionLifecycleLock(params.sessionId, async () => {
+      // Tear down any active in-memory state first so the on-disk file isn't
+      // recreated by an outstanding query writing to it.
+      if (this.sessions[params.sessionId]) {
+        await this.teardownSession(params.sessionId);
+      }
+      await deleteSession(params.sessionId);
+      return {};
+    });
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -8913,6 +8951,26 @@ export class ClaudeAcpAgent {
   }
 
   private async getOrCreateSession(
+    params: {
+      sessionId: string;
+      cwd: string;
+      mcpServers?: NewSessionRequest["mcpServers"];
+      additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      _meta?: NewSessionRequest["_meta"];
+    },
+    resumedSession?: ResumedSessionSnapshot,
+  ): Promise<NewSessionResponse> {
+    // Locked so two concurrent calls for the same sessionId (e.g. a client
+    // retrying `session/load` after a dropped reconnect, without knowing the
+    // first attempt already landed) can't both read the same stale-fingerprint
+    // session, both tear it down, and both spawn a replacement -- see the lock's
+    // own doc comment for why that orphans a subprocess.
+    return this.withSessionLifecycleLock(params.sessionId, () =>
+      this.getOrCreateSessionLocked(params, resumedSession),
+    );
+  }
+
+  private async getOrCreateSessionLocked(
     params: {
       sessionId: string;
       cwd: string;
