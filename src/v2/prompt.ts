@@ -26,8 +26,10 @@ import type { TurnEvents, TurnOutcome } from "../turn-events.js";
  * - Waiting on a permission request or a question: `requires_action`, and
  *   `running` once none is open.
  * - Ended: `idle` with the stop reason, usage, and `_meta` of the turn.
- * - Failed after it was taken in: v2 has no error on `idle`, so an error
- *   `notice` carries the failure, followed by `idle` with `end_turn`.
+ * - Failed after it was taken in: `idle` with {@link FAILED_STOP_REASON} and
+ *   the JSON-RPC error that v1 answers with in `_meta.claudeCode.error`, and
+ *   an error `notice` before it that shows the failure. v2 has no error on
+ *   `idle`, and a notice must not be the only report of a failure.
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
  */
@@ -65,20 +67,23 @@ export function v2Prompt(
           );
         }
       },
-      failed(error) {
+      failed(error, title) {
         if (!inserted) {
           reject(error);
           return;
         }
+        const failure = jsonRpcError(error);
         send({
           sessionUpdate: "notice",
           severity: "error",
-          ...splitNoticeText(
-            error instanceof Error ? error.message : String(error),
-            "The turn failed",
-          ),
+          ...splitNoticeText(title ?? failure.message, "The turn failed"),
         });
-        send({ sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" });
+        send({
+          sessionUpdate: "state_update",
+          state: "idle",
+          stopReason: FAILED_STOP_REASON,
+          _meta: { claudeCode: { error: failure } },
+        });
       },
     };
     let request: PromptRequest;
@@ -90,6 +95,28 @@ export function v2Prompt(
     }
     agent.startTurn(request, events).catch(reject);
   });
+}
+
+/**
+ * The stop reason of a turn that failed after it was taken in. v2's stop
+ * reasons all describe work that ended without an error, and a custom one
+ * starts with `_`; clients show it as a generic stop.
+ */
+export const FAILED_STOP_REASON = "_error";
+
+/** The JSON-RPC error that v1 answers a failed prompt with. */
+function jsonRpcError(error: unknown): { code: number; message: string; data?: unknown } {
+  if (error instanceof RequestError) {
+    return {
+      code: error.code,
+      message: error.message,
+      ...(error.data !== undefined ? { data: error.data } : {}),
+    };
+  }
+  return {
+    code: RequestError.internalError().code,
+    message: error instanceof Error ? error.message : String(error),
+  };
 }
 
 function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
@@ -107,7 +134,7 @@ function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
  * or one from a newer ACP version. Clients send only the kinds the agent
  * advertised, so such a block is rejected rather than silently dropped.
  */
-function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
+export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): PromptRequest {
   return { ...request, prompt: prompt.map(v1ContentBlock) };
 }
 
@@ -128,9 +155,16 @@ function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
   );
 }
 
-/** v2 also accepts audiences of a newer ACP version; v1 knows two. */
+/**
+ * v2 also accepts audiences of a newer ACP version; v1 knows two. An audience
+ * of only unknown roles is dropped rather than narrowed to nobody.
+ */
 function v1Annotations({ audience, ...annotations }: v2.Annotations): Annotations {
-  return audience != null ? { ...annotations, audience: audience.filter(isV1Role) } : annotations;
+  if (audience == null) return annotations;
+  const known = audience.filter(isV1Role);
+  return known.length > 0 || audience.length === 0
+    ? { ...annotations, audience: known }
+    : annotations;
 }
 
 function isV1Role(role: string): role is Role {

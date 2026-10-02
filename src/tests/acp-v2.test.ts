@@ -16,6 +16,7 @@ import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
+import { v1PromptRequest } from "../v2/prompt.js";
 import { v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
@@ -35,6 +36,8 @@ const sdk = vi.hoisted(() => ({
     _prompts: AsyncIterable<SDKUserMessage>,
     _options: Options,
   ): AsyncGenerator<Record<string, unknown>> {},
+  /** Claude Code receives an interrupt, as `cancel()` sends one. */
+  interrupt: async (): Promise<void> => {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
   mcpAuthenticate: async (
     _serverName: string,
@@ -73,6 +76,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         ],
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
+        interrupt: () => sdk.interrupt(),
       });
       return Object.assign(messages, controls);
     },
@@ -443,9 +447,30 @@ function scriptTurns(...turns: TurnScript[]): string[] {
       };
       yield* turn(options);
     }
-    await input.next();
+    // Later prompts are taken off the input without an answer.
+    while (!(await input.next()).done);
   };
   return echoed;
+}
+
+function stream(options: Options, event: Record<string, unknown>) {
+  return {
+    type: "stream_event",
+    event,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+function idleState(options: Options) {
+  return {
+    type: "system",
+    subtype: "session_state_changed",
+    state: "idle",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
 }
 
 function assistantText(options: Options, text: string) {
@@ -595,17 +620,77 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("cancels the running turn, and a queued prompt with -32800", async () => {
-    const release = Promise.withResolvers<void>();
+  it("answers a queued prompt once Claude Code takes it in, after the turn before it", async () => {
+    const firstAnswer = Promise.withResolvers<void>();
+    const echoed = scriptTurns(
+      async function* (options) {
+        await firstAnswer.promise;
+        yield result(options);
+      },
+      async function* (options) {
+        yield result(options);
+      },
+    );
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+      let answered = false;
+      const queued = agent
+        .request(v2.methods.agent.session.prompt, { sessionId, prompt: text("second") })
+        .finally(() => (answered = true));
+      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      expect(answered).toBe(false);
+
+      firstAnswer.resolve();
+      expect(await queued).toEqual({ messageId: echoed[1] });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).filter((s) => s === "idle end_turn")).toHaveLength(
+          2,
+        ),
+      );
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "idle end_turn",
+      "user_message",
+      "running",
+      "idle end_turn",
+    ]);
+    expect(client.updates("user_message").map((update) => update.messageId)).toEqual(echoed);
+  });
+
+  it("cancels the running turn after its last output, and a queued prompt with -32800", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
     scriptTurns(async function* (options) {
-      yield assistantText(options, "Working on it");
-      await release.promise;
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_working", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Working on it" },
+      });
+      await interrupted.promise;
+      // Claude Code still sends what it had when the interrupt arrived.
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: ", stopping" },
+      });
+      yield result(options);
+      yield idleState(options);
     });
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      agents[0].forceCancelGraceMs = 10;
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
       await vi.waitFor(() =>
         expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
@@ -620,7 +705,6 @@ describe("ACP v2 prompts", () => {
 
       await expect(queued).rejects.toMatchObject({ code: -32800 });
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
-      release.resolve();
       await client.authUpdate(1);
     });
 
@@ -628,11 +712,12 @@ describe("ACP v2 prompts", () => {
       "user_message",
       "running",
       "agent_message_chunk",
+      "agent_message_chunk",
       "idle cancelled",
     ]);
   });
 
-  it("reports a turn that fails after it was taken in as an error notice, then idle", async () => {
+  it("reports a turn that fails after it was taken in as idle with _error, and shows it", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
     });
@@ -641,7 +726,7 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
       await client.authUpdate(1);
     });
 
@@ -649,12 +734,64 @@ describe("ACP v2 prompts", () => {
       "user_message",
       "running",
       "notice",
-      "idle end_turn",
+      "idle _error",
     ]);
-    expect(client.updates("notice")[0]).toMatchObject({
-      severity: "error",
-      title: expect.stringContaining("API Error: 529 Overloaded"),
+    expect(client.updates("notice")).toEqual([
+      { sessionUpdate: "notice", severity: "error", title: "API Error: 529 Overloaded" },
+    ]);
+    expect(client.updates("state_update").at(-1)).toMatchObject({
+      _meta: { claudeCode: { error: { code: -32603 } } },
     });
+  });
+
+  it("keeps the auth_required code of a turn that fails for a missing login", async () => {
+    scriptTurns(async function* (options) {
+      yield result(options, { is_error: true, result: "Not logged in · Please run /login" });
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await client.authUpdate(1);
+    });
+
+    // The client owns the login UI, so the notice does not say to run /login.
+    expect(client.updates("notice")[0]).toMatchObject({ title: "Authentication required" });
+    expect(client.updates("state_update").at(-1)).toMatchObject({
+      _meta: { claudeCode: { error: { code: v1.RequestError.authRequired().code } } },
+    });
+  });
+
+  it("answers a queued prompt with the error of a turn that failed before it was taken in", async () => {
+    // Claude Code answers the first prompt, then its stream ends.
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const { value } = await input.next();
+      yield {
+        type: "user",
+        message: value.message,
+        parent_tool_use_id: null,
+        uuid: value.uuid,
+        session_id: options.sessionId,
+        isReplay: true,
+      };
+      await input.next();
+      yield result(options);
+    };
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("first") });
+      await expect(
+        agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("second") }),
+      ).rejects.toMatchObject({ code: -32603 });
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle end_turn"]);
   });
 
   it("gives a messageId to the chunks that the agent builds from a command's output and a result", async () => {
@@ -701,6 +838,38 @@ describe("ACP v2 prompts", () => {
     ).toEqual([
       [outputId, { type: "text", text: "Total cost: $0.00" }],
       [resultId, { type: "text", text: "Done." }],
+    ]);
+  });
+
+  it("gives a refusal explanation the messageId of the refusing result", async () => {
+    const resultId = randomUUID();
+    scriptTurns(async function* (options) {
+      yield {
+        ...assistantText(options, ""),
+        message: {
+          ...assistantText(options, "").message,
+          content: [],
+          stop_reason: "refusal",
+          stop_details: { explanation: "I can't help with that." },
+        },
+      };
+      yield result(options, { stop_reason: "refusal", uuid: resultId });
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle refusal"));
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("agent_message_chunk")).toEqual([
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: resultId,
+        content: { type: "text", text: "I can't help with that." },
+      },
     ]);
   });
 
@@ -760,6 +929,18 @@ describe("ACP v2 session translation", () => {
     expect(() =>
       v2SessionUpdate({ sessionUpdate: "tool_call", toolCallId: "t", title: "Read" }),
     ).toThrow("does not translate tool_call session updates yet");
+  });
+
+  it("keeps the audience roles of a prompt block that v1 knows", () => {
+    const prompt = (audience: string[]) =>
+      v1PromptRequest({
+        sessionId: "s",
+        prompt: [{ type: "text", text: "hi", annotations: { audience, priority: 1 } }],
+      }).prompt[0].annotations;
+    expect(prompt(["user", "_robot"])).toEqual({ audience: ["user"], priority: 1 });
+    // Only unknown roles: no audience, rather than an audience of nobody.
+    expect(prompt(["_robot"])).toEqual({ priority: 1 });
+    expect(prompt([])).toEqual({ audience: [], priority: 1 });
   });
 
   it("fails on a message chunk without a messageId, which v2 requires", () => {

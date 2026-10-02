@@ -786,7 +786,8 @@ type Turn = {
    *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
   carriedModelUsage?: ModelTokenTally;
   resolve: (outcome: TurnOutcome) => void;
-  reject: (error: unknown) => void;
+  /** `title` describes the failure for the user (see `TurnEvents.failed`). */
+  reject: (error: unknown, title?: string) => void;
   /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
 };
@@ -3392,8 +3393,8 @@ export class ClaudeAcpAgent {
         events.ended(outcome);
         completeTurn();
       },
-      reject: (error) => {
-        events.failed(error);
+      reject: (error, title) => {
+        events.failed(error, title);
         completeTurn();
       },
     };
@@ -4579,7 +4580,7 @@ export class ClaudeAcpAgent {
 
     /** Reject the active turn (auth required, error result, …) without tearing
      *  down the consumer: the stream continues to idle and later turns proceed. */
-    const failActive = (error: unknown) => {
+    const failActive = (error: unknown, title?: string) => {
       disarmForceCancel(session);
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
@@ -4598,7 +4599,7 @@ export class ClaudeAcpAgent {
       // start the next stretch clean, or its stale delivery record would
       // suppress the next turn's issue-#453 result-text fallback.
       session.emittedAssistantText = false;
-      turn.reject(error);
+      turn.reject(error, title);
     };
 
     /** Complete a negotiated terminal failure on the prompt response itself,
@@ -4627,7 +4628,7 @@ export class ClaudeAcpAgent {
         return;
       }
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
-        failActive(error);
+        failActive(error, title);
         return;
       }
       if (!session.activeTurn || session.activeTurn.settled) {
@@ -4639,7 +4640,7 @@ export class ClaudeAcpAgent {
       }
       const failure = await createSessionFailure(kind, { title });
       if (!failure) {
-        failActive(error);
+        failActive(error, title);
         return;
       }
       sessionFailures.recordActive(failure);

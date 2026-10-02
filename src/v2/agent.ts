@@ -89,8 +89,12 @@ class V2ClientConnection implements AcpClient {
 
   /**
    * Sends a v2 session update, and logs rather than rejects when that fails.
-   * Updates go out in the order of the calls, whether they come from the
-   * agent or from the v2 surface itself.
+   * It and {@link sessionUpdate} hand updates to the connection synchronously,
+   * so they go out in the order of the calls. The agent's consumer awaits each
+   * of its updates before it reports the next turn event, so a turn's state
+   * follows the output that came before it. (An update the consumer is still
+   * routing can be overtaken by an event from elsewhere, such as a permission
+   * request opening.)
    */
   send(notification: v2.UpdateSessionNotification): Promise<void> {
     return this.ctx.notify(v2.methods.client.session.update, notification).catch((error) => {
