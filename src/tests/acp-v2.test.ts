@@ -297,6 +297,12 @@ describe("ACP v2 sessions", () => {
         description: "Review a change",
         input: { type: "text", hint: "<pull request>" },
       },
+      {
+        name: "mcp",
+        description:
+          "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+        input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
+      },
     ]);
   });
 
