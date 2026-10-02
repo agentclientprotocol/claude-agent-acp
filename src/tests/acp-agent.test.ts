@@ -14493,6 +14493,545 @@ describe("result origin handling", () => {
     expect(response.stopReason).toBe("end_turn");
   });
 
+  it.each([
+    ["singular", "end_turn"],
+    ["plural", "end_turn"],
+    ["both", "end_turn"],
+    ["singular", "max_tokens"],
+    ["plural", "max_tokens"],
+    ["both", "max_tokens"],
+  ])("settles a folded prompt named by %s UUID fields with %s", async (stamp, stopReason) => {
+    const { agent } = createMockAgentWithCapture();
+    const input = new Pushable<any>();
+    const processed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: first } = await iter.next();
+      yield userEcho(first);
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "background-shell",
+        tool_use_id: "shell-tool",
+        description: "sleep 2",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      yield createResult({ user_message_uuid: first.uuid });
+      // The CLI withholds the spawning turn's idle while the shell is live.
+      yield {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "background-shell",
+        tool_use_id: "shell-tool",
+        status: "completed",
+        output_file: "",
+        summary: "done",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const { value: folded } = await iter.next();
+      yield { ...userEcho(folded), origin: { kind: "human" } };
+      yield lifecycleFrame(folded.uuid, "started");
+      yield createAssistantMessage();
+      yield lifecycleFrame(folded.uuid, "completed");
+      yield createResult({
+        origin: { kind: "task-notification" },
+        ...(stamp !== "plural" ? { user_message_uuid: folded.uuid } : {}),
+        ...(stamp !== "singular" ? { user_message_uuids: [folded.uuid] } : {}),
+        stop_reason: stopReason,
+      });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      processed.resolve();
+      // Keep the query open: stream shutdown must not resolve the prompt.
+      await finish.promise;
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "start a background shell" }],
+    });
+    let response: unknown;
+    const prompt = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "folded prompt" }] })
+      .then(
+        (value) => {
+          response = value;
+        },
+        (error) => {
+          response = error;
+        },
+      );
+    try {
+      await processed.promise;
+      await vi.waitFor(() => expect(response).toBeDefined());
+      expect(response).toEqual(expect.objectContaining({ stopReason }));
+    } finally {
+      finish.resolve();
+      await agent.sessions["test-session"].consumer;
+      await prompt;
+    }
+  });
+
+  it.each([false, true])(
+    "keeps a pure notification result out of the active turn (unrelated UUID: %s)",
+    async (stamped) => {
+      const { agent } = createMockAgentWithCapture();
+      const input = new Pushable<any>();
+      const processed = Promise.withResolvers<void>();
+      const continueTurn = Promise.withResolvers<void>();
+      const userProcessed = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      async function* messageGenerator() {
+        const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+        yield { ...userEcho(userMessage), origin: { kind: "human" } };
+        yield createResult({
+          origin: { kind: "task-notification" },
+          ...(stamped
+            ? { user_message_uuid: randomUUID(), user_message_uuids: [randomUUID()] }
+            : {}),
+          stop_reason: "max_tokens",
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        processed.resolve();
+        await continueTurn.promise;
+        yield createResult({ user_message_uuid: userMessage.uuid });
+        userProcessed.resolve();
+        await finish.promise;
+      }
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+      let response: unknown;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] })
+        .then(
+          (value) => {
+            response = value;
+          },
+          (error) => {
+            response = error;
+          },
+        );
+      try {
+        await processed.promise;
+        expect(response).toBeUndefined();
+        continueTurn.resolve();
+        await userProcessed.promise;
+        await vi.waitFor(() => expect(response).toBeDefined());
+        expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+      } finally {
+        continueTurn.resolve();
+        finish.resolve();
+        await agent.sessions["test-session"].consumer;
+        await prompt;
+      }
+    },
+  );
+
+  it.each(["singular", "plural"])(
+    "settles a folded prompt from its own result when another prompt is queued (%s UUID)",
+    async (stamp) => {
+      const { agent } = createMockAgentWithCapture();
+      const input = new Pushable<any>();
+      const firstEchoed = Promise.withResolvers<void>();
+      const firstProcessed = Promise.withResolvers<void>();
+      const continueTurn = Promise.withResolvers<void>();
+      const processed = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield { ...userEcho(first), origin: { kind: "human" } };
+        firstEchoed.resolve();
+        const { value: second } = await iter.next();
+        yield createResult({
+          origin: { kind: "task-notification" },
+          ...(stamp === "singular"
+            ? { user_message_uuid: first.uuid }
+            : { user_message_uuids: [first.uuid] }),
+          queued_turn_count: 1,
+          stop_reason: "end_turn",
+        });
+        firstProcessed.resolve();
+        // The first result must settle its prompt before the second echo's
+        // hand-off can substitute a default end_turn with no result usage.
+        await continueTurn.promise;
+        yield { ...userEcho(second), origin: { kind: "human" } };
+        yield createResult({
+          origin: { kind: "human" },
+          user_message_uuid: second.uuid,
+          queued_turn_count: 0,
+          stop_reason: "max_tokens",
+          usage: {
+            input_tokens: 20,
+            output_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        processed.resolve();
+        await finish.promise;
+      }
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+      const responses: unknown[] = [];
+      const prompt = (index: number) =>
+        agent
+          .prompt({
+            sessionId: "test-session",
+            prompt: [{ type: "text", text: `prompt ${index + 1}` }],
+          })
+          .then(
+            (value) => {
+              responses[index] = value;
+            },
+            (error) => {
+              responses[index] = error;
+            },
+          );
+      const firstPrompt = prompt(0);
+      await firstEchoed.promise;
+      const secondPrompt = prompt(1);
+      const firstOutcome = expect.objectContaining({
+        stopReason: "end_turn",
+        usage: expect.objectContaining({ inputTokens: 10, outputTokens: 5 }),
+      });
+      try {
+        await firstProcessed.promise;
+        await vi.waitFor(() => expect(responses[0]).toBeDefined());
+        expect.soft(responses[0]).toEqual(firstOutcome);
+        expect(responses[1]).toBeUndefined();
+        continueTurn.resolve();
+        await processed.promise;
+        await vi.waitFor(() => expect(responses[1]).toBeDefined());
+        expect(responses[0]).toEqual(firstOutcome);
+        expect(responses[1]).toEqual(
+          expect.objectContaining({
+            stopReason: "max_tokens",
+            usage: expect.objectContaining({ inputTokens: 20, outputTokens: 7 }),
+          }),
+        );
+      } finally {
+        continueTurn.resolve();
+        finish.resolve();
+        await agent.sessions["test-session"].consumer;
+        await Promise.all([firstPrompt, secondPrompt]);
+      }
+    },
+  );
+
+  it.each(["prompt", "steer"])(
+    "preserves both cycles' usage when a %s is folded into a notification cycle",
+    async (foldedSend) => {
+      const { agent } = createMockAgentWithCapture();
+      const input = new Pushable<any>();
+      const echoed = Promise.withResolvers<void>();
+      const interrupted = Promise.withResolvers<void>();
+      const continueTurn = Promise.withResolvers<void>();
+      const processed = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      const model = "claude-sonnet-4-6";
+      const modelUsage = (inputTokens: number, outputTokens: number) => ({
+        [model]: {
+          inputTokens,
+          outputTokens,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0,
+          contextWindow: 200000,
+        },
+      });
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: original } = await iter.next();
+        yield userEcho(original);
+        echoed.resolve();
+        const { value: steered } = await iter.next();
+        // A real steer is still queued when the interrupted cycle ends.
+        yield createResult({
+          origin: { kind: foldedSend === "prompt" ? "task-notification" : "human" },
+          user_message_uuid: original.uuid,
+          user_message_uuids: [original.uuid],
+          queued_turn_count: 1,
+          stop_reason: "tool_use",
+          modelUsage: modelUsage(10, 5),
+        });
+        interrupted.resolve();
+        await continueTurn.promise;
+        yield userEcho(steered);
+        // Only the steer's UUID is named: it belongs to the same ACP prompt.
+        yield createResult({
+          origin: { kind: foldedSend === "steer" ? "task-notification" : "human" },
+          user_message_uuid: steered.uuid,
+          user_message_uuids: [steered.uuid],
+          queued_turn_count: 0,
+          stop_reason: "max_tokens",
+          usage: {
+            input_tokens: 20,
+            output_tokens: 7,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+          modelUsage: modelUsage(30, 12),
+        });
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        processed.resolve();
+        await finish.promise;
+      }
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+      let response: unknown;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "original" }] })
+        .then(
+          (value) => {
+            response = value;
+          },
+          (error) => {
+            response = error;
+          },
+        );
+      try {
+        await echoed.promise;
+        const steer = await agent.steer({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "also handle this" }],
+        });
+        expect(steer).toEqual(expect.objectContaining({ outcome: "injected" }));
+        await interrupted.promise;
+        expect(response).toBeUndefined();
+        continueTurn.resolve();
+        await processed.promise;
+        await vi.waitFor(() => expect(response).toBeDefined());
+        const tokens = {
+          inputTokens: 30,
+          outputTokens: 12,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+        };
+        expect.soft(response).toEqual(
+          expect.objectContaining({
+            stopReason: "max_tokens",
+            usage: { ...tokens, totalTokens: 42 },
+            _meta: expectedQuotaMeta(tokens, [[model, tokens]]),
+          }),
+        );
+        expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+      } finally {
+        continueTurn.resolve();
+        finish.resolve();
+        await agent.sessions["test-session"].consumer;
+        await prompt;
+      }
+    },
+  );
+
+  it.each(["un-echoed", "already handed off"])(
+    "does not settle active P2 with a notification result naming %s P1",
+    async (p1State) => {
+      const { agent } = createMockAgentWithCapture();
+      const input = new Pushable<any>();
+      const firstEchoed = Promise.withResolvers<void>();
+      const processed = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      const chronological = p1State === "already handed off";
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield userEcho(first);
+        firstEchoed.resolve();
+        const { value: second } = await iter.next();
+        const p1 = chronological ? first : second;
+        if (chronological) {
+          yield userEcho(second);
+        } else {
+          yield lifecycleFrame(p1.uuid, "started");
+          yield lifecycleFrame(p1.uuid, "completed");
+        }
+        yield createResult({
+          origin: { kind: "task-notification" },
+          user_message_uuid: p1.uuid,
+          user_message_uuids: [p1.uuid],
+          queued_turn_count: 0,
+          stop_reason: "max_tokens",
+        });
+        processed.resolve();
+        await finish.promise;
+      }
+      agent.sessions["test-session"] = mockSessionState({
+        query: wrapQuery(messageGenerator()),
+        input,
+      });
+      const responses: unknown[] = [];
+      const prompt = (index: number) =>
+        agent
+          .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: `P${index + 1}` }] })
+          .then(
+            (value) => {
+              responses[index] = value;
+            },
+            (error) => {
+              responses[index] = error;
+            },
+          );
+      const firstPrompt = prompt(chronological ? 0 : 1);
+      await firstEchoed.promise;
+      const secondPrompt = prompt(chronological ? 1 : 0);
+      try {
+        await processed.promise;
+        expect(responses[1]).toBeUndefined();
+        if (chronological) {
+          await vi.waitFor(() => expect(responses[0]).toBeDefined());
+          expect(responses[0]).toEqual(
+            expect.objectContaining({
+              stopReason: "end_turn",
+              usage: expect.objectContaining({ inputTokens: 0, outputTokens: 0 }),
+            }),
+          );
+        } else {
+          expect(responses[0]).toBeUndefined();
+        }
+      } finally {
+        finish.resolve();
+        await agent.sessions["test-session"].consumer;
+        await Promise.all([firstPrompt, secondPrompt]);
+      }
+    },
+  );
+
+  it("keeps an echo-less folded prompt pending with no active turn, as on main", async () => {
+    const { agent } = createMockAgentWithCapture();
+    const input = new Pushable<any>();
+    const processed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    async function* messageGenerator() {
+      const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield lifecycleFrame(userMessage.uuid, "started");
+      yield lifecycleFrame(userMessage.uuid, "completed");
+      yield createResult({
+        origin: { kind: "task-notification" },
+        user_message_uuid: userMessage.uuid,
+        user_message_uuids: [userMessage.uuid],
+        queued_turn_count: 0,
+        stop_reason: "max_tokens",
+      });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      processed.resolve();
+      await finish.promise;
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+    let response: unknown;
+    const prompt = agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "folded prompt" }] })
+      .then(
+        (value) => {
+          response = value;
+        },
+        (error) => {
+          response = error;
+        },
+      );
+    try {
+      await processed.promise;
+      expect(response).toBeUndefined();
+      expect(agent.sessions["test-session"].turnQueue).toHaveLength(1);
+      expect(agent.sessions["test-session"].activeTurn).toBeUndefined();
+      expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+    } finally {
+      finish.resolve();
+      await agent.sessions["test-session"].consumer;
+      await prompt;
+    }
+  });
+
+  it("keeps a cancelled folded prompt's usage when a cancelled send is still queued", async () => {
+    const { agent } = createMockAgentWithCapture();
+    const input = new Pushable<any>();
+    const firstEchoed = Promise.withResolvers<void>();
+    const secondPushed = Promise.withResolvers<void>();
+    const continueTurn = Promise.withResolvers<void>();
+    const processed = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    async function* messageGenerator() {
+      const iter = input[Symbol.asyncIterator]();
+      const { value: first } = await iter.next();
+      yield userEcho(first);
+      firstEchoed.resolve();
+      await iter.next();
+      secondPushed.resolve();
+      await continueTurn.promise;
+      // cancel() removed P2's Turn, but its send is still in the SDK queue.
+      yield createResult({
+        origin: { kind: "task-notification" },
+        user_message_uuid: first.uuid,
+        user_message_uuids: [first.uuid],
+        queued_turn_count: 1,
+      });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      processed.resolve();
+      await finish.promise;
+    }
+    agent.sessions["test-session"] = mockSessionState({
+      query: wrapQuery(messageGenerator()),
+      input,
+    });
+    const responses: unknown[] = [];
+    const prompt = (index: number) =>
+      agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: `P${index + 1}` }] })
+        .then(
+          (value) => {
+            responses[index] = value;
+          },
+          (error) => {
+            responses[index] = error;
+          },
+        );
+    const firstPrompt = prompt(0);
+    await firstEchoed.promise;
+    const secondPrompt = prompt(1);
+    try {
+      await secondPushed.promise;
+      await agent.cancel({ sessionId: "test-session" });
+      await vi.waitFor(() => expect(responses[1]).toBeDefined());
+      expect(responses[0]).toBeUndefined();
+      expect(responses[1]).toEqual({ stopReason: "cancelled" });
+      continueTurn.resolve();
+      await processed.promise;
+      await vi.waitFor(() => expect(responses[0]).toBeDefined());
+      expect.soft(responses[0]).toEqual(
+        expect.objectContaining({
+          stopReason: "cancelled",
+          usage: expect.objectContaining({ inputTokens: 10, outputTokens: 5 }),
+        }),
+      );
+      expect(responses[1]).toEqual({ stopReason: "cancelled" });
+      expect(agent.sessions["test-session"].owedTrailingIdles).toBe(0);
+    } finally {
+      continueTurn.resolve();
+      finish.resolve();
+      await agent.sessions["test-session"].consumer;
+      await Promise.all([firstPrompt, secondPrompt]);
+    }
+  });
+
   it("user-prompted result with max_tokens still sets stopReason", async () => {
     const { agent } = createMockAgentWithCapture();
     injectSession(agent, [

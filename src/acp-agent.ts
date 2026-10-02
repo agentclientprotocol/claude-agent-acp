@@ -5734,14 +5734,27 @@ export class ClaudeAcpAgent {
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
-            // A result from an autonomous cycle — a task-notification
-            // followup, or a peer/coordinator/observer message the model
-            // handled on its own (see AUTONOMOUS_RESULT_ORIGINS) — is not
-            // the user's prompt's. Autonomous results must never touch the
-            // user-turn lifecycle (stop reason, settles, failActive,
-            // slash-command output forwarding), though their cost is real.
+            // An autonomous cycle can consume a pending user send while
+            // retaining its origin. Attribute its result only if it names
+            // the live active turn's prompt or a steer belonging to that turn.
+            // Unrelated autonomous results must not affect the user's outcome
+            // or usage, though their cost is still reported separately.
+            const answeredUuids =
+              message.user_message_uuids ??
+              (message.user_message_uuid !== undefined ? [message.user_message_uuid] : []);
+            const activeTurn = session.activeTurn;
+            const liveActiveTurn =
+              activeTurn && !activeTurn.settled && !isHeldOpen(activeTurn) ? activeTurn : undefined;
+            const answersPendingTurn =
+              liveActiveTurn !== undefined &&
+              answeredUuids.some(
+                (uuid) =>
+                  uuid === liveActiveTurn.promptUuid || liveActiveTurn.steeredUuids?.has(uuid),
+              );
             const isAutonomousResult =
-              message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+              message.origin != null &&
+              AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind) &&
+              !answersPendingTurn;
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
