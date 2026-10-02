@@ -256,7 +256,13 @@ import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
-import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import {
+  nodeToWebReadable,
+  nodeToWebWritable,
+  Pushable,
+  raceTimeoutAndAbort,
+  unreachable,
+} from "./utils.js";
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
@@ -408,30 +414,21 @@ async function structuredUsageMarkdown(
   logger: Logger,
 ): Promise<string | null> {
   if (signal.aborted) return null;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
   try {
-    const response = await Promise.race([
+    const outcome = await raceTimeoutAndAbort(
       // Keeping the deliberately unstable method name visible makes an SDK
       // upgrade fail at compile time if Anthropic removes or renames it.
       query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
-      new Promise<null>((resolve) => {
-        timeout = setTimeout(() => resolve(null), STRUCTURED_USAGE_TIMEOUT_MS);
-        timeout.unref?.();
-      }),
-      new Promise<null>((resolve) => {
-        onAbort = () => resolve(null);
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
-      }),
-    ]);
-    if (response === null) {
-      if (!signal.aborted) {
+      STRUCTURED_USAGE_TIMEOUT_MS,
+      signal,
+    );
+    if (outcome.type !== "done") {
+      if (outcome.type === "timeout") {
         logger.error("Structured /usage timed out; preserving Claude Code output");
       }
       return null;
     }
-    const usage = parseUsageResponse(response);
+    const usage = parseUsageResponse(outcome.value);
     if (!usage) {
       logger.error(
         "Structured /usage returned an incompatible response; preserving Claude Code output",
@@ -442,9 +439,6 @@ async function structuredUsageMarkdown(
   } catch (error) {
     logger.error(`Structured /usage failed; preserving Claude Code output: ${error}`);
     return null;
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 

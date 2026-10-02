@@ -1,6 +1,7 @@
 import type { AvailableCommand } from "@agentclientprotocol/sdk";
 import type { McpServerStatus, Query } from "@anthropic-ai/claude-agent-sdk";
 import { escapeMarkdown } from "./usage-markdown.js";
+import { raceTimeoutAndAbort } from "./utils.js";
 
 /** The `/mcp` entry of `available_commands_update`. The adapter shows the
  *  servers as a list, and runs a reconnect, an enable, or a disable through
@@ -49,32 +50,21 @@ export async function readMcpServerStatus(
   logError: (message: string) => void,
 ): Promise<McpServerStatus[] | null> {
   if (signal.aborted) return null;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
   try {
-    const statuses = await Promise.race([
+    const outcome = await raceTimeoutAndAbort(
       query.mcpServerStatus(),
-      new Promise<null>((resolve) => {
-        timeout = setTimeout(() => resolve(null), MCP_STATUS_TIMEOUT_MS);
-        timeout.unref?.();
-      }),
-      new Promise<null>((resolve) => {
-        onAbort = () => resolve(null);
-        signal.addEventListener("abort", onAbort, { once: true });
-      }),
-    ]);
-    if (statuses === null && !signal.aborted) {
+      MCP_STATUS_TIMEOUT_MS,
+      signal,
+    );
+    if (outcome.type === "timeout") {
       logError("The MCP server status read timed out; keeping the Claude Code text of /mcp");
     }
-    return statuses;
+    return outcome.type === "done" ? outcome.value : null;
   } catch (error) {
     if (!signal.aborted) {
       logError(`The MCP server status read failed; keeping the Claude Code text of /mcp: ${error}`);
     }
     return null;
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -279,30 +269,14 @@ type CallResult = { type: "done" } | { type: "failed"; error: string } | { type:
  *  call takes more than {@link MCP_ACTION_TIMEOUT_MS}. */
 async function awaitCall(call: () => Promise<void>, signal: AbortSignal): Promise<CallResult> {
   if (signal.aborted) return { type: "aborted" };
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
   try {
-    return await Promise.race([
-      call().then((): CallResult => ({ type: "done" })),
-      new Promise<CallResult>((resolve) => {
-        timeout = setTimeout(
-          () => resolve({ type: "failed", error: "The request timed out." }),
-          MCP_ACTION_TIMEOUT_MS,
-        );
-        timeout.unref?.();
-      }),
-      new Promise<CallResult>((resolve) => {
-        onAbort = () => resolve({ type: "aborted" });
-        signal.addEventListener("abort", onAbort, { once: true });
-      }),
-    ]);
+    const outcome = await raceTimeoutAndAbort(call(), MCP_ACTION_TIMEOUT_MS, signal);
+    if (outcome.type === "timeout") return { type: "failed", error: "The request timed out." };
+    return outcome.type === "done" ? { type: "done" } : outcome;
   } catch (error) {
     return signal.aborted
       ? { type: "aborted" }
       : { type: "failed", error: error instanceof Error ? error.message : String(error) };
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
