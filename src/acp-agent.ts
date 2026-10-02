@@ -2457,8 +2457,15 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /**
+   * The connection serves ACP v2 (`src/v2/`). The agent still speaks v1
+   * types, except for the tool call content that v2 needs and v1 cannot
+   * express: see {@link ToolCallClientCapabilities.v2}.
+   */
+  private readonly v2: boolean;
 
-  constructor(client: AcpClient, logger?: Logger) {
+  constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
+    this.v2 = options.v2 ?? false;
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
@@ -2515,7 +2522,9 @@ export class ClaudeAcpAgent {
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
-    this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities);
+    this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities, {
+      v2: this.v2,
+    });
 
     // Learn the auth identity in the background: `initialize` never waits on
     // the CLI probe, and no snapshot rides in its response. When the probe
@@ -6493,6 +6502,7 @@ export class ClaudeAcpAgent {
               this.logger,
               {
                 clientCapabilities: this.clientCapabilities,
+                toolCallCapabilities: this.toolCallCapabilities,
                 cwd: session.cwd,
                 taskState: session.taskState,
                 emittedToolCalls: session.emittedToolCalls,
@@ -6729,6 +6739,7 @@ export class ClaudeAcpAgent {
                   this.logger,
                   {
                     clientCapabilities: this.clientCapabilities,
+                    toolCallCapabilities: this.toolCallCapabilities,
                     parentToolUseId: message.parent_tool_use_id,
                     cwd: session.cwd,
                     taskState: session.taskState,
@@ -6848,6 +6859,7 @@ export class ClaudeAcpAgent {
               this.logger,
               {
                 clientCapabilities: this.clientCapabilities,
+                toolCallCapabilities: this.toolCallCapabilities,
                 parentToolUseId: message.parent_tool_use_id,
                 cwd: session.cwd,
                 taskState: session.taskState,
@@ -7980,6 +7992,7 @@ export class ClaudeAcpAgent {
           registerHooks: false,
           replay: true,
           clientCapabilities: this.clientCapabilities,
+          toolCallCapabilities: this.toolCallCapabilities,
           cwd: replayState()?.cwd,
           taskState: replayState()?.taskState,
           messageId: replayMessageId,
@@ -10675,6 +10688,20 @@ function toolCallFieldsOf(session: {
  * Convert an SDKAssistantMessage (Claude) to a SessionNotification (ACP).
  * Only handles text, image, and thinking chunks for now.
  */
+/**
+ * The renderer of the notification functions: the agent's tool call
+ * capabilities when they are passed, else those of the ACP capabilities.
+ */
+function toolCallRenderer(options?: {
+  clientCapabilities?: ClientCapabilities;
+  toolCallCapabilities?: ToolCallClientCapabilities;
+  replay?: boolean;
+}): AcpToolCallRenderer {
+  return options?.toolCallCapabilities
+    ? new AcpToolCallRenderer(options.toolCallCapabilities, options.replay)
+    : AcpToolCallRenderer.for(options?.clientCapabilities, options?.replay);
+}
+
 export function toAcpNotifications(
   content: string | ContentBlockParam[] | BetaContentBlock[] | BetaRawContentBlockDelta[],
   role: "assistant" | "user",
@@ -10685,6 +10712,9 @@ export function toAcpNotifications(
   options?: {
     registerHooks?: boolean;
     clientCapabilities?: ClientCapabilities;
+    // The agent's tool call capabilities. They win over clientCapabilities,
+    // and carry what ACP capabilities cannot (ToolCallClientCapabilities.v2).
+    toolCallCapabilities?: ToolCallClientCapabilities;
     parentToolUseId?: string | null;
     cwd?: string;
     taskState?: TaskState;
@@ -10724,7 +10754,7 @@ export function toAcpNotifications(
 ): SessionNotification[] {
   const taskState = options?.taskState ?? new Map();
   const registerHooks = options?.registerHooks !== false;
-  const renderer = AcpToolCallRenderer.for(options?.clientCapabilities, options?.replay);
+  const renderer = toolCallRenderer(options);
   if (typeof content === "string") {
     if (content.length === 0) {
       return [];
@@ -11093,6 +11123,8 @@ export function streamEventToAcpNotifications(
   logger: Logger,
   options?: {
     clientCapabilities?: ClientCapabilities;
+    // See toAcpNotifications.
+    toolCallCapabilities?: ToolCallClientCapabilities;
     cwd?: string;
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
@@ -11106,6 +11138,7 @@ export function streamEventToAcpNotifications(
   const streamedToolInputs = options?.streamedToolInputs;
   const forwardedOptions = {
     clientCapabilities: options?.clientCapabilities,
+    toolCallCapabilities: options?.toolCallCapabilities,
     parentToolUseId: message.parent_tool_use_id,
     cwd: options?.cwd,
     taskState: options?.taskState,
@@ -11170,9 +11203,11 @@ export function streamEventToAcpNotifications(
         if (!input) return [];
         // TodoWrite and the Task* tools never surfaced a tool_call to refine.
         if (!shouldEmitToolCall(streamedInput.name)) return [];
-        const update: SessionNotification["update"] = AcpToolCallRenderer.for(
-          options?.clientCapabilities,
-        ).partialRefinement(streamedInput, input, options?.cwd);
+        const update: SessionNotification["update"] = toolCallRenderer(options).partialRefinement(
+          streamedInput,
+          input,
+          options?.cwd,
+        );
         if (message.parent_tool_use_id) stampParentToolUseId(update, message.parent_tool_use_id);
         applyMessageId(update, options?.messageId);
         // A refinement resends only what changed: rawInput grows with every

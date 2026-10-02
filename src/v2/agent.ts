@@ -44,7 +44,7 @@ export function v2AgentApp(
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger);
+      agent = new ClaudeAcpAgent(client, logger, { v2: true });
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>

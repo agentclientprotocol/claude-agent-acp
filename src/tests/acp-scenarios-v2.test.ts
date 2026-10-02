@@ -60,7 +60,6 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 const PASSES = "passes";
 /** Step 4 of `docs/acp-v2.md`. */
-const DIFFS = "The ACP v2 surface does not translate diff tool call content yet";
 const REPLAY = "Invalid params: The ACP v2 surface does not replay session history yet";
 /** Step 5 of `docs/acp-v2.md`. */
 const PERMISSIONS = "The ACP v2 surface does not serve session/request_permission yet";
@@ -80,10 +79,10 @@ const V2_STATUS: Record<string, string> = {
   "async-task-ends-before-tool-id": PASSES,
   "async-task-released-at-turn-end": PASSES,
   read: PASSES,
-  "write-new": DIFFS,
-  "write-existing": DIFFS,
-  "edit-with-permission": DIFFS,
-  "edit-rejected": DIFFS,
+  "write-new": PERMISSIONS,
+  "write-existing": PASSES,
+  "edit-with-permission": PERMISSIONS,
+  "edit-rejected": PERMISSIONS,
   "notebook-edit": PERMISSIONS,
   "grep-and-glob": PASSES,
   "web-fetch-and-search": PERMISSIONS,

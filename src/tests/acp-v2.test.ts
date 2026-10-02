@@ -14,6 +14,7 @@ import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
+import { v2DiffContent } from "../diff.js";
 import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
 import { v1PromptRequest } from "../v2/prompt.js";
@@ -976,14 +977,25 @@ describe("ACP v2 session translation", () => {
     ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [] });
   });
 
-  it("fails on tool call content that it does not translate yet", () => {
-    expect(() =>
-      v2SessionUpdate({
-        sessionUpdate: "tool_call_update",
-        toolCallId: "t",
-        content: [{ type: "diff", path: "/p/a.ts", oldText: "a", newText: "b" }],
-      }),
-    ).toThrow("does not translate diff tool call content yet");
+  it("sends the diffs that the agent built for v2 as they are", () => {
+    const diff = v2DiffContent("/p/a.ts", "update", [
+      { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] },
+    ]);
+    expect(
+      v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [diff] }),
+    ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [diff] });
+  });
+
+  it("fails on tool call content that v2 cannot take", () => {
+    const update = (content: v1.ToolCallContent) =>
+      v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [content] });
+    // A v1 diff can hold a snippet, without the operation or line numbers.
+    expect(() => update({ type: "diff", path: "/p/a.ts", oldText: "a", newText: "b" })).toThrow(
+      "An ACP v2 client cannot take a v1 diff",
+    );
+    expect(() => update({ type: "terminal", terminalId: "term" })).toThrow(
+      "does not translate terminal tool call content yet",
+    );
   });
 
   it("keeps the audience roles of a prompt block that v1 knows", () => {

@@ -21,8 +21,10 @@ type V2ToolCallUpdate = v2.ToolCallUpdate & { sessionUpdate: "tool_call_update" 
  * in v1 it leaves the field unchanged too, in v2 it clears the field, so `null`
  * fields are left out.
  *
- * Diff and terminal content throw until the v2 surface translates them
- * (step 4 of `docs/acp-v2.md`).
+ * Diffs need what a v1 diff does not say, so the agent builds them in v2 form
+ * for a v2 client (`v2DiffContent`), and they pass as they are. Terminal
+ * content throws until the v2 surface translates it (step 4 of
+ * `docs/acp-v2.md`).
  */
 export function v2ToolCallUpdate(report: V1ToolCallReport): V2ToolCallUpdate {
   const patch = Object.fromEntries(
@@ -42,7 +44,17 @@ function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {
     case "content":
       // v2 content blocks are a superset of the v1 blocks.
       return item;
+    case "diff":
+      if (isV2Diff(item)) return item;
+      // A v1 diff names one path, with old and new texts that can be a
+      // snippet: v2 cannot say which operation it is, nor give its patch.
+      throw new Error("An ACP v2 client cannot take a v1 diff");
     default:
       throw new Error(`The ACP v2 surface does not translate ${item.type} tool call content yet`);
   }
+}
+
+/** A diff that the agent built in v2 form, which travels as v1 content. */
+function isV2Diff(item: ToolCallContent): item is ToolCallContent & v2.ToolCallContent {
+  return "changes" in item;
 }
