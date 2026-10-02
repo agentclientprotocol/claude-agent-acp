@@ -408,13 +408,6 @@ describe("cleanMcpError", () => {
     expect(cleaned.endsWith("word…")).toBe(true);
   });
 
-  it("keeps the type name when only wrappers and a type path remain", () => {
-    expect(cleanMcpError("Error: rmcp::service::ServerInitializeError")).toBe(
-      "ServerInitializeError",
-    );
-    expect(cleanMcpError("rmcp::service::ServerInitializeError")).toBe("ServerInitializeError");
-  });
-
   it("never keeps an error code alone", () => {
     expect(cleanMcpError("error: 401")).toBe("error: 401");
     expect(cleanMcpError("Error: 12345")).toBe("Error: 12345");
@@ -427,13 +420,6 @@ describe("cleanMcpError", () => {
   it("drops the MCP SDK wrapper", () => {
     expect(cleanMcpError("McpError: MCP error -32001: Request timed out")).toBe(
       "Request timed out",
-    );
-  });
-
-  it("drops a wrapper segment at any position", () => {
-    expect(cleanMcpError("spawn npx ENOENT: Error: spawn npx ENOENT")).toBe("spawn npx ENOENT");
-    expect(cleanMcpError("Transport closed: McpError: connection reset")).toBe(
-      "Transport closed: connection reset",
     );
   });
 

@@ -127,38 +127,16 @@ function isErrorCode(segment: string): boolean {
 }
 
 /** True for a segment that only wraps the real error, such as
- *  `MCP startup failed`, `McpError`, or `MCP error -32001`, or for an error code. */
+ *  `MCP startup failed`, `McpError`, `MCP error -32001`, an error code, or a
+ *  Rust or TypeScript type path. */
 function isWrapperSegment(segment: string): boolean {
-  if (isErrorCode(segment)) return true;
   return (
-    segment.length <= MAX_WRAPPER_LENGTH &&
-    !/[.!?]/.test(segment) &&
-    /(failed|error|exception)(\s+-?\d+)?$/i.test(segment)
+    isErrorCode(segment) ||
+    segment.includes("::") ||
+    (segment.length <= MAX_WRAPPER_LENGTH &&
+      !/[.!?]/.test(segment) &&
+      /(failed|error|exception)(\s+-?\d+)?$/i.test(segment))
   );
-}
-
-/** True for a Rust or TypeScript type path, which means nothing to the user. */
-function isTypeNoise(segment: string): boolean {
-  return segment.includes("::") || /<[^<>]{20,}>/.test(segment);
-}
-
-/** The last name of a type path without its generics, for example
- *  `ServerInitializeError` for `rmcp::service::ServerInitializeError`. */
-function typeName(segment: string): string {
-  return segment.replace(/<.*$/, "").split("::").pop()?.trim() ?? "";
-}
-
-/** The error text when every segment is a wrapper, a code, or a type path.
- *  A type name comes first. Then the last wrapper and the codes after it, so
- *  an error code is never alone. */
-function fallbackError(segments: string[], text: string): string {
-  const typePath = [...segments].reverse().find((segment) => segment.includes("::"));
-  const name = typePath ? typeName(typePath) : "";
-  if (name !== "") return name;
-  const wrappers = segments.filter((segment) => !isTypeNoise(segment));
-  let last = wrappers.length - 1;
-  while (last >= 0 && isErrorCode(wrappers[last]!)) last--;
-  return last >= 0 ? wrappers.slice(last).join(": ") : text;
 }
 
 /** Cut the text to `MAX_ERROR_LENGTH` code points, so a surrogate pair stays whole. */
@@ -166,38 +144,31 @@ function truncate(text: string): string {
   const chars = Array.from(text);
   if (chars.length <= MAX_ERROR_LENGTH) return text;
   const cut = chars.slice(0, MAX_ERROR_LENGTH - 1).join("");
-  const space = cut.lastIndexOf(" ");
-  return `${(space > cut.length / 2 ? cut.slice(0, space) : cut).replace(/[\s.,;:]+$/, "")}…`;
-}
-
-function dedupe(items: string[]): string[] {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const key = item.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  return `${cut.trimEnd()}…`;
 }
 
 /** Make an MCP error short and readable for one list item. The result has
- *  no wrapper segments, no repeated segments, and no type paths. It has at
- *  most two sentences and `MAX_ERROR_LENGTH` code points. When only wrappers
- *  and type paths remain, the result is the type name, or the last wrapper
- *  with its codes. The result is empty for an error with only whitespace. */
+ *  no leading wrapper segments, at most two sentences, and at most
+ *  `MAX_ERROR_LENGTH` code points. A wrapper before an error code stays, so
+ *  an error code is never alone. The result is empty for an error with only
+ *  whitespace. */
 export function cleanMcpError(error: string): string {
-  const text = error.replace(/\s+/g, " ").trim();
-  if (text === "") return "";
-  const segments = text
-    .split(/:\s+/)
-    .map((segment) => segment.trim())
-    .filter((segment) => segment !== "");
-  const content = dedupe(
-    segments.filter((segment) => !isTypeNoise(segment) && !isWrapperSegment(segment)),
+  const segments = error.replace(/\s+/g, " ").trim().split(": ");
+  let start = 0;
+  while (
+    start < segments.length - 1 &&
+    isWrapperSegment(segments[start]!) &&
+    !segments.slice(start + 1).every(isErrorCode)
+  ) {
+    start++;
+  }
+  const content = segments.slice(start).join(": ");
+  return truncate(
+    content
+      .split(/(?<=[.!?]) /)
+      .slice(0, 2)
+      .join(" "),
   );
-  if (content.length === 0) return truncate(fallbackError(segments, text));
-  const sentences = dedupe(content.join(": ").split(/(?<=[.!?])\s+/));
-  return truncate(sentences.slice(0, 2).join(" "));
 }
 
 function toolCount(status: McpServerStatus): string | undefined {
