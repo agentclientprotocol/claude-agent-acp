@@ -1252,6 +1252,23 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
   "observer-activity",
 ]);
 
+/** The origin of a replayed text-only turn the harness injected for an
+ *  autonomous cycle — a subagent hand-back (`peer`) or a task notification —
+ *  rather than one the user typed. The live prompt loop never forwards these;
+ *  replay forwards them tagged with `_claude/origin` so a client can show them
+ *  as notices instead of the user's words. Tool results are never tagged. */
+function injectedUserTurnOrigin(message: SessionMessage): SDKMessageOrigin | undefined {
+  if (message.type !== "user") return undefined;
+  const origin = (message as { origin?: SDKMessageOrigin }).origin;
+  if (!origin || !AUTONOMOUS_RESULT_ORIGINS.has(origin.kind)) return undefined;
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  const isText =
+    typeof content === "string" ||
+    (Array.isArray(content) &&
+      content.every((block) => (block as { type?: unknown } | null)?.type === "text"));
+  return isText ? origin : undefined;
+}
+
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
@@ -7911,6 +7928,7 @@ export class ClaudeAcpAgent {
       ) {
         content = stripSubagentTextAndThinking(content);
       }
+      const injectedOrigin = injectedUserTurnOrigin(message);
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
         for (const notification of taskNotificationsOf(content)) {
@@ -7997,7 +8015,18 @@ export class ClaudeAcpAgent {
         ) {
           continue;
         }
-        await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
+        const update =
+          injectedOrigin && notification.update.sessionUpdate === "user_message_chunk"
+            ? {
+                ...notification.update,
+                _meta: { ...notification.update._meta, "_claude/origin": injectedOrigin },
+              }
+            : notification.update;
+        await this.client.sessionUpdate({
+          ...notification,
+          update,
+          sessionId: replayTargetSessionId,
+        });
       }
 
       // The history of each subagent is in its own transcript. The replay

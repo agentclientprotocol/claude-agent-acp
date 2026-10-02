@@ -2493,6 +2493,79 @@ describe("synthetic login message (issue #863)", () => {
     expect(JSON.stringify(updates)).not.toContain("system-reminder");
   });
 
+  it("loadSession replay tags turns the harness injected with their origin", async () => {
+    const updates: SessionNotification[] = [];
+    const client = {
+      sessionUpdate: async (u: SessionNotification) => {
+        updates.push(u);
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([
+      {
+        type: "user",
+        uuid: "u1",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        origin: { kind: "human" },
+        message: { role: "user", content: "research bot detection" },
+      },
+      {
+        type: "user",
+        uuid: "u2",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        is_meta: true,
+        origin: { kind: "peer", from: "a1" },
+        message: {
+          role: "user",
+          content:
+            'Another Claude session sent a message:\n<agent-message from="a1">report</agent-message>',
+        },
+      },
+      {
+        type: "user",
+        uuid: "u3",
+        session_id: "s1",
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+        isQueuedCommand: true,
+        origin: { kind: "task-notification" },
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "<task-notification>\n<task-id>a1</task-id>\n</task-notification>",
+            },
+          ],
+        },
+      },
+    ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+
+    const userTurns = updates.flatMap((u) =>
+      u.update.sessionUpdate === "user_message_chunk" && u.update.content.type === "text"
+        ? [
+            {
+              text: u.update.content.text,
+              origin: (u.update._meta?.["_claude/origin"] as { kind?: string } | undefined)?.kind,
+            },
+          ]
+        : [],
+    );
+    // What the user typed replays untagged…
+    expect(userTurns[0]).toEqual({ text: "research bot detection", origin: undefined });
+    // …and the injected turns replay tagged, so a client can show them as notices.
+    expect(userTurns.slice(1).map((turn) => turn.origin)).toEqual(["peer", "task-notification"]);
+  });
+
   it("loadSession replay skips the synthetic login message but keeps the rest", async () => {
     const updates: SessionNotification[] = [];
     const client = {
