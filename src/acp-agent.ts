@@ -4185,17 +4185,22 @@ export class ClaudeAcpAgent {
         }
       }
       resetTurnScratch();
-      // Activation is when Claude Code takes the prompt in: its echo, or for an
-      // echo-less command, its result. That inserts it into the conversation.
-      // A turn can be settled by now: an echo hand-off awaits settling the
-      // previous turn, and a cancel in that window settles the queued one.
-      if (!turn.insertedReported && !turn.settled) {
-        turn.insertedReported = true;
-        turn.events.inserted(turn.promptUuid);
-      }
+      // Without a command_lifecycle "started" frame before it (see that
+      // handler), activation is the first sign that Claude Code took the
+      // prompt in: its echo, or for an echo-less command, its result.
+      reportInserted(turn);
       // A request can already be open: Claude Code asks for a queued prompt
       // before the consumer reaches its echo.
       this.syncAwaitingUser(session);
+    };
+
+    /** Report that Claude Code took the turn's prompt in, once. A turn can be
+     *  settled by now: an echo hand-off awaits settling the previous turn, and
+     *  a cancel in that window settles the queued one. */
+    const reportInserted = (turn: Turn) => {
+      if (turn.insertedReported || turn.settled) return;
+      turn.insertedReported = true;
+      turn.events.inserted(turn.promptUuid);
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -4855,10 +4860,10 @@ export class ClaudeAcpAgent {
         // prompt() stamps a uuid on every message. The frame is @internal and
         // absent from the SDKMessage union, so handle it BEFORE the exhaustive
         // switch: it must not reach `unreachable`'s error log, and a `case`
-        // for it wouldn't typecheck. It feeds only the orphan accounting (see
-        // Session.orphanCommands); turn settlement stays driven by
-        // echoes/results/idle. (Raw-mode emission above still forwards these
-        // frames.)
+        // for it wouldn't typecheck. It feeds the orphan accounting (see
+        // Session.orphanCommands) and reports a turn inserted at "started";
+        // turn activation and settlement stay driven by echoes/results/idle.
+        // (Raw-mode emission above still forwards these frames.)
         if ((message as { type: string }).type === "command_lifecycle") {
           const frame = message as unknown as { command_uuid: string; state: string };
           switch (frame.state) {
@@ -4869,6 +4874,16 @@ export class ClaudeAcpAgent {
               if (queued) {
                 queued.commandStarted = true;
                 compaction.resume();
+                // Claude Code took the prompt in: it drained into a turn. A
+                // fresh turn reports that before anything it produces, its echo
+                // and first stream events included, so this is the earliest
+                // insertion point. (A prompt folded into a running turn reports
+                // it after its echo, which already activated it.) While another
+                // turn is still active (held for background work, steered, or
+                // cancelled and awaiting its trailing idle), insertion waits
+                // for this turn's echo, whose hand-off ends that turn first.
+                const active = session.activeTurn;
+                if (!active || active.settled || active === queued) reportInserted(queued);
               }
               // ...and promote an already-orphaned command: once dispatched,
               // a bare `cancelled` no longer means "dropped without running".

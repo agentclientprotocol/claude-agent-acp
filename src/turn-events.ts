@@ -13,9 +13,14 @@ export interface TurnEvents {
   /**
    * Claude Code took the prompt in as the user message `messageId` of the
    * conversation. Reported at most once per turn, and never after
-   * {@link ended} or {@link failed}. For a prompt Claude Code echoes, that is
-   * the echo; for a command it does not echo (such as `/compact`), it is the
-   * command's result, after any output the command streamed.
+   * {@link ended} or {@link failed}.
+   *
+   * When Claude Code reports command lifecycles (`msg_lifecycle_v1`), that is
+   * when the prompt starts a turn, before the turn's output. Otherwise, and
+   * while another turn is still active (held for its background work,
+   * steered, or cancelled but not yet ended), it is the prompt's echo, after
+   * that turn ended; for a command Claude Code does not echo (such as
+   * `/compact`), it is the command's result, after any output it streamed.
    */
   inserted(messageId: string): void;
   /**
