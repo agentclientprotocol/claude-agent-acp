@@ -1505,6 +1505,47 @@ describe("createSession options merging", () => {
       expect(updates).toEqual([]);
     });
 
+    it("sends no update after a load that fails while the replay runs", async () => {
+      let failInit!: () => void;
+      initGate = new Promise((resolve) => (failInit = resolve));
+      initError = new Error("Claude Code process exited with code 1");
+      sessionMessages = [
+        userMessage("u1", "first"),
+        userMessage("u2", "second"),
+        userMessage("u3", "third"),
+      ];
+      const updates: SessionNotification[] = [];
+      let releaseClient!: () => void;
+      const clientGate = new Promise<void>((resolve) => (releaseClient = resolve));
+      const loading = new ClaudeAcpAgent({
+        ...createMockClient(),
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+          await clientGate;
+        },
+      } as AcpClient).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      let updatesAtError: number | undefined;
+      const failed = loading.then(
+        () => expect.unreachable("the load must fail"),
+        () => (updatesAtError = updates.length),
+      );
+
+      // The client still handles the first replayed update when the CLI start fails.
+      await vi.waitFor(() => expect(updates).toHaveLength(1));
+      failInit();
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+      releaseClient();
+      await failed;
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+
+      expect(updatesAtError).toBeGreaterThan(0);
+      expect(updates).toHaveLength(updatesAtError!);
+    });
+
     it("rejects an invalid cwd before it sends an update", async () => {
       sessionMessages = [userMessage("u1", "first")];
       const updates: SessionNotification[] = [];
