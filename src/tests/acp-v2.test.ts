@@ -274,8 +274,14 @@ describe("ACP protocol routing", () => {
       title: "Claude Agent",
       version: packageJson.version,
     });
-    // The whole v2 session baseline and the providers methods are not served yet.
-    expect(response.capabilities?.session).toBeUndefined();
+    // The session baseline and the session extensions that the v2 surface serves,
+    // without `fork`; the providers methods are not served yet.
+    expect(response.capabilities?.session).toEqual({
+      prompt: { image: {}, embeddedContext: {} },
+      mcp: { stdio: {}, http: {} },
+      delete: {},
+      additionalDirectories: {},
+    });
     expect(response.capabilities?.providers).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {

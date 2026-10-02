@@ -45,11 +45,8 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
 /**
  * The v2 `initialize` response for the v1 response of the agent.
  *
- * It advertises no `session` capability yet. A v2 agent that advertises
- * `session` must serve the whole session baseline (`session/new`, `list`,
- * `resume`, `close`, `prompt`, `cancel`, and `update`), and the v2 surface of
- * the adapter does not serve it yet. Nor does it advertise the unstable
- * `providers` methods, which the v2 surface does not serve yet either.
+ * It does not advertise the unstable `providers` methods, which the v2
+ * surface does not serve yet.
  */
 export function v2InitializeResponse(response: InitializeResponse): v2.InitializeResponse {
   if (!response.agentInfo) {
@@ -61,11 +58,32 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
     info: response.agentInfo,
     // v1 `auth.logout` has no v2 counterpart: a v2 agent that advertises auth
     // methods must serve `auth/logout`.
-    capabilities: meta != null ? { _meta: meta } : {},
+    capabilities: {
+      session: V2_SESSION_CAPABILITIES,
+      ...(meta != null ? { _meta: meta } : {}),
+    },
     authMethods: (response.authMethods ?? []).map(v2AuthMethod),
     ...(response._meta != null ? { _meta: response._meta } : {}),
   };
 }
+
+/**
+ * The session capabilities of the v2 surface, which serves each through a v1
+ * method of the agent.
+ *
+ * - The session baseline: `session/new`, `list`, `resume` (with replay),
+ *   `close`, `prompt`, `cancel`, and `update`.
+ * - `session/delete` and `additionalDirectories`. Not `session/fork` yet.
+ * - The prompt content and MCP transports that the agent's v1 `initialize`
+ *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
+ *   v1 baseline; v2 has no SSE transport.
+ */
+const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
+  prompt: { image: {}, embeddedContext: {} },
+  mcp: { stdio: {}, http: {} },
+  delete: {},
+  additionalDirectories: {},
+};
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */
 function v2AuthMethod(method: AuthMethod): v2.AuthMethod {
