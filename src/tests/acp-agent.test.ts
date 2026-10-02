@@ -10443,6 +10443,32 @@ describe("session/delete", () => {
     );
   });
 
+  // The SDK throws when there is no persisted, non-empty transcript to
+  // remove -- a session created but never prompted, or a sessionId that was
+  // never valid or never created at all. The spec treats deleting such an id
+  // as a no-op success (docs/protocol/v1/session-delete.mdx D2), so these two
+  // known shapes must resolve to `{}` instead of rejecting, while the
+  // preceding test confirms a genuinely unrelated error still propagates.
+  it("succeeds silently when the SDK reports no persisted transcript to delete", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(
+      new Error("Session never-prompted not found in project directory for /tmp"),
+    );
+
+    await expect(agent.deleteSession({ sessionId: "never-prompted" })).resolves.toEqual({});
+  });
+
+  it("succeeds silently when the SDK reports an invalid sessionId", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(
+      new Error("Invalid sessionId: tck-never-created-session"),
+    );
+
+    await expect(agent.deleteSession({ sessionId: "tck-never-created-session" })).resolves.toEqual(
+      {},
+    );
+  });
+
   it("does not affect other sessions when deleting one", async () => {
     const agent = createMockAgent();
     injectSession(agent, "session-a");

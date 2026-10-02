@@ -827,8 +827,11 @@ describe("ACP v2 prompts", () => {
         replayFrom: { type: "start" },
       });
       const replayed = client.sessionUpdates.slice(before).map(({ update }) => update);
+      // The available commands belong to the resume and arrive before its response, not
+      // after it, so nothing straggles past the answer.
+      expect(replayed.at(-1)?.sessionUpdate).toBe("available_commands_update");
       // The prompt's user message replays under the id that its response returned.
-      expect(replayed).toEqual([
+      expect(replayed.slice(0, -1)).toEqual([
         { sessionUpdate: "user_message", messageId, content: [] },
         { sessionUpdate: "user_message_chunk", messageId, content: text("hi")[0] },
         { sessionUpdate: "agent_message", messageId: "msg_answer", content: [] },
