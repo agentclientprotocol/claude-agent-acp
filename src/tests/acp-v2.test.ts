@@ -740,6 +740,49 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("replays a Write without the v1 diff that v2 cannot take", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const file = path.join(cwd, "a.ts");
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_write",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_w",
+              name: "Write",
+              input: { file_path: file, content: "x\n" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_w",
+              content: `File created successfully at: ${file}`,
+            },
+          ],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("tool_call_update")).toContainEqual(
+      expect.objectContaining({ toolCallId: "toolu_w", title: "Write a.ts", content: [] }),
+    );
+  });
+
   it("replays the history before it answers session/resume, clearing each message first", async () => {
     const echoed = scriptTurns(
       async function* (options) {

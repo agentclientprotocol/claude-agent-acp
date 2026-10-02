@@ -37,8 +37,10 @@ export class WriteReporter implements ToolReporter {
       // whether the file exists, so the live tool call shows no diff: a diff
       // without the old text would claim a creation. The adapter reads the
       // file only for the preview. A replay has no preview and no hook, so it
-      // keeps the diff.
-      if (!(capabilities.diffPatch || capabilities.v2) || replay) {
+      // keeps the diff, except for a v2 client: a v2 diff names the operation,
+      // which the input does not tell.
+      const inputDiff = capabilities.v2 ? false : !capabilities.diffPatch || replay;
+      if (inputDiff) {
         facts.change = [
           {
             type: "diff",
