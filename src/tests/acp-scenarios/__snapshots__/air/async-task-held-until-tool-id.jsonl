@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<server>|all]]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"asyncTaskId":"monitor_1","canStop":true,"description":"Watch the logs","name":"Watch the logs","sessionUpdate":"async_task_spawned","showInTranscript":true,"taskType":"monitor","toolCallId":"toolu_monitor"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"asyncTaskId":"monitor_1","sessionUpdate":"async_task_progress","summary":"first line","usage":{"durationMs":5,"toolUses":0,"totalTokens":0}}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"asyncTaskId":"monitor_1","sessionUpdate":"async_task_progress","summary":"second line","usage":{"durationMs":6,"toolUses":0,"totalTokens":0}}}}

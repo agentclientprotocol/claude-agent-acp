@@ -122,7 +122,9 @@ import {
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
+  AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
@@ -169,12 +171,12 @@ import {
 import { forkSession } from "./fork-session.js";
 import { subagentHistory } from "./subagent-history.js";
 import {
-  readResumedModel,
   readResumedSession,
+  readResumedTail,
   type ResumedSessionSnapshot,
 } from "./resumed-session.js";
 import { SessionTiming } from "./session-timing.js";
-import { ALLOW_BYPASS, resolvePermissionMode } from "./permissions/modes.js";
+import { ALLOW_BYPASS } from "./permissions/modes.js";
 import { normalizeDurablePermissionChangeSet } from "./permissions/normalization.js";
 import { buildClaudePermissionOptions } from "./permissions/options.js";
 import { buildClaudePermissionPresentation } from "./permissions/presentation.js";
@@ -253,7 +255,14 @@ import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
-import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
+import {
+  nodeToWebReadable,
+  nodeToWebWritable,
+  Pushable,
+  raceTimeoutAndAbort,
+  unreachable,
+} from "./utils.js";
 import {
   acceptedPlanToolResult,
   ExitPlanCoordinator,
@@ -262,7 +271,12 @@ import {
 } from "./exit-plan.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
-import { MODE_CONFIG_ID, SessionModeManager } from "./session-mode.js";
+import { MCP_AVAILABLE_COMMAND, parseMcpCommand, runMcpCommand } from "./mcp-command.js";
+import {
+  MODE_CONFIG_ID,
+  resolveInitialPermissionMode,
+  SessionModeManager,
+} from "./session-mode.js";
 import {
   applyAvailableModelsAllowlist,
   buildModelConfigOption,
@@ -376,6 +390,20 @@ function settleLiveBackgroundTask(session: Session, taskId: string): void {
   }
 }
 
+/** The structured replacement for the text of a local command that Claude
+ *  Code runs itself, such as `/usage` or `/mcp`. */
+type LocalCommandMarkdown = {
+  /** True when `produce` starts at turn activation. Otherwise it starts when
+   *  the command output arrives, so Claude Code has finished the command. */
+  startsAtActivation: boolean;
+  /** The replacement, or null to keep the original text of Claude Code.
+   *  `originalOutput` is that text. It is empty when `produce` starts at
+   *  turn activation. */
+  produce(query: Query, signal: AbortSignal, originalOutput: string): Promise<string | null>;
+  /** Runs once when the turn ends after it delivered the replacement. */
+  afterDelivery?(): void;
+};
+
 /** Best-effort structured presentation for a local `/usage` turn. The command
  * itself always runs through Claude Code; null tells the consumer to forward
  * its original output unchanged. The timeout prevents an unstable control
@@ -386,30 +414,21 @@ async function structuredUsageMarkdown(
   logger: Logger,
 ): Promise<string | null> {
   if (signal.aborted) return null;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
   try {
-    const response = await Promise.race([
+    const outcome = await raceTimeoutAndAbort(
       // Keeping the deliberately unstable method name visible makes an SDK
       // upgrade fail at compile time if Anthropic removes or renames it.
       query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(),
-      new Promise<null>((resolve) => {
-        timeout = setTimeout(() => resolve(null), STRUCTURED_USAGE_TIMEOUT_MS);
-        timeout.unref?.();
-      }),
-      new Promise<null>((resolve) => {
-        onAbort = () => resolve(null);
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
-      }),
-    ]);
-    if (response === null) {
-      if (!signal.aborted) {
+      STRUCTURED_USAGE_TIMEOUT_MS,
+      signal,
+    );
+    if (outcome.type !== "done") {
+      if (outcome.type === "timeout") {
         logger.error("Structured /usage timed out; preserving Claude Code output");
       }
       return null;
     }
-    const usage = parseUsageResponse(response);
+    const usage = parseUsageResponse(outcome.value);
     if (!usage) {
       logger.error(
         "Structured /usage returned an incompatible response; preserving Claude Code output",
@@ -420,9 +439,6 @@ async function structuredUsageMarkdown(
   } catch (error) {
     logger.error(`Structured /usage failed; preserving Claude Code output: ${error}`);
     return null;
-  } finally {
-    if (timeout) clearTimeout(timeout);
-    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -620,17 +636,17 @@ type Turn = {
    *  queue head, not `activeTurn`: a UserPromptSubmit block arrives before
    *  any echo, so the turn is only promoted when its result lands. */
   noticeTexts?: string[];
-  /** Structured presentation for an exact /usage command. The command still
-   * runs through the normal SDK turn so ordering, cancellation, persistence,
-   * and replay remain unchanged. Null means the experimental API failed and
-   * every output path must preserve Claude Code's original text. */
-  isUsageCommand?: boolean;
-  usageMarkdown?: Promise<string | null>;
-  usageMarkdownAbort?: AbortController;
+  /** Structured presentation for an exact /usage or /mcp command. The command
+   * still runs through the normal SDK turn so ordering, cancellation,
+   * persistence, and replay remain unchanged. A null result means the request
+   * failed and every output path must preserve Claude Code's original text. */
+  localCommand?: LocalCommandMarkdown;
+  localCommandMarkdown?: Promise<string | null>;
+  localCommandAbort?: AbortController;
   /** The SDK can expose a local command through more than one message shape;
    * publish the structured replacement at most once. */
-  usageMarkdownDelivered?: boolean;
-  usageOriginalOutput?: string;
+  localCommandDelivered?: boolean;
+  localCommandOriginalOutput?: string;
   /** Optional native checkpoint preview requested by the ACP client for this
    *  turn. The state is turn-owned so a late control response can never be
    *  rebound to a newer prompt. */
@@ -775,6 +791,21 @@ type Turn = {
   completion?: Promise<void>;
 };
 
+/** The part of a {@link Session} that a history replay reads and writes.
+ *  A session/load creates it before the CLI starts, so that the replay runs
+ *  while the CLI starts. The session record then takes the same objects. */
+type ReplayState = Pick<
+  Session,
+  "cwd" | "taskState" | "forwardSubagentText" | "messageIdToUuid" | "sessionFailureState"
+>;
+
+/** A replay that runs before its session record exists. */
+type PendingReplay = {
+  state: ReplayState;
+  /** Set when the session creation fails. The replay then sends no more updates. */
+  stopped: boolean;
+};
+
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -855,6 +886,10 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
+   *  the command name. A `commands_changed` clears it, because the skill
+   *  files can have changed then. */
+  skillPaths?: Map<string, string | undefined>;
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -1800,6 +1835,7 @@ const REPLAY_HIDDEN_COMMANDS = new Set([
   ...LOCAL_ONLY_COMMANDS,
   "/compact",
   "/model",
+  "/mcp",
   "/status",
   "/usage",
 ]);
@@ -2236,12 +2272,23 @@ function startMcpAuthentication(
   sessionId: string,
   mcpServers: NewSessionRequest["mcpServers"],
 ): void {
-  if (!host.clientCapabilities?.elicitation?.url || mcpServers.length === 0) return;
+  if (mcpServers.length === 0) return;
+  startMcpServerAuthentication(host, sessionId, new Set(mcpServers.map((server) => server.name)));
+}
+
+/** Start OAuth in the background for the servers in `requestedServers` that
+ *  Claude reports as needing authentication. Startup and `/mcp` use it. It
+ *  does nothing while another OAuth run of the session is in progress. */
+function startMcpServerAuthentication(
+  host: McpAuthenticationHost,
+  sessionId: string,
+  requestedServers: Set<string>,
+): void {
+  if (!host.clientCapabilities?.elicitation?.url) return;
 
   const session = host.sessions[sessionId];
   if (!session || mcpAuthentications.has(session)) return;
 
-  const requestedServers = new Set(mcpServers.map((server) => server.name));
   const authentication = authenticateMcpServers(host, sessionId, session.query, requestedServers)
     .catch((error) => {
       if (!session.abortController.signal.aborted) {
@@ -2678,6 +2725,64 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /**
+   * Start the CLI of a loaded session, and replay the history while the CLI
+   * starts. The CLI start takes most of the load time, and the replay needs
+   * only the transcript and the {@link ReplayState}. An invalid `cwd` fails
+   * before the first update. A failed CLI start stops the replay.
+   */
+  private async createSessionWhileReplaying(
+    params: LoadSessionRequest,
+    timing: SessionTiming,
+  ): Promise<NewSessionResponse> {
+    await this.validateCwd(params.cwd);
+    const pending: PendingReplay = {
+      state: {
+        cwd: params.cwd,
+        taskState: new Map(),
+        forwardSubagentText: this.forwardsSubagentText(params._meta),
+        messageIdToUuid: new Map(),
+        sessionFailureState: createSessionFailureState(),
+      },
+      stopped: false,
+    };
+    const transcript = readResumedSession(params.sessionId, this.logger);
+    const replay = transcript
+      .then(({ messages }) => this.replaySessionHistory(params.sessionId, messages, pending))
+      .then(
+        () => ({ ok: true as const }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+    let response: NewSessionResponse;
+    try {
+      response = await this.createSession(
+        {
+          cwd: params.cwd,
+          mcpServers: params.mcpServers ?? [],
+          additionalDirectories: params.additionalDirectories,
+          _meta: params._meta,
+        },
+        {
+          resume: params.sessionId,
+          resumedModelHint: transcript.then(({ model }) => model),
+          replayState: pending.state,
+        },
+      );
+    } catch (error) {
+      pending.stopped = true;
+      await replay;
+      throw error;
+    }
+    timing.phase("session-ready");
+    const replayed = await replay;
+    if (!replayed.ok) throw replayed.error;
+    return {
+      sessionId: response.sessionId,
+      modes: response.modes,
+      configOptions: response.configOptions,
+    };
+  }
+
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
     return forkSession(params, {
@@ -2702,11 +2807,15 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    const resumedSession = await readResumedSession(params.sessionId, this.logger);
-    const result = await this.getOrCreateSession(params, resumedSession);
-    timing.phase("session-ready");
-
-    await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    let result: NewSessionResponse;
+    if (this.sessions[params.sessionId]) {
+      const resumedSession = await readResumedSession(params.sessionId, this.logger);
+      result = await this.getOrCreateSession(params, resumedSession);
+      timing.phase("session-ready");
+      await this.replaySessionHistory(params.sessionId, resumedSession.messages);
+    } else {
+      result = await this.createSessionWhileReplaying(params, timing);
+    }
     timing.phase("replay");
 
     // Send available commands after replay so it doesn't interleave with history
@@ -3143,6 +3252,49 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** The structured replacement for a prompt that is exactly `/usage` or a
+   *  `/mcp` command. Claude Code runs the command, and the replacement takes
+   *  the place of its text. Claude Code refuses a `/mcp` reconnect, enable,
+   *  or disable in SDK mode. The `/mcp` producer runs them through the SDK
+   *  control API when the text arrives, so the action stays in the turn. */
+  private localCommandMarkdown(params: PromptRequest): LocalCommandMarkdown | undefined {
+    const text =
+      params.prompt.length === 1 && params.prompt[0]?.type === "text"
+        ? params.prompt[0].text
+        : undefined;
+    if (text === undefined) return undefined;
+    if (isUsageCommandText(text)) {
+      return {
+        startsAtActivation: true,
+        produce: (query, signal) => structuredUsageMarkdown(query, signal, this.logger),
+      };
+    }
+    const command = parseMcpCommand(text);
+    if (!command) return undefined;
+    let reconnected: string[] = [];
+    return {
+      startsAtActivation: false,
+      produce: async (query, signal, originalOutput) => {
+        const outcome = await runMcpCommand(query, command, originalOutput, signal, (message) =>
+          this.logger.error(message),
+        );
+        reconnected = outcome.reconnected;
+        return outcome.markdown;
+      },
+      // A reconnect starts OAuth for the ACP servers that it tried, as the
+      // session start does. A plain `/mcp` and a cancelled turn start none.
+      afterDelivery: () => {
+        const session = this.sessions[params.sessionId];
+        if (!session || session.cancelled) return;
+        const acpServers = new Set(
+          (session.creationParams?.mcpServers ?? []).map((server) => server.name),
+        );
+        const servers = new Set(reconnected.filter((server) => acpServers.has(server)));
+        if (servers.size > 0) startMcpServerAuthentication(this, params.sessionId, servers);
+      },
+    };
+  }
+
   /**
    * Serves an ACP v1 `session/prompt`, which answers when the turn ends. The
    * outcome of a turn is field for field a v1 prompt response.
@@ -3215,11 +3367,8 @@ export class ClaudeAcpAgent {
 
     const fileChangeReport = session.fileChangeReporter?.request(params._meta);
 
-    const isUsageCommand =
-      params.prompt.length === 1 &&
-      params.prompt[0]?.type === "text" &&
-      isUsageCommandText(params.prompt[0].text);
-    const usageMarkdownAbort = isUsageCommand ? new AbortController() : undefined;
+    const localCommand = this.localCommandMarkdown(params);
+    const localCommandAbort = localCommand ? new AbortController() : undefined;
 
     session.titles.onPrompt(params.prompt);
 
@@ -3232,8 +3381,8 @@ export class ClaudeAcpAgent {
       promptUuid,
       events,
       isLocalOnlyCommand,
-      ...(isUsageCommand ? { isUsageCommand: true } : {}),
-      ...(usageMarkdownAbort ? { usageMarkdownAbort } : {}),
+      ...(localCommand ? { localCommand } : {}),
+      ...(localCommandAbort ? { localCommandAbort } : {}),
       ...(fileChangeReport ? { fileChangeReport } : {}),
       settled: false,
       completion: new Promise<void>((resolve) => {
@@ -3377,7 +3526,10 @@ export class ClaudeAcpAgent {
     try {
       // `resume` names the Claude session, which shares the ACP session id, so
       // the new query continues the same conversation under the same id.
-      await this.createSession(creationParams, { resume: sessionId });
+      await this.createSession(creationParams, {
+        resume: sessionId,
+        permissionMode: session.modes.currentModeId as PermissionMode,
+      });
     } catch (error) {
       if (error instanceof RequestError && error.code === RequestError.resourceNotFound().code) {
         // The CLI never wrote this conversation, because the very first turn
@@ -3388,7 +3540,10 @@ export class ClaudeAcpAgent {
           `session ${sessionId} was never persisted; starting a fresh query under the same id`,
         );
         try {
-          await this.createSession(creationParams, { reuseSessionId: sessionId });
+          await this.createSession(creationParams, {
+            reuseSessionId: sessionId,
+            permissionMode: session.modes.currentModeId as PermissionMode,
+          });
           return;
         } catch (fallbackError) {
           if (!this.sessions[sessionId]) {
@@ -3948,14 +4103,17 @@ export class ClaudeAcpAgent {
         supportsAirSessionFailures(this.clientCapabilities) ? undefined : rawDetail,
       );
 
-    const ensureUsageMarkdown = (turn: Turn): Promise<string | null> | undefined => {
-      if (!turn.isUsageCommand || !turn.usageMarkdownAbort) return undefined;
-      turn.usageMarkdown ??= structuredUsageMarkdown(
+    const ensureLocalCommandMarkdown = (
+      turn: Turn,
+      originalOutput = "",
+    ): Promise<string | null> | undefined => {
+      if (!turn.localCommand || !turn.localCommandAbort) return undefined;
+      turn.localCommandMarkdown ??= turn.localCommand.produce(
         session.query,
-        turn.usageMarkdownAbort.signal,
-        this.logger,
+        turn.localCommandAbort.signal,
+        originalOutput,
       );
-      return turn.usageMarkdown;
+      return turn.localCommandMarkdown;
     };
 
     const resetTurnScratch = () => {
@@ -4000,7 +4158,7 @@ export class ClaudeAcpAgent {
       session.activeTurn = turn;
       session.cancelled = false;
       compaction.resume();
-      ensureUsageMarkdown(turn);
+      if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
@@ -4202,26 +4360,27 @@ export class ClaudeAcpAgent {
     const firstUnsettledQueuedTurn = () => (session.turnQueue ?? []).find((t) => !t.settled);
 
     /** Claim the structured replacement for the turn currently producing a
-     * local-command output. Undefined means this is not a structured usage
-     * turn (or its request failed), null means another SDK message shape
-     * already delivered it, and string is the one replacement to publish. */
-    const takeUsageMarkdown = async (
+     * local-command output. Undefined means this is not a structured
+     * local-command turn (or its request failed), null means another SDK
+     * message shape already delivered it, and string is the one replacement
+     * to publish. */
+    const takeLocalCommandMarkdown = async (
       originalOutput: string,
     ): Promise<string | null | undefined> => {
       const turn = session.activeTurn ?? firstUnsettledQueuedTurn();
       if (!turn) return undefined;
-      const usageMarkdown = ensureUsageMarkdown(turn);
-      if (!usageMarkdown) return undefined;
-      const markdown = await usageMarkdown;
+      const pending = ensureLocalCommandMarkdown(turn, originalOutput);
+      if (!pending) return undefined;
+      const markdown = await pending;
       if (markdown === null) return undefined;
-      if (turn.usageMarkdownDelivered) {
+      if (turn.localCommandDelivered) {
         // Different SDK message shapes can mirror the same local-command
         // output. Suppress an exact mirror, but let a later, distinct frame
         // (for example an interruption diagnostic) follow the normal path.
-        return turn.usageOriginalOutput === originalOutput ? null : undefined;
+        return turn.localCommandOriginalOutput === originalOutput ? null : undefined;
       }
-      turn.usageMarkdownDelivered = true;
-      turn.usageOriginalOutput = originalOutput;
+      turn.localCommandDelivered = true;
+      turn.localCommandOriginalOutput = originalOutput;
       return markdown;
     };
 
@@ -4394,7 +4553,8 @@ export class ClaudeAcpAgent {
       // Captured before the settled flip below (isHeldOpen tests !settled).
       const wasHeld = isHeldOpen(turn);
       turn.settled = true;
-      turn.usageMarkdownAbort?.abort();
+      turn.localCommandAbort?.abort();
+      if (turn.localCommandDelivered) turn.localCommand?.afterDelivery?.();
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
@@ -4900,15 +5060,15 @@ export class ClaudeAcpAgent {
                 if (compaction.consumeDuplicateErrorOutput(message.content)) {
                   break;
                 }
-                const usageTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
-                const usageMarkdown = await takeUsageMarkdown(message.content);
-                if (usageTurn?.isUsageCommand && session.cancelled) break;
-                if (usageMarkdown === null) break;
+                const commandTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                const commandMarkdown = await takeLocalCommandMarkdown(message.content);
+                if (commandTurn?.localCommand && session.cancelled) break;
+                if (commandMarkdown === null) break;
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
                     sessionUpdate: "agent_message_chunk",
-                    content: { type: "text", text: usageMarkdown ?? message.content },
+                    content: { type: "text", text: commandMarkdown ?? message.content },
                     messageId: messageIdForGrouping(message),
                   },
                 });
@@ -5078,6 +5238,7 @@ export class ClaudeAcpAgent {
                 // list with this payload. Forward message.commands directly —
                 // it's authoritative, and re-querying supportedCommands()
                 // would just return the same list with an extra round-trip.
+                session.skillPaths = new Map();
                 await sendUpdate({
                   sessionId: params.sessionId,
                   update: {
@@ -5085,6 +5246,8 @@ export class ClaudeAcpAgent {
                     availableCommands: getAvailableSlashCommands(
                       message.commands,
                       session.terminalSlashCommands,
+                      this.toolCallCapabilities.air.client ? session.cwd : undefined,
+                      session.skillPaths,
                     ),
                   },
                 });
@@ -6043,10 +6206,12 @@ export class ClaudeAcpAgent {
                         normalizeNoticeText(message.result),
                       ));
                   if (shouldForwardResult) {
-                    const usageMarkdown = await takeUsageMarkdown(message.result);
-                    if (usageMarkdown === null) break;
+                    const commandTurn = session.activeTurn ?? firstUnsettledQueuedTurn();
+                    const commandMarkdown = await takeLocalCommandMarkdown(message.result);
+                    if (commandTurn?.localCommand && session.cancelled) break;
+                    if (commandMarkdown === null) break;
                     for (const notification of toAcpNotifications(
-                      usageMarkdown ?? message.result,
+                      commandMarkdown ?? message.result,
                       "assistant",
                       params.sessionId,
                       session.toolUseCache,
@@ -6497,20 +6662,20 @@ export class ClaudeAcpAgent {
             // Depending on the Claude Code build, a local command can arrive
             // as the dedicated system message above or as a synthetic
             // assistant message. Replace only the output owned by the exact
-            // /usage turn; no content signatures or text parsing are involved.
+            // /usage or /mcp turn; no content signatures or text parsing are involved.
             if (
               message.type === "assistant" &&
               message.parent_tool_use_id === null &&
               message.message.model === "<synthetic>"
             ) {
-              const usageMarkdown = await takeUsageMarkdown(
+              const commandMarkdown = await takeLocalCommandMarkdown(
                 assistantMessageText(message.message) ?? "",
               );
               if (session.cancelled) break;
-              if (usageMarkdown !== undefined) {
-                if (usageMarkdown !== null) {
+              if (commandMarkdown !== undefined) {
+                if (commandMarkdown !== null) {
                   for (const notification of toAcpNotifications(
-                    usageMarkdown,
+                    commandMarkdown,
                     "assistant",
                     params.sessionId,
                     session.toolUseCache,
@@ -6896,7 +7061,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
-    for (const turn of session.turnQueue ?? []) turn.usageMarkdownAbort?.abort();
+    for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
     // The stream already ended (see closeQueryStream): every in-flight turn was
@@ -7391,6 +7556,7 @@ export class ClaudeAcpAgent {
   private async replaySessionHistory(
     sessionId: string,
     resumedMessages?: SessionMessage[],
+    pending?: PendingReplay,
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
@@ -7399,7 +7565,9 @@ export class ClaudeAcpAgent {
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
     );
-    const session = this.sessions[sessionId];
+    // A pending replay has no session record yet. It uses the state that the record takes later.
+    const replayState = (): ReplayState | undefined => pending?.state ?? this.sessions[sessionId];
+    const session = replayState();
     // A replay rebuilds the client view, so its plan goes out again.
     if (session?.taskState) forgetPublishedTaskPlan(session.taskState);
     const forwardSubagentText =
@@ -7412,7 +7580,11 @@ export class ClaudeAcpAgent {
             sessionId,
             state: session.sessionFailureState,
             capabilities: this.clientCapabilities,
-            isCurrent: () => this.sessions[sessionId] === session,
+            isCurrent: () => {
+              const live = this.sessions[sessionId];
+              if (!live) return pending !== undefined && !pending.stopped;
+              return live.sessionFailureState === session.sessionFailureState;
+            },
             sendUpdate: (notification) => this.client.sessionUpdate(notification),
             logger: this.logger,
           })
@@ -7604,7 +7776,7 @@ export class ClaudeAcpAgent {
     };
 
     const replayMessage = async (message: SessionMessage): Promise<void> => {
-      if (isReplayHiddenMetaMessage(message)) {
+      if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
       if (
@@ -7620,7 +7792,7 @@ export class ClaudeAcpAgent {
       // a client-supplied id without an extra getSessionMessages read. Not read
       // yet (see Session.messageIdToUuid).
       const replayMessageId = messageIdForGrouping(message);
-      const replaySession = this.sessions[sessionId];
+      const replaySession = replayState();
       if (replaySession && replayMessageId && message.uuid) {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
       }
@@ -7739,8 +7911,8 @@ export class ClaudeAcpAgent {
           registerHooks: false,
           replay: true,
           clientCapabilities: this.clientCapabilities,
-          cwd: this.sessions[sessionId]?.cwd,
-          taskState: this.sessions[sessionId]?.taskState,
+          cwd: replayState()?.cwd,
+          taskState: replayState()?.taskState,
           messageId: replayMessageId,
           parentToolUseId,
         },
@@ -7788,7 +7960,7 @@ export class ClaudeAcpAgent {
     };
     for (const message of messages) await replayMessage(message);
 
-    if (nativeReplayEnabled) {
+    if (nativeReplayEnabled && !pending?.stopped) {
       // Claude history persists sidechain messages and Agent/Task tool uses,
       // but not task_started/task_updated lifecycle frames. Recover terminal
       // state from the launch tool_result. Missing results and malformed or
@@ -8336,7 +8508,12 @@ export class ClaudeAcpAgent {
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(commands, session.terminalSlashCommands),
+        availableCommands: getAvailableSlashCommands(
+          commands,
+          session.terminalSlashCommands,
+          this.toolCallCapabilities.air.client ? session.cwd : undefined,
+          (session.skillPaths ??= new Map()),
+        ),
       },
     });
   }
@@ -8749,6 +8926,8 @@ export class ClaudeAcpAgent {
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
     const existingSession = this.sessions[params.sessionId];
+    // A recreated live session keeps its mode, not the mode of the transcript.
+    const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
       if (fingerprint === existingSession.sessionFingerprint) {
@@ -8766,10 +8945,6 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
-    const resumedModelHint = resumedSession
-      ? resumedSession.model
-      : await readResumedModel(params.sessionId, this.logger);
-
     const response = await this.createSession(
       {
         cwd: params.cwd,
@@ -8779,7 +8954,8 @@ export class ClaudeAcpAgent {
       },
       {
         resume: params.sessionId,
-        resumedModelHint,
+        permissionMode: livePermissionMode,
+        ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
       },
     );
 
@@ -8819,6 +8995,15 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Whether the session forwards the text and the thinking of a subagent. */
+  private forwardsSubagentText(meta: NewSessionRequest["_meta"]): boolean {
+    return (
+      clientSupportsSubagents(this.clientCapabilities) ||
+      supportsSubagentTranscript(this.clientCapabilities) ||
+      (meta as NewSessionMeta | undefined)?.claudeCode?.options?.forwardSubagentText === true
+    );
+  }
+
   private async createSession(
     params: NewSessionRequest,
     creationOpts: {
@@ -8834,7 +9019,9 @@ export class ClaudeAcpAgent {
       /** Concrete model id from the resumed transcript's last real assistant
        *  message. Claude Code restores from this same record, so it lets us
        *  report the live model without a slow getContextUsage control request. */
-      resumedModelHint?: string;
+      resumedModelHint?: string | Promise<string | undefined>;
+      /** The state that a replay on the same session uses before this record exists. */
+      replayState?: ReplayState;
     } = {},
   ): Promise<NewSessionResponse> {
     const createStartedAt = performance.now();
@@ -8871,12 +9058,14 @@ export class ClaudeAcpAgent {
     // sign-out respawn, provider rerouting), so fill the same fast local hint
     // here when the caller did not provide it. Never fall back to the slow
     // getContextUsage control request.
+    // The same tail read gives the permission mode of the resumed session.
     let resumedModelHint = creationOpts.resumedModelHint;
-    if (
-      creationOpts.resume !== undefined &&
-      !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint")
-    ) {
-      resumedModelHint = await readResumedModel(creationOpts.resume, this.logger);
+    let resumedPermissionMode: string | undefined;
+    if (creationOpts.resume !== undefined) {
+      const withModel = !Object.prototype.hasOwnProperty.call(creationOpts, "resumedModelHint");
+      const tail = await readResumedTail(creationOpts.resume, this.logger, withModel);
+      if (withModel) resumedModelHint = tail.model;
+      resumedPermissionMode = tail.permissionMode;
       timing.phase("resume-transcript");
     }
 
@@ -8945,8 +9134,12 @@ export class ClaudeAcpAgent {
       settingsManager.getSettings().permissions?.disableBypassPermissionsMode !== "disable" &&
       sessionMeta?.claudeCode?.options?.allowDangerouslySkipPermissions !== false;
 
-    const initialPermissionMode = resolvePermissionMode(
-      creationOpts.permissionMode ?? settingsManager.getSettings().permissions?.defaultMode,
+    const initialPermissionMode = resolveInitialPermissionMode(
+      {
+        explicit: creationOpts.permissionMode,
+        resumed: resumedPermissionMode,
+        defaultMode: settingsManager.getSettings().permissions?.defaultMode,
+      },
       this.logger,
       allowBypass,
     );
@@ -8958,10 +9151,7 @@ export class ClaudeAcpAgent {
     // ACP contract. Ignore the provider-specific option instead of forwarding
     // hidden state that the Client cannot inspect or change.
     if (userProvidedOptions) delete userProvidedOptions.agent;
-    const forwardSubagentText =
-      clientSupportsSubagents(this.clientCapabilities) ||
-      supportsSubagentTranscript(this.clientCapabilities) ||
-      userProvidedOptions?.forwardSubagentText === true;
+    const forwardSubagentText = this.forwardsSubagentText(params._meta);
 
     // Configure thinking behavior from environment variable
     const thinking = resolveThinkingConfig(process.env.MAX_THINKING_TOKENS, this.logger);
@@ -8995,7 +9185,7 @@ export class ClaudeAcpAgent {
     // Per-session task state. Created here (rather than in the session record
     // below) so the TaskCreated/TaskCompleted hook callbacks can close over
     // the same Map that the streaming message handler will read from.
-    const taskState: TaskState = new Map();
+    const taskState: TaskState = creationOpts.replayState?.taskState ?? new Map();
 
     // Resolve every workspace root once. The native checkpoint report uses
     // this same set for lexical path validation, and the SDK receives it below.
@@ -9321,7 +9511,7 @@ export class ClaudeAcpAgent {
         this.logger,
         creationOpts.resume !== undefined,
         sessionId,
-        resumedModelHint,
+        await resumedModelHint,
       );
       timing.phase("models");
 
@@ -9492,8 +9682,9 @@ export class ClaudeAcpAgent {
         nativeSubagentParentByToolUseId: new Map(),
         emittedAssistantText: false,
         owedTrailingIdles: 0,
-        messageIdToUuid: new Map(),
-        sessionFailureState: createSessionFailureState(),
+        messageIdToUuid: creationOpts.replayState?.messageIdToUuid ?? new Map(),
+        sessionFailureState:
+          creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
         fileChangeReporter,
@@ -9540,7 +9731,10 @@ export class ClaudeAcpAgent {
         this.closeQueryStream(session);
         delete this.sessions[sessionId];
         try {
-          await this.createSession(session.creationParams, { resume: sessionId });
+          await this.createSession(session.creationParams, {
+            resume: sessionId,
+            permissionMode: session.modes.currentModeId as PermissionMode,
+          });
         } catch (error) {
           // One session that cannot come back must not abort the switch. The
           // `--hide-claude-auth` guard makes this a normal outcome of
@@ -10139,7 +10333,20 @@ function getAvailableSlashCommands(
   // the CLI's own terminal, which ACP clients aren't) — filtered alongside
   // the static list. Raw CLI names, matched before the MCP rename.
   terminalCommands?: readonly string[],
+  // The session cwd of an AIR client, or undefined for every other client.
+  // AIR gets the kind and the SKILL.md path of each skill command.
+  airSkillCwd?: string,
+  // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
+  skillPaths?: Map<string, string | undefined>,
 ): AvailableCommand[] {
+  const skillPath = (name: string, cwd: string): string | undefined => {
+    const key = `${cwd}\0${name}`;
+    if (skillPaths?.has(key)) return skillPaths.get(key);
+    const resolved = resolveSkillPath(name, cwd);
+    skillPaths?.set(key, resolved);
+    return resolved;
+  };
+
   const UNSUPPORTED_COMMANDS = [
     "clear",
     "cost",
@@ -10151,8 +10358,10 @@ function getAvailableSlashCommands(
     "todos",
   ];
 
-  return commands
-    .filter((command) => !terminalCommands?.includes(command.name))
+  // The adapter replaces the terminal text of `/mcp` and runs its actions,
+  // even when Claude Code tags the command terminal-bound.
+  const advertised = commands
+    .filter((command) => command.name !== "mcp" && !terminalCommands?.includes(command.name))
     .map((command) => {
       const input = command.argumentHint
         ? {
@@ -10162,16 +10371,31 @@ function getAvailableSlashCommands(
           }
         : null;
       let name = command.name;
-      if (command.name.endsWith(" (MCP)")) {
+      const mcpPrompt = command.name.endsWith(" (MCP)");
+      if (mcpPrompt) {
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
+      const skillMdPath =
+        airSkillCwd && !command.builtin && !mcpPrompt
+          ? skillPath(command.name, airSkillCwd)
+          : undefined;
       return {
         name,
         description: command.description || "",
         input,
+        ...(skillMdPath
+          ? {
+              _meta: withAirMeta(
+                withAirMeta(undefined, AIR_KIND_KEY, "skill"),
+                AIR_SKILL_PATH_KEY,
+                skillMdPath,
+              ),
+            }
+          : {}),
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
+  return [...advertised, MCP_AVAILABLE_COMMAND];
 }
 
 function formatUriAsLink(uri: string): string {
