@@ -102,6 +102,8 @@ export interface ScriptContext {
   /** The session id that the agent passed to the SDK. */
   sessionId: string;
   options: QueryOptions;
+  /** The uuid of the prompt the current turn answers, as the agent sent it. */
+  promptUuid?: string;
   /** Calls `canUseTool` like Claude Code does before it runs a tool. */
   canUseTool(
     toolName: string,
@@ -210,6 +212,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       const next = await iterator.next();
       if (next.done) return;
       const user = next.value;
+      ctx.promptUuid = user.uuid;
       yield {
         type: "user",
         message: user.message,

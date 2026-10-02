@@ -18150,6 +18150,237 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
   });
+
+  describe("a prompt folded into an autonomous cycle", () => {
+    // A prompt sent while the CLI runs an autonomous cycle is folded into that
+    // cycle between tool rounds. The cycle's result keeps its autonomous origin
+    // but names the folded send in user_message_uuids, so it is that prompt's
+    // result — skipping it as autonomous would hang the prompt forever.
+
+    /** The CLI keeps its stream open after the cycle, so an unsettled prompt
+     *  hangs instead of being swept up by the stream ending. */
+    function liveStream() {
+      let end!: () => void;
+      const ended = new Promise<void>((resolve) => (end = resolve));
+      return { ended, end };
+    }
+
+    it("settles a prompt the CLI folded into a task-notification cycle", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield assistantText("folded answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("settles a folded prompt the CLI never echoed", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          // No echo: the turn is still queued when the stamped result arrives.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("hands off a held turn and settles the prompt folded into its followup", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage(); // first prompt held for agent-1
+          yield idle();
+          // The second prompt arrives while the first is held; the subagent's
+          // followup cycle then consumes it.
+          const u2 = await iter.next();
+          yield taskNotification("agent-1");
+          yield userEcho(u2.value);
+          yield assistantText("summary and answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: u2.value.uuid,
+            user_message_uuids: [u2.value.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const first = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+      const second = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+      const secondResponse = await second;
+      expect(secondResponse.stopReason).toBe("end_turn");
+      expect(secondResponse.usage?.inputTokens).toBe(10);
+      expect(secondResponse.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a task-notification result naming no pending prompt off the user turn", async () => {
+      const agent = createMockAgent();
+      const unrelatedUuid = randomUUID();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          // An autonomous cycle's result names a send that is not a pending
+          // prompt, so it must not settle the user's turn or lend it tokens.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: unrelatedUuid,
+            user_message_uuids: [unrelatedUuid],
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield resultMessage();
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a held turn open when a followup result names its own prompt", async () => {
+      // A held turn already has its result, so a followup result naming its
+      // uuid is the cycle's own, not a fold into the turn: it must neither
+      // settle the hold nor lend the turn its tokens while a subagent lives.
+      const agent = createMockAgent();
+      const stream = liveStream();
+      let checkpointReached = false;
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => (resume = resolve));
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield subagentStarted("agent-2");
+          yield resultMessage(); // held for both subagents
+          yield idle();
+          yield taskNotification("agent-1");
+          yield assistantText("partial summary");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            num_turns: 1,
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          checkpointReached = true;
+          await resumed;
+          yield taskNotification("agent-2");
+          yield assistantText("final summary");
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 1 });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      let resolved = false;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+
+      await waitFor(() => checkpointReached);
+      // Let a premature settle propagate to the prompt before checking it.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(resolved).toBe(false);
+      resume();
+
+      const response = await prompt;
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+  });
 });
 
 describe("turn steering (_session/steering)", () => {
