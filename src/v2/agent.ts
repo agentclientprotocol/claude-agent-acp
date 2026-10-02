@@ -29,6 +29,7 @@ import {
   v2ResumeSessionResponse,
 } from "./session.js";
 import { v2SessionUpdate } from "./session-update.js";
+import { V2Terminals } from "./terminal.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -67,7 +68,11 @@ export function v2AgentApp(
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
       );
     })
-    .onRequest(v2.methods.agent.session.close, ({ params }) => agent.closeSession(params))
+    .onRequest(v2.methods.agent.session.close, async ({ params }) => {
+      const response = await agent.closeSession(params);
+      client.terminals.forget(params.sessionId);
+      return response;
+    })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
     .onRequest(v2.methods.agent.session.setConfigOption, async ({ params }) => {
       const { configOptions, ...response } = await agent.setSessionConfigOption(
@@ -93,6 +98,9 @@ class V2ClientConnection implements AcpClient {
    * replay has cleared so far.
    */
   private readonly replays = new Map<string, Set<string>>();
+
+  /** The display terminals of the commands that the agent runs. */
+  readonly terminals = new V2Terminals();
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -139,17 +147,34 @@ class V2ClientConnection implements AcpClient {
   }
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
-    const v2Update = v2SessionUpdate(update);
-    if (!v2Update) return;
-    const clear = this.replayClear(notification.sessionId, v2Update);
-    // Both go to the connection before either is awaited, so a chunk that
-    // another call sends meanwhile cannot come between them.
-    await Promise.all([
-      ...(clear
-        ? [this.ctx.notify(v2.methods.client.session.update, { ...notification, update: clear })]
-        : []),
-      this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
-    ]);
+    const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
+      const clear = this.replayClear(notification.sessionId, v2Update);
+      return clear ? [clear, v2Update] : [v2Update];
+    });
+    // Every update goes to the connection before any is awaited, so an update
+    // that another call sends meanwhile cannot come between them.
+    await Promise.all(
+      updates.map((v2Update) =>
+        this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
+      ),
+    );
+  }
+
+  /**
+   * The v2 updates of a v1 update: for a tool call report, the updates of its
+   * terminal first, then the report itself (see {@link V2Terminals}).
+   */
+  private v2Updates(
+    sessionId: string,
+    update: AcpSessionNotification["update"],
+  ): v2.SessionUpdate[] {
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      const v2Update = v2SessionUpdate(update);
+      return v2Update ? [v2Update] : [];
+    }
+    const { terminal, report } = this.terminals.split(sessionId, update);
+    const reportUpdate = report && v2SessionUpdate(report);
+    return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
   }
 
   /**

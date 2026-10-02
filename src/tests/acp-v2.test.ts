@@ -23,6 +23,7 @@ import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
+import { V2Terminals } from "../v2/terminal.js";
 import { v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
@@ -1226,6 +1227,118 @@ describe("ACP v2 session translation", () => {
     ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [diff] });
   });
 
+  it("turns the terminal extension of a command into a display terminal", () => {
+    const terminals = new V2Terminals();
+    const base64 = (text: string) => Buffer.from(text).toString("base64");
+    const toolCallId = "toolu_bash";
+    // The first report of a streamed tool use names the terminal, without a command yet.
+    expect(
+      terminals.split("s", {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Terminal",
+        rawInput: {},
+        content: [{ type: "terminal", terminalId: "term" }],
+        _meta: { claudeCode: { toolName: "Bash" }, terminal_info: { terminal_id: "term" } },
+      }),
+    ).toEqual({
+      terminal: [{ sessionUpdate: "terminal_update", terminalId: "term" }],
+      report: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Terminal",
+        rawInput: {},
+        content: [{ type: "terminal", terminalId: "term" }],
+        _meta: { claudeCode: { toolName: "Bash" } },
+      },
+    });
+    // The command, once the input carries it, and only once.
+    const refinement = {
+      sessionUpdate: "tool_call_update" as const,
+      toolCallId,
+      rawInput: { command: "make" },
+    };
+    expect(terminals.split("s", refinement).terminal).toEqual([
+      { sessionUpdate: "terminal_update", terminalId: "term", command: "make" },
+    ]);
+    expect(terminals.split("s", refinement).terminal).toEqual([]);
+    // A chunk of output, then the output report that carries nothing else.
+    expect(
+      terminals.split("s", {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        _meta: {
+          claudeCode: { parentToolUseId: "toolu_agent" },
+          terminal_output_delta: { terminal_id: "term", data: "bu" },
+        },
+      }),
+    ).toEqual({
+      terminal: [
+        { sessionUpdate: "terminal_output_chunk", terminalId: "term", data: base64("bu") },
+      ],
+      report: undefined,
+    });
+    // The exit, then the status.
+    expect(
+      terminals.split("s", {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "failed",
+        _meta: {
+          claudeCode: { toolName: "Bash" },
+          terminal_output: { terminal_id: "term", data: "build" },
+          terminal_exit: { terminal_id: "term", exit_code: 2, signal: "SIGTERM" },
+        },
+      }),
+    ).toEqual({
+      terminal: [
+        {
+          sessionUpdate: "terminal_update",
+          terminalId: "term",
+          output: { data: base64("build") },
+          exitStatus: { exitCode: 2, signal: "SIGTERM" },
+        },
+      ],
+      report: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "failed",
+        _meta: { claudeCode: { toolName: "Bash" } },
+      },
+    });
+    // The command exited: a later report updates no terminal, and a report
+    // without the extension's keys passes as it is.
+    const hook = {
+      sessionUpdate: "tool_call_update" as const,
+      toolCallId,
+      rawInput: { command: "make all" },
+      _meta: { claudeCode: { toolResponse: { stdout: "build" } } },
+    };
+    expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
+  });
+
+  it("forgets the terminals of a closed session", () => {
+    const terminals = new V2Terminals();
+    const named = (sessionId: string) =>
+      terminals.split(sessionId, {
+        sessionUpdate: "tool_call",
+        toolCallId: "toolu_bash",
+        title: "Terminal",
+        _meta: { terminal_info: { terminal_id: "term" } },
+      });
+    const commanded = (sessionId: string) =>
+      terminals.split(sessionId, {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "toolu_bash",
+        rawInput: { command: "ls" },
+      }).terminal;
+    named("closed");
+    named("open");
+    terminals.forget("closed");
+    expect(commanded("closed")).toEqual([]);
+    expect(commanded("open")).toHaveLength(1);
+  });
+
   it("fails on a permission request without the title that v2 requires", () => {
     const request = {
       sessionId: "s",
@@ -1252,16 +1365,16 @@ describe("ACP v2 session translation", () => {
     });
   });
 
-  it("fails on tool call content that v2 cannot take", () => {
+  it("fails on a v1 diff, and passes a display terminal as it is", () => {
     const update = (content: v1.ToolCallContent) =>
       v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [content] });
     // A v1 diff can hold a snippet, without the operation or line numbers.
     expect(() => update({ type: "diff", path: "/p/a.ts", oldText: "a", newText: "b" })).toThrow(
       "An ACP v2 client cannot take a v1 diff",
     );
-    expect(() => update({ type: "terminal", terminalId: "term" })).toThrow(
-      "does not translate terminal tool call content yet",
-    );
+    expect(update({ type: "terminal", terminalId: "term" })).toMatchObject({
+      content: [{ type: "terminal", terminalId: "term" }],
+    });
   });
 
   it("keeps the audience roles of a prompt block that v1 knows", () => {
