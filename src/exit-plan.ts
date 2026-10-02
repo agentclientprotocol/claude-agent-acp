@@ -8,6 +8,22 @@ import {
   continuePlanInFreshContext,
 } from "./clear-context-coordinator.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
+/**
+ * The plan as its file reads at approval. The CLI writes the plan to `planFilePath`, and the
+ * user may edit that file before approving it, so the edited text is the plan to implement.
+ * `undefined` when the input names no absolute plan file or the file still holds the plan the
+ * model wrote.
+ */
+export async function editedPlan(toolInput: Record<string, unknown>): Promise<string | undefined> {
+  const { plan, planFilePath } = toolInput;
+  if (typeof planFilePath !== "string" || !path.isAbsolute(planFilePath)) return undefined;
+  const text = (await readFile(planFilePath, "utf8")).trim();
+  const written = typeof plan === "string" ? plan.trim() : "";
+  return text && text !== written ? text : undefined;
+}
 
 export function acceptedPlanToolResult(
   notification: SessionNotification,

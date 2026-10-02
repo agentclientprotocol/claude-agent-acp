@@ -4314,6 +4314,46 @@ describe("permission request cancellation", () => {
     });
   });
 
+  it("approves the plan file as the user edited it", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({
+        outcome: { outcome: "selected", optionId: "exit-plan-default" },
+      }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.modes = {
+      currentModeId: "plan",
+      availableModes: ["default", "plan"].map((id) => ({ id, name: id })),
+    };
+    const dir = await mkdtemp(path.join(os.tmpdir(), "edited-plan-"));
+    const planFilePath = path.join(dir, "plan.md");
+    await writeFile(planFilePath, "# Plan\n1. Do it\n2. Test it\n");
+    const approve = (input: Record<string, unknown>) =>
+      agent.canUseTool("session-1")("ExitPlanMode", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-plan",
+        requestId: "request-plan",
+      });
+
+    try {
+      await expect(approve({ plan: "# Plan\n1. Do it", planFilePath })).resolves.toMatchObject({
+        behavior: "allow",
+        updatedInput: { plan: "# Plan\n1. Do it\n2. Test it", planFilePath },
+      });
+      await writeFile(planFilePath, "# Plan\n1. Do it\n");
+      const unedited = await approve({ plan: "# Plan\n1. Do it", planFilePath });
+      expect(unedited).toMatchObject({ behavior: "allow" });
+      expect((unedited as { updatedInput?: { plan?: string } }).updatedInput?.plan).not.toBe(
+        "# Plan\n1. Do it\n2. Test it",
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the plan approval when publishing the new mode fails", async () => {
     const error = vi.fn();
     const mockClient = {
