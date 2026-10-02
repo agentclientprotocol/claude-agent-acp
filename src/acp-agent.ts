@@ -4336,6 +4336,51 @@ export class ClaudeAcpAgent {
           );
           return;
         }
+      } else if (result.stopReason === "cancelled") {
+        // Mirror the end_turn cleanup above, for the same reason but a
+        // different cause: `stream_event`'s `content_block_start` path has no
+        // `session.cancelled` gate (a late SDK flush can keep emitting tool
+        // *starts* for seconds or minutes after a cancel settles), while the
+        // consolidated `tool_result` path that would normally terminate them
+        // drops everything at that guard. A tool call announced that way never
+        // gets a terminal update, which poisons any client that tracks
+        // in-flight tool calls to decide whether work is still running (see
+        // https://github.com/agentclientprotocol/claude-agent-acp/issues/1061).
+        // Unlike end_turn, a cancellation is an expected outcome, not a
+        // failure to report on the prompt -- only the per-tool terminals are
+        // synthesized here, with no session failure and no early return.
+        const backgroundTools = new Set(
+          [...session.liveBackgroundTasks.values()].map((task) => task.parentToolUseId),
+        );
+        const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
+          (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
+        );
+        for (const toolCallId of unfinished) {
+          unregisterHookCallback(toolCallId);
+          session.emittedToolCalls.delete(toolCallId);
+          delete session.toolUseCache[toolCallId];
+          session.toolCallFields?.delete(toolCallId);
+          await sendUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: "failed",
+              content: [
+                {
+                  type: "content",
+                  content: {
+                    type: "text",
+                    text: "The turn was cancelled before this tool call finished.",
+                  },
+                },
+              ],
+            },
+          });
+          // A later cancel-settle call for the same turn (e.g. a concurrent
+          // hand-off) must not double-terminate what this loop already sent.
+          if (turn.settled || session.activeTurn !== turn) return;
+        }
       }
       turn.settling = true;
       turn.settlingOutcome = result;
