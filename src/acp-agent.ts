@@ -1243,7 +1243,11 @@ export type Session = {
  *  (the result is skipped, its trailing idle absorbed as owed, so the
  *  #825 detector can't fire); misrouting an autonomous result into the
  *  user lane is the bounded misattribution class this set exists to
- *  reduce. */
+ *  reduce.
+ *
+ *  Exception: a result from one of these origins that names a pending prompt
+ *  in `user_message_uuids` consumed that folded prompt and takes the user
+ *  lane (see the result handler). */
 const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
   "task-notification",
   "peer",
@@ -4369,6 +4373,44 @@ export class ClaudeAcpAgent {
     const findUnsettledTurn = (uuid: string) =>
       (session.turnQueue ?? []).find((t) => t.promptUuid === uuid && !t.settled);
 
+    /** Whether this result is the answer to a prompt that is still waiting.
+     *
+     *  Claude Code can start a turn on its own, for example when a background
+     *  task finishes. If the user sends a prompt while that turn runs, Claude
+     *  Code adds the prompt to the running turn. The turn's result is still
+     *  marked as a background result, but it lists the uuids of the prompts it
+     *  answered.
+     *
+     *  A turn held open for its background subagents already has its result,
+     *  so a result that names it does not answer it. */
+    const answersPendingPrompt = (message: {
+      user_message_uuid?: string;
+      user_message_uuids?: string[];
+    }): boolean => {
+      // Newer CLIs list every prompt the turn answered. Older ones name only
+      // the last one.
+      let answeredPromptUuids: string[] = [];
+      if (Array.isArray(message.user_message_uuids)) {
+        answeredPromptUuids = message.user_message_uuids;
+      } else if (typeof message.user_message_uuid === "string") {
+        answeredPromptUuids = [message.user_message_uuid];
+      }
+
+      for (const promptUuid of answeredPromptUuids) {
+        const turn = findUnsettledTurn(promptUuid);
+        if (turn === undefined) {
+          // Not a prompt of this session, or it was answered already.
+          continue;
+        }
+        if (isHeldOpen(turn)) {
+          // This turn already has its result and only waits for its subagents.
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
     /** The first queued turn still awaiting its outcome, if any — the single
      *  spelling of "a prompt is pending" shared by the head promotion and
      *  the autonomous stretch-close guard. */
@@ -5728,8 +5770,11 @@ export class ClaudeAcpAgent {
             // the user's prompt's. Autonomous results must never touch the
             // user-turn lifecycle (stop reason, settles, failActive,
             // slash-command output forwarding), though their cost is real.
-            const isAutonomousResult =
+            // The exception: the user's prompt was added to that turn while it
+            // ran, so its result answers the prompt (see answersPendingPrompt).
+            const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+            const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
