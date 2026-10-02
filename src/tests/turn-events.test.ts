@@ -96,12 +96,16 @@ function scriptTurns(turns: TurnScript[], end: "stay open" | "end stream" = "sta
   return promptUuids;
 }
 
-/** Scripts the query of the next session as `run`, which reads the prompts. */
+/**
+ * Scripts the query of the next session as `run`, which reads the prompts.
+ * `controls` override the query's control requests, such as `interrupt`.
+ */
 function scriptQuery(
   run: (
     input: AsyncIterator<any>,
     options: QueryOptions,
   ) => AsyncGenerator<Record<string, unknown>>,
+  controls: Record<string, unknown> = {},
 ) {
   mockQuery.mockImplementation(
     ({ prompt, options }: { prompt: AsyncIterable<any>; options: QueryOptions }) => {
@@ -118,6 +122,7 @@ function scriptQuery(
         close: () => {},
         interrupt: async () => {},
         stopTask: async () => {},
+        ...controls,
       });
     },
   );
@@ -439,6 +444,73 @@ describe("turn events", () => {
 
     expect(first.log).toEqual([expect.stringMatching(/^inserted /), "ended cancelled"]);
     expect(queued.log).toEqual(["ended cancelled"]);
+  });
+
+  it("drops a queued prompt that a cancel ends from Claude Code's queue, so it does not run", async () => {
+    const trace: string[] = [];
+    onSessionUpdate = ({ update }) => {
+      // The turns' answers; the session also sends advisories as chunks.
+      if (
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text" &&
+        update.messageId?.startsWith("msg_")
+      ) {
+        trace.push(`chunk ${update.content.text}`);
+      }
+    };
+    // Claude Code keeps queued messages through an interrupt, and runs them
+    // next unless they are dropped first.
+    const dropped = new Set<string>();
+    const interrupted = Promise.withResolvers<void>();
+    const controls = {
+      cancelAsyncMessage: async (uuid: string) => {
+        trace.push("drop queued prompt");
+        dropped.add(uuid);
+        return true;
+      },
+      interrupt: async () => {
+        trace.push("interrupt");
+        interrupted.resolve();
+      },
+    };
+    scriptQuery(async function* (input, options) {
+      const sessionId = options.sessionId!;
+      const first = (await input.next()).value;
+      yield echo(first, sessionId);
+      yield* streamedText("msg_first", "Working", sessionId);
+      await interrupted.promise;
+      yield result(sessionId);
+      yield system("session_state_changed", sessionId, { state: "idle" });
+      for (;;) {
+        const { value, done } = await input.next();
+        if (done) return;
+        if (dropped.has(value.uuid)) continue;
+        // Not dropped: Claude Code runs the queued prompt after all.
+        yield* streamedText("msg_orphan", "Answer to a cancelled prompt", sessionId);
+        yield echo(value, sessionId);
+        yield result(sessionId);
+        yield system("session_state_changed", sessionId, { state: "idle" });
+      }
+    }, controls);
+    const sessionId = await newSession();
+    const first = recordEvents(trace, "first");
+    const queued = recordEvents(trace, "queued");
+
+    await agent.startTurn(prompt(sessionId, "first"), first.events);
+    await vi.waitFor(() => expect(trace).toContain("chunk Working"));
+    await agent.startTurn(prompt(sessionId, "second"), queued.events);
+    await agent.cancel({ sessionId });
+    await Promise.all([first.done, queued.done]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(trace).toEqual([
+      expect.stringMatching(/^first inserted /),
+      "chunk Working",
+      "queued ended cancelled",
+      "drop queued prompt",
+      "interrupt",
+      "first ended cancelled",
+    ]);
   });
 
   it("does not insert a turn that a cancel ended while the previous turn was handed off", async () => {

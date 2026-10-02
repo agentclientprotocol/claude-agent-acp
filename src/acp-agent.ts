@@ -7058,6 +7058,41 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Ask Claude Code to drop user messages it still has queued, so that a
+   *  prompt a cancel settled is not run after all. Claude Code keeps queued
+   *  messages through an interrupt and runs them next (the receipt's
+   *  `still_queued`), unless they are cancelled first with
+   *  `cancel_async_message`: a no-op for a message it already dequeued, which
+   *  then still runs, as an orphan (see `orphanCommands`).
+   *
+   *  Not awaited: the SDK writes control requests in call order, so the drops
+   *  reach Claude Code before a request sent after them, and a wedged CLI must
+   *  not hold up the cancel. The orphan accounting needs no update here: a
+   *  dropped message gets a `cancelled` lifecycle frame and is missing from the
+   *  interrupt receipt's `still_queued`, which both already account for. The
+   *  SDK implements the request as `Query.cancelAsyncMessage` without typing
+   *  it, so it is looked up, and a CLI that lacks it rejects the request. */
+  private dropQueuedMessages(sessionId: string, query: Query, uuids: string[]): void {
+    const cancelAsyncMessage = (query as Query & { cancelAsyncMessage?: unknown })
+      .cancelAsyncMessage;
+    if (typeof cancelAsyncMessage !== "function") return;
+    const logFailure = (uuid: string, error: unknown) =>
+      this.logger.error(
+        `Session ${sessionId}: could not drop the queued message ${uuid} from Claude Code:`,
+        error,
+      );
+    for (const uuid of uuids) {
+      // Called synchronously: deferring it would let the interrupt go first.
+      try {
+        Promise.resolve(
+          (cancelAsyncMessage as (uuid: string) => Promise<unknown>).call(query, uuid),
+        ).catch((error: unknown) => logFailure(uuid, error));
+      } catch (error) {
+        logFailure(uuid, error);
+      }
+    }
+  }
+
   async cancel(params: CancelNotification): Promise<void> {
     await this.cancelTurns(params, { awaitInterrupt: true });
   }
@@ -7111,12 +7146,16 @@ export class ClaudeAcpAgent {
       session.toolCallFields?.clear();
       clearHookCallbacks(params.sessionId);
     }
+    // The user messages this cancel abandons while Claude Code may still have
+    // them queued: they are dropped from its queue before the interrupt.
+    const abandoned: string[] = [];
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
     if (isSteering(session.activeTurn)) {
       for (const uuid of session.activeTurn.steeredEchoes) {
         this.trackOrphanCommand(session, uuid, "pending");
+        abandoned.push(uuid);
       }
     }
     // Capture the orphan-accounting lane before anything can await: the
@@ -7140,11 +7179,13 @@ export class ClaudeAcpAgent {
           // accumulator (the active turn's tally) is not its spend.
           turn.resolve({ stopReason: "cancelled" });
           orphanedTurns.push(turn);
+          abandoned.push(turn.promptUuid);
         }
       }
-      // Each removed queued turn's user message was already pushed to the SDK,
-      // which processes input FIFO and will still emit a result for it with no
-      // user echo to match (0.3.246+ CLIs do stamp results with the
+      // Each removed queued turn's user message was already pushed to the SDK.
+      // It is dropped from Claude Code's queue below (see dropQueuedMessages),
+      // but one Claude Code already dequeued still runs, FIFO, and emits a
+      // result with no user echo to match (0.3.246+ CLIs do stamp results with the
       // triggering send's user_message_uuid, which ensureActiveTurn uses as
       // an exact join when present). Track those so the consumer skips them
       // (see ensureActiveTurn) rather than misattributing them to the head.
@@ -7305,6 +7346,9 @@ export class ClaudeAcpAgent {
       }, this.forceCancelGraceMs);
     }
 
+    // Before the interrupt: once it stops the running turn, Claude Code starts
+    // the next queued message right away.
+    this.dropQueuedMessages(params.sessionId, session.query, abandoned);
     const interrupt = session.query.interrupt();
     if (!options.awaitInterrupt) {
       // The caller closes the query next, which rejects the pending reply.
