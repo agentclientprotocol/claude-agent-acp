@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import { appendTitleContext } from "../session-titles.js";
+import { appendTitleContext, sanitizeTitle } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import { getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -40,6 +40,13 @@ describe("SDK title generation contract", () => {
     const overflowed = appendTitleContext("x".repeat(1000), "tail");
     expect(overflowed).toHaveLength(1000);
     expect(overflowed.endsWith("tail")).toBe(true);
+  });
+
+  it("cuts a long title to 160 characters with an ellipsis", () => {
+    expect(sanitizeTitle("t".repeat(160))).toBe("t".repeat(160));
+    const cut = sanitizeTitle("t".repeat(161));
+    expect(cut).toHaveLength(160);
+    expect(cut).toBe("t".repeat(159) + "…");
   });
 });
 
