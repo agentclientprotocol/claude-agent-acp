@@ -25,14 +25,15 @@ type V2ToolCallUpdate = v2.ToolCallUpdate & { sessionUpdate: "tool_call_update" 
  * (step 4 of `docs/acp-v2.md`).
  */
 export function v2ToolCallUpdate(report: V1ToolCallReport): V2ToolCallUpdate {
-  const { sessionUpdate: _, content, ...fields } = report;
   const patch = Object.fromEntries(
-    Object.entries(fields).filter(([, value]) => value !== null),
+    Object.entries(report).filter(
+      ([key, value]) => value !== null && key !== "sessionUpdate" && key !== "content",
+    ),
   ) as Omit<V2ToolCallUpdate, "sessionUpdate" | "content">;
   return {
     ...patch,
     sessionUpdate: "tool_call_update",
-    ...(content != null ? { content: content.map(v2ToolCallContent) } : {}),
+    ...(report.content != null ? { content: report.content.map(v2ToolCallContent) } : {}),
   };
 }
 
@@ -41,8 +42,7 @@ function v2ToolCallContent(item: ToolCallContent): v2.ToolCallContent {
     case "content":
       // v2 content blocks are a superset of the v1 blocks.
       return item;
-    case "diff":
-    case "terminal":
+    default:
       throw new Error(`The ACP v2 surface does not translate ${item.type} tool call content yet`);
   }
 }
