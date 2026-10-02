@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
-import { AUTO_MODE_FALLBACK, type SessionMode, SessionModeManager } from "../session-mode.js";
+import {
+  AUTO_MODE_FALLBACK,
+  resolveInitialPermissionMode,
+  type SessionMode,
+  SessionModeManager,
+} from "../session-mode.js";
 
 const SESSION_ID = "session-1";
 
@@ -234,5 +239,51 @@ describe("session mode", () => {
     ).resolves.toBe(true);
     expect(session.modes.currentModeId).toBe("acceptEdits");
     expect(session.query.setPermissionMode).toHaveBeenCalledWith("acceptEdits");
+  });
+});
+
+describe("resolveInitialPermissionMode", () => {
+  const logger = () => ({ error: vi.fn() });
+
+  it("uses defaultMode when nothing else is given", () => {
+    expect(resolveInitialPermissionMode({ defaultMode: "plan" }, logger(), true)).toBe("plan");
+  });
+
+  it("continues in the mode of the resumed transcript instead of defaultMode", () => {
+    expect(
+      resolveInitialPermissionMode(
+        { resumed: "bypassPermissions", defaultMode: "plan" },
+        logger(),
+        true,
+      ),
+    ).toBe("bypassPermissions");
+  });
+
+  it("lets an explicit mode win over the resumed transcript", () => {
+    expect(
+      resolveInitialPermissionMode(
+        { explicit: "acceptEdits", resumed: "bypassPermissions", defaultMode: "plan" },
+        logger(),
+        true,
+      ),
+    ).toBe("acceptEdits");
+  });
+
+  it("falls back to defaultMode when bypass is not available now", () => {
+    const log = logger();
+    expect(
+      resolveInitialPermissionMode(
+        { resumed: "bypassPermissions", defaultMode: "plan" },
+        log,
+        false,
+      ),
+    ).toBe("plan");
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('"bypassPermissions"'));
+  });
+
+  it("falls back to defaultMode for an unknown resumed mode", () => {
+    expect(
+      resolveInitialPermissionMode({ resumed: "warp", defaultMode: "acceptEdits" }, logger(), true),
+    ).toBe("acceptEdits");
   });
 });

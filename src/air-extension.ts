@@ -18,8 +18,16 @@ export const AIR_SKILL_KEY = "skill";
 export const AIR_CONTEXT_COMPACTION_KEY = "contextCompaction";
 export const AIR_GOAL_KEY = "goal";
 export const AIR_KIND_KEY = "kind";
+/** The absolute path of the `SKILL.md` of a skill command in `available_commands_update`. */
+export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/**
+ * The root `_meta` spelling of {@link AIR_CUSTOM_ANSWER_KEY} that released
+ * AIR versions read. Remove it when the ACP registry no longer serves AIR
+ * versions that read only this spelling.
+ */
+export const LEGACY_AIR_CUSTOM_ANSWER_KEY = "_askUserQuestionCustomAnswer";
 
 const JETBRAINS_META_KEY = "jetbrains";
 const AIR_META_KEY = "air";

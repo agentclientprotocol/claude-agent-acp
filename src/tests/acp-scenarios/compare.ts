@@ -16,6 +16,9 @@
  *   `compaction_summary_chunk` text that went out before it.
  * - A subagent message or thought is not sent again in full when the chunks
  *   of the same message that went out before it hold the same text.
+ * - An `available_commands_update` also lists the `mcp` command of the
+ *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
+ *   `mcp`. The adapter replaces the text of `/mcp` for every client.
  */
 import type { Recorded } from "./harness.js";
 
@@ -31,6 +34,9 @@ export const AIR_ONLY_META_KEYS = new Set([
 
 /** The `_meta.claudeCode` keys that exist only for AIR. */
 export const AIR_ONLY_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", "skillPath"]);
+
+/** The names of the commands that the adapter adds to `available_commands_update`. */
+export const ADAPTER_COMMANDS = new Set(["mcp"]);
 
 /** The tool call fields that an update replaces as a whole. */
 const REPLACED_FIELDS = [
@@ -137,6 +143,22 @@ function subagentChunk(update: Json | undefined): { key: string; text: string } 
   return { key: `${update.sessionUpdate} ${parent} ${update.messageId}`, text };
 }
 
+function commandNames(update: Json): Set<unknown> {
+  return new Set(((update.availableCommands ?? []) as Json[]).map((command) => command.name));
+}
+
+/** A copy of `got` without the adapter commands that `want` does not list. */
+function withoutAdapterCommands(want: Json, got: Json): Json {
+  const listed = commandNames(want);
+  const commands = (got.availableCommands ?? []) as Json[];
+  return {
+    ...got,
+    availableCommands: commands.filter(
+      (command) => listed.has(command.name) || !ADAPTER_COMMANDS.has(command.name as string),
+    ),
+  };
+}
+
 function isAppended(key: string): boolean {
   return APPENDED_META_KEYS.has(key.slice("_meta.".length));
 }
@@ -213,6 +235,9 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
           ),
         );
       return other(want) === other(got);
+    }
+    if (want.sessionUpdate === "available_commands_update") {
+      return canonical(want) === canonical(withoutAdapterCommands(want, got));
     }
     if (want.sessionUpdate === "compaction_update" && want.summary && !got.summary) {
       const text = (want.summary as { text?: string }[]).map((part) => part.text ?? "").join("");

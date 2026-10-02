@@ -8,7 +8,7 @@ import {
   isDeniedModel,
   matchResumedModel,
 } from "../session-model.js";
-import { settingsEffortForModel } from "../session-effort.js";
+import { effortFlagSettings, settingsEffortForModel } from "../session-effort.js";
 
 // Mirrors a real `supportedModels()` response: alias rows carry
 // `resolvedModel`, and "Sonnet 5" has no `major.minor` dot unlike older
@@ -367,5 +367,20 @@ describe("settingsEffortForModel", () => {
   it("returns undefined when neither layer sets an effort", () => {
     expect(settingsEffortForModel({}, SONNET)).toBeUndefined();
     expect(settingsEffortForModel({ modelSettings: {} }, undefined)).toBeUndefined();
+  });
+});
+
+describe("effortFlagSettings", () => {
+  it("carries ultracode only when settings request it", () => {
+    expect(effortFlagSettings("high", { ultracode: true })).toEqual({
+      effortLevel: "high",
+      ultracode: true,
+    });
+    expect(effortFlagSettings("default", { ultracode: true })).toEqual({
+      effortLevel: null,
+      ultracode: true,
+    });
+    expect(effortFlagSettings("high", { ultracode: false })).toEqual({ effortLevel: "high" });
+    expect(effortFlagSettings(undefined, {})).toEqual({ effortLevel: null });
   });
 });

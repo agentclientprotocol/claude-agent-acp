@@ -1,4 +1,5 @@
 import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { structuredPatch } from "diff";
 import { constants } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";
@@ -73,6 +74,28 @@ interface EditPreviewInput {
 /** The kind of file change that a git patch describes. */
 type FileChange = "create" | "update";
 
+/** A file change and the hunks of its git patch. */
+interface FilePatch {
+  change: FileChange;
+  hunks: PatchHunk[];
+}
+
+/**
+ * The diff that carries an exact patch: AIR's `diffPatch` extension of a v1
+ * diff, or an ACP v2 diff.
+ */
+export type PatchForm = "air" | "v2";
+
+/**
+ * How a git patch names its file. `git` is git's own form: the leading slash
+ * dropped and the `a/` and `b/` prefixes added. `absolute` is the form of an
+ * ACP v2 `git_patch`, whose paths must be absolute: the path itself.
+ */
+type GitPatchPaths = "git" | "absolute";
+
+/** An ACP v2 diff, as tool call content. */
+type V2DiffContent = v2.Diff & { type: "diff" };
+
 /**
  * Builds the exact patch shown before Claude runs an Edit or Write tool.
  *
@@ -85,8 +108,8 @@ type FileChange = "create" | "update";
  * normalizes quotes or fails.
  *
  * A Write always gets content that shows the change: the patch, the standard
- * diff of a text that cannot have an exact patch, or a notice that the Write
- * overwrites a file that the adapter cannot show.
+ * diff (in v2, the change alone) of a text that cannot have an exact patch, or
+ * a notice that the Write overwrites a file that the adapter cannot show.
  *
  * The preview uses the tool input as it is. Claude can still remove the
  * trailing whitespace of a line before it writes. The PostToolUse hook then
@@ -96,6 +119,7 @@ export async function previewPatchContent(
   toolName: string,
   input: Record<string, unknown>,
   cwd?: string,
+  form: PatchForm = "air",
 ): Promise<ToolCallContent[] | undefined> {
   if (toolName === "Edit") {
     const edit = input as EditPreviewInput;
@@ -119,7 +143,7 @@ export async function previewPatchContent(
       if (oldText !== null && (oldText.trim() !== "" || oldText.includes("\uFEFF"))) {
         return undefined;
       }
-      return optionalContent(filePatch(filePath, oldText, newString)?.content);
+      return exactPatch(filePath, oldText, newString, form);
     }
     if (oldText === null) return undefined;
     const occurrences = oldText.split(oldString).length - 1;
@@ -128,7 +152,7 @@ export async function previewPatchContent(
       return undefined;
     }
     const newText = replacedText(oldText, oldString, newString, edit.replace_all === true);
-    return optionalContent(filePatch(filePath, oldText, newText)?.content);
+    return exactPatch(filePath, oldText, newText, form);
   }
 
   if (toolName === "Write") {
@@ -154,11 +178,13 @@ export async function previewPatchContent(
     }
     if (oldText === content) return undefined;
     const standard: ToolCallContent[] = [
-      { type: "diff", path: write.file_path, oldText, newText: content },
+      form === "v2"
+        ? v2DiffContent(filePath, oldText === null ? "create" : "update")
+        : { type: "diff", path: write.file_path, oldText, newText: content },
     ];
     if (!isPatchableText(content)) return standard;
     // A dense change can exceed the diff budget. The approval then shows the standard diff.
-    return optionalContent(filePatch(filePath, oldText, content)?.content) ?? standard;
+    return exactPatch(filePath, oldText, content, form) ?? standard;
   }
 
   return undefined;
@@ -217,6 +243,7 @@ function replacedText(
  */
 export async function patchUpdateFromDiffToolResponse(
   toolResponse: unknown,
+  form: PatchForm = "air",
 ): Promise<{ content: ToolCallContent[]; locations: ToolCallLocation[] } | undefined> {
   if (!toolResponse || typeof toolResponse !== "object") return undefined;
   const response = toolResponse as DiffToolResponse;
@@ -249,10 +276,10 @@ export async function patchUpdateFromDiffToolResponse(
   const newText = await readPatchSource(response.filePath);
   if (typeof newText !== "string" || newText.startsWith("\uFEFF")) return undefined;
   if (response.type === "create" && newText !== response.content) return undefined;
-  const patch = filePatch(response.filePath, oldText, newText);
+  const patch = filePatch(oldText, newText);
   if (!patch) return undefined;
   return {
-    content: [patch.content],
+    content: [patchContent(response.filePath, patch, form)],
     // A created file keeps the location of its Write tool call.
     locations:
       oldText === null
@@ -342,26 +369,82 @@ export function toolUpdateFromDiffToolResponse(toolResponse: unknown): {
 }
 
 /**
+ * The ACP v2 diff of a finished Edit or Write: the exact patch of
+ * {@link patchUpdateFromDiffToolResponse} when it can be built, else the
+ * change with a patch from what the toolResponse holds.
+ *
+ * The fallback patch of an update comes from the `structuredPatch`, which is
+ * display data (see {@link patchUpdateFromDiffToolResponse}). That is enough
+ * for a v2 patch, which is renderable text, not a patch to apply. An update
+ * without hunks, such as one whose previous content was too large to diff,
+ * gets the change alone. An Edit with an empty `old_string` reports the same
+ * response for a created file and a filled empty one, so it gets no diff.
+ */
+export async function v2UpdateFromDiffToolResponse(toolResponse: unknown): Promise<{
+  content?: ToolCallContent[];
+  locations?: ToolCallLocation[];
+}> {
+  const exact = await patchUpdateFromDiffToolResponse(toolResponse, "v2");
+  if (exact) return exact;
+  if (!toolResponse || typeof toolResponse !== "object") return {};
+  const response = toolResponse as DiffToolResponse;
+  const filePath = response.filePath;
+  if (typeof filePath !== "string") return {};
+  if (response.type === "create") {
+    const hunk =
+      typeof response.content === "string" && isPatchableText(response.content)
+        ? wholeFileHunk(response.content)
+        : undefined;
+    return {
+      content: [v2DiffContent(filePath, "create", hunk && [hunk])],
+      locations: [{ path: filePath }],
+    };
+  }
+  if (response.type === undefined && response.oldString === "" && response.originalFile === "") {
+    return {};
+  }
+  // A Write whose content is the previous text changed nothing.
+  if (response.type === "update" && response.content === response.originalFile) return {};
+  const hunks =
+    Array.isArray(response.structuredPatch) && response.structuredPatch.length > 0
+      ? response.structuredPatch
+      : undefined;
+  return {
+    content: [v2DiffContent(filePath, "update", hunks)],
+    locations: hunks
+      ? hunks.map(({ newStart }) => ({ path: filePath, line: newStart }))
+      : [{ path: filePath }],
+  };
+}
+
+/**
  * The text of one git patch for `filePath`.
  *
- * The headers follow `git diff`: the path loses its leading slash, gets the
- * `a/` and `b/` prefixes, and is quoted when git would quote it. A created
- * file gets its mode line and a `/dev/null` side.
+ * The headers follow `git diff`: the path is quoted when git would quote it,
+ * and a created file gets its mode line and a `/dev/null` side. With `git`
+ * paths, the path loses its leading slash and gets the `a/` and `b/` prefixes.
  */
-export function gitPatchText(filePath: string, change: FileChange, hunks: PatchHunk[]): string {
+export function gitPatchText(
+  filePath: string,
+  change: FileChange,
+  hunks: PatchHunk[],
+  paths: GitPatchPaths = "git",
+): string {
   return [
-    ...gitPatchHeader(filePath, change),
+    ...gitPatchHeader(filePath, change, paths),
     ...hunks.flatMap((hunk) => [hunkHeader(hunk), ...hunk.lines]),
     "",
   ].join("\n");
 }
 
-function gitPatchHeader(filePath: string, change: FileChange): string[] {
-  // git drops one leading slash of an absolute path; a Windows path gets
-  // forward slashes so the header names the same file on every platform.
-  const name = filePath.replaceAll("\\", "/").replace(/^\/+/u, "");
-  const oldName = quoteGitPath("a/", name);
-  const newName = quoteGitPath("b/", name);
+function gitPatchHeader(filePath: string, change: FileChange, paths: GitPatchPaths): string[] {
+  // A Windows path gets forward slashes so the header names the same file on
+  // every platform.
+  const slashed = filePath.replaceAll("\\", "/");
+  // git drops one leading slash of an absolute path.
+  const name = paths === "git" ? slashed.replace(/^\/+/u, "") : slashed;
+  const oldName = quoteGitPath(paths === "git" ? "a/" : "", name);
+  const newName = quoteGitPath(paths === "git" ? "b/" : "", name);
   // git ends a ---/+++ name that contains a space with a tab, for GNU patch.
   const tab = name.includes(" ") ? "\t" : "";
   return [
@@ -481,18 +564,14 @@ function textLines(text: string): string[] {
 }
 
 /**
- * The git patch of a file change and its hunks. Returns undefined when
- * nothing changed or the diff runs out of its time budget.
+ * The patch of a change from `oldText`, null for a missing file, to
+ * `newText`. Returns undefined when nothing changed or the diff runs out of
+ * its time budget.
  */
-function filePatch(
-  filePath: string,
-  oldText: string | null,
-  newText: string,
-): { content: ToolCallContent; hunks: PatchHunk[] } | undefined {
+function filePatch(oldText: string | null, newText: string): FilePatch | undefined {
   const hunks = diffHunks(oldText, newText);
   if (!hunks || hunks.length === 0) return undefined;
-  const change = oldText === null ? "create" : "update";
-  return { content: patchContent(filePath, gitPatchText(filePath, change, hunks)), hunks };
+  return { change: oldText === null ? "create" : "update", hunks };
 }
 
 /**
@@ -553,8 +632,22 @@ function isPatchableText(text: string): boolean {
   );
 }
 
-function optionalContent(content: ToolCallContent | undefined): ToolCallContent[] | undefined {
-  return content ? [content] : undefined;
+/** The exact patch content of a change, or undefined when it has no patch. */
+function exactPatch(
+  filePath: string,
+  oldText: string | null,
+  newText: string,
+  form: PatchForm,
+): ToolCallContent[] | undefined {
+  const patch = filePatch(oldText, newText);
+  return patch && [patchContent(filePath, patch, form)];
+}
+
+/** The content that carries a patch, in the given form. */
+function patchContent(filePath: string, patch: FilePatch, form: PatchForm): ToolCallContent {
+  return form === "v2"
+    ? v2DiffContent(filePath, patch.change, patch.hunks)
+    : airPatchContent(filePath, patch);
 }
 
 /**
@@ -563,7 +656,7 @@ function optionalContent(content: ToolCallContent | undefined): ToolCallContent[
  * `oldText: null` and `newText: ""` only satisfy the ACP schema. The adapter
  * sends this form only to a client that advertised `diffPatch`.
  */
-function patchContent(filePath: string, text: string): ToolCallContent {
+function airPatchContent(filePath: string, { change, hunks }: FilePatch): ToolCallContent {
   return {
     type: "diff",
     path: filePath,
@@ -572,9 +665,37 @@ function patchContent(filePath: string, text: string): ToolCallContent {
     _meta: withAirMeta(undefined, AIR_DIFF_PATCH_CAPABILITY, {
       version: 1,
       format: "git_patch",
-      text,
+      text: gitPatchText(filePath, change, hunks),
     }),
   };
+}
+
+/**
+ * The ACP v2 diff of a change to the text file `filePath`: the change and,
+ * given hunks, its git patch.
+ *
+ * The agent builds tool call content in v1 types, and v1 cannot express a v2
+ * diff, so the diff travels as v1 content. Nothing in the agent reads inside a
+ * diff, and only a v2 client gets one: the v2 surface sends it as it is
+ * (`src/v2/tool-call.ts`).
+ */
+export function v2DiffContent(
+  filePath: string,
+  change: FileChange,
+  hunks?: PatchHunk[],
+): ToolCallContent {
+  const fileChange: v2.DiffChange =
+    change === "create"
+      ? { operation: "add", path: filePath, fileType: "text" }
+      : { operation: "modify", path: filePath, fileType: "text" };
+  const diff: V2DiffContent = {
+    type: "diff",
+    changes: [fileChange],
+    ...(hunks?.length
+      ? { patch: { format: "git_patch", text: gitPatchText(filePath, change, hunks, "absolute") } }
+      : {}),
+  };
+  return diff as unknown as ToolCallContent;
 }
 
 function resolveToolPath(filePath: string, cwd?: string): string {
