@@ -32,6 +32,13 @@ import type { TurnEvents, TurnOutcome } from "../turn-events.js";
  *   `idle`, and a notice must not be the only report of a failure.
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
+ *
+ * Deferred decision: a turn whose background subagents still run ends only
+ * when they finish (`Turn.deferredSettle`), so `idle` waits for them too. The
+ * hold exists for v1, whose clients stop listening at the prompt response.
+ * v2 allows background updates while idle, so it could report `idle` at the
+ * turn's result instead, with a turn event for the hold. To be decided with
+ * async tasks (step 6 in `docs/acp-v2.md`).
  */
 export function v2Prompt(
   agent: ClaudeAcpAgent,
