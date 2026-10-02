@@ -10872,6 +10872,101 @@ describe("usage_update computation", () => {
     });
   }
 
+  it.each(["before", "after"])(
+    "forwards a rate limit event %s assistant usage exactly once",
+    async (order) => {
+      const { agent, updates } = createMockAgentWithCapture();
+      const rateLimitInfo = { status: "allowed_warning", resetsAt: 1700000000, utilization: 0.9 };
+      const rateLimitEvent = {
+        type: "rate_limit_event",
+        rate_limit_info: rateLimitInfo,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      };
+      const assistant = createAssistantMessage({ model: "claude-sonnet-4-20250514" });
+      injectSession(agent, [
+        ...(order === "before" ? [rateLimitEvent, assistant] : [assistant, rateLimitEvent]),
+        createResultMessageWithModel({
+          modelUsage: {
+            "claude-sonnet-4-20250514": {
+              inputTokens: 100,
+              outputTokens: 50,
+              cacheReadInputTokens: 20,
+              cacheCreationInputTokens: 10,
+              webSearchRequests: 0,
+              costUSD: 0.01,
+              contextWindow: 200000,
+              maxOutputTokens: 16384,
+            },
+          },
+        }),
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ]);
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+      const usageUpdates = updates.filter((u) => u.update?.sessionUpdate === "usage_update");
+      expect(
+        usageUpdates.filter((u) => u.update._meta?.["_claude/rateLimit"] !== undefined),
+      ).toHaveLength(1);
+      expect(usageUpdates.find((u) => u.update._meta?.["_claude/rateLimit"])).toMatchObject({
+        update: { used: 180, _meta: { "_claude/rateLimit": rateLimitInfo } },
+      });
+      if (usageUpdates.length > 1) {
+        expect(usageUpdates.at(-1).update._meta?.["_claude/rateLimit"]).toBeUndefined();
+      }
+    },
+  );
+
+  it("attaches a rate limit received before streaming usage to the first usage update", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    const rateLimitInfo = { status: "allowed_warning", resetsAt: 1700000000 };
+    injectSession(agent, [
+      {
+        type: "rate_limit_event",
+        rate_limit_info: rateLimitInfo,
+        uuid: randomUUID(),
+        session_id: "test-session",
+      },
+      createStreamEvent("message_start", {
+        id: "msg_early_rate_limit",
+        model: "claude-sonnet-4-20250514",
+        usage: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_input_tokens: 20,
+          cache_creation_input_tokens: 10,
+        },
+      }),
+      createAssistantMessage({ model: "claude-sonnet-4-20250514" }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-sonnet-4-20250514": {
+            inputTokens: 100,
+            outputTokens: 50,
+            cacheReadInputTokens: 20,
+            cacheCreationInputTokens: 10,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates.filter((u) => u.update?.sessionUpdate === "usage_update");
+    expect(usageUpdates).toHaveLength(2);
+    expect(usageUpdates[0].update).toMatchObject({
+      used: 180,
+      _meta: { "_claude/rateLimit": rateLimitInfo },
+    });
+    expect(usageUpdates[1].update._meta?.["_claude/rateLimit"]).toBeUndefined();
+  });
+
   it("used sums all token types as post-turn context occupancy proxy", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
