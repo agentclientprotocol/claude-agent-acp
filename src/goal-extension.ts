@@ -1,5 +1,6 @@
 import { RequestError } from "@agentclientprotocol/sdk";
 import type { SDKActiveGoalMessage } from "@anthropic-ai/claude-agent-sdk";
+import { AIR_GOAL_KEY, isAirClient, withAirMeta } from "./air-extension.js";
 
 export const GOAL_EXTENSION_VERSION = 1 as const;
 export const GOAL_CONTROL_METHOD = "_session/goal";
@@ -32,6 +33,22 @@ export type GoalRequest =
   { sessionId: string; action: "clear" } | { sessionId: string; action: "set"; objective: string };
 
 export type GoalControlResponse = Record<string, never>;
+
+export function goalMeta(
+  capabilities: unknown,
+  goal: GoalCapability | GoalSnapshot | null,
+  meta?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (isAirClient(capabilities)) {
+    return withAirMeta(meta, AIR_GOAL_KEY, goal);
+  }
+  const clientMeta =
+    capabilities && typeof capabilities === "object" && !Array.isArray(capabilities)
+      ? (capabilities as { _meta?: Record<string, unknown> })._meta
+      : undefined;
+  const optIn = clientMeta?.goal;
+  return optIn && typeof optIn === "object" && !Array.isArray(optIn) ? { ...meta, goal } : meta;
+}
 
 export function goalUpdateFromPrompt(prompt: string): GoalSnapshot | null | undefined {
   const match = /^\/goal(?:\s+([\s\S]*))?$/.exec(prompt);
