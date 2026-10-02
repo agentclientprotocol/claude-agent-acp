@@ -5,6 +5,7 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
+import { v2ToolCallUpdate } from "./tool-call.js";
 
 /**
  * The v2 form of a v1 session update, or `undefined` when v2 has no
@@ -35,6 +36,9 @@ export function v2SessionUpdate(
       }
       return { ...chunk, messageId };
     }
+    case "tool_call":
+    case "tool_call_update":
+      return v2ToolCallUpdate(update);
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

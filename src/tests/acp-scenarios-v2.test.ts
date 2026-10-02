@@ -8,6 +8,9 @@
  *   stopped into passing, and updates the table.
  * - Schema: every message the agent sends, also in a scenario that stops, is
  *   valid against the draft v2 schema of the SDK.
+ * - Tool calls: the first report of each tool call has a title. v2 has no
+ *   `tool_call`, so a report of a tool call that the client has not seen
+ *   creates it, where v1 drops it.
  * - Golden files: `acp-scenarios/__snapshots__/v2/<scenario>.jsonl` for each
  *   passing scenario. Run `npx vitest run src/tests/acp-scenarios-v2.test.ts -u`
  *   to update them.
@@ -57,9 +60,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 
 const PASSES = "passes";
 /** Step 4 of `docs/acp-v2.md`. */
-const TOOL_CALLS = "The ACP v2 surface does not translate tool_call session updates yet";
+const DIFFS = "The ACP v2 surface does not translate diff tool call content yet";
 const REPLAY = "Invalid params: The ACP v2 surface does not replay session history yet";
 /** Step 5 of `docs/acp-v2.md`. */
+const PERMISSIONS = "The ACP v2 surface does not serve session/request_permission yet";
 const PLANS = "The ACP v2 surface does not translate plan session updates yet";
 
 /**
@@ -69,43 +73,43 @@ const PLANS = "The ACP v2 surface does not translate plan session updates yet";
 const V2_STATUS: Record<string, string> = {
   "session-setup": PASSES,
   "text-and-thinking": PASSES,
-  "bash-foreground": TOOL_CALLS,
-  "bash-error": TOOL_CALLS,
-  "bash-background": TOOL_CALLS,
+  "bash-foreground": PERMISSIONS,
+  "bash-error": PASSES,
+  "bash-background": PASSES,
   "async-task-held-until-tool-id": PASSES,
   "async-task-ends-before-tool-id": PASSES,
   "async-task-released-at-turn-end": PASSES,
-  read: TOOL_CALLS,
-  "write-new": TOOL_CALLS,
-  "write-existing": TOOL_CALLS,
-  "edit-with-permission": TOOL_CALLS,
-  "edit-rejected": TOOL_CALLS,
-  "notebook-edit": TOOL_CALLS,
-  "grep-and-glob": TOOL_CALLS,
-  "web-fetch-and-search": TOOL_CALLS,
-  "subagent-task-legacy": TOOL_CALLS,
-  "subagent-agent-async": TOOL_CALLS,
-  "subagent-native-sessions": TOOL_CALLS,
-  "subagent-nested": TOOL_CALLS,
-  "subagent-late-child-update": TOOL_CALLS,
-  "subagent-transcript-extension": TOOL_CALLS,
+  read: PASSES,
+  "write-new": DIFFS,
+  "write-existing": DIFFS,
+  "edit-with-permission": DIFFS,
+  "edit-rejected": DIFFS,
+  "notebook-edit": PERMISSIONS,
+  "grep-and-glob": PASSES,
+  "web-fetch-and-search": PERMISSIONS,
+  "subagent-task-legacy": PERMISSIONS,
+  "subagent-agent-async": PASSES,
+  "subagent-native-sessions": PERMISSIONS,
+  "subagent-nested": PASSES,
+  "subagent-late-child-update": PASSES,
+  "subagent-transcript-extension": PASSES,
   "todo-write": PLANS,
   "task-create-update": PLANS,
   goal: PASSES,
-  "network-permission": TOOL_CALLS,
-  "exit-plan-approve": TOOL_CALLS,
-  "exit-plan-reject": TOOL_CALLS,
-  "ask-user-question": TOOL_CALLS,
-  skill: TOOL_CALLS,
-  "mcp-tool": TOOL_CALLS,
-  "task-output-and-stop": TOOL_CALLS,
-  "memory-recall": TOOL_CALLS,
-  "permission-denied": TOOL_CALLS,
-  "tool-progress": TOOL_CALLS,
+  "network-permission": PERMISSIONS,
+  "exit-plan-approve": PERMISSIONS,
+  "exit-plan-reject": PERMISSIONS,
+  "ask-user-question": PASSES,
+  skill: PASSES,
+  "mcp-tool": PERMISSIONS,
+  "task-output-and-stop": PASSES,
+  "memory-recall": PASSES,
+  "permission-denied": PASSES,
+  "tool-progress": PASSES,
   "rate-limit-and-origin": PASSES,
-  "compaction-legacy": TOOL_CALLS,
-  "compaction-update": TOOL_CALLS,
-  "compaction-failed-legacy": TOOL_CALLS,
+  "compaction-legacy": PASSES,
+  "compaction-update": PASSES,
+  "compaction-failed-legacy": PASSES,
   "session-load-replay": REPLAY,
 };
 
@@ -178,6 +182,25 @@ describe("ACP v2 scenarios", () => {
 
     it.each(SCENARIOS.map((scenario) => scenario.name))("%s", (scenario) => {
       expect(run(scenario).raw.flatMap((message) => validateV2Message(message))).toEqual([]);
+    });
+  });
+
+  describe("tool calls are reported with a title first", () => {
+    it.each(SCENARIOS.map((scenario) => scenario.name))("%s", (scenario) => {
+      const reported = new Set<string>();
+      const untitled: string[] = [];
+      for (const message of run(scenario).raw) {
+        if (message.kind !== "notification" || message.method !== "session/update") continue;
+        const { sessionId, update } = message.payload as {
+          sessionId: string;
+          update: { sessionUpdate: string; toolCallId?: string; title?: unknown };
+        };
+        if (update.sessionUpdate !== "tool_call_update") continue;
+        const key = `${sessionId} ${update.toolCallId}`;
+        if (!reported.has(key) && typeof update.title !== "string") untitled.push(key);
+        reported.add(key);
+      }
+      expect(untitled).toEqual([]);
     });
   });
 

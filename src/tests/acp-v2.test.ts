@@ -926,9 +926,64 @@ describe("ACP v2 session translation", () => {
   });
 
   it("fails on session updates that it does not translate yet", () => {
+    expect(() => v2SessionUpdate({ sessionUpdate: "plan", entries: [] })).toThrow(
+      "does not translate plan session updates yet",
+    );
+  });
+
+  it("reports a new tool call with an upserting tool_call_update", () => {
+    expect(
+      v2SessionUpdate({
+        sessionUpdate: "tool_call",
+        toolCallId: "t",
+        title: "Read",
+        name: "Read",
+        kind: "read",
+        status: "pending",
+        content: [{ type: "content", content: text("a.ts")[0] }],
+        locations: [{ path: "/p/a.ts" }],
+      }),
+    ).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "t",
+      title: "Read",
+      name: "Read",
+      kind: "read",
+      status: "pending",
+      content: [{ type: "content", content: text("a.ts")[0] }],
+      locations: [{ path: "/p/a.ts" }],
+    });
+  });
+
+  it("leaves out the null fields of a tool call update, which v2 would clear", () => {
+    // In v1, null leaves a tool call field unchanged; in v2 it clears it.
+    expect(
+      v2SessionUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        status: "completed",
+        title: null,
+        name: null,
+        content: null,
+        locations: null,
+        rawOutput: null,
+        _meta: null,
+      }),
+    ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", status: "completed" });
+    // An empty array still clears, in both.
+    expect(
+      v2SessionUpdate({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [] }),
+    ).toEqual({ sessionUpdate: "tool_call_update", toolCallId: "t", content: [] });
+  });
+
+  it("fails on tool call content that it does not translate yet", () => {
     expect(() =>
-      v2SessionUpdate({ sessionUpdate: "tool_call", toolCallId: "t", title: "Read" }),
-    ).toThrow("does not translate tool_call session updates yet");
+      v2SessionUpdate({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "t",
+        content: [{ type: "diff", path: "/p/a.ts", oldText: "a", newText: "b" }],
+      }),
+    ).toThrow("does not translate diff tool call content yet");
   });
 
   it("keeps the audience roles of a prompt block that v1 knows", () => {
