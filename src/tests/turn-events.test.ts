@@ -647,6 +647,45 @@ describe("turn events", () => {
     expect(second.log).toEqual(["ended cancelled"]);
   });
 
+  it("ends a closed session's turn before the close returns, also for a slow client", async () => {
+    // Claude Code streams an answer and runs until the close ends its stream.
+    const queryClosed = Promise.withResolvers<void>();
+    const promptUuids: string[] = [];
+    scriptQuery(
+      async function* (input, options) {
+        const { value } = await input.next();
+        promptUuids.push(value.uuid);
+        yield echo(value, options.sessionId!);
+        for (const message of streamedText("msg_answer", "Hi", options.sessionId!)) {
+          yield message;
+        }
+        await queryClosed.promise;
+      },
+      { close: () => queryClosed.resolve() },
+    );
+    const sessionId = await newSession();
+    const turn = recordEvents();
+    // The client takes the answer's text slowly, so the consumer is still
+    // sending it when the close tears the session down.
+    const chunkSeen = Promise.withResolvers<void>();
+    const chunkTaken = Promise.withResolvers<void>();
+    onSessionUpdate = async ({ update }) => {
+      if (update.sessionUpdate !== "agent_message_chunk" || update.messageId !== "msg_answer") {
+        return;
+      }
+      chunkSeen.resolve();
+      await chunkTaken.promise;
+    };
+
+    await agent.startTurn(prompt(sessionId, "hello"), turn.events);
+    await chunkSeen.promise;
+    const closed = agent.closeSession({ sessionId }).then(() => turn.log.push("closed"));
+    setTimeout(() => chunkTaken.resolve(), 10);
+    await closed;
+
+    expect(turn.log).toEqual([`inserted ${promptUuids[0]}`, "ended cancelled", "closed"]);
+  });
+
   it("fails a queued turn without inserting it when the query ends", async () => {
     scriptTurns(
       [

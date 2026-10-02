@@ -373,6 +373,10 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
 const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
+/** How long a session teardown waits for the turns that it cancels to end.
+ *  The teardown wakes the consumer itself, so they end within a few ticks
+ *  unless the consumer is wedged. */
+const TEARDOWN_TURN_END_TIMEOUT_MS = 5_000;
 /** The number of settled subagents whose parent tool call a session keeps for
  *  a later resume (see `resumableSubagents`). */
 const MAX_RESUMABLE_SUBAGENTS = 256;
@@ -7479,12 +7483,20 @@ export class ClaudeAcpAgent {
   }
 
   /** Cleanly tear down a session: cancel in-flight work, release stream
-   *  resources, and remove it from the session map. */
+   *  resources, and remove it from the session map. Returns once the turns it
+   *  cancels have ended, so their end (a v1 `session/prompt` response, a v2
+   *  `idle` state) goes out before the caller answers: ACP v2's
+   *  `session/close` cancels "as if `session/cancel` had been called", then
+   *  frees the session. A wedged consumer holds it at most
+   *  {@link TEARDOWN_TURN_END_TIMEOUT_MS}. */
   private async teardownSession(sessionId: string): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) {
       return;
     }
+    const turnsEnded = Promise.all(
+      (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+    );
     try {
       await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
     } catch (error) {
@@ -7511,6 +7523,16 @@ export class ClaudeAcpAgent {
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
     delete this.sessions[sessionId];
+    const ended = await raceTimeoutAndAbort(
+      turnsEnded,
+      TEARDOWN_TURN_END_TIMEOUT_MS,
+      new AbortController().signal,
+    );
+    if (ended.type === "timeout") {
+      this.logger.error(
+        `Session ${sessionId}: its cancelled turns did not end within ${TEARDOWN_TURN_END_TIMEOUT_MS}ms of the teardown`,
+      );
+    }
   }
 
   /** Tear down all active sessions. Called when the ACP connection closes. */
