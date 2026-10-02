@@ -7339,6 +7339,39 @@ describe("stop reason propagation", () => {
     expect(response.usage?.outputTokens).toBe(promptResult.usage.output_tokens);
   });
 
+  it("settles a prompt the CLI folded into a running task-notification cycle", async () => {
+    const agent = createMockAgent();
+
+    // A prompt sent while an autonomous task-notification cycle runs is folded
+    // into that cycle: the CLI replays its echo, then emits ONE result that
+    // keeps the cycle's task-notification origin but names the folded send in
+    // user_message_uuids. That result is the prompt's own terminal.
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: userMessage } = await iter.next();
+        yield userEcho(userMessage);
+        yield {
+          ...createResultMessage({ subtype: "success", stop_reason: null, is_error: false }),
+          origin: { kind: "task-notification" },
+          user_message_uuid: userMessage.uuid,
+          user_message_uuids: [userMessage.uuid],
+        };
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        // Stay open like the live CLI: a stream end would settle the turn.
+        await iter.next();
+      }
+      return messageGenerator();
+    });
+
+    const response = await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "Reply exactly PONG." }],
+    });
+
+    expect(response.stopReason).toBe("end_turn");
+  });
+
   it("ignores command_lifecycle frames without logging an unexpected-case error", async () => {
     // CLIs 2.1.206+ report the fate of every uuid-stamped queued command as
     // `command_lifecycle` frames (queued/started/completed/...) on the SDK
