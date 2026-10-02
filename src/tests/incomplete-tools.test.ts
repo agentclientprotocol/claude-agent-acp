@@ -116,8 +116,28 @@ describe("incomplete foreground tools", () => {
     const { prompt, updates } = createTestSession(cancelledThenSuccessfulTurnMessages);
 
     await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+    // The cancelled turn's tool start must get a terminal at the cancel
+    // boundary, not be left open for a client's in-flight ledger to inherit
+    // (issue #1061). It is a cancellation, not an incomplete-tool failure.
+    const terminals = updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed");
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0].content[0].content.text).toContain("cancelled");
+    const terminalsBeforeNextTurn = terminals.length;
     await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
-    expect(updates.some((u) => u.toolCallId === toolCallId && u.status === "failed")).toBe(false);
+    // ...and the next turn neither re-fails it nor reports an incomplete tool.
+    expect(
+      updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed"),
+    ).toHaveLength(terminalsBeforeNextTurn);
+  });
+
+  it("terminates a tool whose start streams in after the cancel", async () => {
+    const { prompt, updates, agent } = createTestSession(cancelThenLateToolStartMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+    expect(
+      updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed"),
+    ).toHaveLength(1);
   });
 
   it("preserves an existing SDK failure", async () => {
@@ -297,6 +317,16 @@ async function* incompleteThenSuccessfulTurnMessages(input: Pushable<any>) {
   // Keep the SDK stream open for the next prompt in the same session.
   yield userEcho((await messages.next()).value);
   yield successfulResultMessage();
+}
+
+async function* cancelThenLateToolStartMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  const messages = input[Symbol.asyncIterator]();
+  yield userEcho((await messages.next()).value);
+  await agent.cancel({ sessionId });
+  // The late SDK flush: a tool start that streams in after the cancel but
+  // before the turn's trailing idle settles it. No tool_result will follow.
+  yield toolStart();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
 }
 
 async function* cancelledThenSuccessfulTurnMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
