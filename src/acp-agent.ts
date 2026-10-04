@@ -10974,6 +10974,38 @@ export function toAcpNotifications(
         break;
       }
 
+      case "advisor_tool_result": {
+        // Advisor results arrive in assistant content, including encrypted advice.
+        // Resolve the server tool through the normal result path without rendering
+        // opaque ciphertext. Server tools have no later PostToolUse hook to await.
+        const result = chunk.content;
+        unregisterHookCallback(chunk.tool_use_id);
+        output.push(
+          ...toAcpNotifications(
+            [
+              {
+                type: "tool_result",
+                tool_use_id: chunk.tool_use_id,
+                is_error: result.type === "advisor_tool_result_error",
+                content:
+                  result.type === "advisor_result"
+                    ? result.text
+                    : result.type === "advisor_redacted_result"
+                      ? "Advisor guidance applied server-side."
+                      : `Advisor error: ${result.error_code}`,
+              },
+            ],
+            role,
+            sessionId,
+            toolUseCache,
+            client,
+            logger,
+            options,
+          ),
+        );
+        break;
+      }
+
       case "tool_result":
       case "tool_search_tool_result":
       case "web_fetch_tool_result":
@@ -11126,7 +11158,6 @@ export function toAcpNotifications(
       case "container_upload":
       case "compaction":
       case "compaction_delta":
-      case "advisor_tool_result":
       case "fallback":
       case "mcp_tool_listing":
         break;
