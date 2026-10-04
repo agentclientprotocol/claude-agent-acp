@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.85.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.0...v0.85.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* answer session/close without waiting for the interrupt reply ([#1216](https://github.com/agentclientprotocol/claude-agent-acp/issues/1216)) ([0c862e2](https://github.com/agentclientprotocol/claude-agent-acp/commit/0c862e29496bb018e7a4400697bd2315dfd5b845))
+* fail turns with unfinished tools ([#1212](https://github.com/agentclientprotocol/claude-agent-acp/issues/1212)) ([7f8d547](https://github.com/agentclientprotocol/claude-agent-acp/commit/7f8d5471e24b981b129b3c9c2d6736c4ba3f8011))
+* restore background task stops on replay instead of showing them as prompts ([#1205](https://github.com/agentclientprotocol/claude-agent-acp/issues/1205)) ([4ffa625](https://github.com/agentclientprotocol/claude-agent-acp/commit/4ffa625977af7e85526b9a3098f4dee5844467b4))
+
+## [0.85.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.84.0...v0.85.0) (2026-10-01)
+
+
+### Features
+
+* **deps:** Bump @anthropic-ai/claude-agent-sdk to 0.3.286 ([#1211](https://github.com/agentclientprotocol/claude-agent-acp/issues/1211)) ([f53b0d7](https://github.com/agentclientprotocol/claude-agent-acp/commit/f53b0d7f40bcd0e9bddace85f123ff4851afcb1f))
+
+
+### Bug Fixes
+
+* Adapt to SDK 0.3.284 replay and ultracode changes ([#1208](https://github.com/agentclientprotocol/claude-agent-acp/issues/1208)) ([4af8079](https://github.com/agentclientprotocol/claude-agent-acp/commit/4af807968c7f0813bcb20fe2bcab2370320e9074))
+* send the legacy custom answer key to AIR ([#1210](https://github.com/agentclientprotocol/claude-agent-acp/issues/1210)) ([af0b43d](https://github.com/agentclientprotocol/claude-agent-acp/commit/af0b43de944e36f81343f40b7aa1a96cd48c3218))
+
 ## [0.84.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.83.0...v0.84.0) (2026-09-28)
 
 

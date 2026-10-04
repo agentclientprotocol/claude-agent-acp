@@ -141,7 +141,7 @@ describe("/remote-control", () => {
 
     const names = (update: ReturnType<typeof createAgent>["sessionUpdate"]) =>
       (update.mock.calls as any[][])[0][0].update.availableCommands.map((c: any) => c.name);
-    expect(names(supported.sessionUpdate)).toEqual(["compact", "remote-control"]);
-    expect(names(unsupported.sessionUpdate)).toEqual(["compact"]);
+    expect(names(supported.sessionUpdate)).toContain("remote-control");
+    expect(names(unsupported.sessionUpdate)).not.toContain("remote-control");
   });
 });

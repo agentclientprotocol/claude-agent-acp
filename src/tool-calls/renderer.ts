@@ -248,8 +248,9 @@ export class AcpToolCallRenderer {
   ): RequestPermissionRequest["toolCall"] {
     const facts = this.facts(toolUse, options.cwd);
     if (!this.capabilities.air.client) {
-      // The upstream shape: the whole tool call again.
-      const content = this.toolUseContent(toolUse.id, facts);
+      // The upstream shape: the whole tool call again. A v2 client also gets
+      // the exact preview patch, which the tool call does not show.
+      const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
       const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
       return {
         toolCallId: toolUse.id,

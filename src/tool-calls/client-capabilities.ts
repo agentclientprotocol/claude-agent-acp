@@ -25,13 +25,24 @@ export class ClientCapabilities {
     readonly diffPatch: boolean = false,
     /** The capabilities that only JetBrains AIR declares. */
     readonly air: AirCapabilities = NO_AIR,
+    /**
+     * The client speaks ACP v2. Its diffs carry structured `changes` and an
+     * optional git patch, which a v1 diff cannot express. Only the v2 surface
+     * sets this, never the capabilities that a client sends. A v2 client also
+     * takes the terminal extension (`terminalOutput`), which the v2 surface
+     * sends as display terminals.
+     */
+    readonly v2: boolean = false,
   ) {}
 
-  static from(capabilities: AcpClientCapabilities | null | undefined): ClientCapabilities {
+  static from(
+    capabilities: AcpClientCapabilities | null | undefined,
+    { v2 = false }: { v2?: boolean } = {},
+  ): ClientCapabilities {
     const meta = capabilities?._meta;
     const terminalOutputDelta = meta?.["terminal_output_delta"] === true;
     return new ClientCapabilities(
-      terminalOutputDelta || meta?.["terminal_output"] === true,
+      v2 || terminalOutputDelta || meta?.["terminal_output"] === true,
       terminalOutputDelta,
       clientSupportsAirCapability(capabilities, AIR_DIFF_PATCH_CAPABILITY),
       {
@@ -42,6 +53,7 @@ export class ClientCapabilities {
         ),
         planFile: clientSupportsAirCapability(capabilities, AIR_PLAN_FILE_CAPABILITY),
       },
+      v2,
     );
   }
 }

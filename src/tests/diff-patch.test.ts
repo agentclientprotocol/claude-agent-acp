@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { applyPatch } from "diff";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,7 +11,9 @@ import {
   patchUpdateFromDiffToolResponse,
   previewPatchContent,
   toolUpdateFromDiffToolResponse,
+  v2UpdateFromDiffToolResponse,
 } from "../diff.js";
+import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
 import { toolInfoFromToolUse } from "../tools.js";
 import { WriteReporter } from "../tool-calls/reporters/file-edit.js";
@@ -260,13 +262,32 @@ describe("approval patch previews", () => {
       .join("");
     const filePath = await temporaryFile(oldText);
 
-    // 200 changed lines. A diff that runs out of its time budget gives no
-    // patch, and patchText then throws.
-    const patch = patchText(
-      await previewPatchContent("Write", { file_path: filePath, content: newText }),
-    );
+    // Verify the 200-line patch independently of the runner's speed. The
+    // timeout fallback is exercised separately with an advancing clock.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    try {
+      const patch = patchText(
+        await previewPatchContent("Write", { file_path: filePath, content: newText }),
+      );
+      expect(applyPatch(oldText, patch)).toBe(newText);
+    } finally {
+      clock.mockRestore();
+    }
+  });
 
-    expect(applyPatch(oldText, patch)).toBe(newText);
+  it("falls back to the standard Write diff when the patch budget expires", async () => {
+    const oldText = "before\n";
+    const newText = "after\n";
+    const filePath = await temporaryFile(oldText);
+    let now = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => (now += 1000));
+    try {
+      expect(await previewPatchContent("Write", { file_path: filePath, content: newText })).toEqual(
+        [{ type: "diff", path: filePath, oldText, newText }],
+      );
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("builds patches that turn the old text into the new text", async () => {
@@ -418,6 +439,166 @@ describe("tool-call diff content", () => {
     expect(toolInfoFromToolUse(toolUse, false, undefined, false).content).toEqual([
       { type: "diff", path: "/work/a.ts", oldText: null, newText: "a\n" },
     ]);
+  });
+});
+
+describe("ACP v2 diffs", () => {
+  const hunk = { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] };
+  const v2 = new ClientCapabilities(false, false, false, undefined, true);
+  const v2Diff = (filePath: string, operation: string, patch?: string) => ({
+    type: "diff",
+    changes: [{ operation, path: filePath, fileType: "text" }],
+    ...(patch !== undefined ? { patch: { format: "git_patch", text: patch } } : {}),
+  });
+
+  it("names the absolute path in a git patch, without the a/ and b/ prefixes", () => {
+    expect(gitPatchText("/work/src/App.ts", "update", [hunk], "absolute")).toBe(
+      "diff --git /work/src/App.ts /work/src/App.ts\n--- /work/src/App.ts\n+++ /work/src/App.ts\n@@ -1 +1 @@\n-a\n+b\n",
+    );
+    expect(
+      gitPatchText("/f", "create", [{ ...hunk, oldLines: 0, lines: ["+b"] }], "absolute"),
+    ).toBe("diff --git /f /f\nnew file mode 100644\n--- /dev/null\n+++ /f\n@@ -0,0 +1 @@\n+b\n");
+    expect(gitPatchText('/work/a"b.ts', "update", [hunk], "absolute")).toContain(
+      'diff --git "/work/a\\"b.ts" "/work/a\\"b.ts"\n',
+    );
+    expect(gitPatchText("/work/my file.ts", "update", [hunk], "absolute")).toContain(
+      "--- /work/my file.ts\t\n+++ /work/my file.ts\t\n",
+    );
+  });
+
+  it("shows no diff at tool use, where the input holds a snippet or no old text", () => {
+    const renderer = new AcpToolCallRenderer(v2);
+    const edit = { file_path: "/work/a.ts", old_string: "old", new_string: "new" };
+    const write = { file_path: "/work/a.ts", content: "a\n" };
+
+    expect(renderer.toolInfo({ id: "e", name: "Edit", input: edit }).content).toEqual([]);
+    expect(renderer.toolInfo({ id: "w", name: "Write", input: write }).content).toEqual([]);
+  });
+
+  it("builds the exact patch of a finished change from the written file", async () => {
+    const filePath = await temporaryFile("line 1\nnew\n");
+    const update = await v2UpdateFromDiffToolResponse({
+      filePath,
+      oldString: "old",
+      originalFile: "line 1\nold\n",
+      structuredPatch: [],
+    });
+
+    expect(update).toEqual({
+      content: [
+        v2Diff(
+          filePath,
+          "modify",
+          `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n@@ -1,2 +1,2 @@\n line 1\n-old\n+new\n`,
+        ),
+      ],
+      locations: [{ path: filePath, line: 1 }],
+    });
+  });
+
+  it("falls back to the display hunks when the written file cannot give the patch", async () => {
+    const filePath = await temporaryFile();
+    const update = await v2UpdateFromDiffToolResponse({
+      filePath,
+      oldString: "a",
+      originalFile: "a\n",
+      structuredPatch: [{ ...hunk, newStart: 4 }],
+    });
+
+    expect(update).toEqual({
+      content: [
+        v2Diff(
+          filePath,
+          "modify",
+          `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n@@ -1 +4 @@\n-a\n+b\n`,
+        ),
+      ],
+      locations: [{ path: filePath, line: 4 }],
+    });
+  });
+
+  it("shows a created file whose patch cannot be exact with its whole text", async () => {
+    const filePath = await temporaryFile();
+    const update = await v2UpdateFromDiffToolResponse({
+      type: "create",
+      filePath,
+      content: "x\n",
+      structuredPatch: [],
+      originalFile: null,
+    });
+
+    expect(update).toEqual({
+      content: [
+        v2Diff(
+          filePath,
+          "add",
+          `diff --git ${filePath} ${filePath}\nnew file mode 100644\n--- /dev/null\n+++ ${filePath}\n@@ -0,0 +1 @@\n+x\n`,
+        ),
+      ],
+      locations: [{ path: filePath }],
+    });
+  });
+
+  it("sends the change alone for an update without hunks", async () => {
+    const filePath = await temporaryFile();
+    // The previous content was too large to include, so there is no patch.
+    const update = await v2UpdateFromDiffToolResponse({
+      type: "update",
+      filePath,
+      content: "x\n",
+      structuredPatch: [],
+      originalFile: null,
+    });
+
+    expect(update).toEqual({
+      content: [v2Diff(filePath, "modify")],
+      locations: [{ path: filePath }],
+    });
+  });
+
+  it("previews a change in v2 form", async () => {
+    const filePath = await temporaryFile("a\n");
+    expect(
+      await previewPatchContent("Write", { file_path: filePath, content: "b\n" }, undefined, "v2"),
+    ).toEqual([
+      v2Diff(
+        filePath,
+        "modify",
+        `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n@@ -1 +1 @@\n-a\n+b\n`,
+      ),
+    ]);
+    // A text that cannot have an exact patch: the change alone, where v1 gets
+    // the standard diff.
+    expect(
+      await previewPatchContent(
+        "Write",
+        { file_path: filePath, content: "b\r\n" },
+        undefined,
+        "v2",
+      ),
+    ).toEqual([v2Diff(filePath, "modify")]);
+  });
+
+  it("sends no diff where the operation is unknown or nothing changed", async () => {
+    const filePath = await temporaryFile("x\n");
+    // An Edit with an empty old_string created the file or filled an empty one.
+    expect(
+      await v2UpdateFromDiffToolResponse({
+        filePath,
+        oldString: "",
+        originalFile: "",
+        structuredPatch: [{ ...hunk, oldLines: 0, lines: ["+x"] }],
+      }),
+    ).toEqual({});
+    expect(
+      await v2UpdateFromDiffToolResponse({
+        type: "update",
+        filePath,
+        content: "x\n",
+        structuredPatch: [],
+        originalFile: "x\n",
+      }),
+    ).toEqual({});
   });
 });
 

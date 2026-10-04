@@ -154,6 +154,51 @@ describe("ClaudeAcpAgent settings", () => {
     },
   );
 
+  it("keeps a settings-requested ultracode on when applying effort", async () => {
+    // Since CLI 2.1.284 an effortLevel apply without an ultracode key turns
+    // ultracode off; the CLI's own effort control keeps it on.
+    await fs.promises.writeFile(
+      path.join(tempDir, "settings.json"),
+      JSON.stringify({ ultracode: true }),
+    );
+    const applyFlagSettings = vi.fn();
+    querySpy.mockReturnValue(
+      makeMockQuery({
+        initializationResult: async () => ({
+          models: [
+            {
+              value: "default",
+              displayName: "Default",
+              description: "",
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high"],
+            },
+          ],
+        }),
+        applyFlagSettings,
+      }),
+    );
+    const { ClaudeAcpAgent } = await import("../acp-agent.js");
+    const agent = new ClaudeAcpAgent(createMockClient());
+    (agent as any).clientCapabilities = {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["recommendedValue"] } } },
+    };
+
+    const response = await (agent as any).createSession({
+      cwd: tempDir,
+      mcpServers: [],
+      _meta: { disableBuiltInTools: true },
+    });
+    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "medium", ultracode: true });
+
+    await agent.setSessionConfigOption({
+      sessionId: response.sessionId,
+      configId: "effort",
+      value: "high",
+    });
+    expect(applyFlagSettings).toHaveBeenLastCalledWith({ effortLevel: "high", ultracode: true });
+  });
+
   it("seeds effort from higher-priority programmatic model settings", async () => {
     await fs.promises.writeFile(
       path.join(tempDir, "settings.json"),
@@ -352,6 +397,142 @@ describe("ClaudeAcpAgent settings", () => {
 
     expect(getCapturedOptions().permissionMode).toBe("default");
     expect(response.modes.currentModeId).toBe("default");
+  });
+
+  describe("on resume", () => {
+    const sessionId = "resumed-mode-session";
+
+    async function setup(records: unknown[]) {
+      await fs.promises.writeFile(
+        path.join(tempDir, "settings.json"),
+        JSON.stringify({ permissions: { defaultMode: "plan" } }),
+      );
+      const projectDir = path.join(tempDir, "project");
+      await fs.promises.mkdir(projectDir, { recursive: true });
+      const transcriptDir = path.join(tempDir, "projects", "-project");
+      await fs.promises.mkdir(transcriptDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(transcriptDir, `${sessionId}.jsonl`),
+        records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+      );
+
+      const { getCapturedOptions } = mockQuery();
+      const { ClaudeAcpAgent } = await import("../acp-agent.js");
+      const agent: ClaudeAcpAgentType = new ClaudeAcpAgent(createMockClient());
+      (agent as any).logger = { log: () => {}, error: () => {} };
+      return { agent, projectDir, getCapturedOptions };
+    }
+
+    async function resume(records: unknown[], meta: object = {}) {
+      const { agent, projectDir, getCapturedOptions } = await setup(records);
+      const response = await (agent as any).createSession(
+        { cwd: projectDir, mcpServers: [], _meta: { disableBuiltInTools: true, ...meta } },
+        { resume: sessionId },
+      );
+      return { permissionMode: getCapturedOptions().permissionMode, response };
+    }
+
+    let previousUuid: string | null = null;
+    const user = (permissionMode?: string) => {
+      const uuid = crypto.randomUUID();
+      const record = {
+        type: "user",
+        uuid,
+        parentUuid: previousUuid,
+        sessionId,
+        timestamp: new Date().toISOString(),
+        isSidechain: false,
+        origin: { kind: "human" },
+        message: { role: "user", content: "hello" },
+        ...(permissionMode ? { permissionMode } : {}),
+      };
+      previousUuid = uuid;
+      return record;
+    };
+
+    it("continues in the last permission mode of the transcript", async () => {
+      const { permissionMode, response } = await resume([user("plan"), user("acceptEdits")]);
+
+      expect(permissionMode).toBe("acceptEdits");
+      expect(response.modes.currentModeId).toBe("acceptEdits");
+    });
+
+    it("uses permissions.defaultMode when the transcript has no mode", async () => {
+      const { permissionMode, response } = await resume([user()]);
+
+      expect(permissionMode).toBe("plan");
+      expect(response.modes.currentModeId).toBe("plan");
+    });
+
+    it("uses permissions.defaultMode when bypass is not available now", async () => {
+      const { permissionMode, response } = await resume([user("bypassPermissions")], {
+        claudeCode: { options: { allowDangerouslySkipPermissions: false } },
+      });
+
+      expect(permissionMode).toBe("plan");
+      expect(response.modes.currentModeId).toBe("plan");
+    });
+
+    it("continues in the last permission mode on session/load", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([
+        user("plan"),
+        user("acceptEdits"),
+      ]);
+
+      const response = await agent.loadSession({
+        sessionId,
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+
+      expect(getCapturedOptions().permissionMode).toBe("acceptEdits");
+      expect(response.modes?.currentModeId).toBe("acceptEdits");
+    });
+
+    it("keeps the live mode when it recreates the session", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([user("acceptEdits")]);
+      const params = { sessionId, cwd: projectDir, _meta: { disableBuiltInTools: true } };
+      await agent.resumeSession({ ...params, mcpServers: [] });
+      await agent.setSessionMode({ sessionId, modeId: "default" });
+
+      // Other MCP servers change the fingerprint, so the agent recreates the query.
+      const response = await agent.resumeSession({
+        ...params,
+        mcpServers: [{ name: "other", command: "true", args: [], env: [] }],
+      });
+
+      expect(getCapturedOptions().permissionMode).toBe("default");
+      expect(response.modes?.currentModeId).toBe("default");
+    });
+
+    it("keeps the live mode when a sign-out respawn starts a fresh conversation", async () => {
+      const { agent, projectDir, getCapturedOptions } = await setup([user("acceptEdits")]);
+      await agent.resumeSession({
+        sessionId,
+        cwd: projectDir,
+        mcpServers: [],
+        _meta: { disableBuiltInTools: true },
+      });
+      await agent.setSessionMode({ sessionId, modeId: "default" });
+      const { RequestError } = await import("@agentclientprotocol/sdk");
+      const createSession = (agent as any).createSession.bind(agent);
+      const creations: object[] = [];
+      (agent as any).createSession = async (params: object, options: { resume?: string }) => {
+        creations.push(options);
+        // The CLI never wrote the conversation, so the resume fails.
+        if (options.resume) throw RequestError.resourceNotFound(sessionId);
+        return createSession(params, options);
+      };
+
+      await (agent as any).recreateSignedOutQuery(sessionId, (agent as any).sessions[sessionId]);
+
+      expect(creations).toEqual([
+        { resume: sessionId, permissionMode: "default" },
+        { reuseSessionId: sessionId, permissionMode: "default" },
+      ]);
+      expect(getCapturedOptions().permissionMode).toBe("default");
+    });
   });
 
   it("falls back to 'default' when permissions.defaultMode is invalid", async () => {

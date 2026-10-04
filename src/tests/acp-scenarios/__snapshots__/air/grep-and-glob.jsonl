@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<server>|all]]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Grep"}},"content":[],"kind":"search","name":"Grep","sessionUpdate":"tool_call","status":"pending","title":"grep","toolCallId":"toolu_grep"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"sessionUpdate":"tool_call_update","title":"grep \"value\"","toolCallId":"toolu_grep"}}}

@@ -4,7 +4,11 @@ import type {
   NotebookEditInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
 import type { ToolCallContent } from "@agentclientprotocol/sdk";
-import { patchUpdateFromDiffToolResponse, toolUpdateFromDiffToolResponse } from "../../diff.js";
+import {
+  patchUpdateFromDiffToolResponse,
+  toolUpdateFromDiffToolResponse,
+  v2UpdateFromDiffToolResponse,
+} from "../../diff.js";
 import { markdownEscape, resultText, textContent, toDisplayPath } from "../content.js";
 import type {
   ToolReporter,
@@ -28,12 +32,15 @@ export class WriteReporter implements ToolReporter {
       locations: write?.file_path ? [{ path: write.file_path }] : [],
     };
     if (write?.file_path) {
-      // A negotiated client gets the exact patch from the approval preview or
-      // from the PostToolUse hook. The input does not tell whether the file
-      // exists, so the live tool call shows no diff: a diff without the old
-      // text would claim a creation. The adapter reads the file only for the
-      // preview. A replay has no preview and no hook, so it keeps the diff.
-      if (!capabilities.diffPatch || replay) {
+      // A negotiated client and a v2 client get the exact patch from the
+      // approval preview or from the PostToolUse hook. The input does not tell
+      // whether the file exists, so the live tool call shows no diff: a diff
+      // without the old text would claim a creation. The adapter reads the
+      // file only for the preview. A replay has no preview and no hook, so it
+      // keeps the diff, except for a v2 client: a v2 diff names the operation,
+      // which the input does not tell.
+      const inputDiff = capabilities.v2 ? false : !capabilities.diffPatch || replay;
+      if (inputDiff) {
         facts.change = [
           {
             type: "diff",
@@ -88,7 +95,7 @@ export function normalizeWriteInput(input: unknown): NormalizedWriteInput | unde
 
 /** Edit: the diff holds the old and the new text. */
 export class EditReporter implements ToolReporter {
-  toolUse(input: unknown, { cwd }: ToolUseContext): ToolUseFacts {
+  toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     const edit = input as FileEditInput | undefined;
     const displayPath = edit?.file_path ? toDisplayPath(edit.file_path, cwd) : undefined;
     const facts: ToolUseFacts = {
@@ -96,10 +103,11 @@ export class EditReporter implements ToolReporter {
       kind: "edit",
       locations: edit?.file_path ? [{ path: edit.file_path }] : [],
     };
-    if (edit?.file_path && (edit.old_string || edit.new_string)) {
-      // The standard diff, also for a client that negotiated patches: the
-      // input holds a snippet, not the file, so a patch would need line
-      // numbers that the adapter does not know here.
+    // The standard diff, also for a client that negotiated patches: the input
+    // holds a snippet, not the file, so a patch would need line numbers that
+    // the adapter does not know here. A v2 diff cannot hold a snippet, so a v2
+    // client gets the patch from the PostToolUse hook alone.
+    if (edit?.file_path && (edit.old_string || edit.new_string) && !capabilities.v2) {
       facts.change = [
         {
           type: "diff",
@@ -127,14 +135,15 @@ export class EditReporter implements ToolReporter {
  * PostToolUse `tool_response`. For Write it replaces the optimistic creation
  * diff with the real diff of an updated file. A negotiated client gets an
  * exact git patch built from the written file, or the standard diff when none
- * can be built.
+ * can be built. A v2 client gets a v2 diff.
  */
 async function finalChange(
   toolResponse: unknown,
   { capabilities }: ToolUseContext,
 ): Promise<ToolResultFacts> {
+  if (capabilities.v2) return v2UpdateFromDiffToolResponse(toolResponse);
   if (!capabilities.diffPatch) return toolUpdateFromDiffToolResponse(toolResponse);
-  const patch = await patchUpdateFromDiffToolResponse(toolResponse);
+  const patch = await patchUpdateFromDiffToolResponse(toolResponse, "air");
   if (patch) return patch;
   const created = createdFileDiff(toolResponse);
   return created ?? toolUpdateFromDiffToolResponse(toolResponse);

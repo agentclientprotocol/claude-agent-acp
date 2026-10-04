@@ -13,6 +13,7 @@ import type {
   Query,
 } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_KIND_KEY, airOnlyMeta } from "./air-extension.js";
+import { resolvePermissionMode } from "./permissions/modes.js";
 import {
   noticeOrTranscriptUpdate,
   noticeTranscriptText,
@@ -73,6 +74,37 @@ type InitializeSessionModeParams = {
   /** When false, bypassPermissions is omitted from the mode catalog. */
   allowBypass: boolean;
 };
+
+/**
+ * The permission mode a new Claude query starts in.
+ *
+ * An explicit mode wins. A resume or a load continues in the mode of the last
+ * user record of the transcript. If that mode is unknown or not available now,
+ * for example bypass, the session starts in `defaultMode` of the settings.
+ */
+export function resolveInitialPermissionMode(
+  sources: { explicit?: PermissionMode; resumed?: string; defaultMode?: unknown },
+  logger: { error: (...args: unknown[]) => void },
+  allowBypass: boolean,
+): PermissionMode {
+  if (sources.explicit !== undefined) {
+    return resolvePermissionMode(sources.explicit, logger, allowBypass);
+  }
+  if (sources.resumed !== undefined) {
+    let rejected = false;
+    const mode = resolvePermissionMode(
+      sources.resumed,
+      { error: () => (rejected = true) },
+      allowBypass,
+    );
+    if (!rejected) return mode;
+    logger.error(
+      `Ignoring permission mode "${sources.resumed}" of the resumed transcript: ` +
+        `not available in this session.`,
+    );
+  }
+  return resolvePermissionMode(sources.defaultMode, logger, allowBypass);
+}
 
 /** Owns session-mode policy and the ACP/SDK synchronization it requires. */
 export class SessionModeManager<S extends SessionMode> {
