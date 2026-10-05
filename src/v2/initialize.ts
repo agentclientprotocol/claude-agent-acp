@@ -45,16 +45,26 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
 }
 
 /**
+ * The top-level `_meta` keys of the agent's v1 `initialize` response that
+ * advertise an extension the v2 surface does not serve yet: `steering`, for
+ * `_session/steering`.
+ */
+const UNSERVED_EXTENSION_KEYS: readonly string[] = ["steering"];
+
+/**
  * The v2 `initialize` response for the v1 response of the agent.
  *
- * It does not advertise the unstable `providers` methods, which the v2
- * surface does not serve yet.
+ * It does not advertise what the v2 surface does not serve yet: the unstable
+ * `providers` methods, and the extensions of {@link UNSERVED_EXTENSION_KEYS}.
  */
 export function v2InitializeResponse(response: InitializeResponse): v2.InitializeResponse {
   if (!response.agentInfo) {
     throw new Error("ACP v2 requires agentInfo, and the agent reported none");
   }
   const meta = response.agentCapabilities?._meta;
+  const topMeta = Object.fromEntries(
+    Object.entries(response._meta ?? {}).filter(([key]) => !UNSERVED_EXTENSION_KEYS.includes(key)),
+  );
   return {
     protocolVersion: v2.PROTOCOL_VERSION,
     info: response.agentInfo,
@@ -65,7 +75,7 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
       ...(meta != null ? { _meta: meta } : {}),
     },
     authMethods: (response.authMethods ?? []).map(v2AuthMethod),
-    ...(response._meta != null ? { _meta: response._meta } : {}),
+    ...(Object.keys(topMeta).length > 0 ? { _meta: topMeta } : {}),
   };
 }
 

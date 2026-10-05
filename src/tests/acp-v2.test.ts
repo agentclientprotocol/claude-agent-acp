@@ -285,6 +285,8 @@ describe("ACP protocol routing", () => {
       additionalDirectories: {},
     });
     expect(response.capabilities?.providers).toBeUndefined();
+    // Nor `_session/steering`, which v1 advertises in the top-level `_meta`.
+    expect(response._meta?.steering).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
       expect(method).not.toHaveProperty("id");
