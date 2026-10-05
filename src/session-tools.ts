@@ -28,7 +28,14 @@ export function sessionTools(host: SessionToolsHost) {
       RENAME_SESSION_TOOL_NAME,
       "Rename the current session: set the title the client shows for it, which it is also " +
         "listed and resumed under. Use it when the user asks to rename or title the session.",
-      { title: z.string().describe("The new title: a short phrase, on one line") },
+      {
+        title: z
+          .string()
+          .describe(
+            "The new title: a short phrase. Line breaks are folded into spaces, and a title " +
+              "longer than 256 characters is cut; the result names the title as stored.",
+          ),
+      },
       async ({ title }) => {
         try {
           const stored = await host.rename(title);
