@@ -467,6 +467,80 @@ describe("renaming a session", () => {
     expect(titles()).toEqual(["Generated meanwhile", "Chosen by the model"]);
   });
 
+  it("waits out a generation started before a reset, not just the latest one", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const finishGeneration: Array<(title: string) => void> = [];
+    const generateSessionTitle = vi.fn(
+      () => new Promise<string>((resolve) => finishGeneration.push(resolve)),
+    );
+    const input = new Pushable<any>();
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input));
+    Object.assign(query, { generateSessionTitle });
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    // A `/clear` releases the latch while the first generation is in flight, so
+    // the next turn-end starts a second one beside it.
+    session.titles.onPrompt([{ type: "text", text: LONG_PROMPT }]);
+    await session.titles.onTurnEnd(session);
+    session.titles.reset();
+    session.titles.onPrompt([{ type: "text", text: "Rewrite the title tests after the clear" }]);
+    await session.titles.onTurnEnd(session);
+    expect(generateSessionTitle).toHaveBeenCalledTimes(2);
+
+    const renamed = session.titles.rename(session, "Chosen by the model");
+    finishGeneration[1]("Generated after the clear");
+    await vi.waitFor(() => {
+      expect(titles()).toContain("Generated after the clear");
+    });
+    expect(renameOnQuery).not.toHaveBeenCalled();
+
+    finishGeneration[0]("Generated before the clear");
+    await renamed;
+
+    expect(renameOnQuery).toHaveBeenCalledWith("Chosen by the model", "test-session");
+    expect(titles().at(-1)).toBe("Chosen by the model");
+  });
+
+  it("still generates a title later when the chosen one cannot be stored", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+    vi.mocked(renameSession).mockRejectedValue(new Error("EACCES"));
+
+    const input = new Pushable<any>();
+    const { query } = wrapRenameQuery(oneTurn(input), async () => {
+      throw new Error("session_id is not the current session");
+    });
+    const generateSessionTitle = vi.fn(async () => "Generated instead");
+    Object.assign(query, { generateSessionTitle });
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await expect(session.titles.rename(session, "Chosen by the model")).rejects.toThrow("EACCES");
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: LONG_PROMPT }],
+    });
+    await session.consumer;
+
+    await vi.waitFor(() => {
+      expect(titles()).toEqual(["Generated instead"]);
+    });
+    expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+  });
+
   it("never generates over a renamed session at a later turn-end", async () => {
     const { client, titles } = titleRecorder();
     const agent = newAgent(client);

@@ -95,8 +95,10 @@ export class SessionTitles {
    *  one. Released by {@link reset}, and when generation yields nothing. */
   private settled = false;
 
-  /** The title generation in flight, if any. {@link rename} waits it out, so a
-   *  generated title persisted late never lands on top of a chosen one. */
+  /** Every title generation in flight. {@link rename} waits them out, so a
+   *  generated title persisted late never lands on top of a chosen one. More
+   *  than one can be in flight: {@link reset} releases the latch without ending
+   *  the generation it started. */
   private generation?: Promise<void>;
 
   constructor(
@@ -162,9 +164,10 @@ export class SessionTitles {
     if (this.canRequest(session)) {
       this.settled = true;
 
-      this.generation = this.requestGenerateTitle(session, fallback).catch((error) => {
+      const generation = this.requestGenerateTitle(session, fallback).catch((error) => {
         this.agent.logger.error(`Session ${this.sessionId}: session title update failed: ${error}`);
       });
+      this.generation = Promise.all([this.generation, generation]).then(() => {});
 
       return;
     }
@@ -186,9 +189,17 @@ export class SessionTitles {
       throw new Error("The title is empty");
     }
     await this.generation;
+    // Latched while the title is stored, so no generation starts meanwhile, and
+    // released again if it is not: the session is no more titled than before.
+    const settled = this.settled;
     this.settled = true;
+    try {
+      await this.store(session, title);
+    } catch (error) {
+      this.settled = settled;
+      throw error;
+    }
     this.context = undefined;
-    await this.store(session, title);
     await this.publish(title, Date.now());
     return title;
   }
