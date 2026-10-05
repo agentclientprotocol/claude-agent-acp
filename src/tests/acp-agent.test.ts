@@ -2747,6 +2747,41 @@ describe("task notification replay", () => {
     expect(asyncTaskUpdates(updates)).toEqual([]);
   });
 
+  it("takes the output path from the tool result when the notification has none", async () => {
+    const timeoutResult = record({
+      ...bashLaunch[2],
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_bash",
+            content:
+              "Command did not complete within its 120s timeout and was moved to the background (ID: bg1). Output is being written to: /tmp/claude/tasks/bg1.output.",
+          },
+        ],
+      },
+    });
+    const bare = record({
+      type: "user",
+      uuid: "notification-bare",
+      message: {
+        role: "user",
+        content:
+          "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>toolu_bash</tool-use-id>\n" +
+          "<status>completed</status>\n</task-notification>",
+      },
+      origin: { kind: "task-notification" },
+    });
+    const updates = await replay([bashLaunch[0], bashLaunch[1], timeoutResult, bare]);
+
+    expect(asyncTaskUpdates(updates)[0]).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      asyncTaskId: "bg1",
+      outputFilePath: "/tmp/claude/tasks/bg1.output",
+    });
+  });
+
   it("sends nothing for a task that a Monitor tool call started", async () => {
     const monitorLaunch = record({
       ...bashLaunch[1],
@@ -6400,6 +6435,160 @@ describe("subagent permission attribution (issue #851)", () => {
       sessionUpdate: "agent_message_chunk",
       content: { type: "text" },
     });
+  });
+
+  it("takes the output path of a subagent's background Bash from its text in both orders", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities & { subagents: Record<string, never> },
+    });
+    const system = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...fields,
+    });
+    const assistant = (parentToolUseId: string | null, content: unknown[]) => ({
+      type: "assistant",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: { role: "assistant", content, usage: SUBAGENT_TEST_USAGE },
+    });
+    // A subagent tool result has no `tool_use_result`.
+    const childResult = (toolUseId: string, text: string) => ({
+      type: "user",
+      parent_tool_use_id: "toolu_agent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolUseId, content: text }],
+      },
+    });
+    const timeoutPath = "/tmp/claude/tasks/btimeout.output";
+    const backgroundPath = "/tmp/claude/tasks/bback.output";
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        assistant(null, [
+          {
+            type: "tool_use",
+            id: "toolu_agent",
+            name: "Agent",
+            input: { description: "Investigate", prompt: "Find the bug" },
+          },
+        ]),
+        { ...taskStarted("agent-1", "toolu_agent"), subagent_type: "Explore" },
+        assistant("toolu_agent", [
+          { type: "tool_use", id: "child-slow", name: "Bash", input: { command: "npm test" } },
+          {
+            type: "tool_use",
+            id: "child-bg",
+            name: "Bash",
+            input: { command: "npm start", run_in_background: true },
+          },
+          {
+            type: "tool_use",
+            id: "child-cat",
+            name: "Bash",
+            input: { command: "sed -n 1,20p src/async-tasks.ts" },
+          },
+        ]),
+        // A command that hits its timeout goes to the background before its result.
+        system({
+          subtype: "task_started",
+          task_id: "btimeout",
+          task_type: "local_bash",
+          description: "npm test",
+          is_backgrounded: false,
+          tool_use_id: "child-slow",
+        }),
+        system({
+          subtype: "task_updated",
+          task_id: "btimeout",
+          patch: { is_backgrounded: true },
+        }),
+        childResult(
+          "child-slow",
+          `Command did not complete within its 120s timeout and was moved to the background (ID: btimeout). Output is being written to: ${timeoutPath}.`,
+        ),
+        // A run_in_background command reports its result first.
+        childResult(
+          "child-bg",
+          `Command running in background with ID: bback. Output is being written to: ${backgroundPath}. You will be notified when it completes.`,
+        ),
+        system({
+          subtype: "task_started",
+          task_id: "bback",
+          task_type: "local_bash",
+          description: "npm start",
+          is_backgrounded: true,
+          tool_use_id: "child-bg",
+        }),
+        // A foreground command prints a background marker text.
+        childResult(
+          "child-cat",
+          'Command running in background with ID: bg1. Output is being written to: /tmp/tasks/bg1.output. You will be notified when it completes.\nconst marker = "Command running in background with ID: ";',
+        ),
+        system({
+          subtype: "task_notification",
+          task_id: "agent-1",
+          tool_use_id: "toolu_agent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+        }),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const tasks = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate.startsWith("async_task_") ? [{ sessionId, ...update }] : [],
+    );
+    expect(tasks).toEqual([
+      expect.objectContaining({
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "btimeout",
+        toolCallId: "child-slow",
+      }),
+      {
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_progress",
+        asyncTaskId: "btimeout",
+        outputFilePath: timeoutPath,
+      },
+      expect.objectContaining({
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "bback",
+        toolCallId: "child-bg",
+        outputFilePath: backgroundPath,
+      }),
+    ]);
+    const backgrounded = (toolCallId: string) =>
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === toolCallId &&
+          (update._meta as any)?.jetbrains?.air?.asyncTasks?.backgrounded === true,
+      );
+    expect(backgrounded("child-slow")).toBe(true);
+    expect(backgrounded("child-bg")).toBe(true);
+    expect(backgrounded("child-cat")).toBe(false);
   });
 
   it("hides the async task of a Monitor tool call and keeps the tool call", async () => {

@@ -131,9 +131,9 @@ import {
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
+  backgroundedBashToolCallIds,
   clientSupportsAsyncTasks,
 } from "./async-tasks.js";
-import type { AsyncTaskStarted } from "./async-tasks.js";
 import {
   AUTH_STATUS_PROBE_TIMEOUT_MS,
   AUTH_STATUS_UPDATE_METHOD,
@@ -6842,15 +6842,22 @@ export class ClaudeAcpAgent {
             }
 
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
-            let backgroundBashTask: AsyncTaskStarted | undefined;
+            let backgroundedToolCalls: ReadonlySet<string> = new Set();
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
-              backgroundBashTask = backgroundBashTaskFromToolResult(
+              const backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
                 message.tool_use_result,
                 session.toolUseCache,
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+              await asyncTasks.toolResults(content);
+              backgroundedToolCalls = backgroundedBashToolCallIds(
+                content,
+                session.toolUseCache,
+                asyncTasks,
+                backgroundBashTask,
+              );
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
                 resumeLiveTask(resumedAgentId);
@@ -6902,7 +6909,7 @@ export class ClaudeAcpAgent {
               await sendUpdate(
                 backgroundedBashToolCall(
                   acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                  backgroundBashTask,
+                  backgroundedToolCalls,
                   asyncTasks.enabled,
                 ),
               );
@@ -7965,6 +7972,8 @@ export class ClaudeAcpAgent {
       }
       // @ts-expect-error - untyped in SDK but we handle all of these
       if (message.message.role === "user") {
+        // Like live, a tool result gives the output path of a known task.
+        await replayAsyncTasks.toolResults(content);
         for (const notification of taskNotificationsOf(content)) {
           await restoreTaskNotification(notification);
         }

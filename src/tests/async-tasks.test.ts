@@ -284,30 +284,139 @@ describe("AsyncTaskRuntime", () => {
     });
   });
 
-  it("recovers a background Bash task when the structured result omits its id", () => {
-    const tools = {
-      bash: { name: "Bash", input: { command: "npm run build" } },
-    };
+  // The four texts by which Claude Code 2.1.287 reports a background command.
+  const backgroundTexts = (id: string, path: string) => [
+    `Command was manually backgrounded by user with ID: ${id}. Output is being written to: ${path}.`,
+    `Command was moved to the background (ID: ${id}) so that a message could be sent. Output is being written to: ${path}.`,
+    `Command did not complete within its 120s timeout and was moved to the background (ID: ${id}). Output is being written to: ${path}.`,
+    `Command running in background with ID: ${id}. Output is being written to: ${path}. You will be notified when it completes.`,
+  ];
 
-    expect(
-      backgroundBashTaskFromToolResult(
-        [
-          {
-            type: "tool_result",
-            tool_use_id: "bash",
-            content:
-              "Command running in background with ID: task-1. Output is being written to: " +
-              "/private/tmp/claude/tasks/task-1.output. You will be notified when done.",
-          },
-        ],
-        undefined,
-        tools,
-      ),
-    ).toMatchObject({
-      taskId: "task-1",
-      toolCallId: "bash",
-      description: "npm run build",
-      outputFilePath: "/private/tmp/claude/tasks/task-1.output",
+  it("creates no task from the text of a foreground tool result", async () => {
+    const tools = { bash: { name: "Bash", input: { command: "sed -n 1,40p src/async-tasks.ts" } } };
+    const texts = [
+      ...backgroundTexts("bg1", "/tmp/tasks/bg1.output"),
+      'const marker = "Command running in background with ID: ";\n  const start = text',
+      "Command running in background with ID: You will be notified when it.",
+      "Command running in background with ID: ${e}. Output is being written to: ${Sp(e)}.",
+    ];
+    const published: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "session", async (notification) => {
+      published.push(notification);
+    });
+
+    for (const text of texts) {
+      const content = [{ type: "tool_result", tool_use_id: "bash", content: text }];
+      expect(backgroundBashTaskFromToolResult(content, undefined, tools)).toBeUndefined();
+      await runtime.toolResults(content);
+    }
+    await runtime.releaseHeld();
+
+    expect(published).toEqual([]);
+    expect(runtime.isBackgroundedToolCall("bash")).toBe(false);
+  });
+
+  describe("output path from the tool result of a known task", () => {
+    const path = "/private/tmp/claude-501/project/session/tasks/bq7x.output";
+    const started = {
+      task_id: "bq7x",
+      task_type: "local_bash",
+      description: "npm test",
+      tool_use_id: "bash",
+    };
+    const runtime = () => {
+      const published: AcpSessionNotification[] = [];
+      return {
+        published,
+        runtime: new AsyncTaskRuntime(true, "session", async (notification) => {
+          published.push(notification);
+        }),
+      };
+    };
+    const result = (text: string) => [{ type: "tool_result", tool_use_id: "bash", content: text }];
+
+    it.each(backgroundTexts("bq7x", path).map((text, index) => [index + 1, text]))(
+      "takes the path of format %i when the tool result comes first",
+      async (_, text) => {
+        const { runtime: tasks, published } = runtime();
+        await tasks.toolResults(result(text as string));
+        await tasks.taskStarted({ ...started, is_backgrounded: true });
+
+        expect(published[0]?.update).toMatchObject({
+          sessionUpdate: "async_task_spawned",
+          outputFilePath: path,
+        });
+      },
+    );
+
+    it.each(backgroundTexts("bq7x", path).map((text, index) => [index + 1, text]))(
+      "takes the path of format %i when the task goes to the background first",
+      async (_, text) => {
+        const { runtime: tasks, published } = runtime();
+        // The order of a command that hits its timeout.
+        await tasks.taskStarted({ ...started, is_backgrounded: false });
+        await tasks.taskUpdated({ task_id: "bq7x", patch: { is_backgrounded: true } });
+        expect(tasks.isBackgroundedToolCall("bash")).toBe(true);
+        await tasks.toolResults(result(text as string));
+        await tasks.taskNotification({ task_id: "bq7x", status: "completed", tool_use_id: "bash" });
+
+        expect(published.map(({ update }) => update)).toEqual([
+          expect.not.objectContaining({ outputFilePath: expect.anything() }),
+          { sessionUpdate: "async_task_progress", asyncTaskId: "bq7x", outputFilePath: path },
+          { sessionUpdate: "async_task_state_update", asyncTaskId: "bq7x", state: "completed" },
+        ]);
+      },
+    );
+
+    it("takes a Windows path", async () => {
+      const { runtime: tasks, published } = runtime();
+      const windowsPath = "C:\\Users\\dev\\AppData\\Local\\Temp\\claude\\tasks\\bq7x.output";
+      await tasks.toolResults(result(backgroundTexts("bq7x", windowsPath)[2]));
+      await tasks.taskStarted({ ...started, is_backgrounded: true });
+
+      expect(published[0]?.update).toMatchObject({ outputFilePath: windowsPath });
+    });
+
+    it("does not take the path of another task or of another tool call", async () => {
+      const { runtime: tasks, published } = runtime();
+      await tasks.toolResults(result(backgroundTexts("other", "/tmp/tasks/other.output")[3]));
+      await tasks.toolResults([
+        { type: "tool_result", tool_use_id: "read", content: "/tmp/tasks/bq7x.output" },
+      ]);
+      await tasks.toolResults(result("see /tmp/tasks/bq7x.outputs and tasks/bq7x.output"));
+      await tasks.taskStarted({ ...started, is_backgrounded: true });
+
+      expect(published[0]?.update).not.toHaveProperty("outputFilePath");
+    });
+
+    it("lets a structured output path win over the tool result", async () => {
+      const { runtime: tasks, published } = runtime();
+      await tasks.toolResults(result(backgroundTexts("bq7x", "/tmp/tasks/bq7x.output")[1]));
+      await tasks.taskStarted({ ...started, is_backgrounded: true, output_file: path });
+
+      expect(published[0]?.update).toMatchObject({ outputFilePath: path });
+    });
+
+    it("sends the output path of the terminal notification after a level close", async () => {
+      const { runtime: tasks, published } = runtime();
+      await tasks.taskStarted({ ...started, is_backgrounded: true });
+      await tasks.backgroundTasksChanged([]);
+      await tasks.taskNotification({
+        task_id: "bq7x",
+        status: "completed",
+        tool_use_id: "bash",
+        output_file: path,
+      });
+
+      expect(published.map(({ update }) => update).slice(1)).toEqual([
+        { sessionUpdate: "async_task_state_update", asyncTaskId: "bq7x", state: "stopped" },
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "bq7x",
+          state: "completed",
+          outputFilePath: path,
+        },
+      ]);
     });
   });
 

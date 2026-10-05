@@ -43,6 +43,8 @@ type AsyncTask = {
 
 type TaskIdentity = { taskId?: unknown; task_id?: unknown };
 
+const MAX_TOOL_RESULT_PATHS = 500;
+
 export type AsyncTaskStarted = TaskIdentity & {
   taskType?: unknown;
   task_type?: unknown;
@@ -112,6 +114,13 @@ export class AsyncTaskRuntime {
    * a command was backgrounded can arrive after its terminal SDK edge.
    */
   private readonly tasks = new Map<string, AsyncTask>();
+  /**
+   * The task output path tokens in the text of each tool result, by tool call
+   * id. A task whose id and tool call are known takes its output path from
+   * here. The tool result can come before or after the SDK names the task.
+   * The oldest entries are dropped.
+   */
+  private readonly outputPathsByToolCall = new Map<string, string[]>();
 
   constructor(
     readonly enabled: boolean,
@@ -427,6 +436,41 @@ export class AsyncTaskRuntime {
     );
   }
 
+  /** Whether a task of the tool call went to the background, so the client gets it. */
+  isBackgroundedToolCall(toolCallId: string): boolean {
+    for (const task of this.tasks.values()) {
+      if (task.toolCallId === toolCallId && !task.ignored && (task.announced || task.held)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Reads the tool results in `content` for the output path of a known task.
+   * Only a path token that ends with `tasks/<task id>.output` in the result of
+   * the task's own tool call counts. A tool result never creates a task.
+   */
+  async toolResults(content: unknown): Promise<void> {
+    if (!this.enabled || !Array.isArray(content)) return;
+    for (const result of content.flatMap(toolResultBlock)) {
+      const text = textContent(result.content);
+      const paths = text ? taskOutputPaths(text) : [];
+      if (paths.length === 0) continue;
+      this.outputPathsByToolCall.delete(result.toolUseId);
+      this.outputPathsByToolCall.set(result.toolUseId, paths);
+      if (this.outputPathsByToolCall.size > MAX_TOOL_RESULT_PATHS) {
+        const oldest = this.outputPathsByToolCall.keys().next().value;
+        if (oldest !== undefined) this.outputPathsByToolCall.delete(oldest);
+      }
+      for (const task of this.tasks.values()) {
+        if (task.toolCallId !== result.toolUseId || task.ignored || task.outputFilePath) continue;
+        this.mergeToolResultPath(task);
+        if (task.outputFilePath && task.announced) await this.publishMetadata(task);
+      }
+    }
+  }
+
   /**
    * Sends the spawn of each held task without a tool call id. The prompt
    * result ends the model turn, and the result of the tool call that started a
@@ -441,6 +485,7 @@ export class AsyncTaskRuntime {
 
   clear(): void {
     this.tasks.clear();
+    this.outputPathsByToolCall.clear();
   }
 
   /**
@@ -499,6 +544,7 @@ export class AsyncTaskRuntime {
     this.mergeOutputFilePath(task, message);
     const toolCallId = nonBlankString(field(message, "toolCallId", "tool_use_id"));
     if (toolCallId) task.toolCallId = toolCallId;
+    this.mergeToolResultPath(task);
   }
 
   /** Keeps the first tool call id that a later SDK message brings. */
@@ -507,6 +553,17 @@ export class AsyncTaskRuntime {
     value: { toolCallId?: unknown; tool_use_id?: unknown },
   ): void {
     task.toolCallId ??= nonBlankString(field(value, "toolCallId", "tool_use_id"));
+    this.mergeToolResultPath(task);
+  }
+
+  /**
+   * Takes the output path from the result of the task's tool call when no
+   * structured source gave one. A structured path later replaces it.
+   */
+  private mergeToolResultPath(task: AsyncTask): void {
+    if (task.outputFilePath || !task.toolCallId) return;
+    const paths = this.outputPathsByToolCall.get(task.toolCallId);
+    if (paths) task.outputFilePath = outputFilePathOf(paths, task.id);
   }
 
   /** Sends an update of an announced task. A held task sends it after its spawn. */
@@ -717,7 +774,11 @@ function recordPublished(task: AsyncTask, fields: Record<string, unknown>): void
   }
 }
 
-/** Recovers background Bash lifecycle data exposed only on its tool result. */
+/**
+ * Recovers a background Bash task from the structured `backgroundTaskId` of
+ * its tool result. The text of a tool result never gives a task id: a
+ * foreground command can print any text.
+ */
 export function backgroundBashTaskFromToolResult(
   content: unknown,
   toolUseResult: unknown,
@@ -729,12 +790,7 @@ export function backgroundBashTaskFromToolResult(
   if (bashResults.length === 0) return undefined;
 
   const backgroundResults = structuredBackgroundResults(toolUseResult, toolUses);
-  const distinctTaskIds = new Set([
-    ...backgroundResults.map((result) => result.taskId),
-    ...bashResults
-      .map((result) => backgroundTaskIdFromText(result.content))
-      .filter((taskId): taskId is string => taskId !== undefined),
-  ]);
+  const distinctTaskIds = new Set(backgroundResults.map((result) => result.taskId));
   if (distinctTaskIds.size !== 1) return undefined;
   const taskId = [...distinctTaskIds][0];
   if (!taskId) return undefined;
@@ -768,15 +824,36 @@ export function backgroundBashTaskFromToolResult(
   };
 }
 
-function backgroundTaskIdFromText(content: unknown): string | undefined {
-  const text = textContent(content);
-  if (!text) return undefined;
-  const marker = "Command running in background with ID: ";
-  const start = text.indexOf(marker);
-  if (start < 0) return undefined;
-  const valueStart = start + marker.length;
-  const valueEnd = text.indexOf(".", valueStart);
-  return valueEnd < 0 ? undefined : nonBlankString(text.slice(valueStart, valueEnd));
+/**
+ * The Bash tool calls in `content` whose command went to the background. Only
+ * structured data counts: the task from the structured tool result, a task
+ * that the runtime knows for the tool call, or a `run_in_background` input of
+ * a call that did not fail.
+ */
+export function backgroundedBashToolCallIds(
+  content: unknown,
+  toolUses: Record<string, { name: string; input: unknown }>,
+  runtime: AsyncTaskRuntime,
+  structuredTask?: AsyncTaskStarted,
+): Set<string> {
+  const ids = new Set<string>();
+  if (!runtime.enabled || !Array.isArray(content)) return ids;
+  const structuredToolCallId = structuredTask
+    ? nonBlankString(field(structuredTask, "toolCallId", "tool_use_id"))
+    : undefined;
+  for (const result of content.flatMap(toolResultBlock)) {
+    const toolUse = toolUses[result.toolUseId];
+    if (toolUse?.name !== "Bash") continue;
+    const input = isRecord(toolUse.input) ? toolUse.input : undefined;
+    if (
+      result.toolUseId === structuredToolCallId ||
+      runtime.isBackgroundedToolCall(result.toolUseId) ||
+      (input?.run_in_background === true && !result.isError)
+    ) {
+      ids.add(result.toolUseId);
+    }
+  }
+  return ids;
 }
 
 function structuredBackgroundResults(
@@ -808,27 +885,45 @@ function structuredBackgroundResults(
   return results;
 }
 
-function toolResultBlock(value: unknown): { toolUseId: string; content?: unknown }[] {
+function toolResultBlock(
+  value: unknown,
+): { toolUseId: string; content?: unknown; isError: boolean }[] {
   if (!isRecord(value) || value.type !== "tool_result") return [];
   const toolUseId = nonBlankString(field(value, "toolUseId", "tool_use_id"));
-  return toolUseId ? [{ toolUseId, content: value.content }] : [];
+  return toolUseId
+    ? [
+        {
+          toolUseId,
+          content: value.content,
+          isError: field(value, "isError", "is_error") === true,
+        },
+      ]
+    : [];
 }
 
 function asyncTaskOutputFilePath(content: unknown, taskId: string): string | undefined {
   const text = textContent(content);
-  if (!text) return undefined;
-  const marker = "Output is being written to: ";
-  const start = text.indexOf(marker);
-  if (start < 0) return undefined;
-  const valueStart = start + marker.length;
-  const valueEnd = text.indexOf(". You will be notified", valueStart);
-  if (valueEnd < 0) return undefined;
-  const path = text.slice(valueStart, valueEnd).trim();
-  const expectedPosixSuffix = `/tasks/${taskId}.output`;
-  const expectedWindowsSuffix = `\\tasks\\${taskId}.output`;
-  return path.endsWith(expectedPosixSuffix) || path.endsWith(expectedWindowsSuffix)
-    ? path
-    : undefined;
+  return text ? outputFilePathOf(taskOutputPaths(text), taskId) : undefined;
+}
+
+/**
+ * An absolute path token that ends with `tasks/<id>.output`. Claude Code
+ * writes the output of a background task there, and every text that reports
+ * the task names that path. The phrase around the path does not matter.
+ */
+const TASK_OUTPUT_PATH =
+  /(?<![^\s"'`<>(=])(?:\/|~\/|[A-Za-z]:\\)[^\s"'`<>()]*[/\\]tasks[/\\][^\s"'`<>()/\\]+\.output(?![\w-]|\.\w)/g;
+
+/** The task output path tokens in a tool result text. */
+function taskOutputPaths(text: string): string[] {
+  return [...text.matchAll(TASK_OUTPUT_PATH)].map((match) => match[0]);
+}
+
+/** The output path of the task `taskId` among path tokens, if one names it. */
+function outputFilePathOf(paths: readonly string[], taskId: string): string | undefined {
+  const posix = `/tasks/${taskId}.output`;
+  const windows = `\\tasks\\${taskId}.output`;
+  return paths.find((path) => path.endsWith(posix) || path.endsWith(windows));
 }
 
 function textContent(value: unknown): string | undefined {
