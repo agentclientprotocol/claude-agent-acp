@@ -18,6 +18,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
+import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
 import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
@@ -407,13 +408,14 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("current_mode_update")).toEqual([]);
   });
 
-  it("tells the agent that a v2 client takes notices", async () => {
+  it("tells the agent that a v2 client takes notices and compaction updates", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       await authUpdate(1);
     });
     expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
+    expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
   });
 
   it("forwards the URL elicitation of MCP OAuth to a v2 client", async () => {
@@ -790,6 +792,93 @@ describe("ACP v2 prompts", () => {
     );
   });
 
+  it("reports Claude Code's warnings as live notices", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "system",
+        subtype: "informational",
+        level: "warning",
+        content: "Stop hook blocked continuation\nThe hook said no.",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "Done.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "notice",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(client.updates("notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "Stop hook blocked continuation",
+        description: "The hook said no.",
+      },
+    ]);
+  });
+
+  it("replays a compaction as one completed compaction_update at its position", async () => {
+    const summary =
+      "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+      "Summary:\n1. Primary Request and Intent:\n   Count upward.\n\n" +
+      "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("user", "prompt-uuid", { role: "user", content: text("count") }),
+        {
+          ...transcriptEntry("user", "summary-uuid", { role: "user", content: summary }),
+          isCompactSummary: true,
+        },
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_after",
+          role: "assistant",
+          content: text("4"),
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      // The materialized form only: no in-progress update and no summary
+      // chunks, and the summary between the messages around it.
+      expect(
+        client.sessionUpdates
+          .slice(before)
+          .map(({ update }) => update)
+          .filter((update) => !update.sessionUpdate.endsWith("_chunk")),
+      ).toEqual([
+        { sessionUpdate: "user_message", messageId: "prompt-uuid", content: [] },
+        {
+          sessionUpdate: "compaction_update",
+          compactionId: "summary-uuid",
+          status: "completed",
+          summary: text("1. Primary Request and Intent:\n   Count upward."),
+        },
+        { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
+      ]);
+      await client.authUpdate(1);
+    });
+  });
+
   it("replays the history before it answers session/resume, clearing each message first", async () => {
     const echoed = scriptTurns(
       async function* (options) {
@@ -1159,8 +1248,28 @@ describe("ACP v2 session translation", () => {
 
   it("fails on session updates that it does not translate yet", () => {
     expect(() =>
-      v2SessionUpdate({ sessionUpdate: "compaction_update", compactionId: "c", status: "started" }),
-    ).toThrow("does not translate compaction_update session updates yet");
+      v2SessionUpdate({
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: "agent_n",
+        state: "failed",
+      }),
+    ).toThrow("does not translate subagent_state_update session updates yet");
+  });
+
+  it("sends compaction updates as they are, which v1 and v2 share", () => {
+    const update = {
+      sessionUpdate: "compaction_update" as const,
+      compactionId: "c",
+      status: "completed",
+      summary: text("The summary."),
+    };
+    expect(v2SessionUpdate(update)).toEqual(update);
+    const chunk = {
+      sessionUpdate: "compaction_summary_chunk" as const,
+      compactionId: "c",
+      content: { type: "text" as const, text: "The" },
+    };
+    expect(v2SessionUpdate(chunk)).toEqual(chunk);
   });
 
   it("reports the plan of the session as one v2 plan", () => {

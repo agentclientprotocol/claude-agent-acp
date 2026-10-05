@@ -26,10 +26,12 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
       // reads, writes, and runs commands itself.
       fs: { readTextFile: false, writeTextFile: false },
       terminal: false,
-      // Every v2 client handles boolean config options and notices; v1 asks
-      // for a marker. With notices, the agent reports advisories as notices
-      // rather than as transcript messages.
-      session: { configOptions: { boolean: {} }, notices: {} },
+      // Every v2 client handles boolean config options, notices, and
+      // compaction updates; v1 asks for a marker. With them, the agent reports
+      // advisories as notices rather than as transcript messages, and a
+      // compaction as a compaction entity rather than as a "Compact
+      // conversation" tool call, also on replay.
+      session: { configOptions: { boolean: {} }, notices: {}, compaction: {} },
       // v1 marks terminal auth support with a boolean, v2 with an object.
       auth: {
         terminal: capabilities?.auth?.terminal != null,
