@@ -368,22 +368,69 @@ describe("AsyncTaskRuntime", () => {
       },
     );
 
-    it("takes a Windows path", async () => {
+    const windowsPath =
+      "C:\\Users\\John Doe\\AppData\\Local\\Temp\\claude-0\\C--work-my-repo\\" +
+      "5f0c2a1e-session\\tasks\\bq7x.output";
+    const posixPath = "/Users/John Doe/Library/Caches/claude-501/my repo/session/tasks/bq7x.output";
+    const spacedCases = [
+      ...backgroundTexts("bq7x", windowsPath).map((text, index) => [
+        `Windows format ${index + 1}`,
+        text,
+        windowsPath,
+      ]),
+      ...backgroundTexts("bq7x", posixPath).map((text, index) => [
+        `POSIX format ${index + 1}`,
+        text,
+        posixPath,
+      ]),
+      [
+        "Windows path with forward slashes",
+        "Output is being written to: C:/Users/John Doe/Temp/tasks/bq7x.output.",
+        "C:/Users/John Doe/Temp/tasks/bq7x.output",
+      ],
+      [
+        "UNC path",
+        "Output is being written to: \\\\server\\share\\my tasks\\tasks\\bq7x.output",
+        "\\\\server\\share\\my tasks\\tasks\\bq7x.output",
+      ],
+    ];
+
+    it.each(spacedCases)("takes a path with spaces: %s", async (_, text, expected) => {
       const { runtime: tasks, published } = runtime();
-      const windowsPath = "C:\\Users\\dev\\AppData\\Local\\Temp\\claude\\tasks\\bq7x.output";
-      await tasks.toolResults(result(backgroundTexts("bq7x", windowsPath)[2]));
+      await tasks.toolResults(result(text));
       await tasks.taskStarted({ ...started, is_backgrounded: true });
 
-      expect(published[0]?.update).toMatchObject({ outputFilePath: windowsPath });
+      // The sentence period after the path is not part of it.
+      expect(published[0]?.update).toMatchObject({ outputFilePath: expected });
     });
 
-    it("does not take the path of another task or of another tool call", async () => {
+    it.each(spacedCases)(
+      "takes a path with spaces when the task comes first: %s",
+      async (_, text, expected) => {
+        const { runtime: tasks, published } = runtime();
+        await tasks.taskStarted({ ...started, is_backgrounded: true });
+        await tasks.toolResults(result(text));
+
+        expect(published[1]?.update).toEqual({
+          sessionUpdate: "async_task_progress",
+          asyncTaskId: "bq7x",
+          outputFilePath: expected,
+        });
+      },
+    );
+
+    it.each([
+      ["another task", "bash", backgroundTexts("other", "/tmp/tasks/other.output")[3]],
+      ["another tool call", "read", "Output is being written to: /tmp/tasks/bq7x.output."],
+      ["a longer extension", "bash", "Output is being written to: /tmp/tasks/bq7x.outputs."],
+      ["a file after the suffix", "bash", "Output is being written to: /tmp/tasks/bq7x.output.txt"],
+      ["no colon and space boundary", "bash", "see /tmp/tasks/bq7x.output"],
+      ["a relative path", "bash", "Output is being written to: tmp/tasks/bq7x.output."],
+      ["a path across a line", "bash", "Output: /tmp\n/claude/tasks/bq7x.output"],
+      ["a task id that only ends the same", "bash", "Output: /tmp/tasks/xbq7x.output"],
+    ])("does not take the path of %s", async (_, toolUseId, text) => {
       const { runtime: tasks, published } = runtime();
-      await tasks.toolResults(result(backgroundTexts("other", "/tmp/tasks/other.output")[3]));
-      await tasks.toolResults([
-        { type: "tool_result", tool_use_id: "read", content: "/tmp/tasks/bq7x.output" },
-      ]);
-      await tasks.toolResults(result("see /tmp/tasks/bq7x.outputs and tasks/bq7x.output"));
+      await tasks.toolResults([{ type: "tool_result", tool_use_id: toolUseId, content: text }]);
       await tasks.taskStarted({ ...started, is_backgrounded: true });
 
       expect(published[0]?.update).not.toHaveProperty("outputFilePath");

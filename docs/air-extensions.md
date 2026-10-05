@@ -890,7 +890,9 @@ The sources are `tool_use_result.backgroundTaskId` and the SDK `task_started`, `
 The text of a tool result never creates a task, because a foreground command can print any text.
 The output path comes from `output_file` of the SDK events when they have it.
 Otherwise the adapter reads the text of the tool result of the task's own tool call.
-It takes only an absolute path token that ends with `tasks/<task id>.output`.
+It takes only an absolute path that ends with `tasks/<task id>.output`, followed by a period, whitespace or the end of the text.
+The path starts after the nearest `": "` before that end, so it can hold spaces.
+A POSIX, a Windows drive, and a UNC path count. A path across a line does not.
 The tool result can come before or after the SDK names the task.
 A subagent tool result has no `tool_use_result`, so this text is the only path source there.
 

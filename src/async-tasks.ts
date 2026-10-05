@@ -115,7 +115,7 @@ export class AsyncTaskRuntime {
    */
   private readonly tasks = new Map<string, AsyncTask>();
   /**
-   * The task output path tokens in the text of each tool result, by tool call
+   * The task output paths in the text of each tool result, by tool call
    * id. A task whose id and tool call are known takes its output path from
    * here. The tool result can come before or after the SDK names the task.
    * The oldest entries are dropped.
@@ -448,7 +448,7 @@ export class AsyncTaskRuntime {
 
   /**
    * Reads the tool results in `content` for the output path of a known task.
-   * Only a path token that ends with `tasks/<task id>.output` in the result of
+   * Only a path that ends with `tasks/<task id>.output` in the result of
    * the task's own tool call counts. A tool result never creates a task.
    */
   async toolResults(content: unknown): Promise<void> {
@@ -907,19 +907,34 @@ function asyncTaskOutputFilePath(content: unknown, taskId: string): string | und
 }
 
 /**
- * An absolute path token that ends with `tasks/<id>.output`. Claude Code
- * writes the output of a background task there, and every text that reports
- * the task names that path. The phrase around the path does not matter.
+ * The end of a task output path: `tasks/<id>.output`, followed by a sentence
+ * period, whitespace or the end of the text. Claude Code writes the output of
+ * a background task there.
  */
-const TASK_OUTPUT_PATH =
-  /(?<![^\s"'`<>(=])(?:\/|~\/|[A-Za-z]:\\)[^\s"'`<>()]*[/\\]tasks[/\\][^\s"'`<>()/\\]+\.output(?![\w-]|\.\w)/g;
+const TASK_OUTPUT_SUFFIX = /[/\\]tasks[/\\][^\s/\\]+?\.output(?=\.(?!\w)|\s|$)/g;
+/** An absolute POSIX, Windows drive or UNC path. */
+const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
 
-/** The task output path tokens in a tool result text. */
+/**
+ * The task output paths in a tool result text. Each text of Claude Code puts
+ * the path after "Output is being written to: ", so a path starts after the
+ * nearest `": "` before its end. A drive colon has no space after it, so a
+ * path can hold spaces and a drive. A path that is not absolute, or that
+ * crosses a line, does not count.
+ */
 function taskOutputPaths(text: string): string[] {
-  return [...text.matchAll(TASK_OUTPUT_PATH)].map((match) => match[0]);
+  const paths: string[] = [];
+  for (const match of text.matchAll(TASK_OUTPUT_SUFFIX)) {
+    const end = match.index + match[0].length;
+    const boundary = text.lastIndexOf(": ", match.index);
+    if (boundary < 0) continue;
+    const path = text.slice(boundary + 2, end);
+    if (ABSOLUTE_PATH.test(path) && !/[\r\n]/.test(path)) paths.push(path);
+  }
+  return paths;
 }
 
-/** The output path of the task `taskId` among path tokens, if one names it. */
+/** The output path of the task `taskId` among the paths, if one names it. */
 function outputFilePathOf(paths: readonly string[], taskId: string): string | undefined {
   const posix = `/tasks/${taskId}.output`;
   const windows = `\\tasks\\${taskId}.output`;
