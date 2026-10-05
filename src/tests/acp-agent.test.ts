@@ -6616,9 +6616,16 @@ describe("subagent permission attribution (issue #851)", () => {
             name: "Monitor",
             input: { command: "tail -f build.log", description: "watch the build log" },
           },
+          {
+            type: "tool_use",
+            id: "child-server",
+            name: "Bash",
+            input: { command: "npm start", run_in_background: true },
+          },
         ]);
         yield backgroundTask("shell-child", "child-bash", "npm test");
         yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
+        yield backgroundTask("shell-late", "child-server", "npm start");
         yield assistant(null, [
           {
             type: "tool_use",
@@ -6633,6 +6640,8 @@ describe("subagent permission attribution (issue #851)", () => {
         tasksStarted();
         await released;
         yield taskNotification("agent-1", "toolu_agent");
+        // The task of the subagent ends after the subagent finished.
+        yield taskNotification("shell-late", "child-server");
         yield successResult();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
@@ -6661,10 +6670,12 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(lifecycle).toEqual([
       ["agent-1", "async_task_spawned", "shell-child", undefined],
       ["agent-1", "async_task_spawned", "monitor-child", undefined],
+      ["agent-1", "async_task_spawned", "shell-late", undefined],
       ["test-session", "async_task_spawned", "shell-root", undefined],
       ["agent-1", "async_task_state_update", "shell-child", "completed"],
       ["test-session", "async_task_state_update", "shell-root", "completed"],
       ["agent-1", "async_task_state_update", "monitor-child", "stopped"],
+      ["agent-1", "async_task_state_update", "shell-late", "completed"],
     ]);
     // The stop acknowledgement goes to the transcript that holds the task.
     const stopAcknowledgement = updates.find(

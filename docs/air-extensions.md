@@ -864,6 +864,8 @@ Claude can run work in the background, for example a backgrounded Bash command, 
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
+A task that a subagent tool call started goes to the subagent session.
+Its progress and state updates go there also after the subagent finished.
 
 ### Updates
 
