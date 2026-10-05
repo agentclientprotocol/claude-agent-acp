@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { appendTitleContext } from "../session-titles.js";
 import { Pushable } from "../utils.js";
-import { getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
+import { getSessionInfo, renameSession } from "@anthropic-ai/claude-agent-sdk";
 import {
   mockSessionState,
   successfulResultMessage,
@@ -14,7 +14,7 @@ import {
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
-  return { ...actual, getSessionInfo: vi.fn() };
+  return { ...actual, getSessionInfo: vi.fn(), renameSession: vi.fn() };
 });
 
 describe("SDK title generation contract", () => {
@@ -34,6 +34,16 @@ describe("SDK title generation contract", () => {
     }).toEqual({ method: true, subtype: true });
   });
 
+  // The same guard for the undeclared `Query.renameSession` a rename rests on.
+  it("SDK still ships Query.renameSession and its control subtype", async () => {
+    const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
+    const bundle = await readFile(sdkEntry, "utf8");
+    expect({
+      method: bundle.includes("async renameSession("),
+      subtype: bundle.includes('subtype:"rename_session"'),
+    }).toEqual({ method: true, subtype: true });
+  });
+
   it("keeps only the trailing title context", () => {
     expect(appendTitleContext("abc", "def")).toBe("abcdef");
     expect(appendTitleContext(undefined, "abc")).toBe("abc");
@@ -43,48 +53,48 @@ describe("SDK title generation contract", () => {
   });
 });
 
+/** Collect every `session_info_update` an agent pushes. */
+function titleRecorder() {
+  const updates: any[] = [];
+  const client = {
+    sessionUpdate: async (u: any) => {
+      if (u.update?.sessionUpdate === "session_info_update") updates.push(u.update);
+    },
+  } as unknown as AcpClient;
+  return { client, titles: () => updates.map((u) => u.title) };
+}
+
+/** `wrapQuery` plus the undeclared `generateSessionTitle` the real `Query`
+ *  exposes, so turn-end takes the generate branch. */
+function wrapTitleQuery(generator: AsyncGenerator<any>, title: string | null) {
+  const generateSessionTitle = vi.fn(async (_d: string, _o?: { persist?: boolean }) => title);
+  return {
+    query: Object.assign(wrapQuery(generator), { generateSessionTitle }),
+    generateSessionTitle,
+  };
+}
+
+/** One turn: echo the pushed prompt, succeed, go idle. */
+async function* oneTurn(input: Pushable<any>, turns = 1) {
+  const iter = input[Symbol.asyncIterator]();
+  for (let i = 0; i < turns; i++) {
+    const { value: userMessage } = await iter.next();
+    yield userEcho(userMessage);
+    yield successfulResultMessage();
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  }
+}
+
+function newAgent(client: AcpClient) {
+  return new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+}
+
+const LONG_PROMPT = "Explain what the add function in hello.py does, in one sentence";
+
 describe("session titles at turn-end", () => {
   beforeEach(() => {
     vi.mocked(getSessionInfo).mockReset();
   });
-
-  /** Collect every `session_info_update` an agent pushes. */
-  function titleRecorder() {
-    const updates: any[] = [];
-    const client = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "session_info_update") updates.push(u.update);
-      },
-    } as unknown as AcpClient;
-    return { client, titles: () => updates.map((u) => u.title) };
-  }
-
-  /** `wrapQuery` plus the undeclared `generateSessionTitle` the real `Query`
-   *  exposes, so turn-end takes the generate branch. */
-  function wrapTitleQuery(generator: AsyncGenerator<any>, title: string | null) {
-    const generateSessionTitle = vi.fn(async (_d: string, _o?: { persist?: boolean }) => title);
-    return {
-      query: Object.assign(wrapQuery(generator), { generateSessionTitle }),
-      generateSessionTitle,
-    };
-  }
-
-  /** One turn: echo the pushed prompt, succeed, go idle. */
-  async function* oneTurn(input: Pushable<any>, turns = 1) {
-    const iter = input[Symbol.asyncIterator]();
-    for (let i = 0; i < turns; i++) {
-      const { value: userMessage } = await iter.next();
-      yield userEcho(userMessage);
-      yield successfulResultMessage();
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
-    }
-  }
-
-  function newAgent(client: AcpClient) {
-    return new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-  }
-
-  const LONG_PROMPT = "Explain what the add function in hello.py does, in one sentence";
 
   it("pushes a session_info_update when the SDK generates a title at turn-end", async () => {
     const sessionUpdates: any[] = [];
@@ -334,5 +344,156 @@ describe("session titles at turn-end", () => {
       { persist: true },
     );
     expect(titles()).toEqual(["Investigate Kafka lag alert on prod-3"]);
+  });
+});
+
+describe("renaming a session", () => {
+  beforeEach(() => {
+    vi.mocked(getSessionInfo).mockReset();
+    vi.mocked(renameSession).mockReset();
+  });
+
+  /** `wrapQuery` plus the undeclared `renameSession` the real `Query` exposes. */
+  function wrapRenameQuery(generator: AsyncGenerator<any>, rename = async () => {}) {
+    const renameOnQuery = vi.fn(async (_title: string, _sessionId?: string) => rename());
+    return {
+      query: Object.assign(wrapQuery(generator), { renameSession: renameOnQuery }),
+      renameOnQuery,
+    };
+  }
+
+  it("stores the title through the live CLI and publishes it at once", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input));
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await expect(session.titles.rename(session, "  Fix the\nlogin bug ")).resolves.toBe(
+      "Fix the login bug",
+    );
+
+    expect(renameOnQuery).toHaveBeenCalledWith("Fix the login bug", "test-session");
+    expect(renameSession).not.toHaveBeenCalled();
+    expect(titles()).toEqual(["Fix the login bug"]);
+  });
+
+  it("writes the session file when the CLI refuses the session id", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    // What the CLI answers once a `/clear` moved it to another conversation.
+    const { query } = wrapRenameQuery(oneTurn(input), async () => {
+      throw new Error("session_id is not the current session");
+    });
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await session.titles.rename(session, "After the clear");
+
+    expect(renameSession).toHaveBeenCalledWith("test-session", "After the clear", {
+      dir: "/test",
+    });
+    expect(titles()).toEqual(["After the clear"]);
+  });
+
+  it("writes the session file when the query is closed", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input));
+    const session = mockSessionState({ query, input, queryClosed: true }, agent);
+    agent.sessions["test-session"] = session;
+
+    await session.titles.rename(session, "Closed");
+
+    expect(renameOnQuery).not.toHaveBeenCalled();
+    expect(renameSession).toHaveBeenCalledWith("test-session", "Closed", { dir: "/test" });
+    expect(titles()).toEqual(["Closed"]);
+  });
+
+  it("refuses a blank title and stores nothing", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    const input = new Pushable<any>();
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input));
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await expect(session.titles.rename(session, " \n ")).rejects.toThrow("The title is empty");
+
+    expect(renameOnQuery).not.toHaveBeenCalled();
+    expect(renameSession).not.toHaveBeenCalled();
+    expect(titles()).toEqual([]);
+  });
+
+  it("waits out a generation in flight, so the chosen title is the last one stored", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    let finishGeneration!: (title: string) => void;
+    const generateSessionTitle = vi.fn(
+      () => new Promise<string>((resolve) => (finishGeneration = resolve)),
+    );
+    const input = new Pushable<any>();
+    // Room for a second turn keeps the query open after the first.
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input, 2));
+    Object.assign(query, { generateSessionTitle });
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: LONG_PROMPT }],
+    });
+    await vi.waitFor(() => {
+      expect(generateSessionTitle).toHaveBeenCalledTimes(1);
+    });
+
+    const renamed = session.titles.rename(session, "Chosen by the model");
+    await Promise.resolve();
+    expect(renameOnQuery).not.toHaveBeenCalled();
+
+    finishGeneration("Generated meanwhile");
+    await renamed;
+
+    expect(renameOnQuery).toHaveBeenCalledWith("Chosen by the model", "test-session");
+    expect(titles()).toEqual(["Generated meanwhile", "Chosen by the model"]);
+  });
+
+  it("never generates over a renamed session at a later turn-end", async () => {
+    const { client, titles } = titleRecorder();
+    const agent = newAgent(client);
+    // The stored title has not shown up in `info` yet, so the latch alone holds
+    // generation back.
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "test-session",
+      summary: LONG_PROMPT,
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    const { query, renameOnQuery } = wrapRenameQuery(oneTurn(input));
+    const generateSessionTitle = vi.fn(async () => "Generated instead");
+    Object.assign(query, { generateSessionTitle });
+    const session = mockSessionState({ query, input }, agent);
+    agent.sessions["test-session"] = session;
+
+    await session.titles.rename(session, "Chosen by the model");
+    await agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: LONG_PROMPT }],
+    });
+    await session.consumer;
+
+    expect(renameOnQuery).toHaveBeenCalledTimes(1);
+    expect(generateSessionTitle).not.toHaveBeenCalled();
+    expect(titles()).toEqual(["Chosen by the model"]);
   });
 });
