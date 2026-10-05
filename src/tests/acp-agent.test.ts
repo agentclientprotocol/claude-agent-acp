@@ -44,6 +44,7 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
+  discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
@@ -3988,6 +3989,8 @@ describe("permission request cancellation", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -10294,6 +10297,8 @@ describe("session/close", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -10387,6 +10392,8 @@ describe("session/delete", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -10507,6 +10514,8 @@ describe("getOrCreateSession param change detection", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -14769,6 +14778,8 @@ describe("post-error recovery", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -20168,6 +20179,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -21886,59 +21899,264 @@ describe("messageIdForGrouping", () => {
   });
 });
 
-describe("buildConfigOptions model option resolved description", () => {
-  const modes = { currentModeId: "default", availableModes: [] };
-  const models = {
-    currentModelId: "default",
-    availableModels: [{ modelId: "default", name: "Default", description: "" }],
-  };
+describe("agent selection config option", () => {
+  const baseModes = { currentModeId: "default", availableModes: [] };
+  const baseModels = { currentModelId: "default", availableModels: [] };
 
-  it("sets description to the named model's displayName when resolvedModel matches", () => {
-    const modelInfos = [
-      {
-        value: "default",
-        displayName: "Default",
-        description: "",
-        resolvedModel: "claude-sonnet-5",
-      },
-      {
-        value: "sonnet",
-        displayName: "Claude Sonnet 5",
-        description: "Balanced",
-        resolvedModel: "claude-sonnet-5",
-      },
-    ];
-    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBe("Claude Sonnet 5");
+  describe("discoverCustomAgents", () => {
+    it("filters out Claude Code's built-in subagents", async () => {
+      const q = {
+        supportedAgents: async () => [
+          { name: "claude", description: "catch-all" },
+          { name: "Explore", description: "search" },
+          { name: "general-purpose", description: "gp" },
+          { name: "Plan", description: "architect" },
+          { name: "statusline-setup", description: "status" },
+          { name: "my-reviewer", description: "Reviews code" },
+          { name: "my-writer", description: "Writes docs" },
+        ],
+      } as any;
+      const agents = await discoverCustomAgents(q);
+      expect(agents.map((a) => a.name)).toEqual(["my-reviewer", "my-writer"]);
+    });
+
+    it("excludes a custom agent named 'default' (reserved sentinel)", async () => {
+      const q = {
+        supportedAgents: async () => [
+          { name: "default", description: "collides with the synthetic Default entry" },
+          { name: "my-reviewer", description: "Reviews code" },
+        ],
+      } as any;
+      const agents = await discoverCustomAgents(q);
+      expect(agents.map((a) => a.name)).toEqual(["my-reviewer"]);
+    });
+
+    it("returns an empty list when discovery throws", async () => {
+      const q = {
+        supportedAgents: async () => {
+          throw new Error("control request failed");
+        },
+      } as any;
+      expect(await discoverCustomAgents(q)).toEqual([]);
+    });
   });
 
-  it("falls back to resolvedModel itself when no named model shares it", () => {
-    const modelInfos = [
-      {
-        value: "default",
-        displayName: "Default",
-        description: "",
-        resolvedModel: "claude-opus-5-20251201",
-      },
-    ];
-    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBe("claude-opus-5-20251201");
+  describe("buildConfigOptions agent option", () => {
+    it("omits the agent option when no custom agents are configured", () => {
+      const options = buildConfigOptions(baseModes, baseModels, [], undefined, [], "default");
+      expect(options.find((o) => o.id === "agent")).toBeUndefined();
+    });
+
+    it("adds an agent option with a synthetic Default entry when custom agents exist", () => {
+      const agents = [
+        { name: "my-reviewer", description: "Reviews code" },
+        // empty description should normalize to undefined, not ""
+        { name: "my-writer", description: "" },
+      ];
+      const options = buildConfigOptions(
+        baseModes,
+        baseModels,
+        [],
+        undefined,
+        agents,
+        "my-reviewer",
+      );
+      const agentOption = options.find((o) => o.id === "agent");
+      expect(agentOption).toBeDefined();
+      expect(agentOption!.currentValue).toBe("my-reviewer");
+      expect(agentOption!.type).toBe("select");
+      const entries = (agentOption as any).options;
+      expect(entries.map((o: any) => o.value)).toEqual(["default", "my-reviewer", "my-writer"]);
+      expect(entries[2].description).toBeUndefined();
+    });
   });
 
-  it("leaves description undefined when default model has no resolvedModel", () => {
-    const modelsNoDesc = {
+  describe("buildConfigOptions model option resolved description", () => {
+    const modes = { currentModeId: "default", availableModes: [] };
+    const models = {
       currentModelId: "default",
-      availableModels: [{ modelId: "default", name: "Default" }],
+      availableModels: [{ modelId: "default", name: "Default", description: "" }],
     };
-    const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
-    const options = buildConfigOptions(modes, modelsNoDesc, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBeUndefined();
+
+    it("sets description to the named model's displayName when resolvedModel matches", () => {
+      const modelInfos = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "",
+          resolvedModel: "claude-sonnet-5",
+        },
+        {
+          value: "sonnet",
+          displayName: "Claude Sonnet 5",
+          description: "Balanced",
+          resolvedModel: "claude-sonnet-5",
+        },
+      ];
+      const options = buildConfigOptions(
+        modes,
+        models,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBe("Claude Sonnet 5");
+    });
+
+    it("falls back to resolvedModel itself when no named model shares it", () => {
+      const modelInfos = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "",
+          resolvedModel: "claude-opus-5-20251201",
+        },
+      ];
+      const options = buildConfigOptions(
+        modes,
+        models,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBe("claude-opus-5-20251201");
+    });
+
+    it("leaves description undefined when default model has no resolvedModel", () => {
+      const modelsNoDesc = {
+        currentModelId: "default",
+        availableModels: [{ modelId: "default", name: "Default" }],
+      };
+      const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
+      const options = buildConfigOptions(
+        modes,
+        modelsNoDesc,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBeUndefined();
+    });
+  });
+
+  describe("switching the agent", () => {
+    function createMockAgent() {
+      const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+      return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    }
+
+    const agents = [{ name: "my-reviewer", description: "Reviews code" }];
+
+    function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
+      function* empty() {}
+      const applyFlagSettings = vi.fn(async () => {});
+      const gen = Object.assign(empty(), {
+        interrupt: vi.fn(),
+        close: vi.fn(),
+        applyFlagSettings,
+      });
+      agent.sessions[sessionId] = {
+        query: gen as any,
+        input: new Pushable(),
+        cancelled: false,
+        titles: new SessionTitles(agent, sessionId),
+        cwd: "/test",
+        sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+        modes: { currentModeId: "default", availableModes: [] },
+        models: { currentModelId: "default", availableModels: [] },
+        modelInfos: [],
+        settingsManager: { dispose: vi.fn() } as any,
+        accumulatedUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+        },
+        configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
+        agents,
+        currentAgent: "default",
+        fastModeEnabled: false,
+        abortController: new AbortController(),
+        emitRawSDKMessages: false,
+        forwardSubagentText: false,
+        contextWindowSize: 200000,
+        contextWindowAuthoritative: false,
+        providerCacheKey: "default",
+        taskState: new Map(),
+        toolUseCache: {},
+        emittedToolCalls: new Set(),
+        liveBackgroundTasks: new Map(),
+        emittedAssistantText: false,
+        owedTrailingIdles: 0,
+        messageIdToUuid: new Map(),
+        sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
+      };
+      return { session: agent.sessions[sessionId]!, applyFlagSettings };
+    }
+
+    it("applies the agent flag live without restarting the subprocess", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s1");
+
+      const result = await agent.setSessionConfigOption({
+        sessionId: "s1",
+        configId: "agent",
+        value: "my-reviewer",
+      });
+
+      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: "my-reviewer" });
+      expect(session.currentAgent).toBe("my-reviewer");
+      // The whole point of the SDK >= 0.3.161 approach: no process teardown.
+      expect(session.query.interrupt).not.toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(false);
+      expect(agent.sessions["s1"]).toBe(session);
+      const agentOption = result.configOptions.find((o) => o.id === "agent");
+      expect(agentOption?.currentValue).toBe("my-reviewer");
+    });
+
+    it("clears the flag (agent: null) when switching back to default", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s2");
+      session.currentAgent = "my-reviewer";
+
+      await agent.setSessionConfigOption({
+        sessionId: "s2",
+        configId: "agent",
+        value: "default",
+      });
+
+      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: null });
+      expect(session.currentAgent).toBe("default");
+    });
+
+    it("leaves tracked state untouched when the live switch is rejected", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s3");
+      applyFlagSettings.mockRejectedValueOnce(new Error("control channel closed"));
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "s3",
+          configId: "agent",
+          value: "my-reviewer",
+        }),
+      ).rejects.toThrow("control channel closed");
+
+      // The flag never applied, so neither currentAgent nor the config option
+      // moves — no desync with the agent the SDK is actually running.
+      expect(session.currentAgent).toBe("default");
+      const agentOption = session.configOptions.find((o) => o.id === "agent");
+      expect(agentOption?.currentValue).toBe("default");
+    });
   });
 });
 
