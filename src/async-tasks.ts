@@ -919,17 +919,30 @@ const ABSOLUTE_PATH = /^(?:\/|[A-Za-z]:[\\/]|\\\\)/;
  * The task output paths in a tool result text. Each text of Claude Code puts
  * the path after "Output is being written to: ", so a path starts after the
  * nearest `": "` before its end. A drive colon has no space after it, so a
- * path can hold spaces and a drive. A path that is not absolute, or that
- * crosses a line, does not count.
+ * path can hold spaces and a drive. The search for the start stops at a line
+ * break and at the end of the previous path end, so a path never crosses a
+ * line or holds another path. Each character is read at most once, so the
+ * parse is linear in the text length. A path that is not absolute does not
+ * count.
  */
 function taskOutputPaths(text: string): string[] {
   const paths: string[] = [];
+  let previousEnd = 0;
   for (const match of text.matchAll(TASK_OUTPUT_SUFFIX)) {
     const end = match.index + match[0].length;
-    const boundary = text.lastIndexOf(": ", match.index);
-    if (boundary < 0) continue;
-    const path = text.slice(boundary + 2, end);
-    if (ABSOLUTE_PATH.test(path) && !/[\r\n]/.test(path)) paths.push(path);
+    let start = -1;
+    for (let i = match.index - 1; i >= previousEnd; i--) {
+      const char = text[i];
+      if (char === "\n" || char === "\r") break;
+      if (char === ":" && text[i + 1] === " ") {
+        start = i + 2;
+        break;
+      }
+    }
+    previousEnd = end;
+    if (start < 0) continue;
+    const path = text.slice(start, end);
+    if (ABSOLUTE_PATH.test(path)) paths.push(path);
   }
   return paths;
 }

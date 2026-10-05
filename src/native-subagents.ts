@@ -326,8 +326,8 @@ export class NativeSubagentRuntime {
    * task. The route sends each update to the child generation that owned the
    * tool call when the work started. An async task can outlive that child: a
    * subagent can start a background command and end its turn. So the route
-   * still sends `async_task_progress` and `async_task_state_update` to the
-   * child generation after it finished. The route drops every other update
+   * still sends `async_task_spawned`, `async_task_progress` and
+   * `async_task_state_update` to the child generation after it finished. The route drops every other update
    * after the child finished. `undefined` means that the root session owns the
    * tool call. `eagerSessionId` is the session where a permission request
    * created the tool call before the stream routed it.
@@ -590,10 +590,18 @@ export function isNativeSubagentControlTool(toolName: unknown): boolean {
   return toolName === "Agent" || toolName === "Task";
 }
 
-/** An async task update that may reach a child generation after it finished. */
+/**
+ * An async task update that may reach a child generation after it finished.
+ * The spawn is one of them: a held task can get its tool call id, and so its
+ * spawn, after the child finished.
+ */
 function isLateAsyncTaskUpdate(notification: AcpSessionNotification): boolean {
   const kind = notification.update.sessionUpdate;
-  return kind === "async_task_progress" || kind === "async_task_state_update";
+  return (
+    kind === "async_task_spawned" ||
+    kind === "async_task_progress" ||
+    kind === "async_task_state_update"
+  );
 }
 
 function isFailedToolCallUpdate(update: AcpSessionNotification["update"]): boolean {

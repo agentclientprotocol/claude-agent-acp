@@ -436,6 +436,44 @@ describe("AsyncTaskRuntime", () => {
       expect(published[0]?.update).not.toHaveProperty("outputFilePath");
     });
 
+    it("does not glue two paths on one line", async () => {
+      const line = (b1: string) => [
+        {
+          type: "tool_result",
+          tool_use_id: "bash",
+          content: `files: /a/tasks/b0.output ${b1}`,
+        },
+      ];
+      const b1 = { ...started, task_id: "b1", is_backgrounded: true };
+
+      const glued = runtime();
+      await glued.runtime.toolResults(line("/b/tasks/b1.output"));
+      await glued.runtime.taskStarted(b1);
+      expect(glued.published[0]?.update).not.toHaveProperty("outputFilePath");
+
+      const separated = runtime();
+      await separated.runtime.toolResults(line("and output: /b/tasks/b1.output."));
+      await separated.runtime.taskStarted(b1);
+      expect(separated.published[0]?.update).toMatchObject({
+        outputFilePath: "/b/tasks/b1.output",
+      });
+    });
+
+    it("reads a long text without a boundary in linear time", async () => {
+      const { runtime: tasks, published } = runtime();
+      const text = "/private/tmp/claude/project/session/tasks/bX.output\n".repeat(42_000);
+      expect(text.length).toBeGreaterThan(2_000_000);
+
+      const startedAt = performance.now();
+      await tasks.toolResults(result(text));
+      await tasks.toolResults(result(text.replaceAll("\n", " ")));
+      const elapsed = performance.now() - startedAt;
+      await tasks.taskStarted({ ...started, task_id: "bX", is_backgrounded: true });
+
+      expect(elapsed).toBeLessThan(2_000);
+      expect(published[0]?.update).not.toHaveProperty("outputFilePath");
+    });
+
     it("lets a structured output path win over the tool result", async () => {
       const { runtime: tasks, published } = runtime();
       await tasks.toolResults(result(backgroundTexts("bq7x", "/tmp/tasks/bq7x.output")[1]));

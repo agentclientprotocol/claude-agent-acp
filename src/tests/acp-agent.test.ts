@@ -6967,12 +6967,20 @@ describe("subagent permission attribution (issue #851)", () => {
             name: "Bash",
             input: { command: "npm start", run_in_background: true },
           },
+          {
+            type: "tool_use",
+            id: "child-held",
+            name: "Bash",
+            input: { command: "npm run watch", run_in_background: true },
+          },
         ]);
         yield backgroundTask("shell-child", "child-bash", "npm test");
         yield backgroundTask("watch-child", "child-watch", "tail -f build.log");
         // The SDK reports a Monitor task as a background shell.
         yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
         yield backgroundTask("shell-late", "child-server", "npm start");
+        // This task names no tool call yet, so its spawn waits.
+        yield { ...backgroundTask("shell-held", "", "npm run watch"), tool_use_id: undefined };
         yield assistant(null, [
           {
             type: "tool_use",
@@ -6989,6 +6997,8 @@ describe("subagent permission attribution (issue #851)", () => {
         yield taskNotification("agent-1", "toolu_agent");
         // The task of the subagent ends after the subagent finished.
         yield taskNotification("shell-late", "child-server");
+        // The held task gets its tool call id, and so its spawn, after the subagent finished.
+        yield taskNotification("shell-held", "child-held");
         yield successResult();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
@@ -7028,6 +7038,8 @@ describe("subagent permission attribution (issue #851)", () => {
       ["test-session", "async_task_state_update", "shell-root", "completed"],
       ["agent-1", "async_task_state_update", "watch-child", "stopped"],
       ["agent-1", "async_task_state_update", "shell-late", "completed"],
+      ["agent-1", "async_task_spawned", "shell-held", undefined],
+      ["agent-1", "async_task_state_update", "shell-held", "completed"],
     ]);
     // The stop acknowledgement goes to the transcript that holds the task.
     const stopAcknowledgement = updates.find(

@@ -690,6 +690,20 @@ describe("NativeSubagentRuntime lifecycle", () => {
         },
       } as AcpSessionNotification;
       expect(route?.(taskState)).toMatchObject({ sessionId: "worker-1" });
+      // A held task can get its tool call id, and so its spawn, after the child finished.
+      const taskSpawned = {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "shell-2",
+          name: "npm start",
+          taskType: "shell",
+          description: "npm start",
+          showInTranscript: true,
+          canStop: true,
+        },
+      } as AcpSessionNotification;
+      expect(route?.(taskSpawned)).toMatchObject({ sessionId: "worker-1" });
       // Every other late update of the finished generation is dropped.
       const lateOutput = {
         sessionId: "root",

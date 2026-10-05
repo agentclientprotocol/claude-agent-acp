@@ -870,7 +870,7 @@ The SDK reports such a task as `local_bash`, so the adapter finds it by the tool
 The `Monitor` tool call stays in the transcript.
 The adapter also ignores a `local_monitor` task.
 A task that a subagent tool call started goes to the subagent session.
-Its progress and state updates go there also after the subagent finished.
+Its spawn, progress and state updates go there also after the subagent finished.
 
 ### Updates
 
@@ -891,7 +891,8 @@ The text of a tool result never creates a task, because a foreground command can
 The output path comes from `output_file` of the SDK events when they have it.
 Otherwise the adapter reads the text of the tool result of the task's own tool call.
 It takes only an absolute path that ends with `tasks/<task id>.output`, followed by a period, whitespace or the end of the text.
-The path starts after the nearest `": "` before that end, so it can hold spaces.
+The path starts after the nearest `": "` before that end on the same line, so it can hold spaces.
+A path never holds the end of another path.
 A POSIX, a Windows drive, and a UNC path count. A path across a line does not.
 The tool result can come before or after the SDK names the task.
 A subagent tool result has no `tool_use_result`, so this text is the only path source there.
