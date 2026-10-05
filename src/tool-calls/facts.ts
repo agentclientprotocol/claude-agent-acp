@@ -50,6 +50,8 @@ export interface CommandOutput {
    * command, or a non-zero code that Claude Code accepted as a success.
    */
   exitCode?: number;
+  /** The command was interrupted before it ended. */
+  interrupted?: boolean;
 }
 
 /**

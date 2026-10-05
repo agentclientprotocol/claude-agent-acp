@@ -82,7 +82,10 @@ export type ToolUpdateMeta = {
   };
   terminal_exit?: {
     terminal_id: string;
-    /** Null when the agent does not know the code, as in `TerminalExitStatus`. */
+    /**
+     * Null when the agent does not know the code, as in `TerminalExitStatus`.
+     * AIR always gets a number.
+     */
     exit_code: number | null;
     signal: string | null;
   };
@@ -328,7 +331,13 @@ export class AcpToolCallRenderer {
             : { terminal_output: output }),
           terminal_exit: {
             terminal_id: terminalId,
-            exit_code: command.exitCode ?? null,
+            // AIR keeps the numbers it always got: 1 for a failed or
+            // interrupted command, else the exit code, or 0 when unknown.
+            exit_code: this.capabilities.air.client
+              ? result.is_error === true || command.interrupted
+                ? 1
+                : (command.exitCode ?? 0)
+              : (command.exitCode ?? null),
             signal: null,
           },
         },

@@ -40,6 +40,7 @@ export class BashReporter implements ToolReporter {
     // `returnCodeInterpretation` (grep's "No matches found"), so a success
     // without one exited with 0.
     let exitCode: number | undefined = isError ? undefined : 0;
+    let interrupted = false;
 
     const structuredBash = structuredResult<BashOutput>(structured);
     if (
@@ -55,6 +56,7 @@ export class BashReporter implements ToolReporter {
       if (structuredBash.interrupted) {
         output = [output, "[Command was aborted before completion]"].filter(Boolean).join("\n");
         exitCode = undefined;
+        interrupted = true;
       }
       if (structuredBash.returnCodeInterpretation !== undefined) exitCode = undefined;
       // Structured stdout is clipped when the full output was persisted to
@@ -96,7 +98,13 @@ export class BashReporter implements ToolReporter {
     if (isError && exitCode === undefined) exitCode = failureExitCode(output);
     // A backgrounded command is still running: the result only announces it.
     if (structuredBash?.backgroundTaskId !== undefined) exitCode = undefined;
-    return { command: { output, ...(exitCode !== undefined ? { exitCode } : {}) } };
+    return {
+      command: {
+        output,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(interrupted ? { interrupted } : {}),
+      },
+    };
   }
 }
 

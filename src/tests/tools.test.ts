@@ -4054,26 +4054,6 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       });
 
       expect(update._meta?.terminal_output?.data).toBe(`pushed ok${HINT}`);
-      // The command is still running, so its exit code is not known.
-      expect(update._meta?.terminal_exit).toEqual({
-        terminal_id: "toolu_bash",
-        exit_code: null,
-        signal: null,
-      });
-    });
-
-    it("leaves out a non-zero exit code that Claude Code accepted as a success", () => {
-      const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
-        ...structured,
-        stdout: "",
-        returnCodeInterpretation: "No matches found",
-      });
-
-      expect(update._meta?.terminal_exit).toEqual({
-        terminal_id: "toolu_bash",
-        exit_code: null,
-        signal: null,
-      });
     });
 
     it("falls back to the raw content array for image output", () => {
@@ -4126,6 +4106,67 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       expect(update._meta?.terminal_output).toEqual({
         terminal_id: "toolu_bash",
         data: "clipped stdout\n[Output truncated (38100 bytes total): full output saved to /tmp/tool-results/abc.txt]",
+      });
+    });
+
+    describe("exit codes", () => {
+      const text = (content: string, is_error = false): ToolResultBlockParam => ({
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content,
+        is_error,
+      });
+      const exitCode = (
+        clientCapabilities: ClientCapabilities,
+        result: ToolResultBlockParam,
+        toolUseResult?: unknown,
+      ) =>
+        new AcpToolCallRenderer(ToolCallCapabilities.from(clientCapabilities)).resultFields(
+          bashToolUse,
+          result as Parameters<AcpToolCallRenderer["resultFields"]>[1],
+          toolUseResult,
+        )._meta?.terminal_exit?.exit_code;
+      const zed: ClientCapabilities = { _meta: { terminal_output: true } };
+      const air: ClientCapabilities = {
+        _meta: { ...AIR_CLIENT._meta, terminal_output_delta: true },
+      };
+
+      // The command, its result, the code that Zed gets (null when the result
+      // does not say it), and the number that AIR always got.
+      it.each<[string, ToolResultBlockParam, unknown, number | null, number]>([
+        ["a success", text("pushed ok"), structured, 0, 0],
+        ["a failure that names its code", text("Exit code 2\nboom", true), undefined, 2, 1],
+        [
+          "a failure that names no code",
+          text("Permission to use Bash has been denied.", true),
+          undefined,
+          null,
+          1,
+        ],
+        [
+          "an interrupted command",
+          text("partial"),
+          { ...structured, stdout: "partial", interrupted: true },
+          null,
+          1,
+        ],
+        [
+          "a backgrounded command",
+          text("Command running in background with ID: bash_1."),
+          { ...structured, stdout: "", backgroundTaskId: "bash_1" },
+          null,
+          0,
+        ],
+        [
+          "a non-zero code that Claude Code accepted as a success",
+          text("No matches found"),
+          { ...structured, stdout: "", returnCodeInterpretation: "No matches found" },
+          null,
+          0,
+        ],
+      ])("%s", (_name, result, toolUseResult, zedCode, airCode) => {
+        expect(exitCode(zed, result, toolUseResult)).toBe(zedCode);
+        expect(exitCode(air, result, toolUseResult)).toBe(airCode);
       });
     });
   });
