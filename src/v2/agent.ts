@@ -21,6 +21,7 @@ import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Prompt } from "./prompt.js";
 import {
+  v1ForkSessionRequests,
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
@@ -76,6 +77,14 @@ export function v2AgentApp(
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
       );
+    })
+    .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
+      const requests = v1ForkSessionRequests(params);
+      const { sessionId } = await agent.unstable_forkSession(requests.fork);
+      return {
+        sessionId,
+        ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
+      };
     })
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);

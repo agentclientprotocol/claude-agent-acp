@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import {
+  forkSession,
   getSessionMessages,
   type Options,
   type SDKUserMessage,
@@ -97,6 +98,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       },
     ]),
     getSessionMessages: vi.fn(async () => []),
+    forkSession: vi.fn(async () => ({ sessionId: "99999999-8888-4777-8666-555555555555" })),
     deleteSession: vi.fn(async () => {}),
   };
 });
@@ -277,11 +279,12 @@ describe("ACP protocol routing", () => {
       version: packageJson.version,
     });
     // The session baseline and the session extensions that the v2 surface serves,
-    // without `fork`, and the providers methods.
+    // and the providers methods.
     expect(response.capabilities?.session).toEqual({
       prompt: { image: {}, embeddedContext: {} },
       mcp: { stdio: {}, http: {} },
       delete: {},
+      fork: {},
       additionalDirectories: {},
     });
     expect(response.capabilities?.providers).toEqual({});
@@ -749,6 +752,46 @@ describe("ACP v2 prompts", () => {
       "running",
       "idle end_turn",
     ]);
+  });
+
+  it("forks a session into one that the client can prompt at once", async () => {
+    const forkId = "99999999-8888-4777-8666-555555555555";
+    const echoed = scriptTurns(async function* (options) {
+      yield assistantText(options, "Forked.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const fork = await agent.request(v2.methods.agent.session.fork, {
+        sessionId,
+        cwd,
+        mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
+      });
+
+      expect(fork.sessionId).toBe(forkId);
+      expect(fork.configOptions?.map((option) => option.configId)).toContain("mode");
+      expect(forkSession).toHaveBeenCalledWith(sessionId, { dir: cwd });
+      // The fork runs as its own Claude Code session, resumed from the copied
+      // transcript, with the MCP servers of the fork request.
+      const forkQuery = sdk.queryOptions.at(-1)!;
+      expect(forkQuery.resume).toBe(forkId);
+      expect(Object.keys(forkQuery.mcpServers ?? {})).toContain("linear");
+
+      // No session/resume needed before the first prompt.
+      const { messageId } = await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: forkId,
+        prompt: text("go on"),
+      });
+      expect(messageId).toBe(echoed[0]);
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter((update) => update.sessionId === forkId)),
+        ).toContain("idle end_turn"),
+      );
+      await client.authUpdate(1);
+    });
   });
 
   it("replays a Write without the v1 diff that v2 cannot take", async () => {

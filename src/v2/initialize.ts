@@ -88,7 +88,8 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
  *
  * - The session baseline: `session/new`, `list`, `resume` (with replay),
  *   `close`, `prompt`, `cancel`, and `update`.
- * - `session/delete` and `additionalDirectories`. Not `session/fork` yet.
+ * - `session/delete`, `session/fork` (which returns a session the client can
+ *   prompt, see `v1ForkSessionRequests`), and `additionalDirectories`.
  * - The prompt content and MCP transports that the agent's v1 `initialize`
  *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
  *   v1 baseline; v2 has no SSE transport.
@@ -97,6 +98,7 @@ const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
   mcp: { stdio: {}, http: {} },
   delete: {},
+  fork: {},
   additionalDirectories: {},
 };
 
