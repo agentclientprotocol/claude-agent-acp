@@ -5750,8 +5750,21 @@ export class ClaudeAcpAgent {
             // the user's prompt's. Autonomous results must never touch the
             // user-turn lifecycle (stop reason, settles, failActive,
             // slash-command output forwarding), though their cost is real.
+            // Except a cycle that folded in a prompt sent mid-cycle: the CLI
+            // keeps the cycle's origin but names the folded send in
+            // user_message_uuids, and emits no other result for it — so a
+            // result naming an unsettled, not-held turn is that turn's own.
+            // Leaving it autonomous would hang the prompt (the hazard above).
             const isAutonomousResult =
-              message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+              message.origin != null &&
+              AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind) &&
+              !(
+                message.user_message_uuids ??
+                (message.user_message_uuid !== undefined ? [message.user_message_uuid] : [])
+              ).some((uuid) => {
+                const turn = findUnsettledTurn(uuid);
+                return turn !== undefined && !isHeldOpen(turn);
+              });
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
