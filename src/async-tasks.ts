@@ -100,8 +100,17 @@ type BackgroundTaskLevel = TaskIdentity & {
   description?: unknown;
 };
 
+/**
+ * The client capability `_meta` key a client that does not use AIR sets to `true` to receive
+ * async task updates, like the `terminal-auth` and `subagent-transcript` keys.
+ */
+export const ASYNC_TASKS_META_KEY = "async-tasks";
+
 export function clientSupportsAsyncTasks(capabilities?: ClientCapabilities | null): boolean {
-  return clientSupportsAirCapability(capabilities, AIR_ASYNC_TASKS_CAPABILITY);
+  return (
+    clientSupportsAirCapability(capabilities, AIR_ASYNC_TASKS_CAPABILITY) ||
+    capabilities?._meta?.[ASYNC_TASKS_META_KEY] === true
+  );
 }
 
 /** Publishes Claude's non-agent background work as a separate AIR task lifecycle. */

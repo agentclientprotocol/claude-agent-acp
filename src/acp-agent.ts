@@ -6905,7 +6905,9 @@ export class ClaudeAcpAgent {
                 backgroundedBashToolCall(
                   acceptedPlanToolResult(notification, acceptedPlanToolUseId),
                   backgroundBashTask,
-                  asyncTasks.enabled,
+                  // The marker is an AIR key; a client without AIR links the task to
+                  // its card through the spawn's `toolCallId` instead.
+                  asyncTasks.enabled && this.toolCallCapabilities.air.client,
                 ),
               );
             }
