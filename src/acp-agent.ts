@@ -8677,15 +8677,21 @@ export class ClaudeAcpAgent {
   }
 
   /**
-   * Replace a heuristic context window with `getContextUsage().rawMaxTokens`
+   * Refine a heuristic context window with `getContextUsage().rawMaxTokens`,
    * without blocking the caller. The text heuristic misses natively-1M models
-   * whose picker rows carry no "1m" token (`sonnet`, and since CLI 2.1.283
-   * `opus`/`default`), which would otherwise report 200k until the first
-   * result's modelUsage. Never awaited: SDK control requests are serialized,
-   * so an awaited call would delay session/new or a model switch (before the
-   * first turn it took ~15s on older CLIs, issues #886/#880; ~0.5s on 2.1.283).
-   * Not written to `contextWindowCache` — that stays keyed to the
-   * `result.modelUsage` spellings — and a result still overwrites it.
+   * whose picker rows carry no "1m" token (e.g. `sonnet`, and since CLI
+   * 2.1.283 `opus`/`default`), so those would otherwise show 200k until the
+   * first result's modelUsage arrives.
+   *
+   * Never awaited: SDK control requests are serialized, so awaiting here
+   * would delay session/new or a model switch (~15s on older CLIs, issues
+   * #886/#880; ~0.5s on 2.1.283). Requests the `summary` detail instead of
+   * the default `full` breakdown, which issues one `messages/count_tokens`
+   * call per category (~18 for a bare session) and hit rate limits on every
+   * model switch; `summary` answers locally with the same `rawMaxTokens`.
+   *
+   * Does not write `contextWindowCache` (that stays keyed to the
+   * `result.modelUsage` spellings) — a later result still overwrites this.
    */
   private refreshContextWindowInBackground(sessionId: string, session: Session): void {
     if (session.contextWindowAuthoritative) return;
@@ -8697,7 +8703,7 @@ export class ClaudeAcpAgent {
       session.models.currentModelId === modelId;
     // A synchronous throw must not fail the caller either.
     Promise.resolve()
-      .then(() => query.getContextUsage())
+      .then(() => query.getContextUsage({ detail: "summary" }))
       .then(
         (usage) => {
           if (!stillCurrent() || session.contextWindowAuthoritative) return;
