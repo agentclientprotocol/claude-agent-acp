@@ -74,7 +74,7 @@
     "@anthropic-ai/sdk": "0.131.0",
     "@eslint/js": "10.0.1",
     "@tsconfig/node22": "22.0.6",
-    "@types/node": "26.6.3",
+    "@types/node": "26.6.4",
     "@typescript-eslint/eslint-plugin": "8.71.0",
     "@typescript-eslint/parser": "8.71.0",
     "ajv": "8.20.0",
