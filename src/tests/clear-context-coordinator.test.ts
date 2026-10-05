@@ -28,6 +28,7 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
     },
     models: { currentModelId: "default" },
     configOptions: [],
+    currentAgent: "default",
     fastModeEnabled: false,
     input: { push: vi.fn() },
     ...overrides,
@@ -76,6 +77,7 @@ describe("continuePlanInFreshContext", () => {
       turnQueue: [turn],
       pendingExitPlanContextReset: reset,
       models: { currentModelId: "claude-sonnet" },
+      currentAgent: "reviewer",
       fastModeEnabled: true,
       effortPinnedLevel: "high",
       configOptions: [
@@ -107,6 +109,7 @@ describe("continuePlanInFreshContext", () => {
             options: expect.objectContaining({
               env: { PRESERVED: "yes" },
               model: "claude-sonnet",
+              agent: "reviewer",
               effort: "high",
             }),
           },
@@ -186,6 +189,7 @@ describe("continuePlanInFreshContext", () => {
     const oldSession = testSession({
       activeTurn: turn,
       models: { currentModelId: "default" },
+      currentAgent: "default",
       configOptions: [
         {
           id: "effort",

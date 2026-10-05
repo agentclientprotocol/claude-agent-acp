@@ -252,21 +252,6 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
   });
 
-  it("ignores the provider-specific main-thread agent option", async () => {
-    const response = await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-      _meta: {
-        claudeCode: {
-          options: { agent: "reviewer" },
-        },
-      },
-    });
-
-    expect(capturedOptions).not.toHaveProperty("agent");
-    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
-  });
-
   it("works when user provides empty disallowedTools", async () => {
     await agent.newSession({
       cwd: process.cwd(),
