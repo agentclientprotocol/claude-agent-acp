@@ -892,29 +892,29 @@ describe("AsyncTaskRuntime", () => {
     });
 
     await runtime.taskStarted({
-      task_id: "monitor",
-      task_type: "local_monitor",
+      task_id: "workflow",
+      task_type: "local_workflow",
       description: "Watch the logs",
     });
-    await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
-    await runtime.taskUpdated("monitor", { status: "paused" });
+    await runtime.taskProgress({ task_id: "workflow", summary: "First line" });
+    await runtime.taskUpdated("workflow", { status: "paused" });
     expect(published).toEqual([]);
 
     await runtime.taskProgress({
-      task_id: "monitor",
+      task_id: "workflow",
       summary: "Second line",
-      tool_use_id: "monitor-tool",
+      tool_use_id: "workflow-tool",
     });
 
     expect(published.map(({ update }) => update)).toEqual([
       expect.objectContaining({
         sessionUpdate: "async_task_spawned",
-        asyncTaskId: "monitor",
-        toolCallId: "monitor-tool",
+        asyncTaskId: "workflow",
+        toolCallId: "workflow-tool",
       }),
-      { sessionUpdate: "async_task_progress", asyncTaskId: "monitor", summary: "First line" },
-      { sessionUpdate: "async_task_state_update", asyncTaskId: "monitor", state: "paused" },
-      { sessionUpdate: "async_task_progress", asyncTaskId: "monitor", summary: "Second line" },
+      { sessionUpdate: "async_task_progress", asyncTaskId: "workflow", summary: "First line" },
+      { sessionUpdate: "async_task_state_update", asyncTaskId: "workflow", state: "paused" },
+      { sessionUpdate: "async_task_progress", asyncTaskId: "workflow", summary: "Second line" },
     ]);
   });
 
@@ -989,5 +989,113 @@ describe("AsyncTaskRuntime", () => {
       "async_task_state_update",
     ]);
     expect(published[1]?.update).toMatchObject({ state: "stopped" });
+  });
+
+  describe("Monitor tasks", () => {
+    const toolNames: Record<string, string> = {
+      "monitor-tool": "Monitor",
+      "bash-tool": "Bash",
+    };
+    const monitorRuntime = () => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new AsyncTaskRuntime(
+        true,
+        "session",
+        async (notification) => {
+          published.push(notification);
+        },
+        { toolNameOf: (toolCallId) => toolNames[toolCallId] },
+      );
+      return { runtime, published };
+    };
+
+    it("never announces a task that a Monitor tool call started", async () => {
+      const { runtime, published } = monitorRuntime();
+
+      // The SDK reports a Monitor task as a background shell.
+      await runtime.taskStarted({
+        task_id: "monitor",
+        task_type: "local_bash",
+        description: "Watch the logs",
+        is_backgrounded: true,
+        tool_use_id: "monitor-tool",
+      });
+      await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
+      await runtime.taskUpdated("monitor", { status: "paused" });
+      await runtime.backgroundTasksChanged([{ task_id: "monitor", task_type: "local_bash" }]);
+      expect(runtime.canStop("monitor")).toBe(false);
+      expect(runtime.claimStop("monitor")).toBe(false);
+      await runtime.taskStopped("monitor");
+      await runtime.taskNotification({
+        task_id: "monitor",
+        status: "completed",
+        tool_use_id: "monitor-tool",
+      });
+      await runtime.finishAll("stopped");
+
+      expect(published).toEqual([]);
+    });
+
+    it("never announces a held task whose tool call id names a Monitor", async () => {
+      const { runtime, published } = monitorRuntime();
+
+      await runtime.taskStarted({
+        task_id: "monitor",
+        task_type: "local_workflow",
+        description: "Watch the logs",
+      });
+      await runtime.taskProgress({ task_id: "monitor", summary: "First line" });
+      await runtime.taskProgress({
+        task_id: "monitor",
+        summary: "Second line",
+        tool_use_id: "monitor-tool",
+      });
+      await runtime.releaseHeld();
+      await runtime.taskNotification({ task_id: "monitor", status: "stopped" });
+
+      expect(published).toEqual([]);
+    });
+
+    it("never announces a held task that a Monitor ends", async () => {
+      const { runtime, published } = monitorRuntime();
+
+      await runtime.taskStarted({ task_id: "monitor", task_type: "local_workflow" });
+      await runtime.taskNotification({
+        task_id: "monitor",
+        status: "completed",
+        tool_use_id: "monitor-tool",
+      });
+
+      expect(published).toEqual([]);
+    });
+
+    it("ignores a local_monitor task without a tool call", async () => {
+      const { runtime, published } = monitorRuntime();
+
+      await runtime.backgroundTasksChanged([{ task_id: "level", task_type: "local_monitor" }]);
+      await runtime.taskStarted({ task_id: "level", task_type: "local_monitor" });
+      await runtime.taskStarted({ task_id: "started", task_type: "local_monitor" });
+      await runtime.taskProgress({ task_id: "started", summary: "line" });
+      await runtime.releaseHeld();
+      await runtime.taskNotification({ task_id: "started", status: "completed" });
+
+      expect(published).toEqual([]);
+      expect(runtime.canStop("started")).toBe(false);
+    });
+
+    it("still announces a task of another tool", async () => {
+      const { runtime, published } = monitorRuntime();
+
+      await runtime.taskStarted({
+        task_id: "shell",
+        task_type: "local_bash",
+        description: "npm test",
+        is_backgrounded: true,
+        tool_use_id: "bash-tool",
+      });
+
+      expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["async_task_spawned"]);
+      expect(runtime.canStop("shell")).toBe(true);
+    });
   });
 });

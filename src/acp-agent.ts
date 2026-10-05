@@ -1037,6 +1037,11 @@ export type Session = {
    *  tool_use block streams; this set makes the two paths converge regardless of
    *  order. Pruned at `tool_result` time alongside `toolUseCache`. */
   emittedToolCalls: Set<string>;
+  /** The tool names of the tool uses whose result arrived, after
+   *  {@link toolUseCache} dropped them. An async task can name its tool call
+   *  after the result, and the async task runtime needs the tool name. The
+   *  oldest entries are dropped. */
+  resolvedToolNames?: Map<string, string>;
   /** The fields that the client holds for each open tool call, so that a
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
@@ -3924,6 +3929,8 @@ export class ClaudeAcpAgent {
             toolCallId,
             session.eagerToolCallSessions?.get(toolCallId),
           ),
+        toolNameOf: (toolCallId) =>
+          session.toolUseCache[toolCallId]?.name ?? session.resolvedToolNames?.get(toolCallId),
       },
     ));
 
@@ -6837,6 +6844,7 @@ export class ClaudeAcpAgent {
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundBashTask: AsyncTaskStarted | undefined;
             if (message.type === "user") {
+              rememberResolvedToolNames(session, content);
               backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
                 message.tool_use_result,
@@ -6970,6 +6978,7 @@ export class ClaudeAcpAgent {
             await finishLifecycle("failed", "failed", "during conversation reset");
             subagents.clear();
             asyncTasks.clear();
+            session.resolvedToolNames?.clear();
             session.eagerToolCallSessions?.clear();
             session.toolCallFields?.clear();
             clearHookCallbacks(params.sessionId);
@@ -7856,6 +7865,7 @@ export class ClaudeAcpAgent {
             ? (notification) => ({ ...notification, sessionId: target })
             : undefined;
         },
+        toolNameOf: (toolCallId) => replayToolUses.get(toolCallId)?.name,
       },
     );
     // The replay counterpart of the live `task_notification` frame.
@@ -10747,6 +10757,28 @@ function toolCallRenderer(options?: {
   return options?.toolCallCapabilities
     ? new AcpToolCallRenderer(options.toolCallCapabilities, options.replay)
     : AcpToolCallRenderer.for(options?.clientCapabilities, options?.replay);
+}
+
+const MAX_RESOLVED_TOOL_NAMES = 1000;
+
+/** Keeps the tool names of the tool results in `content` before the tool use cache drops them. */
+function rememberResolvedToolNames(
+  session: Pick<Session, "toolUseCache" | "resolvedToolNames">,
+  content: unknown,
+): void {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
+    const name = session.toolUseCache[block.tool_use_id]?.name;
+    if (!name) continue;
+    const names = (session.resolvedToolNames ??= new Map());
+    names.delete(block.tool_use_id);
+    names.set(block.tool_use_id, name);
+    if (names.size > MAX_RESOLVED_TOOL_NAMES) {
+      const oldest = names.keys().next().value;
+      if (oldest !== undefined) names.delete(oldest);
+    }
+  }
 }
 
 export function toAcpNotifications(

@@ -860,10 +860,15 @@ The live test only initializes the SDK. It sends no model prompt.
 
 ## Async tasks
 
-Claude can run work in the background, for example a backgrounded Bash command, a workflow, or a monitor.
+Claude can run work in the background, for example a backgrounded Bash command or a workflow.
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
+A task that a `Monitor` tool call started is not an async task either.
+Monitor streams its output to the model only, so the client gets nothing for it.
+The SDK reports such a task as `local_bash`, so the adapter finds it by the tool of its tool call.
+The `Monitor` tool call stays in the transcript.
+The adapter also ignores a `local_monitor` task.
 A task that a subagent tool call started goes to the subagent session.
 Its progress and state updates go there also after the subagent finished.
 

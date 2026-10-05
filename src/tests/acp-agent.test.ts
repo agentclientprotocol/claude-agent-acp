@@ -2747,6 +2747,37 @@ describe("task notification replay", () => {
     expect(asyncTaskUpdates(updates)).toEqual([]);
   });
 
+  it("sends nothing for a task that a Monitor tool call started", async () => {
+    const monitorLaunch = record({
+      ...bashLaunch[1],
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Monitor",
+            input: { command: "tail -f build.log", description: "Watch the build log" },
+          },
+        ],
+      },
+    });
+    const updates = await replay([
+      bashLaunch[0],
+      monitorLaunch,
+      bashLaunch[2],
+      notification("completed"),
+    ]);
+
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+    // The Monitor tool call itself stays in the transcript.
+    expect(
+      updates.some(
+        ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === "toolu_bash",
+      ),
+    ).toBe(true);
+  });
+
   it("sends one terminal state for a repeated notification", async () => {
     const updates = await replay([
       ...bashLaunch,
@@ -6371,6 +6402,125 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
+  it("hides the async task of a Monitor tool call and keeps the tool call", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    const system = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...fields,
+    });
+    const monitorResult = (toolUseId: string, taskId: string) => ({
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: `Monitor started (task ${taskId})`,
+          },
+        ],
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "monitor-a",
+                name: "Monitor",
+                input: { command: "tail -f a.log", description: "Watch a.log" },
+              },
+              {
+                type: "tool_use",
+                id: "monitor-b",
+                name: "Monitor",
+                input: { command: "tail -f b.log", description: "Watch b.log" },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        // The result comes first, so the tool use cache no longer has the tool.
+        monitorResult("monitor-a", "mon-a"),
+        // The SDK reports a Monitor task as a background shell.
+        system({
+          subtype: "task_started",
+          task_id: "mon-a",
+          task_type: "local_bash",
+          description: "Watch a.log",
+          is_backgrounded: true,
+          tool_use_id: "monitor-a",
+        }),
+        // This task gets its tool call id only from a later progress.
+        system({
+          subtype: "task_started",
+          task_id: "mon-b",
+          task_type: "local_bash",
+          description: "Watch b.log",
+          is_backgrounded: true,
+        }),
+        system({ subtype: "task_progress", task_id: "mon-b", summary: "line" }),
+        system({
+          subtype: "task_progress",
+          task_id: "mon-b",
+          tool_use_id: "monitor-b",
+          summary: "line",
+        }),
+        monitorResult("monitor-b", "mon-b"),
+        system({
+          subtype: "task_notification",
+          task_id: "mon-a",
+          tool_use_id: "monitor-a",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+        }),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"))).toEqual(
+      [],
+    );
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "mon-b" }),
+    ).resolves.toEqual({ stopped: false });
+    for (const toolCallId of ["monitor-a", "monitor-b"]) {
+      expect(
+        updates.some(
+          ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === toolCallId,
+        ),
+      ).toBe(true);
+    }
+  });
+
   it("holds async_task_spawned until the Bash result brings the tool id", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6612,6 +6762,12 @@ describe("subagent permission attribution (issue #851)", () => {
           },
           {
             type: "tool_use",
+            id: "child-watch",
+            name: "Bash",
+            input: { command: "tail -f build.log", run_in_background: true },
+          },
+          {
+            type: "tool_use",
             id: "child-monitor",
             name: "Monitor",
             input: { command: "tail -f build.log", description: "watch the build log" },
@@ -6624,6 +6780,8 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         ]);
         yield backgroundTask("shell-child", "child-bash", "npm test");
+        yield backgroundTask("watch-child", "child-watch", "tail -f build.log");
+        // The SDK reports a Monitor task as a background shell.
         yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
         yield backgroundTask("shell-late", "child-server", "npm start");
         yield assistant(null, [
@@ -6656,12 +6814,17 @@ describe("subagent permission attribution (issue #851)", () => {
     await started;
     // AIR stops a task with the root session id and the SDK task id.
     await expect(
-      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "watch-child" }),
     ).resolves.toEqual({ stopped: true });
+    // The client never sees a Monitor task, so it cannot stop it.
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
+    ).resolves.toEqual({ stopped: false });
     release();
     await prompt;
 
-    expect(query.stopTask).toHaveBeenCalledWith("monitor-child");
+    expect(query.stopTask).toHaveBeenCalledWith("watch-child");
+    expect(query.stopTask).not.toHaveBeenCalledWith("monitor-child");
     const lifecycle = updates.flatMap(({ sessionId, update }) =>
       "asyncTaskId" in update
         ? [[sessionId, update.sessionUpdate, update.asyncTaskId, (update as any).state]]
@@ -6669,12 +6832,12 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     expect(lifecycle).toEqual([
       ["agent-1", "async_task_spawned", "shell-child", undefined],
-      ["agent-1", "async_task_spawned", "monitor-child", undefined],
+      ["agent-1", "async_task_spawned", "watch-child", undefined],
       ["agent-1", "async_task_spawned", "shell-late", undefined],
       ["test-session", "async_task_spawned", "shell-root", undefined],
       ["agent-1", "async_task_state_update", "shell-child", "completed"],
       ["test-session", "async_task_state_update", "shell-root", "completed"],
-      ["agent-1", "async_task_state_update", "monitor-child", "stopped"],
+      ["agent-1", "async_task_state_update", "watch-child", "stopped"],
       ["agent-1", "async_task_state_update", "shell-late", "completed"],
     ]);
     // The stop acknowledgement goes to the transcript that holds the task.

@@ -120,19 +120,19 @@ export const SCENARIOS: Scenario[] = [
     turns: [
       async function* () {
         yield system("task_started", {
-          task_id: "monitor_1",
-          task_type: "local_monitor",
+          task_id: "workflow_3",
+          task_type: "local_workflow",
           description: "Watch the logs",
         });
         yield system("task_progress", {
-          task_id: "monitor_1",
+          task_id: "workflow_3",
           description: "Watch the logs",
           summary: "first line",
           usage: { total_tokens: 0, tool_uses: 0, duration_ms: 5 },
         });
         yield system("task_progress", {
-          task_id: "monitor_1",
-          tool_use_id: "toolu_monitor",
+          task_id: "workflow_3",
+          tool_use_id: "toolu_workflow",
           description: "Watch the logs",
           summary: "second line",
           usage: { total_tokens: 0, tool_uses: 0, duration_ms: 6 },
