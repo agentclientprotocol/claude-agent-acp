@@ -190,6 +190,41 @@ describe("authorization", () => {
     );
   });
 
+  it("maps an Authorization Bearer header to ANTHROPIC_AUTH_TOKEN after gateway auth", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        auth: { terminal: true, _meta: { gateway: true } },
+      } as any,
+    });
+
+    await agent.authenticate({
+      methodId: "gateway",
+      _meta: {
+        gateway: {
+          baseUrl: "https://gateway.example",
+          headers: { Authorization: "Bearer sk-gateway-token" },
+        },
+      },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          env: expect.objectContaining({
+            ANTHROPIC_AUTH_TOKEN: "sk-gateway-token",
+            ANTHROPIC_BASE_URL: "https://gateway.example",
+            ANTHROPIC_CUSTOM_HEADERS: "",
+          }),
+        }),
+      }),
+    );
+  });
+
   it("uses gateway env after gateway auth", async () => {
     const [agent, mockQuery] = await createAgentMock();
 
