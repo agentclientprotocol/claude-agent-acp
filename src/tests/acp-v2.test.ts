@@ -277,15 +277,15 @@ describe("ACP protocol routing", () => {
       version: packageJson.version,
     });
     // The session baseline and the session extensions that the v2 surface serves,
-    // without `fork`; the providers methods are not served yet.
+    // without `fork`, and the providers methods.
     expect(response.capabilities?.session).toEqual({
       prompt: { image: {}, embeddedContext: {} },
       mcp: { stdio: {}, http: {} },
       delete: {},
       additionalDirectories: {},
     });
-    expect(response.capabilities?.providers).toBeUndefined();
-    // Nor `_session/steering`, which v1 advertises in the top-level `_meta`.
+    expect(response.capabilities?.providers).toEqual({});
+    // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
     expect(response._meta?.steering).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
@@ -1523,6 +1523,44 @@ describe("ACP v2 session translation", () => {
     expect(() =>
       v2SessionUpdate({ sessionUpdate: "agent_message_chunk", content: text("hi")[0] }),
     ).toThrow("An ACP v2 agent_message_chunk needs a messageId");
+  });
+});
+
+describe("ACP v2 providers", () => {
+  it("lists, sets, and disables the provider", async () => {
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const list = async () => (await agent.request(v2.methods.agent.providers.list, {})).providers;
+      const [native] = await list();
+      expect(native).toMatchObject({
+        providerId: "main",
+        supported: ["anthropic", "bedrock", "vertex"],
+        required: false,
+      });
+
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      expect((await list())[0].current).toEqual({
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      await expect(
+        agent.request(v2.methods.agent.providers.set, {
+          providerId: "other",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+
+      // Disabling restores the native routing.
+      await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+      expect((await list())[0].current).toEqual(native.current);
+      await authUpdate(1);
+    });
   });
 });
 

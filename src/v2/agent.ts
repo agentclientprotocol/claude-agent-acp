@@ -44,48 +44,58 @@ export function v2AgentApp(
 ): v2.AgentApp {
   let agent!: ClaudeAcpAgent;
   let client!: V2ClientConnection;
-  return v2
-    .agent({ name: "claude-code-acp" })
-    .onConnect((connection) => {
-      client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger, { v2: true });
-      onAgent(agent);
-    })
-    .onRequest(v2.methods.agent.initialize, async ({ params }) =>
-      v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
-    )
-    .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
-    .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))
-    .onRequest(v2.methods.agent.session.new, async ({ params }) =>
-      v2NewSessionResponse(await agent.newSession(v1NewSessionRequest(params))),
-    )
-    .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
-    .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
-      const restore = v1RestoreSessionRequest(params);
-      return v2ResumeSessionResponse(
-        restore.method === "resume"
-          ? await agent.resumeSession(restore.request)
-          : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
-      );
-    })
-    .onRequest(v2.methods.agent.session.close, async ({ params }) => {
-      const response = await agent.closeSession(params);
-      client.terminals.forget(params.sessionId);
-      return response;
-    })
-    .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
-    .onRequest(v2.methods.agent.session.setConfigOption, async ({ params }) => {
-      const { configOptions, ...response } = await agent.setSessionConfigOption(
-        v1SetSessionConfigOptionRequest(params),
-      );
-      return { ...response, configOptions: v2ConfigOptions(configOptions) };
-    })
-    .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
-      v2Prompt(agent, params, (update) => {
-        void client.send({ sessionId: params.sessionId, update });
-      }),
-    )
-    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+  return (
+    v2
+      .agent({ name: "claude-code-acp" })
+      .onConnect((connection) => {
+        client = new V2ClientConnection(connection.client, logger ?? console);
+        agent = new ClaudeAcpAgent(client, logger, { v2: true });
+        onAgent(agent);
+      })
+      .onRequest(v2.methods.agent.initialize, async ({ params }) =>
+        v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
+      )
+      .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
+      .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))
+      // The provider types are the same in v1 and v2.
+      .onRequest(v2.methods.agent.providers.list, ({ params }) =>
+        agent.unstable_listProviders(params),
+      )
+      .onRequest(v2.methods.agent.providers.set, ({ params }) => agent.unstable_setProvider(params))
+      .onRequest(v2.methods.agent.providers.disable, ({ params }) =>
+        agent.unstable_disableProvider(params),
+      )
+      .onRequest(v2.methods.agent.session.new, async ({ params }) =>
+        v2NewSessionResponse(await agent.newSession(v1NewSessionRequest(params))),
+      )
+      .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
+      .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
+        const restore = v1RestoreSessionRequest(params);
+        return v2ResumeSessionResponse(
+          restore.method === "resume"
+            ? await agent.resumeSession(restore.request)
+            : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
+        );
+      })
+      .onRequest(v2.methods.agent.session.close, async ({ params }) => {
+        const response = await agent.closeSession(params);
+        client.terminals.forget(params.sessionId);
+        return response;
+      })
+      .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
+      .onRequest(v2.methods.agent.session.setConfigOption, async ({ params }) => {
+        const { configOptions, ...response } = await agent.setSessionConfigOption(
+          v1SetSessionConfigOptionRequest(params),
+        );
+        return { ...response, configOptions: v2ConfigOptions(configOptions) };
+      })
+      .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
+        v2Prompt(agent, params, (update) => {
+          void client.send({ sessionId: params.sessionId, update });
+        }),
+      )
+      .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params))
+  );
 }
 
 /**

@@ -54,8 +54,8 @@ const UNSERVED_EXTENSION_KEYS: readonly string[] = ["steering"];
 /**
  * The v2 `initialize` response for the v1 response of the agent.
  *
- * It does not advertise what the v2 surface does not serve yet: the unstable
- * `providers` methods, and the extensions of {@link UNSERVED_EXTENSION_KEYS}.
+ * It does not advertise what the v2 surface does not serve yet: the
+ * extensions of {@link UNSERVED_EXTENSION_KEYS}.
  */
 export function v2InitializeResponse(response: InitializeResponse): v2.InitializeResponse {
   if (!response.agentInfo) {
@@ -72,6 +72,9 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
     // methods must serve `auth/logout`.
     capabilities: {
       session: V2_SESSION_CAPABILITIES,
+      // `providers/list`, `set`, and `disable`, which the agent serves for
+      // every client.
+      providers: {},
       ...(meta != null ? { _meta: meta } : {}),
     },
     authMethods: (response.authMethods ?? []).map(v2AuthMethod),
