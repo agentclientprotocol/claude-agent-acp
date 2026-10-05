@@ -44,7 +44,12 @@ export interface ToolUseFacts {
 /** The output of a command, for the terminal channel. */
 export interface CommandOutput {
   output: string;
-  exitCode: number;
+  /**
+   * The exit code of the command, when the tool result says it. Absent when it
+   * does not: a failure that names no code, an interrupted or backgrounded
+   * command, or a non-zero code that Claude Code accepted as a success.
+   */
+  exitCode?: number;
 }
 
 /**

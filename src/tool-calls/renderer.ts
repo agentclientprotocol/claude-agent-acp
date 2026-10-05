@@ -82,7 +82,8 @@ export type ToolUpdateMeta = {
   };
   terminal_exit?: {
     terminal_id: string;
-    exit_code: number;
+    /** Null when the agent does not know the code, as in `TerminalExitStatus`. */
+    exit_code: number | null;
     signal: string | null;
   };
 };
@@ -325,7 +326,11 @@ export class AcpToolCallRenderer {
           ...(this.capabilities.terminalOutputDelta
             ? { terminal_output_delta: output }
             : { terminal_output: output }),
-          terminal_exit: { terminal_id: terminalId, exit_code: command.exitCode, signal: null },
+          terminal_exit: {
+            terminal_id: terminalId,
+            exit_code: command.exitCode ?? null,
+            signal: null,
+          },
         },
       };
     }

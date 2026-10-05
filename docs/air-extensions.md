@@ -209,6 +209,7 @@ An AIR client that declares `terminal_output_delta` gets appends instead of `ter
   A command tool call then has `content: [{type: "terminal", terminalId}]` and `_meta.terminal_info = {terminal_id}`.
   The output goes in `_meta.terminal_output = {terminal_id, data}`.
   The end sends `_meta.terminal_exit = {terminal_id, exit_code, signal: null}`.
+  `exit_code` is `null` when the tool result does not say the code: a failure that names none, such as a denial, an interrupted or backgrounded command, or a non-zero code that Claude Code accepted as a success.
 - A client that declares neither `terminal_output` nor `terminal_output_delta` gets no terminal.
   The command output is a `console` code block in `content`.
 - A client that declares `clientCapabilities._meta["terminal-auth"]: true` gets `_meta["terminal-auth"] = {command, args, label}` on the terminal login methods.

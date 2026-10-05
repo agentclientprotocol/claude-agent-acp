@@ -36,7 +36,10 @@ export class BashReporter implements ToolReporter {
     // 4. Array content: text blocks for stdout, or image blocks when the
     //    command produces an image.
     let output = "";
-    let exitCode = isError ? 1 : 0;
+    // Claude Code accepts a non-zero code as a success only with a
+    // `returnCodeInterpretation` (grep's "No matches found"), so a success
+    // without one exited with 0.
+    let exitCode: number | undefined = isError ? undefined : 0;
 
     const structuredBash = structuredResult<BashOutput>(structured);
     if (
@@ -47,12 +50,13 @@ export class BashReporter implements ToolReporter {
       structuredBash.backgroundTaskId === undefined
     ) {
       output = [structuredBash.stdout, structuredBash.stderr].filter(Boolean).join("\n");
-      // The CLI appends its abort marker only to the model-facing text, and an
-      // aborted command is not a success.
+      // The CLI appends its abort marker only to the model-facing text. The
+      // result does not carry the code of the aborted command.
       if (structuredBash.interrupted) {
         output = [output, "[Command was aborted before completion]"].filter(Boolean).join("\n");
-        exitCode = 1;
+        exitCode = undefined;
       }
+      if (structuredBash.returnCodeInterpretation !== undefined) exitCode = undefined;
       // Structured stdout is clipped when the full output was persisted to
       // disk. Without this note the clip is silent.
       if (typeof structuredBash.persistedOutputPath === "string") {
@@ -89,6 +93,19 @@ export class BashReporter implements ToolReporter {
       }
       output = content.map((c: any) => c.text).join("\n");
     }
-    return { command: { output, exitCode } };
+    if (isError && exitCode === undefined) exitCode = failureExitCode(output);
+    // A backgrounded command is still running: the result only announces it.
+    if (structuredBash?.backgroundTaskId !== undefined) exitCode = undefined;
+    return { command: { output, ...(exitCode !== undefined ? { exitCode } : {}) } };
   }
+}
+
+/**
+ * The exit code that the text of a failed command names. Claude Code starts the
+ * text of a command that exited with a failing code with `Exit code N`. Other
+ * failures, such as a denial or a command that could not start, name none.
+ */
+function failureExitCode(text: string): number | undefined {
+  const match = /^Exit code (\d+)(?:\n|$)/.exec(text);
+  return match ? Number(match[1]) : undefined;
 }

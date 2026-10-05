@@ -1317,6 +1317,25 @@ describe("ACP v2 session translation", () => {
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
   });
 
+  it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
+    const terminals = new V2Terminals();
+    terminals.split("s", {
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_bash",
+      title: "Terminal",
+      _meta: { terminal_info: { terminal_id: "term" } },
+    });
+    const { terminal } = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "failed",
+      _meta: { terminal_exit: { terminal_id: "term", exit_code: null, signal: null } },
+    });
+    expect(terminal).toEqual([
+      { sessionUpdate: "terminal_update", terminalId: "term", exitStatus: {} },
+    ]);
+  });
+
   it("forgets the terminals of a closed session", () => {
     const terminals = new V2Terminals();
     const named = (sessionId: string) =>
