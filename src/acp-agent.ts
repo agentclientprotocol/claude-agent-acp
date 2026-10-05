@@ -1042,6 +1042,12 @@ export type Session = {
    *  after the result, and the async task runtime needs the tool name. The
    *  oldest entries are dropped. */
   resolvedToolNames?: Map<string, string>;
+  /** The open tool calls that Claude Code sent to the tool runner: a complete
+   *  assistant message holds their `tool_use`, or a permission request asked
+   *  for them. A streamed tool_use that never reached a complete message is
+   *  not here: Claude abandoned it before it ran. Pruned when the call ends;
+   *  the oldest entries are dropped. */
+  dispatchedToolCalls?: Set<string>;
   /** The fields that the client holds for each open tool call, so that a
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
@@ -4008,6 +4014,7 @@ export class ClaudeAcpAgent {
         (update.status === "completed" || update.status === "failed")
       ) {
         session.eagerToolCallSessions?.delete(toolCallId);
+        session.dispatchedToolCalls?.delete(toolCallId);
       }
     };
     // toAcpNotifications registers deferred tool hooks that publish through
@@ -4526,39 +4533,54 @@ export class ClaudeAcpAgent {
         const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
           (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
         );
-        if (unfinished.length > 0) {
-          const message = `Claude ended the turn without returning results for tool calls: ${unfinished.join(", ")}`;
+        /** Closes a tool call as failed. Returns false when the turn ended meanwhile. */
+        const failToolCall = async (toolCallId: string, text: string): Promise<boolean> => {
+          // A late hook must not overwrite the failure we are about to send.
+          unregisterHookCallback(toolCallId);
+          session.emittedToolCalls.delete(toolCallId);
+          delete session.toolUseCache[toolCallId];
+          session.toolCallFields?.delete(toolCallId);
+          session.dispatchedToolCalls?.delete(toolCallId);
+          await sendUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId,
+              status: "failed",
+              content: [{ type: "content", content: { type: "text", text } }],
+            },
+          });
+          // Cancellation can arrive while we await the client update.
+          if (turn.settled || session.activeTurn !== turn) return false;
+          if (session.cancelled) {
+            await settleActive({ ...result, stopReason: "cancelled" });
+            return false;
+          }
+          return true;
+        };
+        // A streamed tool_use that never reached a complete assistant message
+        // never ran: Claude abandoned it, for example for a steering message.
+        // It is not a failure of the turn.
+        const abandoned = unfinished.filter((id) => !session.dispatchedToolCalls?.has(id));
+        const stuck = unfinished.filter((id) => session.dispatchedToolCalls?.has(id));
+        for (const toolCallId of abandoned) {
+          if (!(await failToolCall(toolCallId, "Claude stopped this tool call before it ran."))) {
+            return;
+          }
+        }
+        if (stuck.length > 0) {
+          const message = `Claude ended the turn without returning results for tool calls: ${stuck.join(", ")}`;
           this.logger.error(
             `Session ${params.sessionId}, turn ${turn.promptUuid}, stopReason=${result.stopReason}: ${message}`,
           );
           // Fail every unfinished tool before reporting one error for the prompt.
-          for (const toolCallId of unfinished) {
-            // A late hook must not overwrite the failure we are about to send.
-            unregisterHookCallback(toolCallId);
-            session.emittedToolCalls.delete(toolCallId);
-            delete session.toolUseCache[toolCallId];
-            session.toolCallFields?.delete(toolCallId);
-            await sendUpdate({
-              sessionId: params.sessionId,
-              update: {
-                sessionUpdate: "tool_call_update",
+          for (const toolCallId of stuck) {
+            if (
+              !(await failToolCall(
                 toolCallId,
-                status: "failed",
-                content: [
-                  {
-                    type: "content",
-                    content: {
-                      type: "text",
-                      text: "Claude ended the turn without returning a result for this tool.",
-                    },
-                  },
-                ],
-              },
-            });
-            // Cancellation can arrive while we await the client update.
-            if (turn.settled || session.activeTurn !== turn) return;
-            if (session.cancelled) {
-              await settleActive({ ...result, stopReason: "cancelled" });
+                "Claude ended the turn without returning a result for this tool.",
+              ))
+            ) {
               return;
             }
           }
@@ -6549,6 +6571,8 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
+            if (message.type === "assistant")
+              recordDispatchedToolUses(session, message.message.content);
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
@@ -8249,6 +8273,8 @@ export class ClaudeAcpAgent {
         toolCallFieldsOf(session).pinContent(toolCallId, previewContent);
       }
     };
+    // A permission request comes only for a tool call that is about to run.
+    recordDispatchedToolCall(session, toolCallId);
     if (session.emittedToolCalls.has(toolCallId)) {
       pinPreview();
       return;
@@ -10730,6 +10756,34 @@ function isTaskTool(toolName: string): boolean {
  *  resolved explicitly at tool_result time. */
 function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
+}
+
+const MAX_DISPATCHED_TOOL_CALLS = 1000;
+
+/** Records a tool call that Claude Code sent to the tool runner. */
+function recordDispatchedToolCall(session: Session, toolCallId: string): void {
+  const calls = (session.dispatchedToolCalls ??= new Set());
+  calls.delete(toolCallId);
+  calls.add(toolCallId);
+  if (calls.size > MAX_DISPATCHED_TOOL_CALLS) {
+    const oldest = calls.values().next().value;
+    if (oldest !== undefined) calls.delete(oldest);
+  }
+}
+
+/** Records the tool_use blocks of a complete assistant message. */
+function recordDispatchedToolUses(session: Session, content: unknown): void {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (
+      (block?.type === "tool_use" ||
+        block?.type === "server_tool_use" ||
+        block?.type === "mcp_tool_use") &&
+      typeof block.id === "string"
+    ) {
+      recordDispatchedToolCall(session, block.id);
+    }
+  }
 }
 
 /** Streamed and permission-surfaced tools can precede the SDK's user echo. */
