@@ -2339,11 +2339,14 @@ function startMcpServerAuthentication(
 
 async function settledMcpServerStatuses(
   query: Query,
+  requestedServers: Set<string> | undefined,
   signal: AbortSignal,
 ): Promise<McpServerStatus[]> {
   const deadline = Date.now() + MCP_SETTLE_TIMEOUT_MS;
+  const pending = (server: McpServerStatus) =>
+    server.status === "pending" && (!requestedServers || requestedServers.has(server.name));
   let statuses = await query.mcpServerStatus();
-  while (statuses.some((server) => server.status === "pending") && Date.now() < deadline) {
+  while (statuses.some(pending) && Date.now() < deadline) {
     if (!(await waitUnlessAborted(MCP_SETTLE_POLL_MS, signal))) break;
     statuses = await query.mcpServerStatus();
   }
@@ -2358,7 +2361,7 @@ async function authenticateMcpServers(
   signal: AbortSignal,
 ): Promise<void> {
   const candidates = authenticationCandidates(
-    await settledMcpServerStatuses(query, signal),
+    await settledMcpServerStatuses(query, requestedServers, signal),
     requestedServers,
   );
   if (candidates.length === 0) return;
