@@ -10328,6 +10328,9 @@ export class ClaudeAcpAgent {
       // Set our own session id if not resuming an existing session.
       options.sessionId = creationOpts.publicSessionId ? randomUUID() : sessionId;
     }
+    // A plan "clear context" continuation runs under a fresh Claude id, so the
+    // transcript lives there rather than under the public ACP id.
+    const claudeSessionId = options.sessionId ?? sessionId;
 
     // Handle abort controller from meta options
     if (abortController?.signal.aborted) {
@@ -10553,7 +10556,7 @@ export class ClaudeAcpAgent {
         creationParams: params,
         settingsManager,
         effortSettingsOverride: configuredSettingsObject,
-        titles: new SessionTitles(this, sessionId),
+        titles: new SessionTitles(this, sessionId, claudeSessionId),
         accumulatedUsage: {
           inputTokens: 0,
           outputTokens: 0,
