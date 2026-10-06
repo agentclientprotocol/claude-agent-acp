@@ -16,7 +16,9 @@
  * - a record older than 24 hours counts only when its `procStart` matches.
  *
  * A snapshot is cached for {@link SNAPSHOT_TTL_MS}. A holder check before a
- * destructive operation asks for a fresh one.
+ * destructive operation asks for a fresh one, and ignores the CLI children of
+ * this process: a CLI that this adapter closed stays registered until it has
+ * exited, and is no other writer.
  */
 
 import { execFile } from "node:child_process";
@@ -53,6 +55,10 @@ export type LiveRegistryDeps = {
   processStarts?: (pids: number[]) => Promise<Map<number, string>>;
   /** This machine's pid domain, as the CLI computes it. */
   pidDomain?: () => Promise<string>;
+  /** The parent pid of each live pid. */
+  parentPids?: (pids: number[]) => Promise<Map<number, number>>;
+  /** This process's pid, whose CLI children a holder check ignores. */
+  ownPid?: number;
 };
 
 /** `<config>/sessions`, where each CLI process registers itself. */
@@ -85,6 +91,27 @@ function defaultProcessStarts(pids: number[]): Promise<Map<number, string>> {
         for (const line of String(stdout ?? "").split("\n")) {
           const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
           if (match) result.set(Number(match[1]), normalizeStart(match[2]!));
+        }
+        resolve(result);
+      },
+    );
+  });
+}
+
+/** The parent pids of `pids`, from one `ps` call. Empty where `ps` is not
+ *  available: then no record counts as a child of this process. */
+function defaultParentPids(pids: number[]): Promise<Map<number, number>> {
+  const result = new Map<number, number>();
+  if (pids.length === 0 || process.platform === "win32") return Promise.resolve(result);
+  return new Promise((resolve) => {
+    execFile(
+      "ps",
+      ["-o", "pid=,ppid=", "-p", pids.join(",")],
+      { timeout: PS_TIMEOUT_MS, env: { ...process.env, LC_ALL: "C" } },
+      (_error, stdout) => {
+        for (const line of String(stdout ?? "").split("\n")) {
+          const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+          if (match) result.set(Number(match[1]), Number(match[2]));
         }
         resolve(result);
       },
@@ -153,6 +180,8 @@ export class LiveSessionRegistry {
   private readonly isAlive: (pid: number) => boolean;
   private readonly processStarts: (pids: number[]) => Promise<Map<number, string>>;
   private readonly pidDomain: () => Promise<string>;
+  private readonly parentPids: (pids: number[]) => Promise<Map<number, number>>;
+  private readonly ownPid: number;
 
   constructor(deps: LiveRegistryDeps = {}) {
     this.dir = deps.dir ?? liveRegistryDir;
@@ -160,6 +189,8 @@ export class LiveSessionRegistry {
     this.isAlive = deps.isAlive ?? defaultIsAlive;
     this.processStarts = deps.processStarts ?? defaultProcessStarts;
     this.pidDomain = deps.pidDomain ?? defaultPidDomain;
+    this.parentPids = deps.parentPids ?? defaultParentPids;
+    this.ownPid = deps.ownPid ?? process.pid;
   }
 
   /** The live records by session id. Cached for 5 s unless `fresh`. */
@@ -168,23 +199,37 @@ export class LiveSessionRegistry {
     if (!options.fresh && this.cached && now - this.cached.at < SNAPSHOT_TTL_MS) {
       return this.cached.snapshot;
     }
-    const snapshot = this.read().catch(() => new Map<string, LiveRecord>());
+    const snapshot = this.read()
+      .then(bySession)
+      .catch(() => new Map<string, LiveRecord>());
     this.cached = { at: now, snapshot };
     return snapshot;
   }
 
-  /** The live record of `sessionId` from a fresh read, if a process holds it. */
+  /** A live process other than a CLI child of this one that holds
+   *  `sessionId`, from a fresh read. */
   async holder(sessionId: string): Promise<LiveRecord | undefined> {
-    return (await this.snapshot({ fresh: true })).get(sessionId);
+    let records: LiveRecord[];
+    try {
+      records = (await this.read()).filter((record) => record.sessionId === sessionId);
+    } catch {
+      return undefined;
+    }
+    if (records.length === 0) return undefined;
+    const parents = await this.parentPids(records.map(({ pid }) => pid)).catch(
+      () => new Map<number, number>(),
+    );
+    return records.find(({ pid }) => parents.get(pid) !== this.ownPid);
   }
 
-  private async read(): Promise<LiveSnapshot> {
+  /** Every live record, several per session when several processes hold it. */
+  private async read(): Promise<LiveRecord[]> {
     const dir = this.dir();
     let names: string[];
     try {
       names = await fs.readdir(dir);
     } catch {
-      return new Map();
+      return [];
     }
     const domain = await this.pidDomain();
     const candidates: { pid: number; raw: RawRecord }[] = [];
@@ -205,7 +250,7 @@ export class LiveSessionRegistry {
       .map(({ pid }) => pid);
     const starts = needStarts.length > 0 ? await this.processStarts(needStarts) : new Map();
     const now = this.now();
-    const result = new Map<string, LiveRecord>();
+    const result: LiveRecord[] = [];
     for (const { pid, raw } of candidates) {
       const recorded =
         typeof raw.procStart === "string" ? normalizeStart(raw.procStart) : undefined;
@@ -227,11 +272,20 @@ export class LiveSessionRegistry {
         status: optionalString(raw.status),
         statusUpdatedAt: finiteNumber(raw.statusUpdatedAt),
       };
-      const previous = result.get(record.sessionId);
-      if (!previous || (record.statusUpdatedAt ?? 0) > (previous.statusUpdatedAt ?? 0)) {
-        result.set(record.sessionId, record);
-      }
+      result.push(record);
     }
     return result;
   }
+}
+
+/** One record per session: the one with the newest status. */
+function bySession(records: readonly LiveRecord[]): LiveSnapshot {
+  const result = new Map<string, LiveRecord>();
+  for (const record of records) {
+    const previous = result.get(record.sessionId);
+    if (!previous || (record.statusUpdatedAt ?? 0) > (previous.statusUpdatedAt ?? 0)) {
+      result.set(record.sessionId, record);
+    }
+  }
+  return result;
 }

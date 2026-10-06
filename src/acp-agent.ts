@@ -134,6 +134,7 @@ import {
   withAirMeta,
 } from "./air-extension.js";
 import {
+  archiveInsteadOfDelete,
   LIST_CHANGED_METHOD,
   parseRenameSessionRequest,
   parseSessionIdRequest,
@@ -144,7 +145,7 @@ import {
   type RenameSessionRequest,
   type SessionIdRequest,
 } from "./session-index/service.js";
-import { readArchivedSessionIds, writeArchiveMarker } from "./session-index/archive-markers.js";
+import { readArchivedSessionIds } from "./session-index/archive-markers.js";
 import type { OwnSessionState } from "./session-index/activity.js";
 import {
   AsyncTaskRuntime,
@@ -3010,12 +3011,16 @@ export class ClaudeAcpAgent {
       );
       return {};
     }
+    // A closed session's CLI is gone here, and another process may have
+    // resumed the session since: only a running query is ours.
+    const persist = () =>
+      index.renameOffline(params.sessionId, params.title, {
+        ownedHere: session !== undefined && !session.queryClosed,
+      });
     if (session) {
-      await session.titles.setExplicitTitle(params.title, () =>
-        index.renameOffline(params.sessionId, params.title, { loadedHere: true }),
-      );
+      await session.titles.setExplicitTitle(params.title, persist);
     } else {
-      await index.renameOffline(params.sessionId, params.title);
+      await persist();
     }
     return {};
   }
@@ -7836,8 +7841,13 @@ export class ClaudeAcpAgent {
    * - Every other client: the SDK delete, as before.
    */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    const loaded = this.sessions[params.sessionId] !== undefined;
-    if (this.sessionIndex && !loaded) {
+    const session = this.sessions[params.sessionId];
+    const loaded = session !== undefined;
+    // Only a running query makes the session ours: the CLI of a closed one is
+    // gone, and another process may have resumed the session since. The
+    // holder check ignores the CLIs this process started, which stay
+    // registered while they exit.
+    if (this.sessionIndex && (!session || session.queryClosed)) {
       await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
     }
     // Tear down any active in-memory state first so the on-disk file isn't
@@ -7848,7 +7858,7 @@ export class ClaudeAcpAgent {
     if (this.sessionIndex) {
       await this.sessionIndex.delete(params.sessionId, loaded);
     } else if (this.toolCallCapabilities.air.client) {
-      await writeArchiveMarker(params.sessionId);
+      await archiveInsteadOfDelete(params.sessionId);
     } else {
       await deleteSession(params.sessionId);
     }

@@ -74,6 +74,17 @@ export function projectDirMatches(dirName: string, cwd: string): boolean {
   return name.startsWith(process.platform === "win32" ? prefix.toLowerCase() : prefix);
 }
 
+/** Whether a transcript's `cwd` belongs to `projectPath`, compared the way
+ *  the SDK does: the full sanitized forms, ignoring case where the file
+ *  system does. */
+export function sameProjectPath(cwd: string, projectPath: string): boolean {
+  const a = sanitize(normalizePath(cwd));
+  const b = sanitize(normalizePath(projectPath));
+  return process.platform === "win32" || process.platform === "darwin"
+    ? a.toLowerCase() === b.toLowerCase()
+    : a === b;
+}
+
 /** The real path of `cwd`, like the SDK resolves it before encoding. Falls
  *  back to `cwd` when it does not exist. */
 export async function canonicalPath(cwd: string): Promise<string> {

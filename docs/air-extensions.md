@@ -1217,11 +1217,13 @@ The new methods answer it with `-32601`.
 - A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
 - The page holds the sessions of `cwd` and of every existing worktree of its repository.
   The worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git.
+  A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
   A row's `cwd` is the session's own directory, so it can be a worktree path.
 - Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
 - A session copied to two project directories is listed once, from the larger file.
 - A row's `cwd` comes from the transcript (the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
-  Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory.
+  Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory, read further if the page does not hold one.
+- `updatedAt` needs the last message: when it is longer than the 64 KB tail window, the window grows up to 4 MB to find it.
   The directory name is never decoded.
 
 Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
@@ -1252,8 +1254,9 @@ Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
 - A session this connection runs is renamed through its CLI (`rename_session` control request).
   A title generation in flight finishes first, and no generated title replaces the new one, also after a reload.
   The adapter then sends `session_info_update { title }`.
-- Any other session gets the SDK `renameSession` record and the CLI's `custom-title.json` sidecar (mode 0600, written atomically).
+- Any other session gets the SDK `renameSession` title record in every transcript of the session and the CLI's `custom-title.json` sidecar next to each (mode 0600, written atomically).
 - A session that another live process holds is refused with `data.reason: "thread_active_writer"`.
+  A session whose query closed here counts as any other session; a CLI that this adapter started and is still exiting is no other process.
 
 ### Archive
 
@@ -1279,8 +1282,8 @@ It tells the client to read the first page of that `cwd` again.
 
 `session/delete`:
 
-- a `sessionIndex` client: deletes every transcript of the session and its archive marker. A session that another live process holds is refused with `thread_active_writer`. An unknown session is `-32002`.
-- an AIR client without `sessionIndex`: writes the archive marker instead of deleting, because AIR uses delete for "Done" and can reopen the session. The list hides archived sessions from such a client too.
+- a `sessionIndex` client: deletes every transcript of the session, then its archive marker. A transcript it fails to delete fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename. An unknown session is `-32002`.
+- an AIR client without `sessionIndex`: writes the archive marker instead of deleting, because AIR uses delete for "Done" and can reopen the session. The list hides archived sessions from such a client too. A session without a transcript fails with the error of the SDK delete, as before.
 - any other client: the SDK delete, as before.
 
 `session/close` of a session that is not loaded returns `{}` for every client.

@@ -19,7 +19,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { archiveMarkerDir } from "./archive-markers.js";
 import { liveRegistryDir } from "./live-registry.js";
-import { projectDirMatches, projectsRoot } from "./project-dirs.js";
+import { encodeProjectPath, projectsRoot, sameProjectPath } from "./project-dirs.js";
 
 export const LIST_CHANGED_METHOD = "_session/list_changed";
 
@@ -30,8 +30,9 @@ const MAX_WAIT_MS = 1_000;
 const RESCAN_MS = 10_000;
 
 export type ListChangedDeps = {
-  /** The project directory names of a cwd (with its worktrees). */
-  projectDirs: (cwd: string) => Promise<string[]>;
+  /** The paths that a list of a cwd shows (the cwd and its worktrees), and
+   *  the names of their project directories. */
+  projectDirs: (cwd: string) => Promise<{ dirNames: string[]; paths: string[] }>;
   /** Sends `_session/list_changed { cwd }`. */
   notify: (cwd: string) => Promise<void>;
   now?: () => number;
@@ -45,6 +46,8 @@ type WatchedCwd = {
   cwd: string;
   lastListedAt: number;
   dirNames: string[];
+  /** The paths that `dirNames` belong to. */
+  paths: string[];
   watchers: fs.FSWatcher[];
   fingerprint?: string;
   debounce?: ReturnType<typeof setTimeout>;
@@ -87,8 +90,13 @@ async function dirFingerprint(dir: string, filter: (name: string) => boolean): P
 const isTranscript = (name: string) => name.endsWith(".jsonl");
 const isRegistryRecord = (name: string) => /^\d+\.json$/.test(name);
 
-/** The live records whose cwd belongs to one of `dirNames`. */
-async function liveRecordsFingerprint(dirNames: readonly string[]): Promise<string> {
+/** The live records whose cwd is one of `paths`, or encodes exactly to one
+ *  of `dirNames`. A long path's directory is matched by prefix only, which
+ *  other long paths may share: their records do not belong here. */
+async function liveRecordsFingerprint(
+  dirNames: readonly string[],
+  paths: readonly string[],
+): Promise<string> {
   const dir = liveRegistryDir();
   let names: string[];
   try {
@@ -104,7 +112,11 @@ async function liveRecordsFingerprint(dirNames: readonly string[]): Promise<stri
           unknown
         >;
         const cwd = typeof record.cwd === "string" ? record.cwd : undefined;
-        if (!cwd || !dirNames.some((dirName) => projectDirMatches(dirName, cwd))) return undefined;
+        const belongs =
+          cwd !== undefined &&
+          (dirNames.includes(encodeProjectPath(cwd)) ||
+            paths.some((projectPath) => sameProjectPath(cwd, projectPath)));
+        if (!belongs) return undefined;
         return `${name}:${String(record.sessionId)}:${String(record.status)}:${String(record.statusUpdatedAt)}`;
       } catch {
         return undefined;
@@ -144,7 +156,13 @@ export class ListChangedWatcher {
       existing.lastListedAt = this.now();
       return;
     }
-    const entry: WatchedCwd = { cwd, lastListedAt: this.now(), dirNames: [], watchers: [] };
+    const entry: WatchedCwd = {
+      cwd,
+      lastListedAt: this.now(),
+      dirNames: [],
+      paths: [],
+      watchers: [],
+    };
     this.watched.set(cwd, entry);
     this.evictOverflow();
     this.ensureShared();
@@ -208,13 +226,15 @@ export class ListChangedWatcher {
   /** Watches the current project directories of `entry`. */
   private async refreshDirs(entry: WatchedCwd): Promise<void> {
     let dirNames: string[];
+    let paths: string[];
     try {
-      dirNames = await this.deps.projectDirs(entry.cwd);
+      ({ dirNames, paths } = await this.deps.projectDirs(entry.cwd));
     } catch (error) {
       this.deps.logError?.(`session list watch of ${entry.cwd} failed`, error);
       return;
     }
     if (this.disposed || this.watched.get(entry.cwd) !== entry) return;
+    entry.paths = paths;
     if (dirNames.join("\0") === entry.dirNames.join("\0") && entry.watchers.length > 0) return;
     for (const watcher of entry.watchers) watcher.close();
     entry.dirNames = dirNames;
@@ -243,7 +263,7 @@ export class ListChangedWatcher {
     );
     const [markers, live] = await Promise.all([
       dirFingerprint(archiveMarkerDir(), (name) => sessionIds.has(name.toLowerCase())),
-      liveRecordsFingerprint(entry.dirNames),
+      liveRecordsFingerprint(entry.dirNames, entry.paths),
     ]);
     return [entry.dirNames.join("\0"), ...transcripts, markers, live].join("\n");
   }

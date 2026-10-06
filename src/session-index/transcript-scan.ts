@@ -5,11 +5,17 @@
  * window that the SDK reads. The tail gives the time of the last message, the
  * end of the last turn, and the last `cost-state` record. The head and the
  * tail give the `cwd` candidates.
+ *
+ * A last message longer than the tail window leaves no message in it: then
+ * the tail window grows, up to {@link MAX_TAIL_SIZE}, until it holds one.
  */
 
 import * as fs from "node:fs/promises";
 
 const CHUNK_SIZE = 64 * 1024;
+/** The largest tail window read to find the last message. */
+const MAX_TAIL_SIZE = 4 * 1024 * 1024;
+const TAIL_GROWTH = 4;
 
 export type TurnState = "finished" | "unfinished";
 
@@ -34,6 +40,18 @@ export type TranscriptFacts = {
 
 export type HeadTail = { head: string; tail: string };
 
+/** The last `window` bytes of a file of `size` bytes, without the first,
+ *  cut line. The whole file when it fits. */
+async function readTail(handle: fs.FileHandle, size: number, window: number): Promise<string> {
+  const length = Math.min(window, size);
+  const buffer = Buffer.allocUnsafe(length);
+  const { bytesRead } = await handle.read(buffer, 0, length, size - length);
+  const raw = buffer.toString("utf8", 0, bytesRead);
+  if (length === size) return raw;
+  const newline = raw.indexOf("\n");
+  return newline >= 0 ? raw.slice(newline + 1) : "";
+}
+
 /** The first and the last 64 KB of `filePath`. The tail is the head for a
  *  file that fits in one chunk. */
 export async function readHeadTail(filePath: string, size: number): Promise<HeadTail> {
@@ -43,14 +61,67 @@ export async function readHeadTail(filePath: string, size: number): Promise<Head
     const first = await handle.read(buffer, 0, CHUNK_SIZE, 0);
     const head = buffer.toString("utf8", 0, first.bytesRead);
     if (size <= CHUNK_SIZE) return { head, tail: head };
-    const last = await handle.read(buffer, 0, CHUNK_SIZE, size - CHUNK_SIZE);
-    // The first line of the tail window is cut; drop it.
-    const raw = buffer.toString("utf8", 0, last.bytesRead);
-    const newline = raw.indexOf("\n");
-    return { head, tail: newline >= 0 ? raw.slice(newline + 1) : "" };
+    return { head, tail: await readTail(handle, size, CHUNK_SIZE) };
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * The facts of `filePath`, from its head and tail. When the transcript has
+ * messages but the tail window holds none (the last one is longer than the
+ * window), the window grows until it holds one or reaches
+ * {@link MAX_TAIL_SIZE}.
+ */
+export async function scanTranscriptFile(
+  filePath: string,
+  size: number,
+  sessionId: string,
+  headTail?: HeadTail,
+): Promise<TranscriptFacts> {
+  const read = headTail ?? (await readHeadTail(filePath, size));
+  let facts = scanTranscript(read, sessionId);
+  if (!facts.hasMessages || facts.lastMessageAt !== undefined || size <= CHUNK_SIZE) {
+    return facts;
+  }
+  const handle = await fs.open(filePath, "r");
+  try {
+    for (let window = CHUNK_SIZE * TAIL_GROWTH; ; window *= TAIL_GROWTH) {
+      const bounded = Math.min(window, MAX_TAIL_SIZE);
+      const wider = scanTranscript(
+        { head: read.head, tail: await readTail(handle, size, bounded) },
+        sessionId,
+      );
+      if (wider.lastMessageAt !== undefined) {
+        // A wider tail ends with the same records: what the narrow one found
+        // stays, and the wider one adds what lay before it.
+        facts = { ...wider, hasMessages: facts.hasMessages };
+        break;
+      }
+      if (bounded >= size || bounded >= MAX_TAIL_SIZE) break;
+    }
+  } finally {
+    await handle.close();
+  }
+  return facts;
+}
+
+const RELOCATED_MARKER = '"relocated"';
+
+/** The cwd a transcript belongs to, as the SDK reads it: the last
+ *  `relocated` record of the tail, else the first cwd of the head. */
+export function transcriptProjectCwd({ head, tail }: HeadTail): string | undefined {
+  const lines = tail.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes(RELOCATED_MARKER)) continue;
+    const entry = parseLine(line);
+    if (entry?.type === "relocated" && typeof entry.relocatedCwd === "string") {
+      return entry.relocatedCwd;
+    }
+  }
+  const headCwd = CWD_PATTERN.exec(head)?.[1];
+  return headCwd === undefined ? undefined : decodeJsonString(headCwd);
 }
 
 const MESSAGE_MARKERS = [

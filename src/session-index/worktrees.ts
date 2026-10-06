@@ -6,18 +6,14 @@
  * module reads the same list without spawning git, the way the Codex TUI does:
  * the main worktree is the parent of the common `.git` directory, and each
  * linked worktree is named by `<common-dir>/worktrees/<name>/gitdir`.
- * A worktree whose directory no longer exists is dropped.
+ * A worktree whose directory no longer exists is dropped. Nothing is cached:
+ * `git worktree move` rewrites a `gitdir` file without touching the
+ * `worktrees` directory, so a cache keyed on it would miss the move.
  */
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { normalizePath } from "./project-dirs.js";
-
-type CommonDirEntry = { mtimeMs: number; worktrees: string[] };
-
-/** Linked worktree lists keyed by common dir, valid while the mtime of
- *  `<common-dir>/worktrees` is unchanged. */
-const worktreeCache = new Map<string, CommonDirEntry>();
 
 async function statOrUndefined(target: string) {
   try {
@@ -65,15 +61,13 @@ async function linkedWorktrees(commonDir: string): Promise<string[]> {
   const worktreesDir = path.join(commonDir, "worktrees");
   const stats = await statOrUndefined(worktreesDir);
   if (!stats?.isDirectory()) return [];
-  const cached = worktreeCache.get(commonDir);
-  if (cached && cached.mtimeMs === stats.mtimeMs) return cached.worktrees;
   let names: string[];
   try {
     names = await fs.readdir(worktreesDir);
   } catch {
     return [];
   }
-  const worktrees = (
+  return (
     await Promise.all(
       names.map(async (name) => {
         try {
@@ -86,8 +80,6 @@ async function linkedWorktrees(commonDir: string): Promise<string[]> {
       }),
     )
   ).filter((value): value is string => value !== undefined);
-  worktreeCache.set(commonDir, { mtimeMs: stats.mtimeMs, worktrees });
-  return worktrees;
 }
 
 /**

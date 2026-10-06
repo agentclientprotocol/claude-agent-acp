@@ -28,8 +28,14 @@ import {
   projectDirMatches,
   projectDirsOf,
   projectsRoot,
+  sameProjectPath,
 } from "./project-dirs.js";
-import { readHeadTail, scanTranscript, type TranscriptFacts } from "./transcript-scan.js";
+import {
+  readHeadTail,
+  scanTranscriptFile,
+  transcriptProjectCwd,
+  type TranscriptFacts,
+} from "./transcript-scan.js";
 import { repositoryWorktrees } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
@@ -106,14 +112,28 @@ class Lru<K, V> {
       this.entries.delete(this.entries.keys().next().value as K);
     }
   }
-  clear(): void {
-    this.entries.clear();
+  delete(key: K): void {
+    this.entries.delete(key);
   }
 }
 
 function compareRows(a: { updatedAtMs: number; sessionId: string }, b: typeof a): number {
   if (a.updatedAtMs !== b.updatedAtMs) return b.updatedAtMs - a.updatedAtMs;
   return a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0;
+}
+
+type Resolved = { candidate: TranscriptCandidate; metadata: TranscriptMetadata };
+
+function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
+  return {
+    sessionId: candidate.sessionId,
+    cwd,
+    title: metadata.title,
+    updatedAtMs: metadata.updatedAtMs,
+    gitBranch: metadata.gitBranch,
+    facts: metadata.facts,
+    mtimeMs: candidate.mtimeMs,
+  };
 }
 
 function isAfter(row: { updatedAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
@@ -133,6 +153,8 @@ export class SessionIndex {
   /** A cwd that encodes to each project directory name, learned from its
    *  transcripts; it recovers the cwd of a sibling that has none. */
   private readonly dirCwds = new Map<string, string>();
+  /** Whether a prefix-matched long project directory belongs to a path. */
+  private readonly longDirOwners = new Map<string, { mtimeMs: number; belongs: boolean }>();
 
   constructor(private readonly getSessionInfo: GetSessionInfo) {}
 
@@ -143,7 +165,10 @@ export class SessionIndex {
     return [...new Set([canonical, ...(await repositoryWorktrees(canonical))])];
   }
 
-  /** The project directories (names under the projects root) of `paths`. */
+  /** The project directories (names under the projects root) of `paths`.
+   *  A long path is matched by its cut prefix, which other long paths may
+   *  share: such a directory counts only when one of its transcripts belongs
+   *  to the path, as the SDK checks. */
   async projectDirs(paths: readonly string[]): Promise<{ dirName: string; projectPath: string }[]> {
     const rootEntries = await readDirNames(projectsRoot());
     const seen = new Set<string>();
@@ -151,11 +176,51 @@ export class SessionIndex {
     for (const projectPath of paths) {
       for (const dirName of projectDirsOf(projectPath, rootEntries)) {
         if (seen.has(dirName)) continue;
+        if (
+          dirName !== encodeProjectPath(projectPath) &&
+          !(await this.longDirBelongsTo(dirName, projectPath))
+        ) {
+          continue;
+        }
         seen.add(dirName);
         result.push({ dirName, projectPath });
       }
     }
     return result;
+  }
+
+  /** Whether a transcript of the prefix-matched `dirName` belongs to
+   *  `projectPath`. A match is cached for good; a miss until the directory
+   *  changes. */
+  private async longDirBelongsTo(dirName: string, projectPath: string): Promise<boolean> {
+    const dir = path.join(projectsRoot(), dirName);
+    const key = `${dirName}\0${projectPath}`;
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await fs.stat(dir)).mtimeMs;
+    } catch {
+      return false;
+    }
+    const cached = this.longDirOwners.get(key);
+    if (cached && (cached.belongs || cached.mtimeMs === mtimeMs)) return cached.belongs;
+    let belongs = false;
+    for (const name of await readDirNames(dir)) {
+      if (!name.endsWith(".jsonl")) continue;
+      const filePath = path.join(dir, name);
+      try {
+        const stats = await fs.stat(filePath);
+        if (!stats.isFile()) continue;
+        const cwd = transcriptProjectCwd(await readHeadTail(filePath, stats.size));
+        if (cwd && sameProjectPath(cwd, projectPath)) {
+          belongs = true;
+          break;
+        }
+      } catch {
+        // Gone or unreadable: look at the next one.
+      }
+    }
+    this.longDirOwners.set(key, { mtimeMs, belongs });
+    return belongs;
   }
 
   /** Every non-empty transcript of `cwd` and its worktrees (or of all
@@ -202,8 +267,12 @@ export class SessionIndex {
     return [...bySession.values()];
   }
 
-  /** Every transcript file of `sessionId`, in any project directory. */
-  async findTranscripts(sessionId: string): Promise<string[]> {
+  /** Every transcript file of `sessionId`, in any project directory. Empty
+   *  files only with `includeEmpty`. */
+  async findTranscripts(
+    sessionId: string,
+    options: { includeEmpty?: boolean } = {},
+  ): Promise<string[]> {
     if (!isSessionId(sessionId)) return [];
     const root = projectsRoot();
     const found = await Promise.all(
@@ -211,13 +280,18 @@ export class SessionIndex {
         const filePath = path.join(root, dirName, `${sessionId}.jsonl`);
         try {
           const stats = await fs.stat(filePath);
-          return stats.isFile() && stats.size > 0 ? filePath : undefined;
+          return stats.isFile() && (stats.size > 0 || options.includeEmpty) ? filePath : undefined;
         } catch {
           return undefined;
         }
       }),
     );
     return found.filter((value): value is string => value !== undefined);
+  }
+
+  /** Drops the cached metadata of `filePaths`. */
+  invalidate(filePaths: readonly string[]): void {
+    for (const filePath of filePaths) this.metadata.delete(filePath);
   }
 
   /** One page of rows, plus whether more rows follow the page. */
@@ -240,6 +314,21 @@ export class SessionIndex {
     // cursor never leads to an empty page.
     const wanted = query.limit + 1;
     const rows: IndexRow[] = [];
+    // Read transcripts without a cwd of their own: a sibling of the same
+    // directory may supply it, whichever batch it is read in.
+    let pending: Resolved[] = [];
+    const accept = (resolved: Resolved, cwd: string) => {
+      const row = toRow(resolved, cwd);
+      if (!query.after || isAfter(row, query.after)) rows.push(row);
+    };
+    const settlePending = () => {
+      pending = pending.filter((resolved) => {
+        const cwd = this.fallbackCwd(resolved.candidate);
+        if (cwd) accept(resolved, cwd);
+        return !cwd;
+      });
+    };
+    const read = new Set<TranscriptCandidate>();
     let index = 0;
     while (index < candidates.length) {
       if (rows.length >= wanted) {
@@ -248,29 +337,47 @@ export class SessionIndex {
       }
       const batch = candidates.slice(index, index + READ_BATCH_SIZE);
       index += batch.length;
-      const resolved = await Promise.all(batch.map((candidate) => this.row(candidate)));
-      for (const row of resolved) {
-        if (row && (!query.after || isAfter(row, query.after))) rows.push(row);
+      const resolved = await Promise.all(
+        batch.map(async (candidate) => {
+          read.add(candidate);
+          const metadata = await this.metadataOf(candidate);
+          return metadata ? { candidate, metadata } : undefined;
+        }),
+      );
+      for (const item of resolved) {
+        if (!item) continue;
+        const cwd = item.metadata.fileCwd ?? this.fallbackCwd(item.candidate);
+        if (cwd) accept(item, cwd);
+        else pending.push(item);
       }
+      settlePending();
+    }
+    if (pending.length > 0) {
+      // A row recovered after the scan stopped still sorts into the page: it
+      // was read before the stop, and more rows only raise the bound.
+      await this.learnDirCwds(
+        new Set(pending.map(({ candidate }) => candidate.dirName)),
+        candidates.filter((candidate) => !read.has(candidate)),
+      );
+      settlePending();
     }
     rows.sort(compareRows);
     return { rows: rows.slice(0, query.limit), hasMore: rows.length > query.limit };
   }
 
-  private async row(candidate: TranscriptCandidate): Promise<IndexRow | undefined> {
-    const metadata = await this.metadataOf(candidate);
-    if (!metadata) return undefined;
-    const cwd = metadata.fileCwd ?? this.fallbackCwd(candidate);
-    if (!cwd) return undefined;
-    return {
-      sessionId: candidate.sessionId,
-      cwd,
-      title: metadata.title,
-      updatedAtMs: metadata.updatedAtMs,
-      gitBranch: metadata.gitBranch,
-      facts: metadata.facts,
-      mtimeMs: candidate.mtimeMs,
-    };
+  /** Reads the unread transcripts of `dirNames` until each directory has a
+   *  known cwd, or none of its transcripts gives one. */
+  private async learnDirCwds(
+    dirNames: ReadonlySet<string>,
+    unread: readonly TranscriptCandidate[],
+  ): Promise<void> {
+    let remaining = unread.filter((candidate) => dirNames.has(candidate.dirName));
+    while (remaining.length > 0) {
+      remaining = remaining.filter((candidate) => !this.dirCwds.has(candidate.dirName));
+      const batch = remaining.slice(0, READ_BATCH_SIZE);
+      remaining = remaining.slice(batch.length);
+      await Promise.all(batch.map((candidate) => this.metadataOf(candidate)));
+    }
   }
 
   /** The requested path of the directory, else a sibling's cwd. */
@@ -284,6 +391,7 @@ export class SessionIndex {
   private async metadataOf(candidate: TranscriptCandidate): Promise<TranscriptMetadata | null> {
     const cached = this.metadata.get(candidate.filePath);
     if (cached && cached.mtimeMs === candidate.mtimeMs && cached.size === candidate.size) {
+      if (cached.metadata?.fileCwd) this.dirCwds.set(candidate.dirName, cached.metadata.fileCwd);
       return cached.metadata;
     }
     let metadata: TranscriptMetadata | null;
@@ -314,7 +422,12 @@ export class SessionIndex {
     ]);
     // No info: a sidechain, or no title at all.
     if (!info) return null;
-    const facts = scanTranscript(headTail, candidate.sessionId);
+    const facts = await scanTranscriptFile(
+      candidate.filePath,
+      candidate.size,
+      candidate.sessionId,
+      headTail,
+    );
     if (!facts.hasMessages) return null;
     const fileCwd = this.recoverCwd(candidate.dirName, [
       facts.headCwd,

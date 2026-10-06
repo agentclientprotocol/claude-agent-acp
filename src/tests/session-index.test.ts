@@ -15,8 +15,11 @@ import {
   listSessions,
   renameSession,
 } from "@anthropic-ai/claude-agent-sdk";
+import { spawn, type ChildProcess } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
+import { SessionIndexService, writeCustomTitleSidecar } from "../session-index/service.js";
+import { repositoryWorktrees } from "../session-index/worktrees.js";
 import { ListChangedWatcher } from "../session-index/list-changed.js";
 import { SessionTitles } from "../session-titles.js";
 import { initializeClient } from "./helpers.js";
@@ -72,6 +75,8 @@ type TranscriptOptions = {
   /** A first prompt of this many characters, to push the head past 64 KB. */
   hugePrompt?: number;
   trailer?: object[];
+  /** The project directory name; defaults to the encoding of `cwd`. */
+  dirName?: string;
 };
 
 async function writeTranscript(options: TranscriptOptions): Promise<{ id: string; file: string }> {
@@ -79,7 +84,7 @@ async function writeTranscript(options: TranscriptOptions): Promise<{ id: string
   const cwd = options.cwd ?? workspace;
   const recordCwd = options.recordCwd === undefined ? cwd : options.recordCwd;
   const at = options.lastMessageAt ?? Date.parse("2026-01-01T00:00:00Z");
-  const dir = path.join(configDir, "projects", encodeProjectPath(cwd));
+  const dir = path.join(configDir, "projects", options.dirName ?? encodeProjectPath(cwd));
   await fs.mkdir(dir, { recursive: true });
   const common = {
     sessionId: id,
@@ -621,7 +626,7 @@ describe("_session/list_changed", () => {
     const session = await writeTranscript({});
     const notified: string[] = [];
     const watcher = new ListChangedWatcher({
-      projectDirs: async () => [encodeProjectPath(workspace)],
+      projectDirs: async () => ({ dirNames: [encodeProjectPath(workspace)], paths: [workspace] }),
       notify: async (cwd) => {
         notified.push(cwd);
       },
@@ -641,5 +646,309 @@ describe("_session/list_changed", () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(notified.length).toBe(settled);
     watcher.dispose();
+  });
+});
+
+/** Registers `pid` as a live CLI holding `sessionId`. */
+async function registerHolder(pid: number, sessionId: string, extra: object = {}) {
+  await fs.mkdir(path.join(configDir, "sessions"), { recursive: true });
+  await fs.writeFile(
+    path.join(configDir, "sessions", `${pid}.json`),
+    JSON.stringify({ pid, sessionId, updatedAt: Date.now(), ...extra }),
+  );
+}
+
+describe("ownership of a session for delete and rename", () => {
+  it("checks the registry for a session whose query closed here", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    // The stream ended, the husk stays mapped; another process resumed it.
+    agent.sessions[session.id] = mockSessionState({ queryClosed: true }, agent, session.id) as any;
+    await registerHolder(process.pid, session.id);
+
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(fsSync.existsSync(session.file)).toBe(true);
+    await expect(
+      agent.renameSessionTitle({ sessionId: session.id, title: "x" }),
+    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    expect(renameSession).not.toHaveBeenCalled();
+  });
+
+  describe.skipIf(process.platform === "win32")("a CLI child of this process", () => {
+    let child: ChildProcess | undefined;
+    afterEach(() => {
+      child?.kill("SIGKILL");
+      child = undefined;
+    });
+
+    it("is no other writer while it exits after a close", async () => {
+      const deleted = await writeTranscript({});
+      const renamed = await writeTranscript({});
+      child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+      const pid = child.pid!;
+      // The CLI that this adapter just closed is still registered.
+      await registerHolder(pid, deleted.id, { entrypoint: "sdk-ts" });
+      const { agent } = await indexAgent();
+      await agent.deleteSession({ sessionId: deleted.id });
+      expect(fsSync.existsSync(deleted.file)).toBe(false);
+
+      await registerHolder(pid, renamed.id, { entrypoint: "sdk-ts" });
+      await agent.renameSessionTitle({ sessionId: renamed.id, title: "Renamed" });
+      expect((await agent.listSessions({ cwd: workspace })).sessions[0]!.title).toBe("Renamed");
+    });
+  });
+});
+
+describe("session/delete of an AIR client without sessionIndex", () => {
+  it("fails for an unknown session as the SDK delete did, and writes no marker", async () => {
+    const { agent } = createAgent();
+    await initializeClient(agent, air());
+    for (const sessionId of [randomUUID(), "not-a-uuid"]) {
+      const sdkError = await vi.mocked(deleteSession).getMockImplementation()!(sessionId).then(
+        () => undefined,
+        (error: Error) => error,
+      );
+      expect(sdkError).toBeInstanceOf(Error);
+      vi.mocked(deleteSession).mockClear();
+      await expect(agent.deleteSession({ sessionId })).rejects.toThrow(sdkError!.message);
+      expect(deleteSession).not.toHaveBeenCalled();
+    }
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived"))).toBe(false);
+  });
+});
+
+describe("session index service lifecycle", () => {
+  it("starts no watcher after dispose, also for a list in flight", async () => {
+    await writeTranscript({});
+    const service = new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    const inFlight = service.list({ cwd: workspace }, () => undefined);
+    service.dispose();
+    await inFlight;
+    await service.list({ cwd: workspace }, () => undefined);
+    expect((service as any).watcher).toBeUndefined();
+  });
+});
+
+describe("rename of a session with several transcripts", () => {
+  it("titles every copy, and the list shows the new title at once", async () => {
+    const other = path.join(workspace, "other");
+    const small = await writeTranscript({ cwd: other });
+    const large = await writeTranscript({
+      sessionId: small.id,
+      cwd: workspace,
+      trailer: [{ type: "last-prompt", lastPrompt: "x".repeat(500), sessionId: small.id }],
+    });
+    const { agent } = await indexAgent();
+    // Caches the metadata of the listed (larger) copy.
+    expect((await agent.listSessions({})).sessions[0]!.title).not.toBe("Both copies");
+
+    await agent.renameSessionTitle({ sessionId: small.id, title: "Both copies" });
+    for (const file of [small.file, large.file]) {
+      const records = (await fs.readFile(file, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(records.filter((record) => record.type === "custom-title")).toEqual([
+        { type: "custom-title", customTitle: "Both copies", sessionId: small.id },
+      ]);
+    }
+    const page = await agent.listSessions({});
+    expect(page.sessions.map((s) => [s.sessionId, s.title])).toEqual([[small.id, "Both copies"]]);
+  });
+});
+
+describe("delete of a session with several transcripts", () => {
+  it("reports a copy it could not delete and keeps the session archived", async () => {
+    const first = await writeTranscript({ cwd: path.join(workspace, "a") });
+    const second = await writeTranscript({
+      sessionId: first.id,
+      cwd: path.join(workspace, "b"),
+    });
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: first.id });
+    const marker = path.join(configDir, "acp", "archived", first.id);
+    const actual = vi.mocked(deleteSession).getMockImplementation()!;
+    vi.mocked(deleteSession)
+      .mockImplementationOnce(actual)
+      .mockImplementationOnce(async () => {
+        throw new Error("EACCES: permission denied");
+      });
+
+    await expect(agent.deleteSession({ sessionId: first.id })).rejects.toThrow("EACCES");
+    expect([first.file, second.file].filter((file) => fsSync.existsSync(file))).toHaveLength(1);
+    expect(fsSync.existsSync(marker)).toBe(true);
+
+    await agent.deleteSession({ sessionId: first.id });
+    expect([first.file, second.file].filter((file) => fsSync.existsSync(file))).toEqual([]);
+    expect(fsSync.existsSync(marker)).toBe(false);
+  });
+});
+
+describe("cwd recovery from a sibling transcript", () => {
+  it("does not depend on the batch the sibling is read in", async () => {
+    const base = Date.parse("2026-04-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    // Newest, without a cwd of its own; its only sibling with a cwd is the
+    // oldest transcript, past the point where the page is full.
+    const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    const fillers: string[] = [];
+    for (let i = 1; i <= 16; i++) {
+      fillers.push((await writeTranscript({ lastMessageAt: base - i * 1000 })).id);
+    }
+    await writeTranscript({ cwd: other, lastMessageAt: base - 3600_000 });
+    const { agent } = await indexAgent();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const page = await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
+      expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+        [noCwd.id, other],
+        [fillers[0], workspace],
+      ]);
+    }
+  });
+});
+
+describe("a last message longer than the tail window", () => {
+  it("keeps the session at its last message time after a metadata record", async () => {
+    const lastMessageAt = Date.parse("2026-05-01T00:00:00Z");
+    const id = randomUUID();
+    const session = await writeTranscript({
+      sessionId: id,
+      lastMessageAt: lastMessageAt - 60_000,
+      mtimeMs: lastMessageAt + 3600_000,
+      trailer: [
+        {
+          type: "assistant",
+          sessionId: id,
+          cwd: workspace,
+          uuid: randomUUID(),
+          timestamp: new Date(lastMessageAt).toISOString(),
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "y".repeat(300_000) }],
+            stop_reason: "end_turn",
+          },
+        },
+        { type: "custom-title", customTitle: "Renamed later", sessionId: id },
+      ],
+    });
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => [s.sessionId, s.updatedAt])).toEqual([
+      [session.id, new Date(lastMessageAt).toISOString()],
+    ]);
+  });
+});
+
+describe("custom title sidecar", () => {
+  it("survives concurrent writes and leaves other temporary files alone", async () => {
+    const session = await writeTranscript({});
+    const dir = path.join(path.dirname(session.file), session.id);
+    await fs.mkdir(dir, { recursive: true });
+    const foreign = path.join(dir, "custom-title.json.tmp.foreign");
+    await fs.writeFile(foreign, "{}");
+    const titles = Array.from({ length: 20 }, (_, i) => `Title ${i}`);
+    await Promise.all(titles.map((title) => writeCustomTitleSidecar(session.file, title)));
+    const written = JSON.parse(await fs.readFile(path.join(dir, "custom-title.json"), "utf8"));
+    expect(titles).toContain(written.customTitle);
+    expect((await fs.readdir(dir)).sort()).toEqual([
+      "custom-title.json",
+      "custom-title.json.tmp.foreign",
+    ]);
+  });
+});
+
+describe("long project paths that share a prefix", () => {
+  const longBase = () => path.join(workspace, "x".repeat(210));
+
+  it("lists only the directories whose transcripts belong to the path", async () => {
+    const mine = path.join(longBase(), "mine");
+    const theirs = path.join(longBase(), "theirs");
+    const own = await writeTranscript({ cwd: mine });
+    // The CLI hashes a long name differently from the SDK.
+    const prefix = encodeProjectPath(mine).slice(0, 200);
+    const cliCopy = await writeTranscript({ cwd: mine, dirName: `${prefix}-cli0hash` });
+    await writeTranscript({ cwd: theirs });
+    expect(encodeProjectPath(theirs).startsWith(prefix)).toBe(true);
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({ cwd: mine });
+    expect(page.sessions.map((s) => s.sessionId).sort()).toEqual([own.id, cliCopy.id].sort());
+  });
+
+  it("does not notify a cwd of a live record of another long path", async () => {
+    const mine = path.join(longBase(), "mine");
+    const theirs = path.join(longBase(), "theirs");
+    await writeTranscript({ cwd: mine });
+    await writeTranscript({ cwd: theirs });
+    await fs.mkdir(path.join(configDir, "sessions"), { recursive: true });
+    const notified: string[] = [];
+    const service = new SessionIndexService({
+      notifyListChanged: async ({ cwd }) => {
+        notified.push(cwd);
+      },
+      logError: () => {},
+    });
+    await service.list({ cwd: mine }, () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await registerHolder(process.pid, randomUUID(), { cwd: theirs });
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(notified).toEqual([]);
+    await registerHolder(process.pid, randomUUID(), { cwd: mine });
+    const start = Date.now();
+    while (notified.length === 0 && Date.now() - start < 3000) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(notified).toEqual([mine]);
+    service.dispose();
+  });
+});
+
+describe("session title after an explicit rename", () => {
+  it("never publishes the title a turn end read before the rename", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const session: any = { queryClosed: false, cancelled: false, cwd: "/nowhere", query: {} };
+    agent.sessions.s1 = session;
+    let resolveInfo!: (info: any) => void;
+    vi.mocked(getSessionInfo).mockImplementationOnce(
+      () => new Promise((resolve) => (resolveInfo = resolve)),
+    );
+    const turnEnd = titles.onTurnEnd(session);
+    await titles.setExplicitTitle("Mine", async () => {});
+    resolveInfo({ customTitle: "Old", summary: "Old", lastModified: Date.now() });
+    await turnEnd;
+    await titles.onTurnEnd(session);
+    expect(updates.map((update) => update.update.title)).toEqual(["Mine"]);
+  });
+});
+
+describe("worktrees after git worktree move", () => {
+  it("follows a moved linked worktree", async () => {
+    const repo = path.join(workspace, "repo");
+    const before = path.join(workspace, "before");
+    const after = path.join(workspace, "after");
+    const meta = path.join(repo, ".git", "worktrees", "wt");
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(before);
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(before, ".git")}\n`);
+    // The move rewrites the gitdir file only: the directory keeps its mtime.
+    const worktreesDir = path.dirname(meta);
+    await fs.utimes(worktreesDir, 1_700_000_000, 1_700_000_000);
+    expect(await repositoryWorktrees(repo)).toEqual([repo, before]);
+
+    await fs.rename(before, after);
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(after, ".git")}\n`);
+    await fs.utimes(worktreesDir, 1_700_000_000, 1_700_000_000);
+    expect(await repositoryWorktrees(repo)).toEqual([repo, after]);
   });
 });

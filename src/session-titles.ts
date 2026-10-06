@@ -140,7 +140,15 @@ export class SessionTitles {
    *  not possible do we fall back to `summary`, which for an SDK-driven session
    *  is just the raw first prompt. */
   async onTurnEnd(session: Session): Promise<void> {
+    // A title the client set is final; the session info read below could
+    // still hold the previous one.
+    if (this.explicit) {
+      return;
+    }
     const info = await this.readSessionInfo(session);
+    if (this.explicit) {
+      return;
+    }
 
     if (info?.customTitle) {
       this.settled = true;

@@ -330,6 +330,26 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("finds no other holder in a CLI child of this process", async () => {
+    const dir = await registryWith({
+      "20.json": { pid: 20, sessionId: "closed-here", updatedAt: now },
+      "21.json": { pid: 21, sessionId: "both", updatedAt: now },
+      "22.json": { pid: 22, sessionId: "both", updatedAt: now },
+    });
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      pidDomain: async () => "darwin",
+      ownPid: 1000,
+      parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 22 ? 1 : 1000])),
+    });
+    expect(await registry.holder("closed-here")).toBeUndefined();
+    // Our exiting child and another process: the other one holds it.
+    expect((await registry.holder("both"))?.pid).toBe(22);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("is empty when the registry does not exist", async () => {
     const registry = new LiveSessionRegistry({ dir: () => "/nonexistent/registry" });
     expect((await registry.snapshot()).size).toBe(0);
