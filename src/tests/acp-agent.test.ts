@@ -44,6 +44,7 @@ import {
   messageIdForGrouping,
   buildConfigOptions,
   createFastModeConfigOption,
+  discoverCustomAgents,
   runPromptWithCancellation,
   type AcpClient,
   type SDKMessageFilter,
@@ -2747,6 +2748,72 @@ describe("task notification replay", () => {
     expect(asyncTaskUpdates(updates)).toEqual([]);
   });
 
+  it("takes the output path from the tool result when the notification has none", async () => {
+    const timeoutResult = record({
+      ...bashLaunch[2],
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_bash",
+            content:
+              "Command did not complete within its 120s timeout and was moved to the background (ID: bg1). Output is being written to: /tmp/claude/tasks/bg1.output.",
+          },
+        ],
+      },
+    });
+    const bare = record({
+      type: "user",
+      uuid: "notification-bare",
+      message: {
+        role: "user",
+        content:
+          "<task-notification>\n<task-id>bg1</task-id>\n<tool-use-id>toolu_bash</tool-use-id>\n" +
+          "<status>completed</status>\n</task-notification>",
+      },
+      origin: { kind: "task-notification" },
+    });
+    const updates = await replay([bashLaunch[0], bashLaunch[1], timeoutResult, bare]);
+
+    expect(asyncTaskUpdates(updates)[0]).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      asyncTaskId: "bg1",
+      outputFilePath: "/tmp/claude/tasks/bg1.output",
+    });
+  });
+
+  it("sends nothing for a task that a Monitor tool call started", async () => {
+    const monitorLaunch = record({
+      ...bashLaunch[1],
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_bash",
+            name: "Monitor",
+            input: { command: "tail -f build.log", description: "Watch the build log" },
+          },
+        ],
+      },
+    });
+    const updates = await replay([
+      bashLaunch[0],
+      monitorLaunch,
+      bashLaunch[2],
+      notification("completed"),
+    ]);
+
+    expect(asyncTaskUpdates(updates)).toEqual([]);
+    // The Monitor tool call itself stays in the transcript.
+    expect(
+      updates.some(
+        ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === "toolu_bash",
+      ),
+    ).toBe(true);
+  });
+
   it("sends one terminal state for a repeated notification", async () => {
     const updates = await replay([
       ...bashLaunch,
@@ -3988,6 +4055,8 @@ describe("permission request cancellation", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -6371,6 +6440,279 @@ describe("subagent permission attribution (issue #851)", () => {
     });
   });
 
+  it("takes the output path of a subagent's background Bash from its text in both orders", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        subagents: {},
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      } as ClientCapabilities & { subagents: Record<string, never> },
+    });
+    const system = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...fields,
+    });
+    const assistant = (parentToolUseId: string | null, content: unknown[]) => ({
+      type: "assistant",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: { role: "assistant", content, usage: SUBAGENT_TEST_USAGE },
+    });
+    // A subagent tool result has no `tool_use_result`.
+    const childResult = (toolUseId: string, text: string) => ({
+      type: "user",
+      parent_tool_use_id: "toolu_agent",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: toolUseId, content: text }],
+      },
+    });
+    const timeoutPath = "/tmp/claude/tasks/btimeout.output";
+    const backgroundPath = "/tmp/claude/tasks/bback.output";
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        assistant(null, [
+          {
+            type: "tool_use",
+            id: "toolu_agent",
+            name: "Agent",
+            input: { description: "Investigate", prompt: "Find the bug" },
+          },
+        ]),
+        { ...taskStarted("agent-1", "toolu_agent"), subagent_type: "Explore" },
+        assistant("toolu_agent", [
+          { type: "tool_use", id: "child-slow", name: "Bash", input: { command: "npm test" } },
+          {
+            type: "tool_use",
+            id: "child-bg",
+            name: "Bash",
+            input: { command: "npm start", run_in_background: true },
+          },
+          {
+            type: "tool_use",
+            id: "child-cat",
+            name: "Bash",
+            input: { command: "sed -n 1,20p src/async-tasks.ts" },
+          },
+        ]),
+        // A command that hits its timeout goes to the background before its result.
+        system({
+          subtype: "task_started",
+          task_id: "btimeout",
+          task_type: "local_bash",
+          description: "npm test",
+          is_backgrounded: false,
+          tool_use_id: "child-slow",
+        }),
+        system({
+          subtype: "task_updated",
+          task_id: "btimeout",
+          patch: { is_backgrounded: true },
+        }),
+        childResult(
+          "child-slow",
+          `Command did not complete within its 120s timeout and was moved to the background (ID: btimeout). Output is being written to: ${timeoutPath}.`,
+        ),
+        // A run_in_background command reports its result first.
+        childResult(
+          "child-bg",
+          `Command running in background with ID: bback. Output is being written to: ${backgroundPath}. You will be notified when it completes.`,
+        ),
+        system({
+          subtype: "task_started",
+          task_id: "bback",
+          task_type: "local_bash",
+          description: "npm start",
+          is_backgrounded: true,
+          tool_use_id: "child-bg",
+        }),
+        // A foreground command prints a background marker text.
+        childResult(
+          "child-cat",
+          'Command running in background with ID: bg1. Output is being written to: /tmp/tasks/bg1.output. You will be notified when it completes.\nconst marker = "Command running in background with ID: ";',
+        ),
+        system({
+          subtype: "task_notification",
+          task_id: "agent-1",
+          tool_use_id: "toolu_agent",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+        }),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    const tasks = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate.startsWith("async_task_") ? [{ sessionId, ...update }] : [],
+    );
+    expect(tasks).toEqual([
+      expect.objectContaining({
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "btimeout",
+        toolCallId: "child-slow",
+      }),
+      {
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_progress",
+        asyncTaskId: "btimeout",
+        outputFilePath: timeoutPath,
+      },
+      expect.objectContaining({
+        sessionId: "agent-1",
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: "bback",
+        toolCallId: "child-bg",
+        outputFilePath: backgroundPath,
+      }),
+    ]);
+    const backgrounded = (toolCallId: string) =>
+      updates.some(
+        ({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === toolCallId &&
+          (update._meta as any)?.jetbrains?.air?.asyncTasks?.backgrounded === true,
+      );
+    expect(backgrounded("child-slow")).toBe(true);
+    expect(backgrounded("child-bg")).toBe(true);
+    expect(backgrounded("child-cat")).toBe(false);
+  });
+
+  it("hides the async task of a Monitor tool call and keeps the tool call", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => updates.push(notification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+      },
+    });
+    const system = (fields: Record<string, unknown>) => ({
+      type: "system",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      ...fields,
+    });
+    const monitorResult = (toolUseId: string, taskId: string) => ({
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: `Monitor started (task ${taskId})`,
+          },
+        ],
+      },
+    });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "monitor-a",
+                name: "Monitor",
+                input: { command: "tail -f a.log", description: "Watch a.log" },
+              },
+              {
+                type: "tool_use",
+                id: "monitor-b",
+                name: "Monitor",
+                input: { command: "tail -f b.log", description: "Watch b.log" },
+              },
+            ],
+            usage: SUBAGENT_TEST_USAGE,
+          },
+        },
+        // The result comes first, so the tool use cache no longer has the tool.
+        monitorResult("monitor-a", "mon-a"),
+        // The SDK reports a Monitor task as a background shell.
+        system({
+          subtype: "task_started",
+          task_id: "mon-a",
+          task_type: "local_bash",
+          description: "Watch a.log",
+          is_backgrounded: true,
+          tool_use_id: "monitor-a",
+        }),
+        // This task gets its tool call id only from a later progress.
+        system({
+          subtype: "task_started",
+          task_id: "mon-b",
+          task_type: "local_bash",
+          description: "Watch b.log",
+          is_backgrounded: true,
+        }),
+        system({ subtype: "task_progress", task_id: "mon-b", summary: "line" }),
+        system({
+          subtype: "task_progress",
+          task_id: "mon-b",
+          tool_use_id: "monitor-b",
+          summary: "line",
+        }),
+        monitorResult("monitor-b", "mon-b"),
+        system({
+          subtype: "task_notification",
+          task_id: "mon-a",
+          tool_use_id: "monitor-a",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+        }),
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"))).toEqual(
+      [],
+    );
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "mon-b" }),
+    ).resolves.toEqual({ stopped: false });
+    for (const toolCallId of ["monitor-a", "monitor-b"]) {
+      expect(
+        updates.some(
+          ({ update }) => update.sessionUpdate === "tool_call" && update.toolCallId === toolCallId,
+        ),
+      ).toBe(true);
+    }
+  });
+
   it("holds async_task_spawned until the Bash result brings the tool id", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6612,13 +6954,36 @@ describe("subagent permission attribution (issue #851)", () => {
           },
           {
             type: "tool_use",
+            id: "child-watch",
+            name: "Bash",
+            input: { command: "tail -f build.log", run_in_background: true },
+          },
+          {
+            type: "tool_use",
             id: "child-monitor",
             name: "Monitor",
             input: { command: "tail -f build.log", description: "watch the build log" },
           },
+          {
+            type: "tool_use",
+            id: "child-server",
+            name: "Bash",
+            input: { command: "npm start", run_in_background: true },
+          },
+          {
+            type: "tool_use",
+            id: "child-held",
+            name: "Bash",
+            input: { command: "npm run watch", run_in_background: true },
+          },
         ]);
         yield backgroundTask("shell-child", "child-bash", "npm test");
+        yield backgroundTask("watch-child", "child-watch", "tail -f build.log");
+        // The SDK reports a Monitor task as a background shell.
         yield backgroundTask("monitor-child", "child-monitor", "watch the build log");
+        yield backgroundTask("shell-late", "child-server", "npm start");
+        // This task names no tool call yet, so its spawn waits.
+        yield { ...backgroundTask("shell-held", "", "npm run watch"), tool_use_id: undefined };
         yield assistant(null, [
           {
             type: "tool_use",
@@ -6633,6 +6998,10 @@ describe("subagent permission attribution (issue #851)", () => {
         tasksStarted();
         await released;
         yield taskNotification("agent-1", "toolu_agent");
+        // The task of the subagent ends after the subagent finished.
+        yield taskNotification("shell-late", "child-server");
+        // The held task gets its tool call id, and so its spawn, after the subagent finished.
+        yield taskNotification("shell-held", "child-held");
         yield successResult();
         yield { type: "system", subtype: "session_state_changed", state: "idle" };
       }
@@ -6647,12 +7016,17 @@ describe("subagent permission attribution (issue #851)", () => {
     await started;
     // AIR stops a task with the root session id and the SDK task id.
     await expect(
-      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "watch-child" }),
     ).resolves.toEqual({ stopped: true });
+    // The client never sees a Monitor task, so it cannot stop it.
+    await expect(
+      agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
+    ).resolves.toEqual({ stopped: false });
     release();
     await prompt;
 
-    expect(query.stopTask).toHaveBeenCalledWith("monitor-child");
+    expect(query.stopTask).toHaveBeenCalledWith("watch-child");
+    expect(query.stopTask).not.toHaveBeenCalledWith("monitor-child");
     const lifecycle = updates.flatMap(({ sessionId, update }) =>
       "asyncTaskId" in update
         ? [[sessionId, update.sessionUpdate, update.asyncTaskId, (update as any).state]]
@@ -6660,11 +7034,15 @@ describe("subagent permission attribution (issue #851)", () => {
     );
     expect(lifecycle).toEqual([
       ["agent-1", "async_task_spawned", "shell-child", undefined],
-      ["agent-1", "async_task_spawned", "monitor-child", undefined],
+      ["agent-1", "async_task_spawned", "watch-child", undefined],
+      ["agent-1", "async_task_spawned", "shell-late", undefined],
       ["test-session", "async_task_spawned", "shell-root", undefined],
       ["agent-1", "async_task_state_update", "shell-child", "completed"],
       ["test-session", "async_task_state_update", "shell-root", "completed"],
-      ["agent-1", "async_task_state_update", "monitor-child", "stopped"],
+      ["agent-1", "async_task_state_update", "watch-child", "stopped"],
+      ["agent-1", "async_task_state_update", "shell-late", "completed"],
+      ["agent-1", "async_task_spawned", "shell-held", undefined],
+      ["agent-1", "async_task_state_update", "shell-held", "completed"],
     ]);
     // The stop acknowledgement goes to the transcript that holds the task.
     const stopAcknowledgement = updates.find(
@@ -10294,6 +10672,8 @@ describe("session/close", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -10387,6 +10767,8 @@ describe("session/delete", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -10507,6 +10889,8 @@ describe("getOrCreateSession param change detection", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -14905,6 +15289,8 @@ describe("post-error recovery", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -17841,13 +18227,21 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
     await agent.cancel({ sessionId: "test-session" });
-    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    // The followup is live, so the turn ends at the interrupt's trailer, or,
+    // as here where that trailer lags, at the next prompt's echo.
     releaseAfterCancel();
 
     const second = await agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "next" }],
     });
+    // With the usage its own result recorded (issue #844).
+    await expect(first).resolves.toEqual(
+      expect.objectContaining({
+        stopReason: "cancelled",
+        usage: expect.objectContaining({ totalTokens: 15 }),
+      }),
+    );
     expect(second.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });
@@ -18134,13 +18528,15 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     });
     await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
     await agent.cancel({ sessionId: "test-session" });
-    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+    // A live cycle, so the turn ends at the interrupt's trailer, or here, where
+    // that trailer lags, at the next prompt's echo.
     releaseAfterCancel();
 
     const second = await agent.prompt({
       sessionId: "test-session",
       prompt: [{ type: "text", text: "next" }],
     });
+    await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "cancelled" }));
     expect(second.stopReason).toBe("end_turn");
     await agent.sessions["test-session"]?.consumer;
   });
@@ -18893,6 +19289,23 @@ describe("turn steering (_session/steering)", () => {
     expect(JSON.stringify(injected.message.content)).toContain("also handle X");
   });
 
+  /** Gives test-session a native subagent, agent-42, whose child session the client knows. */
+  function announceChildSession(agent: ClaudeAcpAgent): void {
+    agent.sessions["test-session"].nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "child-session",
+          parentSessionId: "test-session",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+        },
+      ],
+    ]);
+  }
+
   it.each([
     {
       name: "a permission request",
@@ -18926,6 +19339,47 @@ describe("turn steering (_session/steering)", () => {
       response: { action: "accept", content: { question_0: "Blue" } },
     },
     {
+      name: "a permission request of a native subagent, sent to its child session",
+      start: async (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+        announceChildSession(agent);
+        return agent.canUseTool("test-session")("Bash", { command: "npm test" }, {
+          signal,
+          suggestions: [],
+          toolUseID: "tool-child-permission",
+          agentID: "agent-42",
+        } as any);
+      },
+      requestSessionId: "child-session",
+      response: { outcome: { outcome: "selected", optionId: "allow-once" } },
+    },
+    {
+      name: "an AskUserQuestion of a native subagent, sent to its child session",
+      start: async (agent: ClaudeAcpAgent, signal: AbortSignal) => {
+        await initializeClient(agent, {
+          subagents: {},
+          elicitation: { form: {}, url: {} },
+        } as ClientCapabilities);
+        announceChildSession(agent);
+        return agent.canUseTool("test-session")(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Pick a color",
+                header: "Color",
+                options: [{ label: "Blue", description: "Use blue" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          { signal, suggestions: [], toolUseID: "tool-child-question", agentID: "agent-42" } as any,
+        );
+      },
+      requestSessionId: "child-session",
+      response: { action: "accept", content: { question_0: "Blue" } },
+    },
+    {
       name: "an MCP elicitation",
       start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
         (agent as any).handleMcpElicitation("test-session", { form: true, url: true })(
@@ -18954,49 +19408,63 @@ describe("turn steering (_session/steering)", () => {
         ),
       response: { action: "accept", content: { choice: "retry_fallback" } },
     },
-  ])("uses priority:'later' while $name is pending", async ({ start, response }) => {
-    let resolveUserInput!: (response: any) => void;
-    const userInputResponse = new Promise<any>((resolve) => (resolveUserInput = resolve));
-    const userInputRequest = vi.fn(() => userInputResponse);
-    const input = new Pushable<any>();
-    const inputPush = vi.spyOn(input, "push");
-    const agent = new ClaudeAcpAgent(
-      {
-        sessionUpdate: async () => {},
-        requestPermission: userInputRequest,
-        createElicitation: userInputRequest,
-      } as unknown as AcpClient,
-      { log: () => {}, error: () => {} },
-    );
-    agent.sessions["test-session"] = mockSessionState({
-      input,
-      turnQueue: [
+  ])(
+    "uses priority:'later' while $name is pending",
+    async ({
+      start,
+      response,
+      requestSessionId = "test-session",
+    }: {
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) => Promise<unknown>;
+      response: unknown;
+      requestSessionId?: string;
+    }) => {
+      let resolveUserInput!: (response: any) => void;
+      const userInputResponse = new Promise<any>((resolve) => (resolveUserInput = resolve));
+      const userInputRequest = vi.fn(() => userInputResponse);
+      const input = new Pushable<any>();
+      const inputPush = vi.spyOn(input, "push");
+      const agent = new ClaudeAcpAgent(
         {
-          promptUuid: "running",
-          isLocalOnlyCommand: false,
-          settled: false,
-          resolve: () => {},
-          reject: () => {},
-        },
-      ],
-    });
+          sessionUpdate: async () => {},
+          requestPermission: userInputRequest,
+          createElicitation: userInputRequest,
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      agent.sessions["test-session"] = mockSessionState({
+        input,
+        turnQueue: [
+          {
+            promptUuid: "running",
+            isLocalOnlyCommand: false,
+            settled: false,
+            resolve: () => {},
+            reject: () => {},
+          },
+        ],
+      });
 
-    const pending = start(agent, new AbortController().signal);
-    await waitFor(() => userInputRequest.mock.calls.length === 1);
+      const pending = start(agent, new AbortController().signal);
+      await waitFor(() => userInputRequest.mock.calls.length === 1);
+      expect((userInputRequest.mock.calls[0] as unknown[])[0]).toMatchObject({
+        sessionId: requestSessionId,
+      });
 
-    await expect(
-      agent.steer({
-        sessionId: "test-session",
-        prompt: [{ type: "text", text: "also handle this" }],
-      }),
-    ).resolves.toEqual({ outcome: "injected" });
-    expect(inputPush).toHaveBeenCalledTimes(1);
-    expect(inputPush.mock.calls[0][0].priority).toBe("later");
+      await expect(
+        agent.steer({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "also handle this" }],
+        }),
+      ).resolves.toEqual({ outcome: "injected" });
+      expect(inputPush).toHaveBeenCalledTimes(1);
+      expect(inputPush.mock.calls[0][0].priority).toBe("later");
 
-    resolveUserInput(response);
-    await pending;
-    expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
-  });
+      resolveUserInput(response);
+      await pending;
+      expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
+    },
+  );
 
   it("publishes an optimistic goal update for a steered goal replacement", async () => {
     const updates: any[] = [];
@@ -20222,6 +20690,8 @@ describe("session/cancel wedge recovery (issue #680)", () => {
         cachedWriteTokens: 0,
       },
       configOptions: [],
+      agents: [],
+      currentAgent: "default",
       fastModeEnabled: false,
       abortController: new AbortController(),
       emitRawSDKMessages: false,
@@ -21940,59 +22410,264 @@ describe("messageIdForGrouping", () => {
   });
 });
 
-describe("buildConfigOptions model option resolved description", () => {
-  const modes = { currentModeId: "default", availableModes: [] };
-  const models = {
-    currentModelId: "default",
-    availableModels: [{ modelId: "default", name: "Default", description: "" }],
-  };
+describe("agent selection config option", () => {
+  const baseModes = { currentModeId: "default", availableModes: [] };
+  const baseModels = { currentModelId: "default", availableModels: [] };
 
-  it("sets description to the named model's displayName when resolvedModel matches", () => {
-    const modelInfos = [
-      {
-        value: "default",
-        displayName: "Default",
-        description: "",
-        resolvedModel: "claude-sonnet-5",
-      },
-      {
-        value: "sonnet",
-        displayName: "Claude Sonnet 5",
-        description: "Balanced",
-        resolvedModel: "claude-sonnet-5",
-      },
-    ];
-    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBe("Claude Sonnet 5");
+  describe("discoverCustomAgents", () => {
+    it("filters out Claude Code's built-in subagents", async () => {
+      const q = {
+        supportedAgents: async () => [
+          { name: "claude", description: "catch-all" },
+          { name: "Explore", description: "search" },
+          { name: "general-purpose", description: "gp" },
+          { name: "Plan", description: "architect" },
+          { name: "statusline-setup", description: "status" },
+          { name: "my-reviewer", description: "Reviews code" },
+          { name: "my-writer", description: "Writes docs" },
+        ],
+      } as any;
+      const agents = await discoverCustomAgents(q);
+      expect(agents.map((a) => a.name)).toEqual(["my-reviewer", "my-writer"]);
+    });
+
+    it("excludes a custom agent named 'default' (reserved sentinel)", async () => {
+      const q = {
+        supportedAgents: async () => [
+          { name: "default", description: "collides with the synthetic Default entry" },
+          { name: "my-reviewer", description: "Reviews code" },
+        ],
+      } as any;
+      const agents = await discoverCustomAgents(q);
+      expect(agents.map((a) => a.name)).toEqual(["my-reviewer"]);
+    });
+
+    it("returns an empty list when discovery throws", async () => {
+      const q = {
+        supportedAgents: async () => {
+          throw new Error("control request failed");
+        },
+      } as any;
+      expect(await discoverCustomAgents(q)).toEqual([]);
+    });
   });
 
-  it("falls back to resolvedModel itself when no named model shares it", () => {
-    const modelInfos = [
-      {
-        value: "default",
-        displayName: "Default",
-        description: "",
-        resolvedModel: "claude-opus-5-20251201",
-      },
-    ];
-    const options = buildConfigOptions(modes, models, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBe("claude-opus-5-20251201");
+  describe("buildConfigOptions agent option", () => {
+    it("omits the agent option when no custom agents are configured", () => {
+      const options = buildConfigOptions(baseModes, baseModels, [], undefined, [], "default");
+      expect(options.find((o) => o.id === "agent")).toBeUndefined();
+    });
+
+    it("adds an agent option with a synthetic Default entry when custom agents exist", () => {
+      const agents = [
+        { name: "my-reviewer", description: "Reviews code" },
+        // empty description should normalize to undefined, not ""
+        { name: "my-writer", description: "" },
+      ];
+      const options = buildConfigOptions(
+        baseModes,
+        baseModels,
+        [],
+        undefined,
+        agents,
+        "my-reviewer",
+      );
+      const agentOption = options.find((o) => o.id === "agent");
+      expect(agentOption).toBeDefined();
+      expect(agentOption!.currentValue).toBe("my-reviewer");
+      expect(agentOption!.type).toBe("select");
+      const entries = (agentOption as any).options;
+      expect(entries.map((o: any) => o.value)).toEqual(["default", "my-reviewer", "my-writer"]);
+      expect(entries[2].description).toBeUndefined();
+    });
   });
 
-  it("leaves description undefined when default model has no resolvedModel", () => {
-    const modelsNoDesc = {
+  describe("buildConfigOptions model option resolved description", () => {
+    const modes = { currentModeId: "default", availableModes: [] };
+    const models = {
       currentModelId: "default",
-      availableModels: [{ modelId: "default", name: "Default" }],
+      availableModels: [{ modelId: "default", name: "Default", description: "" }],
     };
-    const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
-    const options = buildConfigOptions(modes, modelsNoDesc, modelInfos as any, undefined);
-    const modelOption = options.find((o) => o.id === "model");
-    const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
-    expect(defaultEntry.description).toBeUndefined();
+
+    it("sets description to the named model's displayName when resolvedModel matches", () => {
+      const modelInfos = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "",
+          resolvedModel: "claude-sonnet-5",
+        },
+        {
+          value: "sonnet",
+          displayName: "Claude Sonnet 5",
+          description: "Balanced",
+          resolvedModel: "claude-sonnet-5",
+        },
+      ];
+      const options = buildConfigOptions(
+        modes,
+        models,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBe("Claude Sonnet 5");
+    });
+
+    it("falls back to resolvedModel itself when no named model shares it", () => {
+      const modelInfos = [
+        {
+          value: "default",
+          displayName: "Default",
+          description: "",
+          resolvedModel: "claude-opus-5-20251201",
+        },
+      ];
+      const options = buildConfigOptions(
+        modes,
+        models,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBe("claude-opus-5-20251201");
+    });
+
+    it("leaves description undefined when default model has no resolvedModel", () => {
+      const modelsNoDesc = {
+        currentModelId: "default",
+        availableModels: [{ modelId: "default", name: "Default" }],
+      };
+      const modelInfos = [{ value: "default", displayName: "Default", description: "" }];
+      const options = buildConfigOptions(
+        modes,
+        modelsNoDesc,
+        modelInfos as any,
+        undefined,
+        [],
+        "default",
+      );
+      const modelOption = options.find((o) => o.id === "model");
+      const defaultEntry = (modelOption as any).options.find((o: any) => o.value === "default");
+      expect(defaultEntry.description).toBeUndefined();
+    });
+  });
+
+  describe("switching the agent", () => {
+    function createMockAgent() {
+      const mockClient = { sessionUpdate: async () => {} } as unknown as AcpClient;
+      return new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    }
+
+    const agents = [{ name: "my-reviewer", description: "Reviews code" }];
+
+    function injectSession(agent: ClaudeAcpAgent, sessionId: string) {
+      function* empty() {}
+      const applyFlagSettings = vi.fn(async () => {});
+      const gen = Object.assign(empty(), {
+        interrupt: vi.fn(),
+        close: vi.fn(),
+        applyFlagSettings,
+      });
+      agent.sessions[sessionId] = {
+        query: gen as any,
+        input: new Pushable(),
+        cancelled: false,
+        titles: new SessionTitles(agent, sessionId),
+        cwd: "/test",
+        sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+        modes: { currentModeId: "default", availableModes: [] },
+        models: { currentModelId: "default", availableModels: [] },
+        modelInfos: [],
+        settingsManager: { dispose: vi.fn() } as any,
+        accumulatedUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedReadTokens: 0,
+          cachedWriteTokens: 0,
+        },
+        configOptions: buildConfigOptions(baseModes, baseModels, [], undefined, agents, "default"),
+        agents,
+        currentAgent: "default",
+        fastModeEnabled: false,
+        abortController: new AbortController(),
+        emitRawSDKMessages: false,
+        forwardSubagentText: false,
+        contextWindowSize: 200000,
+        contextWindowAuthoritative: false,
+        providerCacheKey: "default",
+        taskState: new Map(),
+        toolUseCache: {},
+        emittedToolCalls: new Set(),
+        liveBackgroundTasks: new Map(),
+        emittedAssistantText: false,
+        owedTrailingIdles: 0,
+        messageIdToUuid: new Map(),
+        sessionFailureState: { epoch: randomUUID(), revisions: new Map(), active: new Map() },
+      };
+      return { session: agent.sessions[sessionId]!, applyFlagSettings };
+    }
+
+    it("applies the agent flag live without restarting the subprocess", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s1");
+
+      const result = await agent.setSessionConfigOption({
+        sessionId: "s1",
+        configId: "agent",
+        value: "my-reviewer",
+      });
+
+      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: "my-reviewer" });
+      expect(session.currentAgent).toBe("my-reviewer");
+      // The whole point of the SDK >= 0.3.161 approach: no process teardown.
+      expect(session.query.interrupt).not.toHaveBeenCalled();
+      expect(session.abortController.signal.aborted).toBe(false);
+      expect(agent.sessions["s1"]).toBe(session);
+      const agentOption = result.configOptions.find((o) => o.id === "agent");
+      expect(agentOption?.currentValue).toBe("my-reviewer");
+    });
+
+    it("clears the flag (agent: null) when switching back to default", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s2");
+      session.currentAgent = "my-reviewer";
+
+      await agent.setSessionConfigOption({
+        sessionId: "s2",
+        configId: "agent",
+        value: "default",
+      });
+
+      expect(applyFlagSettings).toHaveBeenCalledWith({ agent: null });
+      expect(session.currentAgent).toBe("default");
+    });
+
+    it("leaves tracked state untouched when the live switch is rejected", async () => {
+      const agent = createMockAgent();
+      const { session, applyFlagSettings } = injectSession(agent, "s3");
+      applyFlagSettings.mockRejectedValueOnce(new Error("control channel closed"));
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "s3",
+          configId: "agent",
+          value: "my-reviewer",
+        }),
+      ).rejects.toThrow("control channel closed");
+
+      // The flag never applied, so neither currentAgent nor the config option
+      // moves — no desync with the agent the SDK is actually running.
+      expect(session.currentAgent).toBe("default");
+      const agentOption = session.configOptions.find((o) => o.id === "agent");
+      expect(agentOption?.currentValue).toBe("default");
+    });
   });
 });
 

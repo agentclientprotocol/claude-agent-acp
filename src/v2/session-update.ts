@@ -5,6 +5,14 @@
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { v2AvailableCommands, v2ConfigOptions } from "./session.js";
+import { v2ToolCallUpdate } from "./tool-call.js";
+
+/**
+ * The id of the plan of a session. v1 has one plan per session, which every
+ * plan update replaces whole, from TodoWrite and from the Task tools alike.
+ * v2 tracks plans by id, so that plan gets one.
+ */
+export const SESSION_PLAN_ID = "plan";
 
 /**
  * The v2 form of a v1 session update, or `undefined` when v2 has no
@@ -24,7 +32,29 @@ export function v2SessionUpdate(
     case "session_info_update":
     case "usage_update":
     case "notice":
+    case "compaction_update":
+    case "compaction_summary_chunk":
       return update;
+    case "agent_message_chunk":
+    case "agent_thought_chunk":
+    case "user_message_chunk": {
+      // v2 requires the id of the message a chunk belongs to; v1 allows none.
+      const { messageId, ...chunk } = update;
+      if (!messageId) {
+        throw new Error(`An ACP v2 ${update.sessionUpdate} needs a messageId`);
+      }
+      return { ...chunk, messageId };
+    }
+    case "tool_call":
+    case "tool_call_update":
+      return v2ToolCallUpdate(update);
+    case "plan":
+      // A v2 plan of items is replaced whole as well.
+      return {
+        sessionUpdate: "plan_update",
+        plan: { type: "items", planId: SESSION_PLAN_ID, entries: update.entries },
+        ...(update._meta != null ? { _meta: update._meta } : {}),
+      };
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

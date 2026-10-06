@@ -6,6 +6,8 @@
 import {
   RequestError,
   type AvailableCommand,
+  type ForkSessionRequest,
+  type LoadSessionRequest,
   type McpServer,
   type NewSessionRequest,
   type NewSessionResponse,
@@ -25,18 +27,61 @@ export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionReq
 }
 
 /**
- * `replayFrom` is rejected until the v2 surface can translate the replayed
- * history, which needs the message and tool call updates.
+ * The v1 request that a v2 `session/resume` means.
+ *
+ * v2 restores a session with `session/resume` and replays its history only
+ * when `replayFrom` asks for it. v1 has two methods: `session/resume`, which
+ * never replays, and `session/load`, which replays the whole history before it
+ * responds. `replayFrom: { type: "start" }` is the second; a cursor that
+ * starts elsewhere is rejected.
  */
-export function v1ResumeSessionRequest(params: v2.ResumeSessionRequest): ResumeSessionRequest {
+export function v1RestoreSessionRequest(
+  params: v2.ResumeSessionRequest,
+):
+  | { method: "resume"; request: ResumeSessionRequest }
+  | { method: "load"; request: LoadSessionRequest } {
   const { replayFrom, mcpServers, ...request } = params;
-  if (replayFrom != null) {
+  if (replayFrom == null) {
+    return {
+      method: "resume",
+      request: { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) },
+    };
+  }
+  if (replayFrom.type !== "start") {
     throw RequestError.invalidParams(
       { replayFrom },
-      "The ACP v2 surface does not replay session history yet",
+      `Replaying from a ${replayFrom.type} cursor is not supported`,
     );
   }
-  return { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) };
+  return {
+    method: "load",
+    request: { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) },
+  };
+}
+
+/**
+ * The v1 requests that a v2 `session/fork` means.
+ *
+ * The agent's v1 fork copies the transcript into a new session and returns
+ * only its id; a v1 client then resumes or loads it. A v2 fork returns the new
+ * session with its config options, like `session/new`, so the client can
+ * prompt it. The v2 surface therefore forks, then resumes the fork without
+ * replay, with the request's `cwd`, `additionalDirectories`, and
+ * `mcpServers`. The request's `_meta` goes to the fork alone.
+ */
+export function v1ForkSessionRequests(params: v2.ForkSessionRequest): {
+  fork: ForkSessionRequest;
+  resume: (sessionId: string) => ResumeSessionRequest;
+} {
+  const { mcpServers, _meta, ...request } = params;
+  const session = {
+    ...request,
+    ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
+  };
+  return {
+    fork: { ...session, ...(_meta != null ? { _meta } : {}) },
+    resume: (sessionId) => ({ ...session, sessionId }),
+  };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */

@@ -1,6 +1,7 @@
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { describe, expect, it } from "vitest";
 import type { PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
+import { v2DiffContent } from "../diff.js";
 import { normalizeDurablePermissionChangeSet } from "../permissions/normalization.js";
 import { buildClaudePermissionPresentation } from "../permissions/presentation.js";
 
@@ -516,5 +517,41 @@ describe("Claude permission presentation for a client that is not AIR", () => {
         },
       ],
     });
+  });
+});
+
+describe("Claude permission presentation for a v2 client", () => {
+  const v2 = new ClientCapabilities(false, false, false, undefined, true);
+
+  it("gives the prompt a title and description of its own, apart from the tool call", () => {
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "ExitPlanMode",
+      input: { plan: "Do it." },
+      toolUseID: "tool-4",
+      decisionReason: "Plan mode asks before coding.",
+      capabilities: v2,
+    });
+    expect(presentation).toMatchObject({
+      title: "Ready to code?",
+      description: "Reason: Plan mode asks before coding.",
+      toolCall: { title: "Approve Plan" },
+    });
+    expect(presentation).not.toHaveProperty("_meta");
+  });
+
+  it("shows the exact preview patch, which the tool call does not show", () => {
+    const preview = [
+      v2DiffContent("/work/a.ts", "update", [
+        { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] },
+      ]),
+    ];
+    const presentation = buildClaudePermissionPresentation({
+      toolName: "Edit",
+      input: { file_path: "/work/a.ts", old_string: "a", new_string: "b" },
+      toolUseID: "tool-5",
+      capabilities: v2,
+      previewContent: preview,
+    });
+    expect(presentation.toolCall.content).toEqual(preview);
   });
 });

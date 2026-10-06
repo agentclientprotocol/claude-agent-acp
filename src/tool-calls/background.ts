@@ -1,6 +1,5 @@
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "../air-extension.js";
-import type { AsyncTaskStarted } from "../async-tasks.js";
 
 /**
  * Marks the Bash `tool_call_update` whose command detached into the background.
@@ -12,6 +11,10 @@ import type { AsyncTaskStarted } from "../async-tasks.js";
  * rides the update the tool result already emits, so it costs no extra
  * notification and cannot arrive out of order.
  *
+ * Only structured data marks a call: the `backgroundTaskId` of the tool
+ * result, an SDK task of the call that went to the background, or a
+ * `run_in_background` input. The text of the result never marks a call.
+ *
  * The command's own lifecycle -- progress, completion, the stop control -- is
  * published separately as an async task; this says only that the card has one.
  * Hence the AIR namespace rather than `claudeCode`: to a client without the
@@ -20,16 +23,14 @@ import type { AsyncTaskStarted } from "../async-tasks.js";
  */
 export function backgroundedBashToolCall(
   notification: SessionNotification,
-  task: AsyncTaskStarted | undefined,
+  backgroundedToolCallIds: ReadonlySet<string>,
   asyncTasksSupported: boolean,
 ): SessionNotification {
   const update = notification.update;
-  const toolCallId = task ? nonBlankTaskField(task.toolCallId ?? task.tool_use_id) : undefined;
   if (
     !asyncTasksSupported ||
-    !toolCallId ||
     update.sessionUpdate !== "tool_call_update" ||
-    update.toolCallId !== toolCallId
+    !backgroundedToolCallIds.has(update.toolCallId)
   ) {
     return notification;
   }
@@ -40,11 +41,4 @@ export function backgroundedBashToolCall(
       _meta: withAirMeta(update._meta, AIR_ASYNC_TASKS_CAPABILITY, { backgrounded: true }),
     },
   };
-}
-
-/** The task fields arrive as `unknown` off the wire; only non-blank strings carry a link. */
-function nonBlankTaskField(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
 }

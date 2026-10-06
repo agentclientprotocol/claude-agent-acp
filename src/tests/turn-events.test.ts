@@ -68,31 +68,49 @@ function result(sessionId: string) {
   };
 }
 
+/** Claude Code's echo of a prompt it took in. */
+function echo(prompt: { uuid: string; message: unknown }, sessionId: string) {
+  return {
+    type: "user",
+    message: prompt.message,
+    parent_tool_use_id: null,
+    uuid: prompt.uuid,
+    session_id: sessionId,
+    isReplay: true,
+  };
+}
+
 /** Scripts the query of the next session: each prompt runs the next turn script. */
 function scriptTurns(turns: TurnScript[], end: "stay open" | "end stream" = "stay open") {
   const promptUuids: string[] = [];
+  scriptQuery(async function* (input, options) {
+    for (const turn of turns) {
+      const { value, done } = await input.next();
+      if (done) return;
+      promptUuids.push(value.uuid);
+      yield echo(value, options.sessionId!);
+      for await (const message of turn(options)) yield message;
+    }
+    if (end === "stay open") await input.next();
+  });
+  return promptUuids;
+}
+
+/**
+ * Scripts the query of the next session as `run`, which reads the prompts.
+ * `controls` override the query's control requests, such as `interrupt`.
+ */
+function scriptQuery(
+  run: (
+    input: AsyncIterator<any>,
+    options: QueryOptions,
+  ) => AsyncGenerator<Record<string, unknown>>,
+  controls: Record<string, unknown> = {},
+) {
   mockQuery.mockImplementation(
     ({ prompt, options }: { prompt: AsyncIterable<any>; options: QueryOptions }) => {
-      const sessionId = options.sessionId ?? "session";
-      async function* run() {
-        const input = prompt[Symbol.asyncIterator]();
-        for (const turn of turns) {
-          const { value, done } = await input.next();
-          if (done) return;
-          promptUuids.push(value.uuid);
-          yield {
-            type: "user",
-            message: value.message,
-            parent_tool_use_id: null,
-            uuid: value.uuid,
-            session_id: sessionId,
-            isReplay: true,
-          };
-          for await (const message of turn(options)) yield message;
-        }
-        if (end === "stay open") await input.next();
-      }
-      return Object.assign(run(), {
+      const sessionOptions = { ...options, sessionId: options.sessionId ?? "session" };
+      return Object.assign(run(prompt[Symbol.asyncIterator](), sessionOptions), {
         initializationResult: async () => ({
           models: [{ value: "default", displayName: "Default", description: "" }],
         }),
@@ -104,30 +122,74 @@ function scriptTurns(turns: TurnScript[], end: "stay open" | "end stream" = "sta
         close: () => {},
         interrupt: async () => {},
         stopTask: async () => {},
+        ...controls,
       });
     },
   );
-  return promptUuids;
 }
 
-/** Records the events of one turn as readable strings. */
-function recordEvents() {
-  const log: string[] = [];
+/**
+ * Records the events of one turn as readable strings, into `log` when given,
+ * so several turns and the client's updates share one ordered trace.
+ */
+function recordEvents(log: string[] = [], label?: string) {
   const done = Promise.withResolvers<void>();
+  const push = (entry: string) => log.push(label ? `${label} ${entry}` : entry);
   const events: TurnEvents = {
-    inserted: (messageId) => log.push(`inserted ${messageId}`),
-    awaitingUser: () => log.push("awaitingUser"),
-    resumed: () => log.push("resumed"),
+    inserted: (messageId) => push(`inserted ${messageId}`),
+    awaitingUser: () => push("awaitingUser"),
+    resumed: () => push("resumed"),
     ended: (outcome) => {
-      log.push(`ended ${outcome.stopReason}`);
+      push(`ended ${outcome.stopReason}`);
       done.resolve();
     },
     failed: (error) => {
-      log.push(`failed ${error instanceof Error ? error.message : String(error)}`);
+      push(`failed ${error instanceof Error ? error.message : String(error)}`);
       done.resolve();
     },
   };
   return { log, events, done: done.promise };
+}
+
+function lifecycle(commandUuid: string, state: string, sessionId: string) {
+  return {
+    type: "command_lifecycle",
+    command_uuid: commandUuid,
+    state,
+    uuid: randomUUID(),
+    session_id: sessionId,
+  };
+}
+
+function stream(event: Record<string, unknown>, sessionId: string) {
+  return {
+    type: "stream_event",
+    event,
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: sessionId,
+  };
+}
+
+/** The start of an answer that streams one text delta. */
+function streamedText(messageId: string, text: string, sessionId: string) {
+  return [
+    stream(
+      {
+        type: "message_start",
+        message: { id: messageId, role: "assistant", content: [], usage: {} },
+      },
+      sessionId,
+    ),
+    stream(
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+      sessionId,
+    ),
+  ];
+}
+
+function system(subtype: string, sessionId: string, fields: Record<string, unknown> = {}) {
+  return { type: "system", subtype, uuid: randomUUID(), session_id: sessionId, ...fields };
 }
 
 describe("turn events", () => {
@@ -184,6 +246,77 @@ describe("turn events", () => {
     await turn.done;
 
     expect(turn.log).toEqual([`inserted ${promptUuids[0]}`, "ended end_turn"]);
+  });
+
+  it("reports a turn inserted when Claude Code starts it, before output that comes before its echo", async () => {
+    const trace: string[] = [];
+    onSessionUpdate = ({ update }) => {
+      // The turn's answer; the session also sends advisories as chunks.
+      if (update.sessionUpdate === "agent_message_chunk" && update.messageId === "msg_answer") {
+        trace.push("chunk");
+      }
+    };
+    let promptUuid = "";
+    scriptQuery(async function* (input, options) {
+      const { value } = await input.next();
+      promptUuid = value.uuid;
+      // A fresh turn reports "started" before anything it produces; its
+      // answer can then stream before the echo of its prompt.
+      yield lifecycle(value.uuid, "started", options.sessionId!);
+      yield* streamedText("msg_answer", "Hello", options.sessionId!);
+      yield echo(value, options.sessionId!);
+      yield result(options.sessionId!);
+      await input.next();
+    });
+    const sessionId = await newSession();
+    const turn = recordEvents(trace);
+
+    await agent.startTurn(prompt(sessionId, "hello"), turn.events);
+    await turn.done;
+
+    expect(trace).toEqual([`inserted ${promptUuid}`, "chunk", "ended end_turn"]);
+  });
+
+  it("reports a turn inserted only after a held turn before it ended", async () => {
+    const trace: string[] = [];
+    scriptQuery(async function* (input, options) {
+      const sessionId = options.sessionId!;
+      const first = (await input.next()).value;
+      yield lifecycle(first.uuid, "started", sessionId);
+      yield echo(first, sessionId);
+      yield system("task_started", sessionId, {
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        description: "Explore the project",
+        subagent_type: "Explore",
+      });
+      // The result is held for the live background subagent.
+      yield result(sessionId);
+      yield system("session_state_changed", sessionId, { state: "idle" });
+      const second = (await input.next()).value;
+      // The next prompt starts a turn while the first is still held.
+      yield lifecycle(second.uuid, "started", sessionId);
+      yield echo(second, sessionId);
+      yield result(sessionId);
+      await input.next();
+    });
+    const sessionId = await newSession();
+    const first = recordEvents(trace, "first");
+    const second = recordEvents(trace, "second");
+
+    await agent.startTurn(prompt(sessionId, "explore"), first.events);
+    await vi.waitFor(() =>
+      expect(agent.sessions[sessionId]?.activeTurn?.deferredSettle).toBeDefined(),
+    );
+    await agent.startTurn(prompt(sessionId, "next"), second.events);
+    await Promise.all([first.done, second.done]);
+
+    expect(trace).toEqual([
+      expect.stringMatching(/^first inserted /),
+      "first ended end_turn",
+      expect.stringMatching(/^second inserted /),
+      "second ended end_turn",
+    ]);
   });
 
   it("reports waiting on a permission request, then resuming", async () => {
@@ -313,6 +446,186 @@ describe("turn events", () => {
     expect(queued.log).toEqual(["ended cancelled"]);
   });
 
+  it("drops a queued prompt that a cancel ends from Claude Code's queue, so it does not run", async () => {
+    const trace: string[] = [];
+    onSessionUpdate = ({ update }) => {
+      // The turns' answers; the session also sends advisories as chunks.
+      if (
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text" &&
+        update.messageId?.startsWith("msg_")
+      ) {
+        trace.push(`chunk ${update.content.text}`);
+      }
+    };
+    // Claude Code keeps queued messages through an interrupt, and runs them
+    // next unless they are dropped first.
+    const dropped = new Set<string>();
+    const interrupted = Promise.withResolvers<void>();
+    const controls = {
+      cancelAsyncMessage: async (uuid: string) => {
+        trace.push("drop queued prompt");
+        dropped.add(uuid);
+        return true;
+      },
+      interrupt: async () => {
+        trace.push("interrupt");
+        interrupted.resolve();
+      },
+    };
+    scriptQuery(async function* (input, options) {
+      const sessionId = options.sessionId!;
+      const first = (await input.next()).value;
+      yield echo(first, sessionId);
+      yield* streamedText("msg_first", "Working", sessionId);
+      await interrupted.promise;
+      yield result(sessionId);
+      yield system("session_state_changed", sessionId, { state: "idle" });
+      for (;;) {
+        const { value, done } = await input.next();
+        if (done) return;
+        if (dropped.has(value.uuid)) continue;
+        // Not dropped: Claude Code runs the queued prompt after all.
+        yield* streamedText("msg_orphan", "Answer to a cancelled prompt", sessionId);
+        yield echo(value, sessionId);
+        yield result(sessionId);
+        yield system("session_state_changed", sessionId, { state: "idle" });
+      }
+    }, controls);
+    const sessionId = await newSession();
+    const first = recordEvents(trace, "first");
+    const queued = recordEvents(trace, "queued");
+
+    await agent.startTurn(prompt(sessionId, "first"), first.events);
+    await vi.waitFor(() => expect(trace).toContain("chunk Working"));
+    await agent.startTurn(prompt(sessionId, "second"), queued.events);
+    await agent.cancel({ sessionId });
+    await Promise.all([first.done, queued.done]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(trace).toEqual([
+      expect.stringMatching(/^first inserted /),
+      "chunk Working",
+      "queued ended cancelled",
+      "drop queued prompt",
+      "interrupt",
+      "first ended cancelled",
+    ]);
+  });
+
+  it("ends a cancelled turn when the force-cancel fires while an update is being sent", async () => {
+    // Claude Code streams an answer, then wedges: no result, no idle, even
+    // after the interrupt (issue #680). Only the force-cancel can end the turn.
+    const promptUuids = scriptTurns([
+      async function* (options) {
+        for (const message of streamedText("msg_answer", "Hi", options.sessionId!)) {
+          yield message;
+        }
+        await new Promise(() => {});
+      },
+    ]);
+    const sessionId = await newSession();
+    agent.forceCancelGraceMs = 10;
+    const turn = recordEvents();
+    // The client takes the answer's text slowly, so the consumer is still
+    // sending it when the force-cancel fires.
+    const chunkSeen = Promise.withResolvers<void>();
+    onSessionUpdate = async ({ update }) => {
+      if (update.sessionUpdate !== "agent_message_chunk" || update.messageId !== "msg_answer") {
+        return;
+      }
+      chunkSeen.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    };
+
+    await agent.startTurn(prompt(sessionId, "hello"), turn.events);
+    await chunkSeen.promise;
+    await agent.cancel({ sessionId });
+    await Promise.race([turn.done, new Promise((resolve) => setTimeout(resolve, 1_000))]);
+
+    expect(turn.log).toEqual([`inserted ${promptUuids[0]}`, "ended cancelled"]);
+  });
+
+  it("ends a held turn cancelled mid-followup after the output its interrupt flushes", async () => {
+    const trace: string[] = [];
+    onSessionUpdate = ({ update }) => {
+      if (
+        update.sessionUpdate === "agent_message_chunk" &&
+        update.content.type === "text" &&
+        update.messageId?.startsWith("msg_")
+      ) {
+        trace.push(`chunk ${update.content.text}`);
+      }
+    };
+    const interrupted = Promise.withResolvers<void>();
+    const controls = {
+      interrupt: async () => {
+        trace.push("interrupt");
+        interrupted.resolve();
+      },
+    };
+    scriptQuery(async function* (input, options) {
+      const sessionId = options.sessionId!;
+      const idle = () => system("session_state_changed", sessionId, { state: "idle" });
+      const running = () => system("session_state_changed", sessionId, { state: "running" });
+      const first = (await input.next()).value;
+      yield echo(first, sessionId);
+      yield running();
+      yield system("task_started", sessionId, {
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        description: "Explore the project",
+        subagent_type: "Explore",
+      });
+      yield result(sessionId); // held for the subagent
+      yield idle();
+      yield system("task_notification", sessionId, {
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        status: "completed",
+        output_file: "",
+        summary: "done",
+      });
+      // The followup cycle writes the promised summary when the cancel comes.
+      yield running();
+      yield* streamedText("msg_followup", "Summary so far", sessionId);
+      await interrupted.promise;
+      yield stream(
+        { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: ", stopped" } },
+        sessionId,
+      );
+      yield { ...result(sessionId), origin: { kind: "task-notification" } };
+      yield idle();
+      // A wedged next turn: an idle without a result is the issue #825 signal,
+      // which a leaked trailer debt would absorb.
+      const second = (await input.next()).value;
+      yield echo(second, sessionId);
+      yield idle();
+      yield result(sessionId);
+      await input.next();
+    }, controls);
+    const sessionId = await newSession();
+    const first = recordEvents(trace, "first");
+    const second = recordEvents(trace, "second");
+
+    await agent.startTurn(prompt(sessionId, "explore"), first.events);
+    await vi.waitFor(() => expect(trace).toContain("chunk Summary so far"));
+    await agent.cancel({ sessionId });
+    await first.done;
+    await agent.startTurn(prompt(sessionId, "next"), second.events);
+    await second.done;
+
+    expect(trace).toEqual([
+      expect.stringMatching(/^first inserted /),
+      "chunk Summary so far",
+      "interrupt",
+      "chunk , stopped",
+      "first ended cancelled",
+      expect.stringMatching(/^second inserted /),
+      expect.stringMatching(/^second failed /),
+    ]);
+  });
+
   it("does not insert a turn that a cancel ended while the previous turn was handed off", async () => {
     scriptTurns([
       async function* (options) {
@@ -365,6 +678,45 @@ describe("turn events", () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(second.log).toEqual(["ended cancelled"]);
+  });
+
+  it("ends a closed session's turn before the close returns, also for a slow client", async () => {
+    // Claude Code streams an answer and runs until the close ends its stream.
+    const queryClosed = Promise.withResolvers<void>();
+    const promptUuids: string[] = [];
+    scriptQuery(
+      async function* (input, options) {
+        const { value } = await input.next();
+        promptUuids.push(value.uuid);
+        yield echo(value, options.sessionId!);
+        for (const message of streamedText("msg_answer", "Hi", options.sessionId!)) {
+          yield message;
+        }
+        await queryClosed.promise;
+      },
+      { close: () => queryClosed.resolve() },
+    );
+    const sessionId = await newSession();
+    const turn = recordEvents();
+    // The client takes the answer's text slowly, so the consumer is still
+    // sending it when the close tears the session down.
+    const chunkSeen = Promise.withResolvers<void>();
+    const chunkTaken = Promise.withResolvers<void>();
+    onSessionUpdate = async ({ update }) => {
+      if (update.sessionUpdate !== "agent_message_chunk" || update.messageId !== "msg_answer") {
+        return;
+      }
+      chunkSeen.resolve();
+      await chunkTaken.promise;
+    };
+
+    await agent.startTurn(prompt(sessionId, "hello"), turn.events);
+    await chunkSeen.promise;
+    const closed = agent.closeSession({ sessionId }).then(() => turn.log.push("closed"));
+    setTimeout(() => chunkTaken.resolve(), 10);
+    await closed;
+
+    expect(turn.log).toEqual([`inserted ${promptUuids[0]}`, "ended cancelled", "closed"]);
   });
 
   it("fails a queued turn without inserting it when the query ends", async () => {
