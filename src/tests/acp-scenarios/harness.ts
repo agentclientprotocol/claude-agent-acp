@@ -8,6 +8,10 @@
  * order that Claude Code uses. The harness records every message that the
  * agent sends to the client.
  *
+ * {@link runScenarioV2} runs the same scenarios on the experimental ACP v2
+ * surface, through the protocol router and the SDK's v2 client, and records
+ * the agent's JSON-RPC messages off the wire.
+ *
  * The harness is vitest-free. The test file mocks `query` and
  * `getSessionMessages` of the SDK with {@link mockedQuery} and
  * {@link mockedSessionMessages}.
@@ -18,6 +22,7 @@ import type {
   RequestPermissionRequest,
   SessionNotification,
 } from "@agentclientprotocol/sdk";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -265,18 +270,39 @@ export interface ScenarioRun {
   normalized: Recorded[];
 }
 
-/** Runs one scenario for one profile and records every outbound message. */
-export async function runScenario(
-  Agent: AgentClass,
-  profile: Profile,
-  scenario: Scenario,
-): Promise<ScenarioRun> {
+/**
+ * Prepares a run of `scenario`: its working directory with the scenario's
+ * files, and the script that {@link mockedQuery} runs. Returns the directory.
+ */
+function startRun(scenario: Scenario): string {
   const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "acp-scenario-")));
   for (const [file, text] of Object.entries(scenario.files ?? {})) {
     const target = path.join(cwd, file);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, text);
   }
+  generatedIds.clear();
+  activeScript = {
+    scenario,
+    cwd,
+    transcript: scenario.transcript?.({ cwd, sessionId: SESSION_ID }) ?? [],
+  };
+  return cwd;
+}
+
+function endRun(cwd: string): void {
+  activeScript = undefined;
+  sdkSessionId = undefined;
+  fs.rmSync(cwd, { recursive: true, force: true });
+}
+
+/** Runs one scenario for one profile and records every outbound message. */
+export async function runScenario(
+  Agent: AgentClass,
+  profile: Profile,
+  scenario: Scenario,
+): Promise<ScenarioRun> {
+  const cwd = startRun(scenario);
   const recorded: Recorded[] = [];
   const record = (kind: Recorded["kind"], payload: unknown) =>
     recorded.push({ kind, payload: structuredClone(payload) });
@@ -286,23 +312,11 @@ export async function runScenario(
     },
     async requestPermission(request: RequestPermissionRequest) {
       record("requestPermission", request);
-      const wanted = scenario.permission ?? "allow_once";
-      const option =
-        request.options.find((o) => o.kind === wanted) ??
-        request.options.find((o) => o.kind.startsWith(wanted.split("_")[0])) ??
-        request.options[0];
-      return { outcome: { outcome: "selected", optionId: option.optionId } };
+      return permissionAnswer(scenario, request.options);
     },
     async createElicitation(request: CreateElicitationRequest) {
       record("createElicitation", request);
-      const schema = (request as any).requestedSchema as
-        { properties?: Record<string, any> } | undefined;
-      const content: Record<string, unknown> = {};
-      for (const [key, property] of Object.entries(schema?.properties ?? {})) {
-        const values = property.enum ?? property.oneOf?.map((o: any) => o.const);
-        if (Array.isArray(values) && values.length > 0) content[key] = values[0];
-      }
-      return { action: "accept", content };
+      return elicitationAnswer(request);
     },
     async completeElicitation(params: unknown) {
       record("completeElicitation", params);
@@ -324,12 +338,6 @@ export async function runScenario(
     ...(profile.capabilities._meta || scenario.capabilities?._meta
       ? { _meta: { ...profile.capabilities._meta, ...scenario.capabilities?._meta } }
       : {}),
-  };
-  generatedIds.clear();
-  activeScript = {
-    scenario,
-    cwd,
-    transcript: scenario.transcript?.({ cwd, sessionId: SESSION_ID }) ?? [],
   };
   const logger = { log: () => {}, error: () => {}, warn: () => {}, debug: () => {} };
   const agent = new Agent(client, logger);
@@ -364,15 +372,237 @@ export async function runScenario(
       normalized: normalize(raw, cwd, acpSessionId, generatedIds) as Recorded[],
     };
   } finally {
-    activeScript = undefined;
-    sdkSessionId = undefined;
     try {
       if (sessionId) await agent.unstable_closeSession?.({ sessionId });
     } catch {
       // The session is already gone.
     }
-    fs.rmSync(cwd, { recursive: true, force: true });
+    endRun(cwd);
   }
+}
+
+/** The client's answer to an elicitation: it accepts, with the first choice of each field. */
+function elicitationAnswer(request: unknown): {
+  action: "accept";
+  content: Record<string, string | number | boolean | string[]>;
+} {
+  const schema = (request as { requestedSchema?: { properties?: Record<string, any> } })
+    .requestedSchema;
+  const content: Record<string, string | number | boolean | string[]> = {};
+  for (const [key, property] of Object.entries(schema?.properties ?? {})) {
+    const values = property.enum ?? property.oneOf?.map((o: any) => o.const);
+    if (Array.isArray(values) && values.length > 0) content[key] = values[0];
+  }
+  return { action: "accept", content };
+}
+
+/**
+ * The answer of a client to a permission request: the option of the kind that
+ * the scenario selects, or of its allow or reject group, or the first option.
+ */
+function permissionAnswer(
+  scenario: Scenario,
+  options: readonly { optionId: string; kind: string }[],
+) {
+  const wanted = scenario.permission ?? "allow_once";
+  const option =
+    options.find((o) => o.kind === wanted) ??
+    options.find((o) => o.kind.startsWith(wanted.split("_")[0])) ??
+    options[0];
+  return { outcome: { outcome: "selected" as const, optionId: option.optionId } };
+}
+
+/** One JSON-RPC message that the agent sent to a v2 client. */
+export interface WireRecorded {
+  /** A request or notification to the client, or the answer to one of its requests. */
+  kind: "request" | "notification" | "response" | "error";
+  /** The method of the request or notification; for an answer, of the client's request. */
+  method: string;
+  /** The params, the result, or the error. */
+  payload: unknown;
+}
+
+/** How a scenario ran on the ACP v2 surface. */
+export interface ScenarioRunV2 {
+  /** The messages as the agent sent them. */
+  raw: WireRecorded[];
+  /** The messages with the run-specific values replaced (see {@link normalize}). */
+  normalized: WireRecorded[];
+  /**
+   * `passes` when every prompt turn ended with a stop reason other than
+   * `_error`, or else why the scenario stopped: the error of a rejected
+   * request, or the notice of a turn that failed.
+   */
+  status: string;
+}
+
+/**
+ * The v2 counterpart of the plain profile: v2 has no client file system or
+ * terminals, so a v2 client declares only elicitation.
+ */
+const V2_CAPABILITIES = { elicitation: { form: {} } };
+
+/**
+ * Runs one scenario on the ACP v2 surface. `connect` serves the agent side
+ * of the stream, as `serveAcp` does. The SDK's v2 client drives `initialize`,
+ * `session/new` (or `session/resume` with `replayFrom` for a transcript), and
+ * one `session/prompt` per turn, and waits for the turn's `idle`. Every
+ * message that the agent sends is recorded off the wire, so a message that the
+ * client rejects is still recorded.
+ */
+export async function runScenarioV2(
+  connect: (stream: v2.Stream) => void,
+  scenario: Scenario,
+): Promise<ScenarioRunV2> {
+  const cwd = startRun(scenario);
+  const raw: WireRecorded[] = [];
+  const methodsOfClientRequests = new Map<string | number, string>();
+  let recording = true;
+  let sessionId: string | undefined;
+  // The stop reasons of the session's idle state updates, and its notices.
+  const idles: unknown[] = [];
+  const notices: string[] = [];
+
+  const each = (message: v2.AnyWireMessage) =>
+    (Array.isArray(message) ? message : [message]) as Record<string, any>[];
+  const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+    transform(message, controller) {
+      for (const m of each(message)) {
+        if ("method" in m && "id" in m) methodsOfClientRequests.set(m.id, m.method);
+      }
+      controller.enqueue(message);
+    },
+  });
+  const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>({
+    transform(message, controller) {
+      for (const m of each(message)) {
+        if (recording) raw.push(wireRecord(m, methodsOfClientRequests));
+      }
+      controller.enqueue(message);
+    },
+  });
+  connect({ readable: toAgent.readable, writable: toClient.writable });
+
+  let status = "passes";
+  const stop = (reason: string) => {
+    if (status === "passes") status = reason;
+  };
+  const client = v2
+    .client({ name: "v2-scenario-client" })
+    .onNotification(v2.methods.client.session.update, ({ params }) => {
+      if (params.sessionId !== sessionId) return;
+      const update = params.update as {
+        sessionUpdate: string;
+        state?: string;
+        stopReason?: unknown;
+        title?: string;
+      };
+      if (update.sessionUpdate === "state_update" && update.state === "idle") {
+        idles.push(update.stopReason);
+      }
+      if (update.sessionUpdate === "notice" && update.title) notices.push(update.title);
+    })
+    .onRequest(v2.methods.client.session.requestPermission, ({ params }) =>
+      permissionAnswer(scenario, params.options),
+    )
+    .onRequest(v2.methods.client.elicitation.create, ({ params }) => elicitationAnswer(params))
+    .onNotification(v2.methods.client.elicitation.complete, () => {})
+    .onNotification(
+      "_auth/status_update",
+      (params) => params,
+      () => {},
+    );
+
+  try {
+    await client.connectWith(
+      { readable: toClient.readable, writable: toAgent.writable },
+      async (agent) => {
+        await agent.request(v2.methods.agent.initialize, {
+          protocolVersion: v2.PROTOCOL_VERSION,
+          info: { name: "v2-scenario-client", version: "1.0.0" },
+          capabilities: {
+            ...V2_CAPABILITIES,
+            ...(scenario.capabilities?._meta ? { _meta: scenario.capabilities._meta } : {}),
+          },
+        });
+        try {
+          if (scenario.transcript) {
+            sessionId = SESSION_ID;
+            await agent.request(v2.methods.agent.session.resume, {
+              sessionId: SESSION_ID,
+              cwd,
+              replayFrom: { type: "start" },
+            });
+          } else {
+            sessionId = (await agent.request(v2.methods.agent.session.new, { cwd })).sessionId;
+          }
+        } catch (error) {
+          stop(errorText(error));
+          return;
+        }
+        await settle();
+        for (let turn = 0; turn < scenario.turns.length; turn++) {
+          const idlesBefore = idles.length;
+          try {
+            await agent.request(v2.methods.agent.session.prompt, {
+              sessionId,
+              prompt: [{ type: "text", text: scenario.prompts?.[turn] ?? `prompt ${turn + 1}` }],
+            });
+          } catch (error) {
+            stop(errorText(error));
+            return;
+          }
+          if (!(await until(() => idles.length > idlesBefore))) {
+            stop("the turn reported no idle state");
+            return;
+          }
+          if (idles[idlesBefore] === "_error") {
+            stop(notices.at(-1) ?? "the turn failed");
+            return;
+          }
+          await settle();
+        }
+        recording = false;
+        await agent.request(v2.methods.agent.session.close, { sessionId }).catch(() => {});
+      },
+    );
+    return {
+      raw,
+      normalized: normalize(raw, cwd, sessionId ?? "", generatedIds) as WireRecorded[],
+      status,
+    };
+  } finally {
+    endRun(cwd);
+  }
+}
+
+function wireRecord(
+  message: Record<string, any>,
+  methodsOfClientRequests: ReadonlyMap<string | number, string>,
+): WireRecorded {
+  if ("method" in message) {
+    return {
+      kind: "id" in message ? "request" : "notification",
+      method: message.method,
+      payload: structuredClone(message.params),
+    };
+  }
+  const method = methodsOfClientRequests.get(message.id) ?? "<unknown request>";
+  return "error" in message
+    ? { kind: "error", method, payload: structuredClone(message.error) }
+    : { kind: "response", method, payload: structuredClone(message.result) };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Waits until `condition` holds, for at most two seconds. */
+async function until(condition: () => boolean): Promise<boolean> {
+  for (let i = 0; i < 1000 && !condition(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  return condition();
 }
 
 async function settle() {
