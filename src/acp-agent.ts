@@ -128,10 +128,24 @@ import {
   AIR_GOAL_KEY,
   AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
+  AIR_SESSION_INDEX_CAPABILITY,
   AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
+import {
+  LIST_CHANGED_METHOD,
+  parseRenameSessionRequest,
+  parseSessionIdRequest,
+  SESSION_ARCHIVE_METHOD,
+  SESSION_RENAME_METHOD,
+  SESSION_UNARCHIVE_METHOD,
+  SessionIndexService,
+  type RenameSessionRequest,
+  type SessionIdRequest,
+} from "./session-index/service.js";
+import { readArchivedSessionIds, writeArchiveMarker } from "./session-index/archive-markers.js";
+import type { OwnSessionState } from "./session-index/activity.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -1237,6 +1251,12 @@ export type Session = {
    *  yields none, and a pre-counted debt that never drains would mask one
    *  future issue-#825 detection. */
   lastSessionState?: "idle" | "running" | "requires_action";
+  /** When the last turn ended (the last `session_state_changed: idle`), epoch
+   *  ms. Reported as `activity.lastTurnEndedAt` in the session index. */
+  lastTurnEndedAt?: number;
+  /** `total_cost_usd` of the last result, reported as the cost of the session
+   *  in the session index. */
+  lastTotalCostUsd?: number;
   /** How many trailing `session_state_changed: idle` messages are already
    *  accounted for: every result is followed by one (user-turn results that
    *  terminate a turn — settle, reject, or orphan skip — and autonomous
@@ -2532,6 +2552,13 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
+  /**
+   * The session index of a client that declared `sessionIndex` (see
+   * docs/air-extensions.md, "Session index"). Undefined for every other
+   * client, which keeps the session list, delete and the watchers exactly as
+   * before.
+   */
+  private sessionIndex?: SessionIndexService;
 
   constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
     this.v2 = options.v2 ?? false;
@@ -2594,6 +2621,19 @@ export class ClaudeAcpAgent {
     this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities, {
       v2: this.v2,
     });
+    this.sessionIndex?.dispose();
+    this.sessionIndex = undefined;
+    // ACP v2 does not route the session index methods yet.
+    if (
+      !this.v2 &&
+      this.toolCallCapabilities.air.client &&
+      clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
+    ) {
+      this.sessionIndex = new SessionIndexService({
+        notifyListChanged: (params) => this.client.extNotification(LIST_CHANGED_METHOD, params),
+        logError: (message, error) => this.logger.error(`[session-index] ${message}:`, error),
+      });
+    }
 
     // Learn the auth identity in the background: `initialize` never waits on
     // the CLI probe, and no snapshot rides in its response. When the probe
@@ -2775,6 +2815,7 @@ export class ClaudeAcpAgent {
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
+                ...(this.sessionIndex ? [AIR_SESSION_INDEX_CAPABILITY] : []),
               ),
               AIR_GOAL_KEY,
               {
@@ -2902,6 +2943,9 @@ export class ClaudeAcpAgent {
    * reads the start and the end only of the transcripts of the page.
    */
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    if (this.sessionIndex) {
+      return this.sessionIndex.list(params, (sessionId) => this.ownSessionState(sessionId));
+    }
     const offset = sessionListOffset(params.cursor);
     // One more session than the page tells whether a next page exists.
     const sdkSessions = await listSessions({
@@ -2919,9 +2963,76 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(session.lastModified).toISOString(),
       });
     }
+    // An AIR client archives with session/delete (see deleteSession): its
+    // archived sessions stay hidden, as when the delete removed them.
+    const visible = this.toolCallCapabilities.air.client
+      ? await this.withoutArchived(sessions)
+      : sessions;
     return sdkSessions.length > SESSION_LIST_PAGE_SIZE
-      ? { sessions, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
-      : { sessions };
+      ? { sessions: visible, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
+      : { sessions: visible };
+  }
+
+  private async withoutArchived<T extends { sessionId: string }>(sessions: T[]): Promise<T[]> {
+    const archived = await readArchivedSessionIds();
+    return archived.size === 0
+      ? sessions
+      : sessions.filter((session) => !archived.has(session.sessionId.toLowerCase()));
+  }
+
+  /** What the session index reports for a session this connection runs. */
+  private ownSessionState(sessionId: string): OwnSessionState | undefined {
+    const session = this.sessions[sessionId];
+    if (!session || session.queryClosed) return undefined;
+    return {
+      state: session.lastSessionState,
+      lastTurnEndedAt: session.lastTurnEndedAt,
+      costUsd: session.lastTotalCostUsd,
+    };
+  }
+
+  private requireSessionIndex(method: string): SessionIndexService {
+    if (!this.sessionIndex) throw RequestError.methodNotFound(method);
+    return this.sessionIndex;
+  }
+
+  /** `_session/rename`: names a session; no generated title replaces it. */
+  async renameSessionTitle(params: RenameSessionRequest): Promise<Record<string, never>> {
+    const index = this.requireSessionIndex(SESSION_RENAME_METHOD);
+    const session = this.sessions[params.sessionId];
+    const query = session?.query as
+      | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
+      | undefined;
+    if (session && !session.queryClosed && typeof query?.renameSession === "function") {
+      // The CLI appends the title, writes the sidecar and updates its memory.
+      await session.titles.setExplicitTitle(params.title, () =>
+        query.renameSession!(params.title, params.sessionId),
+      );
+      return {};
+    }
+    if (session) {
+      await session.titles.setExplicitTitle(params.title, () =>
+        index.renameOffline(params.sessionId, params.title, { loadedHere: true }),
+      );
+    } else {
+      await index.renameOffline(params.sessionId, params.title);
+    }
+    return {};
+  }
+
+  /** `_session/archive`: hides a session from the default list. Idempotent;
+   *  the session need not be loaded. */
+  async archiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
+    const index = this.requireSessionIndex(SESSION_ARCHIVE_METHOD);
+    await index.archive(params.sessionId, this.sessions[params.sessionId] !== undefined);
+    return {};
+  }
+
+  /** `_session/unarchive`. Idempotent. */
+  async unarchiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
+    const index = this.requireSessionIndex(SESSION_UNARCHIVE_METHOD);
+    await index.unarchive(params.sessionId, this.sessions[params.sessionId] !== undefined);
+    return {};
   }
 
   /**
@@ -5232,6 +5343,9 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
+                if (message.state === "idle" && previousState !== "idle") {
+                  session.lastTurnEndedAt = Date.now();
+                }
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -6099,6 +6213,7 @@ export class ClaudeAcpAgent {
                 }
               }
 
+              session.lastTotalCostUsd = message.total_cost_usd;
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
                 await sendUpdate({
@@ -7700,24 +7815,43 @@ export class ClaudeAcpAgent {
 
   /** Tear down all active sessions. Called when the ACP connection closes. */
   async dispose(): Promise<void> {
+    this.sessionIndex?.dispose();
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
+  /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
-      throw new Error("Session not found");
+      return {};
     }
     await this.teardownSession(params.sessionId);
     return {};
   }
 
+  /**
+   * - A `sessionIndex` client deletes for real: every transcript and the
+   *   archive marker. A session that another live process holds is refused.
+   * - Another AIR client uses delete to mark a session done, and may reopen
+   *   it later: the adapter archives it instead, so the transcript survives.
+   * - Every other client: the SDK delete, as before.
+   */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    const loaded = this.sessions[params.sessionId] !== undefined;
+    if (this.sessionIndex && !loaded) {
+      await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
+    }
     // Tear down any active in-memory state first so the on-disk file isn't
     // recreated by an outstanding query writing to it.
-    if (this.sessions[params.sessionId]) {
+    if (loaded) {
       await this.teardownSession(params.sessionId);
     }
-    await deleteSession(params.sessionId);
+    if (this.sessionIndex) {
+      await this.sessionIndex.delete(params.sessionId, loaded);
+    } else if (this.toolCallCapabilities.air.client) {
+      await writeArchiveMarker(params.sessionId);
+    } else {
+      await deleteSession(params.sessionId);
+    }
     return {};
   }
 
@@ -11711,6 +11845,21 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<RenameSessionRequest, Record<string, never>>(
+      SESSION_RENAME_METHOD,
+      { parse: parseRenameSessionRequest },
+      (ctx) => agent.renameSessionTitle(ctx.params),
+    )
+    .onRequest<SessionIdRequest, Record<string, never>>(
+      SESSION_ARCHIVE_METHOD,
+      { parse: parseSessionIdRequest },
+      (ctx) => agent.archiveSession(ctx.params),
+    )
+    .onRequest<SessionIdRequest, Record<string, never>>(
+      SESSION_UNARCHIVE_METHOD,
+      { parse: parseSessionIdRequest },
+      (ctx) => agent.unarchiveSession(ctx.params),
     );
 }
 

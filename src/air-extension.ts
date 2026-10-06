@@ -11,6 +11,12 @@ export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
  * file, and AIR reads the plan from it.
  */
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
+/**
+ * The session index: a bounded, ordered `session/list` with row metadata, and
+ * `_session/rename`, `_session/archive`, `_session/unarchive` and
+ * `_session/list_changed`. Advertised only to a client that declares it.
+ */
+export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";

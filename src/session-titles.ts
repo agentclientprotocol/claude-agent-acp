@@ -84,6 +84,14 @@ export class SessionTitles {
    *  one. Released by {@link reset}, and when generation yields nothing. */
   private settled = false;
 
+  /** Set once a client named the session (`_session/rename`). No generated
+   *  title replaces it. */
+  private explicit = false;
+
+  /** The title generation in flight, which a rename waits for: the generator
+   *  persists its title, and a later write would replace the client's. */
+  private generation?: Promise<void>;
+
   constructor(
     private readonly agent: ClaudeAcpAgent,
     private readonly sessionId: string,
@@ -115,6 +123,7 @@ export class SessionTitles {
    *  `conversation_reset`, which mounts a fresh transcript. */
   reset(): void {
     this.settled = false;
+    this.explicit = false;
     this.context = undefined;
     this.lastTitle = undefined;
   }
@@ -147,8 +156,12 @@ export class SessionTitles {
     if (this.canRequest(session)) {
       this.settled = true;
 
-      void this.requestGenerateTitle(session, fallback).catch((error) => {
+      const generation = this.requestGenerateTitle(session, fallback).catch((error) => {
         this.agent.logger.error(`Session ${this.sessionId}: session title update failed: ${error}`);
+      });
+      this.generation = generation;
+      void generation.finally(() => {
+        if (this.generation === generation) this.generation = undefined;
       });
 
       return;
@@ -159,6 +172,22 @@ export class SessionTitles {
     if (fallback && !this.settled) {
       await this.publish(fallback.title, fallback.lastModified);
     }
+  }
+
+  /** Applies a title that the client chose. Settles the title for good,
+   *  waits for a generation in flight so that its persisted title cannot land
+   *  after this one, persists the title with `persist`, and publishes it. */
+  async setExplicitTitle(title: string, persist: () => Promise<void>): Promise<void> {
+    this.explicit = true;
+    this.settled = true;
+    this.context = undefined;
+    await this.generation;
+    await persist();
+    this.lastTitle = title;
+    await this.agent.client.sessionUpdate({
+      sessionId: this.sessionId,
+      update: { sessionUpdate: "session_info_update", title },
+    });
   }
 
   /** Read the SDK's stored info for this session. A missing session file or read
@@ -226,8 +255,8 @@ export class SessionTitles {
     }
 
     // A session torn down or replaced while the title was in flight must not
-    // adopt it.
-    if (this.agent.sessions[this.sessionId] !== session) {
+    // adopt it, and a title the client set meanwhile wins.
+    if (this.agent.sessions[this.sessionId] !== session || this.explicit) {
       return;
     }
 
