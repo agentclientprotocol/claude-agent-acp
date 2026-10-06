@@ -27,6 +27,7 @@ It describes only this adapter.
 - [Session failure](#session-failure)
 - [Native subagent sessions](#native-subagent-sessions)
 - [Session index](#session-index)
+- [Background subagents](#background-subagents)
 - [Context compaction](#context-compaction)
 - [Question custom answers](#question-custom-answers)
 - [Load replay end](#load-replay-end)
@@ -125,7 +126,8 @@ The `initialize` response of an AIR client carries the agent side of the extensi
           "asyncTasks",
           "recommendedValue",
           "diffPatch",
-          "planFile"
+          "planFile",
+          "backgroundSubagents"
         ],
         "goal": {
           "version": 1,
@@ -154,6 +156,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                   | [Agent file-change report](#agent-file-change-report)   |
 | `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                                | [Native subagent sessions](#native-subagent-sessions)   |
 | `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                   | [Plan file](#plan-file)                                 |
+| `backgroundSubagents`    | yes                 | Ends a prompt turn at its result while background subagents still run.                                          | [Background subagents](#background-subagents)           |
 | `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                       | [Session index](#session-index)                         |
 | `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`.    | [Archive](#archive)                                     |
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
@@ -1538,6 +1541,41 @@ It differs in transport, until the RFD lands in the SDK, in the list filter, and
 - the capability is `sessionArchive` in `_meta.jetbrains.air.capabilities`, advertised together with `sessionIndex`, not `sessionCapabilities.archive`;
 - the list parameter is `_meta.jetbrains.air.list.archived`, and the state is `_meta.jetbrains.air.archived` on rows and in `session_info_update`, not the `archived` fields;
 - an AIR client without `sessionIndex` still archives with `session/delete` (see [Delete and close](#delete-and-close)), which the RFD asks clients not to do.
+
+## Background subagents
+
+A prompt turn can start a background Agent or Task subagent.
+A SendMessage tool call can also resume a subagent that ended.
+Claude Code sends the result of the turn when the main agent stops, also while such a subagent still runs.
+
+### Hold without the capability
+
+A client that does not declare `backgroundSubagents` gets the hold of issues #864 and #866.
+The adapter keeps the `session/prompt` request open while a subagent that the turn started or resumed runs.
+The subagent output, its permission requests and the followup summary of the model then go out inside the turn.
+The turn ends at the followup result, at an `idle` with no live subagent, at `session/cancel`, or when the next prompt starts.
+The hold protects a client that stops listening at the prompt response.
+
+### Behavior with the capability
+
+AIR declares `backgroundSubagents` in `initialize.clientCapabilities._meta.jetbrains.air.capabilities`.
+The capability applies to ACP v1 only. ACP v2 keeps the hold, and the agent does not advertise the capability to ACP v2.
+
+- The turn ends at its result with the stop reason of the result, usually `end_turn`.
+- The subagent updates, permission requests and elicitations go out after the prompt response.
+- The routing does not change: the native child session, else the root session with the parent tool call in `_meta.claudeCode.parentToolUseId`.
+- The followup cycle after a subagent ends is an autonomous cycle. Its updates go out of a turn. Its result does not end a turn.
+- A steer with no turn in flight starts a new turn, or returns `promptRequired` when the client asks for it.
+- `session/cancel` with no turn works as before: the adapter interrupts the SDK query and reports each native subagent session as cancelled.
+- The tool call of a running subagent does not fail the incomplete tool call check of the turn.
+- The [agent file-change report](#agent-file-change-report) of the turn does not include an edit that a subagent makes after the result.
+- An open permission request of a subagent counts as an open request for the next turn and for the steer priority.
+
+### Plan approval out of a turn
+
+The followup cycle can call ExitPlanMode. AIR then gets the permission request out of a turn.
+The request has no clear-context option, because the fresh query must continue an ACP turn.
+"No, keep planning" stops only the followup cycle. There is no turn to end.
 
 ## Context compaction
 
