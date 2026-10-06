@@ -594,9 +594,71 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toBeUndefined();
     });
 
-    it("ignores env var when _meta provides settings", async () => {
+    it("keeps model settings when session settings add hooks", async () => {
       process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+      const hooks = { PostToolUse: [{ hooks: [{ type: "command", command: "echo ready" }] }] };
+
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+        hooks,
+      });
+      // The CLI adds these hooks to the ones in the user and project settings.
+      expect(capturedOptions!.settingSources).toEqual(["user", "project", "local"]);
+    });
+
+    it("applies session hooks on session/load with model settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const hooks = { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] };
+
+      await agent.loadSession({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.resume).toBe(sessionId);
+      expect(capturedOptions!.settings).toEqual({ availableModels: ["opus"], hooks });
+    });
+
+    it("merges model settings with a session settings file", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-settings-"));
+      const settingsFile = path.join(settingsDir, "settings.json");
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [] } }));
+
+      try {
+        await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          _meta: { claudeCode: { options: { settings: settingsFile } } },
+        });
+
+        expect(capturedOptions!.settings).toEqual({
+          availableModels: ["opus"],
+          hooks: { Stop: [] },
+        });
+      } finally {
+        fs.rmSync(settingsDir, { recursive: true });
+      }
+    });
+
+    it("prefers session settings when both sources set the same field", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
       });
 
       await agent.newSession({
@@ -614,10 +676,10 @@ describe("createSession options merging", () => {
         },
       });
 
-      // _meta settings take precedence; env var is ignored entirely
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        availableModels: ["opus"],
       });
     });
 
