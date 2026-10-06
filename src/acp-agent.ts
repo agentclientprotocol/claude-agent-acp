@@ -63,6 +63,7 @@ import {
   deleteSession,
   FastModeDisabledReason,
   FastModeState,
+  filterEscalatingDefaultMode,
   getSessionMessages,
   getSubagentMessages,
   listSessions,
@@ -77,6 +78,7 @@ import {
   PermissionResult,
   Query,
   query,
+  resolveSettings,
   SDKAssistantMessageError,
   SDKActiveGoalMessage,
   SDKMessage,
@@ -2465,6 +2467,12 @@ export class ClaudeAcpAgent {
   /** Last auth identity reported to the client, connection-scoped like
    *  `authenticate`/`logout`. Undefined means "not determined yet". */
   currentAuthStatus?: AuthStatus;
+  private authStatusSettings?: {
+    manager: SettingsManager;
+    override?: Settings;
+    env?: Options["env"];
+  };
+  private authStatusHelper?: string;
   /** In-flight `claude auth status --json` probe, shared by every caller so
    *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
    *  processes. */
@@ -2990,7 +2998,30 @@ export class ClaudeAcpAgent {
    * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
    * what the CLI probe already established instead of overwriting it.
    */
-  private publishSessionAccountIdentity(account: AccountInfo | undefined): void {
+  private useAuthStatusSettings(
+    manager: SettingsManager,
+    settingsOverride?: Settings,
+    launchEnv?: Options["env"],
+  ): void {
+    const helper = manager.getApiKeyHelper(settingsOverride);
+    const changed =
+      manager.getCwd() !== (this.authStatusSettings?.manager.getCwd() ?? process.cwd()) ||
+      helper !== this.authStatusHelper ||
+      JSON.stringify(launchEnv) !== JSON.stringify(this.authStatusSettings?.env);
+    this.authStatusSettings = { manager, override: settingsOverride, env: launchEnv };
+    this.authStatusHelper = helper;
+    if (changed) {
+      this.authEpoch += 1;
+      if (this.cliAuthProbe) {
+        void this.probeCliAuthStatus({ fresh: true });
+      }
+    }
+  }
+
+  private publishSessionAccountIdentity(
+    account: AccountInfo | undefined,
+    apiKeyHelper?: string,
+  ): void {
     if (this.providerConfig) {
       if (!this.loggedOverriddenAccount) {
         this.loggedOverriddenAccount = true;
@@ -3003,7 +3034,7 @@ export class ClaudeAcpAgent {
     if (this.gatewayAuthRequest) {
       return;
     }
-    const fromSession = fromAccountInfo(account);
+    const fromSession = fromAccountInfo(account, apiKeyHelper);
     if (fromSession) {
       this.setAuthStatus(fromSession);
     } else if (!this.loggedUninformativeAccount) {
@@ -3037,6 +3068,8 @@ export class ClaudeAcpAgent {
     // auth-affecting event describes a world that no longer exists. Remember
     // which one this read belongs to and drop the answer if it moved on.
     const epoch = this.authEpoch;
+    const context = this.authStatusSettings;
+    const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
     // ACP gateway auth bypasses the CLI credential store entirely, so the
     // probe would report an identity that is not the one being used. A mere
     // client provider override (`providers/set`) does NOT skip the probe: it
@@ -3048,8 +3081,12 @@ export class ClaudeAcpAgent {
     let stdout: string;
     try {
       const cliPath = await claudeCliPath();
-      ({ stdout } = await execFileAsync(cliPath, ["auth", "status", "--json"], {
+      const args = ["auth", "status", "--json"];
+      if (context?.override) args.push("--settings", JSON.stringify(context.override));
+      ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
+        cwd: context?.manager.getCwd() ?? process.cwd(),
+        env: context?.env ? { ...process.env, ...context.env } : process.env,
       }));
     } catch (error) {
       const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
@@ -3076,7 +3113,15 @@ export class ClaudeAcpAgent {
       }
       stdout = failed.stdout;
     }
-    const status = fromCliStatus(stdout);
+    let status = fromCliStatus(stdout, apiKeyHelper);
+    if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
+      try {
+        const resolved = await resolveSettings({ cwd: process.cwd() });
+        status = fromCliStatus(stdout, filterEscalatingDefaultMode(resolved).apiKeyHelper);
+      } catch {
+        this.logger.error("Could not resolve auth source settings");
+      }
+    }
     if (!status) {
       this.logger.error("claude auth status returned unparseable output");
       return undefined;
@@ -3372,6 +3417,11 @@ export class ClaudeAcpAgent {
     // that finds the new credential must not be the one the refusal skipped.
     // The guard itself consumes the result only at the next turn boundary (see
     // `markSessionsWhoseAccountKindChanged`).
+    this.useAuthStatusSettings(
+      session.settingsManager,
+      session.effortSettingsOverride,
+      (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
+    );
     void this.probeCliAuthStatus();
     const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
     if (signOutRespawn) session = await signOutRespawn;
@@ -3622,7 +3672,11 @@ export class ClaudeAcpAgent {
       logger: this.logger,
       // The guard reads the account anyway; reuse that read to keep the
       // reported identity current, refusal or not.
-      onAccount: (account) => this.publishSessionAccountIdentity(account),
+      onAccount: (account) =>
+        this.publishSessionAccountIdentity(
+          account,
+          session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
+        ),
     });
   }
 
@@ -9635,6 +9689,8 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    this.useAuthStatusSettings(settingsManager, configuredSettingsObject, userProvidedOptions?.env);
+    const authSettingsEpoch = this.authEpoch;
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -9660,7 +9716,12 @@ export class ClaudeAcpAgent {
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
       // was refused for.
-      this.publishSessionAccountIdentity(initializationResult.account);
+      if (authSettingsEpoch === this.authEpoch) {
+        this.publishSessionAccountIdentity(
+          initializationResult.account,
+          settingsManager.getApiKeyHelper(configuredSettingsObject),
+        );
+      }
 
       // Shared with the per-turn guard, so "warn once" spans the whole session.
       const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
@@ -9902,7 +9963,10 @@ export class ClaudeAcpAgent {
         sessionFailureState:
           creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
-        accountKind: fromAccountInfo(initializationResult.account)?.kind,
+        accountKind: fromAccountInfo(
+          initializationResult.account,
+          settingsManager.getApiKeyHelper(configuredSettingsObject),
+        )?.kind,
         fileChangeReporter,
       };
       timing.phase("register");
