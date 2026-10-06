@@ -8,6 +8,7 @@ import {
   NativeSubagentSession,
   resumedNativeSubagentId,
   sendMessageResumePrompt,
+  toSubagentWorkState,
 } from "../native-subagents.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -59,6 +60,15 @@ function control(
 }
 
 describe("NativeSubagentRuntime lifecycle", () => {
+  it.each([
+    ["completed", { state: "idle", stopReason: "end_turn" }],
+    ["cancelled", { state: "idle", stopReason: "cancelled" }],
+    ["failed", { state: "idle", stopReason: "error" }],
+    ["disconnected", { state: "unknown" }],
+  ] as const)("maps %s to the current RFD work state", (state, expected) => {
+    expect(toSubagentWorkState(state)).toEqual(expected);
+  });
+
   it("publishes a raced spawn exactly once", async () => {
     const release = deferred();
     const published: AcpSessionNotification[] = [];

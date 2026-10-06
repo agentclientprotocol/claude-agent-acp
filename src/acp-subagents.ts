@@ -1,9 +1,10 @@
 import type {
   ClientCapabilities,
   ContentBlock,
+  Error as JsonRpcError,
   SessionCapabilities,
   SessionNotification,
-  StopReason,
+  Usage,
 } from "@agentclientprotocol/sdk";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -43,8 +44,10 @@ export type SubagentWorkState =
   | { state: "unknown"; _meta?: Record<string, unknown> | null }
   | {
       state: "idle";
-      /** Omitted or `null` means not reported. */
-      stopReason?: StopReason | null;
+      /** V1 stop reasons plus `error`; preserve future reasons as v2 does. */
+      stopReason?: string | null;
+      error?: JsonRpcError | null;
+      usage?: Usage | null;
       _meta?: Record<string, unknown> | null;
     };
 

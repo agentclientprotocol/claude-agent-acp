@@ -16,8 +16,8 @@ export type SubagentState = "completed" | "failed" | "cancelled" | "disconnected
  * Maps this generation's finish reason to the wire-level work-state snapshot.
  * `idle` with `stopReason` covers normal completion and cancellation, per the
  * RFD ("Cancellation uses idle with stopReason: cancelled, not a terminal
- * child state"). `failed` has no accurate `StopReason` value -- omitting it
- * is honest; inventing one would misreport why the child stopped.
+ * child state"). The RFD's error stop reason reports failed foreground work
+ * without closing the reusable child conversation.
  * `disconnected` no longer has a wire equivalent; lost observability is
  * reported as `unknown`, matching "Connection loss" in the RFD.
  */
@@ -28,7 +28,7 @@ export function toSubagentWorkState(state: SubagentState): SubagentWorkState {
     case "cancelled":
       return { state: "idle", stopReason: "cancelled" };
     case "failed":
-      return { state: "idle" };
+      return { state: "idle", stopReason: "error" };
     case "disconnected":
       return { state: "unknown" };
     default:

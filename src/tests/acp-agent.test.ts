@@ -3621,7 +3621,11 @@ describe("subagent transcript replay", () => {
   });
 
   it.each([
-    { content: "subagent failed", state: "failed", wireState: { state: "idle" } },
+    {
+      content: "subagent failed",
+      state: "failed",
+      wireState: { state: "idle", stopReason: "error" },
+    },
     {
       content: "Request interrupted by user",
       state: "cancelled",
@@ -6172,8 +6176,7 @@ describe("subagent permission attribution (issue #851)", () => {
       update: {
         sessionUpdate: "subagent_update",
         sessionId: "agent-42",
-        // No StopReason value accurately describes a generic failure.
-        state: { state: "idle" },
+        state: { state: "idle", stopReason: "error" },
       },
     });
   });
