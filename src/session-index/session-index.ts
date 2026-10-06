@@ -42,6 +42,10 @@ export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
 const METADATA_CACHE_SIZE = 2000;
 const READ_BATCH_SIZE = 16;
+/** Transcripts read at most per directory to recover a sibling's cwd. */
+const MAX_CWD_PROBES_PER_DIR = 64;
+/** How long a directory that gave no cwd is not probed again. */
+const NO_CWD_RETRY_MS = 60_000;
 
 export type ArchivedFilter = "exclude" | "only";
 
@@ -153,8 +157,14 @@ export class SessionIndex {
   /** A cwd that encodes to each project directory name, learned from its
    *  transcripts; it recovers the cwd of a sibling that has none. */
   private readonly dirCwds = new Map<string, string>();
-  /** Whether a prefix-matched long project directory belongs to a path. */
-  private readonly longDirOwners = new Map<string, { mtimeMs: number; belongs: boolean }>();
+  /** The project cwd of the transcripts of prefix-matched long directories. */
+  private readonly transcriptCwds = new Lru<
+    string,
+    { mtimeMs: number; size: number; cwd: string | undefined }
+  >(METADATA_CACHE_SIZE);
+  /** Directories whose transcripts gave no cwd, by the directory mtime and
+   *  when that was learned. */
+  private readonly dirsWithoutCwd = new Map<string, { mtimeMs: number; at: number }>();
 
   constructor(private readonly getSessionInfo: GetSessionInfo) {}
 
@@ -190,37 +200,31 @@ export class SessionIndex {
   }
 
   /** Whether a transcript of the prefix-matched `dirName` belongs to
-   *  `projectPath`. A match is cached for good; a miss until the directory
-   *  changes. */
+   *  `projectPath`. The cwd of each transcript is cached by its
+   *  `(path, mtime, size)`, so a transcript that changes is read again. */
   private async longDirBelongsTo(dirName: string, projectPath: string): Promise<boolean> {
     const dir = path.join(projectsRoot(), dirName);
-    const key = `${dirName}\0${projectPath}`;
-    let mtimeMs: number;
-    try {
-      mtimeMs = (await fs.stat(dir)).mtimeMs;
-    } catch {
-      return false;
-    }
-    const cached = this.longDirOwners.get(key);
-    if (cached && (cached.belongs || cached.mtimeMs === mtimeMs)) return cached.belongs;
-    let belongs = false;
     for (const name of await readDirNames(dir)) {
       if (!name.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, name);
       try {
         const stats = await fs.stat(filePath);
         if (!stats.isFile()) continue;
-        const cwd = transcriptProjectCwd(await readHeadTail(filePath, stats.size));
-        if (cwd && sameProjectPath(cwd, projectPath)) {
-          belongs = true;
-          break;
+        let cached = this.transcriptCwds.get(filePath);
+        if (!cached || cached.mtimeMs !== stats.mtimeMs || cached.size !== stats.size) {
+          cached = {
+            mtimeMs: stats.mtimeMs,
+            size: stats.size,
+            cwd: transcriptProjectCwd(await readHeadTail(filePath, stats.size)),
+          };
+          this.transcriptCwds.set(filePath, cached);
         }
+        if (cached.cwd && sameProjectPath(cached.cwd, projectPath)) return true;
       } catch {
         // Gone or unreadable: look at the next one.
       }
     }
-    this.longDirOwners.set(key, { mtimeMs, belongs });
-    return belongs;
+    return false;
   }
 
   /** Every non-empty transcript of `cwd` and its worktrees (or of all
@@ -366,17 +370,42 @@ export class SessionIndex {
   }
 
   /** Reads the unread transcripts of `dirNames` until each directory has a
-   *  known cwd, or none of its transcripts gives one. */
+   *  known cwd, at most {@link MAX_CWD_PROBES_PER_DIR} per directory. A
+   *  directory that gives none is not read again for a while, unless it
+   *  changes. */
   private async learnDirCwds(
     dirNames: ReadonlySet<string>,
     unread: readonly TranscriptCandidate[],
   ): Promise<void> {
-    let remaining = unread.filter((candidate) => dirNames.has(candidate.dirName));
+    const root = projectsRoot();
+    const now = Date.now();
+    const mtimes = new Map<string, number>();
+    for (const dirName of dirNames) {
+      const mtimeMs = await fs.stat(path.join(root, dirName)).then(
+        (stats) => stats.mtimeMs,
+        () => undefined,
+      );
+      if (mtimeMs === undefined) continue;
+      const known = this.dirsWithoutCwd.get(dirName);
+      if (known && known.mtimeMs === mtimeMs && now - known.at < NO_CWD_RETRY_MS) continue;
+      mtimes.set(dirName, mtimeMs);
+    }
+    const probes = new Map<string, number>();
+    let remaining = unread.filter((candidate) => {
+      if (!mtimes.has(candidate.dirName)) return false;
+      const count = probes.get(candidate.dirName) ?? 0;
+      if (count >= MAX_CWD_PROBES_PER_DIR) return false;
+      probes.set(candidate.dirName, count + 1);
+      return true;
+    });
     while (remaining.length > 0) {
       remaining = remaining.filter((candidate) => !this.dirCwds.has(candidate.dirName));
       const batch = remaining.slice(0, READ_BATCH_SIZE);
       remaining = remaining.slice(batch.length);
       await Promise.all(batch.map((candidate) => this.metadataOf(candidate)));
+    }
+    for (const [dirName, mtimeMs] of mtimes) {
+      if (!this.dirCwds.has(dirName)) this.dirsWithoutCwd.set(dirName, { mtimeMs, at: now });
     }
   }
 

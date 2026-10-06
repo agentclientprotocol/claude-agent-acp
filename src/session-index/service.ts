@@ -33,7 +33,7 @@ import {
 } from "./archive-markers.js";
 import { LIST_CHANGED_METHOD, ListChangedWatcher } from "./list-changed.js";
 import { LiveSessionRegistry } from "./live-registry.js";
-import { isSessionId } from "./project-dirs.js";
+import { canonicalPath, errorCode, isSessionId, projectDirMatches } from "./project-dirs.js";
 import {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
@@ -201,17 +201,40 @@ async function lastLine(filePath: string): Promise<{ line: string; endsWithNewli
 }
 
 /** Appends the title record to a transcript whose last record is not that
- *  title already. */
-async function ensureTitleRecord(filePath: string, sessionId: string, title: string) {
+ *  title already. A transcript that does not end with a complete line is
+ *  left alone while a live writer may be finishing that line; otherwise its
+ *  torn last line is closed first. Returns whether the record is there. */
+async function ensureTitleRecord(
+  filePath: string,
+  sessionId: string,
+  title: string,
+  options: { liveWriter: boolean },
+): Promise<boolean> {
   const { line, endsWithNewline } = await lastLine(filePath);
   try {
     const last = JSON.parse(line) as { type?: unknown; customTitle?: unknown };
-    if (last.type === "custom-title" && last.customTitle === title) return;
+    if (last.type === "custom-title" && last.customTitle === title) return true;
   } catch {
     // Not a record: append.
   }
-  const prefix = endsWithNewline || line === "" ? "" : "\n";
-  await fs.appendFile(filePath, `${prefix}${customTitleRecord(sessionId, title)}\n`);
+  const complete = endsWithNewline || line === "";
+  if (!complete && options.liveWriter) return false;
+  await fs.appendFile(filePath, `${complete ? "" : "\n"}${customTitleRecord(sessionId, title)}\n`);
+  return true;
+}
+
+function isSdkNotFound(error: unknown): boolean {
+  return error instanceof Error && /^Session \S+ not found in /.test(error.message);
+}
+
+async function exists(target: string): Promise<boolean> {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
+    throw error;
+  }
 }
 
 /** The error the SDK `deleteSession` gives for a session id it rejects or
@@ -234,7 +257,8 @@ export async function archiveInsteadOfDelete(
   index: Pick<SessionIndex, "findTranscripts"> = new SessionIndex(sdkGetSessionInfo),
 ): Promise<void> {
   if (!isSessionId(sessionId)) throw sdkDeleteError(sessionId);
-  if ((await index.findTranscripts(sessionId, { includeEmpty: true })).length === 0) {
+  // The SDK delete skips empty transcripts, so they do not count.
+  if ((await index.findTranscripts(sessionId)).length === 0) {
     throw sdkDeleteError(sessionId);
   }
   await writeArchiveMarker(sessionId);
@@ -320,10 +344,16 @@ export class SessionIndexService {
   }
 
   /** Throws `thread_active_writer` when another live process holds the
-   *  session. A CLI that this process started (one being closed) does not
-   *  count. */
+   *  session. A CLI that this process started (one being closed) is no other
+   *  process: the check waits for it to exit instead, a few seconds at most. */
   async assertNotHeldElsewhere(sessionId: string): Promise<void> {
     if (await this.registry.holder(sessionId)) throw activeWriterError(sessionId);
+  }
+
+  /** Waits (bounded) until no CLI child of this process holds the session:
+   *  one just closed may still write its transcript while it exits. */
+  async awaitOwnCliExit(sessionId: string): Promise<void> {
+    await this.registry.holder(sessionId, { ignoreOthers: true });
   }
 
   /** Runs `mutation` after the previous mutation of the session ended. */
@@ -355,14 +385,50 @@ export class SessionIndexService {
       if (!options.ownedHere) await this.assertNotHeldElsewhere(sessionId);
       try {
         await this.renameSession(sessionId, title);
-        for (const transcript of transcripts) {
-          await ensureTitleRecord(transcript, sessionId, title);
-          await writeCustomTitleSidecar(transcript, title);
-        }
+        await this.titleCopies(transcripts, sessionId, title, Boolean(options.ownedHere));
       } finally {
         this.index.invalidate(transcripts);
       }
     });
+  }
+
+  /** Renames a session whose CLI runs here: `rename` asks the CLI, which
+   *  titles its own transcript and sidecar; the other copies of the session
+   *  get the record and the sidecar here. */
+  async renameLive(
+    sessionId: string,
+    title: string,
+    cwd: string,
+    rename: () => Promise<void>,
+  ): Promise<void> {
+    await this.exclusive(sessionId, async () => {
+      await rename();
+      if (!isSessionId(sessionId)) return;
+      const transcripts = await this.index.findTranscripts(sessionId);
+      try {
+        const canonical = await canonicalPath(cwd);
+        const others = transcripts.filter((transcript) => {
+          const dirName = path.basename(path.dirname(transcript));
+          return !projectDirMatches(dirName, cwd) && !projectDirMatches(dirName, canonical);
+        });
+        await this.titleCopies(others, sessionId, title, false);
+      } finally {
+        this.index.invalidate(transcripts);
+      }
+    });
+  }
+
+  private async titleCopies(
+    transcripts: readonly string[],
+    sessionId: string,
+    title: string,
+    liveWriter: boolean,
+  ): Promise<void> {
+    for (const transcript of transcripts) {
+      if (await ensureTitleRecord(transcript, sessionId, title, { liveWriter })) {
+        await writeCustomTitleSidecar(transcript, title);
+      }
+    }
   }
 
   /** Writes the archive marker. `known` skips the existence check for a
@@ -392,36 +458,63 @@ export class SessionIndexService {
   /** Deletes every transcript of the session, then its archive marker. A
    *  failure leaves the marker, so a session it fails to delete stays
    *  archived. `known`: the session was loaded here (and is torn down
-   *  already), so a missing transcript is no error. */
+   *  already), so a missing transcript is no error.
+   *
+   *  The SDK deletes the first non-empty transcript it finds and its
+   *  `<sessionId>/` directory, one copy per call; empty transcripts, which it
+   *  skips, are removed here. */
   async delete(sessionId: string, known: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      const find = () => this.index.findTranscripts(sessionId, { includeEmpty: true });
-      const transcripts = await find();
-      if (transcripts.length === 0) {
+      const all = await this.index.findTranscripts(sessionId, { includeEmpty: true });
+      if (all.length === 0) {
         if (await removeArchiveMarker(sessionId)) return;
         if (known) return;
         throw sessionNotFound(sessionId);
       }
       try {
-        // The SDK deletes the first transcript it finds: one call per copy.
-        for (let i = 0; i < transcripts.length; i++) {
+        const nonEmpty = await this.index.findTranscripts(sessionId);
+        for (let i = 0; i < nonEmpty.length; i++) {
           try {
             await this.deleteSession(sessionId);
           } catch (error) {
-            // A copy removed meanwhile is no failure.
-            if ((await find()).length === 0) break;
+            // Only "not found" with nothing left is a copy removed meanwhile.
+            if (
+              isSdkNotFound(error) &&
+              (await this.index.findTranscripts(sessionId)).length === 0
+            ) {
+              break;
+            }
             throw error;
           }
         }
-        const remaining = await find();
-        if (remaining.length > 0) {
-          throw new Error(
-            `Session ${sessionId} was not deleted from ${remaining.map((file) => path.dirname(file)).join(", ")}`,
-          );
+        for (const transcript of await this.index.findTranscripts(sessionId, {
+          includeEmpty: true,
+        })) {
+          const stats = await fs.stat(transcript).catch(() => undefined);
+          if (stats && stats.size > 0) continue;
+          await fs.rm(transcript, { force: true });
+          await fs.rm(path.join(path.dirname(transcript), sessionId), {
+            recursive: true,
+            force: true,
+          });
+        }
+        const left: string[] = [];
+        for (const transcript of all) {
+          const sessionDir = path.join(path.dirname(transcript), sessionId);
+          if (await exists(transcript)) left.push(transcript);
+          if (await exists(sessionDir)) left.push(sessionDir);
+        }
+        left.push(
+          ...(await this.index.findTranscripts(sessionId, { includeEmpty: true })).filter(
+            (transcript) => !left.includes(transcript),
+          ),
+        );
+        if (left.length > 0) {
+          throw new Error(`Session ${sessionId} was not deleted: ${left.join(", ")} remain`);
         }
       } finally {
-        this.index.invalidate(transcripts);
+        this.index.invalidate(all);
       }
       await removeArchiveMarker(sessionId);
     });

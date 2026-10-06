@@ -16,6 +16,11 @@ const CHUNK_SIZE = 64 * 1024;
 /** The largest tail window read to find the last message. */
 const MAX_TAIL_SIZE = 4 * 1024 * 1024;
 const TAIL_GROWTH = 4;
+const NO_MESSAGE_CACHE_SIZE = 512;
+
+/** `path\0size` of the transcripts whose last {@link MAX_TAIL_SIZE} bytes hold
+ *  no message: a file of the same size is not searched again. */
+const noMessageInTail = new Set<string>();
 
 export type TurnState = "finished" | "unfinished";
 
@@ -80,28 +85,48 @@ export async function scanTranscriptFile(
   headTail?: HeadTail,
 ): Promise<TranscriptFacts> {
   const read = headTail ?? (await readHeadTail(filePath, size));
-  let facts = scanTranscript(read, sessionId);
+  const facts = scanTranscript(read, sessionId);
   if (!facts.hasMessages || facts.lastMessageAt !== undefined || size <= CHUNK_SIZE) {
     return facts;
   }
+  const key = `${filePath}\0${size}`;
+  if (noMessageInTail.has(key)) return facts;
   const handle = await fs.open(filePath, "r");
   try {
-    for (let window = CHUNK_SIZE * TAIL_GROWTH; ; window *= TAIL_GROWTH) {
-      const bounded = Math.min(window, MAX_TAIL_SIZE);
-      const wider = scanTranscript(
-        { head: read.head, tail: await readTail(handle, size, bounded) },
-        sessionId,
-      );
+    // The bytes from `start` to the end, grown by reading the new range only.
+    let start = Math.max(0, size - CHUNK_SIZE);
+    let bytes = Buffer.alloc(0);
+    {
+      const first = Buffer.allocUnsafe(size - start);
+      const { bytesRead } = await handle.read(first, 0, first.length, start);
+      bytes = first.subarray(0, bytesRead);
+    }
+    for (let window = CHUNK_SIZE * TAIL_GROWTH; start > 0; window *= TAIL_GROWTH) {
+      const nextStart = Math.max(0, size - Math.min(window, MAX_TAIL_SIZE));
+      if (nextStart >= start) break;
+      const range = Buffer.allocUnsafe(start - nextStart);
+      const { bytesRead } = await handle.read(range, 0, range.length, nextStart);
+      bytes = Buffer.concat([range.subarray(0, bytesRead), bytes]);
+      start = nextStart;
+      let tail = bytes.toString("utf8");
+      if (start > 0) {
+        // The first line of the window is cut; drop it.
+        const newline = tail.indexOf("\n");
+        tail = newline >= 0 ? tail.slice(newline + 1) : "";
+      }
+      const wider = scanTranscript({ head: read.head, tail }, sessionId);
       if (wider.lastMessageAt !== undefined) {
         // A wider tail ends with the same records: what the narrow one found
         // stays, and the wider one adds what lay before it.
-        facts = { ...wider, hasMessages: facts.hasMessages };
-        break;
+        return { ...wider, hasMessages: facts.hasMessages };
       }
-      if (bounded >= size || bounded >= MAX_TAIL_SIZE) break;
     }
   } finally {
     await handle.close();
+  }
+  noMessageInTail.add(key);
+  if (noMessageInTail.size > NO_MESSAGE_CACHE_SIZE) {
+    noMessageInTail.delete(noMessageInTail.values().next().value as string);
   }
   return facts;
 }

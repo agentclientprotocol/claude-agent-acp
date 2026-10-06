@@ -18,7 +18,12 @@ import {
 import { spawn, type ChildProcess } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
-import { SessionIndexService, writeCustomTitleSidecar } from "../session-index/service.js";
+import {
+  archiveInsteadOfDelete,
+  SessionIndexService,
+  writeCustomTitleSidecar,
+} from "../session-index/service.js";
+import { scanTranscriptFile } from "../session-index/transcript-scan.js";
 import { repositoryWorktrees } from "../session-index/worktrees.js";
 import { ListChangedWatcher } from "../session-index/list-changed.js";
 import { SessionTitles } from "../session-titles.js";
@@ -683,20 +688,57 @@ describe("ownership of a session for delete and rename", () => {
       child = undefined;
     });
 
-    it("is no other writer while it exits after a close", async () => {
+    const exitingChild = () => {
+      const spawned = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+        stdio: "ignore",
+      });
+      child = spawned;
+      const state = { killedAt: Infinity };
+      return {
+        pid: spawned.pid!,
+        state,
+        exit: () => {
+          state.killedAt = Date.now();
+          spawned.kill("SIGKILL");
+        },
+      };
+    };
+
+    it("is waited for, not refused, before a delete or a rename", async () => {
       const deleted = await writeTranscript({});
       const renamed = await writeTranscript({});
-      child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
-      const pid = child.pid!;
-      // The CLI that this adapter just closed is still registered.
-      await registerHolder(pid, deleted.id, { entrypoint: "sdk-ts" });
       const { agent } = await indexAgent();
+
+      // The CLI that this adapter just closed is still registered, and exits.
+      const first = exitingChild();
+      await registerHolder(first.pid, deleted.id, { entrypoint: "sdk-ts" });
+      setTimeout(first.exit, 300);
       await agent.deleteSession({ sessionId: deleted.id });
+      expect(Date.now()).toBeGreaterThanOrEqual(first.state.killedAt);
       expect(fsSync.existsSync(deleted.file)).toBe(false);
 
-      await registerHolder(pid, renamed.id, { entrypoint: "sdk-ts" });
+      const second = exitingChild();
+      await registerHolder(second.pid, renamed.id, { entrypoint: "sdk-ts" });
+      setTimeout(second.exit, 300);
       await agent.renameSessionTitle({ sessionId: renamed.id, title: "Renamed" });
+      expect(Date.now()).toBeGreaterThanOrEqual(second.state.killedAt);
       expect((await agent.listSessions({ cwd: workspace })).sessions[0]!.title).toBe("Renamed");
+    });
+
+    it("is waited for after a delete tears down a running session", async () => {
+      const session = await writeTranscript({});
+      const { agent } = await indexAgent();
+      agent.sessions[session.id] = mockSessionState(
+        { input: { end: () => {} }, query: { close: () => {}, interrupt: async () => {} } },
+        agent,
+        session.id,
+      ) as any;
+      const running = exitingChild();
+      await registerHolder(running.pid, session.id, { entrypoint: "sdk-ts" });
+      setTimeout(running.exit, 300);
+      await agent.deleteSession({ sessionId: session.id });
+      expect(Date.now()).toBeGreaterThanOrEqual(running.state.killedAt);
+      expect(fsSync.existsSync(session.file)).toBe(false);
     });
   });
 });
@@ -950,5 +992,249 @@ describe("worktrees after git worktree move", () => {
     await fs.writeFile(path.join(meta, "gitdir"), `${path.join(after, ".git")}\n`);
     await fs.utimes(worktreesDir, 1_700_000_000, 1_700_000_000);
     expect(await repositoryWorktrees(repo)).toEqual([repo, after]);
+  });
+});
+
+/** The real SDK `deleteSession`, behind the spy. */
+const sdkDelete = () => vi.mocked(deleteSession).getMockImplementation()!;
+
+describe("empty transcripts on delete", () => {
+  it("deletes a session that has only an empty transcript, and its session directory", async () => {
+    const id = randomUUID();
+    const dir = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await fs.mkdir(path.join(dir, id), { recursive: true });
+    await fs.writeFile(path.join(dir, `${id}.jsonl`), "");
+    const { agent } = await indexAgent();
+    await agent.deleteSession({ sessionId: id });
+    expect(await fs.readdir(dir)).toEqual([]);
+  });
+
+  it("deletes a real and an empty copy of a session", async () => {
+    const real = await writeTranscript({ cwd: path.join(workspace, "a") });
+    const emptyDir = path.join(configDir, "projects", encodeProjectPath(path.join(workspace, "b")));
+    await fs.mkdir(emptyDir, { recursive: true });
+    await fs.writeFile(path.join(emptyDir, `${real.id}.jsonl`), "");
+    const { agent } = await indexAgent();
+    await agent.deleteSession({ sessionId: real.id });
+    expect(fsSync.existsSync(real.file)).toBe(false);
+    expect(await fs.readdir(emptyDir)).toEqual([]);
+  });
+
+  it("archives for an AIR client without sessionIndex only what the SDK delete would find", async () => {
+    const id = randomUUID();
+    const dir = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, `${id}.jsonl`), "");
+    const sdkError = await sdkDelete()(id).then(
+      () => undefined,
+      (error: Error) => error,
+    );
+    await expect(archiveInsteadOfDelete(id)).rejects.toThrow(sdkError!.message);
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", id))).toBe(false);
+  });
+});
+
+describe("a failing SDK delete", () => {
+  it("fails the request when the session directory could not be removed", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    // The SDK removed the transcript, then failed to remove `<id>/`.
+    vi.mocked(deleteSession).mockImplementationOnce(async () => {
+      await fs.rm(session.file);
+      throw Object.assign(new Error("EACCES: permission denied, rmdir"), { code: "EACCES" });
+    });
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toThrow("EACCES");
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+  });
+
+  it("fails the request when a session directory is left behind", async () => {
+    const session = await writeTranscript({});
+    const sessionDir = path.join(path.dirname(session.file), session.id);
+    await fs.mkdir(sessionDir);
+    const { agent } = await indexAgent();
+    vi.mocked(deleteSession).mockImplementationOnce(async () => {
+      await fs.rm(session.file);
+    });
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toThrow(sessionDir);
+  });
+});
+
+describe("a long project directory whose transcript gets its cwd later", () => {
+  it("is listed once a transcript in it names the path", async () => {
+    const mine = path.join(workspace, "x".repeat(210), "mine");
+    const prefix = encodeProjectPath(mine).slice(0, 200);
+    const session = await writeTranscript({
+      cwd: mine,
+      recordCwd: null,
+      dirName: `${prefix}-cli0hash`,
+    });
+    const { agent } = await indexAgent();
+    expect((await agent.listSessions({ cwd: mine })).sessions).toEqual([]);
+    // Appending does not change the directory mtime.
+    await fs.appendFile(
+      session.file,
+      JSON.stringify({ type: "user", cwd: mine, sessionId: session.id, message: {} }) + "\n",
+    );
+    expect((await agent.listSessions({ cwd: mine })).sessions.map((s) => s.sessionId)).toEqual([
+      session.id,
+    ]);
+  });
+});
+
+describe("rename of a running session with several transcripts", () => {
+  it("titles the other copies here and leaves the CLI's own copy to the CLI", async () => {
+    const own = await writeTranscript({ cwd: workspace });
+    const other = await writeTranscript({
+      sessionId: own.id,
+      cwd: path.join(workspace, "moved"),
+      trailer: [{ type: "last-prompt", lastPrompt: "x".repeat(500), sessionId: own.id }],
+    });
+    const { agent } = await indexAgent();
+    await agent.listSessions({});
+    const cliRecord =
+      JSON.stringify({ type: "custom-title", customTitle: "Live title", sessionId: own.id }) + "\n";
+    // The CLI titles its own transcript.
+    const rename = vi.fn(async () => {
+      await fs.appendFile(own.file, cliRecord);
+    });
+    const ownBefore = await fs.readFile(own.file, "utf8");
+    agent.sessions[own.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: rename } },
+      agent,
+      own.id,
+    ) as any;
+    await agent.renameSessionTitle({ sessionId: own.id, title: "Live title" });
+
+    expect(rename).toHaveBeenCalledWith("Live title", own.id);
+    expect(await fs.readFile(own.file, "utf8")).toBe(ownBefore + cliRecord);
+    expect(fsSync.existsSync(path.join(path.dirname(own.file), own.id))).toBe(false);
+    const lastRecord = JSON.parse(
+      (await fs.readFile(other.file, "utf8")).trim().split("\n").pop()!,
+    );
+    expect(lastRecord).toEqual({
+      type: "custom-title",
+      customTitle: "Live title",
+      sessionId: own.id,
+    });
+    const sidecar = path.join(path.dirname(other.file), own.id, "custom-title.json");
+    expect(JSON.parse(await fs.readFile(sidecar, "utf8"))).toEqual({ customTitle: "Live title" });
+    expect((await agent.listSessions({})).sessions[0]!.title).toBe("Live title");
+  });
+});
+
+describe("a failed rename", () => {
+  it("leaves the title open to generation", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const session: any = {
+      queryClosed: false,
+      cancelled: false,
+      cwd: "/nowhere",
+      query: { generateSessionTitle: async () => "Generated" },
+    };
+    agent.sessions.s1 = session;
+    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
+    await expect(
+      titles.setExplicitTitle("Mine", async () => {
+        throw new Error("disk full");
+      }),
+    ).rejects.toThrow("disk full");
+    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    await titles.onTurnEnd(session);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
+  });
+});
+
+describe("a title record after a torn last line", () => {
+  it("is not appended while the session's CLI may be writing that line", async () => {
+    const session = await writeTranscript({});
+    await fs.appendFile(session.file, '{"type":"assistant","mess');
+    const before = await fs.readFile(session.file, "utf8");
+    const { agent } = await indexAgent();
+    // A running session whose SDK has no rename control request.
+    agent.sessions[session.id] = mockSessionState({ cwd: workspace }, agent, session.id) as any;
+    vi.mocked(renameSession).mockImplementationOnce(async () => {});
+    await agent.renameSessionTitle({ sessionId: session.id, title: "Later" });
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
+  });
+
+  it("follows a complete line when no process writes the transcript", async () => {
+    const session = await writeTranscript({});
+    await fs.appendFile(session.file, '{"type":"assistant","mess');
+    const { agent } = await indexAgent();
+    vi.mocked(renameSession).mockImplementationOnce(async () => {});
+    await agent.renameSessionTitle({ sessionId: session.id, title: "Later" });
+    const lines = (await fs.readFile(session.file, "utf8")).split("\n");
+    expect(lines.slice(-3)).toEqual([
+      '{"type":"assistant","mess',
+      JSON.stringify({ type: "custom-title", customTitle: "Later", sessionId: session.id }),
+      "",
+    ]);
+  });
+});
+
+describe("cwd recovery in a directory without any cwd", () => {
+  it("reads a bounded number of transcripts, and not again until it changes", async () => {
+    const base = Date.parse("2026-06-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    for (let i = 1; i <= 20; i++) await writeTranscript({ lastMessageAt: base - i * 1000 });
+    for (let i = 0; i < 100; i++) {
+      await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base - 3600_000 - i });
+    }
+    const { agent } = await indexAgent();
+    vi.mocked(getSessionInfo).mockClear();
+    await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
+    expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(16 + 64);
+    vi.mocked(getSessionInfo).mockClear();
+    await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
+    expect(getSessionInfo).not.toHaveBeenCalled();
+  });
+});
+
+describe("tail growth", () => {
+  const big = (id: string, at: number, size: number) =>
+    JSON.stringify({
+      type: "assistant",
+      sessionId: id,
+      timestamp: new Date(at).toISOString(),
+      message: { role: "assistant", content: [{ type: "text", text: "z".repeat(size) }] },
+    });
+
+  it("finds a last message beyond the first grown windows", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    await fs.writeFile(file, `${big(id, at - 1000, 10)}\n${big(id, at, 2_000_000)}\n`);
+    const { size } = await fs.stat(file);
+    expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBe(at);
+  });
+
+  it("does not search a transcript of the same size again", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const filler = JSON.stringify({ type: "progress", data: "q".repeat(5_000_000) });
+    await fs.writeFile(file, `${big(id, at, 10)}\n${filler}\n`);
+    const { size } = await fs.stat(file);
+    expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBeUndefined();
+    // Same path and size, a message 100 KB before the end now: the cached
+    // miss stands, the tail is not searched again.
+    const message = big(id, at, 10);
+    const pad = JSON.stringify({ type: "progress", data: "p".repeat(100_000) });
+    const moved = JSON.stringify({
+      type: "progress",
+      data: "q".repeat(5_000_000 - message.length - pad.length - 2),
+    });
+    await fs.writeFile(file, `${message}\n${moved}\n${message}\n${pad}\n`);
+    expect((await fs.stat(file)).size).toBe(size);
+    expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBeUndefined();
   });
 });

@@ -86,7 +86,14 @@ export class SessionTitles {
 
   /** Set once a client named the session (`_session/rename`). No generated
    *  title replaces it. */
-  private explicit = false;
+  private named = false;
+
+  /** Renames in flight. While one is, no generated title is adopted either. */
+  private pendingRenames = 0;
+
+  private get explicit(): boolean {
+    return this.named || this.pendingRenames > 0;
+  }
 
   /** The title generation in flight, which a rename waits for: the generator
    *  persists its title, and a later write would replace the client's. */
@@ -123,7 +130,7 @@ export class SessionTitles {
    *  `conversation_reset`, which mounts a fresh transcript. */
   reset(): void {
     this.settled = false;
-    this.explicit = false;
+    this.named = false;
     this.context = undefined;
     this.lastTitle = undefined;
   }
@@ -186,11 +193,25 @@ export class SessionTitles {
    *  waits for a generation in flight so that its persisted title cannot land
    *  after this one, persists the title with `persist`, and publishes it. */
   async setExplicitTitle(title: string, persist: () => Promise<void>): Promise<void> {
-    this.explicit = true;
+    const previous = { settled: this.settled, context: this.context };
+    this.pendingRenames++;
     this.settled = true;
     this.context = undefined;
-    await this.generation;
-    await persist();
+    try {
+      await this.generation;
+      await persist();
+      this.named = true;
+    } catch (error) {
+      // A failed rename leaves the title as it was: a later turn may still
+      // generate one.
+      if (!this.named && this.pendingRenames === 1) {
+        this.settled = previous.settled;
+        this.context ??= previous.context;
+      }
+      throw error;
+    } finally {
+      this.pendingRenames--;
+    }
     this.lastTitle = title;
     await this.agent.client.sessionUpdate({
       sessionId: this.sessionId,

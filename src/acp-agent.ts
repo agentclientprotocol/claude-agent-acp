@@ -3005,9 +3005,12 @@ export class ClaudeAcpAgent {
       | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
       | undefined;
     if (session && !session.queryClosed && typeof query?.renameSession === "function") {
-      // The CLI appends the title, writes the sidecar and updates its memory.
+      // The CLI appends the title, writes the sidecar and updates its memory;
+      // the index titles the other copies of the session.
       await session.titles.setExplicitTitle(params.title, () =>
-        query.renameSession!(params.title, params.sessionId),
+        index.renameLive(params.sessionId, params.title, session.cwd, () =>
+          query.renameSession!(params.title, params.sessionId),
+        ),
       );
       return {};
     }
@@ -7845,8 +7848,8 @@ export class ClaudeAcpAgent {
     const loaded = session !== undefined;
     // Only a running query makes the session ours: the CLI of a closed one is
     // gone, and another process may have resumed the session since. The
-    // holder check ignores the CLIs this process started, which stay
-    // registered while they exit.
+    // holder check, like the delete below, waits for the CLIs this process
+    // started to exit: they stay registered, and may write, while they do.
     if (this.sessionIndex && (!session || session.queryClosed)) {
       await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
     }
@@ -7856,6 +7859,7 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
     if (this.sessionIndex) {
+      await this.sessionIndex.awaitOwnCliExit(params.sessionId);
       await this.sessionIndex.delete(params.sessionId, loaded);
     } else if (this.toolCallCapabilities.air.client) {
       await archiveInsteadOfDelete(params.sessionId);

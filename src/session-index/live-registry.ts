@@ -16,9 +16,10 @@
  * - a record older than 24 hours counts only when its `procStart` matches.
  *
  * A snapshot is cached for {@link SNAPSHOT_TTL_MS}. A holder check before a
- * destructive operation asks for a fresh one, and ignores the CLI children of
- * this process: a CLI that this adapter closed stays registered until it has
- * exited, and is no other writer.
+ * destructive operation asks for a fresh one. A CLI child of this process (one
+ * this adapter just closed) is no other writer, but it may still flush the
+ * transcript while it exits: the check waits for it to go, a few seconds at
+ * most.
  */
 
 import { execFile } from "node:child_process";
@@ -31,6 +32,8 @@ import { errorCode } from "./project-dirs.js";
 const SNAPSHOT_TTL_MS = 5_000;
 const STALE_RECORD_MS = 24 * 60 * 60 * 1000;
 const PS_TIMEOUT_MS = 1_000;
+const OWN_CHILD_EXIT_TIMEOUT_MS = 3_000;
+const OWN_CHILD_POLL_MS = 100;
 const RECORD_FILE_PATTERN = /^(\d+)\.json$/;
 
 export type LiveRecord = {
@@ -57,8 +60,10 @@ export type LiveRegistryDeps = {
   pidDomain?: () => Promise<string>;
   /** The parent pid of each live pid. */
   parentPids?: (pids: number[]) => Promise<Map<number, number>>;
-  /** This process's pid, whose CLI children a holder check ignores. */
+  /** This process's pid, whose CLI children a holder check waits for. */
   ownPid?: number;
+  /** How long a holder check waits for a CLI child of this process to exit. */
+  ownChildExitTimeoutMs?: number;
 };
 
 /** `<config>/sessions`, where each CLI process registers itself. */
@@ -182,6 +187,7 @@ export class LiveSessionRegistry {
   private readonly pidDomain: () => Promise<string>;
   private readonly parentPids: (pids: number[]) => Promise<Map<number, number>>;
   private readonly ownPid: number;
+  private readonly ownChildExitTimeoutMs: number;
 
   constructor(deps: LiveRegistryDeps = {}) {
     this.dir = deps.dir ?? liveRegistryDir;
@@ -191,6 +197,7 @@ export class LiveSessionRegistry {
     this.pidDomain = deps.pidDomain ?? defaultPidDomain;
     this.parentPids = deps.parentPids ?? defaultParentPids;
     this.ownPid = deps.ownPid ?? process.pid;
+    this.ownChildExitTimeoutMs = deps.ownChildExitTimeoutMs ?? OWN_CHILD_EXIT_TIMEOUT_MS;
   }
 
   /** The live records by session id. Cached for 5 s unless `fresh`. */
@@ -207,19 +214,33 @@ export class LiveSessionRegistry {
   }
 
   /** A live process other than a CLI child of this one that holds
-   *  `sessionId`, from a fresh read. */
-  async holder(sessionId: string): Promise<LiveRecord | undefined> {
-    let records: LiveRecord[];
-    try {
-      records = (await this.read()).filter((record) => record.sessionId === sessionId);
-    } catch {
-      return undefined;
+   *  `sessionId`, from a fresh read. While only CLI children of this process
+   *  hold it, waits (bounded) for them to exit, so that nothing writes the
+   *  transcript any more when the caller goes on. */
+  async holder(
+    sessionId: string,
+    options: { ignoreOthers?: boolean } = {},
+  ): Promise<LiveRecord | undefined> {
+    const deadline = Date.now() + this.ownChildExitTimeoutMs;
+    for (;;) {
+      let records: LiveRecord[];
+      try {
+        records = (await this.read()).filter((record) => record.sessionId === sessionId);
+      } catch {
+        return undefined;
+      }
+      if (records.length === 0) return undefined;
+      const parents = await this.parentPids(records.map(({ pid }) => pid)).catch(
+        () => new Map<number, number>(),
+      );
+      const children = records.filter(({ pid }) => parents.get(pid) === this.ownPid);
+      if (!options.ignoreOthers) {
+        const other = records.find((record) => !children.includes(record));
+        if (other) return other;
+      }
+      if (children.length === 0 || Date.now() >= deadline) return undefined;
+      await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
     }
-    if (records.length === 0) return undefined;
-    const parents = await this.parentPids(records.map(({ pid }) => pid)).catch(
-      () => new Map<number, number>(),
-    );
-    return records.find(({ pid }) => parents.get(pid) !== this.ownPid);
   }
 
   /** Every live record, several per session when several processes hold it. */

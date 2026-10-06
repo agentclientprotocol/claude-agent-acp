@@ -343,10 +343,30 @@ describe("live registry", () => {
       pidDomain: async () => "darwin",
       ownPid: 1000,
       parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 22 ? 1 : 1000])),
+      ownChildExitTimeoutMs: 0,
     });
     expect(await registry.holder("closed-here")).toBeUndefined();
     // Our exiting child and another process: the other one holds it.
     expect((await registry.holder("both"))?.pid).toBe(22);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("waits a bounded time for a CLI child of this process to exit", async () => {
+    const dir = await registryWith({
+      "30.json": { pid: 30, sessionId: "exiting", updatedAt: now },
+    });
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      pidDomain: async () => "darwin",
+      ownPid: 1000,
+      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1000])),
+      ownChildExitTimeoutMs: 250,
+    });
+    const started = Date.now();
+    expect(await registry.holder("exiting")).toBeUndefined();
+    expect(Date.now() - started).toBeGreaterThanOrEqual(240);
     await fs.rm(dir, { recursive: true, force: true });
   });
 
