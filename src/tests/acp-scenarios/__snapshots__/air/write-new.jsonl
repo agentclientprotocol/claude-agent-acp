@@ -1,4 +1,4 @@
-{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[],"sessionUpdate":"available_commands_update"}}}
+{"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"availableCommands":[{"description":"Show the MCP servers and their status, or reconnect, enable, or disable a server","input":{"hint":"[reconnect|enable|disable [<server>|all]]"},"name":"mcp"}],"sessionUpdate":"available_commands_update"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"_claude/model":"claude-sonnet-4-6"},"sessionUpdate":"usage_update","size":200000,"used":2}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"_meta":{"claudeCode":{"toolName":"Write"}},"content":[],"kind":"edit","locations":[],"name":"Write","sessionUpdate":"tool_call","status":"pending","title":"Preparing file…","toolCallId":"toolu_write"}}}
 {"kind":"sessionUpdate","payload":{"sessionId":"<session>","update":{"locations":[{"path":"<cwd>/new.ts"}],"sessionUpdate":"tool_call_update","title":"Write new.ts","toolCallId":"toolu_write"}}}

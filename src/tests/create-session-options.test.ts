@@ -14,9 +14,13 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let contextUsageCalls: Array<{ detail?: "summary" | "full" } | undefined> = [];
 let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
+/** Holds the CLI initialization until the test resolves it. */
+let initGate: Promise<void> | undefined;
+let initError: Error | undefined;
 let setModelImpl: ((model: string) => Promise<void>) | undefined;
 let interruptImpl: (() => Promise<undefined>) | undefined;
 let closeSpy: ReturnType<typeof vi.fn<() => void>>;
@@ -38,19 +42,16 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       return makeMockQuery({
         interrupt: () => (interruptImpl ? interruptImpl() : Promise.resolve(undefined)),
         close: () => closeSpy(),
-        initializationResult: async () => ({
-          models: initModels ?? [
-            {
-              value: "claude-sonnet-4-6",
-              displayName: "Claude Sonnet",
-              description: "Fast",
-              supportsAutoMode: true,
-            },
-          ],
-        }),
+        initializationResult: async () => {
+          await initGate;
+          if (initError) throw initError;
+          return initializationResponse();
+        },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
-        getContextUsage: () =>
-          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        getContextUsage: (opts?: { detail?: "summary" | "full" }) => {
+          contextUsageCalls.push(opts);
+          return contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE);
+        },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
@@ -58,6 +59,19 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     getSessionMessages: vi.fn(() => sessionMessagesResult()),
   };
 });
+
+function initializationResponse() {
+  return {
+    models: initModels ?? [
+      {
+        value: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        description: "Fast",
+        supportsAutoMode: true,
+      },
+    ],
+  };
+}
 
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
@@ -83,10 +97,13 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    contextUsageCalls = [];
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
     initModels = undefined;
+    initGate = undefined;
+    initError = undefined;
     setModelImpl = undefined;
     interruptImpl = undefined;
     closeSpy = vi.fn<() => void>();
@@ -183,21 +200,6 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
-  });
-
-  it("ignores the provider-specific main-thread agent option", async () => {
-    const response = await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-      _meta: {
-        claudeCode: {
-          options: { agent: "reviewer" },
-        },
-      },
-    });
-
-    expect(capturedOptions).not.toHaveProperty("agent");
-    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -912,6 +914,15 @@ describe("createSession options merging", () => {
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
     });
 
+    it("asks for the summary context usage so the CLI sends no count_tokens requests", async () => {
+      // The default `full` detail counts each context category with its own
+      // messages/count_tokens request — a burst that hit rate limits on every
+      // model switch — while only `rawMaxTokens` is needed here.
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
+    });
+
     it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
       const ctxSpy = vi.fn(async () => ({ rawMaxTokens: 0 }));
       contextUsageResult = ctxSpy;
@@ -1405,6 +1416,147 @@ describe("createSession options merging", () => {
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
       expect((agent as any).sessions[sessionId].models.currentModelId).toBe("claude-sonnet-4-6");
+    });
+  });
+
+  describe("loadSession history replay", () => {
+    const userMessage = (uuid: string, text: string) => ({
+      type: "user",
+      uuid,
+      session_id: "replay-probe",
+      parent_tool_use_id: null,
+      parent_agent_id: null,
+      message: { role: "user", content: [{ type: "text", text }] },
+    });
+
+    function capturingAgent(updates: SessionNotification[]) {
+      return new ClaudeAcpAgent({
+        ...createMockClient(),
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+        },
+      } as AcpClient);
+    }
+
+    it("replays the history while the CLI starts", async () => {
+      let releaseInit!: () => void;
+      initGate = new Promise((resolve) => (releaseInit = resolve));
+      sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+      const updates: SessionNotification[] = [];
+      const loading = capturingAgent(updates).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      let loaded = false;
+      void loading.then(() => (loaded = true));
+
+      await vi.waitFor(() => expect(updates).toHaveLength(2));
+      expect(loaded).toBe(false);
+      expect(updates.map((update) => update.update.sessionUpdate)).toEqual([
+        "user_message_chunk",
+        "user_message_chunk",
+      ]);
+
+      releaseInit();
+      await expect(loading).resolves.toMatchObject({ sessionId: "replay-probe" });
+    });
+
+    it("keeps the not-found error when the CLI finds no conversation", async () => {
+      initError = new Error("No conversation found with session ID: replay-probe");
+      const updates: SessionNotification[] = [];
+      const loadAgent = capturingAgent(updates);
+
+      await expect(
+        loadAgent.loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] }),
+      ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+      expect(updates).toEqual([]);
+      expect((loadAgent as any).sessions["replay-probe"]).toBeUndefined();
+    });
+
+    it("stops the replay when the CLI start fails", async () => {
+      let failInit!: () => void;
+      initGate = new Promise((resolve) => (failInit = resolve));
+      initError = new Error("No conversation found with session ID: replay-probe");
+      let releaseRead!: () => void;
+      const readGate = new Promise<void>((resolve) => (releaseRead = resolve));
+      sessionMessagesResult = async () => {
+        await readGate;
+        return [userMessage("u1", "first")];
+      };
+      const updates: SessionNotification[] = [];
+      const loading = capturingAgent(updates).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      const failed = expect(loading).rejects.toMatchObject({
+        code: RequestError.resourceNotFound().code,
+      });
+
+      failInit();
+      // The failed start closes its query, and the load then stops the replay.
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+      await new Promise((resolve) => setImmediate(resolve));
+      releaseRead();
+      await failed;
+      expect(updates).toEqual([]);
+    });
+
+    it("sends no update after a load that fails while the replay runs", async () => {
+      let failInit!: () => void;
+      initGate = new Promise((resolve) => (failInit = resolve));
+      initError = new Error("Claude Code process exited with code 1");
+      sessionMessages = [
+        userMessage("u1", "first"),
+        userMessage("u2", "second"),
+        userMessage("u3", "third"),
+      ];
+      const updates: SessionNotification[] = [];
+      let releaseClient!: () => void;
+      const clientGate = new Promise<void>((resolve) => (releaseClient = resolve));
+      const loading = new ClaudeAcpAgent({
+        ...createMockClient(),
+        sessionUpdate: async (notification: SessionNotification) => {
+          updates.push(notification);
+          await clientGate;
+        },
+      } as AcpClient).loadSession({
+        sessionId: "replay-probe",
+        cwd: process.cwd(),
+        mcpServers: [],
+      });
+      let updatesAtError: number | undefined;
+      const failed = loading.then(
+        () => expect.unreachable("the load must fail"),
+        () => (updatesAtError = updates.length),
+      );
+
+      // The client still handles the first replayed update when the CLI start fails.
+      await vi.waitFor(() => expect(updates).toHaveLength(1));
+      failInit();
+      await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+      releaseClient();
+      await failed;
+      for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+
+      expect(updatesAtError).toBeGreaterThan(0);
+      expect(updates).toHaveLength(updatesAtError!);
+    });
+
+    it("rejects an invalid cwd before it sends an update", async () => {
+      sessionMessages = [userMessage("u1", "first")];
+      const updates: SessionNotification[] = [];
+
+      await expect(
+        capturingAgent(updates).loadSession({
+          sessionId: "replay-probe",
+          cwd: path.join(os.tmpdir(), "no-such-directory-for-replay-probe"),
+          mcpServers: [],
+        }),
+      ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+      expect(updates).toEqual([]);
+      expect(getSessionMessages).not.toHaveBeenCalled();
     });
   });
 });

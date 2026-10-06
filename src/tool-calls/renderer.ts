@@ -82,7 +82,11 @@ export type ToolUpdateMeta = {
   };
   terminal_exit?: {
     terminal_id: string;
-    exit_code: number;
+    /**
+     * Null when the agent does not know the code, as in `TerminalExitStatus`.
+     * AIR always gets a number.
+     */
+    exit_code: number | null;
     signal: string | null;
   };
 };
@@ -248,8 +252,9 @@ export class AcpToolCallRenderer {
   ): RequestPermissionRequest["toolCall"] {
     const facts = this.facts(toolUse, options.cwd);
     if (!this.capabilities.air.client) {
-      // The upstream shape: the whole tool call again.
-      const content = this.toolUseContent(toolUse.id, facts);
+      // The upstream shape: the whole tool call again. A v2 client also gets
+      // the exact preview patch, which the tool call does not show.
+      const content = options.previewContent ?? this.toolUseContent(toolUse.id, facts);
       const locations = [...(facts.locations ?? []), ...(options.extraLocations ?? [])];
       return {
         toolCallId: toolUse.id,
@@ -324,7 +329,17 @@ export class AcpToolCallRenderer {
           ...(this.capabilities.terminalOutputDelta
             ? { terminal_output_delta: output }
             : { terminal_output: output }),
-          terminal_exit: { terminal_id: terminalId, exit_code: command.exitCode, signal: null },
+          terminal_exit: {
+            terminal_id: terminalId,
+            // AIR keeps the numbers it always got: 1 for a failed or
+            // interrupted command, else the exit code, or 0 when unknown.
+            exit_code: this.capabilities.air.client
+              ? result.is_error === true || command.interrupted
+                ? 1
+                : (command.exitCode ?? 0)
+              : (command.exitCode ?? null),
+            signal: null,
+          },
         },
       };
     }

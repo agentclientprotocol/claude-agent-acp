@@ -80,7 +80,8 @@ function usageBar(percent: number): string {
   return `${"█".repeat(filled)}${"░".repeat(cells - filled)}`;
 }
 
-function escapeMarkdown(value: string): string {
+/** Escape the Markdown syntax characters of `value` and fold its line breaks. */
+export function escapeMarkdown(value: string): string {
   return value.replace(/([\\`*_[\]<>|])/g, "\\$1").replace(/[\r\n]+/g, " ");
 }
 

@@ -27,8 +27,7 @@ export function serveAcp(
     ? acpProtocolRouter(logger, onAgent).connect(v2.ndJsonStream(output, input))
     : v1AgentApp(logger, onAgent).connect(ndJsonStream(output, input));
   return {
-    // The router types `closed` as optional, but always sets it.
-    closed: closed!,
+    closed,
     dispose: async () => {
       await agent?.dispose();
     },

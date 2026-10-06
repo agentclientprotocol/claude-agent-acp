@@ -87,3 +87,34 @@ export function unreachable(value: never, logger: Logger = console) {
 export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
 }
+
+/** The outcome of {@link raceTimeoutAndAbort}. */
+export type RaceOutcome<T> = { type: "done"; value: T } | { type: "timeout" } | { type: "aborted" };
+
+/** Wait for `promise` until `timeoutMs` passes or `signal` aborts. A rejection
+ *  of `promise` rejects the result. The timer does not keep the process alive. */
+export async function raceTimeoutAndAbort<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<RaceOutcome<T>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      promise.then((value): RaceOutcome<T> => ({ type: "done", value })),
+      new Promise<RaceOutcome<T>>((resolve) => {
+        timeout = setTimeout(() => resolve({ type: "timeout" }), timeoutMs);
+        timeout.unref?.();
+      }),
+      new Promise<RaceOutcome<T>>((resolve) => {
+        onAbort = () => resolve({ type: "aborted" });
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}

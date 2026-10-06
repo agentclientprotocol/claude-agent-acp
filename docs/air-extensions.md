@@ -164,25 +164,27 @@ Every payload goes into `_meta.jetbrains.air`, next to `version: 1`.
 The adapter merges a payload into an existing `_meta` and keeps the other namespaces.
 The adapter sends these keys only to an AIR client. "AIR" in the Gate column means an AIR client without a further capability.
 
-| Key                            | Message and field path                                                                | Shape                                                                  | Gate                                           |
-| ------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | ---------------------------------------------- |
-| `capabilities`                 | `initialize` response `_meta.jetbrains.air`                                           | string array                                                           | AIR                                            |
-| `goal`                         | `initialize` response `_meta.jetbrains.air`                                           | `{version: 1, controlMethod, actions}`                                 | AIR                                            |
-| `goal`                         | `session_info_update._meta.jetbrains.air`                                             | goal snapshot or `null`                                                | AIR                                            |
-| `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                    |
-| `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                            |
-| `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                             |
-| `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                   |
-| `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                        |
-| `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                        |
-| `sessionFailure`               | `session_info_update._meta.jetbrains.air` or `PromptResponse._meta.jetbrains.air`     | failure record                                                         | `sessionFailure`                               |
-| `commandTitle`                 | Bash and PowerShell tool call `_meta.jetbrains.air`                                   | the `description` input string                                         | AIR                                            |
-| `subagent`                     | Agent and Task tool call `_meta.jetbrains.air`                                        | `true`                                                                 | AIR                                            |
-| `skill`                        | Skill tool call `_meta.jetbrains.air`                                                 | `{name, path?}`                                                        | AIR                                            |
-| `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                            |
-| `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation |
-| `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                            |
-| `fork`                         | `session/fork` request `_meta.jetbrains.air` (client to agent)                        | `{version: 1, messageId, messageFingerprint?, messageOccurrence?}`     | none                                           |
+| Key                            | Message and field path                                                                | Shape                                                                  | Gate                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `capabilities`                 | `initialize` response `_meta.jetbrains.air`                                           | string array                                                           | AIR                                                                                    |
+| `goal`                         | `initialize` response `_meta.jetbrains.air`                                           | `{version: 1, controlMethod, actions}`                                 | AIR                                                                                    |
+| `goal`                         | `session_info_update._meta.jetbrains.air`                                             | goal snapshot or `null`                                                | AIR                                                                                    |
+| `diffPatch`                    | tool call and permission request `content[]` of type `diff`, `_meta.jetbrains.air`    | `{version: 1, format: "git_patch", text}`                              | `diffPatch`                                                                            |
+| `permission`                   | `session/request_permission` request `_meta.jetbrains.air`                            | `{version: 1, title, description?, defaultToNo?}`                      | AIR                                                                                    |
+| `recommendedValue`             | `model` and effort config options, `_meta.jetbrains.air`                              | option value string                                                    | `recommendedValue`                                                                     |
+| `asyncTasks`                   | Bash `tool_call_update._meta.jetbrains.air`                                           | `{backgrounded: true}`                                                 | `asyncTasks`                                                                           |
+| `agentFileChangeReportRequest` | `session/prompt` request `_meta.jetbrains.air` (client to agent)                      | `{version: 1, requestId}`                                              | `agentFileChangeReport`                                                                |
+| `agentFileChangeReport`        | `session_info_update._meta.jetbrains.air`                                             | report object                                                          | `agentFileChangeReport`                                                                |
+| `sessionFailure`               | `session_info_update._meta.jetbrains.air` or `PromptResponse._meta.jetbrains.air`     | failure record                                                         | `sessionFailure`                                                                       |
+| `commandTitle`                 | Bash and PowerShell tool call `_meta.jetbrains.air`                                   | the `description` input string                                         | AIR                                                                                    |
+| `subagent`                     | Agent and Task tool call `_meta.jetbrains.air`                                        | `true`                                                                 | AIR                                                                                    |
+| `skill`                        | Skill tool call `_meta.jetbrains.air`                                                 | `{name, path?}`                                                        | AIR                                                                                    |
+| `contextCompaction`            | compaction tool call or `compaction_update`, `_meta.jetbrains.air`                    | `{version: 1, trigger?, preTokens?, postTokens?, durationMs?, error?}` | AIR                                                                                    |
+| `customAnswer`                 | elicitation schema property `_meta.jetbrains.air`                                     | `{questionId, isCustomAnswer: true}`                                   | AIR, when the client supports form elicitation                                         |
+| `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
+| `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
+| `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
+| `fork`                         | `session/fork` request `_meta.jetbrains.air` (client to agent)                        | `{version: 1, messageId, messageFingerprint?, messageOccurrence?}`     | none                                                                                   |
 
 ## JetBrains shared keys
 
@@ -858,10 +860,17 @@ The live test only initializes the SDK. It sends no model prompt.
 
 ## Async tasks
 
-Claude can run work in the background, for example a backgrounded Bash command, a workflow, or a monitor.
+Claude can run work in the background, for example a backgrounded Bash command or a workflow.
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
+A task that a `Monitor` tool call started is not an async task either.
+Monitor streams its output to the model only, so the client gets nothing for it.
+The SDK reports such a task as `local_bash`, so the adapter finds it by the tool of its tool call.
+The `Monitor` tool call stays in the transcript.
+The adapter also ignores a `local_monitor` task.
+A task that a subagent tool call started goes to the subagent session.
+Its spawn, progress and state updates go there also after the subagent finished.
 
 ### Updates
 
@@ -872,12 +881,27 @@ A subagent task (`local_agent`) is not an async task. Native subagent sessions r
 - `async_task_state_update` carries `state` (`running`, `paused`, `completed`, `failed`, or `stopped`) and an optional `summary`.
 - The Bash `tool_call_update` of a backgrounded command carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
   The card then shows backgrounded work instead of finished work.
+  Only structured data sets the marker: the `backgroundTaskId` of the tool result, a known background task of the tool call, or a `run_in_background` input.
+
+### Task id and output path
+
+An async task comes only from structured data.
+The sources are `tool_use_result.backgroundTaskId` and the SDK `task_started`, `task_updated`, and `task_notification`.
+The text of a tool result never creates a task, because a foreground command can print any text.
+The output path comes from `output_file` of the SDK events when they have it.
+Otherwise the adapter reads the text of the tool result of the task's own tool call.
+It takes only an absolute path that ends with `tasks/<task id>.output`, followed by a period, whitespace or the end of the text.
+The path starts after the nearest `": "` before that end on the same line, so it can hold spaces.
+A path never holds the end of another path.
+A POSIX, a Windows drive, and a UNC path count. A path across a line does not.
+The tool result can come before or after the SDK names the task.
+A subagent tool result has no `tool_use_result`, so this text is the only path source there.
 
 ### Tool call of a task
 
 The adapter sends `async_task_spawned` only after it knows the tool call that started the task.
 The SDK gives that id as `tool_use_id` of `task_started`, `task_progress`, or `task_notification`.
-The Bash result of a backgrounded command also gives it.
+The structured Bash result of a backgrounded command also gives it.
 Until the id arrives, the adapter holds the task. It sends no update of a held task.
 The progress and state updates of a held task follow its spawn, in their order.
 A held task gets its spawn without `toolCallId` when it ends first, or when the prompt result ends the turn.
