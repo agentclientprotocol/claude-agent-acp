@@ -11165,6 +11165,8 @@ describe("getOrCreateSession concurrency (issue #1011)", () => {
       cwd,
       sessionFingerprint: computeSessionFingerprint({ cwd, mcpServers: [], _meta: undefined }),
       modes: { currentModeId: "default", availableModes: [] },
+      agents: [],
+      currentAgent: "default",
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
       settingsManager: { dispose: vi.fn() } as any,
@@ -19907,70 +19909,77 @@ describe("turn steering (_session/steering)", () => {
     ).rejects.toThrow("restart failed");
   });
 
-  it("does not resurrect a clear-context session closed while its replacement is created", async () => {
-    const agent = createMockAgent();
-    const resolveTurn = vi.fn();
-    const rejectTurn = vi.fn();
-    const turn = {
-      promptUuid: randomUUID(),
-      isLocalOnlyCommand: false,
-      settled: false,
-      resolve: resolveTurn,
-      reject: rejectTurn,
-    };
-    const oldSession = mockSessionState({
-      query: wrapQuery(
-        (async function* () {
-          yield await new Promise<never>(() => {});
-        })(),
-      ),
-      input: new Pushable(),
-      activeTurn: turn,
-      turnQueue: [turn],
-      creationParams: { cwd: "/test", mcpServers: [] },
-    });
-    agent.sessions["test-session"] = oldSession;
-    let finishCreation!: () => void;
-    let freshSession: ReturnType<typeof mockSessionState> | undefined;
-    let freshInputPush: ReturnType<typeof vi.fn> | undefined;
-    vi.spyOn(agent as any, "createSession").mockImplementation(
-      () =>
-        new Promise<void>((resolve) => {
-          finishCreation = () => {
-            const freshInput = new Pushable();
-            freshInputPush = vi.spyOn(freshInput, "push");
-            freshSession = mockSessionState({
-              query: wrapQuery(
-                (async function* () {
-                  yield await new Promise<never>(() => {});
-                })(),
-              ),
-              input: freshInput,
-              modes: { currentModeId: "auto", availableModes: [] },
-            });
-            agent.sessions["test-session"] = freshSession;
-            resolve();
-          };
-        }),
-    );
+  it.each(["close", "dispose"] as const)(
+    "does not resurrect a clear-context session after %s while its replacement is created",
+    async (operation) => {
+      const agent = createMockAgent();
+      const resolveTurn = vi.fn();
+      const rejectTurn = vi.fn();
+      const turn = {
+        promptUuid: randomUUID(),
+        isLocalOnlyCommand: false,
+        settled: false,
+        resolve: resolveTurn,
+        reject: rejectTurn,
+      };
+      const oldSession = mockSessionState({
+        query: wrapQuery(
+          (async function* () {
+            yield await new Promise<never>(() => {});
+          })(),
+        ),
+        input: new Pushable(),
+        activeTurn: turn,
+        turnQueue: [turn],
+        creationParams: { cwd: "/test", mcpServers: [] },
+      });
+      agent.sessions["test-session"] = oldSession;
+      let finishCreation!: () => void;
+      let freshSession: ReturnType<typeof mockSessionState> | undefined;
+      let freshInputPush: ReturnType<typeof vi.fn> | undefined;
+      const createSession = vi.spyOn(agent as any, "createSession").mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            finishCreation = () => {
+              const freshInput = new Pushable();
+              freshInputPush = vi.spyOn(freshInput, "push");
+              freshSession = mockSessionState({
+                query: wrapQuery(
+                  (async function* () {
+                    yield await new Promise<never>(() => {});
+                  })(),
+                ),
+                input: freshInput,
+                modes: { currentModeId: "auto", availableModes: [] },
+              });
+              agent.sessions["test-session"] = freshSession;
+              resolve();
+            };
+          }),
+      );
 
-    const restart = (agent as any).exitPlan.restart("test-session", oldSession, {
-      toolUseId: "tool-plan",
-      plan: "Ship it",
-      mode: "auto",
-    });
-    await vi.waitFor(() => expect(oldSession.query.close).toHaveBeenCalled());
+      const restart = (agent as any).exitPlan.restart("test-session", oldSession, {
+        toolUseId: "tool-plan",
+        plan: "Ship it",
+        mode: "auto",
+      });
+      await vi.waitFor(() => expect(createSession).toHaveBeenCalled());
 
-    await agent.closeSession({ sessionId: "test-session" });
-    finishCreation();
-    await expect(restart).resolves.toBeUndefined();
+      const close =
+        operation === "close" ? agent.closeSession({ sessionId: "test-session" }) : agent.dispose();
+      finishCreation();
+      await close;
+      await expect(restart).resolves.toBeUndefined();
 
-    expect(agent.sessions["test-session"]).toBeUndefined();
-    expect(freshSession?.query.close).toHaveBeenCalled();
-    expect(freshInputPush).not.toHaveBeenCalled();
-    expect(resolveTurn).toHaveBeenCalledWith(expect.objectContaining({ stopReason: "cancelled" }));
-    expect(rejectTurn).not.toHaveBeenCalled();
-  });
+      expect(agent.sessions["test-session"]).toBeUndefined();
+      expect(freshSession?.query.close).toHaveBeenCalled();
+      expect(freshInputPush).not.toHaveBeenCalled();
+      expect(resolveTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ stopReason: "cancelled" }),
+      );
+      expect(rejectTurn).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not hide a diagnostic before the rejected ExitPlanMode tool result", async () => {
     const agent = createMockAgent();
