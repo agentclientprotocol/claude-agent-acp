@@ -35,8 +35,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
     "@anthropic-ai/claude-agent-sdk",
   );
   const { makeMockQuery, DEFAULT_CONTEXT_USAGE } = await import("./helpers.js");
+  const { isolatedResolveSettings } = await import("./isolated-settings-resolver.js");
   return {
     ...actual,
+    resolveSettings: isolatedResolveSettings,
     query: (args: { prompt: unknown; options: Options }) => {
       capturedOptions = args.options;
       return makeMockQuery({
