@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import { appendTitleContext } from "../session-titles.js";
+import { appendTitleContext, SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import { getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -121,6 +121,35 @@ describe("session titles at turn-end", () => {
       updatedAt: new Date(1_700_000_000_000).toISOString(),
     });
     expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
+  });
+
+  it("reads the title from the active Claude session and publishes under the public id", async () => {
+    const sessionUpdates: any[] = [];
+    const agent = newAgent({
+      sessionUpdate: async (u: any) => {
+        sessionUpdates.push(u);
+      },
+    } as unknown as AcpClient);
+
+    vi.mocked(getSessionInfo).mockResolvedValue({
+      sessionId: "claude-session",
+      summary: "ignored",
+      customTitle: "New title",
+      lastModified: 1_700_000_000_000,
+    } as any);
+
+    const input = new Pushable<any>();
+    const session = mockSessionState({ query: wrapQuery(oneTurn(input)), input }, agent);
+    session.titles = new SessionTitles(agent, "test-session", "claude-session");
+    agent.sessions["test-session"] = session;
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+    await agent.sessions["test-session"]?.consumer;
+
+    expect(getSessionInfo).toHaveBeenCalledWith("claude-session", { dir: "/test" });
+    const update = sessionUpdates.find((u) => u.update?.sessionUpdate === "session_info_update");
+    expect(update?.sessionId).toBe("test-session");
+    expect(update?.update.title).toBe("New title");
   });
 
   it("does not re-push session_info_update when the title is unchanged", async () => {
