@@ -785,14 +785,14 @@ describe("/mcp and MCP OAuth", () => {
     await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
   });
 
-  it("does not start the MCP OAuth flow without URL elicitation", async () => {
+  it("starts the MCP OAuth flow without URL elicitation", async () => {
     const mcpAuthenticate = authenticated();
     const { prompt } = setup({ query: { mcpAuthenticate }, acpServers: ["linear"] });
 
     await prompt("/mcp reconnect linear");
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(mcpAuthenticate).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mcpAuthenticate).toHaveBeenCalledOnce());
+    expect(mcpAuthenticate).toHaveBeenCalledWith("linear");
   });
 
   it("does not start the MCP OAuth flow when the result fell back to the CLI text", async () => {
