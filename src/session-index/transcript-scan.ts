@@ -60,6 +60,15 @@ export type TranscriptFacts = {
 
 export type HeadTail = { head: string; tail: string };
 
+/** Facts that an earlier scan may have found before the tail window. */
+const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "costUsd"] as const;
+
+/** What an earlier scan of the same file found, at `size`. */
+export type PreviousScan = { size: number } & Pick<
+  TranscriptFacts,
+  "lastPromptAt" | "promptSearched" | (typeof INHERITED_FACTS)[number]
+>;
+
 /** The last `window` bytes of a file of `size` bytes, without the first,
  *  cut line. The whole file when it fits. */
 async function readTail(handle: fs.FileHandle, size: number, window: number): Promise<string> {
@@ -104,7 +113,9 @@ export async function scanTranscriptFile(
   size: number,
   sessionId: string,
   headTail?: HeadTail,
-  previous?: { size: number; lastPromptAt?: number; promptSearched?: boolean },
+  previous?: PreviousScan,
+  /** Tells a file replaced by another of the same size apart (its inode). */
+  identity?: number,
 ): Promise<TranscriptFacts> {
   const read = headTail ?? (await readHeadTail(filePath, size));
   const facts = scanTranscript(read, sessionId);
@@ -115,6 +126,15 @@ export async function scanTranscriptFile(
     previous !== undefined &&
     size >= previous.size &&
     size - Buffer.byteLength(read.tail) <= previous.size;
+  if (grownWithinTail) {
+    // What the earlier, possibly wider, scan found before the tail stands
+    // when the tail has nothing newer.
+    for (const key of INHERITED_FACTS) {
+      if (facts[key] === undefined && previous[key] !== undefined) {
+        (facts as Record<string, unknown>)[key] = previous[key];
+      }
+    }
+  }
   if (facts.lastPromptAt !== undefined || size <= CHUNK_SIZE) {
     facts.promptSearched = true;
   } else if (grownWithinTail && (previous.lastPromptAt !== undefined || previous.promptSearched)) {
@@ -124,7 +144,7 @@ export async function scanTranscriptFile(
   const complete = (found: TranscriptFacts) =>
     found.lastMessageAt !== undefined && found.promptSearched === true;
   if (!facts.hasMessages || complete(facts) || size <= CHUNK_SIZE) return facts;
-  const key = `${filePath}\0${size}`;
+  const key = `${filePath}\0${size}\0${identity ?? ""}`;
   const searched = fullySearched.get(key);
   if (searched) return searched;
   let result = facts;

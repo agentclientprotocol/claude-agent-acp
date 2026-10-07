@@ -1938,6 +1938,30 @@ describe("paths that share a project directory", () => {
   });
 });
 
+describe("a relocation out of the project directory", () => {
+  it("keeps the session in the change hint, as the list keeps showing it", async () => {
+    const session = await writeTranscript({});
+    const service = new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    const rows = await service.index.list({
+      cwd: workspace,
+      limit: 10,
+      archived: false,
+      archivedIds: new Set(),
+    });
+    expect(rows.rows).toHaveLength(1);
+    await fs.appendFile(
+      session.file,
+      JSON.stringify({ type: "relocated", sessionId: session.id, relocatedCwd: "/elsewhere" }) +
+        "\n",
+    );
+    expect(await service.index.scopeFingerprint(workspace, false)).toHaveLength(1);
+    service.dispose();
+  });
+});
+
 describe("worktrees of a subdirectory cwd", () => {
   it("are the same subdirectory in each existing worktree", async () => {
     const repo = path.join(workspace, "repo");
@@ -2236,6 +2260,64 @@ describe("session index cost", () => {
 });
 
 describe("a transcript without a prompt in its last 4 MB", () => {
+  it("keeps what an earlier wide scan found when a small append has none of it", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const result = (size: number) =>
+      JSON.stringify({
+        type: "user",
+        sessionId: id,
+        timestamp: new Date(at + 5000).toISOString(),
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "o".repeat(size) }],
+        },
+      }) + "\n";
+    await fs.writeFile(file, result(10));
+    const size = (await fs.stat(file)).size;
+    await fs.appendFile(file, result(100));
+    const grown = await scanTranscriptFile(file, (await fs.stat(file)).size, id, undefined, {
+      size,
+      promptSearched: true,
+      model: "claude-model-x",
+      lastTurnEndedAt: at,
+      costUsd: 1.5,
+    });
+    expect(grown.model).toBe("claude-model-x");
+    expect(grown.lastTurnEndedAt).toBe(at);
+    expect(grown.costUsd).toBe(1.5);
+  });
+
+  it("is searched again when replaced by another file of the same size", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (type: "user" | "assistant", time: number, text: string) =>
+      JSON.stringify({
+        type,
+        sessionId: id,
+        timestamp: new Date(time).toISOString(),
+        message: { role: type, content: type === "user" ? text : [{ type: "text", text }] },
+      }) + "\n";
+    const output = record("assistant", at, "a".repeat(1_000_000));
+    const original = record("user", at, "Start") + output.repeat(5);
+    await fs.writeFile(file, original);
+    const size = Buffer.byteLength(original);
+    expect((await scanTranscriptFile(file, size, id, undefined, undefined, 1)).lastPromptAt).toBe(
+      undefined,
+    );
+    const head =
+      record("user", at, "Start") + output.repeat(3) + record("user", at + 1000, "Hidden");
+    const last = record("assistant", at + 2000, "");
+    const pad = size - Buffer.byteLength(head + output + last);
+    await fs.writeFile(file, head + output + record("assistant", at + 2000, "z".repeat(pad)));
+    expect((await fs.stat(file)).size).toBe(size);
+    expect((await scanTranscriptFile(file, size, id, undefined, undefined, 2)).lastPromptAt).toBe(
+      at + 1000,
+    );
+  });
+
   it("is searched again when another file replaces it", async () => {
     const id = randomUUID();
     const dir = path.join(configDir, "projects", encodeProjectPath(workspace));

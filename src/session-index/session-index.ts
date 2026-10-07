@@ -45,6 +45,7 @@ import {
   titleFields,
   transcriptProjectCwd,
   type HeadTail,
+  type PreviousScan,
   type TitleFields,
   type TranscriptFacts,
 } from "./transcript-scan.js";
@@ -56,6 +57,40 @@ export const MAX_LIST_LIMIT = 200;
 /** Entries of the metadata cache: a few hundred bytes each, so the
  *  transcripts of a large history (tens of thousands) stay cached and deep
  *  pages do not read them again. */
+/** How many appended-bytes checks are kept, and run at once. */
+const RELOCATION_CHECK_CACHE_SIZE = 10_000;
+const APPENDED_READ_CONCURRENCY = 16;
+
+/** Runs at most `capacity` tasks at once, the rest in order. */
+class Slots {
+  private running = 0;
+  private readonly waiting: (() => void)[] = [];
+  private head = 0;
+  constructor(private readonly capacity: number) {}
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.running >= this.capacity) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    } else {
+      this.running++;
+    }
+    try {
+      return await task();
+    } finally {
+      const next = this.waiting[this.head];
+      if (next) {
+        this.waiting[this.head++] = undefined as never;
+        if (this.head > 1024 && this.head * 2 > this.waiting.length) {
+          this.waiting.splice(0, this.head);
+          this.head = 0;
+        }
+        next();
+      } else {
+        this.running--;
+      }
+    }
+  }
+}
+
 /** The most a change hint reads of what was appended to a transcript
  *  since a list read it; a larger append counts as a change. */
 const MAX_APPENDED_READ = 1024 * 1024;
@@ -269,6 +304,14 @@ function scopeOf(paths: readonly string[] | undefined): (cwd: string) => Promise
 export class SessionIndex {
   private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
+  /** What a change hint found in the bytes appended to a transcript since a
+   *  list read it, so a later hint does not read them again. */
+  private readonly relocationChecks = new Lru<
+    string,
+    { fromSize: number; size: number; mtimeMs: number; ino: number; cwd: string | undefined }
+  >(RELOCATION_CHECK_CACHE_SIZE);
+  /** Change hints read appended bytes a few files at a time. */
+  private readonly appendedReads = new Slots(APPENDED_READ_CONCURRENCY);
   /** A cwd that encodes to each project directory name, learned from its
    *  transcripts; it recovers the cwd of a sibling that has none. */
   private readonly dirCwds = new Map<string, string>();
@@ -576,18 +619,41 @@ export class SessionIndex {
       return cached.mtimeMs === candidate.mtimeMs ? learned : undefined;
     }
     if (candidate.size - cached.size > MAX_APPENDED_READ) return undefined;
+    const checked = this.relocationChecks.peek(candidate.filePath);
+    if (
+      checked?.fromSize === cached.size &&
+      checked.size === candidate.size &&
+      checked.mtimeMs === candidate.mtimeMs &&
+      checked.ino === candidate.ino
+    ) {
+      return checked.cwd ?? learned;
+    }
+    let relocated: string | undefined;
     try {
-      const handle = await fs.open(candidate.filePath, "r");
-      try {
-        const bytes = Buffer.allocUnsafe(candidate.size - cached.size);
-        const { bytesRead } = await handle.read(bytes, 0, bytes.length, cached.size);
-        return relocatedCwd(bytes.subarray(0, bytesRead).toString("utf8")) ?? learned;
-      } finally {
-        await handle.close();
-      }
+      relocated = await this.appendedReads.run(async () => {
+        const handle = await fs.open(candidate.filePath, "r");
+        try {
+          const bytes = Buffer.allocUnsafe(candidate.size - cached.size);
+          const { bytesRead } = await handle.read(bytes, 0, bytes.length, cached.size);
+          return relocatedCwd(bytes.subarray(0, bytesRead).toString("utf8"));
+        } finally {
+          await handle.close();
+        }
+      });
     } catch {
       return undefined;
     }
+    // A relocation counts as a list reads it (see readMetadata): only to a
+    // cwd of this project directory.
+    const cwd = await this.recoverCwd(candidate.dirName, [relocated]);
+    this.relocationChecks.set(candidate.filePath, {
+      fromSize: cached.size,
+      size: candidate.size,
+      mtimeMs: candidate.mtimeMs,
+      ino: candidate.ino,
+      cwd,
+    });
+    return cwd ?? learned;
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -682,11 +748,7 @@ export class SessionIndex {
       metadata = await this.readMetadata(
         candidate,
         cached && cached.ino === candidate.ino
-          ? {
-              size: cached.size,
-              lastPromptAt: cached.metadata?.facts.lastPromptAt,
-              promptSearched: cached.metadata?.facts.promptSearched,
-            }
+          ? { ...cached.metadata?.facts, size: cached.size }
           : undefined,
       );
     } catch {
@@ -704,7 +766,7 @@ export class SessionIndex {
 
   private async readMetadata(
     candidate: TranscriptCandidate,
-    previous?: { size: number; lastPromptAt?: number; promptSearched?: boolean },
+    previous?: PreviousScan,
   ): Promise<TranscriptMetadata | null> {
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
@@ -714,6 +776,7 @@ export class SessionIndex {
       candidate.sessionId,
       headTail,
       previous,
+      candidate.ino,
     );
     if (!facts.hasMessages) return null;
     // The last relocation names the session's cwd, as the SDK reads it; the
