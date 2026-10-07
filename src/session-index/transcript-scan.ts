@@ -144,9 +144,9 @@ export async function scanTranscriptFile(
 
 const RELOCATED_MARKER = '"relocated"';
 
-/** The cwd a transcript belongs to, as the SDK reads it: the last
- *  `relocated` record of the tail, else the first cwd of the head. */
-export function transcriptProjectCwd({ head, tail }: HeadTail): string | undefined {
+/** The cwd of the last `relocated` record of the tail: where the session
+ *  was moved, whatever cwd its earlier messages carry. */
+export function relocatedCwd(tail: string): string | undefined {
   const lines = tail.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
@@ -156,6 +156,14 @@ export function transcriptProjectCwd({ head, tail }: HeadTail): string | undefin
       return entry.relocatedCwd;
     }
   }
+  return undefined;
+}
+
+/** The cwd a transcript belongs to, as the SDK reads it: the last
+ *  `relocated` record of the tail, else the first cwd of the head. */
+export function transcriptProjectCwd({ head, tail }: HeadTail): string | undefined {
+  const relocated = relocatedCwd(tail);
+  if (relocated !== undefined) return relocated;
   const headCwd = CWD_PATTERN.exec(head)?.[1];
   return headCwd === undefined ? undefined : decodeJsonString(headCwd);
 }

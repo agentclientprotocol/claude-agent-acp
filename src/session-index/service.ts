@@ -122,12 +122,17 @@ function optionalBoolean(list: Record<string, unknown>, key: string): boolean {
 /** `_meta.jetbrains.air.list` of a list request. */
 export function parseListOptions(meta: unknown): ListOptions {
   const list = asRecord(airExtensionMeta(meta)?.list);
-  const limit =
-    typeof list.limit === "number" && Number.isFinite(list.limit)
-      ? Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(list.limit)))
-      : DEFAULT_LIST_LIMIT;
+  // Omitted or null is the default; an integer of at least 1 is clamped;
+  // anything else is invalid.
+  const raw = list.limit ?? DEFAULT_LIST_LIMIT;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+    throw RequestError.invalidParams(
+      { limit: raw },
+      "`_meta.jetbrains.air.list.limit` must be an integer of at least 1",
+    );
+  }
   return {
-    limit,
+    limit: Math.min(MAX_LIST_LIMIT, raw),
     archived: optionalBoolean(list, "archived"),
     includeWorktrees: optionalBoolean(list, "includeWorktrees"),
   };

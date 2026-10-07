@@ -251,8 +251,14 @@ describe("list request parsing", () => {
       archived: false,
       includeWorktrees: false,
     });
+    expect(parseListOptions(meta({ limit: null })).limit).toBe(50);
+    expect(parseListOptions(meta({ limit: 1 })).limit).toBe(1);
     expect(parseListOptions(meta({ limit: 1000 })).limit).toBe(200);
-    expect(parseListOptions(meta({ limit: 0 })).limit).toBe(1);
+    for (const limit of ["1", 1.5, 0, -3, Number.NaN, Number.POSITIVE_INFINITY, true, {}]) {
+      expect(() => parseListOptions(meta({ limit }))).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
   });
 
   it("takes archived and includeWorktrees as booleans, null as false, and rejects anything else", () => {

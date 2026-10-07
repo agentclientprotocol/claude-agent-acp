@@ -38,6 +38,7 @@ import {
   hasTailCustomTitle,
   isSidechainTranscript,
   readHeadTail,
+  relocatedCwd,
   scanTranscriptFile,
   titleFields,
   transcriptProjectCwd,
@@ -628,7 +629,10 @@ export class SessionIndex {
       headTail,
     );
     if (!facts.hasMessages) return null;
+    // The last relocation names the session's cwd, as the SDK reads it; the
+    // messages before it keep the old one.
     const fileCwd = await this.recoverCwd(candidate.dirName, [
+      relocatedCwd(headTail.tail),
       facts.headCwd,
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);

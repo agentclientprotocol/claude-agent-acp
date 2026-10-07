@@ -2018,3 +2018,21 @@ describe("delete of an unknown session with a leftover marker", () => {
     expect(fsSync.existsSync(marker)).toBe(false);
   });
 });
+
+describe("a session relocated to a path with the same project directory", () => {
+  it("is listed under the cwd it was moved to", async () => {
+    const from = path.join(workspace, "app.v2");
+    const to = path.join(workspace, "app-v2");
+    const id = randomUUID();
+    const session = await writeTranscript({
+      sessionId: id,
+      cwd: from,
+      trailer: [{ type: "relocated", sessionId: id, relocatedCwd: to }],
+    });
+    const { agent } = await indexAgent();
+    expect(
+      (await agent.listSessions({ cwd: to })).sessions.map((s) => [s.sessionId, s.cwd]),
+    ).toEqual([[session.id, to]]);
+    expect((await agent.listSessions({ cwd: from })).sessions).toEqual([]);
+  });
+});

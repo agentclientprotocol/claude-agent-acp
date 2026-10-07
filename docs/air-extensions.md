@@ -1206,7 +1206,7 @@ The new methods answer it with `-32601`.
 }
 ```
 
-- `limit` defaults to 50. The adapter clamps it to 1..200 and never returns more.
+- `limit` is an integer of at least 1; omitted or `null` is 50. The adapter clamps it to 200 and never returns more. Another value (a string, a fraction, 0 or less) is `-32602`.
 - `includeWorktrees` is a boolean, `false` when omitted or `null`. Another value is `-32602`.
   Without it, `cwd` matches exactly (after resolving symlinks, as the CLI does): a session of another path that shares the project directory name (`/ws/app.v2` and `/ws/app-v2`, `/a/b` and `/a-b`) is not listed.
   With `true`, the page also holds the sessions of the same subdirectory of `cwd` in every other existing worktree of its repository, as the Codex TUI expands a cwd: for `/repo/packages/a`, `/wt1/packages/a` if that directory exists. For a cwd at a worktree root, that is the worktree roots.
@@ -1230,7 +1230,7 @@ The new methods answer it with `-32601`.
 - A session copied to two project directories is listed once, from the larger file; its title and branch come from that file.
 - A transcript continued in another session (a `continued-in` record) whose successor has history is not listed, as in the SDK list.
 - On macOS a project directory whose name differs from the cwd's encoding in case only is the cwd's directory, as the file system resolves it for the SDK.
-- A row's `cwd` comes from the transcript (the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
+- A row's `cwd` comes from the transcript (the last `relocated` record, else the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
   Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory, read further if the page does not hold one.
 - `updatedAt` needs the last message: when it is longer than the 64 KB tail window, the window grows up to 4 MB to find it.
   The directory name is never decoded.
