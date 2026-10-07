@@ -17,11 +17,12 @@ const CHUNK_SIZE = 64 * 1024;
 /** The largest tail window read to find the last message. */
 const MAX_TAIL_SIZE = 4 * 1024 * 1024;
 const TAIL_GROWTH = 4;
-const NO_MESSAGE_CACHE_SIZE = 512;
+const FULL_SEARCH_CACHE_SIZE = 512;
 
-/** `path\0size` of the transcripts whose last {@link MAX_TAIL_SIZE} bytes hold
- *  no message: a file of the same size is not searched again. */
-const noMessageInTail = new Set<string>();
+/** By `path\0size`, the facts of the transcripts whose last
+ *  {@link MAX_TAIL_SIZE} bytes lack the last message or prompt: a file of
+ *  the same size is not searched again. */
+const fullySearched = new Map<string, TranscriptFacts>();
 
 export type TurnState = "finished" | "unfinished";
 
@@ -85,23 +86,41 @@ export async function readHeadTail(filePath: string, size: number): Promise<Head
 
 /**
  * The facts of `filePath`, from its head and tail. When the transcript has
- * messages but the tail window holds none (the last one is longer than the
- * window), the window grows until it holds one or reaches
- * {@link MAX_TAIL_SIZE}.
+ * messages but the tail window lacks the last message or the last user
+ * prompt (a long answer or tool output follows it), the window grows,
+ * reading only the new range each step, until it holds both or reaches
+ * {@link MAX_TAIL_SIZE}. The result of a full search is kept per
+ * `(path, size)`.
+ *
+ * `previous` is what an earlier scan of the same file found: when the file
+ * only grew by less than the tail window, and the tail holds no prompt, the
+ * appended bytes hold none either, so the earlier `lastPromptAt` stands.
  */
 export async function scanTranscriptFile(
   filePath: string,
   size: number,
   sessionId: string,
   headTail?: HeadTail,
+  previous?: { size: number; lastPromptAt?: number },
 ): Promise<TranscriptFacts> {
   const read = headTail ?? (await readHeadTail(filePath, size));
   const facts = scanTranscript(read, sessionId);
-  if (!facts.hasMessages || facts.lastMessageAt !== undefined || size <= CHUNK_SIZE) {
-    return facts;
+  if (
+    facts.lastPromptAt === undefined &&
+    previous?.lastPromptAt !== undefined &&
+    size >= previous.size &&
+    // The tail covers every appended byte.
+    size - Buffer.byteLength(read.tail) <= previous.size
+  ) {
+    facts.lastPromptAt = previous.lastPromptAt;
   }
+  const complete = (found: TranscriptFacts) =>
+    found.lastMessageAt !== undefined && found.lastPromptAt !== undefined;
+  if (!facts.hasMessages || complete(facts) || size <= CHUNK_SIZE) return facts;
   const key = `${filePath}\0${size}`;
-  if (noMessageInTail.has(key)) return facts;
+  const searched = fullySearched.get(key);
+  if (searched) return searched;
+  let result = facts;
   const handle = await fs.open(filePath, "r");
   try {
     // The bytes from `start` to the end, grown by reading the new range only.
@@ -125,21 +144,24 @@ export async function scanTranscriptFile(
         const newline = tail.indexOf("\n");
         tail = newline >= 0 ? tail.slice(newline + 1) : "";
       }
+      // A wider tail ends with the same records: what the narrow one found
+      // stays, and the wider one adds what lay before it.
       const wider = scanTranscript({ head: read.head, tail }, sessionId);
-      if (wider.lastMessageAt !== undefined) {
-        // A wider tail ends with the same records: what the narrow one found
-        // stays, and the wider one adds what lay before it.
-        return { ...wider, hasMessages: facts.hasMessages };
-      }
+      result = {
+        ...wider,
+        hasMessages: facts.hasMessages,
+        lastPromptAt: wider.lastPromptAt ?? facts.lastPromptAt,
+      };
+      if (complete(result)) return result;
     }
   } finally {
     await handle.close();
   }
-  noMessageInTail.add(key);
-  if (noMessageInTail.size > NO_MESSAGE_CACHE_SIZE) {
-    noMessageInTail.delete(noMessageInTail.values().next().value as string);
+  fullySearched.set(key, result);
+  if (fullySearched.size > FULL_SEARCH_CACHE_SIZE) {
+    fullySearched.delete(fullySearched.keys().next().value as string);
   }
-  return facts;
+  return result;
 }
 
 const RELOCATED_MARKER = '"relocated"';

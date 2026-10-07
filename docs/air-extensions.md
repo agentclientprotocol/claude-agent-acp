@@ -1234,7 +1234,7 @@ The new methods answer it with `-32601`.
 - On macOS a project directory whose name differs from the cwd's encoding in case only is the cwd's directory, as the file system resolves it for the SDK.
 - A row's `cwd` comes from the transcript (the last `relocated` record, else the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
   Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory, read further if the page does not hold one.
-- `updatedAt` needs the last message: when it is longer than the 64 KB tail window, the window grows up to 4 MB to find it.
+- `updatedAt` needs the last message and the order key the last prompt: when the 64 KB tail window lacks either, the window grows up to 4 MB to find it, reading only the new bytes each step.
   The directory name is never decoded.
 
 Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `archived` is always there; every other field is omitted when unknown:
@@ -1254,7 +1254,7 @@ Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `ar
 ```
 
 - `createdAt` is the first timestamp of the transcript, as the SDK's `createdAt`.
-- `lastPromptAt` is the time of the last real user prompt in the transcript tail: not a tool result, a meta record, a slash command or an interrupt (the predicate of the SDK title extractor). It is omitted when the tail window holds no prompt.
+- `lastPromptAt` is the time of the last real user prompt in the transcript tail: not a tool result, a meta record, a slash command or an interrupt (the predicate of the SDK title extractor). When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
 - `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
 - `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
 - `state` is `running`, `idle`, or `requires_action`, never `unknown`:

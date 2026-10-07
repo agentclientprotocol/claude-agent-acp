@@ -615,7 +615,14 @@ export class SessionIndex {
     }
     let metadata: TranscriptMetadata | null;
     try {
-      metadata = await this.readMetadata(candidate);
+      // The transcript grew since: an earlier scan may still know its last
+      // prompt.
+      metadata = await this.readMetadata(
+        candidate,
+        cached
+          ? { size: cached.size, lastPromptAt: cached.metadata?.facts.lastPromptAt }
+          : undefined,
+      );
     } catch {
       // Unreadable now (deleted, permissions): skip it and retry next time.
       return null;
@@ -628,7 +635,10 @@ export class SessionIndex {
     return metadata;
   }
 
-  private async readMetadata(candidate: TranscriptCandidate): Promise<TranscriptMetadata | null> {
+  private async readMetadata(
+    candidate: TranscriptCandidate,
+    previous?: { size: number; lastPromptAt?: number },
+  ): Promise<TranscriptMetadata | null> {
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
     const facts = await scanTranscriptFile(
@@ -636,6 +646,7 @@ export class SessionIndex {
       candidate.size,
       candidate.sessionId,
       headTail,
+      previous,
     );
     if (!facts.hasMessages) return null;
     // The last relocation names the session's cwd, as the SDK reads it; the

@@ -2064,13 +2064,10 @@ describe("order by the last user activity", () => {
     await fs.utimes(workedOn.file, (now + 500) / 1000, (now + 500) / 1000);
     // Prompted 5 minutes ago, done a minute later.
     const recent = await writeTranscript({ lastMessageAt: now - 4 * minute });
-    // No prompt in the tail window: ordered by updatedAt (7 minutes ago).
-    const noPromptId = randomUUID();
+    // No real prompt (a slash command only): ordered by updatedAt (7 minutes ago).
     const noPrompt = await writeTranscript({
-      sessionId: noPromptId,
-      hugePrompt: 70_000,
+      prompt: "<command-name>/compact</command-name>",
       lastMessageAt: now - 7 * minute,
-      trailer: [{ type: "last-prompt", lastPrompt: "Big paste", sessionId: noPromptId }],
     });
     const { agent } = await indexAgent();
 
@@ -2104,5 +2101,43 @@ describe("order by the last user activity", () => {
     );
     const all = await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) });
     expect(all.sessions.map((s) => s.sessionId)).toEqual([recent.id, noPrompt.id, workedOn.id]);
+  });
+});
+
+describe("a last prompt followed by more than the tail window", () => {
+  it("is found by growing the tail, and kept while the transcript grows", async () => {
+    const now = Date.parse("2026-05-01T12:00:00Z");
+    const minute = 60_000;
+    const working = await writeTranscript({ lastMessageAt: now - 10 * minute + 1000 });
+    const output = (at: number, size: number) =>
+      JSON.stringify({
+        type: "user",
+        sessionId: working.id,
+        cwd: workspace,
+        uuid: randomUUID(),
+        timestamp: new Date(at).toISOString(),
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "o".repeat(size) }],
+        },
+      }) + "\n";
+    // 300 KB of tool output after the prompt.
+    await fs.appendFile(working.file, output(now - minute, 300_000));
+    await fs.utimes(working.file, now / 1000, now / 1000);
+    const prompted = await writeTranscript({ lastMessageAt: now - 4 * minute });
+    const { agent } = await indexAgent();
+
+    const ids = async () =>
+      (await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId);
+    expect(await ids()).toEqual([prompted.id, working.id]);
+    const row = (await agent.listSessions({ cwd: workspace })).sessions[1]!;
+    expect((row._meta as any).jetbrains.air.lastPromptAt).toBe(
+      new Date(now - 10 * minute).toISOString(),
+    );
+
+    // The agent writes on: the session stays where its last prompt puts it.
+    await fs.appendFile(working.file, output(now, 1000));
+    await fs.utimes(working.file, (now + 1000) / 1000, (now + 1000) / 1000);
+    expect(await ids()).toEqual([prompted.id, working.id]);
   });
 });
