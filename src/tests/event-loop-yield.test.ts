@@ -174,6 +174,43 @@ describe("consumer under a buffered backlog", () => {
   });
 });
 
+describe("consumer teardown under a buffered backlog", () => {
+  it("settles the turn when the session closes mid-backlog", async () => {
+    const chunks = Array.from({ length: 30 }, (_, i) => `chunk-${i} `);
+    const updates: SessionNotification[] = [];
+    let closeScheduled = false;
+    let chunksAtClose: number | undefined;
+    let closed: Promise<unknown> | undefined;
+    const agent = createAgent(bufferedAnswer(chunks), (notification) => {
+      updates.push(notification);
+      if (notification.update.sessionUpdate !== "agent_message_chunk") return;
+      if (!closeScheduled) {
+        closeScheduled = true;
+        setImmediate(() => {
+          chunksAtClose = chunkTexts(updates).length;
+          closed = agent.closeSession({ sessionId });
+        });
+      }
+      spin(2);
+    });
+
+    const response = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "go" }] });
+
+    expect(chunksAtClose).toBeDefined();
+    expect(chunksAtClose!).toBeLessThan(chunks.length);
+    expect(response.stopReason).toBe("cancelled");
+    await closed;
+    expect(agent.sessions[sessionId]).toBeUndefined();
+    // Whatever reached the client is a prefix of the answer, in order, and
+    // the rest of the backlog is not forwarded after the close.
+    const received = chunkTexts(updates);
+    expect(received.length).toBeLessThan(chunks.length);
+    expect(received).toEqual(chunks.slice(0, received.length));
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    expect(chunkTexts(updates)).toEqual(received);
+  });
+});
+
 describe("nodeToWebWritable", () => {
   it("writes the bytes of each chunk, including a view into a larger buffer", async () => {
     const received: Buffer[] = [];
@@ -188,6 +225,22 @@ describe("nodeToWebWritable", () => {
     await writer.write(backing.subarray(2, 8));
     await writer.write(new TextEncoder().encode("world\n"));
     expect(Buffer.concat(received).toString()).toBe("hello\nworld\n");
+  });
+
+  it("gives an object-mode stream a Buffer copy", async () => {
+    const received: unknown[] = [];
+    const sink = new Writable({
+      objectMode: true,
+      write(chunk, _encoding, callback) {
+        received.push(chunk);
+        callback();
+      },
+    });
+    const bytes = new TextEncoder().encode("hi");
+    await nodeToWebWritable(sink).getWriter().write(bytes);
+    expect(Buffer.isBuffer(received[0])).toBe(true);
+    expect(received[0]).not.toBe(bytes);
+    expect((received[0] as Buffer).toString()).toBe("hi");
   });
 
   it("rejects the write that fails", async () => {

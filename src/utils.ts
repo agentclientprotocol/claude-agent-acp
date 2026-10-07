@@ -45,15 +45,20 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
-// Helper to convert Node.js streams to Web Streams
+// Helper to convert Node.js streams to Web Streams. A byte stream gets each
+// chunk without a copy, so the caller must not change a chunk until its write
+// resolves.
 export function nodeToWebWritable(nodeStream: Writable): WritableStream<Uint8Array> {
   return new WritableStream<Uint8Array>({
     write(chunk) {
       return new Promise<void>((resolve, reject) => {
         // A Uint8Array is written as it is: Node wraps it in a Buffer view
-        // without a copy. The encoder hands each message a fresh array, so
-        // nothing changes the bytes while the write is pending.
-        nodeStream.write(chunk, (err) => {
+        // without a copy. The ACP encoder hands each message a fresh array,
+        // so nothing changes the bytes while the write is pending. An
+        // object-mode stream would get the array itself, so it keeps
+        // getting a Buffer copy, as before.
+        const data = nodeStream.writableObjectMode ? Buffer.from(chunk) : chunk;
+        nodeStream.write(data, (err) => {
           if (err) {
             reject(err);
           } else {
@@ -100,8 +105,11 @@ export function unreachable(value: never, logger: Logger = console) {
  *
  * The budget is measured from the first call since the event loop last
  * reached its check phase, so a loop that already waits on real I/O never
- * yields, and all loops that share one instance share the budget of the
- * macrotask that runs them.
+ * yields, and all loops that share one instance share one budget per
+ * event-loop iteration.
+ *
+ * A test that fakes `setImmediate` and drives such a loop for longer than the
+ * budget must advance the fake timers, or the loop waits for them.
  */
 export class EventLoopYielder {
   /** Whether a check-phase marker is pending. While it is, the event loop has
