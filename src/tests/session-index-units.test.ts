@@ -24,6 +24,7 @@ import {
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
 import { ListChangedWatcher } from "../session-index/list-changed.js";
+import { DirListings, statFiles } from "../session-index/dir-listing.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
@@ -709,5 +710,56 @@ describe("lastPromptAt of a media prompt", () => {
       ),
     );
     expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
+  });
+});
+
+describe("directory listings and stats", () => {
+  it("re-reads a listing when an entry is added or removed, not otherwise", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "listing-"));
+    const listings = new DirListings();
+    await fs.writeFile(path.join(dir, "a.jsonl"), "x");
+    // A directory changed in the last seconds is read again each time: its
+    // mtime may not show a second change in the same second.
+    const old = new Date(Date.now() - 60_000);
+    await fs.utimes(dir, old, old);
+    expect(await listings.names(dir)).toEqual(["a.jsonl"]);
+    await fs.writeFile(path.join(dir, "hidden.jsonl"), "x");
+    await fs.utimes(dir, old, old);
+    // Same mtime: the cached listing stands (an append changes none either).
+    expect(await listings.names(dir)).toEqual(["a.jsonl"]);
+    await fs.rm(path.join(dir, "hidden.jsonl"));
+    await fs.writeFile(path.join(dir, "B.jsonl"), "x");
+    const later = new Date(Date.now() - 30_000);
+    await fs.utimes(dir, later, later);
+    expect((await listings.names(dir)).sort()).toEqual(["B.jsonl", "a.jsonl"]);
+    expect(await listings.matchingAnyInAll([dir], ["b.JSONL", "missing"])).toEqual([
+      [["B.jsonl"], []],
+    ]);
+    // A change just now is seen at once.
+    await fs.rm(path.join(dir, "a.jsonl"));
+    expect(await listings.names(dir)).toEqual(["B.jsonl"]);
+    await fs.writeFile(path.join(dir, "c.jsonl"), "x");
+    expect((await listings.names(dir)).sort()).toEqual(["B.jsonl", "c.jsonl"]);
+    await fs.rm(dir, { recursive: true, force: true });
+    expect(await listings.names(dir)).toEqual([]);
+  });
+
+  it("stats many files in order, bounded, and reports missing ones", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "stats-"));
+    const files = await Promise.all(
+      Array.from({ length: 1500 }, async (_, i) => {
+        const file = path.join(dir, `${i}.txt`);
+        await fs.writeFile(file, "x".repeat(i % 7));
+        return file;
+      }),
+    );
+    const [all, again] = await Promise.all([
+      statFiles([...files, path.join(dir, "missing")]),
+      statFiles(files.slice(0, 10)),
+    ]);
+    expect(all.slice(0, 1500).map((stats) => stats?.size)).toEqual(files.map((_, i) => i % 7));
+    expect(all[1500]).toBeUndefined();
+    expect(again.map((stats) => stats?.size)).toEqual(files.slice(0, 10).map((_, i) => i % 7));
+    await fs.rm(dir, { recursive: true, force: true });
   });
 });

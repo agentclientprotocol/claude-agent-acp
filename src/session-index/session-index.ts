@@ -48,11 +48,15 @@ import {
   type TitleFields,
   type TranscriptFacts,
 } from "./transcript-scan.js";
+import { DirListings, statFiles } from "./dir-listing.js";
 import { worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
-const METADATA_CACHE_SIZE = 2000;
+/** Entries of the metadata cache: a few hundred bytes each, so the
+ *  transcripts of a large history (tens of thousands) stay cached and deep
+ *  pages do not read them again. */
+const METADATA_CACHE_SIZE = 50_000;
 const READ_BATCH_SIZE = 16;
 /** Transcripts read at most per directory to recover a sibling's cwd. */
 const MAX_CWD_PROBES_PER_DIR = 64;
@@ -142,6 +146,10 @@ class Lru<K, V> {
   }
   delete(key: K): void {
     this.entries.delete(key);
+  }
+  /** The value of `key`, without making it recent. */
+  peek(key: K): V | undefined {
+    return this.entries.get(key);
   }
 }
 
@@ -248,15 +256,8 @@ function scopeOf(paths: readonly string[] | undefined): (cwd: string) => Promise
   };
 }
 
-async function readDirNames(dir: string): Promise<string[]> {
-  try {
-    return await fs.readdir(dir);
-  } catch {
-    return [];
-  }
-}
-
 export class SessionIndex {
+  private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
   /** A cwd that encodes to each project directory name, learned from its
    *  transcripts; it recovers the cwd of a sibling that has none. */
@@ -286,7 +287,7 @@ export class SessionIndex {
    *  share: such a directory counts only when one of its transcripts belongs
    *  to the path, as the SDK checks. */
   async projectDirs(paths: readonly string[]): Promise<{ dirName: string; projectPath: string }[]> {
-    const rootEntries = await readDirNames(projectsRoot());
+    const rootEntries = await this.listings.names(projectsRoot());
     const seen = new Set<string>();
     const result: { dirName: string; projectPath: string }[] = [];
     for (const projectPath of paths) {
@@ -314,7 +315,7 @@ export class SessionIndex {
    *  `(path, mtime, size)`, so a transcript that changes is read again. */
   private async longDirBelongsTo(dirName: string, projectPath: string): Promise<boolean> {
     const dir = path.join(projectsRoot(), dirName);
-    for (const name of await readDirNames(dir)) {
+    for (const name of await this.listings.names(dir)) {
       if (!name.endsWith(".jsonl")) continue;
       const filePath = path.join(dir, name);
       try {
@@ -344,37 +345,32 @@ export class SessionIndex {
     const root = projectsRoot();
     const dirs: { dirName: string; projectPath?: string }[] = paths
       ? await this.projectDirs(paths)
-      : (await readDirNames(root)).map((dirName) => ({ dirName }));
-    const perDir = await Promise.all(
-      dirs.map(async ({ dirName, projectPath }) => {
-        const dir = path.join(root, dirName);
-        const names = (await readDirNames(dir)).filter(
-          (name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6)),
-        );
-        const stats = await Promise.all(
-          names.map(async (name): Promise<TranscriptCandidate | undefined> => {
-            const filePath = path.join(dir, name);
-            try {
-              const stats = await fs.stat(filePath);
-              if (!stats.isFile() || stats.size === 0) return undefined;
-              return {
-                sessionId: name.slice(0, -6),
-                filePath,
-                dirName,
-                projectPath,
-                mtimeMs: stats.mtimeMs,
-                size: stats.size,
-              };
-            } catch {
-              return undefined;
-            }
-          }),
-        );
-        return stats.filter((value): value is TranscriptCandidate => value !== undefined);
-      }),
+      : (await this.listings.names(root)).map((dirName) => ({ dirName }));
+    // All directories' names first, then one bounded run of stats.
+    const listed = await this.listings.namesOfAll(
+      dirs.map(({ dirName }) => path.join(root, dirName)),
     );
+    const files = dirs.flatMap(({ dirName, projectPath }, i) =>
+      listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6))).map(
+        (name) => ({ name, filePath: path.join(root, dirName, name), dirName, projectPath }),
+      ),
+    );
+    const stats = await statFiles(files.map(({ filePath }) => filePath));
+    const all: TranscriptCandidate[] = [];
+    files.forEach(({ name, filePath, dirName, projectPath }, i) => {
+      const fileStats = stats[i];
+      if (!fileStats?.isFile() || fileStats.size === 0) return;
+      all.push({
+        sessionId: name.slice(0, -6),
+        filePath,
+        dirName,
+        projectPath,
+        mtimeMs: fileStats.mtimeMs,
+        size: fileStats.size,
+      });
+    });
     const bySession = new Map<string, TranscriptCandidate>();
-    for (const candidate of perDir.flat()) {
+    for (const candidate of all) {
       const key = candidate.sessionId.toLowerCase();
       const previous = bySession.get(key);
       if (!previous || candidate.size > previous.size) bySession.set(key, candidate);
@@ -382,67 +378,55 @@ export class SessionIndex {
     return [...bySession.values()];
   }
 
-  /** Every transcript file of `sessionId`, in any project directory and in
-   *  any spelling of the id (each project directory is read): the CLI names
-   *  files by the id as it was given. Empty files only with `includeEmpty`.
-   *  `exactSpelling` looks for the id as given only, like the SDK. */
+  /**
+   * Every transcript (with its size) and every `<sessionId>/` directory
+   * (sidecar, subagent transcripts) of the session, in any project
+   * directory and in any spelling of the id: the CLI names files by the id
+   * as it was given. One pass over the (cached) project directory listings.
+   */
+  async scanSession(
+    sessionId: string,
+  ): Promise<{ transcripts: { filePath: string; size: number }[]; sessionDirs: string[] }> {
+    if (!isSessionId(sessionId)) return { transcripts: [], sessionDirs: [] };
+    const root = projectsRoot();
+    const dirs = (await this.listings.names(root)).map((dirName) => path.join(root, dirName));
+    const matching = await this.listings.matchingAnyInAll(dirs, [`${sessionId}.jsonl`, sessionId]);
+    const transcriptPaths = dirs.flatMap((dir, i) =>
+      matching[i]![0]!.map((name) => path.join(dir, name)),
+    );
+    const dirPaths = dirs.flatMap((dir, i) => matching[i]![1]!.map((name) => path.join(dir, name)));
+    const [transcriptStats, dirStats] = await Promise.all([
+      statFiles(transcriptPaths),
+      Promise.all(dirPaths.map((dir) => fs.lstat(dir).catch(() => undefined))),
+    ]);
+    return {
+      transcripts: transcriptPaths.flatMap((filePath, i) => {
+        const stats = transcriptStats[i];
+        return stats?.isFile() ? [{ filePath, size: stats.size }] : [];
+      }),
+      sessionDirs: dirPaths.filter((_, i) => dirStats[i]?.isDirectory()),
+    };
+  }
+
+  /** Every transcript file of `sessionId` (see {@link scanSession}). Empty
+   *  files only with `includeEmpty`. `exactSpelling` looks for the id as
+   *  given only, like the SDK. */
   async findTranscripts(
     sessionId: string,
     options: { includeEmpty?: boolean; exactSpelling?: boolean } = {},
   ): Promise<string[]> {
     if (!isSessionId(sessionId)) return [];
-    const root = projectsRoot();
+    const { transcripts } = await this.scanSession(sessionId);
     const wanted = `${sessionId}.jsonl`;
-    const lower = wanted.toLowerCase();
-    const found = await Promise.all(
-      (await readDirNames(root)).map(async (dirName) => {
-        const dir = path.join(root, dirName);
-        const names = options.exactSpelling
-          ? [wanted]
-          : (await readDirNames(dir)).filter((name) => name.toLowerCase() === lower);
-        return Promise.all(
-          names.map(async (name) => {
-            const filePath = path.join(dir, name);
-            try {
-              const stats = await fs.stat(filePath);
-              return stats.isFile() && (stats.size > 0 || options.includeEmpty)
-                ? filePath
-                : undefined;
-            } catch {
-              return undefined;
-            }
-          }),
-        );
-      }),
-    );
-    return found.flat().filter((value): value is string => value !== undefined);
+    return transcripts
+      .filter(({ size }) => size > 0 || options.includeEmpty)
+      .filter(({ filePath }) => !options.exactSpelling || path.basename(filePath) === wanted)
+      .map(({ filePath }) => filePath);
   }
 
-  /** Every `<sessionId>/` directory (sidecar, subagent transcripts) of the
-   *  session, in any project directory and any spelling of the id, with or
-   *  without a transcript. */
+  /** Every `<sessionId>/` directory of the session (see {@link scanSession}). */
   async findSessionDirs(sessionId: string): Promise<string[]> {
-    if (!isSessionId(sessionId)) return [];
-    const root = projectsRoot();
-    const lower = sessionId.toLowerCase();
-    const found = await Promise.all(
-      (await readDirNames(root)).map(async (dirName) => {
-        const dir = path.join(root, dirName);
-        const names = (await readDirNames(dir)).filter((name) => name.toLowerCase() === lower);
-        return Promise.all(
-          names.map(async (name) => {
-            try {
-              return (await fs.lstat(path.join(dir, name))).isDirectory()
-                ? path.join(dir, name)
-                : undefined;
-            } catch {
-              return undefined;
-            }
-          }),
-        );
-      }),
-    );
-    return found.flat().filter((value): value is string => value !== undefined);
+    return (await this.scanSession(sessionId)).sessionDirs;
   }
 
   /** Drops the cached metadata of `filePaths`. */
@@ -456,10 +440,14 @@ export class SessionIndex {
       ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
       : undefined;
     const inScope = scopeOf(paths);
+    const after = query.after;
     const candidates = (await this.enumerate(paths))
       .filter(
         (candidate) => query.archived || !query.archivedIds.has(candidate.sessionId.toLowerCase()),
       )
+      // A page after a cursor skips, without reading them, the transcripts
+      // whose cached order key puts them before the cursor.
+      .filter((candidate) => !after || !this.cachedBefore(candidate, after))
       .sort((a, b) =>
         a.mtimeMs !== b.mtimeMs
           ? b.mtimeMs - a.mtimeMs
@@ -537,20 +525,39 @@ export class SessionIndex {
 
   /** The `sessionId:mtime:size` of every transcript that a list of `cwd`
    *  shows, archived or not, for the change hint: a transcript of another
-   *  path that shares a project directory does not count. A transcript
-   *  whose cwd is unknown counts. */
+   *  path that shares a project directory does not count. Nothing is read:
+   *  the cwd of a transcript is the one an earlier list learned (a later
+   *  append does not change it), and a transcript no list read yet counts. */
   async scopeFingerprint(cwd: string, includeWorktrees: boolean): Promise<string[]> {
     const paths = await this.listedPaths(cwd, includeWorktrees);
     const inScope = scopeOf(paths);
     const parts = await Promise.all(
       (await this.enumerate(paths)).map(async (candidate) => {
-        const metadata = await this.metadataOf(candidate);
-        const rowCwd = metadata?.fileCwd ?? this.fallbackCwd(candidate);
+        const rowCwd = this.metadata.peek(candidate.filePath)?.metadata?.fileCwd;
         if (rowCwd && !(await inScope(rowCwd))) return undefined;
         return `${candidate.sessionId}:${candidate.mtimeMs}:${candidate.size}`;
       }),
     );
     return parts.filter((part): part is string => part !== undefined).sort();
+  }
+
+  /** Whether the cached metadata of `candidate`, still current, places it
+   *  at or before `cursor`. */
+  private cachedBefore(candidate: TranscriptCandidate, cursor: ListCursor): boolean {
+    const cached = this.metadata.peek(candidate.filePath);
+    if (
+      !cached?.metadata ||
+      cached.mtimeMs !== candidate.mtimeMs ||
+      cached.size !== candidate.size
+    ) {
+      return false;
+    }
+    const { metadata } = cached;
+    const orderAtMs = Math.min(
+      metadata.facts.lastPromptAt ?? metadata.updatedAtMs,
+      metadata.updatedAtMs,
+    );
+    return !isAfter({ orderAtMs, sessionId: candidate.sessionId }, cursor);
   }
 
   /** Reads the unread transcripts of `dirNames` until each directory has a
@@ -620,7 +627,11 @@ export class SessionIndex {
       metadata = await this.readMetadata(
         candidate,
         cached
-          ? { size: cached.size, lastPromptAt: cached.metadata?.facts.lastPromptAt }
+          ? {
+              size: cached.size,
+              lastPromptAt: cached.metadata?.facts.lastPromptAt,
+              promptSearched: cached.metadata?.facts.promptSearched,
+            }
           : undefined,
       );
     } catch {
@@ -637,7 +648,7 @@ export class SessionIndex {
 
   private async readMetadata(
     candidate: TranscriptCandidate,
-    previous?: { size: number; lastPromptAt?: number },
+    previous?: { size: number; lastPromptAt?: number; promptSearched?: boolean },
   ): Promise<TranscriptMetadata | null> {
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;

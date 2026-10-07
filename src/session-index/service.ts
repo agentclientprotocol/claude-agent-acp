@@ -561,11 +561,11 @@ export class SessionIndexService {
   async delete(sessionId: string, known: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      const all = await this.index.findTranscripts(sessionId, { includeEmpty: true });
       // A session directory can outlive its transcript: a delete that removed
       // the transcript and then failed on the directory.
-      const sessionDirs = await this.index.findSessionDirs(sessionId);
-      if (all.length === 0 && sessionDirs.length === 0) {
+      const found = await this.index.scanSession(sessionId);
+      const all = found.transcripts.map(({ filePath }) => filePath);
+      if (all.length === 0 && found.sessionDirs.length === 0) {
         // A leftover marker of a session without history is dropped; the
         // session is still unknown unless it was loaded here.
         await removeArchiveMarker(sessionId);
@@ -573,44 +573,34 @@ export class SessionIndexService {
         throw sessionNotFound(sessionId);
       }
       try {
-        // The SDK finds a transcript by its exact file name: one call per
-        // copy, with that copy's spelling of the id.
-        for (const transcript of await this.index.findTranscripts(sessionId)) {
-          const spelling = transcriptSessionId(transcript);
+        // The SDK finds a non-empty transcript by its exact file name: one
+        // call per copy, with that copy's spelling of the id.
+        for (const { filePath } of found.transcripts.filter(({ size }) => size > 0)) {
+          const spelling = transcriptSessionId(filePath);
           try {
             await this.deleteSession(spelling);
           } catch (error) {
-            // Only "not found" with no copy of that spelling left is a copy
-            // removed meanwhile.
-            const left = await this.index.findTranscripts(sessionId);
-            if (
-              isSdkNotFound(error) &&
-              !left.some((file) => transcriptSessionId(file) === spelling)
-            ) {
-              continue;
-            }
+            // Only "not found" with that copy gone is a copy removed meanwhile.
+            if (isSdkNotFound(error) && !(await exists(filePath))) continue;
             throw error;
           }
         }
         // Empty transcripts, which the SDK skips, and session directories
         // without a transcript.
-        for (const transcript of await this.index.findTranscripts(sessionId, {
-          includeEmpty: true,
-        })) {
-          const stats = await fs.stat(transcript).catch(() => undefined);
-          if (stats && stats.size > 0) continue;
-          await fs.rm(transcript, { force: true });
+        for (const { filePath, size } of found.transcripts) {
+          if (size === 0) await fs.rm(filePath, { force: true });
         }
-        for (const sessionDir of await this.index.findSessionDirs(sessionId)) {
+        for (const sessionDir of found.sessionDirs) {
           if (await exists(`${sessionDir}.jsonl`)) continue;
           await fs.rm(sessionDir, { recursive: true, force: true });
         }
-        const left = [
-          ...(await this.index.findTranscripts(sessionId, { includeEmpty: true })),
-          ...(await this.index.findSessionDirs(sessionId)),
+        const left = await this.index.scanSession(sessionId);
+        const remaining = [
+          ...left.transcripts.map(({ filePath }) => filePath),
+          ...left.sessionDirs,
         ];
-        if (left.length > 0) {
-          throw new Error(`Session ${sessionId} was not deleted: ${left.join(", ")} remain`);
+        if (remaining.length > 0) {
+          throw new Error(`Session ${sessionId} was not deleted: ${remaining.join(", ")} remain`);
         }
       } finally {
         this.index.invalidate(all);

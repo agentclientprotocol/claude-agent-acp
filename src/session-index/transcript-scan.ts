@@ -43,6 +43,9 @@ export type TranscriptFacts = {
   /** Time of the last real user prompt in the tail (not a tool result, a
    *  meta record or a slash command), epoch ms. */
   lastPromptAt?: number;
+  /** Whether `lastPromptAt` is final: the prompt was found, or the tail
+   *  window searched up to {@link MAX_TAIL_SIZE} holds none. */
+  promptSearched?: boolean;
   /** The model of the last assistant message in the tail. */
   model?: string;
   /** The first timestamp of the head, as the SDK's `createdAt`. */
@@ -101,21 +104,25 @@ export async function scanTranscriptFile(
   size: number,
   sessionId: string,
   headTail?: HeadTail,
-  previous?: { size: number; lastPromptAt?: number },
+  previous?: { size: number; lastPromptAt?: number; promptSearched?: boolean },
 ): Promise<TranscriptFacts> {
   const read = headTail ?? (await readHeadTail(filePath, size));
   const facts = scanTranscript(read, sessionId);
-  if (
-    facts.lastPromptAt === undefined &&
-    previous?.lastPromptAt !== undefined &&
+  // The file only grew by bytes that the tail covers, and the tail holds no
+  // prompt: the appended bytes hold none either, so the earlier search
+  // stands (its prompt, or that the last 4 MB held none).
+  const grownWithinTail =
+    previous !== undefined &&
     size >= previous.size &&
-    // The tail covers every appended byte.
-    size - Buffer.byteLength(read.tail) <= previous.size
-  ) {
+    size - Buffer.byteLength(read.tail) <= previous.size;
+  if (facts.lastPromptAt !== undefined || size <= CHUNK_SIZE) {
+    facts.promptSearched = true;
+  } else if (grownWithinTail && (previous.lastPromptAt !== undefined || previous.promptSearched)) {
     facts.lastPromptAt = previous.lastPromptAt;
+    facts.promptSearched = true;
   }
   const complete = (found: TranscriptFacts) =>
-    found.lastMessageAt !== undefined && found.lastPromptAt !== undefined;
+    found.lastMessageAt !== undefined && found.promptSearched === true;
   if (!facts.hasMessages || complete(facts) || size <= CHUNK_SIZE) return facts;
   const key = `${filePath}\0${size}`;
   const searched = fullySearched.get(key);
@@ -143,17 +150,24 @@ export async function scanTranscriptFile(
       }
       // A wider tail ends with the same records: what the narrow one found
       // stays, and the wider one adds what lay before it.
-      const wider = scanTranscript({ head: read.head, tail }, sessionId);
+      const wider = scanTranscript({ head: read.head, tail }, sessionId, { wide: true });
+      const lastPromptAt = wider.lastPromptAt ?? facts.lastPromptAt;
       result = {
         ...wider,
+        ...(facts.model !== undefined && { model: facts.model }),
+        ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
         hasMessages: facts.hasMessages,
-        lastPromptAt: wider.lastPromptAt ?? facts.lastPromptAt,
+        lastPromptAt,
+        // Searched to the start of the file, or found.
+        promptSearched: facts.promptSearched || lastPromptAt !== undefined || start === 0,
       };
       if (complete(result)) return result;
     }
   } finally {
     await handle.close();
   }
+  // The whole window is searched: no prompt in it either.
+  result = { ...result, promptSearched: true };
   fullySearched.set(key, result);
   if (fullySearched.size > FULL_SEARCH_CACHE_SIZE) {
     fullySearched.delete(fullySearched.keys().next().value as string);
@@ -273,7 +287,11 @@ function decodeJsonString(raw: string): string | undefined {
 }
 
 /** The facts of a transcript, from its head and its tail. */
-export function scanTranscript({ head, tail }: HeadTail, sessionId: string): TranscriptFacts {
+export function scanTranscript(
+  { head, tail }: HeadTail,
+  sessionId: string,
+  options: { wide?: boolean } = {},
+): TranscriptFacts {
   const facts: TranscriptFacts = {
     hasMessages: MESSAGE_MARKERS.some((marker) => head.includes(marker) || tail.includes(marker)),
   };
@@ -291,17 +309,35 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
   let turnEndFound = false;
   let messageFound = false;
   let promptFound = false;
-  let modelFound = false;
+  // A wide tail (see scanTranscriptFile) is searched for what the narrow
+  // one lacked: the last message, prompt and turn end. The model and the
+  // cwd come from the narrow tail only, so a long answer without them is
+  // not parsed line by line.
+  let modelFound = options.wide === true;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line) continue;
     const isCost = line.includes('"cost-state"');
     const isTurnRecord =
       line.includes('"user"') || line.includes('"assistant"') || line.includes('"system"');
-    const hasCwd = facts.tailCwd === undefined && line.includes('"cwd"');
+    const hasCwd = !options.wide && facts.tailCwd === undefined && line.includes('"cwd"');
     if (!isCost && !isTurnRecord && !hasCwd) continue;
     // Everything has been found: stop parsing.
     if (costFound && turnEndFound && messageFound && promptFound && modelFound && !hasCwd) break;
+    // Once the last message and the turn state are known, only a line that
+    // can still tell something is parsed: lines are often large (tool
+    // results, long answers), and a long tail has thousands of them.
+    if (
+      messageFound &&
+      facts.turnState !== undefined &&
+      !hasCwd &&
+      !(isCost && !costFound) &&
+      !(!promptFound && mayBePrompt(line)) &&
+      !(!modelFound && hasType(line, "assistant")) &&
+      !(!turnEndFound && mayEndTurn(line))
+    ) {
+      continue;
+    }
     const entry = parseLine(line);
     if (!entry) continue;
     if (hasCwd && typeof entry.cwd === "string" && entry.cwd) facts.tailCwd = entry.cwd;
@@ -343,6 +379,27 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
     }
   }
   return facts;
+}
+
+function hasType(line: string, type: string): boolean {
+  return line.includes(`"type":"${type}"`) || line.includes(`"type": "${type}"`);
+}
+
+/** Whether a line may be a user prompt: a user record that is no tool
+ *  result, or one that carries an image or a document. */
+function mayBePrompt(line: string): boolean {
+  if (!hasType(line, "user")) return false;
+  return !line.includes('"tool_result"') || hasType(line, "image") || hasType(line, "document");
+}
+
+/** Whether a line may end a turn (see {@link turnEffect}). */
+function mayEndTurn(line: string): boolean {
+  return (
+    line.includes('"end_turn"') ||
+    line.includes('"isApiErrorMessage"') ||
+    line.includes(INTERRUPT_PREFIX) ||
+    [...TURN_END_SYSTEM_SUBTYPES].some((subtype) => line.includes(`"${subtype}"`))
+  );
 }
 
 /** Every `"key":"value"` string of `text`, in order, decoded. */

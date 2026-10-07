@@ -2176,3 +2176,73 @@ describe("a session whose last prompt is an image or a document", () => {
     );
   });
 });
+
+describe("session index cost", () => {
+  it("pages through a project reading each transcript once", async () => {
+    const base = Date.parse("2026-08-01T00:00:00Z");
+    for (let i = 0; i < 120; i++) await writeTranscript({ lastMessageAt: base - i * 60_000 });
+    const { agent } = await indexAgent();
+    vi.mocked(getSessionInfo).mockClear();
+    let cursor: string | undefined;
+    let rows = 0;
+    do {
+      const page = await agent.listSessions({
+        cwd: workspace,
+        cursor,
+        _meta: listMeta({ limit: 10 }),
+      });
+      rows += page.sessions.length;
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    expect(rows).toBe(120);
+    // Pages after a cursor skip the transcripts cached before it.
+    expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(120);
+  });
+
+  it("computes the change fingerprint without reading transcripts", async () => {
+    for (let i = 0; i < 30; i++) await writeTranscript({});
+    const service = new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    vi.mocked(getSessionInfo).mockClear();
+    const parts = await service.index.scopeFingerprint(workspace, false);
+    expect(parts).toHaveLength(30);
+    expect(getSessionInfo).not.toHaveBeenCalled();
+    service.dispose();
+  });
+});
+
+describe("a transcript without a prompt in its last 4 MB", () => {
+  it("is not searched again while it only grows by what its tail covers", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const record = (type: "user" | "assistant", at: number, text: string) =>
+      JSON.stringify({
+        type,
+        sessionId: id,
+        timestamp: new Date(at).toISOString(),
+        message: { role: type, content: type === "user" ? text : [{ type: "text", text }] },
+      }) + "\n";
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const output = record("assistant", at, "a".repeat(1_000_000));
+    await fs.writeFile(file, record("user", at, "Start") + output.repeat(5));
+    let { size } = await fs.stat(file);
+    const first = await scanTranscriptFile(file, size, id);
+    expect(first.lastPromptAt).toBeUndefined();
+    expect(first.promptSearched).toBe(true);
+
+    // A prompt 1 MB back and a small append: the earlier full search stands,
+    // so the 1 MB is not read (the prompt stays unseen).
+    await fs.writeFile(file, record("user", at, "Hidden") + output + record("assistant", at, "z"));
+    size = (await fs.stat(file)).size;
+    // The appended bytes (the last record) are inside the tail window.
+    const grown = await scanTranscriptFile(file, size, id, undefined, {
+      size: size - 50,
+      lastPromptAt: undefined,
+      promptSearched: true,
+    });
+    expect(grown.lastPromptAt).toBeUndefined();
+    expect(grown.promptSearched).toBe(true);
+  });
+});
