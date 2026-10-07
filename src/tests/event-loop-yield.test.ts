@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { SessionNotification } from "@agentclientprotocol/sdk";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import { EventLoopYielder, Pushable } from "../utils.js";
+import { Writable } from "node:stream";
+import { EventLoopYielder, nodeToWebWritable, Pushable } from "../utils.js";
 import {
   mockSessionState,
   successfulResultMessage,
@@ -170,5 +171,33 @@ describe("consumer under a buffered backlog", () => {
     // reach the client, in order, as they did before the cancel.
     expect(response.stopReason).toBe("cancelled");
     expect(chunkTexts(updates)).toEqual(chunks);
+  });
+});
+
+describe("nodeToWebWritable", () => {
+  it("writes the bytes of each chunk, including a view into a larger buffer", async () => {
+    const received: Buffer[] = [];
+    const sink = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        received.push(Buffer.from(chunk));
+        callback();
+      },
+    });
+    const writer = nodeToWebWritable(sink).getWriter();
+    const backing = new TextEncoder().encode("xxhello\nworld\nyy");
+    await writer.write(backing.subarray(2, 8));
+    await writer.write(new TextEncoder().encode("world\n"));
+    expect(Buffer.concat(received).toString()).toBe("hello\nworld\n");
+  });
+
+  it("rejects the write that fails", async () => {
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(new Error("EPIPE"));
+      },
+    });
+    sink.on("error", () => {});
+    const writer = nodeToWebWritable(sink).getWriter();
+    await expect(writer.write(new Uint8Array([1]))).rejects.toThrow("EPIPE");
   });
 });

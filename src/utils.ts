@@ -50,7 +50,10 @@ export function nodeToWebWritable(nodeStream: Writable): WritableStream<Uint8Arr
   return new WritableStream<Uint8Array>({
     write(chunk) {
       return new Promise<void>((resolve, reject) => {
-        nodeStream.write(Buffer.from(chunk), (err) => {
+        // A Uint8Array is written as it is: Node wraps it in a Buffer view
+        // without a copy. The encoder hands each message a fresh array, so
+        // nothing changes the bytes while the write is pending.
+        nodeStream.write(chunk, (err) => {
           if (err) {
             reject(err);
           } else {
