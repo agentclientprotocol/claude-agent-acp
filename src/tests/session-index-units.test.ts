@@ -23,6 +23,7 @@ import {
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
+import { ListChangedWatcher } from "../session-index/list-changed.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
@@ -245,12 +246,21 @@ describe("list request parsing", () => {
   const meta = (list: object) => ({ jetbrains: { air: { version: 1, list } } });
 
   it("defaults and clamps the limit", () => {
-    expect(parseListOptions(undefined)).toEqual({ limit: 50, archived: false });
+    expect(parseListOptions(undefined)).toEqual({
+      limit: 50,
+      archived: false,
+      includeWorktrees: false,
+    });
     expect(parseListOptions(meta({ limit: 1000 })).limit).toBe(200);
     expect(parseListOptions(meta({ limit: 0 })).limit).toBe(1);
   });
 
-  it("takes archived as a boolean, null as false, and rejects anything else", () => {
+  it("takes archived and includeWorktrees as booleans, null as false, and rejects anything else", () => {
+    expect(parseListOptions(meta({ includeWorktrees: true })).includeWorktrees).toBe(true);
+    expect(parseListOptions(meta({ includeWorktrees: null })).includeWorktrees).toBe(false);
+    expect(() => parseListOptions(meta({ includeWorktrees: "yes" }))).toThrow(
+      expect.objectContaining({ code: -32602 }),
+    );
     expect(parseListOptions(meta({ archived: true })).archived).toBe(true);
     expect(parseListOptions(meta({ archived: false })).archived).toBe(false);
     expect(parseListOptions(meta({ archived: null })).archived).toBe(false);
@@ -262,10 +272,13 @@ describe("list request parsing", () => {
   });
 
   it("round-trips a cursor and rejects one of another scope", () => {
-    const scope = { cwd: "/repo", archived: false };
+    const scope = { cwd: "/repo", archived: false, includeWorktrees: false };
     const cursor = encodeListCursor({ updatedAtMs: 5, sessionId: SESSION }, scope);
     expect(decodeListCursor(cursor, scope)).toEqual({ updatedAtMs: 5, sessionId: SESSION });
     expect(() => decodeListCursor(cursor, { ...scope, archived: true })).toThrow(
+      expect.objectContaining({ code: -32602 }),
+    );
+    expect(() => decodeListCursor(cursor, { ...scope, includeWorktrees: true })).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
     expect(() => decodeListCursor(cursor, { ...scope, cwd: "/other" })).toThrow(
@@ -564,5 +577,83 @@ describe("continued-in", () => {
     expect(
       continuedInSessionId(lines(continued, assistant("end_turn", "2026-01-01T00:00:04Z"))),
     ).toBeUndefined();
+  });
+});
+
+describe("row facts of the tail and head", () => {
+  it("takes lastPromptAt from the last real prompt only", () => {
+    const facts = scan(
+      lines(
+        user("Fix it", "2026-01-01T00:00:00Z"),
+        assistant("tool_use", "2026-01-01T00:00:01Z"),
+        {
+          type: "user",
+          sessionId: SESSION,
+          timestamp: "2026-01-01T00:00:02Z",
+          message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t" }] },
+        },
+        user("<command-name>/status</command-name>", "2026-01-01T00:00:03Z"),
+        user("note", "2026-01-01T00:00:04Z", { isMeta: true }),
+        user("[Request interrupted by user]", "2026-01-01T00:00:05Z"),
+        assistant("end_turn", "2026-01-01T00:00:06Z"),
+      ),
+    );
+    expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
+    expect(facts.createdAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
+  });
+
+  it("takes the model of the last real assistant message", () => {
+    const facts = scan(
+      lines(
+        assistant("end_turn", "2026-01-01T00:00:01Z", {
+          message: { role: "assistant", model: "claude-a", content: [], stop_reason: "end_turn" },
+        }),
+        assistant("end_turn", "2026-01-01T00:00:02Z", {
+          isApiErrorMessage: true,
+          message: {
+            role: "assistant",
+            model: "<synthetic>",
+            content: [],
+            stop_reason: "end_turn",
+          },
+        }),
+      ),
+    );
+    expect(facts.model).toBe("claude-a");
+    expect(scan(lines(user("x", "2026-01-01T00:00:00Z"))).model).toBeUndefined();
+  });
+
+  it("knows forkedFrom only from a fork's records", () => {
+    const parent = "33333333-3333-4333-8333-333333333333";
+    expect(
+      scan(
+        lines(
+          user("x", "2026-01-01T00:00:00Z", {
+            forkedFrom: { sessionId: parent, messageUuid: "m" },
+          }),
+        ),
+      ).forkedFrom,
+    ).toBe(parent);
+    expect(scan(lines(user("x", "2026-01-01T00:00:00Z"))).forkedFrom).toBeUndefined();
+  });
+});
+
+describe("list change watches", () => {
+  it("are keyed by cwd and worktree scope, and a list renews its watch", async () => {
+    const scopes: boolean[] = [];
+    const watcher = new ListChangedWatcher({
+      projectDirs: async (_cwd, includeWorktrees) => {
+        scopes.push(includeWorktrees);
+        return { dirNames: [], paths: [] };
+      },
+      notify: async () => {},
+      rescanMs: 60_000,
+    });
+    await watcher.onListed("/repo");
+    await watcher.onListed("/repo", true);
+    await watcher.onListed("/repo");
+    expect(watcher.watchedCwds()).toEqual(["/repo", "/repo"]);
+    expect(scopes).toEqual([false, true]);
+    watcher.dispose();
   });
 });

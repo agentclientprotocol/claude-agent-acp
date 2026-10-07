@@ -57,11 +57,15 @@ export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
-/** 2: `archived` is a boolean (ACP RFD #2161). */
-const CURSOR_VERSION = 2;
+/** 3: boolean `archived` (ACP RFD #2161) and `includeWorktrees`. */
+const CURSOR_VERSION = 3;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
+
+function iso(ms: number | undefined): string | undefined {
+  return ms === undefined || !Number.isFinite(ms) ? undefined : new Date(ms).toISOString();
+}
 
 export function sessionNotFound(sessionId: string): RequestError {
   return new RequestError(RESOURCE_NOT_FOUND, `Session not found: ${sessionId}`, { sessionId });
@@ -98,7 +102,22 @@ export function parseRenameSessionRequest(value: unknown): RenameSessionRequest 
   return { sessionId, title };
 }
 
-type ListOptions = { limit: number; archived: ArchivedFilter };
+type ListOptions = { limit: number; archived: ArchivedFilter; includeWorktrees: boolean };
+
+/** What a cursor is bound to: the request values that select the rows. */
+export type ListScope = { cwd: string | null; archived: boolean; includeWorktrees: boolean };
+
+function optionalBoolean(list: Record<string, unknown>, key: string): boolean {
+  // Omitted or null is false.
+  const value = list[key] ?? false;
+  if (typeof value !== "boolean") {
+    throw RequestError.invalidParams(
+      { [key]: value },
+      `\`_meta.jetbrains.air.list.${key}\` must be a boolean`,
+    );
+  }
+  return value;
+}
 
 /** `_meta.jetbrains.air.list` of a list request. */
 export function parseListOptions(meta: unknown): ListOptions {
@@ -107,39 +126,37 @@ export function parseListOptions(meta: unknown): ListOptions {
     typeof list.limit === "number" && Number.isFinite(list.limit)
       ? Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(list.limit)))
       : DEFAULT_LIST_LIMIT;
-  // Omitted or null lists the unarchived sessions only, as `false` does.
-  const archived = list.archived ?? false;
-  if (typeof archived !== "boolean") {
-    throw RequestError.invalidParams(
-      { archived },
-      "`_meta.jetbrains.air.list.archived` must be a boolean",
-    );
-  }
-  return { limit, archived };
+  return {
+    limit,
+    archived: optionalBoolean(list, "archived"),
+    includeWorktrees: optionalBoolean(list, "includeWorktrees"),
+  };
 }
 
-type CursorPayload = { v: number; u: number; id: string; cwd: string | null; archived: boolean };
+type CursorPayload = {
+  v: number;
+  u: number;
+  id: string;
+  cwd: string | null;
+  archived: boolean;
+  worktrees: boolean;
+};
 
-export function encodeListCursor(
-  cursor: ListCursor,
-  scope: { cwd: string | null; archived: ArchivedFilter },
-): string {
+export function encodeListCursor(cursor: ListCursor, scope: ListScope): string {
   const payload: CursorPayload = {
     v: CURSOR_VERSION,
     u: cursor.updatedAtMs,
     id: cursor.sessionId,
     cwd: scope.cwd,
     archived: scope.archived,
+    worktrees: scope.includeWorktrees,
   };
   return Buffer.from(JSON.stringify(payload)).toString("base64url");
 }
 
 /** The position a cursor names. A cursor of another cwd or filter, or one
  *  this adapter did not issue, is rejected. */
-export function decodeListCursor(
-  cursor: string,
-  scope: { cwd: string | null; archived: ArchivedFilter },
-): ListCursor {
+export function decodeListCursor(cursor: string, scope: ListScope): ListCursor {
   let payload: Partial<CursorPayload> | undefined;
   try {
     payload = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as CursorPayload;
@@ -154,7 +171,11 @@ export function decodeListCursor(
   ) {
     throw RequestError.invalidParams(undefined, `Unknown session/list cursor: ${cursor}`);
   }
-  if (payload.cwd !== scope.cwd || payload.archived !== scope.archived) {
+  if (
+    payload.cwd !== scope.cwd ||
+    payload.archived !== scope.archived ||
+    payload.worktrees !== scope.includeWorktrees
+  ) {
     throw RequestError.invalidParams(
       undefined,
       "The session/list cursor belongs to another cwd or filter",
@@ -336,9 +357,9 @@ export class SessionIndexService {
     params: ListSessionsRequest,
     own: (sessionId: string) => OwnSessionState | undefined,
   ): Promise<ListSessionsResponse> {
-    const { limit, archived } = parseListOptions(params._meta);
+    const { limit, archived, includeWorktrees } = parseListOptions(params._meta);
     const cwd = params.cwd ?? null;
-    const scope = { cwd, archived };
+    const scope: ListScope = { cwd, archived, includeWorktrees };
     const after =
       params.cursor === null || params.cursor === undefined
         ? undefined
@@ -346,9 +367,17 @@ export class SessionIndexService {
     // The live registry is read while the transcripts are.
     const livePromise = this.registry.snapshot();
     const archivedIds = await readArchivedSessionIds();
-    const { rows, hasMore } = await this.index.list({ cwd, limit, archived, after, archivedIds });
+    const { rows, hasMore } = await this.index.list({
+      cwd,
+      includeWorktrees,
+      limit,
+      archived,
+      after,
+      archivedIds,
+    });
     const live = await livePromise;
-    if (cwd) this.watch(cwd);
+    // A list without a cwd is not watched.
+    if (cwd) this.watch(cwd, includeWorktrees);
     const now = this.now();
     const sessions: SessionInfo[] = rows.map((row) => {
       const ownState = own(row.sessionId);
@@ -360,12 +389,23 @@ export class SessionIndexService {
         now,
       });
       const cost = selectCost(ownState, row.facts);
-      // Always present, as RFD #2161 requires of an agent that supports archiving.
-      let meta = withAirMeta(undefined, "archived", row.archived);
-      if (row.gitBranch) meta = withAirMeta(meta, "gitBranch", row.gitBranch);
-      if (activity) meta = withAirMeta(meta, "activity", activity);
-      if (cost !== undefined) {
-        meta = withAirMeta(meta, "usage", { cost: { amount: cost, currency: "USD" } });
+      const { facts } = row;
+      // The row fields of the session list extensions RFD and RFD #2161, flat;
+      // each is omitted when unknown, except `archived`.
+      const fields: Record<string, unknown> = {
+        archived: row.archived,
+        createdAt: iso(facts.createdAt),
+        lastPromptAt: iso(facts.lastPromptAt),
+        gitBranch: row.gitBranch,
+        model: facts.model,
+        forkedFrom: facts.forkedFrom,
+        state: activity?.state,
+        lastTurnEndedAt: activity?.lastTurnEndedAt,
+        cost: cost === undefined ? undefined : { amount: cost, currency: "USD" },
+      };
+      let meta: Record<string, unknown> | undefined;
+      for (const [key, value] of Object.entries(fields)) {
+        if (value !== undefined) meta = withAirMeta(meta, key, value);
       }
       return {
         sessionId: row.sessionId,
@@ -577,12 +617,12 @@ export class SessionIndexService {
     this.watcher = undefined;
   }
 
-  private watch(cwd: string): void {
+  private watch(cwd: string, includeWorktrees: boolean): void {
     // A list that was in flight when the connection closed starts nothing.
     if (this.disposed) return;
     this.watcher ??= new ListChangedWatcher({
-      projectDirs: async (watchedCwd) => {
-        const paths = await this.index.listedPaths(watchedCwd);
+      projectDirs: async (watchedCwd, worktrees) => {
+        const paths = await this.index.listedPaths(watchedCwd, worktrees);
         const dirs = await this.index.projectDirs(paths);
         return { dirNames: dirs.map(({ dirName }) => dirName), paths };
       },
@@ -590,7 +630,7 @@ export class SessionIndexService {
       logError: this.deps.logError,
     });
     void this.watcher
-      .onListed(cwd)
+      .onListed(cwd, includeWorktrees)
       .catch((error) => this.deps.logError("session list watch failed", error));
   }
 }

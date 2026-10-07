@@ -1199,26 +1199,28 @@ The new methods answer it with `-32601`.
   "cwd": "/Users/me/repo",
   "cursor": null,
   "_meta": {
-    "jetbrains": { "air": { "version": 1, "list": { "limit": 50, "archived": false } } }
+    "jetbrains": {
+      "air": { "version": 1, "list": { "limit": 50, "includeWorktrees": false, "archived": false } }
+    }
   }
 }
 ```
 
-- `limit` defaults to 50. The adapter clamps it to 1..200.
+- `limit` defaults to 50. The adapter clamps it to 1..200 and never returns more.
+- `includeWorktrees` is a boolean, `false` when omitted or `null`. Without it, `cwd` matches exactly (after resolving symlinks, as the CLI does). With `true`, the page also holds the sessions of every existing linked worktree of the repository that contains `cwd`. Another value is `-32602`.
 - `archived` is a boolean. Omitted, `null` or `false` lists the unarchived sessions only; `true` lists the unarchived and the archived ones together, in one order. Another value is `-32602`.
   The filter applies before pagination.
 - Without `cwd` the page holds the sessions of all projects.
 
 ### List response
 
-- Rows are ordered by `updatedAt` descending, then by session id.
+- Every row has `updatedAt`. Rows are ordered by `updatedAt` descending, then by session id.
   `updatedAt` is the time of the last message, capped at the transcript mtime.
   A rename, an archive, or another metadata record does not move a session up.
-- The cursor is opaque. It holds the position and the `cwd` and `archived` it was issued for; another `cwd` or `archived` value rejects it with `-32602`.
+- The cursor is opaque. It holds the position and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`.
 - A deleted session is never listed, whatever `archived` says.
 - A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
-- The page holds the sessions of `cwd` and of every existing worktree of its repository.
-  The worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git.
+- With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.
   A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
   A row's `cwd` is the session's own directory, so it can be a worktree path.
 - Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
@@ -1230,26 +1232,35 @@ The new methods answer it with `-32601`.
 - `updatedAt` needs the last message: when it is longer than the 64 KB tail window, the window grows up to 4 MB to find it.
   The directory name is never decoded.
 
-Each row carries `_meta.jetbrains.air`. `archived` is always there; every other field is omitted when unknown:
+Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `archived` is always there; every other field is omitted when unknown:
 
 ```json
 {
   "archived": false,
+  "createdAt": "2026-10-05T18:12:00.000Z",
+  "lastPromptAt": "2026-10-06T09:57:40.000Z",
   "gitBranch": "fix/auth",
-  "activity": { "state": "idle", "lastTurnEndedAt": "2026-10-06T09:58:10.000Z" },
-  "usage": { "cost": { "amount": 1.23, "currency": "USD" } }
+  "model": "claude-opus-5-5",
+  "forkedFrom": "8f0c1d2e-0000-4000-8000-000000000000",
+  "state": "idle",
+  "lastTurnEndedAt": "2026-10-06T09:58:10.000Z",
+  "cost": { "amount": 1.23, "currency": "USD" }
 }
 ```
 
-- `activity.state` is `running`, `idle`, or `requires_action`:
+- `createdAt` is the first timestamp of the transcript, as the SDK's `createdAt`.
+- `lastPromptAt` is the time of the last real user prompt in the transcript tail: not a tool result, a meta record, a slash command or an interrupt (the predicate of the SDK title extractor). It is omitted when the tail window holds no prompt.
+- `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
+- `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
+- `state` is `running`, `idle`, or `requires_action`, never `unknown`:
   - a session this connection runs: the SDK `session_state_changed` state;
   - a session no live Claude Code process holds: `idle`;
   - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`;
   - any other held session: `idle` after a finished turn (an assistant `end_turn`, an API error, a user interrupt, or the CLI turn-end records), `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
 - The live processes come from `<config>/sessions/<pid>.json`, with the liveness rules of Claude Desktop: `kill(pid, 0)` (or `EPERM`), a matching `procStart`, no foreign `pidDomain`, and records older than 24 hours only with a matching `procStart`.
   The adapter never reads the `.key` files there and never changes the directory.
-- `activity.lastTurnEndedAt` is when the last turn ended.
-- `usage.cost` is the `total_cost_usd` of the last result of a session this connection runs, else the last `cost-state` record of the transcript. It is sent only when it is greater than 0.
+- `lastTurnEndedAt` is when the last turn ended.
+- `cost` is the `total_cost_usd` of the last result of a session this connection runs, else the last `cost-state` record of the transcript. It is sent only when it is greater than 0.
 
 ### Rename
 
@@ -1287,7 +1298,7 @@ The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or
 `_session/list_changed { "cwd": "…" }` is an agent notification.
 It tells the client to read the first page of that `cwd` again.
 
-- The adapter watches only the cwds that this connection listed in the last 10 minutes, at most 32.
+- The adapter watches only the cwds that this connection listed in the last 10 minutes, at most 32, each with the `includeWorktrees` value of the list: a watch is keyed by both, and a list renews it. A list without `cwd` is not watched.
   It watches their project directories (worktrees included), `<config>/sessions` and `<config>/acp/archived`, without recursion.
 - Events are coalesced: 150 ms after the last one, at most 1 s after the first.
   A rescan every 10 s covers missed events.
@@ -1305,6 +1316,8 @@ It tells the client to read the first page of that `cwd` again.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
+`session/load` and `session/resume` of a `sessionIndex` client refuse a session that another live Claude Code process holds with `thread_active_writer` (the holder rules of [Rename](#rename)), instead of starting a second writer. A session this connection runs is its own. Other clients open it as before.
+
 ### Errors
 
 | Case                                               | Error                                                               |
@@ -1312,6 +1325,24 @@ It tells the client to read the first page of that `cwd` again.
 | Another live Claude Code process holds the session | `-32600` with `data: { reason: "thread_active_writer", sessionId }` |
 | Unknown session                                    | `-32002` with `data: { sessionId }`                                 |
 | Invalid parameters or cursor                       | `-32602`                                                            |
+
+### Relation to the RFDs
+
+The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
+Names and semantics follow them; only the transport differs:
+
+| Extension                                                                                                                   | RFD                                                                                                       |
+| --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| capability `sessionIndex` (`_meta.jetbrains.air`)                                                                           | `sessionCapabilities.list.limit`, `.changes`; `sessionCapabilities.archive`; client `session.listChanged` |
+| `_meta.jetbrains.air.list.limit`                                                                                            | `session/list` `limit`                                                                                    |
+| `_meta.jetbrains.air.list.includeWorktrees`                                                                                 | `session/list` `includeWorktrees`                                                                         |
+| `_meta.jetbrains.air.list.archived`                                                                                         | `session/list` `archived` (#2161)                                                                         |
+| row `_meta.jetbrains.air.createdAt`, `lastPromptAt`, `gitBranch`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names                                                                    |
+| row `_meta.jetbrains.air.archived`                                                                                          | `SessionInfo.archived` (#2161)                                                                            |
+| `session_info_update` `_meta.jetbrains.air.archived`                                                                        | `SessionInfoUpdate.archived` (#2161)                                                                      |
+| `_session/list_changed { cwd }`                                                                                             | `session/list_changed { cwd }`                                                                            |
+| `_session/archive`, `_session/unarchive`                                                                                    | `session/archive`, `session/unarchive` (#2161)                                                            |
+| `_session/rename`                                                                                                           | client-set titles (#1987)                                                                                 |
 
 ### Relation to ACP RFD #2161
 

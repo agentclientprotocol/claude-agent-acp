@@ -97,6 +97,8 @@ export type ListCursor = { updatedAtMs: number; sessionId: string };
 
 export type ListQuery = {
   cwd?: string | null;
+  /** Also list the sessions of the existing linked worktrees of `cwd`. */
+  includeWorktrees?: boolean;
   limit: number;
   archived: ArchivedFilter;
   after?: ListCursor;
@@ -234,10 +236,11 @@ export class SessionIndex {
 
   constructor(private readonly getSessionInfo: GetSessionInfo) {}
 
-  /** The paths whose sessions a list of `cwd` shows: `cwd` and every existing
-   *  worktree of its repository. */
-  async listedPaths(cwd: string): Promise<string[]> {
+  /** The paths whose sessions a list of `cwd` shows: `cwd`, and with
+   *  `includeWorktrees` every existing worktree of its repository. */
+  async listedPaths(cwd: string, includeWorktrees: boolean): Promise<string[]> {
     const canonical = await canonicalPath(cwd);
+    if (!includeWorktrees) return [canonical];
     return [...new Set([canonical, ...(await repositoryWorktrees(canonical))])];
   }
 
@@ -297,12 +300,13 @@ export class SessionIndex {
     return false;
   }
 
-  /** Every non-empty transcript of `cwd` and its worktrees (or of all
-   *  projects without a cwd), one per session id: the larger file wins. */
-  async enumerate(cwd?: string | null): Promise<TranscriptCandidate[]> {
+  /** Every non-empty transcript of `cwd` (with `includeWorktrees` also of
+   *  its worktrees; without a cwd, of all projects), one per session id: the
+   *  larger file wins. */
+  async enumerate(cwd?: string | null, includeWorktrees = false): Promise<TranscriptCandidate[]> {
     const root = projectsRoot();
     const dirs: { dirName: string; projectPath?: string }[] = cwd
-      ? await this.projectDirs(await this.listedPaths(cwd))
+      ? await this.projectDirs(await this.listedPaths(cwd, includeWorktrees))
       : (await readDirNames(root)).map((dirName) => ({ dirName }));
     const perDir = await Promise.all(
       dirs.map(async ({ dirName, projectPath }) => {
@@ -411,7 +415,7 @@ export class SessionIndex {
 
   /** One page of rows, plus whether more rows follow the page. */
   async list(query: ListQuery): Promise<{ rows: IndexRow[]; hasMore: boolean }> {
-    const candidates = (await this.enumerate(query.cwd))
+    const candidates = (await this.enumerate(query.cwd, query.includeWorktrees ?? false))
       .filter(
         (candidate) => query.archived || !query.archivedIds.has(candidate.sessionId.toLowerCase()),
       )

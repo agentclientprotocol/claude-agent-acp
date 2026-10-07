@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   deleteSession,
+  forkSession as sdkForkSession,
   getSessionInfo,
   listSessions,
   renameSession,
@@ -83,6 +84,10 @@ type TranscriptOptions = {
   trailer?: object[];
   /** The project directory name; defaults to the encoding of `cwd`. */
   dirName?: string;
+  /** The model of the assistant message. */
+  model?: string;
+  /** The `forkedFrom.sessionId` that a fork writes on every record. */
+  forkedFrom?: string;
 };
 
 async function writeTranscript(options: TranscriptOptions): Promise<{ id: string; file: string }> {
@@ -97,6 +102,9 @@ async function writeTranscript(options: TranscriptOptions): Promise<{ id: string
     isSidechain: options.sidechain ?? false,
     ...(recordCwd !== null && { cwd: recordCwd }),
     ...(options.gitBranch && { gitBranch: options.gitBranch }),
+    ...(options.forkedFrom && {
+      forkedFrom: { sessionId: options.forkedFrom, messageUuid: randomUUID() },
+    }),
   };
   const prompt = options.hugePrompt ? "p".repeat(options.hugePrompt) : (options.prompt ?? "Fix it");
   const entries = [
@@ -114,6 +122,7 @@ async function writeTranscript(options: TranscriptOptions): Promise<{ id: string
       timestamp: new Date(at).toISOString(),
       message: {
         role: "assistant",
+        ...(options.model && { model: options.model }),
         content: [{ type: "text", text: "Done" }],
         stop_reason: options.stopReason ?? "end_turn",
       },
@@ -332,7 +341,7 @@ describe("session/list of a sessionIndex client", () => {
     expect(page.sessions.filter((s) => s.sessionId === small.id)).toHaveLength(1);
   });
 
-  it("includes the sessions of existing linked worktrees, with their own cwd", async () => {
+  it("includes the sessions of existing linked worktrees on request, with their own cwd", async () => {
     const repo = path.join(workspace, "repo");
     const linked = path.join(workspace, "linked");
     const gone = path.join(workspace, "gone");
@@ -357,13 +366,32 @@ describe("session/list of a sessionIndex client", () => {
     await writeTranscript({ cwd: gone, lastMessageAt: base - 2000 });
     const { agent } = await indexAgent();
 
+    // Worktrees are opt-in: without it, a cwd lists its own sessions.
+    expect((await agent.listSessions({ cwd: repo })).sessions.map((s) => s.sessionId)).toEqual([
+      main.id,
+    ]);
+    expect((await agent.listSessions({ cwd: linked })).sessions.map((s) => s.sessionId)).toEqual([
+      inLinked.id,
+    ]);
     for (const cwd of [repo, linked]) {
-      const page = await agent.listSessions({ cwd });
+      const page = await agent.listSessions({
+        cwd,
+        _meta: listMeta({ includeWorktrees: true }),
+      });
       expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
         [main.id, repo],
         [inLinked.id, linked],
       ]);
     }
+    // A cursor is bound to the worktree scope.
+    const first = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true, limit: 1 }),
+    });
+    expect(first.nextCursor).toBeDefined();
+    await expect(
+      agent.listSessions({ cwd: repo, cursor: first.nextCursor, _meta: listMeta({ limit: 1 }) }),
+    ).rejects.toMatchObject({ code: -32602 });
   });
 
   it("recovers the cwd of a session whose head has none", async () => {
@@ -392,11 +420,14 @@ describe("session/list of a sessionIndex client", () => {
     expect(all.sessions.map((s) => s.cwd)).toEqual([workspace, workspace]);
   });
 
-  it("reports branch, activity and cost in the row metadata", async () => {
+  it("reports the row fields of the RFDs, flat", async () => {
+    const parent = randomUUID();
     const session = await writeTranscript({
       lastMessageAt: base,
       gitBranch: "feature/x",
       costUsd: 1.25,
+      model: "claude-opus-5-5",
+      forkedFrom: parent,
     });
     await writeTranscript({ lastMessageAt: base - 1000, costUsd: 0 });
     const { agent } = await indexAgent();
@@ -411,14 +442,23 @@ describe("session/list of a sessionIndex client", () => {
           air: {
             version: 1,
             archived: false,
+            // The first record of the transcript is the prompt, a second before.
+            createdAt: new Date(base - 1000).toISOString(),
+            lastPromptAt: new Date(base - 1000).toISOString(),
             gitBranch: "feature/x",
-            activity: { state: "idle", lastTurnEndedAt: new Date(base).toISOString() },
-            usage: { cost: { amount: 1.25, currency: "USD" } },
+            model: "claude-opus-5-5",
+            forkedFrom: parent,
+            state: "idle",
+            lastTurnEndedAt: new Date(base).toISOString(),
+            cost: { amount: 1.25, currency: "USD" },
           },
         },
       },
     });
-    expect((page.sessions[1]!._meta as any).jetbrains.air.usage).toBeUndefined();
+    const other = (page.sessions[1]!._meta as any).jetbrains.air;
+    for (const omitted of ["cost", "model", "forkedFrom", "gitBranch", "activity", "usage"]) {
+      expect(other).not.toHaveProperty(omitted);
+    }
   });
 
   it("reports the live state and cost of a session this connection runs", async () => {
@@ -431,8 +471,8 @@ describe("session/list of a sessionIndex client", () => {
     ) as any;
     const page = await agent.listSessions({ cwd: workspace });
     const meta = (page.sessions[0]!._meta as any).jetbrains.air;
-    expect(meta.activity.state).toBe("running");
-    expect(meta.usage.cost.amount).toBe(3);
+    expect(meta.state).toBe("running");
+    expect(meta.cost).toEqual({ amount: 3, currency: "USD" });
   });
 });
 
@@ -1778,5 +1818,65 @@ describe("archive state (ACP RFD #2161)", () => {
     expect(all.sessions.map((s) => [s.sessionId, (s._meta as any).jetbrains.air.archived])).toEqual(
       [[session.id, true]],
     );
+  });
+});
+
+describe("session list extensions RFD", () => {
+  it("reports forkedFrom for a session the SDK forked", async () => {
+    const parent = await writeTranscript({});
+    const { sessionId: child } = await sdkForkSession(parent.id, { dir: workspace });
+    const { agent } = await indexAgent();
+    const rows = (await agent.listSessions({ cwd: workspace })).sessions;
+    const forked = rows.find((row) => row.sessionId === child);
+    expect((forked!._meta as any).jetbrains.air.forkedFrom).toBe(parent.id);
+    const original = rows.find((row) => row.sessionId === parent.id);
+    expect((original!._meta as any).jetbrains.air).not.toHaveProperty("forkedFrom");
+  });
+
+  it("does not watch a list without a cwd", async () => {
+    await writeTranscript({});
+    const service = new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    await service.list({}, () => undefined);
+    expect((service as any).watcher).toBeUndefined();
+    await service.list({ cwd: workspace }, () => undefined);
+    expect((service as any).watcher).toBeDefined();
+    service.dispose();
+  });
+});
+
+describe("load and resume of a session that another process holds", () => {
+  const stubOpen = (agent: ClaudeAcpAgent) => {
+    const opened = vi.fn(async () => ({ sessionId: "x" }) as any);
+    (agent as any).getOrCreateSession = opened;
+    (agent as any).createSessionWhileReplaying = opened;
+    return opened;
+  };
+
+  it("is thread_active_writer for a sessionIndex client", async () => {
+    const session = await writeTranscript({});
+    await registerHolder(process.pid, session.id);
+    const { agent } = await indexAgent();
+    const opened = stubOpen(agent);
+    for (const open of [
+      () => agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
+      () => agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
+    ]) {
+      await expect(open()).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    }
+    expect(opened).not.toHaveBeenCalled();
+  });
+
+  it("opens as before for a client without sessionIndex", async () => {
+    const session = await writeTranscript({});
+    await registerHolder(process.pid, session.id);
+    const { agent } = createAgent();
+    await initializeClient(agent, air());
+    const opened = stubOpen(agent);
+    await agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    await agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    expect(opened).toHaveBeenCalledTimes(2);
   });
 });

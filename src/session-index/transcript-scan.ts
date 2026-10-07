@@ -39,6 +39,16 @@ export type TranscriptFacts = {
   headCwd?: string;
   /** The last `cwd` of the tail. */
   tailCwd?: string;
+  /** Time of the last real user prompt in the tail (not a tool result, a
+   *  meta record or a slash command), epoch ms. */
+  lastPromptAt?: number;
+  /** The model of the last assistant message in the tail. */
+  model?: string;
+  /** The first timestamp of the head, as the SDK's `createdAt`. */
+  createdAt?: number;
+  /** The session this one was forked from: the `forkedFrom.sessionId` that
+   *  the SDK and CLI fork write on every copied record. */
+  forkedFrom?: string;
   /** Whether the head or the tail holds a user or an assistant message. A
    *  transcript without one is a metadata-only stub. */
   hasMessages: boolean;
@@ -221,6 +231,9 @@ export function turnEffect(entry: Entry): TurnState | undefined {
   }
 }
 
+const FORKED_FROM_PATTERN =
+  /"forkedFrom":\s?\{"sessionId":\s?"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"/;
+
 const CWD_PATTERN = /"cwd":\s?"((?:[^"\\]|\\.)*)"/;
 
 function decodeJsonString(raw: string): string | undefined {
@@ -239,11 +252,19 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
   };
   const headCwd = CWD_PATTERN.exec(head)?.[1];
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
+  const createdAt = firstField(head, "timestamp");
+  if (createdAt !== undefined && !Number.isNaN(Date.parse(createdAt))) {
+    facts.createdAt = Date.parse(createdAt);
+  }
+  const forkedFrom = FORKED_FROM_PATTERN.exec(head)?.[1];
+  if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
 
   const lines = tail.split("\n");
   let costFound = false;
   let turnEndFound = false;
   let messageFound = false;
+  let promptFound = false;
+  let modelFound = false;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line) continue;
@@ -253,7 +274,7 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
     const hasCwd = facts.tailCwd === undefined && line.includes('"cwd"');
     if (!isCost && !isTurnRecord && !hasCwd) continue;
     // Everything has been found: stop parsing.
-    if (costFound && turnEndFound && messageFound && !hasCwd) break;
+    if (costFound && turnEndFound && messageFound && promptFound && modelFound && !hasCwd) break;
     const entry = parseLine(line);
     if (!entry) continue;
     if (hasCwd && typeof entry.cwd === "string" && entry.cwd) facts.tailCwd = entry.cwd;
@@ -273,6 +294,18 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
     if (!messageFound && (entry.type === "user" || entry.type === "assistant")) {
       messageFound = true;
       facts.lastMessageAt = timestampOf(entry);
+    }
+    if (!promptFound && entry.type === "user" && promptOf(entry, { commandFallback: "" })) {
+      promptFound = true;
+      facts.lastPromptAt = timestampOf(entry);
+    }
+    if (!modelFound && entry.type === "assistant") {
+      const model = (entry.message as { model?: unknown } | undefined)?.model;
+      // The CLI marks the messages it makes up (API errors) `<synthetic>`.
+      if (typeof model === "string" && model && model !== "<synthetic>") {
+        modelFound = true;
+        facts.model = model;
+      }
     }
     const effect = turnEffect(entry);
     if (effect === undefined) continue;

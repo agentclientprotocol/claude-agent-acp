@@ -3,7 +3,8 @@
  * cwd it reads may have changed.
  *
  * Only the cwds that this connection listed in the last 10 minutes are
- * watched, at most 32. Each watched cwd has a non-recursive `fs.watch` on the
+ * watched, at most 32, each with the worktree scope it was listed with (a
+ * list renews its watch; a list without a cwd is not watched). Each watch has a non-recursive `fs.watch` on the
  * project directories of its paths; the CLI registry directory and the
  * archive marker directory are shared by all of them. An event marks cwds
  * dirty; after a 150 ms quiet period (at most 1 s after the first event) each
@@ -30,9 +31,13 @@ const MAX_WAIT_MS = 1_000;
 const RESCAN_MS = 10_000;
 
 export type ListChangedDeps = {
-  /** The paths that a list of a cwd shows (the cwd and its worktrees), and
-   *  the names of their project directories. */
-  projectDirs: (cwd: string) => Promise<{ dirNames: string[]; paths: string[] }>;
+  /** The paths that a list of a cwd shows (the cwd, and with
+   *  `includeWorktrees` its worktrees), and the names of their project
+   *  directories. */
+  projectDirs: (
+    cwd: string,
+    includeWorktrees: boolean,
+  ) => Promise<{ dirNames: string[]; paths: string[] }>;
   /** Sends `_session/list_changed { cwd }`. */
   notify: (cwd: string) => Promise<void>;
   now?: () => number;
@@ -43,7 +48,10 @@ export type ListChangedDeps = {
 };
 
 type WatchedCwd = {
+  /** The watch: the cwd and the worktree scope of the list. */
+  key: string;
   cwd: string;
+  includeWorktrees: boolean;
   lastListedAt: number;
   dirNames: string[];
   /** The paths that `dirNames` belong to. */
@@ -145,25 +153,28 @@ export class ListChangedWatcher {
 
   /** The cwds being watched, for tests and diagnostics. */
   watchedCwds(): string[] {
-    return [...this.watched.keys()];
+    return [...this.watched.values()].map(({ cwd }) => cwd);
   }
 
   /** Records that the client listed `cwd`, and watches it. */
-  async onListed(cwd: string): Promise<void> {
+  async onListed(cwd: string, includeWorktrees = false): Promise<void> {
     if (this.disposed) return;
-    const existing = this.watched.get(cwd);
+    const key = `${includeWorktrees ? "w" : "-"}\0${cwd}`;
+    const existing = this.watched.get(key);
     if (existing) {
       existing.lastListedAt = this.now();
       return;
     }
     const entry: WatchedCwd = {
+      key,
       cwd,
+      includeWorktrees,
       lastListedAt: this.now(),
       dirNames: [],
       paths: [],
       watchers: [],
     };
-    this.watched.set(cwd, entry);
+    this.watched.set(key, entry);
     this.evictOverflow();
     this.ensureShared();
     await this.refreshDirs(entry);
@@ -192,7 +203,7 @@ export class ListChangedWatcher {
       }
       if (!oldest) return;
       this.unwatch(oldest);
-      this.watched.delete(oldest.cwd);
+      this.watched.delete(oldest.key);
     }
   }
 
@@ -228,12 +239,12 @@ export class ListChangedWatcher {
     let dirNames: string[];
     let paths: string[];
     try {
-      ({ dirNames, paths } = await this.deps.projectDirs(entry.cwd));
+      ({ dirNames, paths } = await this.deps.projectDirs(entry.cwd, entry.includeWorktrees));
     } catch (error) {
       this.deps.logError?.(`session list watch of ${entry.cwd} failed`, error);
       return;
     }
-    if (this.disposed || this.watched.get(entry.cwd) !== entry) return;
+    if (this.disposed || this.watched.get(entry.key) !== entry) return;
     entry.paths = paths;
     if (dirNames.join("\0") === entry.dirNames.join("\0") && entry.watchers.length > 0) return;
     for (const watcher of entry.watchers) watcher.close();
@@ -292,12 +303,12 @@ export class ListChangedWatcher {
 
   /** Notifies the client when the fingerprint of `entry` changed. */
   private async check(entry: WatchedCwd): Promise<void> {
-    if (this.disposed || this.watched.get(entry.cwd) !== entry) return;
+    if (this.disposed || this.watched.get(entry.key) !== entry) return;
     try {
       const fingerprint = await this.fingerprint(entry);
       if (fingerprint === entry.fingerprint) return;
       entry.fingerprint = fingerprint;
-      if (this.disposed || this.watched.get(entry.cwd) !== entry) return;
+      if (this.disposed || this.watched.get(entry.key) !== entry) return;
       await this.deps.notify(entry.cwd);
     } catch (error) {
       this.deps.logError?.(`session list change check of ${entry.cwd} failed`, error);
@@ -310,7 +321,7 @@ export class ListChangedWatcher {
     for (const entry of [...this.watched.values()]) {
       if (now - entry.lastListedAt > WATCH_TTL_MS) {
         this.unwatch(entry);
-        this.watched.delete(entry.cwd);
+        this.watched.delete(entry.key);
         continue;
       }
       await this.refreshDirs(entry);
