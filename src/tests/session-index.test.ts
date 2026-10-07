@@ -1553,3 +1553,79 @@ describe("rename of a session that runs here and in another process", () => {
     expect(rename).not.toHaveBeenCalled();
   });
 });
+
+describe("a transcript named by an upper-case id", () => {
+  it("is renamed, archived and deleted under the listed id and its own spelling", async () => {
+    const upper = randomUUID().toUpperCase();
+    const session = await writeTranscript({ sessionId: upper });
+    const dir = path.dirname(session.file);
+    const { agent } = await indexAgent();
+    const [row] = (await agent.listSessions({ cwd: workspace })).sessions;
+    expect(row!.sessionId).toBe(upper);
+
+    await agent.renameSessionTitle({ sessionId: row!.sessionId, title: "Upper" });
+    expect(renameSession).toHaveBeenCalledWith(upper, "Upper");
+    // No transcript of another spelling appeared.
+    expect((await fs.readdir(dir)).filter((name) => name.endsWith(".jsonl"))).toEqual([
+      `${upper}.jsonl`,
+    ]);
+    expect((await agent.listSessions({ cwd: workspace })).sessions[0]!.title).toBe("Upper");
+
+    await agent.archiveSession({ sessionId: row!.sessionId });
+    expect(
+      (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "only" }) }))
+        .sessions,
+    ).toHaveLength(1);
+
+    await agent.deleteSession({ sessionId: row!.sessionId });
+    expect(vi.mocked(deleteSession).mock.calls).toEqual([[upper]]);
+    expect(await fs.readdir(dir)).toEqual([]);
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", upper.toLowerCase()))).toBe(
+      false,
+    );
+  });
+
+  it("deletes copies of both spellings, each by its own name", async () => {
+    const lower = randomUUID();
+    const upper = lower.toUpperCase();
+    const a = await writeTranscript({ sessionId: upper, cwd: path.join(workspace, "a") });
+    const b = await writeTranscript({ sessionId: lower, cwd: path.join(workspace, "b") });
+    const { agent } = await indexAgent();
+    await agent.deleteSession({ sessionId: upper });
+    expect(
+      vi
+        .mocked(deleteSession)
+        .mock.calls.map(([id]) => id)
+        .sort(),
+    ).toEqual([upper, lower].sort());
+    expect(fsSync.existsSync(a.file)).toBe(false);
+    expect(fsSync.existsSync(b.file)).toBe(false);
+  });
+});
+
+describe("a closed session whose lone holder cannot be identified", () => {
+  it("is waited for as this connection's exiting CLI", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    // Parents cannot be told (as on Windows).
+    const registry = (agent as any).sessionIndex.registry as LiveSessionRegistry;
+    (registry as any).parentPids = async () => new Map();
+    (registry as any).ownChildExitTimeoutMs = 200;
+    (agent as any).closedCliSessions.set(session.id, Date.now());
+    await registerHolder(process.pid, session.id);
+    const started = Date.now();
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    // Waited for, then refused as it stayed.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(190);
+
+    // A session this connection never ran: refused at once.
+    const other = await writeTranscript({});
+    await registerHolder(process.pid, other.id);
+    (registry as any).ownChildExitTimeoutMs = 60_000;
+    await expect(
+      agent.renameSessionTitle({ sessionId: other.id, title: "x" }),
+    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+  });
+});

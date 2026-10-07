@@ -223,6 +223,11 @@ async function ensureTitleRecord(
   return true;
 }
 
+/** The session id as the file name of a transcript spells it. */
+function transcriptSessionId(transcript: string): string {
+  return path.basename(transcript, ".jsonl");
+}
+
 function isSdkNotFound(error: unknown): boolean {
   return error instanceof Error && /^Session \S+ not found in /.test(error.message);
 }
@@ -258,7 +263,7 @@ export async function archiveInsteadOfDelete(
 ): Promise<void> {
   if (!isSessionId(sessionId)) throw sdkDeleteError(sessionId);
   // The SDK delete skips empty transcripts, so they do not count.
-  if ((await index.findTranscripts(sessionId)).length === 0) {
+  if ((await index.findTranscripts(sessionId, { exactSpelling: true })).length === 0) {
     throw sdkDeleteError(sessionId);
   }
   await writeArchiveMarker(sessionId);
@@ -345,9 +350,10 @@ export class SessionIndexService {
 
   /** Throws `thread_active_writer` when another live process holds the
    *  session. A CLI that this process started (one being closed) is waited
-   *  for instead, and refused only when it outlives the wait. */
-  async assertNotHeldElsewhere(sessionId: string): Promise<void> {
-    if (await this.registry.holder(sessionId)) throw activeWriterError(sessionId);
+   *  for instead, and refused only when it outlives the wait. `ownCli`: this
+   *  process ran a CLI for the session (see {@link LiveSessionRegistry.holder}). */
+  async assertNotHeldElsewhere(sessionId: string, ownCli?: "running" | "exiting"): Promise<void> {
+    if (await this.registry.holder(sessionId, { ownCli })) throw activeWriterError(sessionId);
   }
 
   /** Runs `mutation` after the previous mutation of the session ended. */
@@ -365,21 +371,22 @@ export class SessionIndexService {
 
   /** Renames a session whose CLI does not run here: appends the title record
    *  to every transcript of the session (the SDK writes the first one only)
-   *  and writes the title sidecar next to each. `ownedHere`: the session's
-   *  query runs in this process, so no other writer is looked for. */
+   *  and writes the title sidecar next to each. `ownCli`: this process runs
+   *  (or just closed) a CLI for the session. */
   async renameOffline(
     sessionId: string,
     title: string,
-    options: { ownedHere?: boolean } = {},
+    options: { ownCli?: "running" | "exiting" } = {},
   ): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
       const transcripts = await this.index.findTranscripts(sessionId);
       if (transcripts.length === 0) throw sessionNotFound(sessionId);
-      if (!options.ownedHere) await this.assertNotHeldElsewhere(sessionId);
+      await this.assertNotHeldElsewhere(sessionId, options.ownCli);
       try {
-        await this.renameSession(sessionId, title);
-        await this.titleCopies(transcripts, sessionId, title, Boolean(options.ownedHere));
+        // The SDK finds the transcript by its exact file name.
+        await this.renameSession(transcriptSessionId(transcripts[0]!), title);
+        await this.titleCopies(transcripts, sessionId, title, options.ownCli === "running");
       } finally {
         this.index.invalidate(transcripts);
       }
@@ -400,9 +407,7 @@ export class SessionIndexService {
     rename: () => Promise<void>,
   ): Promise<void> {
     await this.exclusive(sessionId, async () => {
-      if (await this.registry.holder(sessionId, { ownChildRuns: true })) {
-        throw activeWriterError(sessionId);
-      }
+      await this.assertNotHeldElsewhere(sessionId, "running");
       await rename();
       if (!isSessionId(sessionId)) return;
       let transcripts: string[] = [];
@@ -429,7 +434,8 @@ export class SessionIndexService {
     liveWriter: boolean,
   ): Promise<void> {
     for (const transcript of transcripts) {
-      if (await ensureTitleRecord(transcript, sessionId, title, { liveWriter })) {
+      const id = transcriptSessionId(transcript);
+      if (await ensureTitleRecord(transcript, id, title, { liveWriter })) {
         await writeCustomTitleSidecar(transcript, title);
       }
     }
@@ -480,17 +486,21 @@ export class SessionIndexService {
         throw sessionNotFound(sessionId);
       }
       try {
-        const nonEmpty = await this.index.findTranscripts(sessionId);
-        for (let i = 0; i < nonEmpty.length; i++) {
+        // The SDK finds a transcript by its exact file name: one call per
+        // copy, with that copy's spelling of the id.
+        for (const transcript of await this.index.findTranscripts(sessionId)) {
+          const spelling = transcriptSessionId(transcript);
           try {
-            await this.deleteSession(sessionId);
+            await this.deleteSession(spelling);
           } catch (error) {
-            // Only "not found" with nothing left is a copy removed meanwhile.
+            // Only "not found" with no copy of that spelling left is a copy
+            // removed meanwhile.
+            const left = await this.index.findTranscripts(sessionId);
             if (
               isSdkNotFound(error) &&
-              (await this.index.findTranscripts(sessionId)).length === 0
+              !left.some((file) => transcriptSessionId(file) === spelling)
             ) {
-              break;
+              continue;
             }
             throw error;
           }

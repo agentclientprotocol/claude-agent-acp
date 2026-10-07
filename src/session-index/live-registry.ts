@@ -215,19 +215,23 @@ export class LiveSessionRegistry {
     return snapshot;
   }
 
-  /** A live process that holds `sessionId`, from a fresh read. A CLI child
-   *  of this process is waited for (bounded), so that nothing writes the
-   *  transcript any more when the caller goes on; one still alive after the
-   *  wait is returned. A process whose parent is unknown (no `ps`, as on
-   *  Windows) may be such a child: it is waited for too. Session ids match
-   *  in any case.
+  /**
+   * A live process that holds `sessionId`, from a fresh read, other than a
+   * CLI child of this process. Session ids match in any case.
    *
-   *  `ownChildRuns`: the session runs in a CLI child of this process, which
-   *  does not count and is not waited for; only another process is
-   *  returned. */
+   * A CLI child of this process (identified by its parent pid) is waited for
+   * (bounded), so that nothing writes the transcript any more when the
+   * caller goes on; one still alive after the wait is returned.
+   *
+   * `ownCli` tells that this process ran a CLI for the session: `running`
+   * (it still runs: it is neither counted nor waited for) or `exiting` (it
+   * was just closed). Where the parent of a holder cannot be told (no `ps`,
+   * as on Windows), a single holder of a session with `ownCli` is taken for
+   * that CLI; any other unidentified holder is returned at once.
+   */
   async holder(
     sessionId: string,
-    options: { ownChildRuns?: boolean } = {},
+    options: { ownCli?: "running" | "exiting" } = {},
   ): Promise<LiveRecord | undefined> {
     const id = sessionId.toLowerCase();
     const deadline = Date.now() + this.ownChildExitTimeoutMs;
@@ -247,7 +251,10 @@ export class LiveSessionRegistry {
         return parent !== undefined && parent !== this.ownPid;
       });
       if (other) return other;
-      if (options.ownChildRuns) return undefined;
+      const unidentified = records.find(({ pid }) => !parents.has(pid));
+      if (unidentified && !(options.ownCli && records.length === 1)) return unidentified;
+      // Only CLI children of this process are left.
+      if (options.ownCli === "running") return undefined;
       if (Date.now() >= deadline) return records[0];
       await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
     }

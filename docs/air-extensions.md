@@ -1259,14 +1259,14 @@ Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
   Copies of the session in other project directories get the title record and sidecar from the adapter.
 - Any other session gets the SDK `renameSession` title record in every transcript of the session and the CLI's `custom-title.json` sidecar next to each (mode 0600, written atomically).
 - A session that another live process holds is refused with `data.reason: "thread_active_writer"`, also one that runs here and that another process resumed too.
-  A session whose query closed here counts as any other session. A CLI that this adapter started and is still exiting is no other process: the adapter waits for it to exit, at most 8 seconds, and refuses with `thread_active_writer` if it is still running then. Where the parent of a process cannot be told (Windows), every holder is waited for that way.
+  A session whose query closed here counts as any other session. A CLI that this adapter started and is still exiting is no other process: the adapter waits for it to exit, at most 8 seconds, and refuses with `thread_active_writer` if it is still running then. Where the parent of a process cannot be told (Windows), a lone holder of a session whose CLI this connection runs or just closed is taken for that CLI; any other holder is another process.
   A transcript whose last line is incomplete gets no record while a process may still be writing it.
 
 ### Archive
 
 `_session/archive { "sessionId": "…" }` and `_session/unarchive { "sessionId": "…" }` return `{}`.
 Both are idempotent and work for a session that is not loaded.
-In all of the session index methods and in a `sessionIndex` client's `session/delete`, a session id matches in any case.
+In all of the session index methods and in a `sessionIndex` client's `session/delete`, a session id matches in any case, and each transcript is handled under the spelling of its own file name.
 The archive is a marker file `<config>/acp/archived/<sessionId>`; the transcript is not touched, so archiving does not reorder the list.
 Loading an archived session does not unarchive it.
 The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or not.

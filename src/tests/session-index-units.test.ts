@@ -380,22 +380,55 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("waits for a holder whose parent is unknown, and reports it if it stays", async () => {
-    const dir = await registryWith({
-      "40.json": { pid: 40, sessionId: "unknown-parent", updatedAt: now },
+  describe("a holder whose parent is unknown", () => {
+    const unknownParents = async (records: Record<string, object>, timeoutMs = 150) => {
+      const dir = await registryWith(records);
+      return {
+        dir,
+        registry: new LiveSessionRegistry({
+          dir: () => dir,
+          now: () => now,
+          isAlive: () => true,
+          pidDomain: async () => "win32:host",
+          parentPids: async () => new Map(),
+          ownChildExitTimeoutMs: timeoutMs,
+        }),
+      };
+    };
+
+    it("is another process when this one ran no CLI for the session", async () => {
+      const { dir, registry } = await unknownParents(
+        { "40.json": { pid: 40, sessionId: "s", updatedAt: now } },
+        60_000,
+      );
+      expect((await registry.holder("s"))?.pid).toBe(40);
+      await fs.rm(dir, { recursive: true, force: true });
     });
-    const registry = new LiveSessionRegistry({
-      dir: () => dir,
-      now: () => now,
-      isAlive: () => true,
-      pidDomain: async () => "win32:host",
-      parentPids: async () => new Map(),
-      ownChildExitTimeoutMs: 150,
+
+    it("is taken for the CLI of this process when it is the only one", async () => {
+      const { dir, registry } = await unknownParents({
+        "41.json": { pid: 41, sessionId: "s", updatedAt: now },
+      });
+      expect(await registry.holder("s", { ownCli: "running" })).toBeUndefined();
+      // An exiting one is waited for, and reported if it stays.
+      const started = Date.now();
+      expect((await registry.holder("s", { ownCli: "exiting" }))?.pid).toBe(41);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(140);
+      await fs.rm(dir, { recursive: true, force: true });
     });
-    const started = Date.now();
-    expect((await registry.holder("unknown-parent"))?.pid).toBe(40);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(140);
-    await fs.rm(dir, { recursive: true, force: true });
+
+    it("is another process when two hold the session", async () => {
+      const { dir, registry } = await unknownParents(
+        {
+          "42.json": { pid: 42, sessionId: "s", updatedAt: now },
+          "43.json": { pid: 43, sessionId: "s", updatedAt: now },
+        },
+        60_000,
+      );
+      expect(await registry.holder("s", { ownCli: "running" })).toBeDefined();
+      expect(await registry.holder("s", { ownCli: "exiting" })).toBeDefined();
+      await fs.rm(dir, { recursive: true, force: true });
+    });
   });
 
   it("matches a session id in any case", async () => {
@@ -428,8 +461,8 @@ describe("live registry", () => {
       parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 62 ? 1 : 1000])),
       ownChildExitTimeoutMs: 60_000,
     });
-    expect(await registry.holder("running", { ownChildRuns: true })).toBeUndefined();
-    expect((await registry.holder("resumed", { ownChildRuns: true }))?.pid).toBe(62);
+    expect(await registry.holder("running", { ownCli: "running" })).toBeUndefined();
+    expect((await registry.holder("resumed", { ownCli: "running" }))?.pid).toBe(62);
     await fs.rm(dir, { recursive: true, force: true });
   });
 

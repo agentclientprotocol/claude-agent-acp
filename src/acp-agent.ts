@@ -2509,6 +2509,9 @@ async function waitForMcpAuthentication(
   return false;
 }
 
+/** How long a closed CLI may still be exiting (the SDK kills it after 7 s). */
+const CLOSED_CLI_MEMORY_MS = 30_000;
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -2561,6 +2564,10 @@ export class ClaudeAcpAgent {
    * before.
    */
   private sessionIndex?: SessionIndexService;
+  /** When this connection last closed the CLI of a session, by lower-case
+   *  id: the session index takes a lone registry holder whose parent it
+   *  cannot tell for that CLI while it exits. */
+  private readonly closedCliSessions = new Map<string, number>();
 
   constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
     this.v2 = options.v2 ?? false;
@@ -3010,6 +3017,18 @@ export class ClaudeAcpAgent {
     return Object.keys(this.sessions).find((key) => key.toLowerCase() === lower) ?? lower;
   }
 
+  /** Whether this connection runs a CLI for the session (`running`), or
+   *  closed one that may still be exiting (`exiting`). */
+  private ownCliState(sessionId: string): "running" | "exiting" | undefined {
+    const session = this.sessions[sessionId];
+    if (session && !session.queryClosed) return "running";
+    if (session) return "exiting";
+    const closedAt = this.closedCliSessions.get(sessionId.toLowerCase());
+    if (closedAt !== undefined && Date.now() - closedAt < CLOSED_CLI_MEMORY_MS) return "exiting";
+    this.closedCliSessions.delete(sessionId.toLowerCase());
+    return undefined;
+  }
+
   /** `_session/rename`: names a session; no generated title replaces it. */
   async renameSessionTitle(request: RenameSessionRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_RENAME_METHOD);
@@ -3032,7 +3051,7 @@ export class ClaudeAcpAgent {
     // resumed the session since: only a running query is ours.
     const persist = () =>
       index.renameOffline(params.sessionId, params.title, {
-        ownedHere: session !== undefined && !session.queryClosed,
+        ownCli: this.ownCliState(params.sessionId),
       });
     if (session) {
       await session.titles.setExplicitTitle(params.title, persist);
@@ -7825,6 +7844,7 @@ export class ClaudeAcpAgent {
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
     delete this.sessions[sessionId];
+    this.closedCliSessions.set(sessionId.toLowerCase(), Date.now());
     const ended = await raceTimeoutAndAbort(
       turnsEnded,
       TEARDOWN_TURN_END_TIMEOUT_MS,
@@ -7873,7 +7893,10 @@ export class ClaudeAcpAgent {
     // that another process holds. A session that runs here is checked once
     // its CLI is closed: another process may have resumed it meanwhile.
     if (this.sessionIndex && !running) {
-      await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
+      await this.sessionIndex.assertNotHeldElsewhere(
+        params.sessionId,
+        this.ownCliState(params.sessionId),
+      );
     }
     // Tear down any active in-memory state first so the on-disk file isn't
     // recreated by an outstanding query writing to it.
@@ -7881,7 +7904,7 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
     if (this.sessionIndex) {
-      if (running) await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
+      if (running) await this.sessionIndex.assertNotHeldElsewhere(params.sessionId, "exiting");
       await this.sessionIndex.delete(params.sessionId, loaded);
     } else if (this.toolCallCapabilities.air.client) {
       await archiveInsteadOfDelete(params.sessionId);
