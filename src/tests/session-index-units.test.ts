@@ -330,9 +330,8 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("finds no other holder in a CLI child of this process", async () => {
+  it("reports another process before it waits for a CLI child of this one", async () => {
     const dir = await registryWith({
-      "20.json": { pid: 20, sessionId: "closed-here", updatedAt: now },
       "21.json": { pid: 21, sessionId: "both", updatedAt: now },
       "22.json": { pid: 22, sessionId: "both", updatedAt: now },
     });
@@ -343,30 +342,35 @@ describe("live registry", () => {
       pidDomain: async () => "darwin",
       ownPid: 1000,
       parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 22 ? 1 : 1000])),
-      ownChildExitTimeoutMs: 0,
+      ownChildExitTimeoutMs: 60_000,
     });
-    expect(await registry.holder("closed-here")).toBeUndefined();
-    // Our exiting child and another process: the other one holds it.
+    // Our exiting child and another process: the other one holds it, at once.
     expect((await registry.holder("both"))?.pid).toBe(22);
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("waits a bounded time for a CLI child of this process to exit", async () => {
+  it("waits for a CLI child of this process to exit, and reports one that does not", async () => {
     const dir = await registryWith({
       "30.json": { pid: 30, sessionId: "exiting", updatedAt: now },
+      "31.json": { pid: 31, sessionId: "stuck", updatedAt: now },
     });
+    let exited = false;
     const registry = new LiveSessionRegistry({
       dir: () => dir,
       now: () => now,
-      isAlive: () => true,
+      isAlive: (pid) => pid !== 30 || !exited,
       pidDomain: async () => "darwin",
       ownPid: 1000,
       parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1000])),
       ownChildExitTimeoutMs: 250,
     });
-    const started = Date.now();
+    setTimeout(() => (exited = true), 100);
     expect(await registry.holder("exiting")).toBeUndefined();
+
+    const started = Date.now();
+    expect((await registry.holder("stuck"))?.pid).toBe(31);
     expect(Date.now() - started).toBeGreaterThanOrEqual(240);
+    expect((await registry.holder("stuck", { ignoreOthers: true }))?.pid).toBe(31);
     await fs.rm(dir, { recursive: true, force: true });
   });
 

@@ -283,3 +283,136 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
   }
   return facts;
 }
+
+/** Every `"key":"value"` string of `text`, in order, decoded. */
+function stringFields(text: string, key: string): string[] {
+  const pattern = new RegExp(`"${key}":\\s?"((?:[^"\\\\]|\\\\.)*)"`, "g");
+  const values: string[] = [];
+  for (const match of text.matchAll(pattern)) {
+    const value = decodeJsonString(match[1]!);
+    if (value !== undefined) values.push(value);
+  }
+  return values;
+}
+
+const lastField = (text: string, key: string) => stringFields(text, key).at(-1) || undefined;
+const firstField = (text: string, key: string) => stringFields(text, key)[0] || undefined;
+
+/** Whether the first record of the transcript is a sidechain one, which the
+ *  SDK never lists. */
+export function isSidechainTranscript(head: string): boolean {
+  const newline = head.indexOf("\n");
+  const first = newline >= 0 ? head.slice(0, newline) : head;
+  return first.includes('"isSidechain":true') || first.includes('"isSidechain": true');
+}
+
+/** The text of the first user prompt of the head: not a tool result, not a
+ *  meta or compact summary record. */
+function firstPrompt(head: string): string | undefined {
+  for (const line of head.split("\n")) {
+    if (!line.includes('"type":"user"') && !line.includes('"type": "user"')) continue;
+    if (line.includes('"tool_result"') || line.includes('"isMeta":true')) continue;
+    if (line.includes('"isCompactSummary":true')) continue;
+    const entry = parseLine(line);
+    const text = entry && firstText(entry)?.trim();
+    if (text) return text.replace(/\s+/g, " ");
+  }
+  return undefined;
+}
+
+export type TitleFields = { summary?: string; gitBranch?: string };
+
+/**
+ * The title and branch of a transcript from its own head and tail, in the
+ * SDK's order: custom title (tail, the sidecar, head), AI title, last prompt,
+ * summary, first prompt. For a transcript the SDK `getSessionInfo` does not
+ * read (another copy of the session comes first in its search).
+ */
+export function titleFields({ head, tail }: HeadTail, sidecarTitle?: string): TitleFields {
+  const summary =
+    lastField(tail, "customTitle") ??
+    sidecarTitle ??
+    lastField(head, "customTitle") ??
+    lastField(tail, "aiTitle") ??
+    lastField(head, "aiTitle") ??
+    lastField(tail, "lastPrompt") ??
+    lastField(tail, "summary") ??
+    firstPrompt(head);
+  const gitBranch = lastField(tail, "gitBranch") ?? firstField(head, "gitBranch");
+  return {
+    ...(summary !== undefined && { summary }),
+    ...(gitBranch !== undefined && { gitBranch }),
+  };
+}
+
+/** Whether the tail carries a custom title of its own. */
+export function hasTailCustomTitle(tail: string): boolean {
+  return lastField(tail, "customTitle") !== undefined;
+}
+
+const CONTINUED_IN_MARKER = '"type":"continued-in"';
+
+/**
+ * The session this transcript was continued in, as the SDK list reads it: the
+ * last `continued-in` record of the tail, unless a completed turn follows it
+ * (the session was resumed here again).
+ */
+export function continuedInSessionId(tail: string): string | undefined {
+  if (!tail.includes(CONTINUED_IN_MARKER)) return undefined;
+  const lines = tail.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    const isContinuation = line.includes(CONTINUED_IN_MARKER);
+    const isMessage = line.includes('"type":"user"') || line.includes('"type":"assistant"');
+    if (!isContinuation && !isMessage) continue;
+    const entry = parseLine(line);
+    if (!entry) continue;
+    if (isContinuation && entry.type === "continued-in") {
+      const id = entry.continuedInSessionId;
+      return typeof id === "string" && SESSION_ID.test(id) ? id : undefined;
+    }
+    if (entry.type === "assistant") {
+      const stopReason = (entry.message as { stop_reason?: unknown } | undefined)?.stop_reason;
+      if (entry.isApiErrorMessage !== true && typeof stopReason === "string") return undefined;
+    } else if (entry.type === "user" && firstText(entry) !== undefined) {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const HISTORY_MARKER = '"parentUuid":';
+const HISTORY_SCAN_LIMIT = 16 * 1024 * 1024;
+const HISTORY_SCAN_CHUNK = 1024 * 1024;
+
+/** Whether the transcript at `filePath` holds conversation history (a record
+ *  with a `parentUuid`), as the SDK checks a continuation's successor. */
+export async function hasHistory(filePath: string): Promise<boolean> {
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(filePath, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const { size } = await handle.stat();
+    const buffer = Buffer.allocUnsafe(HISTORY_SCAN_CHUNK + HISTORY_MARKER.length);
+    let carry = 0;
+    for (let offset = 0; offset < Math.min(size, HISTORY_SCAN_LIMIT);) {
+      const { bytesRead } = await handle.read(buffer, carry, HISTORY_SCAN_CHUNK, offset);
+      if (bytesRead === 0) return false;
+      const end = carry + bytesRead;
+      if (buffer.subarray(0, end).includes(HISTORY_MARKER)) return true;
+      carry = Math.min(HISTORY_MARKER.length, end);
+      buffer.copyWithin(0, end - carry, end);
+      offset += bytesRead;
+    }
+    // Past the scan limit the SDK assumes history.
+    return size > HISTORY_SCAN_LIMIT;
+  } catch {
+    return false;
+  } finally {
+    await handle.close();
+  }
+}

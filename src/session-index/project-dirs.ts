@@ -85,6 +85,15 @@ export function sameProjectPath(cwd: string, projectPath: string): boolean {
     : a === b;
 }
 
+/** Whether `dirName` is the exact project directory of `cwd`, as the SDK
+ *  finds it by `dir`: the exact encoding, on macOS in any case (the file
+ *  system ignores it). */
+export function isExactProjectDir(dirName: string, cwd: string): boolean {
+  const exact = encodeProjectPath(cwd);
+  if (sameName(dirName, exact)) return true;
+  return process.platform === "darwin" && dirName.toLowerCase() === exact.toLowerCase();
+}
+
 /** The real path of `cwd`, like the SDK resolves it before encoding. Falls
  *  back to `cwd` when it does not exist. */
 export async function canonicalPath(cwd: string): Promise<string> {

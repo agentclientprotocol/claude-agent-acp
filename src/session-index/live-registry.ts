@@ -18,8 +18,8 @@
  * A snapshot is cached for {@link SNAPSHOT_TTL_MS}. A holder check before a
  * destructive operation asks for a fresh one. A CLI child of this process (one
  * this adapter just closed) is no other writer, but it may still flush the
- * transcript while it exits: the check waits for it to go, a few seconds at
- * most.
+ * transcript while it exits: the check waits for it to go, and a child that
+ * outlives the wait counts as a holder.
  */
 
 import { execFile } from "node:child_process";
@@ -32,7 +32,9 @@ import { errorCode } from "./project-dirs.js";
 const SNAPSHOT_TTL_MS = 5_000;
 const STALE_RECORD_MS = 24 * 60 * 60 * 1000;
 const PS_TIMEOUT_MS = 1_000;
-const OWN_CHILD_EXIT_TIMEOUT_MS = 3_000;
+/** The SDK closes a CLI with stdin EOF, SIGTERM after 2 s and SIGKILL 5 s
+ *  later: this covers all of it. */
+const OWN_CHILD_EXIT_TIMEOUT_MS = 8_000;
 const OWN_CHILD_POLL_MS = 100;
 const RECORD_FILE_PATTERN = /^(\d+)\.json$/;
 
@@ -213,10 +215,10 @@ export class LiveSessionRegistry {
     return snapshot;
   }
 
-  /** A live process other than a CLI child of this one that holds
-   *  `sessionId`, from a fresh read. While only CLI children of this process
-   *  hold it, waits (bounded) for them to exit, so that nothing writes the
-   *  transcript any more when the caller goes on. */
+  /** A live process that holds `sessionId`, from a fresh read. A CLI child
+   *  of this process is waited for (bounded), so that nothing writes the
+   *  transcript any more when the caller goes on; one still alive after the
+   *  wait is returned. `ignoreOthers` waits for the children only. */
   async holder(
     sessionId: string,
     options: { ignoreOthers?: boolean } = {},
@@ -238,7 +240,8 @@ export class LiveSessionRegistry {
         const other = records.find((record) => !children.includes(record));
         if (other) return other;
       }
-      if (children.length === 0 || Date.now() >= deadline) return undefined;
+      if (children.length === 0) return undefined;
+      if (Date.now() >= deadline) return children[0];
       await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
     }
   }

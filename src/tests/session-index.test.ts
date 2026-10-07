@@ -24,6 +24,7 @@ import {
   writeCustomTitleSidecar,
 } from "../session-index/service.js";
 import { scanTranscriptFile } from "../session-index/transcript-scan.js";
+import { LiveSessionRegistry } from "../session-index/live-registry.js";
 import { repositoryWorktrees } from "../session-index/worktrees.js";
 import { ListChangedWatcher } from "../session-index/list-changed.js";
 import { SessionTitles } from "../session-titles.js";
@@ -1035,20 +1036,30 @@ describe("empty transcripts on delete", () => {
 });
 
 describe("a failing SDK delete", () => {
-  it("fails the request when the session directory could not be removed", async () => {
+  it("fails the request when the session directory could not be removed, and a retry finishes", async () => {
     const session = await writeTranscript({});
+    const sessionDir = path.join(path.dirname(session.file), session.id);
+    await fs.mkdir(path.join(sessionDir, "subagents"), { recursive: true });
+    await fs.writeFile(path.join(sessionDir, "subagents", "agent-1.jsonl"), "{}\n");
     const { agent } = await indexAgent();
     await agent.archiveSession({ sessionId: session.id });
+    const marker = path.join(configDir, "acp", "archived", session.id);
     // The SDK removed the transcript, then failed to remove `<id>/`.
     vi.mocked(deleteSession).mockImplementationOnce(async () => {
       await fs.rm(session.file);
       throw Object.assign(new Error("EACCES: permission denied, rmdir"), { code: "EACCES" });
     });
     await expect(agent.deleteSession({ sessionId: session.id })).rejects.toThrow("EACCES");
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+    expect(fsSync.existsSync(marker)).toBe(true);
+    expect(fsSync.existsSync(sessionDir)).toBe(true);
+
+    // The retry finds the session directory without a transcript.
+    await agent.deleteSession({ sessionId: session.id });
+    expect(fsSync.existsSync(sessionDir)).toBe(false);
+    expect(fsSync.existsSync(marker)).toBe(false);
   });
 
-  it("fails the request when a session directory is left behind", async () => {
+  it("removes a session directory that the SDK left behind", async () => {
     const session = await writeTranscript({});
     const sessionDir = path.join(path.dirname(session.file), session.id);
     await fs.mkdir(sessionDir);
@@ -1056,8 +1067,32 @@ describe("a failing SDK delete", () => {
     vi.mocked(deleteSession).mockImplementationOnce(async () => {
       await fs.rm(session.file);
     });
-    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toThrow(sessionDir);
+    await agent.deleteSession({ sessionId: session.id });
+    expect(fsSync.existsSync(sessionDir)).toBe(false);
   });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "fails the request when a session directory cannot be removed",
+    async () => {
+      const session = await writeTranscript({});
+      const projectDir = path.dirname(session.file);
+      const sessionDir = path.join(projectDir, session.id);
+      await fs.mkdir(sessionDir);
+      const { agent } = await indexAgent();
+      await agent.archiveSession({ sessionId: session.id });
+      vi.mocked(deleteSession).mockImplementationOnce(async () => {
+        await fs.rm(session.file);
+        await fs.chmod(projectDir, 0o500);
+      });
+      try {
+        await expect(agent.deleteSession({ sessionId: session.id })).rejects.toThrow();
+      } finally {
+        await fs.chmod(projectDir, 0o700);
+      }
+      expect(fsSync.existsSync(sessionDir)).toBe(true);
+      expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+    },
+  );
 });
 
 describe("a long project directory whose transcript gets its cwd later", () => {
@@ -1236,5 +1271,144 @@ describe("tail growth", () => {
     await fs.writeFile(file, `${message}\n${moved}\n${message}\n${pad}\n`);
     expect((await fs.stat(file)).size).toBe(size);
     expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBeUndefined();
+  });
+});
+
+describe("a CLI child of this process that does not exit", () => {
+  let child: ChildProcess | undefined;
+  afterEach(() => {
+    child?.kill("SIGKILL");
+    child = undefined;
+  });
+
+  it.skipIf(process.platform === "win32")("is a holder once the wait is over", async () => {
+    const session = await writeTranscript({});
+    child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    await registerHolder(child.pid!, session.id, { entrypoint: "sdk-ts" });
+    const service = new SessionIndexService({
+      registry: new LiveSessionRegistry({ ownChildExitTimeoutMs: 200 }),
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    await expect(service.assertNotHeldElsewhere(session.id)).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    await expect(service.awaitOwnCliExit(session.id)).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(fsSync.existsSync(session.file)).toBe(true);
+  });
+});
+
+describe("other copies on a running session's rename", () => {
+  async function runningWithCopy(otherTrailer = "") {
+    const own = await writeTranscript({ cwd: workspace });
+    const other = await writeTranscript({ sessionId: own.id, cwd: path.join(workspace, "moved") });
+    if (otherTrailer) await fs.appendFile(other.file, otherTrailer);
+    const { agent, updates } = await indexAgent();
+    agent.sessions[own.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: async () => {} } },
+      agent,
+      own.id,
+    ) as any;
+    return { agent, updates, own, other };
+  }
+
+  it("leaves a copy alone whose last line another process may be writing", async () => {
+    const { agent, other, own } = await runningWithCopy('{"type":"assistant","mess');
+    const before = await fs.readFile(other.file, "utf8");
+    await agent.renameSessionTitle({ sessionId: own.id, title: "Live" });
+    expect(await fs.readFile(other.file, "utf8")).toBe(before);
+    expect(fsSync.existsSync(path.join(path.dirname(other.file), own.id))).toBe(false);
+  });
+
+  it("succeeds once the CLI has the title, even when another copy fails", async () => {
+    const { agent, updates, other, own } = await runningWithCopy();
+    // A file where the sidecar directory would go.
+    await fs.writeFile(path.join(path.dirname(other.file), own.id), "");
+    await agent.renameSessionTitle({ sessionId: own.id, title: "Live" });
+    expect(updates).toContainEqual({
+      sessionId: own.id,
+      update: { sessionUpdate: "session_info_update", title: "Live" },
+    });
+  });
+});
+
+describe("list metadata of the listed copy", () => {
+  it("takes title and branch from the listed transcript, not another copy", async () => {
+    const id = randomUUID();
+    // Sorted first, so the SDK finds this copy first without a dir.
+    await writeTranscript({
+      sessionId: id,
+      cwd: path.join(workspace, "a"),
+      gitBranch: "old",
+      trailer: [{ type: "custom-title", customTitle: "Old copy", sessionId: id }],
+    });
+    await writeTranscript({
+      sessionId: id,
+      cwd: path.join(workspace, "b"),
+      gitBranch: "new",
+      trailer: [
+        { type: "custom-title", customTitle: "Listed copy", sessionId: id },
+        { type: "last-prompt", lastPrompt: "x".repeat(300), sessionId: id },
+      ],
+    });
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({});
+    expect(page.sessions.map((s) => [s.title, (s._meta as any).jetbrains.air.gitBranch])).toEqual([
+      ["Listed copy", "new"],
+    ]);
+  });
+
+  it("keeps a row whose copy the SDK does not find", async () => {
+    const session = await writeTranscript({});
+    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => [s.sessionId, s.title])).toEqual([[session.id, "Fix it"]]);
+  });
+});
+
+describe("a continued session", () => {
+  it("is hidden once its successor has history, as in the SDK list", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      lastMessageAt: Date.parse("2026-08-01T00:00:00Z"),
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({
+      sessionId: successorId,
+      lastMessageAt: Date.parse("2026-08-01T01:00:00Z"),
+    });
+    const { agent } = await indexAgent();
+    const ids = async () =>
+      (await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId);
+    const sdkIds = async () => (await listSessions({ dir: workspace })).map((s) => s.sessionId);
+
+    // The successor has no history yet: both are listed.
+    expect((await ids()).sort()).toEqual([predecessor.id, stub.id].sort());
+    expect((await sdkIds()).sort()).toEqual([predecessor.id, stub.id].sort());
+
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(await ids()).toEqual([successorId]);
+    expect(await sdkIds()).toEqual([successorId]);
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")("a project directory renamed in case", () => {
+  it("is the project directory of the cwd on a case-insensitive volume", async () => {
+    const lower = path.join(workspace, "repo");
+    const upper = path.join(workspace, "Repo");
+    const session = await writeTranscript({ cwd: lower });
+    if (!fsSync.existsSync(path.join(configDir, "projects", encodeProjectPath(upper)))) return;
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: upper });
+    expect(page.sessions.map((s) => s.sessionId)).toEqual([session.id]);
+    // The SDK finds it too.
+    expect((await listSessions({ dir: upper })).map((s) => s.sessionId)).toEqual([session.id]);
   });
 });

@@ -23,6 +23,7 @@ import { sanitizeTitle } from "../session-titles.js";
 import {
   canonicalPath,
   encodeProjectPath,
+  isExactProjectDir,
   isSessionId,
   pathAndAncestors,
   projectDirMatches,
@@ -31,9 +32,16 @@ import {
   sameProjectPath,
 } from "./project-dirs.js";
 import {
+  continuedInSessionId,
+  hasHistory,
+  hasTailCustomTitle,
+  isSidechainTranscript,
   readHeadTail,
   scanTranscriptFile,
+  titleFields,
   transcriptProjectCwd,
+  type HeadTail,
+  type TitleFields,
   type TranscriptFacts,
 } from "./transcript-scan.js";
 import { repositoryWorktrees } from "./worktrees.js";
@@ -66,6 +74,8 @@ type TranscriptMetadata = {
   gitBranch?: string;
   /** The cwd read from the transcript, when it encodes to the directory name. */
   fileCwd?: string;
+  /** The session this transcript was continued in, from its tail. */
+  continuedIn?: string;
   updatedAtMs: number;
   facts: TranscriptFacts;
 };
@@ -144,6 +154,44 @@ function isAfter(row: { updatedAtMs: number; sessionId: string }, cursor: ListCu
   return compareRows(row, cursor) > 0;
 }
 
+/** The title of the CLI's `custom-title.json` sidecar of a transcript. */
+async function readSidecarTitle(filePath: string, sessionId: string): Promise<string | undefined> {
+  try {
+    const text = await fs.readFile(
+      path.join(path.dirname(filePath), sessionId, "custom-title.json"),
+      "utf8",
+    );
+    const title = (JSON.parse(text) as { customTitle?: unknown }).customTitle;
+    return typeof title === "string" && title.trim() ? title : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * On macOS the SDK opens `<projects>/<encoded cwd>` through the file system,
+ * which ignores case on the usual volumes: a directory whose name differs in
+ * case only (a repository renamed in case) is the project directory then.
+ * Returns that entry of `rootEntries` when the file system resolves the
+ * exact name to it.
+ */
+async function caseInsensitiveProjectDir(
+  projectPath: string,
+  rootEntries: readonly string[],
+): Promise<string | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  const exact = encodeProjectPath(projectPath);
+  if (rootEntries.includes(exact)) return undefined;
+  const lower = exact.toLowerCase();
+  const variant = rootEntries.find((name) => name.toLowerCase() === lower);
+  if (!variant) return undefined;
+  try {
+    return (await fs.stat(path.join(projectsRoot(), exact))).isDirectory() ? variant : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function readDirNames(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
@@ -184,9 +232,13 @@ export class SessionIndex {
     const seen = new Set<string>();
     const result: { dirName: string; projectPath: string }[] = [];
     for (const projectPath of paths) {
-      for (const dirName of projectDirsOf(projectPath, rootEntries)) {
+      const names = projectDirsOf(projectPath, rootEntries);
+      const caseVariant = await caseInsensitiveProjectDir(projectPath, rootEntries);
+      if (caseVariant && !names.includes(caseVariant)) names.unshift(caseVariant);
+      for (const dirName of names) {
         if (seen.has(dirName)) continue;
         if (
+          dirName !== caseVariant &&
           dirName !== encodeProjectPath(projectPath) &&
           !(await this.longDirBelongsTo(dirName, projectPath))
         ) {
@@ -293,6 +345,24 @@ export class SessionIndex {
     return found.filter((value): value is string => value !== undefined);
   }
 
+  /** Every `<sessionId>/` directory (sidecar, subagent transcripts) of the
+   *  session, in any project directory, with or without a transcript. */
+  async findSessionDirs(sessionId: string): Promise<string[]> {
+    if (!isSessionId(sessionId)) return [];
+    const root = projectsRoot();
+    const found = await Promise.all(
+      (await readDirNames(root)).map(async (dirName) => {
+        const dir = path.join(root, dirName, sessionId);
+        try {
+          return (await fs.lstat(dir)).isDirectory() ? dir : undefined;
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    return found.filter((value): value is string => value !== undefined);
+  }
+
   /** Drops the cached metadata of `filePaths`. */
   invalidate(filePaths: readonly string[]): void {
     for (const filePath of filePaths) this.metadata.delete(filePath);
@@ -345,7 +415,8 @@ export class SessionIndex {
         batch.map(async (candidate) => {
           read.add(candidate);
           const metadata = await this.metadataOf(candidate);
-          return metadata ? { candidate, metadata } : undefined;
+          if (!metadata || (await this.continuedElsewhere(candidate, metadata))) return undefined;
+          return { candidate, metadata };
         }),
       );
       for (const item of resolved) {
@@ -439,18 +510,8 @@ export class SessionIndex {
   }
 
   private async readMetadata(candidate: TranscriptCandidate): Promise<TranscriptMetadata | null> {
-    // With the exact project path the SDK looks in this directory only;
-    // without it, it searches every project directory.
-    const dir =
-      candidate.projectPath && encodeProjectPath(candidate.projectPath) === candidate.dirName
-        ? candidate.projectPath
-        : undefined;
-    const [info, headTail] = await Promise.all([
-      this.getSessionInfo(candidate.sessionId, dir ? { dir } : {}),
-      readHeadTail(candidate.filePath, candidate.size),
-    ]);
-    // No info: a sidechain, or no title at all.
-    if (!info) return null;
+    const headTail = await readHeadTail(candidate.filePath, candidate.size);
+    if (isSidechainTranscript(headTail.head)) return null;
     const facts = await scanTranscriptFile(
       candidate.filePath,
       candidate.size,
@@ -461,17 +522,61 @@ export class SessionIndex {
     const fileCwd = this.recoverCwd(candidate.dirName, [
       facts.headCwd,
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
-      info.cwd,
     ]);
     if (fileCwd) this.dirCwds.set(candidate.dirName, fileCwd);
+    const { summary, gitBranch } = await this.titleOf(candidate, headTail, fileCwd);
+    // No title at all: the SDK does not list it either.
+    if (!summary) return null;
     const lastMessageAt = facts.lastMessageAt ?? candidate.mtimeMs;
+    const continuedIn = continuedInSessionId(headTail.tail);
     return {
-      title: sanitizeTitle(info.summary),
-      ...(info.gitBranch && { gitBranch: info.gitBranch }),
+      title: sanitizeTitle(summary),
+      ...(gitBranch && { gitBranch }),
       ...(fileCwd && { fileCwd }),
+      ...(continuedIn && { continuedIn }),
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
       facts,
     };
+  }
+
+  /**
+   * The title and branch of the listed transcript. The SDK `getSessionInfo`
+   * reads the first copy of the session that its search finds; its answer is
+   * used only when that copy is the listed file (same size and mtime), else
+   * the fields come from the listed file itself.
+   */
+  private async titleOf(
+    candidate: TranscriptCandidate,
+    headTail: HeadTail,
+    fileCwd: string | undefined,
+  ): Promise<TitleFields> {
+    const dir = [fileCwd, candidate.projectPath].find(
+      (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
+    );
+    const info = await this.getSessionInfo(candidate.sessionId, dir ? { dir } : {}).catch(
+      () => undefined,
+    );
+    if (
+      info &&
+      info.fileSize === candidate.size &&
+      info.lastModified === Math.trunc(candidate.mtimeMs)
+    ) {
+      return {
+        summary: info.summary,
+        ...(info.gitBranch && { gitBranch: info.gitBranch }),
+      };
+    }
+    const sidecar = hasTailCustomTitle(headTail.tail)
+      ? undefined
+      : await readSidecarTitle(candidate.filePath, candidate.sessionId);
+    return titleFields(headTail, sidecar);
+  }
+
+  /** Whether a successor of a continued transcript holds history: the SDK
+   *  list then hides the predecessor. */
+  private async continuedElsewhere(candidate: TranscriptCandidate, metadata: TranscriptMetadata) {
+    if (!metadata.continuedIn) return false;
+    return hasHistory(path.join(path.dirname(candidate.filePath), `${metadata.continuedIn}.jsonl`));
   }
 
   /** The first candidate that encodes to `dirName`. A directory name is

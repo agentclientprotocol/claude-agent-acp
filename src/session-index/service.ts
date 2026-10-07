@@ -344,16 +344,19 @@ export class SessionIndexService {
   }
 
   /** Throws `thread_active_writer` when another live process holds the
-   *  session. A CLI that this process started (one being closed) is no other
-   *  process: the check waits for it to exit instead, a few seconds at most. */
+   *  session. A CLI that this process started (one being closed) is waited
+   *  for instead, and refused only when it outlives the wait. */
   async assertNotHeldElsewhere(sessionId: string): Promise<void> {
     if (await this.registry.holder(sessionId)) throw activeWriterError(sessionId);
   }
 
   /** Waits (bounded) until no CLI child of this process holds the session:
-   *  one just closed may still write its transcript while it exits. */
+   *  one just closed may still write its transcript while it exits. One that
+   *  does not exit is `thread_active_writer`. */
   async awaitOwnCliExit(sessionId: string): Promise<void> {
-    await this.registry.holder(sessionId, { ignoreOthers: true });
+    if (await this.registry.holder(sessionId, { ignoreOthers: true })) {
+      throw activeWriterError(sessionId);
+    }
   }
 
   /** Runs `mutation` after the previous mutation of the session ended. */
@@ -393,8 +396,10 @@ export class SessionIndexService {
   }
 
   /** Renames a session whose CLI runs here: `rename` asks the CLI, which
-   *  titles its own transcript and sidecar; the other copies of the session
-   *  get the record and the sidecar here. */
+   *  titles its own transcript and sidecar. The other copies of the session
+   *  get the record and the sidecar here, as a best effort once the CLI has
+   *  the title: a copy that another process may be writing (its last line
+   *  incomplete) is left alone, and a failure is logged, not returned. */
   async renameLive(
     sessionId: string,
     title: string,
@@ -404,14 +409,17 @@ export class SessionIndexService {
     await this.exclusive(sessionId, async () => {
       await rename();
       if (!isSessionId(sessionId)) return;
-      const transcripts = await this.index.findTranscripts(sessionId);
+      let transcripts: string[] = [];
       try {
+        transcripts = await this.index.findTranscripts(sessionId);
         const canonical = await canonicalPath(cwd);
         const others = transcripts.filter((transcript) => {
           const dirName = path.basename(path.dirname(transcript));
           return !projectDirMatches(dirName, cwd) && !projectDirMatches(dirName, canonical);
         });
-        await this.titleCopies(others, sessionId, title, false);
+        await this.titleCopies(others, sessionId, title, true);
+      } catch (error) {
+        this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
       } finally {
         this.index.invalidate(transcripts);
       }
@@ -467,7 +475,10 @@ export class SessionIndexService {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
       const all = await this.index.findTranscripts(sessionId, { includeEmpty: true });
-      if (all.length === 0) {
+      // A session directory can outlive its transcript: a delete that removed
+      // the transcript and then failed on the directory.
+      const sessionDirs = await this.index.findSessionDirs(sessionId);
+      if (all.length === 0 && sessionDirs.length === 0) {
         if (await removeArchiveMarker(sessionId)) return;
         if (known) return;
         throw sessionNotFound(sessionId);
@@ -488,28 +499,23 @@ export class SessionIndexService {
             throw error;
           }
         }
+        // Empty transcripts, which the SDK skips, and session directories
+        // without a transcript.
         for (const transcript of await this.index.findTranscripts(sessionId, {
           includeEmpty: true,
         })) {
           const stats = await fs.stat(transcript).catch(() => undefined);
           if (stats && stats.size > 0) continue;
           await fs.rm(transcript, { force: true });
-          await fs.rm(path.join(path.dirname(transcript), sessionId), {
-            recursive: true,
-            force: true,
-          });
         }
-        const left: string[] = [];
-        for (const transcript of all) {
-          const sessionDir = path.join(path.dirname(transcript), sessionId);
-          if (await exists(transcript)) left.push(transcript);
-          if (await exists(sessionDir)) left.push(sessionDir);
+        for (const sessionDir of await this.index.findSessionDirs(sessionId)) {
+          if (await exists(`${sessionDir}.jsonl`)) continue;
+          await fs.rm(sessionDir, { recursive: true, force: true });
         }
-        left.push(
-          ...(await this.index.findTranscripts(sessionId, { includeEmpty: true })).filter(
-            (transcript) => !left.includes(transcript),
-          ),
-        );
+        const left = [
+          ...(await this.index.findTranscripts(sessionId, { includeEmpty: true })),
+          ...(await this.index.findSessionDirs(sessionId)),
+        ];
         if (left.length > 0) {
           throw new Error(`Session ${sessionId} was not deleted: ${left.join(", ")} remain`);
         }
