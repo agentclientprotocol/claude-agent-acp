@@ -84,6 +84,55 @@ export function unreachable(value: never, logger: Logger = console) {
   logger.error(`Unexpected case: ${valueAsString}`);
 }
 
+/**
+ * Yields to the event loop when the current macrotask has run for too long.
+ *
+ * An await of an already-resolved promise continues in a microtask, so a loop
+ * that drains a backlog of buffered messages never lets timers or I/O run:
+ * incoming requests, `session/cancel` among them, wait until the backlog is
+ * gone. A loop calls {@link maybeYield} once per item. Within the budget it
+ * returns undefined and the loop goes on at once. Past the budget it returns a
+ * promise that resolves in the check phase of the event loop, after pending
+ * I/O has run.
+ *
+ * The budget is measured from the first call since the event loop last
+ * reached its check phase, so a loop that already waits on real I/O never
+ * yields, and all loops that share one instance share the budget of the
+ * macrotask that runs them.
+ */
+export class EventLoopYielder {
+  /** Whether a check-phase marker is pending. While it is, the event loop has
+   *  not reached its check phase since {@link sliceStart}. */
+  private markerPending = false;
+  private sliceStart = 0;
+
+  constructor(
+    private readonly budgetMs: number,
+    private readonly now: () => number = () => performance.now(),
+  ) {}
+
+  maybeYield(): Promise<void> | undefined {
+    const time = this.now();
+    if (!this.markerPending) {
+      this.markerPending = true;
+      this.sliceStart = time;
+      setImmediate(() => {
+        this.markerPending = false;
+      });
+      return undefined;
+    }
+    if (time - this.sliceStart < this.budgetMs) return undefined;
+    return new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+/** The longest stretch, in milliseconds, that a message loop keeps the event
+ *  loop before it yields. */
+const MESSAGE_LOOP_BUDGET_MS = 8;
+
+/** The yielder shared by the loops that forward messages to the client. */
+export const messageLoopYielder = new EventLoopYielder(MESSAGE_LOOP_BUDGET_MS);
+
 export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
 }
