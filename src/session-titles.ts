@@ -43,7 +43,22 @@ type TitleCapableQuery = Query & {
  *  unavailable or yields nothing. */
 type TitleFallback = { title: string; lastModified: number };
 
+/** How much of a long text {@link sanitizeTitle} reads first. Collapsed, it
+ *  is longer than a title unless it is mostly whitespace. */
+const TITLE_SCAN_LENGTH = 4096;
+
 export function sanitizeTitle(text: string): string {
+  if (text.length > TITLE_SCAN_LENGTH) {
+    // A stored summary can be a whole first prompt of megabytes. The title
+    // depends only on the start of the text: collapsing the whitespace of a
+    // prefix gives a prefix of the collapsed text. Two more characters than a
+    // title hold at least one that is not a space (spaces are collapsed), so
+    // the full text is longer than a title and gets the same cut.
+    const head = text.slice(0, TITLE_SCAN_LENGTH).replace(/\s+/g, " ").trimStart();
+    if (head.length >= MAX_TITLE_LENGTH + 2) {
+      return head.slice(0, MAX_TITLE_LENGTH - 1) + "…";
+    }
+  }
   // Replace newlines and collapse whitespace
   const sanitized = text
     .replace(/[\r\n]+/g, " ")
