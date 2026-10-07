@@ -350,15 +350,6 @@ export class SessionIndexService {
     if (await this.registry.holder(sessionId)) throw activeWriterError(sessionId);
   }
 
-  /** Waits (bounded) until no CLI child of this process holds the session:
-   *  one just closed may still write its transcript while it exits. One that
-   *  does not exit is `thread_active_writer`. */
-  async awaitOwnCliExit(sessionId: string): Promise<void> {
-    if (await this.registry.holder(sessionId, { ignoreOthers: true })) {
-      throw activeWriterError(sessionId);
-    }
-  }
-
   /** Runs `mutation` after the previous mutation of the session ended. */
   private exclusive<T>(sessionId: string, mutation: () => Promise<T>): Promise<T> {
     const key = sessionId.toLowerCase();

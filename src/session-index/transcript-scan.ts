@@ -11,6 +11,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import { firstPrompt, mediaPrompt, promptOf } from "./first-prompt.js";
 
 const CHUNK_SIZE = 64 * 1024;
 /** The largest tail window read to find the last message. */
@@ -306,20 +307,6 @@ export function isSidechainTranscript(head: string): boolean {
   return first.includes('"isSidechain":true') || first.includes('"isSidechain": true');
 }
 
-/** The text of the first user prompt of the head: not a tool result, not a
- *  meta or compact summary record. */
-function firstPrompt(head: string): string | undefined {
-  for (const line of head.split("\n")) {
-    if (!line.includes('"type":"user"') && !line.includes('"type": "user"')) continue;
-    if (line.includes('"tool_result"') || line.includes('"isMeta":true')) continue;
-    if (line.includes('"isCompactSummary":true')) continue;
-    const entry = parseLine(line);
-    const text = entry && firstText(entry)?.trim();
-    if (text) return text.replace(/\s+/g, " ");
-  }
-  return undefined;
-}
-
 export type TitleFields = { summary?: string; gitBranch?: string };
 
 /**
@@ -337,7 +324,7 @@ export function titleFields({ head, tail }: HeadTail, sidecarTitle?: string): Ti
     lastField(head, "aiTitle") ??
     lastField(tail, "lastPrompt") ??
     lastField(tail, "summary") ??
-    firstPrompt(head);
+    (firstPrompt(head) || mediaPrompt(head) || undefined);
   const gitBranch = lastField(tail, "gitBranch") ?? firstField(head, "gitBranch");
   return {
     ...(summary !== undefined && { summary }),
@@ -374,7 +361,7 @@ export function continuedInSessionId(tail: string): string | undefined {
     if (entry.type === "assistant") {
       const stopReason = (entry.message as { stop_reason?: unknown } | undefined)?.stop_reason;
       if (entry.isApiErrorMessage !== true && typeof stopReason === "string") return undefined;
-    } else if (entry.type === "user" && firstText(entry) !== undefined) {
+    } else if (promptOf(entry, { commandFallback: "" }) !== undefined) {
       return undefined;
     }
   }

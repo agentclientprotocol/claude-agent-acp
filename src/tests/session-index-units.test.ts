@@ -16,7 +16,13 @@ import {
   parseListOptions,
   parseRenameSessionRequest,
 } from "../session-index/service.js";
-import { scanTranscript, type TranscriptFacts } from "../session-index/transcript-scan.js";
+import {
+  continuedInSessionId,
+  scanTranscript,
+  titleFields,
+  type TranscriptFacts,
+} from "../session-index/transcript-scan.js";
+import { firstPrompt } from "../session-index/first-prompt.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
@@ -322,6 +328,7 @@ describe("live registry", () => {
           [14, "Tue Jan 2 00:00:00 2024"],
         ]),
       pidDomain: async () => "darwin",
+      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1])),
     });
     const snapshot = await registry.snapshot();
     expect([...snapshot.keys()].sort()).toEqual(["live", "old-but-proven"]);
@@ -370,12 +377,105 @@ describe("live registry", () => {
     const started = Date.now();
     expect((await registry.holder("stuck"))?.pid).toBe(31);
     expect(Date.now() - started).toBeGreaterThanOrEqual(240);
-    expect((await registry.holder("stuck", { ignoreOthers: true }))?.pid).toBe(31);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("waits for a holder whose parent is unknown, and reports it if it stays", async () => {
+    const dir = await registryWith({
+      "40.json": { pid: 40, sessionId: "unknown-parent", updatedAt: now },
+    });
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      pidDomain: async () => "win32:host",
+      parentPids: async () => new Map(),
+      ownChildExitTimeoutMs: 150,
+    });
+    const started = Date.now();
+    expect((await registry.holder("unknown-parent"))?.pid).toBe(40);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(140);
     await fs.rm(dir, { recursive: true, force: true });
   });
 
   it("is empty when the registry does not exist", async () => {
     const registry = new LiveSessionRegistry({ dir: () => "/nonexistent/registry" });
     expect((await registry.snapshot()).size).toBe(0);
+  });
+});
+
+describe("first prompt, as the SDK extracts it", () => {
+  const userLine = (content: unknown, extra: object = {}) =>
+    JSON.stringify({
+      type: "user",
+      sessionId: SESSION,
+      message: { role: "user", content },
+      ...extra,
+    });
+
+  it("keeps a slash command only as a fallback for a real prompt", () => {
+    const init = userLine(
+      "<command-message>init</command-message>\n<command-name>/init</command-name>",
+    );
+    expect(firstPrompt([init, userLine("Explain the parser")].join("\n"))).toBe(
+      "Explain the parser",
+    );
+    expect(firstPrompt(init)).toBe("/init");
+    expect(titleFields({ head: init, tail: init }).summary).toBe("/init");
+  });
+
+  it("skips tags, interrupts, meta, compact summaries and tool results", () => {
+    const head = [
+      userLine("<local-command-stdout>ok</local-command-stdout>"),
+      userLine("[Request interrupted by user]"),
+      userLine("Hidden", { isMeta: true }),
+      userLine("Summary", { isCompactSummary: true }),
+      userLine([{ type: "tool_result", tool_use_id: "t", content: "x" }]),
+      userLine([
+        { type: "text", text: "<system-reminder>r</system-reminder>" },
+        { type: "text", text: "Second  block\nprompt" },
+      ]),
+    ].join("\n");
+    expect(firstPrompt(head)).toBe("Second  block prompt");
+  });
+
+  it("renders bash input, expands pasted content, and cuts at 200 characters", () => {
+    expect(firstPrompt(userLine("<bash-input> ls -la </bash-input>"))).toBe("! ls -la");
+    const pasted =
+      'Fix this\n<pasted_content id="0a1f">\nstack trace\n</pasted_content id="0a1f">\n';
+    expect(firstPrompt(userLine(pasted))).toBe("Fix thisstack trace");
+    expect(firstPrompt(userLine("y".repeat(300)))).toBe(`${"y".repeat(200)}…`);
+  });
+
+  it("titles an image-only first prompt", () => {
+    const head = userLine([{ type: "image", source: { type: "base64", data: "x" } }]);
+    expect(titleFields({ head, tail: head }).summary).toBe("Image");
+  });
+});
+
+describe("continued-in", () => {
+  const successor = "22222222-2222-4222-8222-222222222222";
+  const continued = { type: "continued-in", continuedInSessionId: successor };
+
+  it("counts only a real prompt or a finished answer after it as a resume", () => {
+    expect(continuedInSessionId(lines(user("x", "2026-01-01T00:00:00Z"), continued))).toBe(
+      successor,
+    );
+    // A meta record or a slash command after it is no resume.
+    expect(
+      continuedInSessionId(
+        lines(
+          continued,
+          user("<command-name>/status</command-name>", "2026-01-01T00:00:01Z"),
+          user("note", "2026-01-01T00:00:02Z", { isMeta: true }),
+        ),
+      ),
+    ).toBe(successor);
+    expect(
+      continuedInSessionId(lines(continued, user("Go on", "2026-01-01T00:00:03Z"))),
+    ).toBeUndefined();
+    expect(
+      continuedInSessionId(lines(continued, assistant("end_turn", "2026-01-01T00:00:04Z"))),
+    ).toBeUndefined();
   });
 });

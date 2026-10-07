@@ -192,6 +192,20 @@ async function caseInsensitiveProjectDir(
   }
 }
 
+/** Whether the encoding of `cwd` names the directory `dirName` on disk. */
+async function sameDirOnDisk(dirName: string, cwd: string): Promise<boolean> {
+  const root = projectsRoot();
+  try {
+    const [listed, resolved] = await Promise.all([
+      fs.stat(path.join(root, dirName)),
+      fs.stat(path.join(root, encodeProjectPath(cwd))),
+    ]);
+    return listed.isDirectory() && listed.ino === resolved.ino && listed.dev === resolved.dev;
+  } catch {
+    return false;
+  }
+}
+
 async function readDirNames(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
@@ -482,7 +496,13 @@ export class SessionIndex {
 
   /** The requested path of the directory, else a sibling's cwd. */
   private fallbackCwd(candidate: TranscriptCandidate): string | undefined {
-    if (candidate.projectPath && projectDirMatches(candidate.dirName, candidate.projectPath)) {
+    // A directory found for the requested path belongs to it, also one that
+    // differs in case only (see caseInsensitiveProjectDir).
+    if (
+      candidate.projectPath &&
+      (projectDirMatches(candidate.dirName, candidate.projectPath) ||
+        isExactProjectDir(candidate.dirName, candidate.projectPath))
+    ) {
       return candidate.projectPath;
     }
     return this.dirCwds.get(candidate.dirName);
@@ -519,7 +539,7 @@ export class SessionIndex {
       headTail,
     );
     if (!facts.hasMessages) return null;
-    const fileCwd = this.recoverCwd(candidate.dirName, [
+    const fileCwd = await this.recoverCwd(candidate.dirName, [
       facts.headCwd,
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);
@@ -579,11 +599,17 @@ export class SessionIndex {
     return hasHistory(path.join(path.dirname(candidate.filePath), `${metadata.continuedIn}.jsonl`));
   }
 
-  /** The first candidate that encodes to `dirName`. A directory name is
-   *  never decoded. */
-  private recoverCwd(dirName: string, candidates: (string | undefined)[]): string | undefined {
+  /** The first candidate that encodes to `dirName`, or, on macOS, that
+   *  encodes to a name the file system resolves to `dirName` (it differs in
+   *  case only). A directory name is never decoded. */
+  private async recoverCwd(
+    dirName: string,
+    candidates: (string | undefined)[],
+  ): Promise<string | undefined> {
     for (const candidate of candidates) {
-      if (candidate && path.isAbsolute(candidate) && projectDirMatches(dirName, candidate)) {
+      if (!candidate || !path.isAbsolute(candidate)) continue;
+      if (projectDirMatches(dirName, candidate)) return candidate;
+      if (isExactProjectDir(dirName, candidate) && (await sameDirOnDisk(dirName, candidate))) {
         return candidate;
       }
     }

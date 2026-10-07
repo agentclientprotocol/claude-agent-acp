@@ -1259,7 +1259,7 @@ Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
   Copies of the session in other project directories get the title record and sidecar from the adapter.
 - Any other session gets the SDK `renameSession` title record in every transcript of the session and the CLI's `custom-title.json` sidecar next to each (mode 0600, written atomically).
 - A session that another live process holds is refused with `data.reason: "thread_active_writer"`.
-  A session whose query closed here counts as any other session. A CLI that this adapter started and is still exiting is no other process: the adapter waits for it to exit, at most 8 seconds, and refuses with `thread_active_writer` if it is still running then.
+  A session whose query closed here counts as any other session. A CLI that this adapter started and is still exiting is no other process: the adapter waits for it to exit, at most 8 seconds, and refuses with `thread_active_writer` if it is still running then. Where the parent of a process cannot be told (Windows), every holder is waited for that way.
   A transcript whose last line is incomplete gets no record while a process may still be writing it.
 
 ### Archive
@@ -1286,7 +1286,7 @@ It tells the client to read the first page of that `cwd` again.
 
 `session/delete`:
 
-- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename. An unknown session is `-32002`.
+- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename; a session that runs here is checked after its CLI is closed. An unknown session is `-32002`.
 - an AIR client without `sessionIndex`: writes the archive marker instead of deleting, because AIR uses delete for "Done" and can reopen the session. The list hides archived sessions from such a client too. A session without a transcript fails with the error of the SDK delete, as before.
 - any other client: the SDK delete, as before.
 

@@ -218,11 +218,9 @@ export class LiveSessionRegistry {
   /** A live process that holds `sessionId`, from a fresh read. A CLI child
    *  of this process is waited for (bounded), so that nothing writes the
    *  transcript any more when the caller goes on; one still alive after the
-   *  wait is returned. `ignoreOthers` waits for the children only. */
-  async holder(
-    sessionId: string,
-    options: { ignoreOthers?: boolean } = {},
-  ): Promise<LiveRecord | undefined> {
+   *  wait is returned. A process whose parent is unknown (no `ps`, as on
+   *  Windows) may be such a child: it is waited for too. */
+  async holder(sessionId: string): Promise<LiveRecord | undefined> {
     const deadline = Date.now() + this.ownChildExitTimeoutMs;
     for (;;) {
       let records: LiveRecord[];
@@ -235,13 +233,12 @@ export class LiveSessionRegistry {
       const parents = await this.parentPids(records.map(({ pid }) => pid)).catch(
         () => new Map<number, number>(),
       );
-      const children = records.filter(({ pid }) => parents.get(pid) === this.ownPid);
-      if (!options.ignoreOthers) {
-        const other = records.find((record) => !children.includes(record));
-        if (other) return other;
-      }
-      if (children.length === 0) return undefined;
-      if (Date.now() >= deadline) return children[0];
+      const other = records.find(({ pid }) => {
+        const parent = parents.get(pid);
+        return parent !== undefined && parent !== this.ownPid;
+      });
+      if (other) return other;
+      if (Date.now() >= deadline) return records[0];
       await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
     }
   }

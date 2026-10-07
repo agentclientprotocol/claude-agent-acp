@@ -1293,9 +1293,6 @@ describe("a CLI child of this process that does not exit", () => {
     await expect(service.assertNotHeldElsewhere(session.id)).rejects.toMatchObject({
       data: { reason: "thread_active_writer" },
     });
-    await expect(service.awaitOwnCliExit(session.id)).rejects.toMatchObject({
-      data: { reason: "thread_active_writer" },
-    });
     expect(fsSync.existsSync(session.file)).toBe(true);
   });
 });
@@ -1410,5 +1407,81 @@ describe.skipIf(process.platform !== "darwin")("a project directory renamed in c
     expect(page.sessions.map((s) => s.sessionId)).toEqual([session.id]);
     // The SDK finds it too.
     expect((await listSessions({ dir: upper })).map((s) => s.sessionId)).toEqual([session.id]);
+  });
+});
+
+describe("delete of a session that runs here", () => {
+  it("is refused after the teardown when another process holds it", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    agent.sessions[session.id] = mockSessionState(
+      { input: { end: () => {} }, query: { close: () => {}, interrupt: async () => {} } },
+      agent,
+      session.id,
+    ) as any;
+    // Another CLI resumed the session meanwhile.
+    await registerHolder(process.pid, session.id);
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(agent.sessions[session.id]).toBeUndefined();
+    expect(fsSync.existsSync(session.file)).toBe(true);
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")(
+  "a cwd that differs in case from its directory",
+  () => {
+    it("is recovered from the transcript", async () => {
+      const lower = path.join(workspace, "repo");
+      const upper = path.join(workspace, "Repo");
+      // The repository was renamed in case; the CLI keeps writing to the old directory.
+      const session = await writeTranscript({ cwd: lower, recordCwd: upper });
+      if (!fsSync.existsSync(path.join(configDir, "projects", encodeProjectPath(upper)))) return;
+      const { agent } = await indexAgent();
+      for (const params of [{}, { cwd: upper }]) {
+        const page = await agent.listSessions(params);
+        expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[session.id, upper]]);
+      }
+    });
+  },
+);
+
+describe("title of a listed copy that starts with a slash command", () => {
+  it("is the first real prompt, as the SDK titles it", async () => {
+    const id = randomUUID();
+    const dir = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${id}.jsonl`);
+    const record = (content: unknown, at: string) => ({
+      type: "user",
+      sessionId: id,
+      cwd: workspace,
+      uuid: randomUUID(),
+      parentUuid: null,
+      timestamp: at,
+      message: { role: "user", content },
+    });
+    await fs.writeFile(
+      file,
+      [
+        record("<command-name>/init</command-name>", "2026-09-01T00:00:00Z"),
+        record("Add a parser", "2026-09-01T00:00:01Z"),
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    // The SDK does not find this copy: the title comes from the file.
+    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.title)).toEqual([
+      (await vi
+        .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+          "@anthropic-ai/claude-agent-sdk",
+        )
+        .then((sdk) => sdk.getSessionInfo(id, { dir: workspace })))!.summary,
+    ]);
+    expect(page.sessions[0]!.title).toBe("Add a parser");
   });
 });

@@ -7846,11 +7846,12 @@ export class ClaudeAcpAgent {
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     const session = this.sessions[params.sessionId];
     const loaded = session !== undefined;
-    // Only a running query makes the session ours: the CLI of a closed one is
-    // gone, and another process may have resumed the session since. The
-    // holder check, like the delete below, waits for the CLIs this process
-    // started to exit: they stay registered, and may write, while they do.
-    if (this.sessionIndex && (!session || session.queryClosed)) {
+    const running = session !== undefined && !session.queryClosed;
+    // The holder check waits for the CLIs this process started to exit (they
+    // stay registered, and may write, while they do) and refuses a session
+    // that another process holds. A session that runs here is checked once
+    // its CLI is closed: another process may have resumed it meanwhile.
+    if (this.sessionIndex && !running) {
       await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
     }
     // Tear down any active in-memory state first so the on-disk file isn't
@@ -7859,7 +7860,7 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
     if (this.sessionIndex) {
-      await this.sessionIndex.awaitOwnCliExit(params.sessionId);
+      if (running) await this.sessionIndex.assertNotHeldElsewhere(params.sessionId);
       await this.sessionIndex.delete(params.sessionId, loaded);
     } else if (this.toolCallCapabilities.air.client) {
       await archiveInsteadOfDelete(params.sessionId);
