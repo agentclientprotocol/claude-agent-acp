@@ -1257,8 +1257,9 @@ describe("tail growth", () => {
     const file = path.join(workspace, `${id}.jsonl`);
     const at = Date.parse("2026-07-01T00:00:00Z");
     const filler = JSON.stringify({ type: "progress", data: "q".repeat(5_000_000) });
-    await fs.writeFile(file, `${big(id, at, 10)}\n${filler}\n`);
-    const { size } = await fs.stat(file);
+    const first = `${big(id, at, 10)}\n${filler}\n`;
+    const size = Buffer.byteLength(first);
+    await fs.writeFile(file, first);
     expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBeUndefined();
     // Same path and size, a message 100 KB before the end now: the cached
     // miss stands, the tail is not searched again.
@@ -1268,8 +1269,9 @@ describe("tail growth", () => {
       type: "progress",
       data: "q".repeat(5_000_000 - message.length - pad.length - 2),
     });
-    await fs.writeFile(file, `${message}\n${moved}\n${message}\n${pad}\n`);
-    expect((await fs.stat(file)).size).toBe(size);
+    const second = `${message}\n${moved}\n${message}\n${pad}\n`;
+    expect(Buffer.byteLength(second)).toBe(size);
+    await fs.writeFile(file, second);
     expect((await scanTranscriptFile(file, size, id)).lastMessageAt).toBeUndefined();
   });
 });
