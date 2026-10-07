@@ -2274,16 +2274,21 @@ describe("a transcript without a prompt in its last 4 MB", () => {
           content: [{ type: "tool_result", tool_use_id: "t", content: "o".repeat(size) }],
         },
       }) + "\n";
-    await fs.writeFile(file, result(10));
-    const size = (await fs.stat(file)).size;
-    await fs.appendFile(file, result(100));
-    const grown = await scanTranscriptFile(file, (await fs.stat(file)).size, id, undefined, {
-      size,
-      promptSearched: true,
-      model: "claude-model-x",
-      lastTurnEndedAt: at,
-      costUsd: 1.5,
-    });
+    const size = Buffer.byteLength(result(10));
+    await fs.writeFile(file, result(10) + result(100));
+    const grown = await scanTranscriptFile(
+      file,
+      size + Buffer.byteLength(result(100)),
+      id,
+      undefined,
+      {
+        size,
+        promptSearched: true,
+        model: "claude-model-x",
+        lastTurnEndedAt: at,
+        costUsd: 1.5,
+      },
+    );
     expect(grown.model).toBe("claude-model-x");
     expect(grown.lastTurnEndedAt).toBe(at);
     expect(grown.costUsd).toBe(1.5);
@@ -2311,8 +2316,9 @@ describe("a transcript without a prompt in its last 4 MB", () => {
       record("user", at, "Start") + output.repeat(3) + record("user", at + 1000, "Hidden");
     const last = record("assistant", at + 2000, "");
     const pad = size - Buffer.byteLength(head + output + last);
-    await fs.writeFile(file, head + output + record("assistant", at + 2000, "z".repeat(pad)));
-    expect((await fs.stat(file)).size).toBe(size);
+    const replacement = head + output + record("assistant", at + 2000, "z".repeat(pad));
+    expect(Buffer.byteLength(replacement)).toBe(size);
+    await fs.writeFile(file, replacement);
     expect((await scanTranscriptFile(file, size, id, undefined, undefined, 2)).lastPromptAt).toBe(
       at + 1000,
     );
@@ -2373,16 +2379,18 @@ describe("a transcript without a prompt in its last 4 MB", () => {
       }) + "\n";
     const at = Date.parse("2026-07-01T00:00:00Z");
     const output = record("assistant", at, "a".repeat(1_000_000));
-    await fs.writeFile(file, record("user", at, "Start") + output.repeat(5));
-    let { size } = await fs.stat(file);
+    const original = record("user", at, "Start") + output.repeat(5);
+    await fs.writeFile(file, original);
+    let size = Buffer.byteLength(original);
     const first = await scanTranscriptFile(file, size, id);
     expect(first.lastPromptAt).toBeUndefined();
     expect(first.promptSearched).toBe(true);
 
     // A prompt 1 MB back and a small append: the earlier full search stands,
     // so the 1 MB is not read (the prompt stays unseen).
-    await fs.writeFile(file, record("user", at, "Hidden") + output + record("assistant", at, "z"));
-    size = (await fs.stat(file)).size;
+    const replaced = record("user", at, "Hidden") + output + record("assistant", at, "z");
+    await fs.writeFile(file, replaced);
+    size = Buffer.byteLength(replaced);
     // The appended bytes (the last record) are inside the tail window.
     const grown = await scanTranscriptFile(file, size, id, undefined, {
       size: size - 50,
