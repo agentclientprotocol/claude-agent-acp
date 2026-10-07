@@ -663,3 +663,51 @@ describe("list change watches", () => {
     watcher.dispose();
   });
 });
+
+describe("lastPromptAt of a media prompt", () => {
+  const media = (type: "image" | "document", timestamp: string, extra: object = {}) => ({
+    type: "user",
+    sessionId: SESSION,
+    timestamp,
+    message: {
+      role: "user",
+      content: [{ type, source: { type: "base64", media_type: "x", data: "x" } }],
+    },
+    ...extra,
+  });
+
+  it("counts an image or a document as a prompt", () => {
+    for (const type of ["image", "document"] as const) {
+      const facts = scan(
+        lines(
+          user("Fix it", "2026-01-01T00:00:00Z"),
+          assistant("end_turn", "2026-01-01T00:00:01Z"),
+          media(type, "2026-01-01T00:00:02Z"),
+          assistant("end_turn", "2026-01-01T00:00:03Z"),
+        ),
+      );
+      expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:02Z"));
+    }
+  });
+
+  it("does not count media in a tool result or a meta record", () => {
+    const facts = scan(
+      lines(
+        user("Fix it", "2026-01-01T00:00:00Z"),
+        {
+          type: "user",
+          sessionId: SESSION,
+          timestamp: "2026-01-01T00:00:02Z",
+          message: {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: "t", content: [{ type: "image", source: {} }] },
+            ],
+          },
+        },
+        media("image", "2026-01-01T00:00:03Z", { isMeta: true }),
+      ),
+    );
+    expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
+  });
+});

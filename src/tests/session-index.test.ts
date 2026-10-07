@@ -2141,3 +2141,38 @@ describe("a last prompt followed by more than the tail window", () => {
     expect(await ids()).toEqual([prompted.id, working.id]);
   });
 });
+
+describe("a session whose last prompt is an image or a document", () => {
+  it("is ordered by that prompt", async () => {
+    const now = Date.parse("2026-06-01T12:00:00Z");
+    const minute = 60_000;
+    const middle = await writeTranscript({ lastMessageAt: now - 5 * minute });
+    const withMedia: string[] = [];
+    for (const [type, at] of [
+      ["image", now - 2 * minute],
+      ["document", now - minute],
+    ] as const) {
+      // A text prompt 10 minutes ago, then a media-only prompt.
+      const session = await writeTranscript({ lastMessageAt: now - 10 * minute + 1000 });
+      await fs.appendFile(
+        session.file,
+        JSON.stringify({
+          type: "user",
+          sessionId: session.id,
+          cwd: workspace,
+          uuid: randomUUID(),
+          timestamp: new Date(at).toISOString(),
+          message: { role: "user", content: [{ type, source: { type: "base64", data: "x" } }] },
+        }) + "\n",
+      );
+      await fs.utimes(session.file, (at + 500) / 1000, (at + 500) / 1000);
+      withMedia.push(session.id);
+    }
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.sessionId)).toEqual([withMedia[1], withMedia[0], middle.id]);
+    expect((page.sessions[0]!._meta as any).jetbrains.air.lastPromptAt).toBe(
+      new Date(now - minute).toISOString(),
+    );
+  });
+});

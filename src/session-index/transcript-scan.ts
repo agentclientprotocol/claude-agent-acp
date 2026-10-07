@@ -11,7 +11,7 @@
  */
 
 import * as fs from "node:fs/promises";
-import { firstPrompt, mediaPrompt, promptOf } from "./first-prompt.js";
+import { firstPrompt, isUserPrompt, mediaPrompt, promptOf } from "./first-prompt.js";
 
 const CHUNK_SIZE = 64 * 1024;
 /** The largest tail window read to find the last message. */
@@ -325,7 +325,7 @@ export function scanTranscript({ head, tail }: HeadTail, sessionId: string): Tra
       messageFound = true;
       facts.lastMessageAt = timestampOf(entry);
     }
-    if (!promptFound && entry.type === "user" && promptOf(entry, { commandFallback: "" })) {
+    if (!promptFound && entry.type === "user" && isUserPrompt(entry)) {
       promptFound = true;
       facts.lastPromptAt = timestampOf(entry);
     }

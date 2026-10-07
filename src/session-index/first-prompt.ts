@@ -106,6 +106,29 @@ export function promptOf(entry: Entry, state: { commandFallback: string }): stri
   return undefined;
 }
 
+/**
+ * Whether a user record is a prompt the user sent: one with prompt text
+ * ({@link promptOf}), or one with an image or a document, which the SDK
+ * titles `Image` or `Document` when it has no prompt text. A tool result, a meta or compact summary
+ * record, an interrupt and a slash command are none.
+ */
+export function isUserPrompt(entry: Entry): boolean {
+  if (promptOf(entry, { commandFallback: "" }) !== undefined) return true;
+  if (entry.type !== "user" || entry.isMeta === true || entry.isCompactSummary === true) {
+    return false;
+  }
+  const content = (entry.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  let media = false;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const { type } = block as { type?: unknown };
+    if (type === "tool_result") return false;
+    if (type === "image" || type === "document") media = true;
+  }
+  return media;
+}
+
 function isUserLine(line: string): boolean {
   return line.includes('"type":"user"') || line.includes('"type": "user"');
 }

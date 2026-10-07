@@ -1254,7 +1254,7 @@ Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `ar
 ```
 
 - `createdAt` is the first timestamp of the transcript, as the SDK's `createdAt`.
-- `lastPromptAt` is the time of the last real user prompt in the transcript tail: not a tool result, a meta record, a slash command or an interrupt (the predicate of the SDK title extractor). When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
+- `lastPromptAt` is the time of the last real user prompt in the transcript tail: prompt text (the predicate of the SDK title extractor) or an image or a document, but not a tool result, a meta or compact summary record, a slash command or an interrupt. When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
 - `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
 - `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
 - `state` is `running`, `idle`, or `requires_action`, never `unknown`:
