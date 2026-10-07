@@ -25,6 +25,7 @@ import {
   encodeProjectPath,
   isExactProjectDir,
   isSessionId,
+  normalizePath,
   pathAndAncestors,
   projectDirMatches,
   projectDirsOf,
@@ -44,7 +45,7 @@ import {
   type TitleFields,
   type TranscriptFacts,
 } from "./transcript-scan.js";
-import { repositoryWorktrees } from "./worktrees.js";
+import { worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
@@ -212,6 +213,32 @@ async function sameDirOnDisk(dirName: string, cwd: string): Promise<boolean> {
   }
 }
 
+/** A path as the file system compares it: case-insensitive on macOS and
+ *  Windows, as the SDK assumes there. */
+function comparable(value: string): string {
+  const normalized = normalizePath(value);
+  return process.platform === "darwin" || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+/** Whether a row cwd is one of `paths` (every cwd is without `paths`): the
+ *  same path, or one that resolves to it through symlinks. */
+function scopeOf(paths: readonly string[] | undefined): (cwd: string) => Promise<boolean> {
+  if (!paths) return async () => true;
+  const wanted = new Set(paths.map(comparable));
+  const resolved = new Map<string, Promise<boolean>>();
+  return (cwd) => {
+    if (wanted.has(comparable(cwd))) return Promise.resolve(true);
+    let result = resolved.get(cwd);
+    if (!result) {
+      result = canonicalPath(cwd).then((real) => wanted.has(comparable(real)));
+      resolved.set(cwd, result);
+    }
+    return result;
+  };
+}
+
 async function readDirNames(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
@@ -237,11 +264,12 @@ export class SessionIndex {
   constructor(private readonly getSessionInfo: GetSessionInfo) {}
 
   /** The paths whose sessions a list of `cwd` shows: `cwd`, and with
-   *  `includeWorktrees` every existing worktree of its repository. */
+   *  `includeWorktrees` the same subdirectory of every other existing
+   *  worktree of its repository (the worktree roots for a cwd at the root). */
   async listedPaths(cwd: string, includeWorktrees: boolean): Promise<string[]> {
     const canonical = await canonicalPath(cwd);
     if (!includeWorktrees) return [canonical];
-    return [...new Set([canonical, ...(await repositoryWorktrees(canonical))])];
+    return [...new Set([canonical, ...(await worktreeCounterparts(canonical))])];
   }
 
   /** The project directories (names under the projects root) of `paths`.
@@ -303,10 +331,10 @@ export class SessionIndex {
   /** Every non-empty transcript of `cwd` (with `includeWorktrees` also of
    *  its worktrees; without a cwd, of all projects), one per session id: the
    *  larger file wins. */
-  async enumerate(cwd?: string | null, includeWorktrees = false): Promise<TranscriptCandidate[]> {
+  async enumerate(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
     const root = projectsRoot();
-    const dirs: { dirName: string; projectPath?: string }[] = cwd
-      ? await this.projectDirs(await this.listedPaths(cwd, includeWorktrees))
+    const dirs: { dirName: string; projectPath?: string }[] = paths
+      ? await this.projectDirs(paths)
       : (await readDirNames(root)).map((dirName) => ({ dirName }));
     const perDir = await Promise.all(
       dirs.map(async ({ dirName, projectPath }) => {
@@ -415,7 +443,11 @@ export class SessionIndex {
 
   /** One page of rows, plus whether more rows follow the page. */
   async list(query: ListQuery): Promise<{ rows: IndexRow[]; hasMore: boolean }> {
-    const candidates = (await this.enumerate(query.cwd, query.includeWorktrees ?? false))
+    const paths = query.cwd
+      ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
+      : undefined;
+    const inScope = scopeOf(paths);
+    const candidates = (await this.enumerate(paths))
       .filter(
         (candidate) => query.archived || !query.archivedIds.has(candidate.sessionId.toLowerCase()),
       )
@@ -435,7 +467,10 @@ export class SessionIndex {
     // Read transcripts without a cwd of their own: a sibling of the same
     // directory may supply it, whichever batch it is read in.
     let pending: Resolved[] = [];
-    const accept = (resolved: Resolved, cwd: string) => {
+    const accept = async (resolved: Resolved, cwd: string) => {
+      // Another path that encodes to the same project directory is not this
+      // cwd (`/a/b` and `/a-b`).
+      if (!(await inScope(cwd))) return;
       const row = toRow(
         resolved,
         cwd,
@@ -443,12 +478,14 @@ export class SessionIndex {
       );
       if (!query.after || isAfter(row, query.after)) rows.push(row);
     };
-    const settlePending = () => {
-      pending = pending.filter((resolved) => {
+    const settlePending = async () => {
+      const left: Resolved[] = [];
+      for (const resolved of pending) {
         const cwd = this.fallbackCwd(resolved.candidate);
-        if (cwd) accept(resolved, cwd);
-        return !cwd;
-      });
+        if (cwd) await accept(resolved, cwd);
+        else left.push(resolved);
+      }
+      pending = left;
     };
     const read = new Set<TranscriptCandidate>();
     let index = 0;
@@ -470,10 +507,10 @@ export class SessionIndex {
       for (const item of resolved) {
         if (!item) continue;
         const cwd = item.metadata.fileCwd ?? this.fallbackCwd(item.candidate);
-        if (cwd) accept(item, cwd);
+        if (cwd) await accept(item, cwd);
         else pending.push(item);
       }
-      settlePending();
+      await settlePending();
     }
     if (pending.length > 0) {
       // A row recovered after the scan stopped still sorts into the page: it
@@ -482,10 +519,28 @@ export class SessionIndex {
         new Set(pending.map(({ candidate }) => candidate.dirName)),
         candidates.filter((candidate) => !read.has(candidate)),
       );
-      settlePending();
+      await settlePending();
     }
     rows.sort(compareRows);
     return { rows: rows.slice(0, query.limit), hasMore: rows.length > query.limit };
+  }
+
+  /** The `sessionId:mtime:size` of every transcript that a list of `cwd`
+   *  shows, archived or not, for the change hint: a transcript of another
+   *  path that shares a project directory does not count. A transcript
+   *  whose cwd is unknown counts. */
+  async scopeFingerprint(cwd: string, includeWorktrees: boolean): Promise<string[]> {
+    const paths = await this.listedPaths(cwd, includeWorktrees);
+    const inScope = scopeOf(paths);
+    const parts = await Promise.all(
+      (await this.enumerate(paths)).map(async (candidate) => {
+        const metadata = await this.metadataOf(candidate);
+        const rowCwd = metadata?.fileCwd ?? this.fallbackCwd(candidate);
+        if (rowCwd && !(await inScope(rowCwd))) return undefined;
+        return `${candidate.sessionId}:${candidate.mtimeMs}:${candidate.size}`;
+      }),
+    );
+    return parts.filter((part): part is string => part !== undefined).sort();
   }
 
   /** Reads the unread transcripts of `dirNames` until each directory has a

@@ -1259,6 +1259,9 @@ export type Session = {
   /** `total_cost_usd` of the last result, reported as the cost of the session
    *  in the session index. */
   lastTotalCostUsd?: number;
+  /** The query resumed a stored conversation (load, resume, fork): the
+   *  session has a transcript, unlike a new one before its first turn. */
+  resumedFromHistory?: boolean;
   /** How many trailing `session_state_changed: idle` messages are already
    *  accounted for: every result is followed by one (user-turn results that
    *  terminate a turn — settle, reject, or orphan skip — and autonomous
@@ -2923,9 +2926,9 @@ export class ClaudeAcpAgent {
    *  `thread_active_writer`. A session this connection runs is its own. */
   private async assertNoOtherWriter(sessionId: string): Promise<void> {
     if (!this.sessionIndex) return;
-    const ownCli = this.ownCliState(sessionId);
-    if (ownCli === "running") return;
-    await this.sessionIndex.assertNotHeldElsewhere(sessionId, ownCli);
+    // The CLI that runs the session here does not count; another process
+    // that resumed it too does.
+    await this.sessionIndex.assertNotHeldElsewhere(sessionId, this.ownCliState(sessionId));
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -3073,6 +3076,19 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /** A new session this connection runs that may have no transcript yet: it
+   *  resumed no stored conversation and no turn of it has ended. A session
+   *  whose query ended, or that has history, needs its transcript. */
+  private isUnwrittenSession(sessionId: string): boolean {
+    const session = this.sessions[sessionId];
+    return (
+      session !== undefined &&
+      !session.queryClosed &&
+      !session.resumedFromHistory &&
+      session.lastTurnEndedAt === undefined
+    );
+  }
+
   /** Tells the client the archive state of a session loaded on this
    *  connection (`session_info_update` with `_meta.jetbrains.air.archived`,
    *  RFD #2161's `archived` field). The session itself is not touched. */
@@ -3092,7 +3108,7 @@ export class ClaudeAcpAgent {
   async archiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_ARCHIVE_METHOD);
     const sessionId = this.indexSessionId(params.sessionId);
-    await index.archive(sessionId, this.sessions[sessionId] !== undefined);
+    await index.archive(sessionId, this.isUnwrittenSession(sessionId));
     await this.reportArchived(sessionId, true);
     return {};
   }
@@ -3101,7 +3117,7 @@ export class ClaudeAcpAgent {
   async unarchiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_UNARCHIVE_METHOD);
     const sessionId = this.indexSessionId(params.sessionId);
-    await index.unarchive(sessionId, this.sessions[sessionId] !== undefined);
+    await index.unarchive(sessionId, this.isUnwrittenSession(sessionId));
     await this.reportArchived(sessionId, false);
     return {};
   }
@@ -10199,6 +10215,7 @@ export class ClaudeAcpAgent {
         query: q,
         input: input,
         cancelled: false,
+        resumedFromHistory: creationOpts.resume !== undefined,
         cwd: params.cwd,
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,

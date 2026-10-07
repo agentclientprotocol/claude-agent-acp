@@ -20,7 +20,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { archiveMarkerDir } from "./archive-markers.js";
 import { liveRegistryDir } from "./live-registry.js";
-import { encodeProjectPath, projectsRoot, sameProjectPath } from "./project-dirs.js";
+import { normalizePath, projectsRoot } from "./project-dirs.js";
 
 export const LIST_CHANGED_METHOD = "_session/list_changed";
 
@@ -38,6 +38,9 @@ export type ListChangedDeps = {
     cwd: string,
     includeWorktrees: boolean,
   ) => Promise<{ dirNames: string[]; paths: string[] }>;
+  /** `sessionId:mtime:size` of each transcript the list of the cwd shows.
+   *  Without it, every transcript of the project directories counts. */
+  transcripts?: (cwd: string, includeWorktrees: boolean) => Promise<string[]>;
   /** Sends `_session/list_changed { cwd }`. */
   notify: (cwd: string) => Promise<void>;
   now?: () => number;
@@ -98,13 +101,20 @@ async function dirFingerprint(dir: string, filter: (name: string) => boolean): P
 const isTranscript = (name: string) => name.endsWith(".jsonl");
 const isRegistryRecord = (name: string) => /^\d+\.json$/.test(name);
 
-/** The live records whose cwd is one of `paths`, or encodes exactly to one
- *  of `dirNames`. A long path's directory is matched by prefix only, which
- *  other long paths may share: their records do not belong here. */
-async function liveRecordsFingerprint(
-  dirNames: readonly string[],
-  paths: readonly string[],
-): Promise<string> {
+/** A path as the file system compares it: case-insensitive on macOS and
+ *  Windows. */
+function comparable(value: string): string {
+  const normalized = normalizePath(value);
+  return process.platform === "darwin" || process.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+/** The live records whose cwd is one of `paths`. Another path that shares a
+ *  project directory (`/a/b` and `/a-b`, or a long path's cut prefix) does
+ *  not belong here. */
+async function liveRecordsFingerprint(paths: readonly string[]): Promise<string> {
+  const wanted = new Set(paths.map(comparable));
   const dir = liveRegistryDir();
   let names: string[];
   try {
@@ -120,11 +130,7 @@ async function liveRecordsFingerprint(
           unknown
         >;
         const cwd = typeof record.cwd === "string" ? record.cwd : undefined;
-        const belongs =
-          cwd !== undefined &&
-          (dirNames.includes(encodeProjectPath(cwd)) ||
-            paths.some((projectPath) => sameProjectPath(cwd, projectPath)));
-        if (!belongs) return undefined;
+        if (cwd === undefined || !wanted.has(comparable(cwd))) return undefined;
         return `${name}:${String(record.sessionId)}:${String(record.status)}:${String(record.statusUpdatedAt)}`;
       } catch {
         return undefined;
@@ -263,18 +269,26 @@ export class ListChangedWatcher {
    *  directories. */
   private async fingerprint(entry: WatchedCwd): Promise<string> {
     const root = projectsRoot();
-    const transcripts = await Promise.all(
-      entry.dirNames.map((dirName) => dirFingerprint(path.join(root, dirName), isTranscript)),
-    );
-    const sessionIds = new Set(
-      transcripts
-        .flatMap((part) => part.split("|"))
-        .map((item) => item.slice(0, item.indexOf(".jsonl")).toLowerCase())
-        .filter(Boolean),
-    );
+    let transcripts: string[];
+    let sessionIds: Set<string>;
+    if (this.deps.transcripts) {
+      const parts = await this.deps.transcripts(entry.cwd, entry.includeWorktrees);
+      transcripts = [parts.join("|")];
+      sessionIds = new Set(parts.map((part) => part.slice(0, part.indexOf(":")).toLowerCase()));
+    } else {
+      transcripts = await Promise.all(
+        entry.dirNames.map((dirName) => dirFingerprint(path.join(root, dirName), isTranscript)),
+      );
+      sessionIds = new Set(
+        transcripts
+          .flatMap((part) => part.split("|"))
+          .map((item) => item.slice(0, item.indexOf(".jsonl")).toLowerCase())
+          .filter(Boolean),
+      );
+    }
     const [markers, live] = await Promise.all([
       dirFingerprint(archiveMarkerDir(), (name) => sessionIds.has(name.toLowerCase())),
-      liveRecordsFingerprint(entry.dirNames, entry.paths),
+      liveRecordsFingerprint(entry.paths),
     ]);
     return [entry.dirNames.join("\0"), ...transcripts, markers, live].join("\n");
   }

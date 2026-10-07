@@ -1880,3 +1880,141 @@ describe("load and resume of a session that another process holds", () => {
     expect(opened).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("paths that share a project directory", () => {
+  it("are listed and watched apart", async () => {
+    const dotted = path.join(workspace, "app.v2");
+    const dashed = path.join(workspace, "app-v2");
+    expect(encodeProjectPath(dotted)).toBe(encodeProjectPath(dashed));
+    const mine = await writeTranscript({
+      cwd: dotted,
+      lastMessageAt: Date.parse("2026-01-02T00:00:00Z"),
+    });
+    const theirs = await writeTranscript({ cwd: dashed });
+    const { agent, notifications } = await indexAgent();
+    for (const [cwd, id] of [
+      [dotted, mine.id],
+      [dashed, theirs.id],
+    ] as const) {
+      const page = await agent.listSessions({ cwd });
+      expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[id, cwd]]);
+    }
+
+    // Watched by the last list: the dashed path. A change of the dotted
+    // path's session is no change of that list.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await fs.appendFile(mine.file, "{}\n");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(notifications.filter((n) => n.params.cwd === dashed)).toEqual([]);
+    await fs.appendFile(theirs.file, "{}\n");
+    const start = Date.now();
+    while (!notifications.some((n) => n.params.cwd === dashed) && Date.now() - start < 3000) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(notifications.some((n) => n.params.cwd === dashed)).toBe(true);
+    await agent.dispose();
+  });
+});
+
+describe("worktrees of a subdirectory cwd", () => {
+  it("are the same subdirectory in each existing worktree", async () => {
+    const repo = path.join(workspace, "repo");
+    const linked = path.join(workspace, "linked");
+    const meta = path.join(repo, ".git", "worktrees", "linked");
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(path.join(repo, "packages", "a"), { recursive: true });
+    await fs.mkdir(path.join(linked, "packages", "a"), { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(linked, ".git")}\n`);
+    await fs.writeFile(path.join(linked, ".git"), `gitdir: ${meta}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    const sub = path.join(repo, "packages", "a");
+    const linkedSub = path.join(linked, "packages", "a");
+    const base = Date.parse("2026-02-01T00:00:00Z");
+    const inSub = await writeTranscript({ cwd: sub, lastMessageAt: base });
+    const inLinkedSub = await writeTranscript({ cwd: linkedSub, lastMessageAt: base - 1000 });
+    await writeTranscript({ cwd: linked, lastMessageAt: base - 2000 });
+    await writeTranscript({ cwd: repo, lastMessageAt: base - 3000 });
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({
+      cwd: sub,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+      [inSub.id, sub],
+      [inLinkedSub.id, linkedSub],
+    ]);
+  });
+});
+
+describe("list cursor scope", () => {
+  it("does not bind the limit", async () => {
+    const base = Date.parse("2026-03-01T00:00:00Z");
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++)
+      ids.push((await writeTranscript({ lastMessageAt: base - i * 1000 })).id);
+    const { agent } = await indexAgent();
+    const first = await agent.listSessions({ cwd: workspace, _meta: listMeta({ limit: 1 }) });
+    const rest = await agent.listSessions({
+      cwd: workspace,
+      cursor: first.nextCursor,
+      _meta: listMeta({ limit: 10, archived: null, includeWorktrees: null }),
+    });
+    expect([...first.sessions, ...rest.sessions].map((s) => s.sessionId)).toEqual(ids);
+  });
+});
+
+describe("open a session that runs here and that another process resumed", () => {
+  it("is thread_active_writer for a sessionIndex client", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    agent.sessions[session.id] = mockSessionState({}, agent, session.id) as any;
+    await registerHolder(process.pid, session.id);
+    (agent as any).getOrCreateSession = vi.fn();
+    await expect(
+      agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
+    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    await expect(
+      agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
+    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    expect((agent as any).getOrCreateSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("archive of a loaded session without its transcript", () => {
+  it("is unknown once the session had history, and allowed for a new unwritten one", async () => {
+    const { agent, updates } = await indexAgent();
+    const stale = randomUUID();
+    agent.sessions[stale] = mockSessionState({ queryClosed: true }, agent, stale) as any;
+    const finished = randomUUID();
+    agent.sessions[finished] = mockSessionState(
+      { lastTurnEndedAt: Date.now() },
+      agent,
+      finished,
+    ) as any;
+    const resumed = randomUUID();
+    agent.sessions[resumed] = mockSessionState({ resumedFromHistory: true }, agent, resumed) as any;
+    for (const sessionId of [stale, finished, resumed]) {
+      await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
+      await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
+    }
+    expect(updates).toEqual([]);
+
+    const fresh = randomUUID();
+    agent.sessions[fresh] = mockSessionState({}, agent, fresh) as any;
+    await agent.archiveSession({ sessionId: fresh });
+    await agent.unarchiveSession({ sessionId: fresh });
+    expect(updates).toHaveLength(2);
+  });
+});
+
+describe("delete of an unknown session with a leftover marker", () => {
+  it("drops the marker and is -32002", async () => {
+    const sessionId = randomUUID();
+    const marker = path.join(configDir, "acp", "archived", sessionId);
+    await fs.mkdir(path.dirname(marker), { recursive: true });
+    await fs.writeFile(marker, "");
+    const { agent } = await indexAgent();
+    await expect(agent.deleteSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
+    expect(fsSync.existsSync(marker)).toBe(false);
+  });
+});

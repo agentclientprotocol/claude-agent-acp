@@ -82,6 +82,39 @@ async function linkedWorktrees(commonDir: string): Promise<string[]> {
   ).filter((value): value is string => value !== undefined);
 }
 
+/** The root of the worktree that contains `cwd`: the directory of its
+ *  `.git` (a directory in the main worktree, a file in a linked one). */
+async function worktreeRootOf(cwd: string): Promise<string | undefined> {
+  let current = path.resolve(cwd);
+  for (;;) {
+    if (await statOrUndefined(path.join(current, ".git"))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+/**
+ * The same subdirectory as `cwd` in every existing worktree of its
+ * repository (the main one and the linked ones), as the Codex TUI expands a
+ * cwd: for `/repo/packages/a`, `/wt1/packages/a` if it exists. For a cwd at a
+ * worktree root, the worktree roots. Empty outside a repository.
+ */
+export async function worktreeCounterparts(cwd: string): Promise<string[]> {
+  const root = await worktreeRootOf(cwd);
+  if (!root) return [];
+  const relative = path.relative(root, path.resolve(cwd));
+  const candidates = (await repositoryWorktrees(cwd)).map((worktree) =>
+    relative ? path.join(worktree, relative) : worktree,
+  );
+  const existing = await Promise.all(
+    candidates.map(async (candidate) =>
+      (await statOrUndefined(candidate))?.isDirectory() ? normalizePath(candidate) : undefined,
+    ),
+  );
+  return [...new Set(existing.filter((value): value is string => value !== undefined))];
+}
+
 /**
  * Every existing worktree of the repository that contains `cwd`: the main
  * worktree and the linked ones. Empty outside a repository.

@@ -1207,7 +1207,10 @@ The new methods answer it with `-32601`.
 ```
 
 - `limit` defaults to 50. The adapter clamps it to 1..200 and never returns more.
-- `includeWorktrees` is a boolean, `false` when omitted or `null`. Without it, `cwd` matches exactly (after resolving symlinks, as the CLI does). With `true`, the page also holds the sessions of every existing linked worktree of the repository that contains `cwd`. Another value is `-32602`.
+- `includeWorktrees` is a boolean, `false` when omitted or `null`. Another value is `-32602`.
+  Without it, `cwd` matches exactly (after resolving symlinks, as the CLI does): a session of another path that shares the project directory name (`/ws/app.v2` and `/ws/app-v2`, `/a/b` and `/a-b`) is not listed.
+  With `true`, the page also holds the sessions of the same subdirectory of `cwd` in every other existing worktree of its repository, as the Codex TUI expands a cwd: for `/repo/packages/a`, `/wt1/packages/a` if that directory exists. For a cwd at a worktree root, that is the worktree roots.
+- `archived` and `includeWorktrees` treat `null` as omitted.
 - `archived` is a boolean. Omitted, `null` or `false` lists the unarchived sessions only; `true` lists the unarchived and the archived ones together, in one order. Another value is `-32602`.
   The filter applies before pagination.
 - Without `cwd` the page holds the sessions of all projects.
@@ -1217,7 +1220,7 @@ The new methods answer it with `-32601`.
 - Every row has `updatedAt`. Rows are ordered by `updatedAt` descending, then by session id.
   `updatedAt` is the time of the last message, capped at the transcript mtime.
   A rename, an archive, or another metadata record does not move a session up.
-- The cursor is opaque. It holds the position and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`.
+- The cursor is opaque. It holds the position and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`. `limit` may change from page to page.
 - A deleted session is never listed, whatever `archived` says.
 - A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
 - With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.
@@ -1286,6 +1289,7 @@ Both are idempotent and work for a session that is not loaded.
 - After either, a session loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes.
 - Neither changes `updatedAt`.
 - A session without a transcript (unknown, deleted, or removed by the CLI cleanup) is `-32002`, also when it still has an archive marker; unarchive then drops the marker. Unarchive never brings back a deleted session.
+  Only a new session that runs on this connection and has not finished a turn yet may have no transcript: it can be archived before the CLI writes one. A loaded session whose query ended, that finished a turn, or that was loaded, resumed or forked from history needs its transcript.
 - Rename, archive, unarchive and delete of one session run one at a time.
 
 In all of the session index methods and in a `sessionIndex` client's `session/delete`, a session id matches in any case, and each transcript is handled under the spelling of its own file name.
@@ -1299,7 +1303,8 @@ The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or
 It tells the client to read the first page of that `cwd` again.
 
 - The adapter watches only the cwds that this connection listed in the last 10 minutes, at most 32, each with the `includeWorktrees` value of the list: a watch is keyed by both, and a list renews it. A list without `cwd` is not watched.
-  It watches their project directories (worktrees included), `<config>/sessions` and `<config>/acp/archived`, without recursion.
+  It watches their project directories (those of the worktrees too when the list had `includeWorktrees`), `<config>/sessions` and `<config>/acp/archived`, without recursion.
+  A change of a session of another path that shares a project directory is no change of the list.
 - Events are coalesced: 150 ms after the last one, at most 1 s after the first.
   A rescan every 10 s covers missed events.
 - The adapter sends the hint only when the transcripts, archive markers, or live records of that `cwd` changed.
@@ -1309,14 +1314,14 @@ It tells the client to read the first page of that `cwd` again.
 
 `session/delete`:
 
-- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename; a session that runs here is checked after its CLI is closed. An unknown session is `-32002`.
+- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename; a session that runs here is checked after its CLI is closed. An unknown session is `-32002`, also when an archive marker was left over (the marker is dropped).
 - an AIR client without `sessionIndex`: writes the archive marker instead of deleting, because AIR uses delete for "Done" and can reopen the session. The list hides archived sessions from such a client too. A session without a transcript fails with the error of the SDK delete, as before.
   A `sessionIndex` client sees such a session as archived (`archived: true`): this is a deliberate migration choice, so the sessions older AIR builds marked done are not lost.
 - any other client: the SDK delete, as before.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
-`session/load` and `session/resume` of a `sessionIndex` client refuse a session that another live Claude Code process holds with `thread_active_writer` (the holder rules of [Rename](#rename)), instead of starting a second writer. A session this connection runs is its own. Other clients open it as before.
+`session/load` and `session/resume` of a `sessionIndex` client refuse a session that another live Claude Code process holds with `thread_active_writer` (the holder rules of [Rename](#rename)), instead of starting a second writer, also when this connection runs the session too. The CLI that runs it here is its own. Other clients open it as before.
 
 ### Errors
 

@@ -514,13 +514,13 @@ export class SessionIndexService {
 
   /** Writes the archive marker. Neither touches the transcript (so
    *  `updatedAt` stays) nor the session's execution. A session without a
-   *  transcript is unknown (`-32002`), also one that still has a marker;
-   *  `known` is a session this connection runs, which may have no transcript
-   *  yet. */
-  async archive(sessionId: string, known: boolean): Promise<void> {
+   *  transcript is unknown (`-32002`), also one that still has a marker.
+   *  `unwritten`: a new session this connection runs that has no transcript
+   *  yet; any other session needs its history. */
+  async archive(sessionId: string, unwritten: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      if (!known && !(await this.exists(sessionId))) throw sessionNotFound(sessionId);
+      if (!unwritten && !(await this.exists(sessionId))) throw sessionNotFound(sessionId);
       await writeArchiveMarker(sessionId);
     });
   }
@@ -528,10 +528,10 @@ export class SessionIndexService {
   /** Removes the archive marker. A deleted session is not brought back: a
    *  session without a transcript is unknown (`-32002`), and its stale
    *  marker is dropped. */
-  async unarchive(sessionId: string, known: boolean): Promise<void> {
+  async unarchive(sessionId: string, unwritten: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      if (!known && !(await this.exists(sessionId))) {
+      if (!unwritten && !(await this.exists(sessionId))) {
         await removeArchiveMarker(sessionId);
         throw sessionNotFound(sessionId);
       }
@@ -560,7 +560,9 @@ export class SessionIndexService {
       // the transcript and then failed on the directory.
       const sessionDirs = await this.index.findSessionDirs(sessionId);
       if (all.length === 0 && sessionDirs.length === 0) {
-        if (await removeArchiveMarker(sessionId)) return;
+        // A leftover marker of a session without history is dropped; the
+        // session is still unknown unless it was loaded here.
+        await removeArchiveMarker(sessionId);
         if (known) return;
         throw sessionNotFound(sessionId);
       }
@@ -626,6 +628,7 @@ export class SessionIndexService {
         const dirs = await this.index.projectDirs(paths);
         return { dirNames: dirs.map(({ dirName }) => dirName), paths };
       },
+      transcripts: (watchedCwd, worktrees) => this.index.scopeFingerprint(watchedCwd, worktrees),
       notify: (changedCwd) => this.deps.notifyListChanged({ cwd: changedCwd }),
       logError: this.deps.logError,
     });
