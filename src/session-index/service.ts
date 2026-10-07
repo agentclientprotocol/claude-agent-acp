@@ -33,7 +33,15 @@ import {
 } from "./archive-markers.js";
 import { LIST_CHANGED_METHOD, ListChangedWatcher } from "./list-changed.js";
 import { LiveSessionRegistry } from "./live-registry.js";
-import { canonicalPath, errorCode, isSessionId, projectDirMatches } from "./project-dirs.js";
+import {
+  canonicalPath,
+  errorCode,
+  isExactProjectDir,
+  isSessionId,
+  projectDirMatches,
+  sameProjectPath,
+} from "./project-dirs.js";
+import { readHeadTail, transcriptProjectCwd } from "./transcript-scan.js";
 import {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
@@ -221,6 +229,27 @@ async function ensureTitleRecord(
   if (!complete && options.liveWriter) return false;
   await fs.appendFile(filePath, `${complete ? "" : "\n"}${customTitleRecord(sessionId, title)}\n`);
   return true;
+}
+
+/**
+ * Whether `transcript` lies in the project directory of one of `paths`, the
+ * one the CLI of that cwd writes: the exact encoding, or, for a long path
+ * whose name the CLI hashes differently, a directory with the cut prefix
+ * whose transcript belongs to the path. Another long path that shares the
+ * prefix does not count.
+ */
+async function isTranscriptOf(transcript: string, paths: readonly string[]): Promise<boolean> {
+  const dirName = path.basename(path.dirname(transcript));
+  if (paths.some((cwd) => isExactProjectDir(dirName, cwd))) return true;
+  if (!paths.some((cwd) => projectDirMatches(dirName, cwd))) return false;
+  try {
+    const { size } = await fs.stat(transcript);
+    const cwd = transcriptProjectCwd(await readHeadTail(transcript, size));
+    return cwd !== undefined && paths.some((projectPath) => sameProjectPath(cwd, projectPath));
+  } catch {
+    // Unreadable: not known to be the CLI's own copy.
+    return false;
+  }
 }
 
 /** The session id as the file name of a transcript spells it. */
@@ -413,11 +442,11 @@ export class SessionIndexService {
       let transcripts: string[] = [];
       try {
         transcripts = await this.index.findTranscripts(sessionId);
-        const canonical = await canonicalPath(cwd);
-        const others = transcripts.filter((transcript) => {
-          const dirName = path.basename(path.dirname(transcript));
-          return !projectDirMatches(dirName, cwd) && !projectDirMatches(dirName, canonical);
-        });
+        const paths = [...new Set([cwd, await canonicalPath(cwd)])];
+        const others: string[] = [];
+        for (const transcript of transcripts) {
+          if (!(await isTranscriptOf(transcript, paths))) others.push(transcript);
+        }
         await this.titleCopies(others, sessionId, title, true);
       } catch (error) {
         this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);

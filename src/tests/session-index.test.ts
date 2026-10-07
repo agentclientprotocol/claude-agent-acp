@@ -1629,3 +1629,31 @@ describe("a closed session whose lone holder cannot be identified", () => {
     ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
   });
 });
+
+describe("rename of a running session with a copy under another long path", () => {
+  it("titles the copy of the other path that shares the cut prefix", async () => {
+    const base = path.join(workspace, "x".repeat(210));
+    const mine = path.join(base, "mine");
+    const theirs = path.join(base, "theirs");
+    const prefix = encodeProjectPath(mine).slice(0, 200);
+    // The CLI's own copy, in a directory hashed the CLI's way.
+    const own = await writeTranscript({ cwd: mine, dirName: `${prefix}-cli0hash` });
+    const other = await writeTranscript({ sessionId: own.id, cwd: theirs });
+    expect(path.basename(path.dirname(other.file)).startsWith(prefix)).toBe(true);
+    const ownBefore = await fs.readFile(own.file, "utf8");
+    const { agent } = await indexAgent();
+    agent.sessions[own.id] = mockSessionState(
+      { cwd: mine, query: { renameSession: async () => {} } },
+      agent,
+      own.id,
+    ) as any;
+    await agent.renameSessionTitle({ sessionId: own.id, title: "Long" });
+
+    expect(await fs.readFile(own.file, "utf8")).toBe(ownBefore);
+    const last = JSON.parse((await fs.readFile(other.file, "utf8")).trim().split("\n").pop()!);
+    expect(last).toEqual({ type: "custom-title", customTitle: "Long", sessionId: own.id });
+    expect(
+      fsSync.existsSync(path.join(path.dirname(other.file), own.id, "custom-title.json")),
+    ).toBe(true);
+  });
+});
