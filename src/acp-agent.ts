@@ -2559,7 +2559,10 @@ export class ClaudeAcpAgent {
     // lands it calls `setAuthStatus`, which pushes `_auth/status_update` — the
     // connection's first push, and unconditional, because nothing was reported
     // before it. It is therefore sent after this response, never before it.
-    void this.probeCliAuthStatus();
+    // The launch waits one tick to guarantee that: a verdict that needs no CLI
+    // work (ACP_GATEWAY_AUTH, see `runCliAuthProbe`) would otherwise be
+    // computed inside this body and publish before the response is out.
+    void Promise.resolve().then(() => this.probeCliAuthStatus());
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
@@ -3003,6 +3006,13 @@ export class ClaudeAcpAgent {
     if (this.gatewayAuthRequest) {
       return;
     }
+    // Env-level gateway routing pins the identity for the whole process (see
+    // `runCliAuthProbe`); a session account must not repaint it — an
+    // `{apiProvider: "gateway"}` account would even downgrade the payload by
+    // dropping the base-URL detail.
+    if (isEnvGatewayMode()) {
+      return;
+    }
     const fromSession = fromAccountInfo(account);
     if (fromSession) {
       this.setAuthStatus(fromSession);
@@ -3033,6 +3043,18 @@ export class ClaudeAcpAgent {
 
   /** Never rejects: an unavailable CLI means "not reported", not an error. */
   private async runCliAuthProbe(): Promise<AuthStatus | undefined> {
+    // Env-level gateway routing (`ACP_GATEWAY_AUTH`): the identity is
+    // the deployment's — the gateway and the user's settings.json own auth —
+    // and the CLI credential store this probe reads is not what pays for the
+    // turn. Its verdict (typically "not logged in" on a machine that never
+    // signed in) must never be published. The gateway status takes the probe's
+    // usual place as the connection's first push; later probes are no-ops
+    // (`setAuthStatus` drops identical payloads). This runs before the exec,
+    // so gateway mode never spawns a `claude auth status` process.
+    if (isEnvGatewayMode()) {
+      this.setAuthStatus(this.currentAuthStatus ?? gatewayAuthStatus());
+      return this.currentAuthStatus;
+    }
     // Monotonicity: a read that started before the connection's latest
     // auth-affecting event describes a world that no longer exists. Remember
     // which one this read belongs to and drop the answer if it moved on.
@@ -10297,6 +10319,26 @@ function gatewayRequestToProviderConfig(request?: GatewayAuthRequest): ProviderC
 }
 
 /**
+ * True when the deployment routes API traffic through a custom
+ * Anthropic-protocol gateway whose credentials live outside this process
+ * (`ACP_GATEWAY_AUTH`; e.g. `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`
+ * in the user's `~/.claude/settings.json`, with the gateway injecting the real
+ * credential). The CLI credential store is then not the identity in use — it
+ * may well say "logged out" — so the agent reports `kind: "gateway"` and never
+ * lets a probe or a session account offer or trigger sign-in over it.
+ *
+ * STATUS-ONLY: this never affects session routing. `resolveProviderConfig`
+ * must not consult it — provider env would clobber the user's real base URL
+ * and token with the `"acp-proxy"` placeholders. Traffic flows exactly where
+ * the user's settings.json/env point it. Same truthiness convention as
+ * `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`: any non-empty value
+ * enables.
+ */
+function isEnvGatewayMode(): boolean {
+  return Boolean(process.env.ACP_GATEWAY_AUTH);
+}
+
+/**
  * Map a resolved provider config into the Claude Code env vars that redirect API
  * traffic and inject headers. Returns an empty object when routing is
  * unconfigured. The token/bypass placeholders (`" "`) are required so the CLI
@@ -10312,6 +10354,7 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
     ANTHROPIC_VERTEX_BASE_URL: "",
     CLAUDE_CODE_USE_BEDROCK: "0",
     CLAUDE_CODE_USE_VERTEX: "0",
+    ACP_GATEWAY_AUTH: "0",
     ANTHROPIC_VERTEX_PROJECT_ID: "",
     CLOUD_ML_REGION: "",
     AWS_REGION: "",
@@ -11655,6 +11698,7 @@ const PROVIDER_ROUTING_ENV_VARS = [
   "ANTHROPIC_VERTEX_BASE_URL",
   "CLAUDE_CODE_USE_BEDROCK",
   "CLAUDE_CODE_USE_VERTEX",
+  "ACP_GATEWAY_AUTH",
   "ANTHROPIC_VERTEX_PROJECT_ID",
   "CLOUD_ML_REGION",
   "AWS_REGION",

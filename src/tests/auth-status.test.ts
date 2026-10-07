@@ -863,6 +863,109 @@ describe("auth status over ACP", () => {
     expect(lastPush()).toEqual({ kind: "none", label: "Not logged in" });
   });
 
+  describe("when ACP_GATEWAY_AUTH is set", () => {
+    const GATEWAY = {
+      kind: "gateway",
+      label: "Custom model gateway",
+    };
+
+    beforeEach(() => {
+      vi.stubEnv("ACP_GATEWAY_AUTH", "1");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("reports the gateway identity instead of the CLI store's verdict", async () => {
+      // The regression behind the reported IntelliJ behavior: a machine with
+      // no Anthropic login whose credentials live in settings.json. The probe
+      // would read "not logged in"; the deployment flag says otherwise.
+      statusStdout = CLI_LOGGED_OUT;
+      statusFails = true;
+
+      await initialize();
+
+      expect(lastPush()).toEqual(GATEWAY);
+      expect(agent.currentAuthStatus).toEqual(GATEWAY);
+    });
+
+    it("pushes the gateway identity after the initialize response, never before it", async () => {
+      const order: string[] = [];
+      extNotification.mockImplementation(async (method: string) => {
+        order.push(method);
+      });
+
+      const response = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      order.push("initialize:returned");
+      await vi.waitFor(() => expect(updates()).toHaveLength(1));
+
+      expect(order).toEqual(["initialize:returned", "_auth/status_update"]);
+      expect(response._meta?.authStatus).toBeUndefined();
+    });
+
+    it("does not spawn the CLI probe in gateway mode", async () => {
+      statusStdout = CLI_LOGGED_OUT;
+      statusFails = true;
+
+      await initialize();
+
+      expect(statusCalls()).toHaveLength(0);
+      expect(lastPush()).toEqual(GATEWAY);
+    });
+
+    it("keeps the gateway identity at the start of each prompt", async () => {
+      statusStdout = CLI_LOGGED_OUT;
+      statusFails = true;
+      const sessionId = await scriptedSession({ apiKeySource: "apiKeyHelper" });
+
+      await promptOnce(sessionId);
+
+      expect(statusCalls()).toHaveLength(0);
+      expect(lastPush()).toEqual(GATEWAY);
+    });
+
+    it("keeps the gateway identity when the session account reports one", async () => {
+      await initialize();
+      extNotification.mockClear();
+      // A subscription account from the SDK session must not repaint the
+      // deployment identity the env var pinned.
+      const sessionId = await scriptedSession({
+        apiProvider: "firstParty",
+        subscriptionType: "max",
+        email: "user@example.com",
+      });
+
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      void sessionId;
+
+      expect(updates()).toHaveLength(0);
+      expect(agent.currentAuthStatus).toEqual(GATEWAY);
+    });
+
+    it("still reports the gateway identity after logout", async () => {
+      await initialize();
+      statusStdout = CLI_LOGGED_OUT;
+      statusFails = true;
+
+      await agent.logout({});
+
+      // Routing is env-owned, so the CLI credential store logout clears does
+      // not touch the identity: the gateway status survives, and no probe ran.
+      expect(statusCalls()).toHaveLength(0);
+      expect(lastPush()).toEqual(GATEWAY);
+      expect(agent.currentAuthStatus).toEqual(GATEWAY);
+    });
+
+    it("treats any non-empty value as enabled", async () => {
+      vi.stubEnv("ACP_GATEWAY_AUTH", "0");
+
+      await initialize();
+
+      expect(lastPush()).toEqual(GATEWAY);
+    });
+  });
+
   describe("when the CLI never answers", () => {
     /** The last known state, so a timed-out probe has something to fall back
      *  to and a wrong "cannot determine" answer would be visible. */
