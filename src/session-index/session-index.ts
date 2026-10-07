@@ -9,11 +9,13 @@
  * what the SDK does not report (see {@link scanTranscript}). Misses are read in
  * parallel batches.
  *
- * Order is `updatedAt` descending, then session id. `updatedAt` is the time
- * of the last message, capped at the transcript mtime, so a rename or another
- * metadata record does not move a session up. Candidates are read in mtime
- * order: a candidate's `updatedAt` is at most its mtime, so the scan stops as
- * soon as the page is full and the next mtime is older than the last row.
+ * Order is the last user activity descending, then session id: the time of
+ * the last real user prompt (`lastPromptAt`), else `updatedAt`. `updatedAt`
+ * is the time of the last message, capped at the transcript mtime, so a
+ * rename or another metadata record does not move a session up, and the
+ * order key is never later than it. Candidates are read in mtime order: a
+ * candidate's order key is at most its mtime, so the scan stops as soon as
+ * the page is full and the next mtime is older than the key of the last row.
  */
 
 import * as fs from "node:fs/promises";
@@ -89,13 +91,18 @@ export type IndexRow = {
   cwd: string;
   title: string;
   updatedAtMs: number;
+  /** The order key: the last user activity, `lastPromptAt`, else
+   *  `updatedAt`. Never later than `updatedAt`, so never later than the
+   *  transcript mtime. */
+  orderAtMs: number;
   gitBranch?: string;
   facts: TranscriptFacts;
   mtimeMs: number;
   archived: boolean;
 };
 
-export type ListCursor = { updatedAtMs: number; sessionId: string };
+/** A keyset position: the order key and the session id of the last row. */
+export type ListCursor = { orderAtMs: number; sessionId: string };
 
 export type ListQuery = {
   cwd?: string | null;
@@ -138,8 +145,8 @@ class Lru<K, V> {
   }
 }
 
-function compareRows(a: { updatedAtMs: number; sessionId: string }, b: typeof a): number {
-  if (a.updatedAtMs !== b.updatedAtMs) return b.updatedAtMs - a.updatedAtMs;
+function compareRows(a: { orderAtMs: number; sessionId: string }, b: typeof a): number {
+  if (a.orderAtMs !== b.orderAtMs) return b.orderAtMs - a.orderAtMs;
   return a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0;
 }
 
@@ -152,13 +159,14 @@ function toRow({ candidate, metadata }: Resolved, cwd: string, archived: boolean
     cwd,
     title: metadata.title,
     updatedAtMs: metadata.updatedAtMs,
+    orderAtMs: Math.min(metadata.facts.lastPromptAt ?? metadata.updatedAtMs, metadata.updatedAtMs),
     gitBranch: metadata.gitBranch,
     facts: metadata.facts,
     mtimeMs: candidate.mtimeMs,
   };
 }
 
-function isAfter(row: { updatedAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
+function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
   return compareRows(row, cursor) > 0;
 }
 
@@ -493,7 +501,8 @@ export class SessionIndex {
     while (index < candidates.length) {
       if (rows.length >= wanted) {
         rows.sort(compareRows);
-        if (candidates[index]!.mtimeMs < rows[wanted - 1]!.updatedAtMs) break;
+        // A candidate's order key is at most its mtime.
+        if (candidates[index]!.mtimeMs < rows[wanted - 1]!.orderAtMs) break;
       }
       const batch = candidates.slice(index, index + READ_BATCH_SIZE);
       index += batch.length;

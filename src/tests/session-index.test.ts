@@ -2036,3 +2036,73 @@ describe("a session relocated to a path with the same project directory", () => 
     expect((await agent.listSessions({ cwd: from })).sessions).toEqual([]);
   });
 });
+
+describe("order by the last user activity", () => {
+  it("ranks by the last prompt, else updatedAt, and pages and merges archived on that key", async () => {
+    const now = Date.parse("2026-04-01T12:00:00Z");
+    const minute = 60_000;
+    // Prompted 10 minutes ago; the agent kept working until now.
+    const workedOn = await writeTranscript({
+      lastMessageAt: now - 10 * minute + 1000,
+      mtimeMs: now + 500,
+    });
+    await fs.appendFile(
+      workedOn.file,
+      JSON.stringify({
+        type: "assistant",
+        sessionId: workedOn.id,
+        cwd: workspace,
+        uuid: randomUUID(),
+        timestamp: new Date(now).toISOString(),
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "more" }],
+          stop_reason: "end_turn",
+        },
+      }) + "\n",
+    );
+    await fs.utimes(workedOn.file, (now + 500) / 1000, (now + 500) / 1000);
+    // Prompted 5 minutes ago, done a minute later.
+    const recent = await writeTranscript({ lastMessageAt: now - 4 * minute });
+    // No prompt in the tail window: ordered by updatedAt (7 minutes ago).
+    const noPromptId = randomUUID();
+    const noPrompt = await writeTranscript({
+      sessionId: noPromptId,
+      hugePrompt: 70_000,
+      lastMessageAt: now - 7 * minute,
+      trailer: [{ type: "last-prompt", lastPrompt: "Big paste", sessionId: noPromptId }],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.sessionId)).toEqual([recent.id, noPrompt.id, workedOn.id]);
+    const workedOnRow = page.sessions[2]!;
+    expect(workedOnRow.updatedAt).toBe(new Date(now).toISOString());
+    expect((workedOnRow._meta as any).jetbrains.air.lastPromptAt).toBe(
+      new Date(now - 10 * minute).toISOString(),
+    );
+    expect((page.sessions[1]!._meta as any).jetbrains.air).not.toHaveProperty("lastPromptAt");
+
+    // A cursor anchors on the same key.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const next = await agent.listSessions({
+        cwd: workspace,
+        cursor,
+        _meta: listMeta({ limit: 1 }),
+      });
+      seen.push(...next.sessions.map((s) => s.sessionId));
+      cursor = next.nextCursor ?? undefined;
+    } while (cursor);
+    expect(seen).toEqual([recent.id, noPrompt.id, workedOn.id]);
+
+    // Archived sessions merge on the same key.
+    await agent.archiveSession({ sessionId: noPrompt.id });
+    expect((await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId)).toEqual(
+      [recent.id, workedOn.id],
+    );
+    const all = await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) });
+    expect(all.sessions.map((s) => s.sessionId)).toEqual([recent.id, noPrompt.id, workedOn.id]);
+  });
+});

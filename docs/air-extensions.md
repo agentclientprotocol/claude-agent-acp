@@ -1217,10 +1217,12 @@ The new methods answer it with `-32601`.
 
 ### List response
 
-- Every row has `updatedAt`. Rows are ordered by `updatedAt` descending, then by session id.
-  `updatedAt` is the time of the last message, capped at the transcript mtime.
-  A rename, an archive, or another metadata record does not move a session up.
-- The cursor is opaque. It holds the position and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`. `limit` may change from page to page.
+- Rows are ordered by the last user activity descending, then by session id: `lastPromptAt`, else `updatedAt` for a row without it.
+  A session the agent kept working on after the last prompt does not move up, as in Codex Desktop and the AIR session tree.
+  With `archived: true`, archived and unarchived rows merge on the same key.
+- Every row has `updatedAt`: the time of the last message of any kind, capped at the transcript mtime.
+  A rename, an archive, or another metadata record moves neither `updatedAt` nor the order.
+- The cursor is opaque. It holds the position (the order key and session id of the last row) and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`. `limit` may change from page to page.
 - A deleted session is never listed, whatever `archived` says.
 - A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
 - With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.

@@ -279,8 +279,8 @@ describe("list request parsing", () => {
 
   it("round-trips a cursor and rejects one of another scope", () => {
     const scope = { cwd: "/repo", archived: false, includeWorktrees: false };
-    const cursor = encodeListCursor({ updatedAtMs: 5, sessionId: SESSION }, scope);
-    expect(decodeListCursor(cursor, scope)).toEqual({ updatedAtMs: 5, sessionId: SESSION });
+    const cursor = encodeListCursor({ orderAtMs: 5, sessionId: SESSION }, scope);
+    expect(decodeListCursor(cursor, scope)).toEqual({ orderAtMs: 5, sessionId: SESSION });
     expect(() => decodeListCursor(cursor, { ...scope, archived: true })).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
@@ -293,9 +293,9 @@ describe("list request parsing", () => {
     expect(() => decodeListCursor("offset:1000", scope)).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
-    // A cursor of the string filter this adapter issued before.
+    // A cursor of an earlier version (keyed by updatedAt).
     const legacy = Buffer.from(
-      JSON.stringify({ v: 1, u: 5, id: SESSION, cwd: "/repo", archived: "exclude" }),
+      JSON.stringify({ v: 3, u: 5, id: SESSION, cwd: "/repo", archived: false, worktrees: false }),
     ).toString("base64url");
     expect(() => decodeListCursor(legacy, scope)).toThrow(
       expect.objectContaining({ code: -32602 }),

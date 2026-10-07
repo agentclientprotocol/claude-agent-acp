@@ -57,8 +57,9 @@ export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
-/** 3: boolean `archived` (ACP RFD #2161) and `includeWorktrees`. */
-const CURSOR_VERSION = 3;
+/** 4: keyed by the last user activity (`lastPromptAt`, else `updatedAt`);
+ *  3 added the boolean `archived` (ACP RFD #2161) and `includeWorktrees`. */
+const CURSOR_VERSION = 4;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
@@ -150,7 +151,7 @@ type CursorPayload = {
 export function encodeListCursor(cursor: ListCursor, scope: ListScope): string {
   const payload: CursorPayload = {
     v: CURSOR_VERSION,
-    u: cursor.updatedAtMs,
+    u: cursor.orderAtMs,
     id: cursor.sessionId,
     cwd: scope.cwd,
     archived: scope.archived,
@@ -186,7 +187,7 @@ export function decodeListCursor(cursor: string, scope: ListScope): ListCursor {
       "The session/list cursor belongs to another cwd or filter",
     );
   }
-  return { updatedAtMs: payload.u, sessionId: payload.id };
+  return { orderAtMs: payload.u, sessionId: payload.id };
 }
 
 /** Writes `<projectDir>/<sessionId>/custom-title.json` the way the CLI's
