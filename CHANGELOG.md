@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.87.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.86.0...v0.87.0) (2026-10-07)
+
+
+### Features
+
+* **deps:** Bump the minor group with 2 updates ([#1260](https://github.com/agentclientprotocol/claude-agent-acp/issues/1260)) ([0724b17](https://github.com/agentclientprotocol/claude-agent-acp/commit/0724b17c581e30b1242cfbec7bce44c21df99525))
+
+
+### Bug Fixes
+
+* async task routing, Monitor tasks, structured task ids, and abandoned tool calls ([#1249](https://github.com/agentclientprotocol/claude-agent-acp/issues/1249)) ([0e83a06](https://github.com/agentclientprotocol/claude-agent-acp/commit/0e83a06c4a8825ba654bddf1ab909d1a773942e2))
+* settle prompts folded into a task-notification cycle ([#1233](https://github.com/agentclientprotocol/claude-agent-acp/issues/1233)) ([390b0b9](https://github.com/agentclientprotocol/claude-agent-acp/commit/390b0b9f8bf0cc0aa7d9273a7b614172c916d3a6))
+
 ## [0.86.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.1...v0.86.0) (2026-10-05)
 
 
