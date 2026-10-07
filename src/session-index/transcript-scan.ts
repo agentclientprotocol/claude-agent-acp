@@ -125,12 +125,9 @@ export async function scanTranscriptFile(
   try {
     // The bytes from `start` to the end, grown by reading the new range only.
     let start = Math.max(0, size - CHUNK_SIZE);
-    let bytes = Buffer.alloc(0);
-    {
-      const first = Buffer.allocUnsafe(size - start);
-      const { bytesRead } = await handle.read(first, 0, first.length, start);
-      bytes = first.subarray(0, bytesRead);
-    }
+    const first = Buffer.allocUnsafe(size - start);
+    const { bytesRead: firstRead } = await handle.read(first, 0, first.length, start);
+    let bytes = first.subarray(0, firstRead);
     for (let window = CHUNK_SIZE * TAIL_GROWTH; start > 0; window *= TAIL_GROWTH) {
       const nextStart = Math.max(0, size - Math.min(window, MAX_TAIL_SIZE));
       if (nextStart >= start) break;
