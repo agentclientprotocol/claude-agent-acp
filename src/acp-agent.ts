@@ -61,7 +61,6 @@ import {
   AccountInfo,
   AgentInfo,
   CanUseTool,
-  deleteSession,
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
@@ -128,26 +127,12 @@ import {
   AIR_GOAL_KEY,
   AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
-  AIR_SESSION_INDEX_CAPABILITY,
   AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
-import {
-  archiveInsteadOfDelete,
-  LIST_CHANGED_METHOD,
-  parseRenameSessionRequest,
-  parseSessionIdRequest,
-  SESSION_ARCHIVE_METHOD,
-  SESSION_RENAME_METHOD,
-  SESSION_UNARCHIVE_METHOD,
-  SessionIndexService,
-  type RenameSessionRequest,
-  type SessionIdRequest,
-} from "./session-index/service.js";
-import { readArchivedSessionIds } from "./session-index/archive-markers.js";
-import { isSessionId } from "./session-index/project-dirs.js";
-import type { OwnSessionState } from "./session-index/activity.js";
+import * as sessionIndex from "./session-index/connection.js";
+import type { RenameSessionRequest, SessionIdRequest } from "./session-index/service.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -1253,15 +1238,6 @@ export type Session = {
    *  yields none, and a pre-counted debt that never drains would mask one
    *  future issue-#825 detection. */
   lastSessionState?: "idle" | "running" | "requires_action";
-  /** When the last turn ended (the last `session_state_changed: idle`), epoch
-   *  ms. Reported as `activity.lastTurnEndedAt` in the session index. */
-  lastTurnEndedAt?: number;
-  /** `total_cost_usd` of the last result, reported as the cost of the session
-   *  in the session index. */
-  lastTotalCostUsd?: number;
-  /** The query resumed a stored conversation (load, resume, fork): the
-   *  session has a transcript, unlike a new one before its first turn. */
-  resumedFromHistory?: boolean;
   /** How many trailing `session_state_changed: idle` messages are already
    *  accounted for: every result is followed by one (user-turn results that
    *  terminate a turn — settle, reject, or orphan skip — and autonomous
@@ -1316,7 +1292,7 @@ export type Session = {
   needsSignOutRespawn?: boolean;
   /** The in-flight recreation, so turns that arrive together share one. */
   signOutRespawn?: Promise<void>;
-};
+} & sessionIndex.SessionIndexFields;
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
  *  model did on its own (a task-notification followup, a peer/coordinator/
@@ -2512,9 +2488,6 @@ async function waitForMcpAuthentication(
   return false;
 }
 
-/** How long a closed CLI may still be exiting (the SDK kills it after 7 s). */
-const CLOSED_CLI_MEMORY_MS = 30_000;
-
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -2560,17 +2533,12 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
-  /**
-   * The session index of a client that declared `sessionIndex` (see
-   * docs/air-extensions.md, "Session index"). Undefined for every other
-   * client, which keeps the session list, delete and the watchers exactly as
-   * before.
-   */
-  private sessionIndex?: SessionIndexService;
-  /** When this connection last closed the CLI of a session, by lower-case
-   *  id: the session index takes a lone registry holder whose parent it
-   *  cannot tell for that CLI while it exits. */
-  private readonly closedCliSessions = new Map<string, number>();
+  /** The session index (docs/air-extensions.md, "Session index"). */
+  private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
+    agent: this,
+    isAirClient: () => this.toolCallCapabilities.air.client,
+    teardownSession: (sessionId) => this.teardownSession(sessionId),
+  });
 
   constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
     this.v2 = options.v2 ?? false;
@@ -2633,19 +2601,7 @@ export class ClaudeAcpAgent {
     this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities, {
       v2: this.v2,
     });
-    this.sessionIndex?.dispose();
-    this.sessionIndex = undefined;
-    // ACP v2 does not route the session index methods yet.
-    if (
-      !this.v2 &&
-      this.toolCallCapabilities.air.client &&
-      clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
-    ) {
-      this.sessionIndex = new SessionIndexService({
-        notifyListChanged: (params) => this.client.extNotification(LIST_CHANGED_METHOD, params),
-        logError: (message, error) => this.logger.error(`[session-index] ${message}:`, error),
-      });
-    }
+    this.sessionIndex.negotiate(request, { v2: this.v2 });
 
     // Learn the auth identity in the background: `initialize` never waits on
     // the CLI probe, and no snapshot rides in its response. When the probe
@@ -2827,7 +2783,7 @@ export class ClaudeAcpAgent {
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
-                ...(this.sessionIndex ? [AIR_SESSION_INDEX_CAPABILITY] : []),
+                ...this.sessionIndex.capabilities(),
               ),
               AIR_GOAL_KEY,
               {
@@ -2921,19 +2877,9 @@ export class ClaudeAcpAgent {
     });
   }
 
-  /** A `sessionIndex` client may not open a second writer: loading or
-   *  resuming a session that another live process holds is
-   *  `thread_active_writer`. A session this connection runs is its own. */
-  private async assertNoOtherWriter(sessionId: string): Promise<void> {
-    if (!this.sessionIndex) return;
-    // The CLI that runs the session here does not count; another process
-    // that resumed it too does.
-    await this.sessionIndex.assertNotHeldElsewhere(sessionId, this.ownCliState(sessionId));
-  }
-
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    await this.assertNoOtherWriter(params.sessionId);
+    await this.sessionIndex.assertNoOtherWriter(params.sessionId);
     const result = await this.getOrCreateSession(params);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -2943,7 +2889,7 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    await this.assertNoOtherWriter(params.sessionId);
+    await this.sessionIndex.assertNoOtherWriter(params.sessionId);
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);
@@ -2967,9 +2913,8 @@ export class ClaudeAcpAgent {
    * reads the start and the end only of the transcripts of the page.
    */
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
-    if (this.sessionIndex) {
-      return this.sessionIndex.list(params, (sessionId) => this.ownSessionState(sessionId));
-    }
+    const indexed = this.sessionIndex.list(params);
+    if (indexed) return indexed;
     const offset = sessionListOffset(params.cursor);
     // One more session than the page tells whether a next page exists.
     const sdkSessions = await listSessions({
@@ -2987,139 +2932,21 @@ export class ClaudeAcpAgent {
         updatedAt: new Date(session.lastModified).toISOString(),
       });
     }
-    // An AIR client archives with session/delete (see deleteSession): its
-    // archived sessions stay hidden, as when the delete removed them.
-    const visible = this.toolCallCapabilities.air.client
-      ? await this.withoutArchived(sessions)
-      : sessions;
+    const visible = await this.sessionIndex.hideArchived(sessions);
     return sdkSessions.length > SESSION_LIST_PAGE_SIZE
       ? { sessions: visible, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
       : { sessions: visible };
   }
 
-  private async withoutArchived<T extends { sessionId: string }>(sessions: T[]): Promise<T[]> {
-    const archived = await readArchivedSessionIds();
-    return archived.size === 0
-      ? sessions
-      : sessions.filter((session) => !archived.has(session.sessionId.toLowerCase()));
+  /** `_session/rename`, `_session/archive`, `_session/unarchive`. */
+  renameSessionTitle(params: RenameSessionRequest) {
+    return this.sessionIndex.rename(params);
   }
-
-  /** What the session index reports for a session this connection runs. */
-  private ownSessionState(sessionId: string): OwnSessionState | undefined {
-    const session = this.sessions[sessionId];
-    if (!session || session.queryClosed) return undefined;
-    return {
-      state: session.lastSessionState,
-      lastTurnEndedAt: session.lastTurnEndedAt,
-      costUsd: session.lastTotalCostUsd,
-    };
+  archiveSession(params: SessionIdRequest) {
+    return this.sessionIndex.archive(params);
   }
-
-  private requireSessionIndex(method: string): SessionIndexService {
-    if (!this.sessionIndex) throw RequestError.methodNotFound(method);
-    return this.sessionIndex;
-  }
-
-  /**
-   * The id under which the session index handles a session: a UUID is
-   * matched in any case, so the id this connection runs the session under
-   * (normally lower case, like the CLI's transcripts), else the lower-case
-   * UUID. Used by the `sessionIndex` paths only.
-   */
-  private indexSessionId(sessionId: string): string {
-    if (!isSessionId(sessionId) || this.sessions[sessionId]) return sessionId;
-    const lower = sessionId.toLowerCase();
-    return Object.keys(this.sessions).find((key) => key.toLowerCase() === lower) ?? lower;
-  }
-
-  /** Whether this connection runs a CLI for the session (`running`), or
-   *  closed one that may still be exiting (`exiting`). */
-  private ownCliState(sessionId: string): "running" | "exiting" | undefined {
-    const session = this.sessions[sessionId];
-    if (session && !session.queryClosed) return "running";
-    if (session) return "exiting";
-    const closedAt = this.closedCliSessions.get(sessionId.toLowerCase());
-    if (closedAt !== undefined && Date.now() - closedAt < CLOSED_CLI_MEMORY_MS) return "exiting";
-    this.closedCliSessions.delete(sessionId.toLowerCase());
-    return undefined;
-  }
-
-  /** `_session/rename`: names a session; no generated title replaces it. */
-  async renameSessionTitle(request: RenameSessionRequest): Promise<Record<string, never>> {
-    const index = this.requireSessionIndex(SESSION_RENAME_METHOD);
-    const params = { ...request, sessionId: this.indexSessionId(request.sessionId) };
-    const session = this.sessions[params.sessionId];
-    const query = session?.query as
-      | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
-      | undefined;
-    if (session && !session.queryClosed && typeof query?.renameSession === "function") {
-      // The CLI appends the title, writes the sidecar and updates its memory;
-      // the index titles the other copies of the session.
-      await session.titles.setExplicitTitle(params.title, () =>
-        index.renameLive(params.sessionId, params.title, session.cwd, () =>
-          query.renameSession!(params.title, params.sessionId),
-        ),
-      );
-      return {};
-    }
-    // A closed session's CLI is gone here, and another process may have
-    // resumed the session since: only a running query is ours.
-    const persist = () =>
-      index.renameOffline(params.sessionId, params.title, {
-        ownCli: this.ownCliState(params.sessionId),
-      });
-    if (session) {
-      await session.titles.setExplicitTitle(params.title, persist);
-    } else {
-      await persist();
-    }
-    return {};
-  }
-
-  /** A new session this connection runs that may have no transcript yet: it
-   *  resumed no stored conversation and no turn of it has ended. A session
-   *  whose query ended, or that has history, needs its transcript. */
-  private isUnwrittenSession(sessionId: string): boolean {
-    const session = this.sessions[sessionId];
-    return (
-      session !== undefined &&
-      !session.queryClosed &&
-      !session.resumedFromHistory &&
-      session.lastTurnEndedAt === undefined
-    );
-  }
-
-  /** Tells the client the archive state of a session loaded on this
-   *  connection (`session_info_update` with `_meta.jetbrains.air.archived`,
-   *  RFD #2161's `archived` field). The session itself is not touched. */
-  private async reportArchived(sessionId: string, archived: boolean): Promise<void> {
-    if (!this.sessions[sessionId]) return;
-    await this.client.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: withAirMeta(undefined, "archived", archived),
-      },
-    });
-  }
-
-  /** `_session/archive`: hides a session from the default list. Idempotent;
-   *  the session need not be loaded. */
-  async archiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
-    const index = this.requireSessionIndex(SESSION_ARCHIVE_METHOD);
-    const sessionId = this.indexSessionId(params.sessionId);
-    await index.archive(sessionId, this.isUnwrittenSession(sessionId));
-    await this.reportArchived(sessionId, true);
-    return {};
-  }
-
-  /** `_session/unarchive`. Idempotent. */
-  async unarchiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
-    const index = this.requireSessionIndex(SESSION_UNARCHIVE_METHOD);
-    const sessionId = this.indexSessionId(params.sessionId);
-    await index.unarchive(sessionId, this.isUnwrittenSession(sessionId));
-    await this.reportArchived(sessionId, false);
-    return {};
+  unarchiveSession(params: SessionIdRequest) {
+    return this.sessionIndex.unarchive(params);
   }
 
   /**
@@ -5430,9 +5257,7 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
-                if (message.state === "idle" && previousState !== "idle") {
-                  session.lastTurnEndedAt = Date.now();
-                }
+                sessionIndex.noteSessionState(session, previousState, message.state);
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -7888,7 +7713,7 @@ export class ClaudeAcpAgent {
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
     delete this.sessions[sessionId];
-    this.closedCliSessions.set(sessionId.toLowerCase(), Date.now());
+    this.sessionIndex.onTeardown(sessionId);
     const ended = await raceTimeoutAndAbort(
       turnsEnded,
       TEARDOWN_TURN_END_TIMEOUT_MS,
@@ -7903,7 +7728,7 @@ export class ClaudeAcpAgent {
 
   /** Tear down all active sessions. Called when the ACP connection closes. */
   async dispose(): Promise<void> {
-    this.sessionIndex?.dispose();
+    this.sessionIndex.dispose();
     await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
   }
 
@@ -7916,46 +7741,9 @@ export class ClaudeAcpAgent {
     return {};
   }
 
-  /**
-   * - A `sessionIndex` client deletes for real: every transcript and the
-   *   archive marker. A session that another live process holds is refused.
-   * - Another AIR client uses delete to mark a session done, and may reopen
-   *   it later: the adapter archives it instead, so the transcript survives.
-   * - Every other client: the SDK delete, as before.
-   */
-  async deleteSession(request: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    // A sessionIndex client's id matches in any case; every other client's
-    // exactly, as before.
-    const params = this.sessionIndex
-      ? { ...request, sessionId: this.indexSessionId(request.sessionId) }
-      : request;
-    const session = this.sessions[params.sessionId];
-    const loaded = session !== undefined;
-    const running = session !== undefined && !session.queryClosed;
-    // The holder check waits for the CLIs this process started to exit (they
-    // stay registered, and may write, while they do) and refuses a session
-    // that another process holds. A session that runs here is checked once
-    // its CLI is closed: another process may have resumed it meanwhile.
-    if (this.sessionIndex && !running) {
-      await this.sessionIndex.assertNotHeldElsewhere(
-        params.sessionId,
-        this.ownCliState(params.sessionId),
-      );
-    }
-    // Tear down any active in-memory state first so the on-disk file isn't
-    // recreated by an outstanding query writing to it.
-    if (loaded) {
-      await this.teardownSession(params.sessionId);
-    }
-    if (this.sessionIndex) {
-      if (running) await this.sessionIndex.assertNotHeldElsewhere(params.sessionId, "exiting");
-      await this.sessionIndex.delete(params.sessionId, loaded);
-    } else if (this.toolCallCapabilities.air.client) {
-      await archiveInsteadOfDelete(params.sessionId);
-    } else {
-      await deleteSession(params.sessionId);
-    }
-    return {};
+  /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    return this.sessionIndex.deleteSession(params);
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -11911,7 +11699,7 @@ export function v1AgentApp(
   onAgent: (agent: ClaudeAcpAgent) => void,
 ): AgentApp {
   let agent!: ClaudeAcpAgent;
-  return acpAgent({ name: "claude-code-acp" })
+  const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
       onAgent(agent);
@@ -11949,22 +11737,8 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
-    )
-    .onRequest<RenameSessionRequest, Record<string, never>>(
-      SESSION_RENAME_METHOD,
-      { parse: parseRenameSessionRequest },
-      (ctx) => agent.renameSessionTitle(ctx.params),
-    )
-    .onRequest<SessionIdRequest, Record<string, never>>(
-      SESSION_ARCHIVE_METHOD,
-      { parse: parseSessionIdRequest },
-      (ctx) => agent.archiveSession(ctx.params),
-    )
-    .onRequest<SessionIdRequest, Record<string, never>>(
-      SESSION_UNARCHIVE_METHOD,
-      { parse: parseSessionIdRequest },
-      (ctx) => agent.unarchiveSession(ctx.params),
     );
+  return sessionIndex.onSessionIndexRequests(app, () => agent);
 }
 
 /** Serves ACP v1 on stdio. */

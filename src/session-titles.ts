@@ -17,6 +17,7 @@
 import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
+import { ExplicitTitle } from "./session-index/explicit-title.js";
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -84,20 +85,8 @@ export class SessionTitles {
    *  one. Released by {@link reset}, and when generation yields nothing. */
   private settled = false;
 
-  /** Set once a client named the session (`_session/rename`). No generated
-   *  title replaces it. */
-  private named = false;
-
-  /** Renames in flight. While one is, no generated title is adopted either. */
-  private pendingRenames = 0;
-
-  private get explicit(): boolean {
-    return this.named || this.pendingRenames > 0;
-  }
-
-  /** The title generation in flight, which a rename waits for: the generator
-   *  persists its title, and a later write would replace the client's. */
-  private generation?: Promise<void>;
+  /** The title a client set, which no generated title replaces. */
+  private readonly explicit = new ExplicitTitle();
 
   constructor(
     private readonly agent: ClaudeAcpAgent,
@@ -130,7 +119,7 @@ export class SessionTitles {
    *  `conversation_reset`, which mounts a fresh transcript. */
   reset(): void {
     this.settled = false;
-    this.named = false;
+    this.explicit.reset();
     this.context = undefined;
     this.lastTitle = undefined;
   }
@@ -149,13 +138,9 @@ export class SessionTitles {
   async onTurnEnd(session: Session): Promise<void> {
     // A title the client set is final; the session info read below could
     // still hold the previous one.
-    if (this.explicit) {
-      return;
-    }
+    if (this.explicit.active) return;
     const info = await this.readSessionInfo(session);
-    if (this.explicit) {
-      return;
-    }
+    if (this.explicit.active) return;
 
     if (info?.customTitle) {
       this.settled = true;
@@ -171,13 +156,13 @@ export class SessionTitles {
     if (this.canRequest(session)) {
       this.settled = true;
 
-      const generation = this.requestGenerateTitle(session, fallback).catch((error) => {
-        this.agent.logger.error(`Session ${this.sessionId}: session title update failed: ${error}`);
-      });
-      this.generation = generation;
-      void generation.finally(() => {
-        if (this.generation === generation) this.generation = undefined;
-      });
+      this.explicit.track(
+        this.requestGenerateTitle(session, fallback).catch((error) => {
+          this.agent.logger.error(
+            `Session ${this.sessionId}: session title update failed: ${error}`,
+          );
+        }),
+      );
 
       return;
     }
@@ -194,24 +179,12 @@ export class SessionTitles {
    *  after this one, persists the title with `persist`, and publishes it. */
   async setExplicitTitle(title: string, persist: () => Promise<void>): Promise<void> {
     const previous = { settled: this.settled, context: this.context };
-    this.pendingRenames++;
     this.settled = true;
     this.context = undefined;
-    try {
-      await this.generation;
-      await persist();
-      this.named = true;
-    } catch (error) {
-      // A failed rename leaves the title as it was: a later turn may still
-      // generate one.
-      if (!this.named && this.pendingRenames === 1) {
-        this.settled = previous.settled;
-        this.context ??= previous.context;
-      }
-      throw error;
-    } finally {
-      this.pendingRenames--;
-    }
+    await this.explicit.apply(persist, () => {
+      this.settled = previous.settled;
+      this.context ??= previous.context;
+    });
     this.lastTitle = title;
     await this.agent.client.sessionUpdate({
       sessionId: this.sessionId,
@@ -285,7 +258,7 @@ export class SessionTitles {
 
     // A session torn down or replaced while the title was in flight must not
     // adopt it, and a title the client set meanwhile wins.
-    if (this.agent.sessions[this.sessionId] !== session || this.explicit) {
+    if (this.agent.sessions[this.sessionId] !== session || this.explicit.active) {
       return;
     }
 

@@ -1689,10 +1689,10 @@ describe("a closed session whose lone holder cannot be identified", () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
     // Parents cannot be told (as on Windows).
-    const registry = (agent as any).sessionIndex.registry as LiveSessionRegistry;
+    const registry = (agent as any).sessionIndex.service.registry as LiveSessionRegistry;
     (registry as any).parentPids = async () => new Map();
     (registry as any).ownChildExitTimeoutMs = 200;
-    (agent as any).closedCliSessions.set(session.id, Date.now());
+    (agent as any).sessionIndex.closedCliSessions.set(session.id, Date.now());
     await registerHolder(process.pid, session.id);
     const started = Date.now();
     await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
