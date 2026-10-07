@@ -2294,6 +2294,60 @@ describe("a transcript without a prompt in its last 4 MB", () => {
     expect(grown.costUsd).toBe(1.5);
   });
 
+  it("keeps an inherited turn end and cost when a small append needs a wider tail", async () => {
+    const id = randomUUID();
+    const file = path.join(workspace, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const line = (entry: object) => JSON.stringify({ sessionId: id, ...entry }) + "\n";
+    const working = Array.from({ length: 400 }, (_, i) =>
+      line({
+        type: "assistant",
+        timestamp: new Date(at + 10_000 + i).toISOString(),
+        message: {
+          role: "assistant",
+          stop_reason: "tool_use",
+          content: [{ type: "text", text: "w".repeat(2_000) }],
+        },
+      }),
+    ).join("");
+    const meta = line({ type: "last-prompt", lastPrompt: "m".repeat(1_000) }).repeat(80);
+    const before =
+      line({
+        type: "user",
+        timestamp: new Date(at).toISOString(),
+        message: { role: "user", content: "Go" },
+      }) +
+      line({
+        type: "assistant",
+        timestamp: new Date(at + 1000).toISOString(),
+        message: {
+          role: "assistant",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: "ok" }],
+        },
+      }) +
+      working +
+      meta;
+    const appended = line({ type: "last-prompt", lastPrompt: "x" });
+    await fs.writeFile(file, before + appended);
+    const grown = await scanTranscriptFile(
+      file,
+      Buffer.byteLength(before + appended),
+      id,
+      undefined,
+      {
+        size: Buffer.byteLength(before),
+        lastPromptAt: at,
+        promptSearched: true,
+        lastTurnEndedAt: at + 1000,
+        costUsd: 2,
+      },
+    );
+    expect(grown.lastMessageAt).toBeDefined();
+    expect(grown.lastTurnEndedAt).toBe(at + 1000);
+    expect(grown.costUsd).toBe(2);
+  });
+
   it("is searched again when replaced by another file of the same size", async () => {
     const id = randomUUID();
     const file = path.join(workspace, `${id}.jsonl`);

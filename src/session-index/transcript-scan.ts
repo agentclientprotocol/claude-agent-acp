@@ -179,6 +179,10 @@ export async function scanTranscriptFile(
         ...wider,
         ...(facts.model !== undefined && { model: facts.model }),
         ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
+        // A turn end or cost the wider tail lacks may lie before it: the
+        // narrow scan inherited it from an earlier scan of this file.
+        lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
+        costUsd: wider.costUsd ?? facts.costUsd,
         hasMessages: facts.hasMessages,
         lastPromptAt,
         // Searched to the start of the file, or found.
