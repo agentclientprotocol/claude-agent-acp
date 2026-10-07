@@ -219,13 +219,22 @@ export class LiveSessionRegistry {
    *  of this process is waited for (bounded), so that nothing writes the
    *  transcript any more when the caller goes on; one still alive after the
    *  wait is returned. A process whose parent is unknown (no `ps`, as on
-   *  Windows) may be such a child: it is waited for too. */
-  async holder(sessionId: string): Promise<LiveRecord | undefined> {
+   *  Windows) may be such a child: it is waited for too. Session ids match
+   *  in any case.
+   *
+   *  `ownChildRuns`: the session runs in a CLI child of this process, which
+   *  does not count and is not waited for; only another process is
+   *  returned. */
+  async holder(
+    sessionId: string,
+    options: { ownChildRuns?: boolean } = {},
+  ): Promise<LiveRecord | undefined> {
+    const id = sessionId.toLowerCase();
     const deadline = Date.now() + this.ownChildExitTimeoutMs;
     for (;;) {
       let records: LiveRecord[];
       try {
-        records = (await this.read()).filter((record) => record.sessionId === sessionId);
+        records = (await this.read()).filter((record) => record.sessionId.toLowerCase() === id);
       } catch {
         return undefined;
       }
@@ -238,6 +247,7 @@ export class LiveSessionRegistry {
         return parent !== undefined && parent !== this.ownPid;
       });
       if (other) return other;
+      if (options.ownChildRuns) return undefined;
       if (Date.now() >= deadline) return records[0];
       await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
     }

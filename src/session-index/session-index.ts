@@ -206,6 +206,26 @@ async function sameDirOnDisk(dirName: string, cwd: string): Promise<boolean> {
   }
 }
 
+/** The spellings a session's files may have: as given, and lower case (as
+ *  the CLI names them). */
+function idSpellings(sessionId: string): string[] {
+  const lower = sessionId.toLowerCase();
+  return lower === sessionId ? [sessionId] : [lower, sessionId];
+}
+
+/** The found paths, one per file (a case-insensitive file system resolves
+ *  both spellings to the same file). */
+function uniqueFiles(found: ({ filePath: string; key: string } | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of found) {
+    if (!item || seen.has(item.key)) continue;
+    seen.add(item.key);
+    result.push(item.filePath);
+  }
+  return result;
+}
+
 async function readDirNames(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
@@ -346,17 +366,21 @@ export class SessionIndex {
     if (!isSessionId(sessionId)) return [];
     const root = projectsRoot();
     const found = await Promise.all(
-      (await readDirNames(root)).map(async (dirName) => {
-        const filePath = path.join(root, dirName, `${sessionId}.jsonl`);
-        try {
-          const stats = await fs.stat(filePath);
-          return stats.isFile() && (stats.size > 0 || options.includeEmpty) ? filePath : undefined;
-        } catch {
-          return undefined;
-        }
-      }),
+      (await readDirNames(root)).flatMap((dirName) =>
+        idSpellings(sessionId).map(async (id) => {
+          const filePath = path.join(root, dirName, `${id}.jsonl`);
+          try {
+            const stats = await fs.stat(filePath);
+            return stats.isFile() && (stats.size > 0 || options.includeEmpty)
+              ? { filePath, key: `${stats.dev}:${stats.ino}` }
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        }),
+      ),
     );
-    return found.filter((value): value is string => value !== undefined);
+    return uniqueFiles(found);
   }
 
   /** Every `<sessionId>/` directory (sidecar, subagent transcripts) of the
@@ -365,16 +389,21 @@ export class SessionIndex {
     if (!isSessionId(sessionId)) return [];
     const root = projectsRoot();
     const found = await Promise.all(
-      (await readDirNames(root)).map(async (dirName) => {
-        const dir = path.join(root, dirName, sessionId);
-        try {
-          return (await fs.lstat(dir)).isDirectory() ? dir : undefined;
-        } catch {
-          return undefined;
-        }
-      }),
+      (await readDirNames(root)).flatMap((dirName) =>
+        idSpellings(sessionId).map(async (id) => {
+          const dir = path.join(root, dirName, id);
+          try {
+            const stats = await fs.lstat(dir);
+            return stats.isDirectory()
+              ? { filePath: dir, key: `${stats.dev}:${stats.ino}` }
+              : undefined;
+          } catch {
+            return undefined;
+          }
+        }),
+      ),
     );
-    return found.filter((value): value is string => value !== undefined);
+    return uniqueFiles(found);
   }
 
   /** Drops the cached metadata of `filePaths`. */

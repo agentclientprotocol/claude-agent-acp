@@ -146,6 +146,7 @@ import {
   type SessionIdRequest,
 } from "./session-index/service.js";
 import { readArchivedSessionIds } from "./session-index/archive-markers.js";
+import { isSessionId } from "./session-index/project-dirs.js";
 import type { OwnSessionState } from "./session-index/activity.js";
 import {
   AsyncTaskRuntime,
@@ -2997,9 +2998,22 @@ export class ClaudeAcpAgent {
     return this.sessionIndex;
   }
 
+  /**
+   * The id under which the session index handles a session: a UUID is
+   * matched in any case, so the id this connection runs the session under
+   * (normally lower case, like the CLI's transcripts), else the lower-case
+   * UUID. Used by the `sessionIndex` paths only.
+   */
+  private indexSessionId(sessionId: string): string {
+    if (!isSessionId(sessionId) || this.sessions[sessionId]) return sessionId;
+    const lower = sessionId.toLowerCase();
+    return Object.keys(this.sessions).find((key) => key.toLowerCase() === lower) ?? lower;
+  }
+
   /** `_session/rename`: names a session; no generated title replaces it. */
-  async renameSessionTitle(params: RenameSessionRequest): Promise<Record<string, never>> {
+  async renameSessionTitle(request: RenameSessionRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_RENAME_METHOD);
+    const params = { ...request, sessionId: this.indexSessionId(request.sessionId) };
     const session = this.sessions[params.sessionId];
     const query = session?.query as
       | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
@@ -3032,14 +3046,16 @@ export class ClaudeAcpAgent {
    *  the session need not be loaded. */
   async archiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_ARCHIVE_METHOD);
-    await index.archive(params.sessionId, this.sessions[params.sessionId] !== undefined);
+    const sessionId = this.indexSessionId(params.sessionId);
+    await index.archive(sessionId, this.sessions[sessionId] !== undefined);
     return {};
   }
 
   /** `_session/unarchive`. Idempotent. */
   async unarchiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_UNARCHIVE_METHOD);
-    await index.unarchive(params.sessionId, this.sessions[params.sessionId] !== undefined);
+    const sessionId = this.indexSessionId(params.sessionId);
+    await index.unarchive(sessionId, this.sessions[sessionId] !== undefined);
     return {};
   }
 
@@ -7843,7 +7859,12 @@ export class ClaudeAcpAgent {
    *   it later: the adapter archives it instead, so the transcript survives.
    * - Every other client: the SDK delete, as before.
    */
-  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+  async deleteSession(request: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    // A sessionIndex client's id matches in any case; every other client's
+    // exactly, as before.
+    const params = this.sessionIndex
+      ? { ...request, sessionId: this.indexSessionId(request.sessionId) }
+      : request;
     const session = this.sessions[params.sessionId];
     const loaded = session !== undefined;
     const running = session !== undefined && !session.queryClosed;

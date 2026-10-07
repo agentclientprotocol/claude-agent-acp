@@ -1485,3 +1485,71 @@ describe("title of a listed copy that starts with a slash command", () => {
     expect(page.sessions[0]!.title).toBe("Add a parser");
   });
 });
+
+describe("session ids in another case", () => {
+  const running = (agent: ClaudeAcpAgent, sessionId: string, extra: object = {}) =>
+    mockSessionState(
+      {
+        cwd: workspace,
+        input: { end: () => {} },
+        query: { close: () => {}, interrupt: async () => {} },
+        ...extra,
+      },
+      agent,
+      sessionId,
+    ) as any;
+
+  it("finds the holder, the running session and the transcript of a lower-case id", async () => {
+    const session = await writeTranscript({});
+    const upper = session.id.toUpperCase();
+    const { agent } = await indexAgent();
+    agent.sessions[session.id] = running(agent, session.id);
+    await registerHolder(process.pid, session.id);
+
+    await expect(agent.deleteSession({ sessionId: upper })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    // The running session was torn down, the transcript kept.
+    expect(agent.sessions[session.id]).toBeUndefined();
+    expect(fsSync.existsSync(session.file)).toBe(true);
+    await expect(agent.renameSessionTitle({ sessionId: upper, title: "x" })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+
+    await fs.rm(path.join(configDir, "sessions"), { recursive: true });
+    await agent.archiveSession({ sessionId: upper });
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+    await agent.deleteSession({ sessionId: upper });
+    expect(fsSync.existsSync(session.file)).toBe(false);
+    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(false);
+  });
+
+  it("renames a running session through its CLI under its own id", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    const rename = vi.fn(async () => {});
+    agent.sessions[session.id] = running(agent, session.id, {
+      query: { renameSession: rename },
+    });
+    await agent.renameSessionTitle({ sessionId: session.id.toUpperCase(), title: "Upper" });
+    expect(rename).toHaveBeenCalledWith("Upper", session.id);
+  });
+});
+
+describe("rename of a session that runs here and in another process", () => {
+  it("is refused before the CLI renames it", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    const rename = vi.fn(async () => {});
+    agent.sessions[session.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: rename } },
+      agent,
+      session.id,
+    ) as any;
+    await registerHolder(process.pid, session.id);
+    await expect(
+      agent.renameSessionTitle({ sessionId: session.id, title: "Mine" }),
+    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    expect(rename).not.toHaveBeenCalled();
+  });
+});

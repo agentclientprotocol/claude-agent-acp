@@ -398,6 +398,41 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("matches a session id in any case", async () => {
+    const id = "abcdef01-2345-4678-89ab-cdef01234567";
+    const dir = await registryWith({ "50.json": { pid: 50, sessionId: id, updatedAt: now } });
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      pidDomain: async () => "darwin",
+      ownPid: 1000,
+      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1])),
+    });
+    expect((await registry.holder(id.toUpperCase()))?.pid).toBe(50);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("does not count or wait for the CLI child that runs the session", async () => {
+    const dir = await registryWith({
+      "60.json": { pid: 60, sessionId: "running", updatedAt: now },
+      "61.json": { pid: 61, sessionId: "resumed", updatedAt: now },
+      "62.json": { pid: 62, sessionId: "resumed", updatedAt: now },
+    });
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      pidDomain: async () => "darwin",
+      ownPid: 1000,
+      parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 62 ? 1 : 1000])),
+      ownChildExitTimeoutMs: 60_000,
+    });
+    expect(await registry.holder("running", { ownChildRuns: true })).toBeUndefined();
+    expect((await registry.holder("resumed", { ownChildRuns: true }))?.pid).toBe(62);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("is empty when the registry does not exist", async () => {
     const registry = new LiveSessionRegistry({ dir: () => "/nonexistent/registry" });
     expect((await registry.snapshot()).size).toBe(0);

@@ -390,7 +390,9 @@ export class SessionIndexService {
    *  titles its own transcript and sidecar. The other copies of the session
    *  get the record and the sidecar here, as a best effort once the CLI has
    *  the title: a copy that another process may be writing (its last line
-   *  incomplete) is left alone, and a failure is logged, not returned. */
+   *  incomplete) is left alone, and a failure is logged, not returned.
+   *  Another process that resumed the session too is `thread_active_writer`:
+   *  only the CLI child of this process that runs it does not count. */
   async renameLive(
     sessionId: string,
     title: string,
@@ -398,6 +400,9 @@ export class SessionIndexService {
     rename: () => Promise<void>,
   ): Promise<void> {
     await this.exclusive(sessionId, async () => {
+      if (await this.registry.holder(sessionId, { ownChildRuns: true })) {
+        throw activeWriterError(sessionId);
+      }
       await rename();
       if (!isSessionId(sessionId)) return;
       let transcripts: string[] = [];
