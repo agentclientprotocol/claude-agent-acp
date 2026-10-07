@@ -19,6 +19,9 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - The `initialize` response does not advertise
+ *   `agentCapabilities.sessionCapabilities.subagents`: the subagents RFD has
+ *   only the client capability, and only AIR's draft keeps the agent one.
  * - A `terminal_exit` has a `null` exit code where origin/main sent a code
  *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
  *   failure that names no code or an interrupted command, 0 for a
@@ -198,13 +201,29 @@ function isMeta(key: string): boolean {
   return key.startsWith("_meta.");
 }
 
+/** `record` without the agent subagent capability, when it is an `initialize` response. */
+function withoutAgentSubagentCapability(record: Recorded): Recorded {
+  if (record.kind !== "initialize") return record;
+  const payload = record.payload as Json;
+  const agent = payload.agentCapabilities as Json | undefined;
+  const session = agent?.sessionCapabilities as Json | undefined;
+  if (!session || !("subagents" in session)) return record;
+  return {
+    ...record,
+    payload: {
+      ...payload,
+      agentCapabilities: { ...agent, sessionCapabilities: without(session, "subagents") },
+    },
+  } as Recorded;
+}
+
 /**
  * Returns the differences between the baseline and the current traffic that
  * the compatibility rule does not allow. An empty list means compatible.
  */
 export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): string[] {
   const expected = baseline
-    .map((record) => withoutAirOnlyKeys(record) as Recorded)
+    .map((record) => withoutAgentSubagentCapability(withoutAirOnlyKeys(record) as Recorded))
     .filter((record) => {
       const update = updateOf(record);
       return !(update?.sessionUpdate === "session_info_update" && Object.keys(update).length === 1);

@@ -1165,8 +1165,9 @@ This section covers only the AIR bridge.
 - The canonical client field is `clientCapabilities.subagents: {}`.
 - Released ACP SDKs can strip that draft field.
   AIR can instead declare `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`.
-- Either signal enables native subagent sessions. The canonical field takes precedence when it is available.
-- The agent advertises `nativeSubagentSessions` to AIR, and `agentCapabilities.sessionCapabilities.subagents` to every client.
+- Either signal enables native subagent sessions, and AIR gets this earlier draft of the RFD whichever it declares.
+- The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
+- A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
 - `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.
