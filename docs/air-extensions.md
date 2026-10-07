@@ -1199,13 +1199,14 @@ The new methods answer it with `-32601`.
   "cwd": "/Users/me/repo",
   "cursor": null,
   "_meta": {
-    "jetbrains": { "air": { "version": 1, "list": { "limit": 50, "archived": "exclude" } } }
+    "jetbrains": { "air": { "version": 1, "list": { "limit": 50, "archived": false } } }
   }
 }
 ```
 
 - `limit` defaults to 50. The adapter clamps it to 1..200.
-- `archived` is `exclude` (default) or `only`. Another value is `-32602`.
+- `archived` is a boolean. Omitted, `null` or `false` lists the unarchived sessions only; `true` lists the unarchived and the archived ones together, in one order. Another value is `-32602`.
+  The filter applies before pagination.
 - Without `cwd` the page holds the sessions of all projects.
 
 ### List response
@@ -1213,7 +1214,8 @@ The new methods answer it with `-32601`.
 - Rows are ordered by `updatedAt` descending, then by session id.
   `updatedAt` is the time of the last message, capped at the transcript mtime.
   A rename, an archive, or another metadata record does not move a session up.
-- The cursor is opaque. It holds the position and the `cwd` and `archived` it was issued for; another `cwd` or filter rejects it with `-32602`.
+- The cursor is opaque. It holds the position and the `cwd` and `archived` it was issued for; another `cwd` or `archived` value rejects it with `-32602`.
+- A deleted session is never listed, whatever `archived` says.
 - A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
 - The page holds the sessions of `cwd` and of every existing worktree of its repository.
   The worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git.
@@ -1228,10 +1230,11 @@ The new methods answer it with `-32601`.
 - `updatedAt` needs the last message: when it is longer than the 64 KB tail window, the window grows up to 4 MB to find it.
   The directory name is never decoded.
 
-Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
+Each row carries `_meta.jetbrains.air`. `archived` is always there; every other field is omitted when unknown:
 
 ```json
 {
+  "archived": false,
   "gitBranch": "fix/auth",
   "activity": { "state": "idle", "lastTurnEndedAt": "2026-10-06T09:58:10.000Z" },
   "usage": { "cost": { "amount": 1.23, "currency": "USD" } }
@@ -1266,6 +1269,14 @@ Each row can carry `_meta.jetbrains.air`; every field is omitted when unknown:
 
 `_session/archive { "sessionId": "…" }` and `_session/unarchive { "sessionId": "…" }` return `{}`.
 Both are idempotent and work for a session that is not loaded.
+
+- Neither loads, resumes, closes or cancels the session: a session that runs on this connection keeps running.
+  Closing, loading or resuming a session does not change its archive state.
+- After either, a session loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes.
+- Neither changes `updatedAt`.
+- A session without a transcript (unknown, deleted, or removed by the CLI cleanup) is `-32002`, also when it still has an archive marker; unarchive then drops the marker. Unarchive never brings back a deleted session.
+- Rename, archive, unarchive and delete of one session run one at a time.
+
 In all of the session index methods and in a `sessionIndex` client's `session/delete`, a session id matches in any case, and each transcript is handled under the spelling of its own file name.
 The archive is a marker file `<config>/acp/archived/<sessionId>`; the transcript is not touched, so archiving does not reorder the list.
 Loading an archived session does not unarchive it.
@@ -1289,6 +1300,7 @@ It tells the client to read the first page of that `cwd` again.
 
 - a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename; a session that runs here is checked after its CLI is closed. An unknown session is `-32002`.
 - an AIR client without `sessionIndex`: writes the archive marker instead of deleting, because AIR uses delete for "Done" and can reopen the session. The list hides archived sessions from such a client too. A session without a transcript fails with the error of the SDK delete, as before.
+  A `sessionIndex` client sees such a session as archived (`archived: true`): this is a deliberate migration choice, so the sessions older AIR builds marked done are not lost.
 - any other client: the SDK delete, as before.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
@@ -1300,6 +1312,16 @@ It tells the client to read the first page of that `cwd` again.
 | Another live Claude Code process holds the session | `-32600` with `data: { reason: "thread_active_writer", sessionId }` |
 | Unknown session                                    | `-32002` with `data: { sessionId }`                                 |
 | Invalid parameters or cursor                       | `-32602`                                                            |
+
+### Relation to ACP RFD #2161
+
+The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the boolean `archived` list parameter, the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, an unchanged `updatedAt`, and execution left alone.
+It differs only in transport, until the RFD lands in the SDK:
+
+- the methods are `_session/archive` and `_session/unarchive`, not `session/archive` and `session/unarchive`;
+- the capability is `sessionIndex` in `_meta.jetbrains.air.capabilities`, not `sessionCapabilities.archive`;
+- the list parameter is `_meta.jetbrains.air.list.archived`, and the state is `_meta.jetbrains.air.archived` on rows and in `session_info_update`, not the `archived` fields;
+- an AIR client without `sessionIndex` still archives with `session/delete` (see [Delete and close](#delete-and-close)), which the RFD asks clients not to do.
 
 ## Context compaction
 

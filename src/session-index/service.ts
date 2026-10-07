@@ -28,7 +28,6 @@ import { deriveActivity, selectCost, type OwnSessionState } from "./activity.js"
 import {
   readArchivedSessionIds,
   removeArchiveMarker,
-  hasArchiveMarker,
   writeArchiveMarker,
 } from "./archive-markers.js";
 import { LIST_CHANGED_METHOD, ListChangedWatcher } from "./list-changed.js";
@@ -58,7 +57,8 @@ export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
-const CURSOR_VERSION = 1;
+/** 2: `archived` is a boolean (ACP RFD #2161). */
+const CURSOR_VERSION = 2;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
@@ -107,17 +107,18 @@ export function parseListOptions(meta: unknown): ListOptions {
     typeof list.limit === "number" && Number.isFinite(list.limit)
       ? Math.min(MAX_LIST_LIMIT, Math.max(1, Math.floor(list.limit)))
       : DEFAULT_LIST_LIMIT;
-  const archived = list.archived ?? "exclude";
-  if (archived !== "exclude" && archived !== "only") {
+  // Omitted or null lists the unarchived sessions only, as `false` does.
+  const archived = list.archived ?? false;
+  if (typeof archived !== "boolean") {
     throw RequestError.invalidParams(
       { archived },
-      '`_meta.jetbrains.air.list.archived` must be "exclude" or "only"',
+      "`_meta.jetbrains.air.list.archived` must be a boolean",
     );
   }
   return { limit, archived };
 }
 
-type CursorPayload = { v: number; u: number; id: string; cwd: string | null; archived: string };
+type CursorPayload = { v: number; u: number; id: string; cwd: string | null; archived: boolean };
 
 export function encodeListCursor(
   cursor: ListCursor,
@@ -359,7 +360,8 @@ export class SessionIndexService {
         now,
       });
       const cost = selectCost(ownState, row.facts);
-      let meta: Record<string, unknown> | undefined;
+      // Always present, as RFD #2161 requires of an agent that supports archiving.
+      let meta = withAirMeta(undefined, "archived", row.archived);
       if (row.gitBranch) meta = withAirMeta(meta, "gitBranch", row.gitBranch);
       if (activity) meta = withAirMeta(meta, "activity", activity);
       if (cost !== undefined) {
@@ -370,7 +372,7 @@ export class SessionIndexService {
         cwd: row.cwd,
         title: row.title,
         updatedAt: new Date(row.updatedAtMs).toISOString(),
-        ...(meta && { _meta: meta }),
+        _meta: meta,
       };
     });
     const last = rows[rows.length - 1];
@@ -470,28 +472,36 @@ export class SessionIndexService {
     }
   }
 
-  /** Writes the archive marker. `known` skips the existence check for a
-   *  session this connection runs (it may have no transcript yet). */
+  /** Writes the archive marker. Neither touches the transcript (so
+   *  `updatedAt` stays) nor the session's execution. A session without a
+   *  transcript is unknown (`-32002`), also one that still has a marker;
+   *  `known` is a session this connection runs, which may have no transcript
+   *  yet. */
   async archive(sessionId: string, known: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      if (!known && !(await hasArchiveMarker(sessionId))) {
-        if ((await this.index.findTranscripts(sessionId)).length === 0) {
-          throw sessionNotFound(sessionId);
-        }
-      }
+      if (!known && !(await this.exists(sessionId))) throw sessionNotFound(sessionId);
       await writeArchiveMarker(sessionId);
     });
   }
 
+  /** Removes the archive marker. A deleted session is not brought back: a
+   *  session without a transcript is unknown (`-32002`), and its stale
+   *  marker is dropped. */
   async unarchive(sessionId: string, known: boolean): Promise<void> {
     if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
     await this.exclusive(sessionId, async () => {
-      if (await removeArchiveMarker(sessionId)) return;
-      if (!known && (await this.index.findTranscripts(sessionId)).length === 0) {
+      if (!known && !(await this.exists(sessionId))) {
+        await removeArchiveMarker(sessionId);
         throw sessionNotFound(sessionId);
       }
+      await removeArchiveMarker(sessionId);
     });
+  }
+
+  /** Whether the session has a transcript the list can show. */
+  private async exists(sessionId: string): Promise<boolean> {
+    return (await this.index.findTranscripts(sessionId)).length > 0;
   }
 
   /** Deletes every transcript of the session, then its archive marker. A

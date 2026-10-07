@@ -245,21 +245,40 @@ describe("list request parsing", () => {
   const meta = (list: object) => ({ jetbrains: { air: { version: 1, list } } });
 
   it("defaults and clamps the limit", () => {
-    expect(parseListOptions(undefined)).toEqual({ limit: 50, archived: "exclude" });
+    expect(parseListOptions(undefined)).toEqual({ limit: 50, archived: false });
     expect(parseListOptions(meta({ limit: 1000 })).limit).toBe(200);
     expect(parseListOptions(meta({ limit: 0 })).limit).toBe(1);
-    expect(parseListOptions(meta({ archived: "only" })).archived).toBe("only");
-    expect(() => parseListOptions(meta({ archived: "all" }))).toThrow();
+  });
+
+  it("takes archived as a boolean, null as false, and rejects anything else", () => {
+    expect(parseListOptions(meta({ archived: true })).archived).toBe(true);
+    expect(parseListOptions(meta({ archived: false })).archived).toBe(false);
+    expect(parseListOptions(meta({ archived: null })).archived).toBe(false);
+    for (const archived of ["only", "exclude", 1, "true", {}]) {
+      expect(() => parseListOptions(meta({ archived }))).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
   });
 
   it("round-trips a cursor and rejects one of another scope", () => {
-    const scope = { cwd: "/repo", archived: "exclude" as const };
+    const scope = { cwd: "/repo", archived: false };
     const cursor = encodeListCursor({ updatedAtMs: 5, sessionId: SESSION }, scope);
     expect(decodeListCursor(cursor, scope)).toEqual({ updatedAtMs: 5, sessionId: SESSION });
-    expect(() => decodeListCursor(cursor, { ...scope, archived: "only" })).toThrow(
+    expect(() => decodeListCursor(cursor, { ...scope, archived: true })).toThrow(
+      expect.objectContaining({ code: -32602 }),
+    );
+    expect(() => decodeListCursor(cursor, { ...scope, cwd: "/other" })).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
     expect(() => decodeListCursor("offset:1000", scope)).toThrow(
+      expect.objectContaining({ code: -32602 }),
+    );
+    // A cursor of the string filter this adapter issued before.
+    const legacy = Buffer.from(
+      JSON.stringify({ v: 1, u: 5, id: SESSION, cwd: "/repo", archived: "exclude" }),
+    ).toString("base64url");
+    expect(() => decodeListCursor(legacy, scope)).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
   });

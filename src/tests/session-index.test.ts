@@ -237,7 +237,7 @@ describe("session/list of a sessionIndex client", () => {
       agent.listSessions({
         cwd: workspace,
         cursor: first.nextCursor,
-        _meta: listMeta({ archived: "only" }),
+        _meta: listMeta({ archived: true }),
       }),
     ).rejects.toMatchObject({ code: -32602 });
   });
@@ -265,19 +265,56 @@ describe("session/list of a sessionIndex client", () => {
     expect(getSessionInfo).not.toHaveBeenCalled();
   });
 
-  it("filters archived sessions and lists only them on request", async () => {
-    const kept = await writeTranscript({ lastMessageAt: base });
+  it("hides archived sessions, and lists them with the others in one order on request", async () => {
+    const newest = await writeTranscript({ lastMessageAt: base });
     const archived = await writeTranscript({ lastMessageAt: base - 1000 });
+    const oldest = await writeTranscript({ lastMessageAt: base - 2000 });
     const { agent } = await indexAgent();
     await agent.archiveSession({ sessionId: archived.id });
+    const rows = (page: { sessions: { sessionId: string; _meta?: unknown }[] }) =>
+      page.sessions.map((s) => [s.sessionId, (s._meta as any).jetbrains.air.archived]);
 
-    const active = await agent.listSessions({ cwd: workspace });
-    expect(active.sessions.map((s) => s.sessionId)).toEqual([kept.id]);
-    const only = await agent.listSessions({
+    for (const archivedParam of [undefined, null, false]) {
+      const page = await agent.listSessions({
+        cwd: workspace,
+        ...(archivedParam !== undefined && { _meta: listMeta({ archived: archivedParam }) }),
+      });
+      expect(rows(page)).toEqual([
+        [newest.id, false],
+        [oldest.id, false],
+      ]);
+    }
+    const all = await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) });
+    expect(rows(all)).toEqual([
+      [newest.id, false],
+      [archived.id, true],
+      [oldest.id, false],
+    ]);
+    // Archiving did not move the session: its updatedAt is its last message.
+    expect(all.sessions[1]!.updatedAt).toBe(new Date(base - 1000).toISOString());
+
+    // The filter applies before pagination; a cursor keeps its value.
+    const first = await agent.listSessions({
       cwd: workspace,
-      _meta: listMeta({ archived: "only" }),
+      _meta: listMeta({ archived: true, limit: 2 }),
     });
-    expect(only.sessions.map((s) => s.sessionId)).toEqual([archived.id]);
+    expect(first.sessions.map((s) => s.sessionId)).toEqual([newest.id, archived.id]);
+    const second = await agent.listSessions({
+      cwd: workspace,
+      cursor: first.nextCursor,
+      _meta: listMeta({ archived: true, limit: 2 }),
+    });
+    expect(second.sessions.map((s) => s.sessionId)).toEqual([oldest.id]);
+    await expect(
+      agent.listSessions({
+        cwd: workspace,
+        cursor: first.nextCursor,
+        _meta: listMeta({ limit: 2 }),
+      }),
+    ).rejects.toMatchObject({ code: -32602 });
+    await expect(
+      agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "only" }) }),
+    ).rejects.toMatchObject({ code: -32602 });
   });
 
   it("dedupes a session copied to two project directories, keeping the larger file", async () => {
@@ -373,6 +410,7 @@ describe("session/list of a sessionIndex client", () => {
         jetbrains: {
           air: {
             version: 1,
+            archived: false,
             gitBranch: "feature/x",
             activity: { state: "idle", lastTurnEndedAt: new Date(base).toISOString() },
             usage: { cost: { amount: 1.25, currency: "USD" } },
@@ -1575,9 +1613,10 @@ describe("a transcript named by an upper-case id", () => {
 
     await agent.archiveSession({ sessionId: row!.sessionId });
     expect(
-      (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "only" }) }))
-        .sessions,
-    ).toHaveLength(1);
+      (
+        await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) })
+      ).sessions.map((s) => (s._meta as any).jetbrains.air.archived),
+    ).toEqual([true]);
 
     await agent.deleteSession({ sessionId: row!.sessionId });
     expect(vi.mocked(deleteSession).mock.calls).toEqual([[upper]]);
@@ -1657,5 +1696,87 @@ describe("rename of a running session with a copy under another long path", () =
     expect(
       fsSync.existsSync(path.join(path.dirname(other.file), own.id, "custom-title.json")),
     ).toBe(true);
+  });
+});
+
+describe("archive state (ACP RFD #2161)", () => {
+  it("is reported to a session loaded here, which keeps running", async () => {
+    const session = await writeTranscript({});
+    const { agent, updates } = await indexAgent();
+    const close = vi.fn();
+    const interrupt = vi.fn(async () => {});
+    const loaded = mockSessionState({ query: { close, interrupt } }, agent, session.id) as any;
+    agent.sessions[session.id] = loaded;
+    const before = await fs.stat(session.file);
+
+    await agent.archiveSession({ sessionId: session.id });
+    await agent.unarchiveSession({ sessionId: session.id });
+
+    const archivedMeta = (archived: boolean) => ({
+      sessionId: session.id,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { jetbrains: { air: { version: 1, archived } } },
+      },
+    });
+    expect(updates).toEqual([archivedMeta(true), archivedMeta(false)]);
+    expect(agent.sessions[session.id]).toBe(loaded);
+    expect(loaded.queryClosed).toBeFalsy();
+    expect(close).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    expect((await fs.stat(session.file)).mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it("is not reported for a session not loaded on this connection", async () => {
+    const session = await writeTranscript({});
+    const { agent, updates } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    expect(updates).toEqual([]);
+  });
+
+  it("never brings back a deleted session", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    await agent.deleteSession({ sessionId: session.id });
+    expect(
+      (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) })).sessions,
+    ).toEqual([]);
+    await expect(agent.unarchiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: -32002,
+    });
+    await expect(agent.archiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: -32002,
+    });
+  });
+
+  it("is unknown for a session whose transcript is gone but whose marker stayed", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    // The CLI cleanup removed the transcript.
+    await fs.rm(session.file);
+    const marker = path.join(configDir, "acp", "archived", session.id);
+    await expect(agent.archiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: -32002,
+    });
+    await expect(agent.unarchiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: -32002,
+    });
+    expect(fsSync.existsSync(marker)).toBe(false);
+  });
+
+  it("shows a session that an AIR client without sessionIndex marked done as archived", async () => {
+    const session = await writeTranscript({});
+    const legacy = createAgent().agent;
+    await initializeClient(legacy, air());
+    await legacy.deleteSession({ sessionId: session.id });
+
+    const { agent } = await indexAgent();
+    expect((await agent.listSessions({ cwd: workspace })).sessions).toEqual([]);
+    const all = await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: true }) });
+    expect(all.sessions.map((s) => [s.sessionId, (s._meta as any).jetbrains.air.archived])).toEqual(
+      [[session.id, true]],
+    );
   });
 });

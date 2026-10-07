@@ -3061,12 +3061,27 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /** Tells the client the archive state of a session loaded on this
+   *  connection (`session_info_update` with `_meta.jetbrains.air.archived`,
+   *  RFD #2161's `archived` field). The session itself is not touched. */
+  private async reportArchived(sessionId: string, archived: boolean): Promise<void> {
+    if (!this.sessions[sessionId]) return;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: withAirMeta(undefined, "archived", archived),
+      },
+    });
+  }
+
   /** `_session/archive`: hides a session from the default list. Idempotent;
    *  the session need not be loaded. */
   async archiveSession(params: SessionIdRequest): Promise<Record<string, never>> {
     const index = this.requireSessionIndex(SESSION_ARCHIVE_METHOD);
     const sessionId = this.indexSessionId(params.sessionId);
     await index.archive(sessionId, this.sessions[sessionId] !== undefined);
+    await this.reportArchived(sessionId, true);
     return {};
   }
 
@@ -3075,6 +3090,7 @@ export class ClaudeAcpAgent {
     const index = this.requireSessionIndex(SESSION_UNARCHIVE_METHOD);
     const sessionId = this.indexSessionId(params.sessionId);
     await index.unarchive(sessionId, this.sessions[sessionId] !== undefined);
+    await this.reportArchived(sessionId, false);
     return {};
   }
 

@@ -55,7 +55,9 @@ const MAX_CWD_PROBES_PER_DIR = 64;
 /** How long a directory that gave no cwd is not probed again. */
 const NO_CWD_RETRY_MS = 60_000;
 
-export type ArchivedFilter = "exclude" | "only";
+/** Whether a list includes archived sessions: `false` lists the unarchived
+ *  ones only, `true` all of them in one order (ACP RFD #2161). */
+export type ArchivedFilter = boolean;
 
 /** One transcript file found by the enumeration. */
 export type TranscriptCandidate = {
@@ -88,6 +90,7 @@ export type IndexRow = {
   gitBranch?: string;
   facts: TranscriptFacts;
   mtimeMs: number;
+  archived: boolean;
 };
 
 export type ListCursor = { updatedAtMs: number; sessionId: string };
@@ -138,8 +141,9 @@ function compareRows(a: { updatedAtMs: number; sessionId: string }, b: typeof a)
 
 type Resolved = { candidate: TranscriptCandidate; metadata: TranscriptMetadata };
 
-function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
+function toRow({ candidate, metadata }: Resolved, cwd: string, archived: boolean): IndexRow {
   return {
+    archived,
     sessionId: candidate.sessionId,
     cwd,
     title: metadata.title,
@@ -408,10 +412,9 @@ export class SessionIndex {
   /** One page of rows, plus whether more rows follow the page. */
   async list(query: ListQuery): Promise<{ rows: IndexRow[]; hasMore: boolean }> {
     const candidates = (await this.enumerate(query.cwd))
-      .filter((candidate) => {
-        const archived = query.archivedIds.has(candidate.sessionId.toLowerCase());
-        return query.archived === "only" ? archived : !archived;
-      })
+      .filter(
+        (candidate) => query.archived || !query.archivedIds.has(candidate.sessionId.toLowerCase()),
+      )
       .sort((a, b) =>
         a.mtimeMs !== b.mtimeMs
           ? b.mtimeMs - a.mtimeMs
@@ -429,7 +432,11 @@ export class SessionIndex {
     // directory may supply it, whichever batch it is read in.
     let pending: Resolved[] = [];
     const accept = (resolved: Resolved, cwd: string) => {
-      const row = toRow(resolved, cwd);
+      const row = toRow(
+        resolved,
+        cwd,
+        query.archivedIds.has(resolved.candidate.sessionId.toLowerCase()),
+      );
       if (!query.after || isAfter(row, query.after)) rows.push(row);
     };
     const settlePending = () => {
