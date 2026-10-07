@@ -1914,6 +1914,28 @@ describe("paths that share a project directory", () => {
     expect(notifications.some((n) => n.params.cwd === dashed)).toBe(true);
     await agent.dispose();
   });
+
+  it("hint a watched path when a session of the other path moves into it", async () => {
+    const dotted = path.join(workspace, "app.v2");
+    const dashed = path.join(workspace, "app-v2");
+    const mine = await writeTranscript({ cwd: dotted });
+    await writeTranscript({ cwd: dashed });
+    const { agent, notifications } = await indexAgent();
+    await agent.listSessions({ cwd: dotted });
+    await agent.listSessions({ cwd: dashed });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await fs.appendFile(
+      mine.file,
+      JSON.stringify({ type: "relocated", sessionId: mine.id, relocatedCwd: dashed }) + "\n",
+    );
+    const start = Date.now();
+    while (!notifications.some((n) => n.params.cwd === dashed) && Date.now() - start < 3000) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(notifications.some((n) => n.params.cwd === dashed)).toBe(true);
+    await agent.dispose();
+  });
 });
 
 describe("worktrees of a subdirectory cwd", () => {
@@ -2214,6 +2236,49 @@ describe("session index cost", () => {
 });
 
 describe("a transcript without a prompt in its last 4 MB", () => {
+  it("is searched again when another file replaces it", async () => {
+    const id = randomUUID();
+    const dir = path.join(configDir, "projects", encodeProjectPath(workspace));
+    await fs.mkdir(dir, { recursive: true });
+    const file = path.join(dir, `${id}.jsonl`);
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (type: "user" | "assistant", time: number, text: string) =>
+      JSON.stringify({
+        type,
+        sessionId: id,
+        cwd: workspace,
+        uuid: randomUUID(),
+        timestamp: new Date(time).toISOString(),
+        message: { role: type, content: type === "user" ? text : [{ type: "text", text }] },
+      }) + "\n";
+    const output = record("assistant", at, "a".repeat(1_000_000));
+    await fs.writeFile(
+      file,
+      record("user", at - 60_000, "Start") +
+        output.repeat(5) +
+        record("assistant", at, "y".repeat(40_000)),
+    );
+    const { agent } = await indexAgent();
+    const lastPromptAt = async () =>
+      ((await agent.listSessions({ cwd: workspace })).sessions[0]!._meta as any).jetbrains.air
+        .lastPromptAt;
+    expect(await lastPromptAt()).toBeUndefined();
+
+    // A slightly larger file takes its place, grown by less than its tail
+    // covers: a prompt 1 MB before its end.
+    const replacement = `${file}.new`;
+    await fs.writeFile(
+      replacement,
+      record("user", at - 60_000, "Start") +
+        output.repeat(4) +
+        record("user", at + 1000, "Hidden") +
+        output +
+        record("assistant", at + 2000, "z".repeat(40_000)),
+    );
+    await fs.rename(replacement, file);
+    expect(await lastPromptAt()).toBe(new Date(at + 1000).toISOString());
+  });
+
   it("is not searched again while it only grows by what its tail covers", async () => {
     const id = randomUUID();
     const file = path.join(workspace, `${id}.jsonl`);

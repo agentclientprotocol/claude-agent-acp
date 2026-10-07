@@ -19,12 +19,14 @@ import {
 import {
   continuedInSessionId,
   scanTranscript,
+  scanTranscriptFile,
   titleFields,
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
 import { ListChangedWatcher } from "../session-index/list-changed.js";
 import { DirListings, statFiles } from "../session-index/dir-listing.js";
+import { SessionIndex } from "../session-index/session-index.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
@@ -146,6 +148,51 @@ describe("transcript scan", () => {
     expect(facts.headCwd).toBe("/repo");
     expect(facts.tailCwd).toBe("/repo/sub");
     expect(facts.hasMessages).toBe(false);
+  });
+
+  it('takes a prompt whose text is "tool_result" for a prompt', () => {
+    const facts = scan(
+      lines(
+        user("tool_result", "2026-01-01T00:00:01.000Z"),
+        assistant("end_turn", "2026-01-01T00:00:02.000Z"),
+      ),
+    );
+    expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:01.000Z"));
+  });
+
+  it("finds the model and cwd before a tail that is one large tool result", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "si-scan-"));
+    try {
+      const file = path.join(dir, `${SESSION}.jsonl`);
+      const text =
+        lines(
+          user("hello", "2026-01-01T00:00:01.000Z", { cwd: "/repo" }),
+          assistant("tool_use", "2026-01-01T00:00:02.000Z", {
+            cwd: "/repo",
+            message: {
+              role: "assistant",
+              model: "claude-model-x",
+              stop_reason: "tool_use",
+              content: [],
+            },
+          }),
+          {
+            type: "user",
+            sessionId: SESSION,
+            timestamp: "2026-01-01T00:00:03.000Z",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "t1", content: "x".repeat(200_000) }],
+            },
+          },
+        ) + "\n";
+      await fs.writeFile(file, text);
+      const facts = await scanTranscriptFile(file, Buffer.byteLength(text), SESSION);
+      expect(facts.model).toBe("claude-model-x");
+      expect(facts.tailCwd).toBe("/repo");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -744,6 +791,26 @@ describe("directory listings and stats", () => {
     expect(await listings.names(dir)).toEqual([]);
   });
 
+  it("re-reads a directory replaced by another with the same mtime", async () => {
+    const parent = await fs.mkdtemp(path.join(os.tmpdir(), "listing-swap-"));
+    const dir = path.join(parent, "project");
+    const other = path.join(parent, "restored");
+    await fs.mkdir(dir);
+    await fs.mkdir(other);
+    await fs.writeFile(path.join(dir, "a.jsonl"), "x");
+    await fs.writeFile(path.join(other, "b.jsonl"), "x");
+    const old = new Date(Date.now() - 60_000);
+    await fs.utimes(dir, old, old);
+    await fs.utimes(other, old, old);
+    const listings = new DirListings();
+    expect(await listings.names(dir)).toEqual(["a.jsonl"]);
+    await fs.rm(dir, { recursive: true });
+    await fs.rename(other, dir);
+    await fs.utimes(dir, old, old);
+    expect(await listings.names(dir)).toEqual(["b.jsonl"]);
+    await fs.rm(parent, { recursive: true, force: true });
+  });
+
   it("stats many files in order, bounded, and reports missing ones", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "stats-"));
     const files = await Promise.all(
@@ -761,5 +828,34 @@ describe("directory listings and stats", () => {
     expect(all[1500]).toBeUndefined();
     expect(again.map((stats) => stats?.size)).toEqual(files.slice(0, 10).map((_, i) => i % 7));
     await fs.rm(dir, { recursive: true, force: true });
+  });
+});
+
+describe("exact spelling lookup", () => {
+  it("lets the file system resolve the id as given, like the SDK", async () => {
+    const config = await fs.mkdtemp(path.join(os.tmpdir(), "si-spelling-"));
+    const previous = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = config;
+    try {
+      const dir = path.join(config, "projects", "-repo");
+      await fs.mkdir(dir, { recursive: true });
+      const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      const file = path.join(dir, `${id}.jsonl`);
+      await fs.writeFile(file, lines(user("hi", "2026-01-01T00:00:00.000Z")) + "\n");
+      const index = new SessionIndex(async () => undefined);
+      expect(await index.findTranscripts(id, { exactSpelling: true })).toEqual([file]);
+      const upper = id.toUpperCase();
+      const caseInsensitive = await fs
+        .stat(path.join(dir, `${upper}.jsonl`))
+        .then(() => true)
+        .catch(() => false);
+      expect(await index.findTranscripts(upper, { exactSpelling: true })).toEqual(
+        caseInsensitive ? [path.join(dir, `${upper}.jsonl`)] : [],
+      );
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previous;
+      await fs.rm(config, { recursive: true, force: true });
+    }
   });
 });

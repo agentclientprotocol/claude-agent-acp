@@ -150,7 +150,10 @@ export async function scanTranscriptFile(
       }
       // A wider tail ends with the same records: what the narrow one found
       // stays, and the wider one adds what lay before it.
-      const wider = scanTranscript({ head: read.head, tail }, sessionId, { wide: true });
+      const wider = scanTranscript({ head: read.head, tail }, sessionId, {
+        wide: true,
+        known: { model: facts.model, tailCwd: facts.tailCwd },
+      });
       const lastPromptAt = wider.lastPromptAt ?? facts.lastPromptAt;
       result = {
         ...wider,
@@ -290,7 +293,7 @@ function decodeJsonString(raw: string): string | undefined {
 export function scanTranscript(
   { head, tail }: HeadTail,
   sessionId: string,
-  options: { wide?: boolean } = {},
+  options: { wide?: boolean; known?: { model?: string; tailCwd?: string } } = {},
 ): TranscriptFacts {
   const facts: TranscriptFacts = {
     hasMessages: MESSAGE_MARKERS.some((marker) => head.includes(marker) || tail.includes(marker)),
@@ -310,17 +313,19 @@ export function scanTranscript(
   let messageFound = false;
   let promptFound = false;
   // A wide tail (see scanTranscriptFile) is searched for what the narrow
-  // one lacked: the last message, prompt and turn end. The model and the
-  // cwd come from the narrow tail only, so a long answer without them is
-  // not parsed line by line.
-  let modelFound = options.wide === true;
+  // one lacked: the last message, prompt and turn end, and the model and
+  // the cwd only when the narrow tail had none (its records can all be cut,
+  // e.g. one large tool result), so a long answer is not parsed line by line.
+  const wide = options.wide === true;
+  let modelFound = wide && options.known?.model !== undefined;
+  const searchCwd = !wide || options.known?.tailCwd === undefined;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line) continue;
     const isCost = line.includes('"cost-state"');
     const isTurnRecord =
       line.includes('"user"') || line.includes('"assistant"') || line.includes('"system"');
-    const hasCwd = !options.wide && facts.tailCwd === undefined && line.includes('"cwd"');
+    const hasCwd = searchCwd && facts.tailCwd === undefined && line.includes('"cwd"');
     if (!isCost && !isTurnRecord && !hasCwd) continue;
     // Everything has been found: stop parsing.
     if (costFound && turnEndFound && messageFound && promptFound && modelFound && !hasCwd) break;
@@ -389,7 +394,7 @@ function hasType(line: string, type: string): boolean {
  *  result, or one that carries an image or a document. */
 function mayBePrompt(line: string): boolean {
   if (!hasType(line, "user")) return false;
-  return !line.includes('"tool_result"') || hasType(line, "image") || hasType(line, "document");
+  return !hasType(line, "tool_result") || hasType(line, "image") || hasType(line, "document");
 }
 
 /** Whether a line may end a turn (see {@link turnEffect}). */

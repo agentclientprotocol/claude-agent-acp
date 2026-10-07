@@ -56,6 +56,9 @@ export const MAX_LIST_LIMIT = 200;
 /** Entries of the metadata cache: a few hundred bytes each, so the
  *  transcripts of a large history (tens of thousands) stay cached and deep
  *  pages do not read them again. */
+/** The most a change hint reads of what was appended to a transcript
+ *  since a list read it; a larger append counts as a change. */
+const MAX_APPENDED_READ = 1024 * 1024;
 const METADATA_CACHE_SIZE = 50_000;
 const READ_BATCH_SIZE = 16;
 /** Transcripts read at most per directory to recover a sibling's cwd. */
@@ -76,6 +79,8 @@ export type TranscriptCandidate = {
   projectPath?: string;
   mtimeMs: number;
   size: number;
+  /** Tells a replaced file from one that grew. */
+  ino: number;
 };
 
 /** The cached metadata of one transcript. */
@@ -123,7 +128,12 @@ export type GetSessionInfo = (
   options: { dir?: string },
 ) => Promise<SDKSessionInfo | undefined>;
 
-type CacheEntry = { mtimeMs: number; size: number; metadata: TranscriptMetadata | null };
+type CacheEntry = {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+  metadata: TranscriptMetadata | null;
+};
 
 /** A small LRU: a `Map` keeps insertion order, and a hit is re-inserted. */
 class Lru<K, V> {
@@ -367,6 +377,7 @@ export class SessionIndex {
         projectPath,
         mtimeMs: fileStats.mtimeMs,
         size: fileStats.size,
+        ino: fileStats.ino,
       });
     });
     const bySession = new Map<string, TranscriptCandidate>();
@@ -416,11 +427,22 @@ export class SessionIndex {
     options: { includeEmpty?: boolean; exactSpelling?: boolean } = {},
   ): Promise<string[]> {
     if (!isSessionId(sessionId)) return [];
+    if (options.exactSpelling) {
+      // The id as given, resolved by the file system like the SDK does (a
+      // case-insensitive one finds another spelling too).
+      const root = projectsRoot();
+      const candidates = (await this.listings.names(root)).map((dirName) =>
+        path.join(root, dirName, `${sessionId}.jsonl`),
+      );
+      const stats = await statFiles(candidates);
+      return candidates.filter((_, i) => {
+        const found = stats[i];
+        return found?.isFile() && (found.size > 0 || options.includeEmpty);
+      });
+    }
     const { transcripts } = await this.scanSession(sessionId);
-    const wanted = `${sessionId}.jsonl`;
     return transcripts
       .filter(({ size }) => size > 0 || options.includeEmpty)
-      .filter(({ filePath }) => !options.exactSpelling || path.basename(filePath) === wanted)
       .map(({ filePath }) => filePath);
   }
 
@@ -525,20 +547,47 @@ export class SessionIndex {
 
   /** The `sessionId:mtime:size` of every transcript that a list of `cwd`
    *  shows, archived or not, for the change hint: a transcript of another
-   *  path that shares a project directory does not count. Nothing is read:
-   *  the cwd of a transcript is the one an earlier list learned (a later
-   *  append does not change it), and a transcript no list read yet counts. */
+   *  path that shares a project directory does not count. The cwd of a
+   *  transcript is the one an earlier list learned; of one that grew since,
+   *  only the appended bytes are read, for a relocation. A transcript no
+   *  list read yet counts. */
   async scopeFingerprint(cwd: string, includeWorktrees: boolean): Promise<string[]> {
     const paths = await this.listedPaths(cwd, includeWorktrees);
     const inScope = scopeOf(paths);
     const parts = await Promise.all(
       (await this.enumerate(paths)).map(async (candidate) => {
-        const rowCwd = this.metadata.peek(candidate.filePath)?.metadata?.fileCwd;
+        const rowCwd = await this.knownCwd(candidate);
         if (rowCwd && !(await inScope(rowCwd))) return undefined;
         return `${candidate.sessionId}:${candidate.mtimeMs}:${candidate.size}`;
       }),
     );
     return parts.filter((part): part is string => part !== undefined).sort();
+  }
+
+  /** The cwd an earlier list learned of `candidate`, followed by a
+   *  relocation appended since; undefined when unknown. */
+  private async knownCwd(candidate: TranscriptCandidate): Promise<string | undefined> {
+    const cached = this.metadata.peek(candidate.filePath);
+    const learned = cached?.metadata?.fileCwd;
+    if (!cached || !learned || cached.ino !== candidate.ino || candidate.size < cached.size) {
+      return undefined;
+    }
+    if (candidate.size === cached.size) {
+      return cached.mtimeMs === candidate.mtimeMs ? learned : undefined;
+    }
+    if (candidate.size - cached.size > MAX_APPENDED_READ) return undefined;
+    try {
+      const handle = await fs.open(candidate.filePath, "r");
+      try {
+        const bytes = Buffer.allocUnsafe(candidate.size - cached.size);
+        const { bytesRead } = await handle.read(bytes, 0, bytes.length, cached.size);
+        return relocatedCwd(bytes.subarray(0, bytesRead).toString("utf8")) ?? learned;
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -548,7 +597,8 @@ export class SessionIndex {
     if (
       !cached?.metadata ||
       cached.mtimeMs !== candidate.mtimeMs ||
-      cached.size !== candidate.size
+      cached.size !== candidate.size ||
+      cached.ino !== candidate.ino
     ) {
       return false;
     }
@@ -616,7 +666,12 @@ export class SessionIndex {
 
   private async metadataOf(candidate: TranscriptCandidate): Promise<TranscriptMetadata | null> {
     const cached = this.metadata.get(candidate.filePath);
-    if (cached && cached.mtimeMs === candidate.mtimeMs && cached.size === candidate.size) {
+    if (
+      cached &&
+      cached.mtimeMs === candidate.mtimeMs &&
+      cached.size === candidate.size &&
+      cached.ino === candidate.ino
+    ) {
       if (cached.metadata?.fileCwd) this.dirCwds.set(candidate.dirName, cached.metadata.fileCwd);
       return cached.metadata;
     }
@@ -626,7 +681,7 @@ export class SessionIndex {
       // prompt.
       metadata = await this.readMetadata(
         candidate,
-        cached
+        cached && cached.ino === candidate.ino
           ? {
               size: cached.size,
               lastPromptAt: cached.metadata?.facts.lastPromptAt,
@@ -641,6 +696,7 @@ export class SessionIndex {
     this.metadata.set(candidate.filePath, {
       mtimeMs: candidate.mtimeMs,
       size: candidate.size,
+      ino: candidate.ino,
       metadata,
     });
     return metadata;

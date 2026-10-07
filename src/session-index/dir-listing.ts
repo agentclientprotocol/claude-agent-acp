@@ -62,6 +62,8 @@ export function statFiles(filePaths: readonly string[]): Promise<(fs.Stats | und
 
 type Listing = {
   mtimeMs: number;
+  /** A directory replaced by another one with the same mtime differs here. */
+  ino: number;
   /** When the listing was read. */
   readAt: number;
   names: string[];
@@ -115,12 +117,13 @@ export class DirListings {
   private async listing(dir: string, stats: fs.Stats | undefined): Promise<Listing> {
     if (!stats?.isDirectory()) {
       this.listings.delete(dir);
-      return { mtimeMs: 0, readAt: 0, names: [] };
+      return { mtimeMs: 0, ino: 0, readAt: 0, names: [] };
     }
     const cached = this.listings.get(dir);
     if (
       cached &&
       cached.mtimeMs === stats.mtimeMs &&
+      cached.ino === stats.ino &&
       cached.readAt - cached.mtimeMs > MTIME_RESOLUTION_MS
     ) {
       return cached;
@@ -130,9 +133,9 @@ export class DirListings {
     try {
       names = await fs.promises.readdir(dir);
     } catch {
-      return { mtimeMs: 0, readAt, names: [] };
+      return { mtimeMs: 0, ino: 0, readAt, names: [] };
     }
-    const listing: Listing = { mtimeMs: stats.mtimeMs, readAt, names };
+    const listing: Listing = { mtimeMs: stats.mtimeMs, ino: stats.ino, readAt, names };
     this.listings.set(dir, listing);
     return listing;
   }
