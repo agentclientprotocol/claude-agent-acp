@@ -110,7 +110,11 @@ describe("EventLoopYielder", () => {
     for (let i = 0; i < 5; i++) {
       expect(yielder.maybeYield()).toBeUndefined();
       time += 20;
+      // A wait on I/O lets the event loop run its phases. A timer alone can
+      // resume within the same timers phase on a slow machine, before the
+      // check phase that ends the slice, so the wait ends in that phase.
       await new Promise((resolve) => setTimeout(resolve, 1));
+      await new Promise((resolve) => setImmediate(resolve));
     }
   });
 });
