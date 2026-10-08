@@ -885,6 +885,14 @@ describe("ACP v2 prompts", () => {
     await client.app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // Drain session/new's deferred commands update before measuring replay.
+      await vi.waitFor(() =>
+        expect(
+          client.sessionUpdates.some(
+            ({ update }) => update.sessionUpdate === "available_commands_update",
+          ),
+        ).toBe(true),
+      );
       vi.mocked(getSessionMessages).mockResolvedValueOnce([
         transcriptEntry("user", "prompt-uuid", { role: "user", content: text("count") }),
         {
