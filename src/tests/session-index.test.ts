@@ -471,6 +471,32 @@ describe("session/list of a sessionIndex client", () => {
     expect(all.sessions.map((s) => s.cwd)).toEqual([workspace, workspace]);
   });
 
+  it("recovers a cwd from a sibling that the archive filter leaves out", async () => {
+    const other = path.join(workspace, "other");
+    const withCwd = await writeTranscript({ cwd: other, lastMessageAt: base });
+    const noCwd = await writeTranscript({
+      cwd: other,
+      recordCwd: null,
+      lastMessageAt: base - 1000,
+    });
+    const rows = (page: { sessions: { sessionId: string; cwd: string }[] }) =>
+      page.sessions.map((s) => [s.sessionId, s.cwd]);
+
+    // The cwd-less session is archived, its sibling is not.
+    const archiving = await indexAgent();
+    await archiving.agent.archiveSession({ sessionId: noCwd.id });
+    const archivedOnly = await (
+      await indexAgent()
+    ).agent.listSessions({ _meta: listMeta({ archived: "archived" }) });
+    expect(rows(archivedOnly)).toEqual([[noCwd.id, other]]);
+
+    // And the reverse: the sibling with the cwd is archived.
+    await archiving.agent.unarchiveSession({ sessionId: noCwd.id });
+    await archiving.agent.archiveSession({ sessionId: withCwd.id });
+    const unarchivedOnly = await (await indexAgent()).agent.listSessions({});
+    expect(rows(unarchivedOnly)).toEqual([[noCwd.id, other]]);
+  });
+
   it("reports the row fields of the RFDs, flat", async () => {
     const parent = randomUUID();
     const session = await writeTranscript({
@@ -1823,9 +1849,11 @@ describe("archive state (ACP RFD #2161)", () => {
     const { agent } = await indexAgent();
     await agent.archiveSession({ sessionId: session.id });
     await agent.deleteSession({ sessionId: session.id });
-    expect(
-      (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "all" }) })).sessions,
-    ).toEqual([]);
+    for (const archived of ["all", "archived"]) {
+      expect(
+        (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived }) })).sessions,
+      ).toEqual([]);
+    }
     await expect(agent.unarchiveSession({ sessionId: session.id })).rejects.toMatchObject({
       code: -32002,
     });

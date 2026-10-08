@@ -510,7 +510,16 @@ export class SessionIndex {
       : undefined;
     const inScope = scopeOf(paths);
     const after = query.after;
-    const candidates = (await this.enumerate(paths))
+    const enumerated = (await this.enumerate(paths)).sort((a, b) =>
+      a.mtimeMs !== b.mtimeMs
+        ? b.mtimeMs - a.mtimeMs
+        : a.sessionId < b.sessionId
+          ? -1
+          : a.sessionId > b.sessionId
+            ? 1
+            : 0,
+    );
+    const candidates = enumerated
       .filter((candidate) =>
         archivedFilterKeeps(
           query.archived,
@@ -519,16 +528,7 @@ export class SessionIndex {
       )
       // A page after a cursor skips, without reading them, the transcripts
       // whose cached order key puts them before the cursor.
-      .filter((candidate) => !after || !this.cachedBefore(candidate, after))
-      .sort((a, b) =>
-        a.mtimeMs !== b.mtimeMs
-          ? b.mtimeMs - a.mtimeMs
-          : a.sessionId < b.sessionId
-            ? -1
-            : a.sessionId > b.sessionId
-              ? 1
-              : 0,
-      );
+      .filter((candidate) => !after || !this.cachedBefore(candidate, after));
     // One row more than the page tells whether a next page exists, so a
     // cursor never leads to an empty page.
     const wanted = query.limit + 1;
@@ -584,10 +584,12 @@ export class SessionIndex {
     }
     if (pending.length > 0) {
       // A row recovered after the scan stopped still sorts into the page: it
-      // was read before the stop, and more rows only raise the bound.
+      // was read before the stop, and more rows only raise the bound. A
+      // sibling that the archive filter or the cursor leaves out may still
+      // supply the cwd.
       await this.learnDirCwds(
         new Set(pending.map(({ candidate }) => candidate.dirName)),
-        candidates.filter((candidate) => !read.has(candidate)),
+        enumerated.filter((candidate) => !read.has(candidate)),
       );
       await settlePending();
     }
