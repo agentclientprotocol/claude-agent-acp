@@ -1,0 +1,6 @@
+Use the Agent tool with run_in_background: true to launch one general-purpose subagent. Give the subagent exactly these instructions:
+
+"Start this command with the Bash tool and run_in_background: true: for i in $(seq 1 30); do echo $i; sleep 1; done
+Do NOT wait for it: do not read its output, do not sleep, do not poll, do not call any other tool. Immediately end your turn by replying only: started. When you are later notified that the command finished, read its output file and reply with the last number it printed."
+
+After launching the subagent, do not wait for it and do not check on it: end your own turn immediately by replying only: launched.

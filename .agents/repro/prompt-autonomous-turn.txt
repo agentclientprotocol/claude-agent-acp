@@ -1,0 +1,9 @@
+Do not use any subagents. Start this command with the Bash tool and run_in_background: true:
+for i in $(seq 1 20); do echo $i; sleep 1; done
+Then end your turn immediately by replying only: started. Do not wait for it, do not read its output, do not sleep, do not poll.
+
+Later, when you are notified that the background command finished, do these steps in order, each as a separate foreground Bash call (no run_in_background):
+1. tail -n 1 on its output file
+2. sleep 30 && echo slept
+3. echo done
+Then reply with the last number the command printed.
