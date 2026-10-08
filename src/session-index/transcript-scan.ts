@@ -34,6 +34,9 @@ export type TranscriptFacts = {
   turnState?: TurnState;
   /** Time the last ended turn ended, epoch ms. */
   lastTurnEndedAt?: number;
+  /** The last turn ended with an API error (an `isApiErrorMessage`
+   *  assistant record), not a user interrupt, and nothing came after it. */
+  lastTurnError?: boolean;
   /** `totalCostUSD` of the last valid `cost-state` record of this session. */
   costUsd?: number;
   /** The first `cwd` of the head. */
@@ -332,6 +335,8 @@ export function scanTranscript(
   let turnEndFound = false;
   let messageFound = false;
   let promptFound = false;
+  /** The last turn ended: is its end an API error? */
+  let checkingTurnError = false;
   // A wide tail (see scanTranscriptFile) is searched for what the narrow
   // one lacked: the last message, prompt and turn end, and the model and
   // the cwd only when the narrow tail had none (its records can all be cut,
@@ -348,7 +353,17 @@ export function scanTranscript(
     const hasCwd = searchCwd && facts.tailCwd === undefined && line.includes('"cwd"');
     if (!isCost && !isTurnRecord && !hasCwd) continue;
     // Everything has been found: stop parsing.
-    if (costFound && turnEndFound && messageFound && promptFound && modelFound && !hasCwd) break;
+    if (
+      costFound &&
+      turnEndFound &&
+      messageFound &&
+      promptFound &&
+      modelFound &&
+      !checkingTurnError &&
+      !hasCwd
+    ) {
+      break;
+    }
     // Once the last message and the turn state are known, only a line that
     // can still tell something is parsed: lines are often large (tool
     // results, long answers), and a long tail has thousands of them.
@@ -359,7 +374,8 @@ export function scanTranscript(
       !(isCost && !costFound) &&
       !(!promptFound && mayBePrompt(line)) &&
       !(!modelFound && hasType(line, "assistant")) &&
-      !(!turnEndFound && mayEndTurn(line))
+      !(!turnEndFound && mayEndTurn(line)) &&
+      !(checkingTurnError && isTurnRecord)
     ) {
       continue;
     }
@@ -397,7 +413,20 @@ export function scanTranscript(
     }
     const effect = turnEffect(entry);
     if (effect === undefined) continue;
-    if (facts.turnState === undefined) facts.turnState = effect;
+    if (facts.turnState === undefined) {
+      facts.turnState = effect;
+      checkingTurnError = effect === "finished";
+    }
+    if (checkingTurnError) {
+      // The record that ended the last turn, behind the CLI's turn-end
+      // system records: an API error is an error.
+      if (entry.type === "assistant" && entry.isApiErrorMessage === true) {
+        facts.lastTurnError = true;
+        checkingTurnError = false;
+      } else if (entry.type !== "system") {
+        checkingTurnError = false;
+      }
+    }
     if (effect === "finished" && !turnEndFound) {
       turnEndFound = true;
       facts.lastTurnEndedAt = timestampOf(entry);

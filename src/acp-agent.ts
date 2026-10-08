@@ -4798,6 +4798,11 @@ export class ClaudeAcpAgent {
       error: unknown,
       title?: string,
     ) => {
+      if (!session.cancelled) {
+        // The turn ends with an error: its list row shows `error`.
+        session.lastTurnFailed = true;
+        this.sessionIndex.onOwnSessionChanged(params.sessionId);
+      }
       if (session.activeTurn && !session.activeTurn.settled) {
         await compaction.interrupt();
       }
@@ -5284,6 +5289,7 @@ export class ClaudeAcpAgent {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
                 sessionIndex.noteSessionState(session, previousState, message.state);
+                if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
                 this.sessionIndex.onOwnSessionChanged(params.sessionId);
                 if (
                   message.state === "running" &&
@@ -6385,6 +6391,12 @@ export class ClaudeAcpAgent {
                 break;
               }
 
+              // An error result ends the turn with an error, unless it was
+              // cancelled: the session's list row shows `error` once idle.
+              session.lastTurnFailed =
+                !session.cancelled && (message.is_error || message.subtype !== "success");
+              this.sessionIndex.onOwnSessionChanged(params.sessionId);
+
               if (!message.is_error && lastAssistantModel !== null) {
                 const activeTurnId = session.activeTurn?.promptUuid;
                 await sessionFailures.clear(
@@ -7215,6 +7227,10 @@ export class ClaudeAcpAgent {
       // inline via failActive and never reach here. Reject every in-flight turn;
       // if the process is gone, tear the session down so the client starts fresh.
       const message = error instanceof Error ? error.message : String(error);
+      if (!session.cancelled) {
+        session.lastTurnFailed = true;
+        this.sessionIndex.onQueryFailed(params.sessionId);
+      }
       const processDied =
         error instanceof Error &&
         (message.includes("ProcessTransport") ||

@@ -1096,6 +1096,69 @@ describe("_session/list/subscribe", () => {
     await agent.dispose();
   }, 60_000);
 
+  it("sends the error state of a turn that ended with an API error, and clears it", async () => {
+    const session = await writeTranscript({});
+    const { rowsOf, agent } = await subscribedAgent();
+    await fs.appendFile(
+      session.file,
+      JSON.stringify({
+        type: "assistant",
+        sessionId: session.id,
+        cwd: workspace,
+        uuid: randomUUID(),
+        timestamp: new Date().toISOString(),
+        isApiErrorMessage: true,
+        message: { role: "assistant", content: [{ type: "text", text: "API Error" }] },
+      }) + "\n",
+    );
+    const state = (value: string) => () =>
+      rowsOf(session.id).some((row) => airRow(row).state === value);
+    expect(await waitFor(state("error"))).toBe(true);
+    const listed = await agent.listSessions({ cwd: workspace });
+    expect(airRow(listed.sessions[0]!).state).toBe("error");
+    await fs.appendFile(session.file, promptRecord(session.id, "Try again") + "\n");
+    expect(await waitFor(() => airRow(rowsOf(session.id).at(-1)!).state === "idle")).toBe(true);
+    await agent.dispose();
+  });
+
+  it("keeps the error of a query that failed here after it closes", async () => {
+    const session = await writeTranscript({});
+    const { rowsOf, agent } = await subscribedAgent();
+    const loaded = mockSessionState({}, agent, session.id) as any;
+    loaded.lastSessionState = "running";
+    loaded.input = { end: () => {} };
+    loaded.query = { close: () => {} };
+    agent.sessions[session.id] = loaded;
+    (agent as any).sessionIndex.onQueryFailed(session.id);
+    (agent as any).closeQueryStream(loaded);
+    const last = () => rowsOf(session.id).at(-1);
+    expect(await waitFor(() => last() !== undefined && airRow(last()!).state === "error")).toBe(
+      true,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(airRow(last()!).state).toBe("error");
+    const listed = await agent.listSessions({ cwd: workspace });
+    expect(airRow(listed.sessions[0]!).state).toBe("error");
+    // Loaded again: still the failure until a turn starts.
+    const reloaded = mockSessionState({}, agent, session.id) as any;
+    reloaded.lastSessionState = "idle";
+    agent.sessions[session.id] = reloaded;
+    const relisted = async () =>
+      airRow((await agent.listSessions({ cwd: workspace })).sessions[0]!).state;
+    expect(await relisted()).toBe("error");
+    (agent as any).sessionIndex.onTurnStarted(session.id);
+    expect(await relisted()).toBe("idle");
+    delete agent.sessions[session.id];
+    await agent.dispose();
+  });
+
+  it("clears the failed turn of a session that runs here when a new turn starts", async () => {
+    const { noteSessionState } = await import("../session-index/connection.js");
+    const session = { lastTurnFailed: true } as any;
+    noteSessionState(session, "idle", "running");
+    expect(session.lastTurnFailed).toBe(false);
+  });
+
   it("sends the SDK state of a session this connection runs at once, and its close", async () => {
     const session = await writeTranscript({});
     const { rowsOf, agent } = await subscribedAgent();

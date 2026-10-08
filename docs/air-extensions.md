@@ -1266,11 +1266,11 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 - `lastPromptAt` is the time of the last real user prompt in the transcript tail: prompt text (the predicate of the SDK title extractor) or an image or a document, but not a tool result, a meta or compact summary record, a slash command or an interrupt. When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
 - `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
 - `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
-- `state` is `running`, `idle`, or `requires_action`, never `unknown`:
-  - a session this connection runs: the SDK `session_state_changed` state;
-  - a session no live Claude Code process holds: `idle`;
-  - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`;
-  - any other held session: `idle` after a finished turn (an assistant `end_turn`, an API error, a user interrupt, or the CLI turn-end records), `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
+- `state` is `running`, `idle`, `requires_action`, or `error`, never `unknown`. `error` means the session is not running and its last turn ended with an error; a user cancel or interrupt is no error, and a new turn clears it:
+  - a session this connection runs: the SDK `session_state_changed` state; `error` instead of `idle` when its last turn failed (an error result, `is_error` or an `error_*` subtype, that was not a cancel). A session whose query failed here (not a cancel) is reported as any other session, but `error` until its transcript shows a prompt or a turn end after the failure, unless a busy or waiting interactive CLI holds it;
+  - a session no live Claude Code process holds: `idle`, or `error` when its last turn ended with an API error (an assistant record with `isApiErrorMessage: true`, also when the CLI's turn-end records follow it, with no prompt after it);
+  - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`, or `error` after such an API error;
+  - any other held session: `idle` after a finished turn (an assistant `end_turn`, a user interrupt, or the CLI turn-end records), `error` after a turn that ended with an API error, `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
 - The live processes come from `<config>/sessions/<pid>.json`, with the liveness rules of Claude Desktop: `kill(pid, 0)` (or `EPERM`), a matching `procStart`, no foreign `pidDomain`, and records older than 24 hours only with a matching `procStart`.
   The adapter never reads the `.key` files there and never changes the directory.
 - `lastTurnEndedAt` is when the last turn ended.
@@ -1401,21 +1401,21 @@ It is idempotent, and an unknown id also returns `{}`.
 The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
 Names and semantics follow them; the transport differs, and so does the `archived` list filter (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
 
-| Extension                                                                                         | RFD                                                |
-| ------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
-| capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`                   |
-| capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)              |
-| capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)             |
-| `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                             |
-| `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                  |
-| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there |
-| row `_meta.jetbrains.air.lastPromptAt`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names             |
-| row `_meta.jetbrains.air.archived`                                                                | `SessionInfo.archived` (#2161)                     |
-| `session_info_update` `_meta.jetbrains.air.archived`                                              | `SessionInfoUpdate.archived` (#2161)               |
-| capability `sessionListSubscribe`, `_session/list/subscribe`, `_session/list/unsubscribe`         | none                                               |
-| `_session/list/changes { subscriptionId, sessions, removed }`                                     | none                                               |
-| `_session/archive`, `_session/unarchive`                                                          | `session/archive`, `session/unarchive` (#2161)     |
-| `_session/rename`                                                                                 | `session/set_title` (#1987)                        |
+| Extension                                                                                         | RFD                                                                    |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`                                       |
+| capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)                                  |
+| capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)                                 |
+| `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                 |
+| `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                      |
+| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                     |
+| row `_meta.jetbrains.air.lastPromptAt`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names; the RFD `state` has no `error` |
+| row `_meta.jetbrains.air.archived`                                                                | `SessionInfo.archived` (#2161)                                         |
+| `session_info_update` `_meta.jetbrains.air.archived`                                              | `SessionInfoUpdate.archived` (#2161)                                   |
+| capability `sessionListSubscribe`, `_session/list/subscribe`, `_session/list/unsubscribe`         | none                                                                   |
+| `_session/list/changes { subscriptionId, sessions, removed }`                                     | none                                                                   |
+| `_session/archive`, `_session/unarchive`                                                          | `session/archive`, `session/unarchive` (#2161)                         |
+| `_session/rename`                                                                                 | `session/set_title` (#1987)                                            |
 
 ### Relation to ACP RFD #2161
 

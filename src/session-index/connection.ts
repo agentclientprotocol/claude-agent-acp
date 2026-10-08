@@ -65,6 +65,9 @@ export type SessionIndexFields = {
   /** When the last turn ended (the last `session_state_changed: idle`), epoch
    *  ms. Reported as `lastTurnEndedAt` in the session index. */
   lastTurnEndedAt?: number;
+  /** The last turn failed with an error, not a cancel; a new turn clears
+   *  it. Reported as the `error` state in the session index. */
+  lastTurnFailed?: boolean;
   /** `total_cost_usd` of the last result, reported as the cost of the session
    *  in the session index. */
   lastTotalCostUsd?: number;
@@ -80,6 +83,7 @@ export function noteSessionState(
   state: Session["lastSessionState"],
 ): void {
   if (state === "idle" && previous !== "idle") session.lastTurnEndedAt = Date.now();
+  if (state === "running" && previous !== "running") session.lastTurnFailed = false;
 }
 
 /** What the connection needs from the agent. */
@@ -111,6 +115,8 @@ export class SessionIndexConnection {
    *  id: the session index takes a lone registry holder whose parent it
    *  cannot tell for that CLI while it exits. */
   readonly closedCliSessions = new Map<string, number>();
+  /** When the query of a session failed here, by lower-case id. */
+  private readonly failedQueries = new Map<string, number>();
 
   constructor(private readonly host: SessionIndexHost) {}
 
@@ -157,6 +163,22 @@ export class SessionIndexConnection {
 
   dispose(): void {
     this.service?.dispose();
+  }
+
+  /** The query of a session that ran here failed (not a cancel): its row
+   *  shows `error` until its transcript changes. */
+  onQueryFailed(sessionId: string): void {
+    this.failedQueries.set(sessionId.toLowerCase(), Date.now());
+    if (this.failedQueries.size > 1024) {
+      this.failedQueries.delete(this.failedQueries.keys().next().value as string);
+    }
+    this.service?.ownSessionChanged(sessionId);
+  }
+
+  /** A turn of a session started here: an earlier failed query of it no
+   *  longer counts. */
+  onTurnStarted(sessionId: string): void {
+    this.failedQueries.delete(sessionId.toLowerCase());
   }
 
   onTeardown(sessionId: string): void {
@@ -370,10 +392,16 @@ export class SessionIndexConnection {
   /** What the session index reports for a session this connection runs. */
   private ownSessionState(sessionId: string): OwnSessionState | undefined {
     const session = this.host.agent.sessions[sessionId];
-    if (!session || session.queryClosed) return undefined;
+    if (!session || session.queryClosed) {
+      const failedAt = this.failedQueries.get(sessionId.toLowerCase());
+      return failedAt === undefined ? undefined : { queryFailedAt: failedAt };
+    }
     return {
       state: session.lastSessionState,
       lastTurnEndedAt: session.lastTurnEndedAt,
+      // A session loaded again after its query failed here shows the failure
+      // until a turn of it starts.
+      lastTurnFailed: session.lastTurnFailed || this.failedQueries.has(sessionId.toLowerCase()),
       costUsd: session.lastTotalCostUsd,
     };
   }

@@ -236,6 +236,91 @@ describe("activity", () => {
     });
   });
 
+  it("is error after a turn that ended with an API error, until a new turn", () => {
+    const errorFacts = scan(
+      lines(
+        user("hi", "2026-01-01T00:00:00Z"),
+        assistant(null, "2026-01-01T00:00:05Z", { isApiErrorMessage: true }),
+      ),
+    );
+    expect(errorFacts.lastTurnError).toBe(true);
+    const at = { transcriptMtimeMs: now, now };
+    expect(deriveActivity({ facts: errorFacts, ...at })?.state).toBe("error");
+    // A user interrupt is no error.
+    const interrupted = scan(
+      lines(
+        user("hi", "2026-01-01T00:00:00Z"),
+        user("[Request interrupted by user]", "2026-01-01T00:00:05Z"),
+      ),
+    );
+    expect(interrupted.lastTurnError).toBeUndefined();
+    expect(deriveActivity({ facts: interrupted, ...at })?.state).toBe("idle");
+    // A prompt after the error starts a new turn.
+    const again = scan(
+      lines(
+        user("hi", "2026-01-01T00:00:00Z"),
+        assistant(null, "2026-01-01T00:00:05Z", { isApiErrorMessage: true }),
+        user("again", "2026-01-01T00:00:09Z"),
+      ),
+    );
+    expect(again.lastTurnError).toBeUndefined();
+    expect(deriveActivity({ facts: again, ...at })?.state).toBe("idle");
+    // A busy or waiting CLI wins; an idle one shows the error.
+    const live = (status: string) => ({
+      pid: 1,
+      sessionId: "s",
+      kind: "interactive",
+      entrypoint: "cli",
+      status,
+      statusUpdatedAt: now,
+    });
+    const held = { facts: errorFacts, transcriptMtimeMs: now - 1, now };
+    expect(deriveActivity({ live: live("busy"), ...held })?.state).toBe("running");
+    expect(deriveActivity({ live: live("waiting"), ...held })?.state).toBe("requires_action");
+    expect(deriveActivity({ live: live("idle"), ...held })?.state).toBe("error");
+    // A session that runs here: its own failed turn, while idle.
+    expect(
+      deriveActivity({ own: { state: "idle", lastTurnFailed: true }, facts: facts(), ...at })
+        ?.state,
+    ).toBe("error");
+    expect(
+      deriveActivity({ own: { state: "running", lastTurnFailed: true }, facts: facts(), ...at })
+        ?.state,
+    ).toBe("running");
+    expect(deriveActivity({ own: { state: "idle" }, facts: errorFacts, ...at })?.state).toBe(
+      "idle",
+    );
+    // The API error behind the CLI's turn-end records.
+    const behindTurnEnd = scan(
+      lines(
+        user("hi", "2026-01-01T00:00:00Z"),
+        assistant(null, "2026-01-01T00:00:05Z", { isApiErrorMessage: true }),
+        { type: "system", subtype: "turn_duration", timestamp: "2026-01-01T00:00:06Z" },
+        { type: "system", subtype: "stop_hook_summary", timestamp: "2026-01-01T00:00:06Z" },
+      ),
+    );
+    expect(behindTurnEnd.lastTurnError).toBe(true);
+    // A query that failed here: error until the transcript changes, and a
+    // busy CLI still wins.
+    const unfinished = facts({ turnState: "unfinished" });
+    const failedHere = { own: { queryFailedAt: now }, facts: unfinished, now };
+    expect(deriveActivity({ ...failedHere, transcriptMtimeMs: now - 1 })?.state).toBe("error");
+    expect(deriveActivity({ ...failedHere, transcriptMtimeMs: now + 60_000 })?.state).toBe("error");
+    // A turn that ended after the failure (another process resumed it).
+    const resumed = facts({ turnState: "finished", lastTurnEndedAt: now + 2000 });
+    expect(
+      deriveActivity({
+        own: { queryFailedAt: now },
+        facts: resumed,
+        transcriptMtimeMs: now + 2000,
+        now,
+      })?.state,
+    ).toBe("idle");
+    expect(
+      deriveActivity({ ...failedHere, live: live("busy"), transcriptMtimeMs: now - 1 })?.state,
+    ).toBe("running");
+  });
+
   it("is idle when no live process holds the session", () => {
     expect(
       deriveActivity({ facts: facts({ turnState: "unfinished" }), transcriptMtimeMs: now, now }),
