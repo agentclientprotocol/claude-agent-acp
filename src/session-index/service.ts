@@ -602,61 +602,60 @@ export class SessionIndexService {
       let stored: string | undefined;
       // Every copy has the requested title: only then is a marker dropped.
       let complete: boolean;
-      try {
-        if (live) {
-          await this.assertNotHeldElsewhere(sessionId, "running");
-          const canonical = await canonicalPath(live.cwd);
-          const paths = [...new Set([live.cwd, canonical])];
-          const own: string[] = [];
-          for (const transcript of transcripts) {
-            if (await isTranscriptOf(transcript, paths)) own.push(transcript);
-          }
-          // The CLI writes the transcript of the resolved cwd.
-          const cli =
-            own.find((transcript) =>
-              isExactProjectDir(path.basename(path.dirname(transcript)), canonical),
-            ) ?? own[0];
-          const others = transcripts.filter((transcript) => transcript !== cli);
-          // The CLI writes the custom title of a rename before it answers,
-          // and the agent name after: while the last custom title of its
-          // transcript is the title last given to it, that title is current.
-          // A title changed otherwise since (a `/rename`) is read from the
-          // transcript.
-          const primary = cli ?? others[0];
-          const read = primary ? await copyTitles(primary) : undefined;
-          const given = live.stored();
-          const current =
-            read === undefined
-              ? (given ?? live.shown)
-              : given !== undefined && read.tailCustomTitle === given
-                ? given
-                : (read.title ?? given ?? live.shown);
-          stored = change(current, sessionId);
-          if (stored !== undefined) {
-            await live.rename(stored);
-            live.remember(stored);
-          } else if (cli) {
-            await alignSidecar(cli, current, sessionId);
-          }
-          try {
-            complete = (await this.titleCopies(others, change, true, options.sidecar)).complete;
-          } catch (error) {
-            complete = false;
-            this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
-          }
-        } else {
-          await this.assertNotHeldElsewhere(sessionId, options.ownCli);
-          const result = await this.titleCopies(
-            transcripts,
-            change,
-            options.ownCli === "running",
-            options.sidecar,
-          );
-          stored = result.first;
-          complete = result.complete;
+      // The cache is left as it is: the appended records change the size,
+      // and the next read keeps what the earlier scans found (a last prompt
+      // beyond the tail search).
+      if (live) {
+        await this.assertNotHeldElsewhere(sessionId, "running");
+        const canonical = await canonicalPath(live.cwd);
+        const paths = [...new Set([live.cwd, canonical])];
+        const own: string[] = [];
+        for (const transcript of transcripts) {
+          if (await isTranscriptOf(transcript, paths)) own.push(transcript);
         }
-      } finally {
-        this.index.invalidate(transcripts);
+        // The CLI writes the transcript of the resolved cwd.
+        const cli =
+          own.find((transcript) =>
+            isExactProjectDir(path.basename(path.dirname(transcript)), canonical),
+          ) ?? own[0];
+        const others = transcripts.filter((transcript) => transcript !== cli);
+        // The CLI writes the custom title of a rename before it answers,
+        // and the agent name after: while the last custom title of its
+        // transcript is the title last given to it, that title is current.
+        // A title changed otherwise since (a `/rename`) is read from the
+        // transcript.
+        const primary = cli ?? others[0];
+        const read = primary ? await copyTitles(primary) : undefined;
+        const given = live.stored();
+        const current =
+          read === undefined
+            ? (given ?? live.shown)
+            : given !== undefined && read.tailCustomTitle === given
+              ? given
+              : (read.title ?? given ?? live.shown);
+        stored = change(current, sessionId);
+        if (stored !== undefined) {
+          await live.rename(stored);
+          live.remember(stored);
+        } else if (cli) {
+          await alignSidecar(cli, current, sessionId);
+        }
+        try {
+          complete = (await this.titleCopies(others, change, true, options.sidecar)).complete;
+        } catch (error) {
+          complete = false;
+          this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
+        }
+      } else {
+        await this.assertNotHeldElsewhere(sessionId, options.ownCli);
+        const result = await this.titleCopies(
+          transcripts,
+          change,
+          options.ownCli === "running",
+          options.sidecar,
+        );
+        stored = result.first;
+        complete = result.complete;
       }
       if (options.dropMarker && complete) await removeArchiveMarker(sessionId);
       return stored;

@@ -3072,3 +3072,35 @@ describe("archive in AIR's title format, round three", () => {
     expect(after!.updatedAt).toBe(before!.updatedAt);
   });
 });
+
+describe("archive of a long session", () => {
+  it("keeps a last prompt that only an earlier scan could see", async () => {
+    const at = Date.parse("2026-03-01T00:00:00Z");
+    const session = await writeTranscript({ lastMessageAt: at });
+    const record = (i: number, size: number) =>
+      JSON.stringify({
+        type: "assistant",
+        sessionId: session.id,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "z".repeat(size) }],
+          stop_reason: "end_turn",
+        },
+        timestamp: new Date(at + 1000 + i).toISOString(),
+      }) + "\n";
+    // Grows past the 4 MB search in steps the tail window covers, listed in
+    // between, so the prompt is known from the earlier scans only.
+    await fs.appendFile(session.file, record(0, 4 * 1024 * 1024 - 100 * 1024));
+    const { agent } = await indexAgent();
+    const list = async (archived = "all") =>
+      (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived }) })).sessions[0]!;
+    const lastPromptAt = (row: any) => row._meta.jetbrains.air.lastPromptAt;
+    expect(lastPromptAt(await list())).toBe(new Date(at - 1000).toISOString());
+    for (let i = 1; i <= 6; i++) {
+      await fs.appendFile(session.file, record(i, 30 * 1024));
+      expect(lastPromptAt(await list())).toBe(new Date(at - 1000).toISOString());
+    }
+    await agent.archiveSession({ sessionId: session.id });
+    expect(lastPromptAt(await list("archived"))).toBe(new Date(at - 1000).toISOString());
+  });
+});
