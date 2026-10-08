@@ -79,13 +79,15 @@ async function readTail(handle: fs.FileHandle, size: number, window: number): Pr
   return newline >= 0 ? raw.slice(newline + 1) : "";
 }
 
-/** The first and the last 64 KB of `filePath`. The tail is the head for a
- *  file that fits in one chunk. */
+/** The first and the last 64 KB of the first `size` bytes of `filePath`:
+ *  what was appended after the file was stat'ed is not read, so the result
+ *  matches the size it is cached by. The tail is the head for a file that
+ *  fits in one chunk. */
 export async function readHeadTail(filePath: string, size: number): Promise<HeadTail> {
   const handle = await fs.open(filePath, "r");
   try {
     const buffer = Buffer.allocUnsafe(CHUNK_SIZE);
-    const first = await handle.read(buffer, 0, CHUNK_SIZE, 0);
+    const first = await handle.read(buffer, 0, Math.min(CHUNK_SIZE, size), 0);
     const head = buffer.toString("utf8", 0, first.bytesRead);
     if (size <= CHUNK_SIZE) return { head, tail: head };
     return { head, tail: await readTail(handle, size, CHUNK_SIZE) };

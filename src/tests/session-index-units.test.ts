@@ -27,6 +27,7 @@ import {
   continuedInSessionId,
   effectiveTranscriptTitle,
   lastAgentName,
+  readHeadTail,
   scanTranscript,
   scanTranscriptFile,
   transcriptTitle,
@@ -82,6 +83,16 @@ describe("project directory encoding", () => {
 });
 
 describe("transcript scan", () => {
+  it("reads a small transcript only up to the size it was stat'ed at", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "head-tail-"));
+    const file = path.join(dir, "t.jsonl");
+    await fs.writeFile(file, "first\n");
+    const { size } = await fs.stat(file);
+    await fs.appendFile(file, "appended later\n");
+    expect(await readHeadTail(file, size)).toEqual({ head: "first\n", tail: "first\n" });
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("sees a finished turn at an assistant end_turn", () => {
     const facts = scan(
       lines(user("hi", "2026-01-01T00:00:00Z"), assistant("end_turn", "2026-01-01T00:00:05Z")),
