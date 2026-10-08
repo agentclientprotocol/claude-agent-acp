@@ -1200,7 +1200,10 @@ The new methods answer it with `-32601`.
   "cursor": null,
   "_meta": {
     "jetbrains": {
-      "air": { "version": 1, "list": { "limit": 50, "includeWorktrees": false, "archived": false } }
+      "air": {
+        "version": 1,
+        "list": { "limit": 50, "includeWorktrees": false, "archived": "unarchived" }
+      }
     }
   }
 }
@@ -1211,7 +1214,8 @@ The new methods answer it with `-32601`.
   Without it, `cwd` matches exactly (after resolving symlinks, as the CLI does): a session of another path that shares the project directory name (`/ws/app.v2` and `/ws/app-v2`, `/a/b` and `/a-b`) is not listed.
   With `true`, the page also holds the sessions of the same subdirectory of `cwd` in every other existing worktree of its repository, as the Codex TUI expands a cwd: for `/repo/packages/a`, `/wt1/packages/a` if that directory exists. For a cwd at a worktree root, that is the worktree roots.
 - `archived` and `includeWorktrees` treat `null` as omitted.
-- `archived` is a boolean. Omitted, `null` or `false` lists the unarchived sessions only; `true` lists the unarchived and the archived ones together, in one order. Another value is `-32602`.
+- `archived` is one of three strings: `"unarchived"` lists the unarchived sessions only, `"archived"` the archived sessions only, and `"all"` both together, in one order.
+  Omitted or `null` is `"unarchived"`. Another value, a boolean included, is `-32602`.
   The filter applies before pagination.
 - Without `cwd` the page holds the sessions of all projects.
 
@@ -1219,7 +1223,7 @@ The new methods answer it with `-32601`.
 
 - Rows are ordered by the last user activity descending, then by session id: `lastPromptAt`, else `updatedAt` for a row without it.
   A session the agent kept working on after the last prompt does not move up, as in Codex Desktop and the AIR session tree.
-  With `archived: true`, archived and unarchived rows merge on the same key.
+  With `archived: "all"`, archived and unarchived rows merge on the same key.
 - Every row has `updatedAt`: the time of the last message of any kind, capped at the transcript mtime.
   A rename, an archive, or another metadata record moves neither `updatedAt` nor the order.
 - The cursor is opaque. It holds the position (the order key and session id of the last row) and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`. `limit` may change from page to page.
@@ -1336,14 +1340,14 @@ It tells the client to read the first page of that `cwd` again.
 ### Relation to the RFDs
 
 The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
-Names and semantics follow them; only the transport differs:
+Names and semantics follow them; the transport differs, and so does the `archived` list filter (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
 
 | Extension                                                                                                                   | RFD                                                                                                       |
 | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | capability `sessionIndex` (`_meta.jetbrains.air`)                                                                           | `sessionCapabilities.list.limit`, `.changes`; `sessionCapabilities.archive`; client `session.listChanged` |
 | `_meta.jetbrains.air.list.limit`                                                                                            | `session/list` `limit`                                                                                    |
 | `_meta.jetbrains.air.list.includeWorktrees`                                                                                 | `session/list` `includeWorktrees`                                                                         |
-| `_meta.jetbrains.air.list.archived`                                                                                         | `session/list` `archived` (#2161)                                                                         |
+| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                                                 | `session/list` `archived` (#2161), a boolean there                                                        |
 | row `_meta.jetbrains.air.createdAt`, `lastPromptAt`, `gitBranch`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names                                                                    |
 | row `_meta.jetbrains.air.archived`                                                                                          | `SessionInfo.archived` (#2161)                                                                            |
 | `session_info_update` `_meta.jetbrains.air.archived`                                                                        | `SessionInfoUpdate.archived` (#2161)                                                                      |
@@ -1353,9 +1357,10 @@ Names and semantics follow them; only the transport differs:
 
 ### Relation to ACP RFD #2161
 
-The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the boolean `archived` list parameter, the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, an unchanged `updatedAt`, and execution left alone.
-It differs only in transport, until the RFD lands in the SDK:
+The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, an unchanged `updatedAt`, and execution left alone.
+It differs in transport, until the RFD lands in the SDK, and in the list filter:
 
+- the list parameter has three values, not two: `"unarchived"` is the RFD's `false` (and the default of both), `"all"` its `true`, and `"archived"`, the archived sessions only, has no RFD counterpart;
 - the methods are `_session/archive` and `_session/unarchive`, not `session/archive` and `session/unarchive`;
 - the capability is `sessionIndex` in `_meta.jetbrains.air.capabilities`, not `sessionCapabilities.archive`;
 - the list parameter is `_meta.jetbrains.air.list.archived`, and the state is `_meta.jetbrains.air.archived` on rows and in `session_info_update`, not the `archived` fields;

@@ -15,6 +15,7 @@ import {
   encodeListCursor,
   parseListOptions,
   parseRenameSessionRequest,
+  type ListScope,
 } from "../session-index/service.js";
 import {
   continuedInSessionId,
@@ -296,7 +297,7 @@ describe("list request parsing", () => {
   it("defaults and clamps the limit", () => {
     expect(parseListOptions(undefined)).toEqual({
       limit: 50,
-      archived: false,
+      archived: "unarchived",
       includeWorktrees: false,
     });
     expect(parseListOptions(meta({ limit: null })).limit).toBe(50);
@@ -309,16 +310,18 @@ describe("list request parsing", () => {
     }
   });
 
-  it("takes archived and includeWorktrees as booleans, null as false, and rejects anything else", () => {
+  it("takes includeWorktrees as a boolean and archived as a filter value, null as the default", () => {
     expect(parseListOptions(meta({ includeWorktrees: true })).includeWorktrees).toBe(true);
     expect(parseListOptions(meta({ includeWorktrees: null })).includeWorktrees).toBe(false);
     expect(() => parseListOptions(meta({ includeWorktrees: "yes" }))).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
-    expect(parseListOptions(meta({ archived: true })).archived).toBe(true);
-    expect(parseListOptions(meta({ archived: false })).archived).toBe(false);
-    expect(parseListOptions(meta({ archived: null })).archived).toBe(false);
-    for (const archived of ["only", "exclude", 1, "true", {}]) {
+    for (const archived of ["unarchived", "archived", "all"]) {
+      expect(parseListOptions(meta({ archived })).archived).toBe(archived);
+    }
+    expect(parseListOptions(meta({ archived: null })).archived).toBe("unarchived");
+    expect(parseListOptions(meta({})).archived).toBe("unarchived");
+    for (const archived of [true, false, "only", "ALL", "Archived", "", 1, "true", {}, []]) {
       expect(() => parseListOptions(meta({ archived }))).toThrow(
         expect.objectContaining({ code: -32602 }),
       );
@@ -326,12 +329,22 @@ describe("list request parsing", () => {
   });
 
   it("round-trips a cursor and rejects one of another scope", () => {
-    const scope = { cwd: "/repo", archived: false, includeWorktrees: false };
+    const scope: ListScope = { cwd: "/repo", archived: "unarchived", includeWorktrees: false };
     const cursor = encodeListCursor({ orderAtMs: 5, sessionId: SESSION }, scope);
     expect(decodeListCursor(cursor, scope)).toEqual({ orderAtMs: 5, sessionId: SESSION });
-    expect(() => decodeListCursor(cursor, { ...scope, archived: true })).toThrow(
-      expect.objectContaining({ code: -32602 }),
-    );
+    for (const archived of ["archived", "all"] as const) {
+      expect(() => decodeListCursor(cursor, { ...scope, archived })).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+      const other = encodeListCursor({ orderAtMs: 5, sessionId: SESSION }, { ...scope, archived });
+      expect(decodeListCursor(other, { ...scope, archived })).toEqual({
+        orderAtMs: 5,
+        sessionId: SESSION,
+      });
+      expect(() => decodeListCursor(other, scope)).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
     expect(() => decodeListCursor(cursor, { ...scope, includeWorktrees: true })).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
@@ -341,13 +354,15 @@ describe("list request parsing", () => {
     expect(() => decodeListCursor("offset:1000", scope)).toThrow(
       expect.objectContaining({ code: -32602 }),
     );
-    // A cursor of an earlier version (keyed by updatedAt).
-    const legacy = Buffer.from(
-      JSON.stringify({ v: 3, u: 5, id: SESSION, cwd: "/repo", archived: false, worktrees: false }),
-    ).toString("base64url");
-    expect(() => decodeListCursor(legacy, scope)).toThrow(
-      expect.objectContaining({ code: -32602 }),
-    );
+    // Cursors of earlier format versions.
+    for (const v of [3, 4]) {
+      const legacy = Buffer.from(
+        JSON.stringify({ v, u: 5, id: SESSION, cwd: "/repo", archived: false, worktrees: false }),
+      ).toString("base64url");
+      expect(() => decodeListCursor(legacy, scope)).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
   });
 
   it("validates and truncates a rename title", () => {

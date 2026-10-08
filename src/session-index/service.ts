@@ -44,6 +44,7 @@ import { readHeadTail, transcriptProjectCwd } from "./transcript-scan.js";
 import {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
+  ARCHIVED_FILTERS,
   SessionIndex,
   type ArchivedFilter,
   type GetSessionInfo,
@@ -57,9 +58,8 @@ export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
 
 /** The JSON-RPC code of an unknown session (ACP `ResourceNotFound`). */
 const RESOURCE_NOT_FOUND = -32002;
-/** 4: keyed by the last user activity (`lastPromptAt`, else `updatedAt`);
- *  3 added the boolean `archived` (ACP RFD #2161) and `includeWorktrees`. */
-const CURSOR_VERSION = 4;
+/** The cursor format. A cursor of another version is rejected. */
+const CURSOR_VERSION = 5;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
@@ -106,7 +106,23 @@ export function parseRenameSessionRequest(value: unknown): RenameSessionRequest 
 type ListOptions = { limit: number; archived: ArchivedFilter; includeWorktrees: boolean };
 
 /** What a cursor is bound to: the request values that select the rows. */
-export type ListScope = { cwd: string | null; archived: boolean; includeWorktrees: boolean };
+export type ListScope = {
+  cwd: string | null;
+  archived: ArchivedFilter;
+  includeWorktrees: boolean;
+};
+
+function archivedFilter(list: Record<string, unknown>): ArchivedFilter {
+  // Omitted or null is `unarchived`.
+  const value = list.archived ?? "unarchived";
+  if (!ARCHIVED_FILTERS.includes(value as ArchivedFilter)) {
+    throw RequestError.invalidParams(
+      { archived: value },
+      '`_meta.jetbrains.air.list.archived` must be "unarchived", "archived" or "all"',
+    );
+  }
+  return value as ArchivedFilter;
+}
 
 function optionalBoolean(list: Record<string, unknown>, key: string): boolean {
   // Omitted or null is false.
@@ -134,7 +150,7 @@ export function parseListOptions(meta: unknown): ListOptions {
   }
   return {
     limit: Math.min(MAX_LIST_LIMIT, raw),
-    archived: optionalBoolean(list, "archived"),
+    archived: archivedFilter(list),
     includeWorktrees: optionalBoolean(list, "includeWorktrees"),
   };
 }
@@ -144,7 +160,7 @@ type CursorPayload = {
   u: number;
   id: string;
   cwd: string | null;
-  archived: boolean;
+  archived: ArchivedFilter;
   worktrees: boolean;
 };
 

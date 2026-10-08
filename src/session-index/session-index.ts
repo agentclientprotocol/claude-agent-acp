@@ -101,9 +101,17 @@ const MAX_CWD_PROBES_PER_DIR = 64;
 /** How long a directory that gave no cwd is not probed again. */
 const NO_CWD_RETRY_MS = 60_000;
 
-/** Whether a list includes archived sessions: `false` lists the unarchived
- *  ones only, `true` all of them in one order (ACP RFD #2161). */
-export type ArchivedFilter = boolean;
+/** Which sessions a list holds by archive state: `unarchived` the
+ *  unarchived ones only, `archived` the archived ones only, `all` both in one
+ *  order. */
+export type ArchivedFilter = "unarchived" | "archived" | "all";
+
+export const ARCHIVED_FILTERS: readonly ArchivedFilter[] = ["unarchived", "archived", "all"];
+
+/** Whether `filter` keeps a session of that archive state. */
+export function archivedFilterKeeps(filter: ArchivedFilter, archived: boolean): boolean {
+  return filter === "all" || (filter === "archived") === archived;
+}
 
 /** One transcript file found by the enumeration. */
 export type TranscriptCandidate = {
@@ -507,8 +515,11 @@ export class SessionIndex {
     const inScope = scopeOf(paths);
     const after = query.after;
     const candidates = (await this.enumerate(paths))
-      .filter(
-        (candidate) => query.archived || !query.archivedIds.has(candidate.sessionId.toLowerCase()),
+      .filter((candidate) =>
+        archivedFilterKeeps(
+          query.archived,
+          query.archivedIds.has(candidate.sessionId.toLowerCase()),
+        ),
       )
       // A page after a cursor skips, without reading them, the transcripts
       // whose cached order key puts them before the cursor.
