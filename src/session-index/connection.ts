@@ -20,7 +20,9 @@ import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sd
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
+  AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_INDEX_CAPABILITY,
+  AIR_SESSION_RENAME_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
@@ -113,9 +115,17 @@ export class SessionIndexConnection {
     }
   }
 
-  /** The AIR capabilities the agent advertises for the index. */
+  /** The AIR capabilities the agent advertises for the index: the index
+   *  itself, archive and rename, all only to a client that declared
+   *  `sessionIndex`. */
   capabilities(): string[] {
-    return this.service ? [AIR_SESSION_INDEX_CAPABILITY] : [];
+    return this.service
+      ? [
+          AIR_SESSION_INDEX_CAPABILITY,
+          AIR_SESSION_ARCHIVE_CAPABILITY,
+          AIR_SESSION_RENAME_CAPABILITY,
+        ]
+      : [];
   }
 
   dispose(): void {

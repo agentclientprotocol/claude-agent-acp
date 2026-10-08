@@ -162,6 +162,7 @@ const airCapabilities = (response: { _meta?: Record<string, unknown> | null }) =
   (response._meta as any)?.jetbrains?.air?.capabilities as string[] | undefined;
 
 describe("sessionIndex negotiation", () => {
+  const indexCapabilities = ["sessionIndex", "sessionArchive", "sessionRename"];
   const baseline = [
     "sessionFailure",
     "agentFileChangeReport",
@@ -172,18 +173,25 @@ describe("sessionIndex negotiation", () => {
     "planFile",
   ];
 
-  it("is advertised only to an AIR client that declares it", async () => {
+  it("is advertised with sessionArchive and sessionRename only to an AIR client that declares it", async () => {
     const declared = await createAgent().agent.initialize({
       protocolVersion: 1,
       clientCapabilities: air("sessionIndex"),
     });
-    expect(airCapabilities(declared)).toEqual([...baseline, "sessionIndex"]);
+    expect(airCapabilities(declared)).toEqual([...baseline, ...indexCapabilities]);
 
     const undeclared = await createAgent().agent.initialize({
       protocolVersion: 1,
       clientCapabilities: air("diffPatch"),
     });
     expect(airCapabilities(undeclared)).toEqual(baseline);
+
+    // Declaring archive or rename alone enables nothing.
+    const withoutIndex = await createAgent().agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: air("sessionArchive", "sessionRename"),
+    });
+    expect(airCapabilities(withoutIndex)).toEqual(baseline);
 
     const nonAir = await createAgent().agent.initialize({
       protocolVersion: 1,
@@ -197,18 +205,24 @@ describe("sessionIndex negotiation", () => {
       protocolVersion: 1,
       clientCapabilities: air("sessionIndex"),
     });
-    expect(airCapabilities(response)).not.toContain("sessionIndex");
+    for (const capability of indexCapabilities) {
+      expect(airCapabilities(response)).not.toContain(capability);
+    }
   });
 
   it("answers method-not-found to the new methods without the capability", async () => {
-    const { agent } = createAgent();
-    await initializeClient(agent, air());
-    const sessionId = randomUUID();
-    await expect(agent.renameSessionTitle({ sessionId, title: "x" })).rejects.toMatchObject({
-      code: -32601,
-    });
-    await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
-    await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
+    // Declaring sessionArchive or sessionRename without sessionIndex enables
+    // nothing either.
+    for (const capabilities of [[], ["sessionArchive", "sessionRename"]]) {
+      const { agent } = createAgent();
+      await initializeClient(agent, air(...capabilities));
+      const sessionId = randomUUID();
+      await expect(agent.renameSessionTitle({ sessionId, title: "x" })).rejects.toMatchObject({
+        code: -32601,
+      });
+      await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
+      await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32601 });
+    }
   });
 });
 

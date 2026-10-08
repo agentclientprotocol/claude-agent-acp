@@ -17,6 +17,17 @@ export const AIR_PLAN_FILE_CAPABILITY = "planFile";
  * `_session/list_changed`. Advertised only to a client that declares it.
  */
 export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
+/**
+ * The agent supports `_session/archive` and `_session/unarchive`. Advertised
+ * exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not
+ * declare it.
+ */
+export const AIR_SESSION_ARCHIVE_CAPABILITY = "sessionArchive";
+/**
+ * The agent supports `_session/rename`. Advertised exactly when
+ * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
+ */
+export const AIR_SESSION_RENAME_CAPABILITY = "sessionRename";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
