@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.88.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.87.0...v0.88.0) (2026-10-08)
+
+
+### Features
+
+* **deps:** update Claude SDK ([#1276](https://github.com/agentclientprotocol/claude-agent-acp/issues/1276)) ([0304f74](https://github.com/agentclientprotocol/claude-agent-acp/commit/0304f743f85e2505ad5a67c1fe7b7d24f2f9ad23))
+
 ## [0.87.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.86.0...v0.87.0) (2026-10-07)
 
 
