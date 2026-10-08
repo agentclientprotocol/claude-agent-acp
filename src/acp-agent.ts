@@ -4454,6 +4454,8 @@ export class ClaudeAcpAgent {
      *  marked as a background result, but it lists the uuids of the prompts it
      *  answered.
      *
+     *  A steer belongs to the live active turn even though it has no queued
+     *  Turn of its own. Its stamped result can answer that turn too.
      *  A turn held open for its background subagents already has its result,
      *  so a result that names it does not answer it. */
     const answersPendingPrompt = (message: {
@@ -4469,8 +4471,15 @@ export class ClaudeAcpAgent {
         answeredPromptUuids = [message.user_message_uuid];
       }
 
+      const activeTurn = session.activeTurn;
+      const liveActiveTurn =
+        activeTurn && !activeTurn.settled && !isHeldOpen(activeTurn) ? activeTurn : undefined;
       for (const promptUuid of answeredPromptUuids) {
-        const turn = findUnsettledTurn(promptUuid);
+        // Keep queued prompt matching, including folded sends with no echo.
+        // Steers qualify only through their live active owner.
+        const turn =
+          findUnsettledTurn(promptUuid) ??
+          (liveActiveTurn?.steeredUuids?.has(promptUuid) ? liveActiveTurn : undefined);
         if (turn === undefined) {
           // Not a prompt of this session, or it was answered already.
           continue;
