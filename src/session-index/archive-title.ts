@@ -30,15 +30,9 @@ const ARCHIVED_PATTERN = /^\s*\[archived\][ \t\n\v\f\r]+(?=[^ \t\n\v\f\r])/;
 
 const WHITESPACE_RUN = /[ \t\n\v\f\r]+/g;
 
-/** How much of a long title the normalization reads: the stored title is
- *  cut to {@link CLI_TITLE_LIMIT} characters after it. */
-const TITLE_SCAN_LENGTH = 4096;
-
 /** Whitespace collapsed to single spaces and trimmed, as AIR stores a title. */
 export function normalizeStoredTitle(title: string): string {
-  const start = title.trimStart();
-  const text = start.length > TITLE_SCAN_LENGTH ? start.slice(0, TITLE_SCAN_LENGTH) : start;
-  return text.replace(WHITESPACE_RUN, " ").trim();
+  return title.replace(WHITESPACE_RUN, " ").trim();
 }
 
 /** Cut to what the CLI keeps of a title. */
@@ -51,7 +45,8 @@ export function isArchivedTitle(title: string | undefined): boolean {
   return title !== undefined && ARCHIVED_PATTERN.test(title);
 }
 
-/** The title shown for an effective title: without the archive prefix. */
+/** The title shown for an effective title: without the archive prefix,
+ *  removed once, as AIR shows it. */
 export function visibleTitle(title: string): string {
   return title.replace(ARCHIVED_PATTERN, "");
 }
@@ -65,7 +60,10 @@ export function defaultSessionTitle(sessionId: string): string {
  *  visible title, with the prefix when archived, normalized and cut to the
  *  CLI limit. */
 export function storedTitle(title: string, archived: boolean, sessionId: string): string {
-  const visible = normalizeStoredTitle(visibleTitle(title)) || defaultSessionTitle(sessionId);
+  // Every prefix: a title stored twice prefixed must not stay archived.
+  let bare = title;
+  while (isArchivedTitle(bare)) bare = visibleTitle(bare);
+  const visible = normalizeStoredTitle(bare) || defaultSessionTitle(sessionId);
   return capTitle(archived ? ARCHIVED_TITLE_PREFIX + visible : visible);
 }
 

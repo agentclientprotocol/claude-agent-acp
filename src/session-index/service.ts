@@ -38,7 +38,7 @@ import {
 } from "./project-dirs.js";
 import {
   effectiveTranscriptTitle,
-  hasTailCustomTitle,
+  lastCustomTitle,
   readHeadTail,
   transcriptAgentName,
   transcriptProjectCwd,
@@ -283,13 +283,22 @@ async function ensureTitleRecords(
 /** The effective title of one transcript copy (see
  *  {@link effectiveTranscriptTitle}). */
 async function copyTitle(filePath: string): Promise<string | undefined> {
+  return (await copyTitles(filePath)).title;
+}
+
+/** The effective title of a copy and the custom title of its tail. */
+async function copyTitles(
+  filePath: string,
+): Promise<{ title: string | undefined; tailCustomTitle: string | undefined }> {
   const { size } = await fs.stat(filePath);
   const headTail = await readHeadTail(filePath, size);
-  const sidecar = hasTailCustomTitle(headTail.tail)
-    ? undefined
-    : await readSidecarTitle(filePath, transcriptSessionId(filePath));
+  const tailCustomTitle = lastCustomTitle(headTail.tail);
+  const sidecar =
+    tailCustomTitle !== undefined
+      ? undefined
+      : await readSidecarTitle(filePath, transcriptSessionId(filePath));
   const agentName = await transcriptAgentName(filePath, size, headTail);
-  return effectiveTranscriptTitle(headTail, agentName, sidecar);
+  return { title: effectiveTranscriptTitle(headTail, agentName, sidecar), tailCustomTitle };
 }
 
 /** Rewrites the sidecar of a copy whose title is `current` when the
@@ -412,7 +421,10 @@ export type RetitleOptions = {
   live?: {
     cwd: string;
     rename: (title: string) => Promise<void>;
-    stored?: string;
+    /** Read once the session's earlier title changes are done. */
+    stored: () => string | undefined;
+    /** Records a title the CLI took, before the next change starts. */
+    remember: (title: string) => void;
     shown?: string;
   };
   /** A session without a transcript is not unknown: a new session this
@@ -573,8 +585,11 @@ export class SessionIndexService {
       if (!live || !options.mayBeUnwritten) throw sessionNotFound(sessionId);
       return this.exclusive(sessionId, async () => {
         await this.assertNotHeldElsewhere(sessionId, "running");
-        const title = change(live.stored ?? live.shown, sessionId);
-        if (title !== undefined) await live.rename(title);
+        const title = change(live.stored() ?? live.shown, sessionId);
+        if (title !== undefined) {
+          await live.rename(title);
+          live.remember(title);
+        }
         return title;
       });
     }
@@ -596,14 +611,26 @@ export class SessionIndexService {
           for (const transcript of transcripts) {
             ((await isTranscriptOf(transcript, paths)) ? own : others).push(transcript);
           }
-          // The CLI holds the title it was last given and may not have
-          // written all of it yet (it writes the agent name after it
-          // answers): that title is current.
+          // The CLI writes the custom title of a rename before it answers,
+          // and the agent name after: while its transcript ends with the
+          // title last given to it, that title is current. A title changed
+          // otherwise since (a `/rename`) is read from the transcript.
           const primary = own[0] ?? others[0];
+          const read = primary ? await copyTitles(primary) : undefined;
+          const given = live.stored();
           const current =
-            live.stored ?? (primary ? await copyTitle(primary) : undefined) ?? live.shown;
+            read === undefined
+              ? (given ?? live.shown)
+              : given !== undefined && read.tailCustomTitle === given
+                ? given
+                : read.title;
           stored = change(current, sessionId);
-          if (stored !== undefined) await live.rename(stored);
+          if (stored !== undefined) {
+            await live.rename(stored);
+            live.remember(stored);
+          } else if (own[0]) {
+            await alignSidecar(own[0], current, sessionId);
+          }
           try {
             complete = (await this.titleCopies(others, change, true, options.sidecar)).complete;
           } catch (error) {

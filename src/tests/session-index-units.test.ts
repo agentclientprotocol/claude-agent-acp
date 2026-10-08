@@ -900,6 +900,8 @@ describe("archive titles (AIR's Claude format)", () => {
     expect(storedTitle("[archived] Fix it", false, id)).toBe("Fix it");
     expect(storedTitle("[archived] Fix it", true, id)).toBe("[archived] Fix it");
     expect(storedTitle("", true, id)).toBe("[archived] Session 0b0e6c2e");
+    expect(storedTitle(`A${" ".repeat(5000)}B`, true, id)).toBe("[archived] A B");
+    expect(storedTitle("[archived] [archived] X", false, id)).toBe("X");
     expect(storedTitle(`${"a".repeat(188)} ${"b".repeat(20)}`, true, id)).toBe(
       `[archived] ${"a".repeat(188)}`,
     );

@@ -108,6 +108,10 @@ export class SessionTitles {
    *  holds. */
   private persistedTitle?: string;
 
+  /** Client title changes in flight, and the title state before the first. */
+  private explicitChanges = 0;
+  private beforeExplicit?: { settled: boolean; context: string | undefined };
+
   get storedTitle(): string | undefined {
     return this.persistedTitle;
   }
@@ -211,29 +215,45 @@ export class SessionTitles {
    *  publishes `title` unless it is undefined. A change that stored and
    *  publishes nothing leaves the title state as it was. */
   async setExplicitTitle(
-    title: string | undefined,
+    publish: string | ((stored: string | undefined) => string) | undefined,
     persist: () => Promise<string | undefined | void>,
   ): Promise<void> {
-    const previous = { settled: this.settled, context: this.context };
+    // The state before the first of overlapping changes, which a change that
+    // fails or names nothing puts back.
+    if (this.explicitChanges++ === 0) {
+      this.beforeExplicit = { settled: this.settled, context: this.context };
+    }
+    const previous = this.beforeExplicit!;
     this.settled = true;
     this.context = undefined;
-    await this.explicit.apply(
-      async () => {
-        const stored = await persist();
-        if (stored !== undefined) this.persistedTitle = stored;
-        return stored !== undefined || title !== undefined;
-      },
-      () => {
-        this.settled = previous.settled;
-        this.context ??= previous.context;
-      },
-    );
+    let stored: string | undefined;
+    try {
+      await this.explicit.apply(
+        async () => {
+          stored = (await persist()) ?? undefined;
+          if (stored !== undefined) this.persistedTitle = stored;
+          return stored !== undefined || publish !== undefined;
+        },
+        () => {
+          this.settled = previous.settled;
+          this.context ??= previous.context;
+        },
+      );
+    } finally {
+      if (--this.explicitChanges === 0) this.beforeExplicit = undefined;
+    }
+    const title = typeof publish === "function" ? publish(stored) : publish;
     if (title === undefined) return;
     this.lastTitle = title;
     await this.agent.client.sessionUpdate({
       sessionId: this.sessionId,
       update: { sessionUpdate: "session_info_update", title },
     });
+  }
+
+  /** Records a title the CLI took, as soon as it took it. */
+  rememberStoredTitle(title: string): void {
+    this.persistedTitle = title;
   }
 
   /** Read the SDK's stored info for this session. A missing session file or read

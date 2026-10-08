@@ -123,11 +123,11 @@ export class SessionIndexConnection {
     }
   }
 
-  /** A stored title as the client shows it: a `sessionIndex` client gets
-   *  the title of an archived session without the archive prefix, as in
-   *  its list; every other client the title as stored. */
+  /** A stored title as the client shows it: an AIR client gets the title
+   *  of an archived session without the archive prefix, as in its list;
+   *  every other client the title as stored. */
   clientTitle(title: string): string {
-    return this.service && isArchivedTitle(title) ? visibleTitle(title) : title;
+    return this.host.isAirClient() && isArchivedTitle(title) ? visibleTitle(title) : title;
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
@@ -187,7 +187,10 @@ export class SessionIndexConnection {
     // As the CLI keeps it, and never with the archive prefix: a rename does
     // not change the archive state.
     const title = storedTitle(request.title, false, sessionId);
-    await this.retitle(index, sessionId, renameTo(title), title, {
+    // The title as stored: an archived one is cut with its prefix.
+    const shown = (stored: string | undefined) =>
+      stored === undefined ? title : visibleTitle(stored);
+    await this.retitle(index, sessionId, renameTo(title), shown, {
       mayBeUnwritten: true,
       sidecar: "always",
     });
@@ -230,7 +233,7 @@ export class SessionIndexConnection {
     index: SessionIndexService,
     sessionId: string,
     change: TitleChange,
-    publish: string | undefined,
+    publish: Parameters<Session["titles"]["setExplicitTitle"]>[0],
     options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar" | "dropMarker">,
   ): Promise<void> {
     const session = this.host.agent.sessions[sessionId];
@@ -254,7 +257,8 @@ export class SessionIndexConnection {
         ? {
             cwd: session.cwd,
             rename: (title: string) => query!.renameSession!(title, sessionId),
-            stored: session.titles.storedTitle,
+            stored: () => session.titles.storedTitle,
+            remember: (title: string) => session.titles.rememberStoredTitle(title),
             shown: session.titles.shownTitle,
           }
         : undefined;

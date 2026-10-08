@@ -168,6 +168,16 @@ async function lastRecords(file: string, count = 2): Promise<unknown[]> {
   return lines.slice(-count).map((line) => JSON.parse(line));
 }
 
+/** A `rename_session` of a CLI: it writes the custom title before it
+ *  answers (the agent name follows later, and is left out). */
+const cliRename = (file: string, sessionId: string) =>
+  vi.fn(async (title: string) => {
+    await fs.appendFile(
+      file,
+      JSON.stringify({ type: "custom-title", customTitle: title, sessionId }) + "\n",
+    );
+  });
+
 const markerOf = (sessionId: string) => path.join(configDir, "acp", "archived", sessionId);
 
 /** An archive marker file, which the adapter reads but never writes. */
@@ -1475,13 +1485,14 @@ describe("rename of a running session with several transcripts", () => {
 });
 
 describe("the stored title of an archived session at turn end", () => {
-  it("is published without the prefix to a sessionIndex client only", async () => {
-    for (const [capabilities, expected] of [
-      [["sessionIndex"], "Done"],
-      [[], "[archived] Done"],
+  it("is published without the prefix to an AIR client only", async () => {
+    for (const [request, expected] of [
+      [air("sessionIndex"), "Done"],
+      [air(), "Done"],
+      [{}, "[archived] Done"],
     ] as const) {
       const { agent, updates } = createAgent();
-      await initializeClient(agent, air(...capabilities));
+      await initializeClient(agent, request);
       const titles = new SessionTitles(agent, "s1");
       vi.mocked(getSessionInfo).mockResolvedValueOnce({
         sessionId: "s1",
@@ -1999,7 +2010,7 @@ describe("archive state (ACP RFD #2161)", () => {
     const { agent, updates } = await indexAgent();
     const close = vi.fn();
     const interrupt = vi.fn(async () => {});
-    const rename = vi.fn(async () => {});
+    const rename = cliRename(session.file, session.id);
     const loaded = mockSessionState(
       { cwd: workspace, query: { close, interrupt, renameSession: rename } },
       agent,
@@ -2024,13 +2035,21 @@ describe("archive state (ACP RFD #2161)", () => {
     expect(close).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
     // The CLI titles its own transcript; the adapter does not write it.
-    // The unarchive reads the title the CLI holds, not the transcript the
-    // CLI may not have written yet.
+    // The unarchive reads the title the CLI holds, whose agent name the CLI
+    // may not have written yet.
     expect(rename.mock.calls).toEqual([
       ["[archived] Fix it", session.id],
       ["Fix it", session.id],
     ]);
-    expect(await fs.readFile(session.file, "utf8")).toBe(before);
+    expect(await fs.readFile(session.file, "utf8")).toBe(
+      before +
+        ["[archived] Fix it", "Fix it"]
+          .map((title) =>
+            JSON.stringify({ type: "custom-title", customTitle: title, sessionId: session.id }),
+          )
+          .join("\n") +
+        "\n",
+    );
   });
 
   it("is not reported for a session not loaded on this connection", async () => {
@@ -2745,7 +2764,7 @@ describe("archive in AIR's title format, edge cases", () => {
   it("renames a running archived session through its CLI with the prefix kept", async () => {
     const session = await writeTranscript({});
     const { agent, updates } = await indexAgent();
-    const rename = vi.fn(async () => {});
+    const rename = cliRename(session.file, session.id);
     agent.sessions[session.id] = mockSessionState(
       { cwd: workspace, query: { renameSession: rename } },
       agent,
@@ -2899,6 +2918,109 @@ describe("an archive that stores nothing", () => {
     agent.sessions.s1 = session;
     titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
     await titles.setExplicitTitle(undefined, async () => undefined);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    await titles.onTurnEnd(session);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
+  });
+});
+
+describe("archive in AIR's title format, round two", () => {
+  it("never leaves a twice-prefixed title archived by a rename or an unarchive", async () => {
+    const session = await writeTranscript({
+      trailer: titleRecords("", "[archived] [archived] Twice"),
+    });
+    const { agent } = await indexAgent();
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Twice"));
+    await agent.renameSessionTitle({ sessionId: session.id, title: "[archived] [archived] X" });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "X"));
+  });
+
+  it("publishes the title an archived rename stored", async () => {
+    const session = await writeTranscript({});
+    const { agent, updates } = await indexAgent();
+    agent.sessions[session.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: cliRename(session.file, session.id) } },
+      agent,
+      session.id,
+    ) as any;
+    await agent.archiveSession({ sessionId: session.id });
+    await agent.renameSessionTitle({ sessionId: session.id, title: "x".repeat(200) });
+    expect(updates.at(-1)).toEqual({
+      sessionId: session.id,
+      update: { sessionUpdate: "session_info_update", title: "x".repeat(189) },
+    });
+  });
+
+  it("reads the title of a running session from its transcript once the CLI changed it", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    const rename = vi.fn(async (title: string) => {
+      // The CLI writes the custom title before it answers.
+      await fs.appendFile(
+        session.file,
+        JSON.stringify({ type: "custom-title", customTitle: title, sessionId: session.id }) + "\n",
+      );
+    });
+    agent.sessions[session.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: rename } },
+      agent,
+      session.id,
+    ) as any;
+    await agent.archiveSession({ sessionId: session.id });
+    // A `/rename` in the session, which the adapter does not see.
+    await fs.appendFile(
+      session.file,
+      titleRecords(session.id, "Renamed in the CLI")
+        .map((record) => JSON.stringify(record) + "\n")
+        .join(""),
+    );
+    await agent.archiveSession({ sessionId: session.id });
+    expect(rename.mock.calls.map(([title]) => title)).toEqual([
+      "[archived] Fix it",
+      "[archived] Renamed in the CLI",
+    ]);
+  });
+
+  it("unarchives a resumed session that AIR archived through its CLI", async () => {
+    const session = await writeTranscript({ trailer: titleRecords("", "[archived] Done") });
+    const { agent } = await indexAgent();
+    const rename = vi.fn(async () => {});
+    agent.sessions[session.id] = mockSessionState(
+      { cwd: workspace, resumedFromHistory: true, query: { renameSession: rename } },
+      agent,
+      session.id,
+    ) as any;
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(rename.mock.calls).toEqual([["Done", session.id]]);
+  });
+
+  it("keeps the title open to generation across overlapping changes that store nothing", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const session: any = {
+      queryClosed: false,
+      cancelled: false,
+      cwd: "/nowhere",
+      query: { generateSessionTitle: async () => "Generated" },
+    };
+    agent.sessions.s1 = session;
+    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
+    let release!: () => void;
+    const first = titles.setExplicitTitle(
+      undefined,
+      () => new Promise<undefined>((resolve) => (release = () => resolve(undefined))),
+    );
+    const second = titles.setExplicitTitle(undefined, async () => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    release();
+    await Promise.all([first, second]);
     vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
     await titles.onTurnEnd(session);
     await new Promise((resolve) => setTimeout(resolve, 10));
