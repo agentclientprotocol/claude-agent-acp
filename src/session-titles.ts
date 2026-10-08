@@ -87,6 +87,9 @@ export class SessionTitles {
   constructor(
     private readonly agent: ClaudeAcpAgent,
     private readonly sessionId: string,
+    /** Id of the Claude session whose transcript is written; differs from
+     *  `sessionId` after a plan "clear context". */
+    private readonly claudeSessionId: string = sessionId,
   ) {}
 
   /** Collect a prompt's own text for the title, skipping openers not worth
@@ -165,7 +168,7 @@ export class SessionTitles {
    *  error is non-fatal: the title is best-effort and another turn will retry. */
   private async readSessionInfo(session: Session): Promise<SDKSessionInfo | undefined> {
     try {
-      return await getSessionInfo(this.sessionId, { dir: session.cwd });
+      return await getSessionInfo(this.claudeSessionId, { dir: session.cwd });
     } catch (error) {
       this.agent.logger.error(`Session ${this.sessionId}: failed to read session info: ${error}`);
       return undefined;
