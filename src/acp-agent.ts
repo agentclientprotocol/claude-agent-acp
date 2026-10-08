@@ -3255,6 +3255,7 @@ export class ClaudeAcpAgent {
     // provider routing set via `providers/set`. Neither touches the on-disk
     // credential store, so dropping these references is the whole logout for
     // those paths.
+    const hadRoutingOverride = this.resolveProviderConfig() !== null;
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
     // Any probe already running read the pre-logout world; the bump makes its
@@ -3270,8 +3271,8 @@ export class ClaudeAcpAgent {
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
     // `claude auth logout` is non-interactive and idempotent.
-    const cliPath = await claudeCliPath();
     try {
+      const cliPath = await claudeCliPath();
       await execFileAsync(cliPath, ["auth", "logout"]);
     } catch (error) {
       const stderr =
@@ -3282,6 +3283,16 @@ export class ClaudeAcpAgent {
         { stderr: stderr || undefined },
         `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      // The cleared provider or gateway routing is baked into the env of every
+      // live query, so recreate them the way `providers/disable` does: after
+      // the active turns settle, resuming each session under its id. Done even
+      // when the CLI logout failed, because the override is already gone. A
+      // plain CLI login needs nothing here: the running CLI picks up the
+      // logout by itself.
+      if (hadRoutingOverride) {
+        await this.enqueueProviderUpdate(undefined);
+      }
     }
 
     // Re-read the store rather than assuming "none": an API key from the env

@@ -16,6 +16,14 @@ npm run format        # prettier --write
 CI runs `format:check`, `lint`, `build` and `test:run`. Run `npm run check` before
 opening a PR.
 
+## Code comments
+
+Keep comments straightforward, concise, and concrete. Say what the code does and
+why, in plain terms: name the actual state, call, or failure involved instead of
+alluding to it. Prefer a short concrete example over an abstract description.
+Don't use vague phrases like "keeps it honest" or "the residual case" that make
+the reader reconstruct the meaning.
+
 ## Pull requests
 
 Squash merges use the PR title as the commit subject, and release-please parses it
