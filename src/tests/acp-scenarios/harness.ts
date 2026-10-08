@@ -58,6 +58,7 @@ export const AIR_CAPABILITY_NAMES = [
   "rawInputRendering",
   "planFile",
   "agentFileChangeReport",
+  "backgroundSubagents",
 ];
 
 const baseCapabilities: ClientCapabilities = {

@@ -10409,6 +10409,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "backgroundSubagents",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
@@ -10431,6 +10432,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "backgroundSubagents",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
@@ -16917,6 +16919,19 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   // 2.1.270: no idle until the subagent drains) and settles once its
   // subagents are done — at the followup's terminal result, or at an idle
   // with none of them left.
+  //
+  // The tests without `declareBackgroundSubagents` are the cases of a client
+  // that does not declare the AIR `backgroundSubagents` capability. Such a
+  // client keeps the hold.
+
+  /** Declares the AIR `backgroundSubagents` capability: no turn is held. */
+  const declareBackgroundSubagents = (agent: ClaudeAcpAgent) =>
+    agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
+      },
+    });
 
   function createMockAgent() {
     const mockClient = {
@@ -17264,6 +17279,182 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(createSession).not.toHaveBeenCalled();
       expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
     });
+
+    describe("with backgroundSubagents", () => {
+      it("asks out of the turn without a clear-context option and drops the interrupt", async () => {
+        let request: RequestPermissionRequest | undefined;
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              request = params;
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        const createSession = vi.spyOn(agent as any, "createSession");
+        let answer!: () => void;
+        const answered = new Promise<void>((resolve) => (answer = resolve));
+        let planToolSeen = false;
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            const { value: first } = await iter.next();
+            // The followup asks before its tool result, as Claude Code does.
+            const followup = heldTurnPlanningFollowup(first);
+            for (let step = followup.next(); !step.done; step = followup.next()) {
+              const message: any = step.value;
+              if (message.type === "user" && message.tool_result_meta) {
+                planToolSeen = true;
+                await answered;
+              }
+              yield message;
+            }
+            yield idle();
+            const { value: second } = await iter.next();
+            yield userEcho(second);
+            yield running();
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const first = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        // The turn ends at its own result; the plan comes after it.
+        expect(first.stopReason).toBe("end_turn");
+        await waitFor(() => planToolSeen);
+        expect(session.activeTurn).toBeNull();
+
+        await expect(
+          agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+            signal: new AbortController().signal,
+            suggestions: [],
+            toolUseID: "tool-plan",
+          } as any),
+        ).resolves.toMatchObject({ behavior: "deny", interrupt: true });
+        // No ACP turn can continue a fresh context out of a turn.
+        expect(request?.options.map((o) => o.optionId)).not.toEqual(
+          expect.arrayContaining([expect.stringMatching(/^exit-plan-clear-/)]),
+        );
+        expect(request?.options.map((o) => o.optionId)).toContain("reject");
+
+        answer();
+        await waitFor(() => session.pendingExitPlanModeInterruption === undefined);
+        const second = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "next" }],
+        });
+        expect(second.stopReason).toBe("end_turn");
+        expect(createSession).not.toHaveBeenCalled();
+        await session.consumer;
+      });
+
+      it("offers the clear-context option inside a turn", async () => {
+        let request: RequestPermissionRequest | undefined;
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              request = params;
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        let asked!: () => void;
+        const askedGate = new Promise<void>((resolve) => (asked = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield userEcho(first);
+            yield running();
+            await askedGate;
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+        await agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "tool-plan",
+        } as any);
+        expect(request?.options.map((o) => o.optionId)).toEqual(
+          expect.arrayContaining([expect.stringMatching(/^exit-plan-clear-/)]),
+        );
+        asked();
+        await prompt;
+        await agent.sessions["test-session"]?.consumer;
+      });
+
+      it("drops a clear-context reset that has no turn to continue", async () => {
+        const error = vi.fn();
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error },
+        );
+        const createSession = vi.spyOn(agent as any, "createSession");
+        injectGeneratorSession(
+          agent,
+          (input) => {
+            async function* messageGenerator() {
+              const { value: first } = await input[Symbol.asyncIterator]().next();
+              yield* heldTurnPlanningFollowup(first);
+              yield idle();
+            }
+            return messageGenerator();
+          },
+          {
+            creationParams: { cwd: "/test", mcpServers: [] },
+            pendingExitPlanContextReset: {
+              toolUseId: "tool-plan",
+              plan: "Implement it",
+              mode: "auto",
+            },
+          },
+        );
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const response = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+
+        expect(response.stopReason).toBe("end_turn");
+        await session.consumer;
+        expect(createSession).not.toHaveBeenCalled();
+        expect(session.pendingExitPlanModeInterruption).toBeUndefined();
+        expect(session.pendingExitPlanContextReset).toBeUndefined();
+        expect(error).toHaveBeenCalledWith(
+          expect.stringContaining("no turn to continue the accepted plan"),
+        );
+      });
+    });
   });
 
   // CLI 2.1.270+ stays `running` while background agents live (verified
@@ -17551,7 +17742,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     /** Turn 1 spawns agent-1, which fails inside the turn. Turn 2 resumes it
      *  with `resume` and holds at `gate` until the test releases it; then
      *  agent-1 completes and the model sends its followup. */
-    function run(resume: unknown[], options: { subagents?: boolean } = {}) {
+    function run(
+      resume: unknown[],
+      options: { subagents?: boolean; backgroundSubagents?: boolean } = {},
+    ) {
       const updates: AcpSessionNotification[] = [];
       const requests: RequestPermissionRequest[] = [];
       const agent = new ClaudeAcpAgent(
@@ -17603,6 +17797,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
             },
           });
         }
+        if (options.backgroundSubagents) await declareBackgroundSubagents(agent);
         const first = await agent.prompt({
           sessionId: "test-session",
           prompt: [{ type: "text", text: "explore" }],
@@ -17612,7 +17807,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           sessionId: "test-session",
           prompt: [{ type: "text", text: "continue" }],
         });
-        await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+        // With `backgroundSubagents` the turn is never held.
+        if (!options.backgroundSubagents) {
+          await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+        }
         // Wrapped: an async function would unwrap and wait for the held prompt.
         return { second };
       };
@@ -17757,6 +17955,214 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(notified()).toBe(false);
       release();
       await agent.sessions["test-session"]?.consumer;
+    });
+
+    describe("with backgroundSubagents", () => {
+      const summaryChunks = (updates: AcpSessionNotification[]) =>
+        updates.filter(
+          (n) =>
+            n.update.sessionUpdate === "agent_message_chunk" &&
+            (n.update.content as { text?: string }).text === "resumed summary",
+        );
+
+      it("settles the SendMessage turn at its result while the resumed subagent runs", async () => {
+        const { agent, updates, release, notified, start } = run([sendMessageResult()], {
+          backgroundSubagents: true,
+        });
+        const { second } = await start();
+        const session = agent.sessions["test-session"]!;
+
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(notified()).toBe(false);
+        expect(session.liveBackgroundTasks.has("agent-1")).toBe(true);
+        expect(session.activeTurn).toBeNull();
+
+        // The followup summary goes out after the prompt response.
+        release();
+        await waitFor(() => summaryChunks(updates).length === 1);
+        await waitFor(() => !session.liveBackgroundTasks.has("agent-1"));
+        await session.consumer;
+        expect(session.owedTrailingIdles).toBe(0);
+      });
+
+      it("sends a permission request of the resumed subagent after the prompt response", async () => {
+        const { agent, updates, requests, release, start } = run([sendMessageResult()], {
+          backgroundSubagents: true,
+        });
+        const { second } = await start();
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+
+        const result = await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "toolu_sub",
+          agentID: "agent-1",
+        } as any);
+
+        expect(result).toMatchObject({ behavior: "allow" });
+        expect(requests).toHaveLength(1);
+        expect(requests[0].toolCall.toolCallId).toBe("toolu_sub");
+        expect(
+          updates.find(
+            (n) => n.update.sessionUpdate === "tool_call" && n.update.toolCallId === "toolu_sub",
+          )?.update,
+        ).toMatchObject({ _meta: { claudeCode: { parentToolUseId: "toolu_agent-1" } } });
+        release();
+        await agent.sessions["test-session"]?.consumer;
+      });
+    });
+  });
+
+  describe("with backgroundSubagents", () => {
+    /** Agent whose client records the chunk texts as `chunk:<text>`, keeps
+     *  every update, and allows every permission request. */
+    const recordingAgent = () => {
+      const events: string[] = [];
+      const updates: AcpSessionNotification[] = [];
+      const requests: RequestPermissionRequest[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (n: AcpSessionNotification) => {
+            updates.push(n);
+            if (n.update.sessionUpdate === "agent_message_chunk") {
+              events.push(`chunk:${(n.update.content as { text?: string }).text}`);
+            }
+          },
+          requestPermission: async (params: RequestPermissionRequest) => {
+            requests.push(params);
+            return { outcome: { outcome: "selected", optionId: "allow-once" } };
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      return { agent, events, updates, requests };
+    };
+
+    it("settles at the result while a fresh subagent runs and sends its traffic after the response", async () => {
+      const { agent, events, updates, requests } = recordingAgent();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage();
+          yield idle();
+          await gate;
+          yield taskNotification("agent-1");
+          yield assistantText("late summary");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      events.push("resolved");
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.totalTokens).toBe(15);
+      expect(session.activeTurn).toBeNull();
+      expect(session.liveBackgroundTasks.get("agent-1")).toMatchObject({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+      });
+
+      // The subagent asks after the prompt response. The request keeps the
+      // parent tool call of the subagent, and the client answers it.
+      const result = await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_sub",
+        agentID: "agent-1",
+      } as any);
+      expect(result).toMatchObject({ behavior: "allow" });
+      expect(requests.map((r) => r.toolCall.toolCallId)).toEqual(["toolu_sub"]);
+      expect(
+        updates.find(
+          (n) => n.update.sessionUpdate === "tool_call" && n.update.toolCallId === "toolu_sub",
+        )?.update,
+      ).toMatchObject({ _meta: { claudeCode: { parentToolUseId: "toolu_agent-1" } } });
+
+      // The followup summary is an out-of-turn session/update.
+      release();
+      await waitFor(() => events.includes("chunk:late summary"));
+      expect(events.indexOf("chunk:late summary")).toBeGreaterThan(events.indexOf("resolved"));
+      await session.consumer;
+      expect(session.liveBackgroundTasks.has("agent-1")).toBe(false);
+      expect(session.owedTrailingIdles).toBe(0);
+    });
+
+    it("does not settle the next prompt at the followup result after the turn ended", async () => {
+      const { agent, events } = recordingAgent();
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: first } = await iter.next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage();
+          yield idle();
+          // The next prompt is queued before the subagent ends.
+          const { value: second } = await iter.next();
+          yield taskNotification("agent-1");
+          yield assistantText("late summary");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            stop_reason: "max_tokens",
+            usage: {
+              input_tokens: 100,
+              output_tokens: 100,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield idle();
+          yield userEcho(second);
+          yield running();
+          yield assistantText("second answer");
+          yield resultMessage({
+            usage: {
+              input_tokens: 20,
+              output_tokens: 7,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const first = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      expect(first.stopReason).toBe("end_turn");
+
+      const second = await agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] })
+        .then((r) => {
+          events.push("resolved:second");
+          return r;
+        });
+
+      // The second prompt settles at its own result, with its own usage.
+      expect(second.stopReason).toBe("end_turn");
+      expect(second.usage?.totalTokens).toBe(27);
+      expect(events).toEqual(["chunk:late summary", "chunk:second answer", "resolved:second"]);
+      await session.consumer;
+      expect(session.owedTrailingIdles).toBe(0);
     });
   });
 

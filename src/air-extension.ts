@@ -1,5 +1,10 @@
 export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
+/**
+ * A prompt turn ends at its result also while its background subagents run.
+ * The subagent updates and requests then go out after the prompt response.
+ */
+export const AIR_BACKGROUND_SUBAGENTS_CAPABILITY = "backgroundSubagents";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
 export const AIR_DIFF_PATCH_CAPABILITY = "diffPatch";

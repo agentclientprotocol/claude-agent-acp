@@ -120,6 +120,7 @@ import {
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
+  AIR_BACKGROUND_SUBAGENTS_CAPABILITY,
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
@@ -732,7 +733,9 @@ type Turn = {
    *  names only a launching subagent), so a spawn made by a
    *  PREVIOUS turn's followup chain while a later turn happens to be held
    *  is attributed to the holder — extending that hold behind a foreign
-   *  chain. Bounded: the hold still ends at drain, hand-off, or cancel. */
+   *  chain. Bounded: the hold still ends at drain, hand-off, or cancel.
+   *  The set is also kept for a client with `backgroundSubagents`, but no
+   *  hold reads it there (see `deferredSettle`). */
   spawnedTaskIds?: Set<string>;
   /** Set instead of settling when the turn's terminal result arrives while
    *  subagents it spawned are still live (`spawnedTaskIds` ∩
@@ -742,6 +745,17 @@ type Turn = {
    *  client that stops consuming at the prompt response never answers —
    *  issue #866), and the model's task-notification followup summary all
    *  land inside the turn.
+   *
+   *  An ACP v1 AIR client that declares `backgroundSubagents` gets no hold:
+   *  this field stays unset, and the turn settles at its result. AIR keeps
+   *  listening after the prompt response, so the subagent updates, their
+   *  permission requests and elicitations, and the followup summary go out
+   *  after it, with the same routing. A held turn hides the end of the
+   *  answer, and the next user message would steer into it. Consequences:
+   *  a followup result is an out-of-turn autonomous result; a steer with no
+   *  turn in flight starts a new turn; the file-change report of the turn
+   *  leaves out subagent edits after the result. Every other client keeps
+   *  the hold, so issue #866 stays fixed for it.
    *
    *  Idle cadence depends on the CLI. Through 2.1.269 the trailing idle is
    *  NOT held for background agents (observed on 2.1.206: `idle` follows
@@ -1128,7 +1142,9 @@ export type Session = {
    *  `turnAwaitingSubagents` (with `spawnedTaskIds`) to decide whether a
    *  turn's settlement is deferred (see `Turn.deferredSettle`), so the
    *  subagents' post-result output and permission requests stay inside the
-   *  turn (issues #864/#866). Deliberately false for non-subagent background
+   *  turn (issues #864/#866). A client with `backgroundSubagents` gets no
+   *  such hold. Its subagent requests keep this attribution after the
+   *  prompt response. Deliberately false for non-subagent background
    *  tasks (e.g. a `run_in_background` dev server): those can outlive every
    *  turn, and the model's contract with them is a wake-on-exit
    *  notification, not a turn-scoped drain — a hold must NEVER wait on a
@@ -1168,7 +1184,9 @@ export type Session = {
    *  agent id without a new `task_started` (a running `task_updated` patch or
    *  a SendMessage `resumedAgentId`). The resume signal puts the subagent back
    *  into `liveBackgroundTasks` from this record, so the resuming turn holds
-   *  and its permission requests keep their attribution. Bounded by
+   *  and its permission requests keep their attribution. With
+   *  `backgroundSubagents` the resuming turn does not hold, and the
+   *  attribution stays the same. Bounded by
    *  `MAX_RESUMABLE_SUBAGENTS`, oldest first. */
   resumableSubagents?: Map<string, { parentToolUseId?: string }>;
   /** The latest `run_id` seen on each task's events, so a late frame of an
@@ -1320,7 +1338,8 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
- *  lanes and cancel(). */
+ *  lanes and cancel(). Always false for a client with `backgroundSubagents`,
+ *  because no turn of that client is held. */
 function isHeldOpen(turn: Turn | null | undefined): turn is Turn & { deferredSettle: TurnOutcome } {
   return turn != null && turn.deferredSettle !== undefined && !turn.settled;
 }
@@ -2527,6 +2546,19 @@ export class ClaudeAcpAgent {
    */
   private readonly v2: boolean;
 
+  /**
+   * Whether a turn ends at its result while background subagents that it
+   * spawned or resumed still run. Only an ACP v1 AIR client that declares
+   * `backgroundSubagents` gets this. Every other client keeps the hold of
+   * `Turn.deferredSettle`.
+   */
+  private endsTurnsWithLiveSubagents(): boolean {
+    return (
+      !this.v2 &&
+      clientSupportsAirCapability(this.clientCapabilities, AIR_BACKGROUND_SUBAGENTS_CAPABILITY)
+    );
+  }
+
   constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
     this.v2 = options.v2 ?? false;
     this.sessions = {};
@@ -2768,6 +2800,8 @@ export class ClaudeAcpAgent {
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
+                // ACP v2 keeps the hold (see `src/v2/prompt.ts`).
+                ...(this.v2 ? [] : [AIR_BACKGROUND_SUBAGENTS_CAPABILITY]),
               ),
               AIR_GOAL_KEY,
               {
@@ -4505,7 +4539,8 @@ export class ClaudeAcpAgent {
 
     /** Registers a live background task (see `liveBackgroundTasks`). A
      *  subagent is also recorded on the active turn, so that turn holds until
-     *  the subagent settles (see `Turn.spawnedTaskIds`). */
+     *  the subagent settles (see `Turn.spawnedTaskIds`). A client with
+     *  `backgroundSubagents` gets no hold (see `turnAwaitingSubagents`). */
     const registerLiveTask = (
       taskId: string,
       parentToolUseId: string | undefined,
@@ -4523,8 +4558,9 @@ export class ClaudeAcpAgent {
 
     /** Registers a settled subagent again when the SDK resumes it without a
      *  new `task_started`. The active turn is the one that resumed it, so it
-     *  holds until the subagent settles again. A repeated resume signal finds
-     *  the subagent live and changes nothing. */
+     *  holds until the subagent settles again, unless the client declared
+     *  `backgroundSubagents`. A repeated resume signal finds the subagent live
+     *  and changes nothing. */
     const resumeLiveTask = (taskId: string) => {
       if (session.liveBackgroundTasks.has(taskId)) return;
       const settled = session.resumableSubagents?.get(taskId);
@@ -4534,9 +4570,12 @@ export class ClaudeAcpAgent {
     /** Whether any background subagent this turn spawned is still live —
      *  while true, the turn's settlement stays deferred so the subagent's
      *  output and permission requests land inside it (see
-     *  Turn.deferredSettle). */
+     *  Turn.deferredSettle). Always false for a client that declared
+     *  `backgroundSubagents`: its turns end at their result, and the subagent
+     *  traffic goes out after the prompt response. This is the single gate of
+     *  the hold, so no turn of such a client is ever held open. */
     const turnAwaitingSubagents = (turn: Turn) => {
-      if (!turn.spawnedTaskIds?.size) {
+      if (this.endsTurnsWithLiveSubagents() || !turn.spawnedTaskIds?.size) {
         return false;
       }
       for (const taskId of turn.spawnedTaskIds) {
@@ -4569,7 +4608,8 @@ export class ClaudeAcpAgent {
      *  turn open (see Turn.deferredSettle). Every result-time settle of a
      *  turn that can have spawned subagents must route through here: a site
      *  calling settleActive directly bypasses the hold and re-opens the
-     *  out-of-turn permission deadlock (issue #866) through its lane. */
+     *  out-of-turn permission deadlock (issue #866) through its lane. For a
+     *  client with `backgroundSubagents` this always settles now. */
     const settleOrDefer = async (outcome: TurnOutcome) => {
       // No result ends a steered turn: the steer aborted the cycle this result
       // may belong to, and the steered one is still to come. Record the outcome
@@ -6176,6 +6216,27 @@ export class ClaudeAcpAgent {
                   await settleOrDefer({ ...heldTurn.deferredSettle, stopReason: "cancelled" });
                   break;
                 }
+                // The same followup with no held turn: the client declared
+                // `backgroundSubagents`, or the hold already ended. The user
+                // answered out of a turn, so there is no turn to end. The
+                // interrupt only stops this autonomous cycle. Drop the markers,
+                // so that a later user-turn result is not read as this
+                // interruption. A clear-context reset cannot run here, because
+                // the fresh query continues an ACP turn. `canUseTool` offers
+                // no clear-context option out of a turn for such a client, so
+                // a reset here is only a race with the end of a turn.
+                if (
+                  pendingExitPlanModeInterruption &&
+                  isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
+                ) {
+                  session.pendingExitPlanModeInterruption = undefined;
+                  if (pendingExitPlanContextReset) {
+                    session.pendingExitPlanContextReset = undefined;
+                    this.logger.error(
+                      `Session ${params.sessionId}: no turn to continue the accepted plan in a fresh context`,
+                    );
+                  }
+                }
                 // CLI 2.1.274+ answers background-task completions that were
                 // already queued with ONE model call: every queued
                 // notification still gets its own result, but all except the
@@ -6492,7 +6553,9 @@ export class ClaudeAcpAgent {
               // permission requests, and the model's promised summary all land
               // inside the turn. `session/cancel` and the next prompt's echo
               // hand-off still settle a deferred turn early, so a long-running
-              // subagent never holds the prompt hostage.
+              // subagent never holds the prompt hostage. A client with
+              // `backgroundSubagents` gets no hold: the turn settles here, and
+              // the subagent traffic goes out after the prompt response.
               //
               // is_error/auth already settled via failActive (activeTurn is null
               // then, so both branches no-op); cancellation is left to the
@@ -8576,6 +8639,12 @@ export class ClaudeAcpAgent {
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
         prePlanMode: session.prePlanMode,
+        // A fresh context continues the active ACP turn. With
+        // `backgroundSubagents` a followup cycle can ask out of a turn, and
+        // then there is no turn to continue.
+        allowContextReset:
+          !this.endsTurnsWithLiveSubagents() ||
+          (session.activeTurn != null && !session.activeTurn.settled),
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined

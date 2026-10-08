@@ -99,6 +99,29 @@ describe("incomplete foreground tools", () => {
     expect(logError).not.toHaveBeenCalled();
   });
 
+  it("with backgroundSubagents, settles at the result without failing the running subagent's tool", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { agent, prompt, updates, logError } = createTestSession((input) =>
+      backgroundSubagentMessages(input, gate),
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
+      },
+    });
+
+    // The turn is not held, so the check runs while the subagent still runs.
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(agent.sessions[sessionId].liveBackgroundTasks.has("child")).toBe(true);
+    expect(updates.some((u) => u.toolCallId === toolCallId && u.status === "failed")).toBe(false);
+    expect(logError).not.toHaveBeenCalled();
+    release();
+    await agent.sessions[sessionId].consumer;
+    expect(agent.sessions[sessionId].liveBackgroundTasks.has("child")).toBe(false);
+  });
+
   it("fails every unfinished tool and allows a later prompt to succeed", async () => {
     const { prompt, updates, agent } = createTestSession(incompleteThenSuccessfulTurnMessages);
 
@@ -347,6 +370,36 @@ async function* deferredSettlementMessages(input: Pushable<any>) {
     summary: "done",
   };
   yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/** The tool call of a subagent that still runs in the background when the
+ *  result arrives. Its tool result comes after the result. */
+async function* backgroundSubagentMessages(input: Pushable<any>, gate: Promise<void>) {
+  yield* echoNextPrompt(input);
+  yield toolStart();
+  yield toolUse();
+  yield {
+    type: "system",
+    subtype: "task_started",
+    session_id: sessionId,
+    task_id: "child",
+    tool_use_id: toolCallId,
+    subagent_type: "Explore",
+    description: "investigate",
+  };
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  await gate;
+  yield toolResult();
+  yield {
+    type: "system",
+    subtype: "task_notification",
+    session_id: sessionId,
+    task_id: "child",
+    tool_use_id: toolCallId,
+    status: "completed",
+    summary: "done",
+  };
 }
 
 async function* incompleteThenSuccessfulTurnMessages(input: Pushable<any>) {
