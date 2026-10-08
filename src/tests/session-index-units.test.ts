@@ -921,8 +921,13 @@ describe("archive titles (AIR's Claude format)", () => {
       { type: "user", toolUseResult: { agentName: "nested" } },
     );
     expect(lastAgentName(text)).toBe("Second");
-    expect(effectiveTranscriptTitle({ head: text, tail: text })).toBe("Second");
+    expect(effectiveTranscriptTitle({ head: text, tail: text }, lastAgentName(text))).toBe(
+      "Second",
+    );
     const custom = lines({ type: "custom-title", customTitle: "Custom" });
-    expect(effectiveTranscriptTitle({ head: custom, tail: custom })).toBe("Custom");
+    expect(effectiveTranscriptTitle({ head: custom, tail: custom }, undefined)).toBe("Custom");
+    // A custom title nested in another record is no title.
+    const nested = lines({ type: "user", toolUseResult: { customTitle: "[archived] Nested" } });
+    expect(effectiveTranscriptTitle({ head: nested, tail: nested }, undefined)).toBeUndefined();
   });
 });

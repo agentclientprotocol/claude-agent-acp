@@ -40,6 +40,7 @@ import {
   effectiveTranscriptTitle,
   hasTailCustomTitle,
   readHeadTail,
+  transcriptAgentName,
   transcriptProjectCwd,
 } from "./transcript-scan.js";
 import {
@@ -287,7 +288,25 @@ async function copyTitle(filePath: string): Promise<string | undefined> {
   const sidecar = hasTailCustomTitle(headTail.tail)
     ? undefined
     : await readSidecarTitle(filePath, transcriptSessionId(filePath));
-  return effectiveTranscriptTitle(headTail, sidecar);
+  const agentName = await transcriptAgentName(filePath, size, headTail);
+  return effectiveTranscriptTitle(headTail, agentName, sidecar);
+}
+
+/** Rewrites the sidecar of a copy whose title is `current` when the
+ *  sidecar says the other archive state (a sidecar write that failed after
+ *  the records were appended). */
+async function alignSidecar(
+  transcript: string,
+  current: string | undefined,
+  sessionId: string,
+): Promise<void> {
+  if (current === undefined) return;
+  const sidecar = await readSidecarTitle(transcript, transcriptSessionId(transcript));
+  if (sidecar === undefined || isArchivedTitle(sidecar) === isArchivedTitle(current)) return;
+  await writeCustomTitleSidecar(
+    transcript,
+    storedTitle(current, isArchivedTitle(current), sessionId),
+  );
 }
 
 /** The title a change stores for a copy whose effective title is `current`
@@ -387,9 +406,15 @@ export type RetitleOptions = {
   /** This process runs (or just closed) a CLI for the session. */
   ownCli?: "running" | "exiting";
   /** The CLI of the session runs here: it stores the title of its own
-   *  transcript (`rename_session`), and `title` is the title it holds while
-   *  it has no transcript yet. */
-  live?: { cwd: string; rename: (title: string) => Promise<void>; title?: string };
+   *  transcript (`rename_session`). `stored`: the title last stored through
+   *  it, which it holds; `shown`: the title last shown for a session that has
+   *  neither that nor a transcript. */
+  live?: {
+    cwd: string;
+    rename: (title: string) => Promise<void>;
+    stored?: string;
+    shown?: string;
+  };
   /** A session without a transcript is not unknown: a new session this
    *  connection runs, or a live one being renamed. */
   mayBeUnwritten?: boolean;
@@ -517,8 +542,10 @@ export class SessionIndexService {
 
   /**
    * Retitles every transcript of a session with `change`: rename, archive
-   * and unarchive. Returns the title stored for the session's own copy (the
-   * CLI's, else the first), or undefined when it was left as it was.
+   * and unarchive. Returns the title stored through the CLI that runs here,
+   * else the title of the first copy that got one; undefined when nothing
+   * was stored. A legacy marker is dropped only once no copy was left alone
+   * for a writer that may hold it.
    *
    * - The CLI runs here (`live`): it titles its own transcript and sidecar
    *   (`rename_session`), the only writer that cannot be overtaken by the
@@ -546,7 +573,7 @@ export class SessionIndexService {
       if (!live || !options.mayBeUnwritten) throw sessionNotFound(sessionId);
       return this.exclusive(sessionId, async () => {
         await this.assertNotHeldElsewhere(sessionId, "running");
-        const title = change(live.title, sessionId);
+        const title = change(live.stored ?? live.shown, sessionId);
         if (title !== undefined) await live.rename(title);
         return title;
       });
@@ -558,6 +585,8 @@ export class SessionIndexService {
         throw sessionNotFound(sessionId);
       }
       let stored: string | undefined;
+      // Every copy has the requested title: only then is a marker dropped.
+      let complete: boolean;
       try {
         if (live) {
           await this.assertNotHeldElsewhere(sessionId, "running");
@@ -567,52 +596,69 @@ export class SessionIndexService {
           for (const transcript of transcripts) {
             ((await isTranscriptOf(transcript, paths)) ? own : others).push(transcript);
           }
+          // The CLI holds the title it was last given and may not have
+          // written all of it yet (it writes the agent name after it
+          // answers): that title is current.
           const primary = own[0] ?? others[0];
-          const current = primary ? await copyTitle(primary) : live.title;
+          const current =
+            live.stored ?? (primary ? await copyTitle(primary) : undefined) ?? live.shown;
           stored = change(current, sessionId);
           if (stored !== undefined) await live.rename(stored);
           try {
-            await this.titleCopies(others, change, true, options.sidecar);
+            complete = (await this.titleCopies(others, change, true, options.sidecar)).complete;
           } catch (error) {
+            complete = false;
             this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
           }
         } else {
           await this.assertNotHeldElsewhere(sessionId, options.ownCli);
-          stored = await this.titleCopies(
+          const result = await this.titleCopies(
             transcripts,
             change,
             options.ownCli === "running",
             options.sidecar,
           );
+          stored = result.first;
+          complete = result.complete;
         }
       } finally {
         this.index.invalidate(transcripts);
       }
-      if (options.dropMarker) await removeArchiveMarker(sessionId);
+      if (options.dropMarker && complete) await removeArchiveMarker(sessionId);
       return stored;
     });
   }
 
   /** Appends the title records `change` gives each copy, then its sidecar.
-   *  Returns the title of the first copy that got one. */
+   *  A copy already in the requested state gets nothing, but its sidecar is
+   *  brought in line with it. `first`: the title the first titled copy got;
+   *  `complete`: no copy was left alone for a writer that may hold it. */
   private async titleCopies(
     transcripts: readonly string[],
     change: TitleChange,
     liveWriter: boolean,
     sidecar: RetitleOptions["sidecar"],
-  ): Promise<string | undefined> {
+  ): Promise<{ first?: string; complete: boolean }> {
     let first: string | undefined;
+    let complete = true;
     for (const transcript of transcripts) {
       const id = transcriptSessionId(transcript);
-      const title = change(await copyTitle(transcript), id);
-      if (title === undefined) continue;
-      if (!(await ensureTitleRecords(transcript, id, title, { liveWriter }))) continue;
+      const current = await copyTitle(transcript);
+      const title = change(current, id);
+      if (title === undefined) {
+        await alignSidecar(transcript, current, id);
+        continue;
+      }
+      if (!(await ensureTitleRecords(transcript, id, title, { liveWriter }))) {
+        complete = false;
+        continue;
+      }
       first ??= title;
       if (sidecar === "always" || (await exists(sidecarPath(transcript)))) {
         await writeCustomTitleSidecar(transcript, title);
       }
     }
-    return first;
+    return { first, complete };
   }
 
   /** Deletes every transcript of the session, then its archive marker (see

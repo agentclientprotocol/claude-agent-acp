@@ -28,7 +28,7 @@ import {
 } from "../air-extension.js";
 import type { OwnSessionState } from "./activity.js";
 import { readArchivedSessionIds } from "./archive-markers.js";
-import { isArchivedTitle, visibleTitle } from "./archive-title.js";
+import { isArchivedTitle, storedTitle, visibleTitle } from "./archive-title.js";
 import { isSessionId } from "./project-dirs.js";
 import {
   archiveInsteadOfDelete,
@@ -184,7 +184,10 @@ export class SessionIndexConnection {
   async rename(request: RenameSessionRequest): Promise<EmptyResponse> {
     const index = this.requireService(SESSION_RENAME_METHOD);
     const sessionId = this.indexSessionId(request.sessionId);
-    await this.retitle(index, sessionId, renameTo(request.title), request.title, {
+    // As the CLI keeps it, and never with the archive prefix: a rename does
+    // not change the archive state.
+    const title = storedTitle(request.title, false, sessionId);
+    await this.retitle(index, sessionId, renameTo(title), title, {
       mayBeUnwritten: true,
       sidecar: "always",
     });
@@ -239,14 +242,22 @@ export class SessionIndexConnection {
         | undefined;
       // A closed session's CLI is gone here, and another process may have
       // resumed the session since: only a running query is ours.
-      const live =
-        session && !session.queryClosed && typeof query?.renameSession === "function"
-          ? {
-              cwd: session.cwd,
-              rename: (title: string) => query.renameSession!(title, sessionId),
-              title: session.titles.heldTitle,
-            }
-          : undefined;
+      const running = session !== undefined && !session.queryClosed;
+      if (running && typeof query?.renameSession !== "function") {
+        // Its CLI holds the title and would write it back over ours.
+        throw RequestError.invalidRequest(
+          { sessionId },
+          "The Claude Code CLI of this session cannot change its title while it runs.",
+        );
+      }
+      const live = running
+        ? {
+            cwd: session.cwd,
+            rename: (title: string) => query!.renameSession!(title, sessionId),
+            stored: session.titles.storedTitle,
+            shown: session.titles.shownTitle,
+          }
+        : undefined;
       return index.retitle(sessionId, change, {
         ...options,
         // Without its CLI, a session needs its transcript.
@@ -284,11 +295,11 @@ export class SessionIndexConnection {
     // stay registered, and may write, while they do) and refuses a session
     // that another process holds. A session that runs here is checked once
     // its CLI is closed: another process may have resumed it meanwhile.
-    if (this.service && !running) {
-      await this.service.assertNotHeldElsewhere(
-        params.sessionId,
-        this.ownCliState(params.sessionId),
-      );
+    // An AIR client without sessionIndex archives instead (see below): the
+    // same holder rules, before the session is torn down.
+    const index = this.service ?? (this.host.isAirClient() ? this.airArchiver() : undefined);
+    if (index && !running) {
+      await index.assertNotHeldElsewhere(params.sessionId, this.ownCliState(params.sessionId));
     }
     // Tear down any active in-memory state first so the on-disk file isn't
     // recreated by an outstanding query writing to it.
@@ -298,19 +309,23 @@ export class SessionIndexConnection {
     if (this.service) {
       if (running) await this.service.assertNotHeldElsewhere(params.sessionId, "exiting");
       await this.service.delete(params.sessionId, loaded);
-    } else if (this.host.isAirClient()) {
-      this.archiver ??= new SessionIndexService({
-        notifyListChanged: async () => {},
-        logError: (message, error) =>
-          this.host.agent.logger.error(`[session-index] ${message}:`, error),
-      });
-      await archiveInsteadOfDelete(params.sessionId, this.archiver, {
+    } else if (index) {
+      await archiveInsteadOfDelete(params.sessionId, index, {
         ownCli: this.ownCliState(params.sessionId),
       });
     } else {
       await sdkDeleteSession(params.sessionId);
     }
     return {};
+  }
+
+  private airArchiver(): SessionIndexService {
+    this.archiver ??= new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: (message, error) =>
+        this.host.agent.logger.error(`[session-index] ${message}:`, error),
+    });
+    return this.archiver;
   }
 
   private requireService(method: string): SessionIndexService {

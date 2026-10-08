@@ -448,8 +448,8 @@ export function isSidechainTranscript(head: string): boolean {
 
 /**
  * The title of a transcript from its own head and tail, in the
- * SDK's order: custom title (tail, the sidecar, head), AI title, last prompt,
- * summary, first prompt. For a transcript the SDK `getSessionInfo` does not
+ * SDK's order: custom title (tail, the sidecar, head), then
+ * {@link generatedTitle}. For a transcript the SDK `getSessionInfo` does not
  * read (another copy of the session comes first in its search).
  */
 export function transcriptTitle(
@@ -460,6 +460,14 @@ export function transcriptTitle(
     lastField(tail, "customTitle") ??
     sidecarTitle ??
     lastField(head, "customTitle") ??
+    generatedTitle({ head, tail })
+  );
+}
+
+/** The title of a transcript without a custom title, in the SDK's order: AI
+ *  title, last prompt, summary, first prompt. */
+export function generatedTitle({ head, tail }: HeadTail): string | undefined {
+  return (
     lastField(tail, "aiTitle") ??
     lastField(head, "aiTitle") ??
     lastField(tail, "lastPrompt") ??
@@ -468,39 +476,89 @@ export function transcriptTitle(
   );
 }
 
-/** The last non-blank top-level `agentName` of the records of `text`: the
- *  name that `/rename`, a `rename_session` and AIR write with the custom
- *  title, and that AIR ranks above it. */
-export function lastAgentName(text: string): string | undefined {
-  if (!text.includes('"agentName"')) return undefined;
+/** The last non-blank top-level string `field` of the records of `text`,
+ *  of records of `type` only when given. */
+function lastRecordField(text: string, field: string, type?: string): string | undefined {
+  const key = `"${field}"`;
+  if (!text.includes(key)) return undefined;
   const lines = text.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
-    if (!line.includes('"agentName"')) continue;
-    const name = parseLine(line)?.agentName;
-    if (typeof name === "string" && name.trim()) return name;
+    if (!line.includes(key)) continue;
+    const entry = parseLine(line);
+    if (!entry || (type !== undefined && entry.type !== type)) continue;
+    const value = entry[field];
+    if (typeof value === "string" && value.trim()) return value;
   }
   return undefined;
 }
 
+/** The last agent name of `text`: the top-level `agentName` of any record,
+ *  which `/rename`, a `rename_session` and AIR write with the custom title,
+ *  and which AIR ranks above it. */
+export function lastAgentName(text: string): string | undefined {
+  return lastRecordField(text, "agentName");
+}
+
+/** The last `customTitle` of a `custom-title` record of `text`. */
+export function lastCustomTitle(text: string): string | undefined {
+  return lastRecordField(text, "customTitle", "custom-title");
+}
+
 /**
- * The effective title of a transcript, as AIR resolves it: the last agent
- * name (tail, then head), else {@link transcriptTitle}.
+ * The last agent name of a transcript: in its tail, else, when the tail has
+ * a custom title or the head an agent name (the session was named), in the
+ * last {@link MAX_TAIL_SIZE} bytes before the tail, else in its head.
+ */
+export async function transcriptAgentName(
+  filePath: string,
+  size: number,
+  headTail: HeadTail,
+): Promise<string | undefined> {
+  const inTail = lastAgentName(headTail.tail);
+  if (inTail !== undefined) return inTail;
+  const inHead = lastAgentName(headTail.head);
+  const end = size - Buffer.byteLength(headTail.tail);
+  if (end > CHUNK_SIZE && (inHead !== undefined || lastCustomTitle(headTail.tail) !== undefined)) {
+    const start = Math.max(0, end - MAX_TAIL_SIZE);
+    const handle = await fs.open(filePath, "r");
+    try {
+      const buffer = Buffer.allocUnsafe(end - start);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+      let text = buffer.toString("utf8", 0, bytesRead);
+      if (start > 0) text = text.slice(text.indexOf("\n") + 1);
+      const found = lastAgentName(text);
+      if (found !== undefined) return found;
+    } finally {
+      await handle.close();
+    }
+  }
+  return inHead;
+}
+
+/**
+ * The effective title of a transcript, as AIR ranks the named ones: the
+ * last agent name (`agentName`, see {@link transcriptAgentName}), else the
+ * last custom title (tail, the sidecar, head), else the title the SDK gives
+ * a session without a name ({@link generatedTitle}).
  */
 export function effectiveTranscriptTitle(
   headTail: HeadTail,
+  agentName: string | undefined,
   sidecarTitle?: string,
 ): string | undefined {
   return (
-    lastAgentName(headTail.tail) ??
-    lastAgentName(headTail.head) ??
-    transcriptTitle(headTail, sidecarTitle)
+    agentName ??
+    lastCustomTitle(headTail.tail) ??
+    sidecarTitle ??
+    lastCustomTitle(headTail.head) ??
+    generatedTitle(headTail)
   );
 }
 
 /** Whether the tail carries a custom title of its own. */
 export function hasTailCustomTitle(tail: string): boolean {
-  return lastField(tail, "customTitle") !== undefined;
+  return lastCustomTitle(tail) !== undefined;
 }
 
 const CONTINUED_IN_MARKER = '"type":"continued-in"';

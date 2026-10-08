@@ -30,15 +30,17 @@ export class ExplicitTitle {
     });
   }
 
-  /** Persists a client title after the generation in flight. When it fails
-   *  and no other rename named the session, `restore` puts the title state
-   *  back, so a later turn may still generate a title. */
-  async apply(persist: () => Promise<void>, restore: () => void): Promise<void> {
+  /** Persists a client title after the generation in flight. `persist`
+   *  tells whether the session is named now. When it fails or names nothing
+   *  (an archive of an archived session), and no other rename named the
+   *  session, `restore` puts the title state back, so a later turn may still
+   *  generate a title. */
+  async apply(persist: () => Promise<boolean>, restore: () => void): Promise<void> {
     this.pending++;
     try {
       await this.generation;
-      await persist();
-      this.named = true;
+      if (await persist()) this.named = true;
+      else if (!this.named && this.pending === 1) restore();
     } catch (error) {
       if (!this.named && this.pending === 1) restore();
       throw error;

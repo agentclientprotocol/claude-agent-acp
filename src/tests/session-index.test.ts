@@ -1525,14 +1525,20 @@ describe("a failed rename", () => {
 });
 
 describe("a title record after a torn last line", () => {
-  it("is not appended while the session's CLI may be writing that line", async () => {
+  it("is not written for a running session whose CLI cannot take a title", async () => {
     const session = await writeTranscript({});
     await fs.appendFile(session.file, '{"type":"assistant","mess');
     const before = await fs.readFile(session.file, "utf8");
     const { agent } = await indexAgent();
-    // A running session whose SDK has no rename control request.
+    // A running session whose SDK has no rename control request: its CLI
+    // holds the title and would write it back.
     agent.sessions[session.id] = mockSessionState({ cwd: workspace }, agent, session.id) as any;
-    await agent.renameSessionTitle({ sessionId: session.id, title: "Later" });
+    await expect(
+      agent.renameSessionTitle({ sessionId: session.id, title: "Later" }),
+    ).rejects.toMatchObject({ code: -32600 });
+    await expect(agent.archiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      code: -32600,
+    });
     expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
@@ -2018,7 +2024,12 @@ describe("archive state (ACP RFD #2161)", () => {
     expect(close).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
     // The CLI titles its own transcript; the adapter does not write it.
-    expect(rename.mock.calls).toEqual([["[archived] Fix it", session.id]]);
+    // The unarchive reads the title the CLI holds, not the transcript the
+    // CLI may not have written yet.
+    expect(rename.mock.calls).toEqual([
+      ["[archived] Fix it", session.id],
+      ["Fix it", session.id],
+    ]);
     expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
@@ -2286,16 +2297,21 @@ describe("open a session that runs here and that another process resumed", () =>
 describe("archive of a loaded session without its transcript", () => {
   it("is unknown once the session had history, and allowed for a new unwritten one", async () => {
     const { agent, updates } = await indexAgent();
+    const query = { renameSession: async () => {} };
     const stale = randomUUID();
     agent.sessions[stale] = mockSessionState({ queryClosed: true }, agent, stale) as any;
     const finished = randomUUID();
     agent.sessions[finished] = mockSessionState(
-      { lastTurnEndedAt: Date.now() },
+      { lastTurnEndedAt: Date.now(), query },
       agent,
       finished,
     ) as any;
     const resumed = randomUUID();
-    agent.sessions[resumed] = mockSessionState({ resumedFromHistory: true }, agent, resumed) as any;
+    agent.sessions[resumed] = mockSessionState(
+      { resumedFromHistory: true, query },
+      agent,
+      resumed,
+    ) as any;
     for (const sessionId of [stale, finished, resumed]) {
       await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
       await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
@@ -2722,5 +2738,170 @@ describe("a transcript without a prompt in its last 4 MB", () => {
     });
     expect(grown.lastPromptAt).toBeUndefined();
     expect(grown.promptSearched).toBe(true);
+  });
+});
+
+describe("archive in AIR's title format, edge cases", () => {
+  it("renames a running archived session through its CLI with the prefix kept", async () => {
+    const session = await writeTranscript({});
+    const { agent, updates } = await indexAgent();
+    const rename = vi.fn(async () => {});
+    agent.sessions[session.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: rename } },
+      agent,
+      session.id,
+    ) as any;
+    await agent.archiveSession({ sessionId: session.id });
+    await agent.renameSessionTitle({ sessionId: session.id, title: "[archived] New" });
+    expect(rename.mock.calls).toEqual([
+      ["[archived] Fix it", session.id],
+      ["[archived] New", session.id],
+    ]);
+    expect(updates).toContainEqual({
+      sessionId: session.id,
+      update: { sessionUpdate: "session_info_update", title: "New" },
+    });
+  });
+
+  it("stores a rename as the CLI keeps it, and never archives by a client title", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.renameSessionTitle({ sessionId: session.id, title: "[archived] Mine" });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Mine"));
+    const long = `${"a".repeat(199)} tail`;
+    await agent.renameSessionTitle({ sessionId: session.id, title: long });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "a".repeat(199)));
+    await agent.archiveSession({ sessionId: session.id });
+    await agent.renameSessionTitle({ sessionId: session.id, title: long });
+    expect(await lastRecords(session.file)).toEqual(
+      titleRecords(session.id, `[archived] ${"a".repeat(189)}`),
+    );
+  });
+
+  it("finds an agent name that later traffic pushed out of the tail window", async () => {
+    const filler = Array.from({ length: 40 }, () => ({
+      type: "system",
+      subtype: "informational",
+      content: "x".repeat(4000),
+    }));
+    const session = await writeTranscript({
+      trailer: [
+        ...titleRecords("", "[archived] Done"),
+        ...filler,
+        // A custom title alone, as the SDK renameSession writes it.
+        { type: "custom-title", customTitle: "Plain", sessionId: "" },
+      ],
+    });
+    expect((await fs.stat(session.file)).size).toBeGreaterThan(128 * 1024);
+    const { agent } = await indexAgent();
+    const [row] = (
+      await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "all" }) })
+    ).sessions;
+    expect(row!.title).toBe("Done");
+    expect((row!._meta as any).jetbrains.air.archived).toBe(true);
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Done"));
+  });
+
+  it("keeps the marker while a copy of a running session could not be titled", async () => {
+    const own = await writeTranscript({ cwd: workspace });
+    const other = await writeTranscript({ sessionId: own.id, cwd: path.join(workspace, "b") });
+    await fs.appendFile(other.file, '{"type":"assistant","mess');
+    const marker = await writeMarker(own.id);
+    const { agent } = await indexAgent();
+    agent.sessions[own.id] = mockSessionState(
+      { cwd: workspace, query: { renameSession: async () => {} } },
+      agent,
+      own.id,
+    ) as any;
+    await agent.archiveSession({ sessionId: own.id });
+    expect((await fs.readFile(other.file, "utf8")).endsWith('"mess')).toBe(true);
+    expect(fsSync.existsSync(marker)).toBe(true);
+  });
+
+  it("brings an existing sidecar in line with a transcript already archived", async () => {
+    const session = await writeTranscript({
+      trailer: titleRecords("", "[archived] Done"),
+    });
+    await writeCustomTitleSidecar(session.file, "Done");
+    const { agent } = await indexAgent();
+    const before = await fs.readFile(session.file, "utf8");
+    await agent.archiveSession({ sessionId: session.id });
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
+    const sidecar = path.join(path.dirname(session.file), session.id, "custom-title.json");
+    expect(JSON.parse(await fs.readFile(sidecar, "utf8"))).toEqual({
+      customTitle: "[archived] Done",
+    });
+  });
+
+  it("leaves a loaded session in place when AIR without sessionIndex may not archive it", async () => {
+    const session = await writeTranscript({});
+    const { agent } = createAgent();
+    await initializeClient(agent, air());
+    const loaded = mockSessionState({ queryClosed: true }, agent, session.id) as any;
+    agent.sessions[session.id] = loaded;
+    await registerHolder(process.pid, session.id);
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(agent.sessions[session.id]).toBe(loaded);
+  });
+
+  it("filters archived rows after reading them, across batches and pages", async () => {
+    const base = Date.parse("2026-05-01T00:00:00Z");
+    const sessions = [];
+    for (let i = 0; i < 40; i++) {
+      const archived = i % 3 === 0;
+      sessions.push({
+        archived,
+        ...(await writeTranscript({
+          lastMessageAt: base - i * 1000,
+          ...(archived && { trailer: titleRecords("", "[archived] Old") }),
+        })),
+      });
+    }
+    const { agent } = await indexAgent();
+    for (const archived of ["unarchived", "archived"] as const) {
+      const expected = sessions
+        .filter((session) => session.archived === (archived === "archived"))
+        .map((session) => session.id);
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await agent.listSessions({
+          cwd: workspace,
+          cursor,
+          _meta: listMeta({ archived, limit: 4 }),
+        });
+        seen.push(...page.sessions.map((s) => s.sessionId));
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      expect(seen).toEqual(expected);
+    }
+  });
+});
+
+describe("an archive that stores nothing", () => {
+  it("leaves the title open to generation", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const session: any = {
+      queryClosed: false,
+      cancelled: false,
+      cwd: "/nowhere",
+      query: { generateSessionTitle: async () => "Generated" },
+    };
+    agent.sessions.s1 = session;
+    titles.onPrompt([{ type: "text", text: "Please refactor the parser module" }]);
+    await titles.setExplicitTitle(undefined, async () => undefined);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
+    await titles.onTurnEnd(session);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
   });
 });

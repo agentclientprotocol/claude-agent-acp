@@ -104,13 +104,17 @@ export class SessionTitles {
   private readonly explicit = new ExplicitTitle();
 
   /** The title last stored through {@link setExplicitTitle}, as stored
-   *  (with the archive prefix of an archived session). */
+   *  (with the archive prefix of an archived session): the title the CLI
+   *  holds. */
   private persistedTitle?: string;
 
-  /** The title the CLI holds as far as this session knows: the one last
-   *  stored for a client, else the one last published. */
-  get heldTitle(): string | undefined {
-    return this.persistedTitle ?? this.lastTitle;
+  get storedTitle(): string | undefined {
+    return this.persistedTitle;
+  }
+
+  /** The title last published, as the client shows it. */
+  get shownTitle(): string | undefined {
+    return this.lastTitle;
   }
 
   constructor(
@@ -204,7 +208,8 @@ export class SessionTitles {
    *  unarchive). Settles the title for good, waits for a generation in flight
    *  so that its persisted title cannot land after this one, persists the
    *  title with `persist`, which returns what it stored, if anything, and
-   *  publishes `title` unless it is undefined. */
+   *  publishes `title` unless it is undefined. A change that stored and
+   *  publishes nothing leaves the title state as it was. */
   async setExplicitTitle(
     title: string | undefined,
     persist: () => Promise<string | undefined | void>,
@@ -216,6 +221,7 @@ export class SessionTitles {
       async () => {
         const stored = await persist();
         if (stored !== undefined) this.persistedTitle = stored;
+        return stored !== undefined || title !== undefined;
       },
       () => {
         this.settled = previous.settled;

@@ -39,13 +39,14 @@ import {
   continuedInSessionId,
   hasHistory,
   hasTailCustomTitle,
+  generatedTitle,
   isSidechainTranscript,
-  lastAgentName,
+  lastCustomTitle,
+  transcriptAgentName,
   readHeadTail,
   relocatedCwd,
   scanTranscriptFile,
   transcriptProjectCwd,
-  transcriptTitle,
   type HeadTail,
   type PreviousScan,
   type TranscriptFacts,
@@ -821,19 +822,25 @@ export class SessionIndex {
   }
 
   /**
-   * The effective title of the listed transcript, as AIR resolves it: the
-   * last agent name, else the SDK title. The SDK `getSessionInfo` reads the
-   * first copy of the session that its search finds; its answer is used
-   * only when that copy is the listed file (same size and mtime), else the
-   * title comes from the listed file itself.
+   * The effective title of the listed transcript (see
+   * {@link effectiveTranscriptTitle}): the last agent name, else the last
+   * custom title, else the SDK title of a session without a name. The SDK
+   * `getSessionInfo` reads the first copy of the session that its search
+   * finds; its answer is used only when that copy is the listed file (same
+   * size and mtime), else the title comes from the listed file itself.
    */
   private async titleOf(
     candidate: TranscriptCandidate,
     headTail: HeadTail,
     fileCwd: string | undefined,
   ): Promise<string | undefined> {
-    const agentName = lastAgentName(headTail.tail) ?? lastAgentName(headTail.head);
-    if (agentName !== undefined) return agentName;
+    const agentName = await transcriptAgentName(candidate.filePath, candidate.size, headTail);
+    const sidecar = hasTailCustomTitle(headTail.tail)
+      ? undefined
+      : await readSidecarTitle(candidate.filePath, candidate.sessionId);
+    const named =
+      agentName ?? lastCustomTitle(headTail.tail) ?? sidecar ?? lastCustomTitle(headTail.head);
+    if (named !== undefined) return named;
     const dir = [fileCwd, candidate.projectPath].find(
       (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
     );
@@ -847,10 +854,7 @@ export class SessionIndex {
     ) {
       return info.summary;
     }
-    const sidecar = hasTailCustomTitle(headTail.tail)
-      ? undefined
-      : await readSidecarTitle(candidate.filePath, candidate.sessionId);
-    return transcriptTitle(headTail, sidecar);
+    return generatedTitle(headTail);
   }
 
   /** Whether a successor of a continued transcript holds history: the SDK

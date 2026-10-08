@@ -23,9 +23,12 @@ export const ARCHIVED_TITLE_PREFIX = "[archived] ";
 /** What the CLI keeps of a stored title: `title.slice(0, 200).trim()`. */
 const CLI_TITLE_LIMIT = 200;
 
-/** A title once normalized starts with the prefix: leading space, the
- *  marker, a run of white space, then a title character. */
-const ARCHIVED_PATTERN = /^\s*\[archived\]\s+(?=\S)/;
+/** A title once normalized starts with the prefix: leading space (what a
+ *  trim removes), the marker, a run of white space, then a title character.
+ *  The white space AIR collapses is ASCII white space, as in Java's `\s`. */
+const ARCHIVED_PATTERN = /^\s*\[archived\][ \t\n\v\f\r]+(?=[^ \t\n\v\f\r])/;
+
+const WHITESPACE_RUN = /[ \t\n\v\f\r]+/g;
 
 /** How much of a long title the normalization reads: the stored title is
  *  cut to {@link CLI_TITLE_LIMIT} characters after it. */
@@ -33,8 +36,9 @@ const TITLE_SCAN_LENGTH = 4096;
 
 /** Whitespace collapsed to single spaces and trimmed, as AIR stores a title. */
 export function normalizeStoredTitle(title: string): string {
-  const text = title.length > TITLE_SCAN_LENGTH ? title.slice(0, TITLE_SCAN_LENGTH) : title;
-  return text.replace(/\s+/g, " ").trim();
+  const start = title.trimStart();
+  const text = start.length > TITLE_SCAN_LENGTH ? start.slice(0, TITLE_SCAN_LENGTH) : start;
+  return text.replace(WHITESPACE_RUN, " ").trim();
 }
 
 /** Cut to what the CLI keeps of a title. */
