@@ -1245,7 +1245,7 @@ The new methods answer it with `-32601`.
 - On macOS a project directory whose name differs from the cwd's encoding in case only is the cwd's directory, as the file system resolves it for the SDK.
 - A row's `cwd` comes from the transcript (the last `relocated` record, else the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
   Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory, read further if the page does not hold one.
-- `updatedAt` needs the last message and the order key the last prompt: when the 64 KB tail window lacks either, the window grows up to 4 MB to find it, reading only the new bytes each step.
+- `updatedAt` needs the last message and the order key the last prompt: when the 64 KB tail window lacks either, the window grows up to 4 MB to find it, reading only the new bytes each step. A last message longer than that gives the last `timestamp` of the file's last 64 KB, so title records appended after it move nothing.
   The directory name is never decoded.
 
 Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archived` is always there (see [Archive](#archive)); every other field is omitted when unknown:
@@ -1308,7 +1308,7 @@ The archive state lives in the session title, in the format of AIR's own Claude 
   ```
 
   A transcript already in the requested state gets nothing. A `custom-title.json` sidecar that the adapter finds is rewritten with the same title (also one left in the other state next to a transcript already in the requested state); the adapter creates none. The CLI of a session that runs here writes the sidecar of its own transcript, as for a rename.
-  The current title is the effective title of each transcript. For a session that runs here, it is the title last stored through its CLI while its transcript still ends with that custom title (the CLI writes the agent name later); otherwise the transcript's.
+  The current title is the effective title of each transcript. For a session that runs here, it is the title last stored through its CLI while the last custom title of its transcript is that title (the CLI writes the agent name later); otherwise the transcript's.
   Every `[archived] ` prefix of the current title is removed before one is added, so unarchive also unarchives a title stored with the prefix twice.
   A new session archived before it has a title gets `[archived] Session …`, and keeps `Session …` as its name once unarchived: no title is generated for a named session.
 
