@@ -1347,7 +1347,7 @@ Names and semantics follow them; the transport differs, and so does the `archive
 | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`, `.changes`; client `session.listChanged` |
 | capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)                                      |
-| capability `sessionRename` (`_meta.jetbrains.air`)                                                | the `rename` capability (#1987)                                            |
+| capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)                                     |
 | `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                     |
 | `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                          |
 | `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                         |
@@ -1356,7 +1356,7 @@ Names and semantics follow them; the transport differs, and so does the `archive
 | `session_info_update` `_meta.jetbrains.air.archived`                                              | `SessionInfoUpdate.archived` (#2161)                                       |
 | `_session/list_changed { cwd }`                                                                   | `session/list_changed { cwd }`                                             |
 | `_session/archive`, `_session/unarchive`                                                          | `session/archive`, `session/unarchive` (#2161)                             |
-| `_session/rename`                                                                                 | client-set titles (#1987)                                                  |
+| `_session/rename`                                                                                 | `session/set_title` (#1987)                                                |
 
 ### Relation to ACP RFD #2161
 
