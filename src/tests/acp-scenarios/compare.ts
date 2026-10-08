@@ -241,8 +241,7 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     if (wanted.kind === "initialize") {
       const payload = actual.payload as Json;
       const meta = { ...((payload._meta as Json) ?? {}) };
-      for (const key of ["runtime", "sessionRewind", "sessionRewindFiles", "sessionMcp"])
-        delete meta[key];
+      delete meta.sessionRewind;
       return canonical({ ...actual, payload: { ...payload, _meta: meta } }) === canonical(wanted);
     }
     const want = updateOf(wanted);

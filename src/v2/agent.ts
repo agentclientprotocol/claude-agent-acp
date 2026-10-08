@@ -1,33 +1,9 @@
 import {
-  SESSION_MCP_SET_METHOD,
-  SESSION_MCP_STATE_METHOD,
-  parseSessionMcpSetRequest,
-  parseSessionMcpStateRequest,
-  sessionMcpState,
-  setSessionMcpServers,
-  type SessionMcpSetRequest,
-} from "../session-mcp-set.js";
-import {
-  RUNTIME_READ_METHOD,
-  RUNTIME_CONTROL_METHOD,
-  parseRuntimeReadRequest,
-  parseRuntimeControlRequest,
-  type RuntimeReadRequest,
-  type RuntimeControlRequest,
-  type RuntimeResponse,
-} from "../desktop-runtime.js";
-import {
   SESSION_REWIND_METHOD,
   parseSessionRewindRequest,
   type SessionRewindRequest,
   type SessionRewindResponse,
 } from "../session-rewind.js";
-import {
-  SESSION_REWIND_FILES_METHOD,
-  parseSessionRewindFilesRequest,
-  type SessionRewindFilesRequest,
-  type SessionRewindFilesResponse,
-} from "../session-rewind-files.js";
 /**
  * The experimental draft ACP v2 surface of the adapter.
  *
@@ -87,35 +63,10 @@ export function v2AgentApp(
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
       v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
     )
-    .onRequest<{ sessionId: string }, ReturnType<typeof sessionMcpState>>(
-      SESSION_MCP_STATE_METHOD,
-      { parse: parseSessionMcpStateRequest },
-      (ctx) => agent.readSessionMcpState(ctx.params),
-    )
-    .onRequest<SessionMcpSetRequest, Awaited<ReturnType<typeof setSessionMcpServers>>>(
-      SESSION_MCP_SET_METHOD,
-      { parse: parseSessionMcpSetRequest },
-      (ctx) => agent.setSessionMcp(ctx.params, ctx.signal),
-    )
-    .onRequest<RuntimeReadRequest, RuntimeResponse>(
-      RUNTIME_READ_METHOD,
-      { parse: parseRuntimeReadRequest },
-      (ctx) => agent.readSessionRuntime(ctx.params, ctx.signal),
-    )
-    .onRequest<RuntimeControlRequest, RuntimeResponse>(
-      RUNTIME_CONTROL_METHOD,
-      { parse: parseRuntimeControlRequest },
-      (ctx) => agent.controlSessionRuntime(ctx.params, ctx.signal),
-    )
     .onRequest<SessionRewindRequest, SessionRewindResponse>(
       SESSION_REWIND_METHOD,
       { parse: parseSessionRewindRequest },
       (ctx) => agent.rewindSession(ctx.params, ctx.signal),
-    )
-    .onRequest<SessionRewindFilesRequest, SessionRewindFilesResponse>(
-      SESSION_REWIND_FILES_METHOD,
-      { parse: parseSessionRewindFilesRequest },
-      (ctx) => agent.rewindFiles(ctx.params, ctx.signal),
     )
     .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
     .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))
