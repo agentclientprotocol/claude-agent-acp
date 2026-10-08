@@ -103,13 +103,11 @@ async function connect(version: 1 | 2) {
   };
 }
 
-describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
-  it("rewinds through the router with the same session and no new control endpoints", async () => {
+describe.each([1, 2] as const)("ACP v%s rewind wire", (version) => {
+  it("rewinds through the router while preserving the same session", async () => {
     const c = await connect(version);
     try {
       expect(JSON.stringify(c.initialized)).toContain("sessionRewind");
-      for (const key of ["sessionRewindFiles", "sessionMcp", '"runtime"'])
-        expect(JSON.stringify(c.initialized)).not.toContain(key);
       expect(await c.send("_session/rewind", requestParams)).toEqual({
         rewound: true,
         sessionId: "sid",
@@ -122,16 +120,6 @@ describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
         last_seen_user_message_uuid: "user-1",
         interrupt_if_running: false,
       });
-      for (const method of [
-        "_session/runtime/read",
-        "_session/runtime/control",
-        "_session/mcp/state",
-        "_session/mcp/set",
-        "_session/rewind_files",
-      ])
-        await expect(c.send(method, { sessionId: "sid" })).rejects.toMatchObject({
-          code: -32601,
-        });
     } finally {
       await c.close();
     }

@@ -176,6 +176,21 @@ function resolveTarget(
   }
   return target;
 }
+export async function resolveHistoryPoint(
+  sessionId: string,
+  point: SessionHistoryPoint,
+  role: "user" | "assistant",
+  grouping: SessionRewindDependencies["messageIdForGrouping"],
+): Promise<SessionMessage> {
+  return resolveHistoryPointFromMessages(
+    await readSessionHistory(sessionId, true),
+    sessionId,
+    point,
+    role,
+    grouping,
+  );
+}
+
 export function resolveHistoryPointFromMessages(
   messages: SessionMessage[],
   sessionId: string,

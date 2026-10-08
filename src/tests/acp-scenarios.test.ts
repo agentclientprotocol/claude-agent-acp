@@ -554,7 +554,9 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       expect(initialize.agentCapabilities._meta.claudeCode).toEqual({ promptQueueing: true });
       expect(initialize._meta).toMatchObject({
         steering: { supported: true },
+        runtime: { version: 1 },
         sessionRewind: { version: 1 },
+        sessionRewindFiles: { version: 1 },
       });
     });
 

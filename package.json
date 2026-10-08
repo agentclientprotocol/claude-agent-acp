@@ -39,10 +39,11 @@
     "test": "vitest",
     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
     "test:run": "vitest run",
-    "test:coverage": "vitest run --coverage",
-    "prepublishOnly": "npm run build",
+    "test:native": "npm run build && node scripts/native/e2e.mjs",
     "test:native:rewind": "npm run build && node scripts/native/e2e.mjs --rewind-only",
-    "test:native:compat": "vitest run src/tests/native-sdk-compat.test.ts src/tests/native-mutation.test.ts src/tests/session-rewind.test.ts src/tests/session-rewind-wire.test.ts src/tests/session-history.test.ts src/tests/session-mutation-lock.test.ts src/tests/resumed-session.test.ts"
+    "test:native:compat": "vitest run src/tests/native-sdk-compat.test.ts src/tests/native-mutation.test.ts src/tests/session-rewind.test.ts src/tests/session-mcp-set.test.ts src/tests/runtime-wire.test.ts",
+    "test:coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "claude",

@@ -83,12 +83,13 @@ npm run test:native:compat
 npm run test:native:rewind
 ```
 
-The native command builds this checkout and runs only `first`, `historical`,
-`latest` and `sdk-contract`. The runner contains no file restore, runtime or MCP
-replacement scenarios. It starts the real pinned SDK/native CLI with a loopback
+The rewind command builds this checkout and runs only `first`, `historical`,
+`latest` and `sdk-contract`. The full extension checkout also provides separate
+file restore, runtime and MCP scenarios through `test:native`; those are excluded
+by `test:native:rewind`. It starts the real pinned SDK/native CLI with a loopback
 streaming provider and an allowlisted child environment. Temporary homes, Claude
-config, workspaces and child temporary files stay under this checkout's ignored
-`node_modules/.native-rewind` directory. User settings and inherited credentials
+config, workspaces and child temporary files use fresh system temporary directories.
+User settings and inherited credentials
 are excluded; only a dummy key is sent to loopback. Nonessential native traffic
 is disabled and proxy requests to other destinations are refused locally.
 

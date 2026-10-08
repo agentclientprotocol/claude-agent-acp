@@ -8,6 +8,7 @@ import {
   NativeRewindUncertain,
   NativeRewindUnsupported,
 } from "../native-rewind-control.js";
+import { setSessionMcpServers, type SessionMcpState } from "../session-mcp-set.js";
 
 vi.mock("../session-history.js", () => ({ readSessionHistory: vi.fn() }));
 
@@ -91,5 +92,57 @@ describe("pinned SDK private rewind acknowledgement compatibility", () => {
       rewound: true,
       targetMessageUuid: "u1",
     });
+  });
+});
+
+describe("native MCP acknowledgement compatibility", () => {
+  it.each([
+    undefined,
+    null,
+    [],
+    {},
+    { errors: {} },
+    { added: [], removed: [], errors: null },
+    { added: [], removed: [], errors: [] },
+    { added: "host", removed: [], errors: {} },
+    { added: [1], removed: [], errors: {} },
+    { added: [], removed: [null], errors: {} },
+    { added: [], removed: [], errors: { host: true } },
+    { response: { added: [], removed: [], errors: {} } },
+  ])("invalidates unknown SDK shapes before committing the revision (%#)", async (reply) => {
+    const host = { name: "host", command: "node", args: [], env: [] };
+    const state: SessionMcpState = { revision: 7, hostServers: [host], protectedServers: {} };
+    const query = {
+      mcpServerStatus: vi.fn(async () => []),
+      setMcpServers: vi.fn(async () => reply),
+    };
+    const invalidate = vi.fn();
+    await expect(
+      setSessionMcpServers(
+        query as unknown as Query,
+        state,
+        { sessionId: "s", expectedRevision: 7, mcpServers: [] },
+        "s",
+        invalidate,
+      ),
+    ).rejects.toThrow("uncertain");
+    expect(state).toEqual({
+      revision: 7,
+      hostServers: [host],
+      protectedServers: {},
+      uncertain: true,
+    });
+    expect(invalidate).toHaveBeenCalledOnce();
+    expect(query.setMcpServers).toHaveBeenCalledOnce();
+    await expect(
+      setSessionMcpServers(
+        query as unknown as Query,
+        state,
+        { sessionId: "s", expectedRevision: 7, mcpServers: [] },
+        "s",
+        invalidate,
+      ),
+    ).rejects.toThrow("uncertain");
+    expect(query.setMcpServers).toHaveBeenCalledOnce();
   });
 });
