@@ -42,6 +42,7 @@ import {
   generatedTitle,
   isSidechainTranscript,
   lastCustomTitle,
+  lastTimestamp,
   transcriptAgentName,
   readHeadTail,
   relocatedCwd,
@@ -809,7 +810,12 @@ export class SessionIndex {
     // No title at all: the SDK does not list it either.
     if (!summary) return null;
     const archived = isArchivedTitle(summary);
-    const lastMessageAt = facts.lastMessageAt ?? candidate.mtimeMs;
+    // A last message longer than the tail search still ends with its
+    // timestamp; the mtime moves with every metadata record.
+    const lastMessageAt =
+      facts.lastMessageAt ??
+      (await lastTimestamp(candidate.filePath, candidate.size)) ??
+      candidate.mtimeMs;
     const continuedIn = continuedInSessionId(headTail.tail);
     return {
       title: sanitizeTitle(archived ? visibleTitle(summary) : summary),

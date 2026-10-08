@@ -556,6 +556,26 @@ export function effectiveTranscriptTitle(
   );
 }
 
+/** The time of the last `"timestamp"` in the last 64 KB of a file, cut
+ *  line included, epoch ms: a record longer than that still ends with it. */
+export async function lastTimestamp(filePath: string, size: number): Promise<number | undefined> {
+  const handle = await fs.open(filePath, "r");
+  let text: string;
+  try {
+    const length = Math.min(size, CHUNK_SIZE);
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, size - length);
+    text = buffer.toString("utf8", 0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+  for (const raw of stringFields(text, "timestamp").reverse()) {
+    const value = Date.parse(raw);
+    if (!Number.isNaN(value)) return value;
+  }
+  return undefined;
+}
+
 /** Whether the tail carries a custom title of its own. */
 export function hasTailCustomTitle(tail: string): boolean {
   return lastCustomTitle(tail) !== undefined;

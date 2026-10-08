@@ -28,6 +28,9 @@ const CLI_TITLE_LIMIT = 200;
  *  The white space AIR collapses is ASCII white space, as in Java's `\s`. */
 const ARCHIVED_PATTERN = /^\s*\[archived\][ \t\n\v\f\r]+(?=[^ \t\n\v\f\r])/;
 
+/** Every leading archive prefix at once. */
+const ARCHIVED_PREFIXES = /^(?:\s*\[archived\][ \t\n\v\f\r]+(?=[^ \t\n\v\f\r]))+/;
+
 const WHITESPACE_RUN = /[ \t\n\v\f\r]+/g;
 
 /** Whitespace collapsed to single spaces and trimmed, as AIR stores a title. */
@@ -61,9 +64,8 @@ export function defaultSessionTitle(sessionId: string): string {
  *  CLI limit. */
 export function storedTitle(title: string, archived: boolean, sessionId: string): string {
   // Every prefix: a title stored twice prefixed must not stay archived.
-  let bare = title;
-  while (isArchivedTitle(bare)) bare = visibleTitle(bare);
-  const visible = normalizeStoredTitle(bare) || defaultSessionTitle(sessionId);
+  const visible =
+    normalizeStoredTitle(title.replace(ARCHIVED_PREFIXES, "")) || defaultSessionTitle(sessionId);
   return capTitle(archived ? ARCHIVED_TITLE_PREFIX + visible : visible);
 }
 

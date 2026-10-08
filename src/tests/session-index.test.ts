@@ -3027,3 +3027,48 @@ describe("archive in AIR's title format, round two", () => {
     expect(updates.map((update) => update.update.title)).toEqual(["Generated"]);
   });
 });
+
+describe("archive in AIR's title format, round three", () => {
+  it("titles the copy of the unresolved cwd of a running session here", async () => {
+    const real = path.join(workspace, "real");
+    const link = path.join(workspace, "link");
+    await fs.mkdir(real);
+    await fs.symlink(real, link);
+    const cliCopy = await writeTranscript({ cwd: real });
+    const linkCopy = await writeTranscript({ sessionId: cliCopy.id, cwd: link });
+    const { agent } = await indexAgent();
+    const rename = cliRename(cliCopy.file, cliCopy.id);
+    agent.sessions[cliCopy.id] = mockSessionState(
+      { cwd: link, query: { renameSession: rename } },
+      agent,
+      cliCopy.id,
+    ) as any;
+    await agent.archiveSession({ sessionId: cliCopy.id });
+    expect(rename.mock.calls).toEqual([["[archived] Fix it", cliCopy.id]]);
+    expect(await lastRecords(linkCopy.file)).toEqual(titleRecords(cliCopy.id, "[archived] Fix it"));
+  });
+
+  it("keeps updatedAt of a session whose last message outgrows the tail search", async () => {
+    const at = Date.parse("2026-03-01T00:00:00Z");
+    const session = await writeTranscript({ lastMessageAt: at, mtimeMs: at + 60_000 });
+    const huge = {
+      type: "assistant",
+      sessionId: session.id,
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "y".repeat(5 * 1024 * 1024) }],
+      },
+      timestamp: new Date(at + 1000).toISOString(),
+    };
+    await fs.appendFile(session.file, JSON.stringify(huge) + "\n");
+    await fs.utimes(session.file, (at + 60_000) / 1000, (at + 60_000) / 1000);
+    const { agent } = await indexAgent();
+    const [before] = (await agent.listSessions({ cwd: workspace })).sessions;
+    expect(before!.updatedAt).toBe(new Date(at + 1000).toISOString());
+    await agent.archiveSession({ sessionId: session.id });
+    const [after] = (
+      await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "archived" }) })
+    ).sessions;
+    expect(after!.updatedAt).toBe(before!.updatedAt);
+  });
+});

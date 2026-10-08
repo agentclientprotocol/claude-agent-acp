@@ -605,17 +605,24 @@ export class SessionIndexService {
       try {
         if (live) {
           await this.assertNotHeldElsewhere(sessionId, "running");
-          const paths = [...new Set([live.cwd, await canonicalPath(live.cwd)])];
+          const canonical = await canonicalPath(live.cwd);
+          const paths = [...new Set([live.cwd, canonical])];
           const own: string[] = [];
-          const others: string[] = [];
           for (const transcript of transcripts) {
-            ((await isTranscriptOf(transcript, paths)) ? own : others).push(transcript);
+            if (await isTranscriptOf(transcript, paths)) own.push(transcript);
           }
+          // The CLI writes the transcript of the resolved cwd.
+          const cli =
+            own.find((transcript) =>
+              isExactProjectDir(path.basename(path.dirname(transcript)), canonical),
+            ) ?? own[0];
+          const others = transcripts.filter((transcript) => transcript !== cli);
           // The CLI writes the custom title of a rename before it answers,
-          // and the agent name after: while its transcript ends with the
-          // title last given to it, that title is current. A title changed
-          // otherwise since (a `/rename`) is read from the transcript.
-          const primary = own[0] ?? others[0];
+          // and the agent name after: while the last custom title of its
+          // transcript is the title last given to it, that title is current.
+          // A title changed otherwise since (a `/rename`) is read from the
+          // transcript.
+          const primary = cli ?? others[0];
           const read = primary ? await copyTitles(primary) : undefined;
           const given = live.stored();
           const current =
@@ -623,13 +630,13 @@ export class SessionIndexService {
               ? (given ?? live.shown)
               : given !== undefined && read.tailCustomTitle === given
                 ? given
-                : read.title;
+                : (read.title ?? given ?? live.shown);
           stored = change(current, sessionId);
           if (stored !== undefined) {
             await live.rename(stored);
             live.remember(stored);
-          } else if (own[0]) {
-            await alignSidecar(own[0], current, sessionId);
+          } else if (cli) {
+            await alignSidecar(cli, current, sessionId);
           }
           try {
             complete = (await this.titleCopies(others, change, true, options.sidecar)).complete;
