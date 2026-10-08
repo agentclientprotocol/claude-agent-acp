@@ -85,9 +85,8 @@ describe("transcript scan", () => {
   it("reads a small transcript only up to the size it was stat'ed at", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "head-tail-"));
     const file = path.join(dir, "t.jsonl");
-    await fs.writeFile(file, "first\n");
-    const { size } = await fs.stat(file);
-    await fs.appendFile(file, "appended later\n");
+    const size = Buffer.byteLength("first\n");
+    await fs.writeFile(file, "first\nappended later\n");
     expect(await readHeadTail(file, size)).toEqual({ head: "first\n", tail: "first\n" });
     await fs.rm(dir, { recursive: true, force: true });
   });
