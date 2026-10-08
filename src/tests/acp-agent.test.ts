@@ -4418,7 +4418,7 @@ describe("permission request cancellation", () => {
       updatedPermissions: [{ type: "setMode", mode: "default", destination: "session" }],
     });
     expect(error).toHaveBeenCalledWith(
-      "Failed to publish mode after plan approval:",
+      "Failed to publish mode after a permission answer:",
       expect.any(Error),
     );
   });

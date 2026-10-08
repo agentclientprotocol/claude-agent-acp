@@ -282,6 +282,41 @@ describe("Claude permission response effects", () => {
     });
   });
 
+  it("applies only what a shell ask's always option shows, and switches the session to auto mode", () => {
+    const shown: PermissionUpdate[] = [
+      { type: "addRules", rules: [rule], behavior: "allow", destination: "localSettings" },
+      { type: "addDirectories", directories: ["/workspace/probe-dir"], destination: "session" },
+    ];
+    const changeSet = normalizeDurablePermissionChangeSet([
+      ...shown,
+      { type: "setMode", mode: "acceptEdits", destination: "session" },
+    ]);
+    const options = buildClaudePermissionOptions({
+      toolName: "Bash",
+      input: { command: "npm test" },
+      cwd: "/workspace",
+      durableChangeSet: changeSet,
+      availableModes: ["default", "auto"],
+      currentMode: "default",
+    });
+    const choose = (optionId: string) =>
+      permissionResult(
+        { outcome: { outcome: "selected", optionId } },
+        "Bash",
+        { command: "npm test" },
+        "tool-shell",
+        options,
+        changeSet,
+      );
+    const always = choose(PERMISSION_OPTION_ID.allowWithUpdates);
+    expect(always.behavior === "allow" && always.updatedPermissions).toEqual(shown);
+    const auto = choose(PERMISSION_OPTION_ID.switchToAuto);
+    expect(auto).toMatchObject({ behavior: "allow", decisionClassification: "user_permanent" });
+    expect(auto.behavior === "allow" && auto.updatedPermissions).toEqual([
+      { type: "setMode", mode: "auto", destination: "session" },
+    ]);
+  });
+
   it("maps durable allow to the snapshotted provider effect", () => {
     const suggestions: PermissionUpdate[] = [
       { type: "addRules", rules: [rule], behavior: "allow", destination: "session" },

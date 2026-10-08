@@ -8518,6 +8518,7 @@ export class ClaudeAcpAgent {
         allowPersistentOptions: !noPersistentRule,
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
+        currentMode: session.modes.currentModeId,
         prePlanMode: session.prePlanMode,
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
@@ -8559,7 +8560,9 @@ export class ClaudeAcpAgent {
       if (autoFallback.fallbackApplied) {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
       }
-      if (toolName === "ExitPlanMode" && permissionResult.behavior === "allow") {
+      // An answer that switches the session's mode (a plan approval, a shell ask's
+      // auto mode) is told to the client like any other mode change.
+      if (permissionResult.behavior === "allow") {
         const modeUpdate = permissionResult.updatedPermissions?.find(
           (update) => update.type === "setMode" && update.destination === "session",
         );
@@ -8568,9 +8571,9 @@ export class ClaudeAcpAgent {
             await this.sessionModes.publishCurrent(sessionId, modeUpdate.mode);
             await this.updateConfigOption(sessionId, MODE_CONFIG_ID, modeUpdate.mode);
           } catch (error) {
-            // The user already approved the plan; a failed notification must not
-            // turn that approval into a failed permission request.
-            this.logger.error("Failed to publish mode after plan approval:", error);
+            // The user already answered; a failed notification must not turn that
+            // answer into a failed permission request.
+            this.logger.error("Failed to publish mode after a permission answer:", error);
           }
         }
       }

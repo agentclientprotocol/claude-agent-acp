@@ -733,6 +733,7 @@ describe("ACP v2 prompts", () => {
       subject: { type: "tool_call", toolCall: { toolCallId: "toolu_allow", title: "ls" } },
       options: [
         { optionId: "allow-once", kind: "allow_once" },
+        { optionId: "switch-to-auto", kind: "allow_always" },
         { optionId: "reject", kind: "reject_once" },
       ],
     });
