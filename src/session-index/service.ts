@@ -3,8 +3,8 @@
  * delete of a client that declared the capability.
  *
  * Wire contract: docs/air-extensions.md, "Session index". Everything here is
- * reached only for a `sessionIndex` client, except the archive markers that an
- * AIR client without the capability gets in place of a delete (see
+ * reached only for a `sessionIndex` client, except the archive that an AIR
+ * client without the capability gets in place of a delete (see
  * `ClaudeAcpAgent.deleteSession`).
  */
 
@@ -20,16 +20,12 @@ import {
 import {
   deleteSession as sdkDeleteSession,
   getSessionInfo as sdkGetSessionInfo,
-  renameSession as sdkRenameSession,
 } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta, withAirMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
 import { deriveActivity, selectCost, type OwnSessionState } from "./activity.js";
-import {
-  readArchivedSessionIds,
-  removeArchiveMarker,
-  writeArchiveMarker,
-} from "./archive-markers.js";
+import { readArchivedSessionIds, removeArchiveMarker } from "./archive-markers.js";
+import { isArchivedTitle, storedTitle, titleRecords } from "./archive-title.js";
 import { LIST_CHANGED_METHOD, ListChangedWatcher } from "./list-changed.js";
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
@@ -40,11 +36,17 @@ import {
   projectDirMatches,
   sameProjectPath,
 } from "./project-dirs.js";
-import { readHeadTail, transcriptProjectCwd } from "./transcript-scan.js";
+import {
+  effectiveTranscriptTitle,
+  hasTailCustomTitle,
+  readHeadTail,
+  transcriptProjectCwd,
+} from "./transcript-scan.js";
 import {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
   ARCHIVED_FILTERS,
+  readSidecarTitle,
   SessionIndex,
   type ArchivedFilter,
   type GetSessionInfo,
@@ -206,15 +208,19 @@ export function decodeListCursor(cursor: string, scope: ListScope): ListCursor {
   return { orderAtMs: payload.u, sessionId: payload.id };
 }
 
+/** `<projectDir>/<sessionId>/custom-title.json` of a transcript. */
+function sidecarPath(transcriptPath: string): string {
+  const sessionId = path.basename(transcriptPath, ".jsonl");
+  return path.join(path.dirname(transcriptPath), sessionId, "custom-title.json");
+}
+
 /** Writes `<projectDir>/<sessionId>/custom-title.json` the way the CLI's
  *  `/rename` does: file 0600 in a 0700 directory, replaced atomically. The
  *  temporary file has a random name of the CLI's `custom-title.json.tmp.*`
  *  pattern, and only a temporary file this call created is removed. */
 export async function writeCustomTitleSidecar(transcriptPath: string, title: string) {
-  const sessionId = path.basename(transcriptPath, ".jsonl");
-  const dir = path.join(path.dirname(transcriptPath), sessionId);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const target = path.join(dir, "custom-title.json");
+  const target = sidecarPath(transcriptPath);
+  await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.tmp.${randomBytes(8).toString("hex")}`;
   const handle = await fs.open(temporary, "wx", 0o600);
   try {
@@ -230,14 +236,11 @@ export async function writeCustomTitleSidecar(transcriptPath: string, title: str
   }
 }
 
-/** The title record that the SDK `renameSession` appends. */
-function customTitleRecord(sessionId: string, title: string): string {
-  return JSON.stringify({ type: "custom-title", customTitle: title, sessionId });
-}
-
-/** The last non-empty line of a file, from its last 64 KB, and whether the
- *  file ends with a newline. */
-async function lastLine(filePath: string): Promise<{ line: string; endsWithNewline: boolean }> {
+/** The last two non-empty lines of a file, from its last 64 KB, and
+ *  whether the file ends with a newline. */
+async function lastLines(
+  filePath: string,
+): Promise<{ lines: string[]; last: string; endsWithNewline: boolean }> {
   const handle = await fs.open(filePath, "r");
   try {
     const { size } = await handle.stat();
@@ -246,33 +249,65 @@ async function lastLine(filePath: string): Promise<{ line: string; endsWithNewli
     await handle.read(buffer, 0, length, size - length);
     const text = buffer.toString("utf8");
     const lines = text.split("\n").filter((line) => line.trim());
-    return { line: lines[lines.length - 1] ?? "", endsWithNewline: text.endsWith("\n") };
+    return {
+      lines: lines.slice(-2),
+      last: lines.at(-1) ?? "",
+      endsWithNewline: text.endsWith("\n"),
+    };
   } finally {
     await handle.close();
   }
 }
 
-/** Appends the title record to a transcript whose last record is not that
- *  title already. A transcript that does not end with a complete line is
- *  left alone while a live writer may be finishing that line; otherwise its
- *  torn last line is closed first. Returns whether the record is there. */
-async function ensureTitleRecord(
+/** Appends the title records of `title` (see archive-title.ts) to a
+ *  transcript whose last two records are not those already. A transcript
+ *  that does not end with a complete line is left alone while a live writer
+ *  may be finishing that line; otherwise its torn last line is closed first.
+ *  Returns whether the records are there. */
+async function ensureTitleRecords(
   filePath: string,
   sessionId: string,
   title: string,
   options: { liveWriter: boolean },
 ): Promise<boolean> {
-  const { line, endsWithNewline } = await lastLine(filePath);
-  try {
-    const last = JSON.parse(line) as { type?: unknown; customTitle?: unknown };
-    if (last.type === "custom-title" && last.customTitle === title) return true;
-  } catch {
-    // Not a record: append.
-  }
-  const complete = endsWithNewline || line === "";
+  const records = titleRecords(sessionId, title);
+  const { lines, last, endsWithNewline } = await lastLines(filePath);
+  if (lines.join("\n") + "\n" === records) return true;
+  const complete = endsWithNewline || last === "";
   if (!complete && options.liveWriter) return false;
-  await fs.appendFile(filePath, `${complete ? "" : "\n"}${customTitleRecord(sessionId, title)}\n`);
+  await fs.appendFile(filePath, `${complete ? "" : "\n"}${records}`);
   return true;
+}
+
+/** The effective title of one transcript copy (see
+ *  {@link effectiveTranscriptTitle}). */
+async function copyTitle(filePath: string): Promise<string | undefined> {
+  const { size } = await fs.stat(filePath);
+  const headTail = await readHeadTail(filePath, size);
+  const sidecar = hasTailCustomTitle(headTail.tail)
+    ? undefined
+    : await readSidecarTitle(filePath, transcriptSessionId(filePath));
+  return effectiveTranscriptTitle(headTail, sidecar);
+}
+
+/** The title a change stores for a copy whose effective title is `current`
+ *  (undefined: none yet), or undefined to leave the copy as it is. */
+export type TitleChange = (current: string | undefined, sessionId: string) => string | undefined;
+
+/** `_session/rename`: the new title, with the archive prefix on a copy
+ *  that is archived, so a rename keeps the archive state. */
+export function renameTo(title: string): TitleChange {
+  return (current, sessionId) =>
+    isArchivedTitle(current) ? storedTitle(title, true, sessionId) : title;
+}
+
+/** `_session/archive` and `_session/unarchive`: the current title with or
+ *  without the archive prefix; a copy already in that state is left alone. */
+export function archiveTo(archived: boolean): TitleChange {
+  return (current, sessionId) =>
+    isArchivedTitle(current) === archived
+      ? undefined
+      : storedTitle(current ?? "", archived, sessionId);
 }
 
 /**
@@ -328,23 +363,45 @@ function sdkDeleteError(sessionId: string): Error {
 /**
  * `session/delete` of an AIR client without `sessionIndex`, which uses delete
  * to mark a session done: archives it instead, so the transcript survives. A
- * session without a transcript fails as the SDK delete did.
+ * session without a transcript fails as the SDK delete did. `ownCli`: this
+ * process ran a CLI for the session, which is waited for.
  */
 export async function archiveInsteadOfDelete(
   sessionId: string,
-  index: Pick<SessionIndex, "findTranscripts"> = new SessionIndex(sdkGetSessionInfo),
+  service: SessionIndexService,
+  options: { ownCli?: "running" | "exiting" } = {},
 ): Promise<void> {
   if (!isSessionId(sessionId)) throw sdkDeleteError(sessionId);
   // The SDK delete skips empty transcripts, so they do not count.
-  if ((await index.findTranscripts(sessionId, { exactSpelling: true })).length === 0) {
-    throw sdkDeleteError(sessionId);
-  }
-  await writeArchiveMarker(sessionId);
+  const found = await service.index.findTranscripts(sessionId, { exactSpelling: true });
+  if (found.length === 0) throw sdkDeleteError(sessionId);
+  await service.retitle(sessionId, archiveTo(true), {
+    ownCli: options.ownCli,
+    sidecar: "existing",
+    dropMarker: true,
+  });
 }
+
+/** How {@link SessionIndexService.retitle} reaches the session. */
+export type RetitleOptions = {
+  /** This process runs (or just closed) a CLI for the session. */
+  ownCli?: "running" | "exiting";
+  /** The CLI of the session runs here: it stores the title of its own
+   *  transcript (`rename_session`), and `title` is the title it holds while
+   *  it has no transcript yet. */
+  live?: { cwd: string; rename: (title: string) => Promise<void>; title?: string };
+  /** A session without a transcript is not unknown: a new session this
+   *  connection runs, or a live one being renamed. */
+  mayBeUnwritten?: boolean;
+  /** `always` writes the CLI title sidecar next to every titled copy;
+   *  `existing` rewrites only one that is there already. */
+  sidecar: "always" | "existing";
+  /** Also drop the session's archive marker. */
+  dropMarker?: boolean;
+};
 
 export type SessionIndexDeps = {
   getSessionInfo?: GetSessionInfo;
-  renameSession?: (sessionId: string, title: string) => Promise<void>;
   deleteSession?: (sessionId: string) => Promise<void>;
   registry?: LiveSessionRegistry;
   now?: () => number;
@@ -362,14 +419,12 @@ export class SessionIndexService {
   /** The mutation in flight per session, which the next one waits for. */
   private readonly mutations = new Map<string, Promise<unknown>>();
   private readonly now: () => number;
-  private readonly renameSession: (sessionId: string, title: string) => Promise<void>;
   private readonly deleteSession: (sessionId: string) => Promise<void>;
 
   constructor(private readonly deps: SessionIndexDeps) {
     this.index = new SessionIndex(deps.getSessionInfo ?? sdkGetSessionInfo);
     this.registry = deps.registry ?? new LiveSessionRegistry();
     this.now = deps.now ?? Date.now;
-    this.renameSession = deps.renameSession ?? ((id, title) => sdkRenameSession(id, title));
     this.deleteSession = deps.deleteSession ?? ((id) => sdkDeleteSession(id));
   }
 
@@ -460,113 +515,108 @@ export class SessionIndexService {
     return next;
   }
 
-  /** Renames a session whose CLI does not run here: appends the title record
-   *  to every transcript of the session (the SDK writes the first one only)
-   *  and writes the title sidecar next to each. `ownCli`: this process runs
-   *  (or just closed) a CLI for the session. */
-  async renameOffline(
+  /**
+   * Retitles every transcript of a session with `change`: rename, archive
+   * and unarchive. Returns the title stored for the session's own copy (the
+   * CLI's, else the first), or undefined when it was left as it was.
+   *
+   * - The CLI runs here (`live`): it titles its own transcript and sidecar
+   *   (`rename_session`), the only writer that cannot be overtaken by the
+   *   title the CLI holds. The other copies get the records and the sidecar
+   *   here, as a best effort once the CLI has the title: a copy that another
+   *   process may be writing (its last line incomplete) is left alone, and a
+   *   failure is logged, not returned. Another process that resumed the
+   *   session too is `thread_active_writer`: only the CLI child of this
+   *   process that runs it does not count.
+   * - Otherwise every transcript gets the records (and the sidecar, see
+   *   {@link RetitleOptions.sidecar}). A session that another live process
+   *   holds is `thread_active_writer`; a CLI this process closed is waited
+   *   for.
+   *
+   * A session without a transcript is unknown (`-32002`), unless
+   * {@link RetitleOptions.mayBeUnwritten}.
+   */
+  async retitle(
     sessionId: string,
-    title: string,
-    options: { ownCli?: "running" | "exiting" } = {},
-  ): Promise<void> {
-    if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
-    await this.exclusive(sessionId, async () => {
+    change: TitleChange,
+    options: RetitleOptions,
+  ): Promise<string | undefined> {
+    const { live } = options;
+    if (!isSessionId(sessionId)) {
+      if (!live || !options.mayBeUnwritten) throw sessionNotFound(sessionId);
+      return this.exclusive(sessionId, async () => {
+        await this.assertNotHeldElsewhere(sessionId, "running");
+        const title = change(live.title, sessionId);
+        if (title !== undefined) await live.rename(title);
+        return title;
+      });
+    }
+    return this.exclusive(sessionId, async () => {
       const transcripts = await this.index.findTranscripts(sessionId);
-      if (transcripts.length === 0) throw sessionNotFound(sessionId);
-      await this.assertNotHeldElsewhere(sessionId, options.ownCli);
-      try {
-        // The SDK finds the transcript by its exact file name.
-        await this.renameSession(transcriptSessionId(transcripts[0]!), title);
-        await this.titleCopies(transcripts, sessionId, title, options.ownCli === "running");
-      } finally {
-        this.index.invalidate(transcripts);
+      if (transcripts.length === 0 && !options.mayBeUnwritten) {
+        if (options.dropMarker) await removeArchiveMarker(sessionId);
+        throw sessionNotFound(sessionId);
       }
-    });
-  }
-
-  /** Renames a session whose CLI runs here: `rename` asks the CLI, which
-   *  titles its own transcript and sidecar. The other copies of the session
-   *  get the record and the sidecar here, as a best effort once the CLI has
-   *  the title: a copy that another process may be writing (its last line
-   *  incomplete) is left alone, and a failure is logged, not returned.
-   *  Another process that resumed the session too is `thread_active_writer`:
-   *  only the CLI child of this process that runs it does not count. */
-  async renameLive(
-    sessionId: string,
-    title: string,
-    cwd: string,
-    rename: () => Promise<void>,
-  ): Promise<void> {
-    await this.exclusive(sessionId, async () => {
-      await this.assertNotHeldElsewhere(sessionId, "running");
-      await rename();
-      if (!isSessionId(sessionId)) return;
-      let transcripts: string[] = [];
+      let stored: string | undefined;
       try {
-        transcripts = await this.index.findTranscripts(sessionId);
-        const paths = [...new Set([cwd, await canonicalPath(cwd)])];
-        const others: string[] = [];
-        for (const transcript of transcripts) {
-          if (!(await isTranscriptOf(transcript, paths))) others.push(transcript);
+        if (live) {
+          await this.assertNotHeldElsewhere(sessionId, "running");
+          const paths = [...new Set([live.cwd, await canonicalPath(live.cwd)])];
+          const own: string[] = [];
+          const others: string[] = [];
+          for (const transcript of transcripts) {
+            ((await isTranscriptOf(transcript, paths)) ? own : others).push(transcript);
+          }
+          const primary = own[0] ?? others[0];
+          const current = primary ? await copyTitle(primary) : live.title;
+          stored = change(current, sessionId);
+          if (stored !== undefined) await live.rename(stored);
+          try {
+            await this.titleCopies(others, change, true, options.sidecar);
+          } catch (error) {
+            this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
+          }
+        } else {
+          await this.assertNotHeldElsewhere(sessionId, options.ownCli);
+          stored = await this.titleCopies(
+            transcripts,
+            change,
+            options.ownCli === "running",
+            options.sidecar,
+          );
         }
-        await this.titleCopies(others, sessionId, title, true);
-      } catch (error) {
-        this.deps.logError(`titling the other transcripts of ${sessionId} failed`, error);
       } finally {
         this.index.invalidate(transcripts);
       }
+      if (options.dropMarker) await removeArchiveMarker(sessionId);
+      return stored;
     });
   }
 
+  /** Appends the title records `change` gives each copy, then its sidecar.
+   *  Returns the title of the first copy that got one. */
   private async titleCopies(
     transcripts: readonly string[],
-    sessionId: string,
-    title: string,
+    change: TitleChange,
     liveWriter: boolean,
-  ): Promise<void> {
+    sidecar: RetitleOptions["sidecar"],
+  ): Promise<string | undefined> {
+    let first: string | undefined;
     for (const transcript of transcripts) {
       const id = transcriptSessionId(transcript);
-      if (await ensureTitleRecord(transcript, id, title, { liveWriter })) {
+      const title = change(await copyTitle(transcript), id);
+      if (title === undefined) continue;
+      if (!(await ensureTitleRecords(transcript, id, title, { liveWriter }))) continue;
+      first ??= title;
+      if (sidecar === "always" || (await exists(sidecarPath(transcript)))) {
         await writeCustomTitleSidecar(transcript, title);
       }
     }
+    return first;
   }
 
-  /** Writes the archive marker. Neither touches the transcript (so
-   *  `updatedAt` stays) nor the session's execution. A session without a
-   *  transcript is unknown (`-32002`), also one that still has a marker.
-   *  `unwritten`: a new session this connection runs that has no transcript
-   *  yet; any other session needs its history. */
-  async archive(sessionId: string, unwritten: boolean): Promise<void> {
-    if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
-    await this.exclusive(sessionId, async () => {
-      if (!unwritten && !(await this.exists(sessionId))) throw sessionNotFound(sessionId);
-      await writeArchiveMarker(sessionId);
-    });
-  }
-
-  /** Removes the archive marker. A deleted session is not brought back: a
-   *  session without a transcript is unknown (`-32002`), and its stale
-   *  marker is dropped. */
-  async unarchive(sessionId: string, unwritten: boolean): Promise<void> {
-    if (!isSessionId(sessionId)) throw sessionNotFound(sessionId);
-    await this.exclusive(sessionId, async () => {
-      if (!unwritten && !(await this.exists(sessionId))) {
-        await removeArchiveMarker(sessionId);
-        throw sessionNotFound(sessionId);
-      }
-      await removeArchiveMarker(sessionId);
-    });
-  }
-
-  /** Whether the session has a transcript the list can show. */
-  private async exists(sessionId: string): Promise<boolean> {
-    return (await this.index.findTranscripts(sessionId)).length > 0;
-  }
-
-  /** Deletes every transcript of the session, then its archive marker. A
-   *  failure leaves the marker, so a session it fails to delete stays
-   *  archived. `known`: the session was loaded here (and is torn down
+  /** Deletes every transcript of the session, then its archive marker (see
+   *  archive-markers.ts). A failure leaves the marker. `known`: the session was loaded here (and is torn down
    *  already), so a missing transcript is no error.
    *
    *  The SDK deletes the first non-empty transcript it finds and its

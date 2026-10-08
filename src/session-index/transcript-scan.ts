@@ -468,6 +468,36 @@ export function transcriptTitle(
   );
 }
 
+/** The last non-blank top-level `agentName` of the records of `text`: the
+ *  name that `/rename`, a `rename_session` and AIR write with the custom
+ *  title, and that AIR ranks above it. */
+export function lastAgentName(text: string): string | undefined {
+  if (!text.includes('"agentName"')) return undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes('"agentName"')) continue;
+    const name = parseLine(line)?.agentName;
+    if (typeof name === "string" && name.trim()) return name;
+  }
+  return undefined;
+}
+
+/**
+ * The effective title of a transcript, as AIR resolves it: the last agent
+ * name (tail, then head), else {@link transcriptTitle}.
+ */
+export function effectiveTranscriptTitle(
+  headTail: HeadTail,
+  sidecarTitle?: string,
+): string | undefined {
+  return (
+    lastAgentName(headTail.tail) ??
+    lastAgentName(headTail.head) ??
+    transcriptTitle(headTail, sidecarTitle)
+  );
+}
+
 /** Whether the tail carries a custom title of its own. */
 export function hasTailCustomTitle(tail: string): boolean {
   return lastField(tail, "customTitle") !== undefined;

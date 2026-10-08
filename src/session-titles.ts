@@ -103,6 +103,16 @@ export class SessionTitles {
   /** The title a client set, which no generated title replaces. */
   private readonly explicit = new ExplicitTitle();
 
+  /** The title last stored through {@link setExplicitTitle}, as stored
+   *  (with the archive prefix of an archived session). */
+  private persistedTitle?: string;
+
+  /** The title the CLI holds as far as this session knows: the one last
+   *  stored for a client, else the one last published. */
+  get heldTitle(): string | undefined {
+    return this.persistedTitle ?? this.lastTitle;
+  }
+
   constructor(
     private readonly agent: ClaudeAcpAgent,
     private readonly sessionId: string,
@@ -137,6 +147,7 @@ export class SessionTitles {
     this.explicit.reset();
     this.context = undefined;
     this.lastTitle = undefined;
+    this.persistedTitle = undefined;
   }
 
   /** Turn-end title handling. `idle` is the SDK's turn-over signal, so it is
@@ -189,17 +200,29 @@ export class SessionTitles {
     }
   }
 
-  /** Applies a title that the client chose. Settles the title for good,
-   *  waits for a generation in flight so that its persisted title cannot land
-   *  after this one, persists the title with `persist`, and publishes it. */
-  async setExplicitTitle(title: string, persist: () => Promise<void>): Promise<void> {
+  /** Applies a title that the client chose (a rename, an archive or an
+   *  unarchive). Settles the title for good, waits for a generation in flight
+   *  so that its persisted title cannot land after this one, persists the
+   *  title with `persist`, which returns what it stored, if anything, and
+   *  publishes `title` unless it is undefined. */
+  async setExplicitTitle(
+    title: string | undefined,
+    persist: () => Promise<string | undefined | void>,
+  ): Promise<void> {
     const previous = { settled: this.settled, context: this.context };
     this.settled = true;
     this.context = undefined;
-    await this.explicit.apply(persist, () => {
-      this.settled = previous.settled;
-      this.context ??= previous.context;
-    });
+    await this.explicit.apply(
+      async () => {
+        const stored = await persist();
+        if (stored !== undefined) this.persistedTitle = stored;
+      },
+      () => {
+        this.settled = previous.settled;
+        this.context ??= previous.context;
+      },
+    );
+    if (title === undefined) return;
     this.lastTitle = title;
     await this.agent.client.sessionUpdate({
       sessionId: this.sessionId,
@@ -220,7 +243,7 @@ export class SessionTitles {
 
   /** Notify the client of a title, unless it is the one we last sent. */
   private async publish(rawTitle: string, lastModified: number): Promise<void> {
-    const title = sanitizeTitle(rawTitle);
+    const title = sanitizeTitle(this.agent.clientTitle?.(rawTitle) ?? rawTitle);
     if (title === this.lastTitle) {
       return;
     }

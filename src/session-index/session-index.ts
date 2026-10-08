@@ -22,6 +22,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeTitle } from "../session-titles.js";
+import { isArchivedTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,
   encodeProjectPath,
@@ -39,6 +40,7 @@ import {
   hasHistory,
   hasTailCustomTitle,
   isSidechainTranscript,
+  lastAgentName,
   readHeadTail,
   relocatedCwd,
   scanTranscriptFile,
@@ -127,7 +129,10 @@ export type TranscriptCandidate = {
 
 /** The cached metadata of one transcript. */
 type TranscriptMetadata = {
+  /** The visible title: without the archive prefix. */
   title: string;
+  /** The effective title carries the archive prefix. */
+  archived: boolean;
   /** The cwd read from the transcript, when it encodes to the directory name. */
   fileCwd?: string;
   /** The session this transcript was continued in, from its tail. */
@@ -160,6 +165,8 @@ export type ListQuery = {
   limit: number;
   archived: ArchivedFilter;
   after?: ListCursor;
+  /** Sessions archived by a marker file (see archive-markers.ts), besides
+   *  those whose title is archived. */
   archivedIds: ReadonlySet<string>;
 };
 
@@ -210,9 +217,9 @@ function compareRows(a: { orderAtMs: number; sessionId: string }, b: typeof a): 
 
 type Resolved = { candidate: TranscriptCandidate; metadata: TranscriptMetadata };
 
-function toRow({ candidate, metadata }: Resolved, cwd: string, archived: boolean): IndexRow {
+function toRow({ candidate, metadata }: Resolved, cwd: string, marked: boolean): IndexRow {
   return {
-    archived,
+    archived: metadata.archived || marked,
     sessionId: candidate.sessionId,
     cwd,
     title: metadata.title,
@@ -228,7 +235,10 @@ function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCurs
 }
 
 /** The title of the CLI's `custom-title.json` sidecar of a transcript. */
-async function readSidecarTitle(filePath: string, sessionId: string): Promise<string | undefined> {
+export async function readSidecarTitle(
+  filePath: string,
+  sessionId: string,
+): Promise<string | undefined> {
   try {
     const text = await fs.readFile(
       path.join(path.dirname(filePath), sessionId, "custom-title.json"),
@@ -519,16 +529,13 @@ export class SessionIndex {
             ? 1
             : 0,
     );
-    const candidates = enumerated
-      .filter((candidate) =>
-        archivedFilterKeeps(
-          query.archived,
-          query.archivedIds.has(candidate.sessionId.toLowerCase()),
-        ),
-      )
-      // A page after a cursor skips, without reading them, the transcripts
-      // whose cached order key puts them before the cursor.
-      .filter((candidate) => !after || !this.cachedBefore(candidate, after));
+    // A page after a cursor skips, without reading them, the transcripts
+    // whose cached order key puts them before the cursor. The archive state
+    // comes from the title, so the archive filter applies once a transcript
+    // is read.
+    const candidates = enumerated.filter(
+      (candidate) => !after || !this.cachedBefore(candidate, after),
+    );
     // One row more than the page tells whether a next page exists, so a
     // cursor never leads to an empty page.
     const wanted = query.limit + 1;
@@ -545,6 +552,7 @@ export class SessionIndex {
         cwd,
         query.archivedIds.has(resolved.candidate.sessionId.toLowerCase()),
       );
+      if (!archivedFilterKeeps(query.archived, row.archived)) return;
       if (!query.after || isAfter(row, query.after)) rows.push(row);
     };
     const settlePending = async () => {
@@ -799,10 +807,12 @@ export class SessionIndex {
     const summary = await this.titleOf(candidate, headTail, fileCwd);
     // No title at all: the SDK does not list it either.
     if (!summary) return null;
+    const archived = isArchivedTitle(summary);
     const lastMessageAt = facts.lastMessageAt ?? candidate.mtimeMs;
     const continuedIn = continuedInSessionId(headTail.tail);
     return {
-      title: sanitizeTitle(summary),
+      title: sanitizeTitle(archived ? visibleTitle(summary) : summary),
+      archived,
       ...(fileCwd && { fileCwd }),
       ...(continuedIn && { continuedIn }),
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
@@ -811,16 +821,19 @@ export class SessionIndex {
   }
 
   /**
-   * The title of the listed transcript. The SDK `getSessionInfo`
-   * reads the first copy of the session that its search finds; its answer is
-   * used only when that copy is the listed file (same size and mtime), else
-   * the title comes from the listed file itself.
+   * The effective title of the listed transcript, as AIR resolves it: the
+   * last agent name, else the SDK title. The SDK `getSessionInfo` reads the
+   * first copy of the session that its search finds; its answer is used
+   * only when that copy is the listed file (same size and mtime), else the
+   * title comes from the listed file itself.
    */
   private async titleOf(
     candidate: TranscriptCandidate,
     headTail: HeadTail,
     fileCwd: string | undefined,
   ): Promise<string | undefined> {
+    const agentName = lastAgentName(headTail.tail) ?? lastAgentName(headTail.head);
+    if (agentName !== undefined) return agentName;
     const dir = [fileCwd, candidate.projectPath].find(
       (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
     );

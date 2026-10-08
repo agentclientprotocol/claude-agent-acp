@@ -18,7 +18,15 @@ import {
   type ListScope,
 } from "../session-index/service.js";
 import {
+  isArchivedTitle,
+  storedTitle,
+  titleRecords,
+  visibleTitle,
+} from "../session-index/archive-title.js";
+import {
   continuedInSessionId,
+  effectiveTranscriptTitle,
+  lastAgentName,
   scanTranscript,
   scanTranscriptFile,
   transcriptTitle,
@@ -871,5 +879,50 @@ describe("exact spelling lookup", () => {
       else process.env.CLAUDE_CONFIG_DIR = previous;
       await fs.rm(config, { recursive: true, force: true });
     }
+  });
+});
+
+describe("archive titles (AIR's Claude format)", () => {
+  const id = "0b0e6c2e-1d55-4c1f-9b4e-2b1d7f6f1a11";
+
+  it("tells an archived title by its prefix once normalized", () => {
+    for (const title of ["[archived] Done", "  [archived]\n  Done", "[archived]\tx"]) {
+      expect(isArchivedTitle(title)).toBe(true);
+    }
+    for (const title of [undefined, "Done", "[archived]", "[archived]   ", "x [archived] y"]) {
+      expect(isArchivedTitle(title)).toBe(false);
+    }
+    expect(visibleTitle("[archived]  Done")).toBe("Done");
+  });
+
+  it("stores the visible title normalized, with the prefix when archived, cut to 200", () => {
+    expect(storedTitle(" Fix\n the  parser ", true, id)).toBe("[archived] Fix the parser");
+    expect(storedTitle("[archived] Fix it", false, id)).toBe("Fix it");
+    expect(storedTitle("[archived] Fix it", true, id)).toBe("[archived] Fix it");
+    expect(storedTitle("", true, id)).toBe("[archived] Session 0b0e6c2e");
+    expect(storedTitle(`${"a".repeat(188)} ${"b".repeat(20)}`, true, id)).toBe(
+      `[archived] ${"a".repeat(188)}`,
+    );
+  });
+
+  it("writes the custom-title and agent-name records with AIR's fields", () => {
+    expect(titleRecords(id, "[archived] T")).toBe(
+      `{"type":"custom-title","customTitle":"[archived] T","sessionId":"${id}"}\n` +
+        `{"type":"agent-name","agentName":"[archived] T","sessionId":"${id}"}\n`,
+    );
+  });
+
+  it("ranks the last top-level agent name above the custom title", () => {
+    const lines = (...records: object[]) => records.map((r) => JSON.stringify(r)).join("\n");
+    const text = lines(
+      { type: "agent-name", agentName: "First" },
+      { type: "custom-title", customTitle: "Custom" },
+      { type: "system", agentName: "Second" },
+      { type: "user", toolUseResult: { agentName: "nested" } },
+    );
+    expect(lastAgentName(text)).toBe("Second");
+    expect(effectiveTranscriptTitle({ head: text, tail: text })).toBe("Second");
+    const custom = lines({ type: "custom-title", customTitle: "Custom" });
+    expect(effectiveTranscriptTitle({ head: custom, tail: custom })).toBe("Custom");
   });
 });

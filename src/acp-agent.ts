@@ -2923,20 +2923,26 @@ export class ClaudeAcpAgent {
       limit: SESSION_LIST_PAGE_SIZE + 1,
       offset,
     });
-    const sessions = [];
-    for (const session of sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE)) {
+    const page = await this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
+    const visible = [];
+    for (const session of page) {
       if (!session.cwd) continue;
-      sessions.push({
+      visible.push({
         sessionId: session.sessionId,
         cwd: session.cwd,
         title: sanitizeTitle(session.summary),
         updatedAt: new Date(session.lastModified).toISOString(),
       });
     }
-    const visible = await this.sessionIndex.hideArchived(sessions);
     return sdkSessions.length > SESSION_LIST_PAGE_SIZE
       ? { sessions: visible, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
       : { sessions: visible };
+  }
+
+  /** A stored session title as this client shows it (see
+   *  {@link sessionIndex.SessionIndexConnection.clientTitle}). */
+  clientTitle(title: string): string {
+    return this.sessionIndex.clientTitle(title);
   }
 
   /** `_session/rename`, `_session/archive`, `_session/unarchive`. */

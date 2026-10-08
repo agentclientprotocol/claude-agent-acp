@@ -1,15 +1,9 @@
 /**
- * The adapter's own session archive: one empty marker file per archived
- * session in `<config>/acp/archived/<sessionId>`.
- *
- * A marker is created with `O_EXCL` and removed with `unlink`, so archive and
- * unarchive are idempotent and never touch the transcript (its mtime, and so
- * the order of the list, stays as it was). The list reads the directory once
- * into a set.
- *
- * The CLI has no archive of its own. The adapter never writes the
- * `.desktop-released.json` of Claude Desktop: the CLI cleanup deletes a
- * transcript that has one.
+ * Archive marker files, `<config>/acp/archived/<sessionId>`: an empty file
+ * per session. The archive itself lives in the transcript title (see
+ * archive-title.ts); markers are read for compatibility and never written. A
+ * session with one is listed as archived, and unarchive, archive and delete
+ * remove it, so it turns into the title format.
  */
 
 import * as fs from "node:fs/promises";
@@ -28,20 +22,6 @@ function markerPath(sessionId: string): string {
   return path.join(archiveMarkerDir(), sessionId.toLowerCase());
 }
 
-/** Marks `sessionId` archived. Returns false when it already was. */
-export async function writeArchiveMarker(sessionId: string): Promise<boolean> {
-  const file = markerPath(sessionId);
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  try {
-    const handle = await fs.open(file, "wx", 0o600);
-    await handle.close();
-    return true;
-  } catch (error) {
-    if (errorCode(error) === "EEXIST") return false;
-    throw error;
-  }
-}
-
 /** Removes the archive marker of `sessionId`. Returns whether it existed. */
 export async function removeArchiveMarker(sessionId: string): Promise<boolean> {
   try {
@@ -50,16 +30,6 @@ export async function removeArchiveMarker(sessionId: string): Promise<boolean> {
   } catch (error) {
     if (errorCode(error) === "ENOENT") return false;
     throw error;
-  }
-}
-
-/** Whether `sessionId` has an archive marker. */
-export async function hasArchiveMarker(sessionId: string): Promise<boolean> {
-  try {
-    await fs.access(markerPath(sessionId));
-    return true;
-  } catch {
-    return false;
   }
 }
 

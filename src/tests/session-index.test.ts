@@ -14,7 +14,6 @@ import {
   forkSession as sdkForkSession,
   getSessionInfo,
   listSessions,
-  renameSession,
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
@@ -39,7 +38,6 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
     deleteSession: vi.fn(actual.deleteSession),
     getSessionInfo: vi.fn(actual.getSessionInfo),
     listSessions: vi.fn(actual.listSessions),
-    renameSession: vi.fn(actual.renameSession),
   };
 });
 
@@ -156,6 +154,28 @@ async function indexAgent() {
   const created = createAgent();
   await initializeClient(created.agent, air("sessionIndex"));
   return created;
+}
+
+/** The `custom-title` and `agent-name` records that title a session. */
+const titleRecords = (sessionId: string, title: string) => [
+  { type: "custom-title", customTitle: title, sessionId },
+  { type: "agent-name", agentName: title, sessionId },
+];
+
+/** The last `count` records of a transcript. */
+async function lastRecords(file: string, count = 2): Promise<unknown[]> {
+  const lines = (await fs.readFile(file, "utf8")).trim().split("\n");
+  return lines.slice(-count).map((line) => JSON.parse(line));
+}
+
+const markerOf = (sessionId: string) => path.join(configDir, "acp", "archived", sessionId);
+
+/** An archive marker file, which the adapter reads but never writes. */
+async function writeMarker(sessionId: string): Promise<string> {
+  const marker = markerOf(sessionId);
+  await fs.mkdir(path.dirname(marker), { recursive: true });
+  await fs.writeFile(marker, "");
+  return marker;
 }
 
 const airCapabilities = (response: { _meta?: Record<string, unknown> | null }) =>
@@ -575,15 +595,36 @@ describe("old session/list path", () => {
       [{ dir: workspace, limit: 1001, offset: 0 }],
     ]);
   });
+
+  it("hides a session with an archived title from AIR without sessionIndex only", async () => {
+    const archived = await writeTranscript({
+      lastMessageAt: Date.parse("2026-01-02T00:00:00Z"),
+      trailer: [{ type: "custom-title", customTitle: "[archived] Done", sessionId: "" }],
+    });
+    const open = await writeTranscript({});
+    const airAgent = createAgent().agent;
+    await initializeClient(airAgent, air());
+    expect(
+      (await airAgent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId),
+    ).toEqual([open.id]);
+    const plain = createAgent().agent;
+    await initializeClient(plain, {});
+    expect(
+      (await plain.listSessions({ cwd: workspace })).sessions.map((s) => [s.sessionId, s.title]),
+    ).toEqual([
+      [archived.id, "[archived] Done"],
+      [open.id, "Fix it"],
+    ]);
+  });
 });
 
 describe("_session/rename", () => {
-  it("renames a session that is not loaded: SDK title record and the sidecar", async () => {
+  it("renames a session that is not loaded: title records and the sidecar", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
     await agent.renameSessionTitle({ sessionId: session.id, title: "New name" });
 
-    expect(renameSession).toHaveBeenCalledWith(session.id, "New name");
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "New name"));
     const sidecar = path.join(path.dirname(session.file), session.id, "custom-title.json");
     expect(JSON.parse(await fs.readFile(sidecar, "utf8"))).toEqual({ customTitle: "New name" });
     expect((await fs.stat(sidecar)).mode & 0o777).toBe(0o600);
@@ -604,10 +645,11 @@ describe("_session/rename", () => {
       path.join(configDir, "sessions", `${process.pid}.json`),
       JSON.stringify({ pid: process.pid, sessionId: session.id, updatedAt: Date.now() }),
     );
+    const before = await fs.readFile(session.file, "utf8");
     await expect(
       agent.renameSessionTitle({ sessionId: session.id, title: "x" }),
     ).rejects.toMatchObject({ code: -32600, data: { reason: "thread_active_writer" } });
-    expect(renameSession).not.toHaveBeenCalled();
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
   it("renames a session loaded here through its CLI and publishes the title", async () => {
@@ -615,13 +657,14 @@ describe("_session/rename", () => {
     const { agent, updates } = await indexAgent();
     const rename = vi.fn(async () => {});
     agent.sessions[session.id] = mockSessionState(
-      { query: { renameSession: rename } },
+      { cwd: workspace, query: { renameSession: rename } },
       agent,
       session.id,
     ) as any;
+    const before = await fs.readFile(session.file, "utf8");
     await agent.renameSessionTitle({ sessionId: session.id, title: "Live title" });
     expect(rename).toHaveBeenCalledWith("Live title", session.id);
-    expect(renameSession).not.toHaveBeenCalled();
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
     expect(updates).toContainEqual({
       sessionId: session.id,
       update: { sessionUpdate: "session_info_update", title: "Live title" },
@@ -671,19 +714,117 @@ describe("_session/rename", () => {
 });
 
 describe("_session/archive and _session/unarchive", () => {
-  it("are idempotent and keep the transcript untouched", async () => {
-    const session = await writeTranscript({});
-    const before = await fs.stat(session.file);
+  it("append AIR's archive title records, are idempotent and keep updatedAt", async () => {
+    const session = await writeTranscript({ prompt: "Fix  the\nparser" });
     const { agent } = await indexAgent();
-    const marker = path.join(configDir, "acp", "archived", session.id);
+    const [before] = (await agent.listSessions({ cwd: workspace })).sessions;
+    const read = () => fs.readFile(session.file, "utf8");
 
     await agent.archiveSession({ sessionId: session.id });
+    expect(await lastRecords(session.file)).toEqual(
+      titleRecords(session.id, "[archived] Fix the parser"),
+    );
+    const archived = await read();
     await agent.archiveSession({ sessionId: session.id });
-    expect(fsSync.existsSync(marker)).toBe(true);
+    expect(await read()).toBe(archived);
+    const [row] = (
+      await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "archived" }) })
+    ).sessions;
+    expect(row).toMatchObject({ title: "Fix the parser", updatedAt: before!.updatedAt });
+    expect((row!._meta as any).jetbrains.air.archived).toBe(true);
+    // AIR writes no sidecar for an archive.
+    expect(fsSync.existsSync(path.join(path.dirname(session.file), session.id))).toBe(false);
+
     await agent.unarchiveSession({ sessionId: session.id });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Fix the parser"));
+    const unarchived = await read();
     await agent.unarchiveSession({ sessionId: session.id });
-    expect(fsSync.existsSync(marker)).toBe(false);
-    expect((await fs.stat(session.file)).mtimeMs).toBe(before.mtimeMs);
+    expect(await read()).toBe(unarchived);
+    expect((await agent.listSessions({ cwd: workspace })).sessions).toEqual([
+      { ...before, title: "Fix the parser" },
+    ]);
+  });
+
+  it("read a session archived by AIR, and rename it with the prefix kept", async () => {
+    const session = await writeTranscript({
+      trailer: [
+        // An older explicit name, which the later agent name outranks.
+        { type: "custom-title", customTitle: "Old", sessionId: randomUUID() },
+        ...titleRecords("ignored", "[archived] Done work").map((record) => ({
+          ...record,
+          sessionId: undefined,
+        })),
+      ],
+    });
+    const { agent } = await indexAgent();
+    const page = (archived: string) =>
+      agent.listSessions({ cwd: workspace, _meta: listMeta({ archived }) });
+    expect((await page("unarchived")).sessions).toEqual([]);
+    expect((await page("archived")).sessions.map((s) => s.title)).toEqual(["Done work"]);
+
+    await agent.renameSessionTitle({ sessionId: session.id, title: "Renamed" });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "[archived] Renamed"));
+    expect(
+      JSON.parse(
+        await fs.readFile(
+          path.join(path.dirname(session.file), session.id, "custom-title.json"),
+          "utf8",
+        ),
+      ),
+    ).toEqual({ customTitle: "[archived] Renamed" });
+    expect((await page("archived")).sessions.map((s) => s.title)).toEqual(["Renamed"]);
+  });
+
+  it("rank the agent name above the custom title for the archive state", async () => {
+    const session = await writeTranscript({
+      trailer: [
+        { type: "agent-name", agentName: "Named", sessionId: "" },
+        { type: "custom-title", customTitle: "[archived] Named", sessionId: "" },
+      ],
+    });
+    const { agent } = await indexAgent();
+    expect((await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.title)).toEqual([
+      "Named",
+    ]);
+    await agent.archiveSession({ sessionId: session.id });
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "[archived] Named"));
+  });
+
+  it("cut the archived title to the CLI's 200 characters", async () => {
+    const long = "t".repeat(195);
+    const session = await writeTranscript({
+      trailer: [{ type: "custom-title", customTitle: long, sessionId: "" }],
+    });
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    const [record] = (await lastRecords(session.file)) as { customTitle: string }[];
+    expect(record!.customTitle).toBe(`[archived] ${long}`.slice(0, 200));
+  });
+
+  it("turn an archive marker into the title format", async () => {
+    const archivedByMarker = await writeTranscript({});
+    const unarchivedByMarker = await writeTranscript({});
+    await writeMarker(archivedByMarker.id);
+    await writeMarker(unarchivedByMarker.id);
+    const { agent } = await indexAgent();
+    const archivedRows = async () =>
+      (
+        await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "archived" }) })
+      ).sessions.map((s) => s.sessionId);
+    expect((await archivedRows()).sort()).toEqual(
+      [archivedByMarker.id, unarchivedByMarker.id].sort(),
+    );
+
+    await agent.archiveSession({ sessionId: archivedByMarker.id });
+    expect(fsSync.existsSync(markerOf(archivedByMarker.id))).toBe(false);
+    expect(await lastRecords(archivedByMarker.file)).toEqual(
+      titleRecords(archivedByMarker.id, "[archived] Fix it"),
+    );
+    const before = await fs.readFile(unarchivedByMarker.file, "utf8");
+    await agent.unarchiveSession({ sessionId: unarchivedByMarker.id });
+    expect(fsSync.existsSync(markerOf(unarchivedByMarker.id))).toBe(false);
+    expect(await fs.readFile(unarchivedByMarker.file, "utf8")).toBe(before);
+    expect(await archivedRows()).toEqual([archivedByMarker.id]);
   });
 
   it("refuses an unknown session", async () => {
@@ -731,7 +872,21 @@ describe("session/delete per client", () => {
     await agent.deleteSession({ sessionId: session.id });
     expect(deleteSession).not.toHaveBeenCalled();
     expect(fsSync.existsSync(session.file)).toBe(true);
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "[archived] Fix it"));
+    expect(fsSync.existsSync(markerOf(session.id))).toBe(false);
+    expect((await agent.listSessions({ cwd: workspace })).sessions).toEqual([]);
+  });
+
+  it("refuses the archive of an AIR client without sessionIndex for a session held elsewhere", async () => {
+    const session = await writeTranscript({});
+    await registerHolder(process.pid, session.id);
+    const { agent } = createAgent();
+    await initializeClient(agent, air());
+    const before = await fs.readFile(session.file, "utf8");
+    await expect(agent.deleteSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
   it("deletes with the SDK for a client that is not AIR", async () => {
@@ -828,10 +983,14 @@ describe("ownership of a session for delete and rename", () => {
       data: { reason: "thread_active_writer" },
     });
     expect(fsSync.existsSync(session.file)).toBe(true);
+    const before = await fs.readFile(session.file, "utf8");
     await expect(
       agent.renameSessionTitle({ sessionId: session.id, title: "x" }),
     ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
-    expect(renameSession).not.toHaveBeenCalled();
+    await expect(agent.archiveSession({ sessionId: session.id })).rejects.toMatchObject({
+      data: { reason: "thread_active_writer" },
+    });
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
   describe.skipIf(process.platform === "win32")("a CLI child of this process", () => {
@@ -966,7 +1125,10 @@ describe("delete of a session with several transcripts", () => {
     });
     const { agent } = await indexAgent();
     await agent.archiveSession({ sessionId: first.id });
-    const marker = path.join(configDir, "acp", "archived", first.id);
+    for (const file of [first.file, second.file]) {
+      expect(await lastRecords(file)).toEqual(titleRecords(first.id, "[archived] Fix it"));
+    }
+    const marker = await writeMarker(first.id);
     const actual = vi.mocked(deleteSession).getMockImplementation()!;
     vi.mocked(deleteSession)
       .mockImplementationOnce(actual)
@@ -977,6 +1139,11 @@ describe("delete of a session with several transcripts", () => {
     await expect(agent.deleteSession({ sessionId: first.id })).rejects.toThrow("EACCES");
     expect([first.file, second.file].filter((file) => fsSync.existsSync(file))).toHaveLength(1);
     expect(fsSync.existsSync(marker)).toBe(true);
+    expect(
+      (await agent.listSessions({ _meta: listMeta({ archived: "archived" }) })).sessions.map(
+        (s) => s.sessionId,
+      ),
+    ).toEqual([first.id]);
 
     await agent.deleteSession({ sessionId: first.id });
     expect([first.file, second.file].filter((file) => fsSync.existsSync(file))).toEqual([]);
@@ -1182,8 +1349,12 @@ describe("empty transcripts on delete", () => {
       () => undefined,
       (error: Error) => error,
     );
-    await expect(archiveInsteadOfDelete(id)).rejects.toThrow(sdkError!.message);
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", id))).toBe(false);
+    const service = new SessionIndexService({
+      notifyListChanged: async () => {},
+      logError: () => {},
+    });
+    await expect(archiveInsteadOfDelete(id, service)).rejects.toThrow(sdkError!.message);
+    expect(await fs.readFile(path.join(dir, `${id}.jsonl`), "utf8")).toBe("");
   });
 });
 
@@ -1194,8 +1365,7 @@ describe("a failing SDK delete", () => {
     await fs.mkdir(path.join(sessionDir, "subagents"), { recursive: true });
     await fs.writeFile(path.join(sessionDir, "subagents", "agent-1.jsonl"), "{}\n");
     const { agent } = await indexAgent();
-    await agent.archiveSession({ sessionId: session.id });
-    const marker = path.join(configDir, "acp", "archived", session.id);
+    const marker = await writeMarker(session.id);
     // The SDK removed the transcript, then failed to remove `<id>/`.
     vi.mocked(deleteSession).mockImplementationOnce(async () => {
       await fs.rm(session.file);
@@ -1231,7 +1401,7 @@ describe("a failing SDK delete", () => {
       const sessionDir = path.join(projectDir, session.id);
       await fs.mkdir(sessionDir);
       const { agent } = await indexAgent();
-      await agent.archiveSession({ sessionId: session.id });
+      await writeMarker(session.id);
       vi.mocked(deleteSession).mockImplementationOnce(async () => {
         await fs.rm(session.file);
         await fs.chmod(projectDir, 0o500);
@@ -1279,8 +1449,9 @@ describe("rename of a running session with several transcripts", () => {
     });
     const { agent } = await indexAgent();
     await agent.listSessions({});
-    const cliRecord =
-      JSON.stringify({ type: "custom-title", customTitle: "Live title", sessionId: own.id }) + "\n";
+    const cliRecord = titleRecords(own.id, "Live title")
+      .map((record) => JSON.stringify(record) + "\n")
+      .join("");
     // The CLI titles its own transcript.
     const rename = vi.fn(async () => {
       await fs.appendFile(own.file, cliRecord);
@@ -1296,17 +1467,31 @@ describe("rename of a running session with several transcripts", () => {
     expect(rename).toHaveBeenCalledWith("Live title", own.id);
     expect(await fs.readFile(own.file, "utf8")).toBe(ownBefore + cliRecord);
     expect(fsSync.existsSync(path.join(path.dirname(own.file), own.id))).toBe(false);
-    const lastRecord = JSON.parse(
-      (await fs.readFile(other.file, "utf8")).trim().split("\n").pop()!,
-    );
-    expect(lastRecord).toEqual({
-      type: "custom-title",
-      customTitle: "Live title",
-      sessionId: own.id,
-    });
+    expect(await lastRecords(other.file)).toEqual(titleRecords(own.id, "Live title"));
     const sidecar = path.join(path.dirname(other.file), own.id, "custom-title.json");
     expect(JSON.parse(await fs.readFile(sidecar, "utf8"))).toEqual({ customTitle: "Live title" });
     expect((await agent.listSessions({})).sessions[0]!.title).toBe("Live title");
+  });
+});
+
+describe("the stored title of an archived session at turn end", () => {
+  it("is published without the prefix to a sessionIndex client only", async () => {
+    for (const [capabilities, expected] of [
+      [["sessionIndex"], "Done"],
+      [[], "[archived] Done"],
+    ] as const) {
+      const { agent, updates } = createAgent();
+      await initializeClient(agent, air(...capabilities));
+      const titles = new SessionTitles(agent, "s1");
+      vi.mocked(getSessionInfo).mockResolvedValueOnce({
+        sessionId: "s1",
+        summary: "[archived] Done",
+        customTitle: "[archived] Done",
+        lastModified: 0,
+      });
+      await titles.onTurnEnd({ queryClosed: false, cwd: workspace } as any);
+      expect(updates.map((update: any) => update.update.title)).toEqual([expected]);
+    }
   });
 });
 
@@ -1347,7 +1532,6 @@ describe("a title record after a torn last line", () => {
     const { agent } = await indexAgent();
     // A running session whose SDK has no rename control request.
     agent.sessions[session.id] = mockSessionState({ cwd: workspace }, agent, session.id) as any;
-    vi.mocked(renameSession).mockImplementationOnce(async () => {});
     await agent.renameSessionTitle({ sessionId: session.id, title: "Later" });
     expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
@@ -1356,12 +1540,11 @@ describe("a title record after a torn last line", () => {
     const session = await writeTranscript({});
     await fs.appendFile(session.file, '{"type":"assistant","mess');
     const { agent } = await indexAgent();
-    vi.mocked(renameSession).mockImplementationOnce(async () => {});
     await agent.renameSessionTitle({ sessionId: session.id, title: "Later" });
     const lines = (await fs.readFile(session.file, "utf8")).split("\n");
-    expect(lines.slice(-3)).toEqual([
+    expect(lines.slice(-4)).toEqual([
       '{"type":"assistant","mess',
-      JSON.stringify({ type: "custom-title", customTitle: "Later", sessionId: session.id }),
+      ...titleRecords(session.id, "Later").map((record) => JSON.stringify(record)),
       "",
     ]);
   });
@@ -1668,10 +1851,9 @@ describe("session ids in another case", () => {
 
     await fs.rm(path.join(configDir, "sessions"), { recursive: true });
     await agent.archiveSession({ sessionId: upper });
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(true);
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "[archived] Fix it"));
     await agent.deleteSession({ sessionId: upper });
     expect(fsSync.existsSync(session.file)).toBe(false);
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", session.id))).toBe(false);
   });
 
   it("renames a running session through its CLI under its own id", async () => {
@@ -1714,7 +1896,7 @@ describe("a transcript named by an upper-case id", () => {
     expect(row!.sessionId).toBe(upper);
 
     await agent.renameSessionTitle({ sessionId: row!.sessionId, title: "Upper" });
-    expect(renameSession).toHaveBeenCalledWith(upper, "Upper");
+    expect(await lastRecords(session.file)).toEqual(titleRecords(upper, "Upper"));
     // No transcript of another spelling appeared.
     expect((await fs.readdir(dir)).filter((name) => name.endsWith(".jsonl"))).toEqual([
       `${upper}.jsonl`,
@@ -1731,9 +1913,6 @@ describe("a transcript named by an upper-case id", () => {
     await agent.deleteSession({ sessionId: row!.sessionId });
     expect(vi.mocked(deleteSession).mock.calls).toEqual([[upper]]);
     expect(await fs.readdir(dir)).toEqual([]);
-    expect(fsSync.existsSync(path.join(configDir, "acp", "archived", upper.toLowerCase()))).toBe(
-      false,
-    );
   });
 
   it("deletes copies of both spellings, each by its own name", async () => {
@@ -1801,8 +1980,7 @@ describe("rename of a running session with a copy under another long path", () =
     await agent.renameSessionTitle({ sessionId: own.id, title: "Long" });
 
     expect(await fs.readFile(own.file, "utf8")).toBe(ownBefore);
-    const last = JSON.parse((await fs.readFile(other.file, "utf8")).trim().split("\n").pop()!);
-    expect(last).toEqual({ type: "custom-title", customTitle: "Long", sessionId: own.id });
+    expect(await lastRecords(other.file)).toEqual(titleRecords(own.id, "Long"));
     expect(
       fsSync.existsSync(path.join(path.dirname(other.file), own.id, "custom-title.json")),
     ).toBe(true);
@@ -1815,9 +1993,14 @@ describe("archive state (ACP RFD #2161)", () => {
     const { agent, updates } = await indexAgent();
     const close = vi.fn();
     const interrupt = vi.fn(async () => {});
-    const loaded = mockSessionState({ query: { close, interrupt } }, agent, session.id) as any;
+    const rename = vi.fn(async () => {});
+    const loaded = mockSessionState(
+      { cwd: workspace, query: { close, interrupt, renameSession: rename } },
+      agent,
+      session.id,
+    ) as any;
     agent.sessions[session.id] = loaded;
-    const before = await fs.stat(session.file);
+    const before = await fs.readFile(session.file, "utf8");
 
     await agent.archiveSession({ sessionId: session.id });
     await agent.unarchiveSession({ sessionId: session.id });
@@ -1834,7 +2017,9 @@ describe("archive state (ACP RFD #2161)", () => {
     expect(loaded.queryClosed).toBeFalsy();
     expect(close).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
-    expect((await fs.stat(session.file)).mtimeMs).toBe(before.mtimeMs);
+    // The CLI titles its own transcript; the adapter does not write it.
+    expect(rename.mock.calls).toEqual([["[archived] Fix it", session.id]]);
+    expect(await fs.readFile(session.file, "utf8")).toBe(before);
   });
 
   it("is not reported for a session not loaded on this connection", async () => {
@@ -2117,11 +2302,23 @@ describe("archive of a loaded session without its transcript", () => {
     }
     expect(updates).toEqual([]);
 
+    // The CLI holds the title until it writes the transcript.
     const fresh = randomUUID();
-    agent.sessions[fresh] = mockSessionState({}, agent, fresh) as any;
+    const rename = vi.fn(async () => {});
+    agent.sessions[fresh] = mockSessionState(
+      { query: { renameSession: rename } },
+      agent,
+      fresh,
+    ) as any;
+    await agent.archiveSession({ sessionId: fresh });
     await agent.archiveSession({ sessionId: fresh });
     await agent.unarchiveSession({ sessionId: fresh });
-    expect(updates).toHaveLength(2);
+    const name = `Session ${fresh.slice(0, 8)}`;
+    expect(rename.mock.calls).toEqual([
+      [`[archived] ${name}`, fresh],
+      [name, fresh],
+    ]);
+    expect(updates).toHaveLength(3);
   });
 });
 

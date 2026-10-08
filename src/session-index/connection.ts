@@ -1,7 +1,7 @@
 /**
  * The session index of one ACP connection: what `ClaudeAcpAgent` does for a
- * client that declared `sessionIndex`, and the archive-marker guard of an
- * AIR client without it. The agent keeps thin call sites; everything else
+ * client that declared `sessionIndex`, and the archive of an AIR client
+ * without it. The agent keeps thin call sites; everything else
  * lives here.
  *
  * Wire contract: docs/air-extensions.md, "Session index".
@@ -28,9 +28,12 @@ import {
 } from "../air-extension.js";
 import type { OwnSessionState } from "./activity.js";
 import { readArchivedSessionIds } from "./archive-markers.js";
+import { isArchivedTitle, visibleTitle } from "./archive-title.js";
 import { isSessionId } from "./project-dirs.js";
 import {
   archiveInsteadOfDelete,
+  archiveTo,
+  renameTo,
   LIST_CHANGED_METHOD,
   parseRenameSessionRequest,
   parseSessionIdRequest,
@@ -39,7 +42,9 @@ import {
   SESSION_UNARCHIVE_METHOD,
   SessionIndexService,
   type RenameSessionRequest,
+  type RetitleOptions,
   type SessionIdRequest,
+  type TitleChange,
 } from "./service.js";
 
 /** How long a closed CLI may still be exiting (the SDK kills it after 7 s). */
@@ -89,6 +94,9 @@ export class SessionIndexConnection {
    * exactly as before.
    */
   service?: SessionIndexService;
+  /** The archive behind `session/delete` of an AIR client without
+   *  `sessionIndex`: the same writes, without a list or a watcher. */
+  private archiver?: SessionIndexService;
   /** When this connection last closed the CLI of a session, by lower-case
    *  id: the session index takes a lone registry holder whose parent it
    *  cannot tell for that CLI while it exits. */
@@ -113,6 +121,13 @@ export class SessionIndexConnection {
           this.host.agent.logger.error(`[session-index] ${message}:`, error),
       });
     }
+  }
+
+  /** A stored title as the client shows it: a `sessionIndex` client gets
+   *  the title of an archived session without the archive prefix, as in
+   *  its list; every other client the title as stored. */
+  clientTitle(title: string): string {
+    return this.service && isArchivedTitle(title) ? visibleTitle(title) : title;
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
@@ -142,14 +157,17 @@ export class SessionIndexConnection {
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):
-   *  its archived sessions stay hidden from the old list, as when the delete
-   *  removed them. */
-  async hideArchived<T extends { sessionId: string }>(sessions: T[]): Promise<T[]> {
+   *  its archived sessions (an archived custom title, or an archive marker)
+   *  stay hidden from the old list, as when the delete removed them. */
+  async hideArchived<T extends { sessionId: string; customTitle?: string }>(
+    sessions: T[],
+  ): Promise<T[]> {
     if (!this.host.isAirClient()) return sessions;
-    const archived = await readArchivedSessionIds();
-    return archived.size === 0
-      ? sessions
-      : sessions.filter((session) => !archived.has(session.sessionId.toLowerCase()));
+    const marked = await readArchivedSessionIds();
+    return sessions.filter(
+      (session) =>
+        !isArchivedTitle(session.customTitle) && !marked.has(session.sessionId.toLowerCase()),
+    );
   }
 
   /** A `sessionIndex` client may not open a second writer: loading or
@@ -161,55 +179,87 @@ export class SessionIndexConnection {
     await this.service.assertNotHeldElsewhere(sessionId, this.ownCliState(sessionId));
   }
 
-  /** `_session/rename`: names a session; no generated title replaces it. */
+  /** `_session/rename`: names a session; no generated title replaces it.
+   *  An archived session stays archived. */
   async rename(request: RenameSessionRequest): Promise<EmptyResponse> {
     const index = this.requireService(SESSION_RENAME_METHOD);
-    const params = { ...request, sessionId: this.indexSessionId(request.sessionId) };
-    const session = this.host.agent.sessions[params.sessionId];
-    const query = session?.query as
-      | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
-      | undefined;
-    if (session && !session.queryClosed && typeof query?.renameSession === "function") {
-      // The CLI appends the title, writes the sidecar and updates its memory;
-      // the index titles the other copies of the session.
-      await session.titles.setExplicitTitle(params.title, () =>
-        index.renameLive(params.sessionId, params.title, session.cwd, () =>
-          query.renameSession!(params.title, params.sessionId),
-        ),
-      );
-      return {};
-    }
-    // A closed session's CLI is gone here, and another process may have
-    // resumed the session since: only a running query is ours.
-    const persist = () =>
-      index.renameOffline(params.sessionId, params.title, {
-        ownCli: this.ownCliState(params.sessionId),
-      });
-    if (session) {
-      await session.titles.setExplicitTitle(params.title, persist);
-    } else {
-      await persist();
-    }
+    const sessionId = this.indexSessionId(request.sessionId);
+    await this.retitle(index, sessionId, renameTo(request.title), request.title, {
+      mayBeUnwritten: true,
+      sidecar: "always",
+    });
     return {};
   }
 
   /** `_session/archive`: hides a session from the default list. Idempotent;
    *  the session need not be loaded. */
   async archive(params: SessionIdRequest): Promise<EmptyResponse> {
-    const index = this.requireService(SESSION_ARCHIVE_METHOD);
-    const sessionId = this.indexSessionId(params.sessionId);
-    await index.archive(sessionId, this.isUnwrittenSession(sessionId));
-    await this.reportArchived(sessionId, true);
-    return {};
+    return this.setArchived(this.requireService(SESSION_ARCHIVE_METHOD), params, true);
   }
 
   /** `_session/unarchive`. Idempotent. */
   async unarchive(params: SessionIdRequest): Promise<EmptyResponse> {
-    const index = this.requireService(SESSION_UNARCHIVE_METHOD);
+    return this.setArchived(this.requireService(SESSION_UNARCHIVE_METHOD), params, false);
+  }
+
+  private async setArchived(
+    index: SessionIndexService,
+    params: SessionIdRequest,
+    archived: boolean,
+  ): Promise<EmptyResponse> {
     const sessionId = this.indexSessionId(params.sessionId);
-    await index.unarchive(sessionId, this.isUnwrittenSession(sessionId));
-    await this.reportArchived(sessionId, false);
+    await this.retitle(index, sessionId, archiveTo(archived), undefined, {
+      mayBeUnwritten: this.isUnwrittenSession(sessionId),
+      sidecar: "existing",
+      dropMarker: true,
+    });
+    await this.reportArchived(sessionId, archived);
     return {};
+  }
+
+  /**
+   * Retitles a session (see {@link SessionIndexService.retitle}). A session
+   * this connection runs is titled through its CLI (`rename_session`). A
+   * loaded session's title state takes the change as a client title, so no
+   * generated title replaces it; `publish` is the title it then publishes.
+   */
+  private async retitle(
+    index: SessionIndexService,
+    sessionId: string,
+    change: TitleChange,
+    publish: string | undefined,
+    options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar" | "dropMarker">,
+  ): Promise<void> {
+    const session = this.host.agent.sessions[sessionId];
+    // Decided once a title generation in flight has ended: the query may
+    // have closed meanwhile.
+    const persist = () => {
+      const query = session?.query as
+        | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
+        | undefined;
+      // A closed session's CLI is gone here, and another process may have
+      // resumed the session since: only a running query is ours.
+      const live =
+        session && !session.queryClosed && typeof query?.renameSession === "function"
+          ? {
+              cwd: session.cwd,
+              rename: (title: string) => query.renameSession!(title, sessionId),
+              title: session.titles.heldTitle,
+            }
+          : undefined;
+      return index.retitle(sessionId, change, {
+        ...options,
+        // Without its CLI, a session needs its transcript.
+        mayBeUnwritten: live !== undefined && options.mayBeUnwritten,
+        live,
+        ownCli: this.ownCliState(sessionId),
+      });
+    };
+    if (session) {
+      await session.titles.setExplicitTitle(publish, persist);
+    } else {
+      await persist();
+    }
   }
 
   /**
@@ -217,7 +267,8 @@ export class SessionIndexConnection {
    * - A `sessionIndex` client deletes for real: every transcript and the
    *   archive marker. A session that another live process holds is refused.
    * - Another AIR client uses delete to mark a session done, and may reopen
-   *   it later: the adapter archives it instead, so the transcript survives.
+   *   it later: the adapter archives it instead (as `_session/archive` does,
+   *   after the CLI closed), so the transcript survives.
    * - Every other client: the SDK delete, as before.
    */
   async deleteSession(request: DeleteSessionRequest): Promise<DeleteSessionResponse> {
@@ -248,7 +299,14 @@ export class SessionIndexConnection {
       if (running) await this.service.assertNotHeldElsewhere(params.sessionId, "exiting");
       await this.service.delete(params.sessionId, loaded);
     } else if (this.host.isAirClient()) {
-      await archiveInsteadOfDelete(params.sessionId);
+      this.archiver ??= new SessionIndexService({
+        notifyListChanged: async () => {},
+        logError: (message, error) =>
+          this.host.agent.logger.error(`[session-index] ${message}:`, error),
+      });
+      await archiveInsteadOfDelete(params.sessionId, this.archiver, {
+        ownCli: this.ownCliState(params.sessionId),
+      });
     } else {
       await sdkDeleteSession(params.sessionId);
     }
