@@ -21,7 +21,7 @@ import {
   continuedInSessionId,
   scanTranscript,
   scanTranscriptFile,
-  titleFields,
+  transcriptTitle,
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
@@ -590,7 +590,7 @@ describe("first prompt, as the SDK extracts it", () => {
       "Explain the parser",
     );
     expect(firstPrompt(init)).toBe("/init");
-    expect(titleFields({ head: init, tail: init }).summary).toBe("/init");
+    expect(transcriptTitle({ head: init, tail: init })).toBe("/init");
   });
 
   it("skips tags, interrupts, meta, compact summaries and tool results", () => {
@@ -618,7 +618,7 @@ describe("first prompt, as the SDK extracts it", () => {
 
   it("titles an image-only first prompt", () => {
     const head = userLine([{ type: "image", source: { type: "base64", data: "x" } }]);
-    expect(titleFields({ head, tail: head }).summary).toBe("Image");
+    expect(transcriptTitle({ head, tail: head })).toBe("Image");
   });
 });
 
@@ -668,7 +668,6 @@ describe("row facts of the tail and head", () => {
       ),
     );
     expect(facts.lastPromptAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
-    expect(facts.createdAt).toBe(Date.parse("2026-01-01T00:00:00Z"));
   });
 
   it("takes the model of the last real assistant message", () => {

@@ -48,8 +48,6 @@ export type TranscriptFacts = {
   promptSearched?: boolean;
   /** The model of the last assistant message in the tail. */
   model?: string;
-  /** The first timestamp of the head, as the SDK's `createdAt`. */
-  createdAt?: number;
   /** The session this one was forked from: the `forkedFrom.sessionId` that
    *  the SDK and CLI fork write on every copied record. */
   forkedFrom?: string;
@@ -324,10 +322,6 @@ export function scanTranscript(
   };
   const headCwd = CWD_PATTERN.exec(head)?.[1];
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
-  const createdAt = firstField(head, "timestamp");
-  if (createdAt !== undefined && !Number.isNaN(Date.parse(createdAt))) {
-    facts.createdAt = Date.parse(createdAt);
-  }
   const forkedFrom = FORKED_FROM_PATTERN.exec(head)?.[1];
   if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
 
@@ -443,7 +437,6 @@ function stringFields(text: string, key: string): string[] {
 }
 
 const lastField = (text: string, key: string) => stringFields(text, key).at(-1) || undefined;
-const firstField = (text: string, key: string) => stringFields(text, key)[0] || undefined;
 
 /** Whether the first record of the transcript is a sidechain one, which the
  *  SDK never lists. */
@@ -453,16 +446,17 @@ export function isSidechainTranscript(head: string): boolean {
   return first.includes('"isSidechain":true') || first.includes('"isSidechain": true');
 }
 
-export type TitleFields = { summary?: string; gitBranch?: string };
-
 /**
- * The title and branch of a transcript from its own head and tail, in the
+ * The title of a transcript from its own head and tail, in the
  * SDK's order: custom title (tail, the sidecar, head), AI title, last prompt,
  * summary, first prompt. For a transcript the SDK `getSessionInfo` does not
  * read (another copy of the session comes first in its search).
  */
-export function titleFields({ head, tail }: HeadTail, sidecarTitle?: string): TitleFields {
-  const summary =
+export function transcriptTitle(
+  { head, tail }: HeadTail,
+  sidecarTitle?: string,
+): string | undefined {
+  return (
     lastField(tail, "customTitle") ??
     sidecarTitle ??
     lastField(head, "customTitle") ??
@@ -470,12 +464,8 @@ export function titleFields({ head, tail }: HeadTail, sidecarTitle?: string): Ti
     lastField(head, "aiTitle") ??
     lastField(tail, "lastPrompt") ??
     lastField(tail, "summary") ??
-    (firstPrompt(head) || mediaPrompt(head) || undefined);
-  const gitBranch = lastField(tail, "gitBranch") ?? firstField(head, "gitBranch");
-  return {
-    ...(summary !== undefined && { summary }),
-    ...(gitBranch !== undefined && { gitBranch }),
-  };
+    (firstPrompt(head) || mediaPrompt(head) || undefined)
+  );
 }
 
 /** Whether the tail carries a custom title of its own. */

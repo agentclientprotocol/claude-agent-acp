@@ -416,9 +416,7 @@ export class SessionIndexService {
       // each is omitted when unknown, except `archived`.
       const fields: Record<string, unknown> = {
         archived: row.archived,
-        createdAt: iso(facts.createdAt),
         lastPromptAt: iso(facts.lastPromptAt),
-        gitBranch: row.gitBranch,
         model: facts.model,
         forkedFrom: facts.forkedFrom,
         state: activity?.state,

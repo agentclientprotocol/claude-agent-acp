@@ -78,7 +78,6 @@ type TranscriptOptions = {
   stopReason?: string;
   costUsd?: number;
   sidechain?: boolean;
-  gitBranch?: string;
   /** A first prompt of this many characters, to push the head past 64 KB. */
   hugePrompt?: number;
   trailer?: object[];
@@ -101,7 +100,6 @@ async function writeTranscript(options: TranscriptOptions): Promise<{ id: string
     sessionId: id,
     isSidechain: options.sidechain ?? false,
     ...(recordCwd !== null && { cwd: recordCwd }),
-    ...(options.gitBranch && { gitBranch: options.gitBranch }),
     ...(options.forkedFrom && {
       forkedFrom: { sessionId: options.forkedFrom, messageUuid: randomUUID() },
     }),
@@ -463,7 +461,6 @@ describe("session/list of a sessionIndex client", () => {
     const parent = randomUUID();
     const session = await writeTranscript({
       lastMessageAt: base,
-      gitBranch: "feature/x",
       costUsd: 1.25,
       model: "claude-opus-5-5",
       forkedFrom: parent,
@@ -481,10 +478,8 @@ describe("session/list of a sessionIndex client", () => {
           air: {
             version: 1,
             archived: false,
-            // The first record of the transcript is the prompt, a second before.
-            createdAt: new Date(base - 1000).toISOString(),
+            // The prompt is the first record, a second before the answer.
             lastPromptAt: new Date(base - 1000).toISOString(),
-            gitBranch: "feature/x",
             model: "claude-opus-5-5",
             forkedFrom: parent,
             state: "idle",
@@ -495,7 +490,7 @@ describe("session/list of a sessionIndex client", () => {
       },
     });
     const other = (page.sessions[1]!._meta as any).jetbrains.air;
-    for (const omitted of ["cost", "model", "forkedFrom", "gitBranch", "activity", "usage"]) {
+    for (const omitted of ["cost", "model", "forkedFrom", "activity", "usage"]) {
       expect(other).not.toHaveProperty(omitted);
     }
   });
@@ -1451,19 +1446,17 @@ describe("other copies on a running session's rename", () => {
 });
 
 describe("list metadata of the listed copy", () => {
-  it("takes title and branch from the listed transcript, not another copy", async () => {
+  it("takes the title from the listed transcript, not another copy", async () => {
     const id = randomUUID();
     // Sorted first, so the SDK finds this copy first without a dir.
     await writeTranscript({
       sessionId: id,
       cwd: path.join(workspace, "a"),
-      gitBranch: "old",
       trailer: [{ type: "custom-title", customTitle: "Old copy", sessionId: id }],
     });
     await writeTranscript({
       sessionId: id,
       cwd: path.join(workspace, "b"),
-      gitBranch: "new",
       trailer: [
         { type: "custom-title", customTitle: "Listed copy", sessionId: id },
         { type: "last-prompt", lastPrompt: "x".repeat(300), sessionId: id },
@@ -1471,9 +1464,7 @@ describe("list metadata of the listed copy", () => {
     });
     const { agent } = await indexAgent();
     const page = await agent.listSessions({});
-    expect(page.sessions.map((s) => [s.title, (s._meta as any).jetbrains.air.gitBranch])).toEqual([
-      ["Listed copy", "new"],
-    ]);
+    expect(page.sessions.map((s) => s.title)).toEqual(["Listed copy"]);
   });
 
   it("keeps a row whose copy the SDK does not find", async () => {

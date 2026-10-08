@@ -1233,7 +1233,7 @@ The new methods answer it with `-32601`.
   A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
   A row's `cwd` is the session's own directory, so it can be a worktree path.
 - Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
-- A session copied to two project directories is listed once, from the larger file; its title and branch come from that file.
+- A session copied to two project directories is listed once, from the larger file; its title comes from that file.
 - A transcript continued in another session (a `continued-in` record) whose successor has history is not listed, as in the SDK list.
 - On macOS a project directory whose name differs from the cwd's encoding in case only is the cwd's directory, as the file system resolves it for the SDK.
 - A row's `cwd` comes from the transcript (the last `relocated` record, else the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
@@ -1241,14 +1241,12 @@ The new methods answer it with `-32601`.
 - `updatedAt` needs the last message and the order key the last prompt: when the 64 KB tail window lacks either, the window grows up to 4 MB to find it, reading only the new bytes each step.
   The directory name is never decoded.
 
-Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `archived` is always there; every other field is omitted when unknown:
+Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archived` is always there; every other field is omitted when unknown:
 
 ```json
 {
   "archived": false,
-  "createdAt": "2026-10-05T18:12:00.000Z",
   "lastPromptAt": "2026-10-06T09:57:40.000Z",
-  "gitBranch": "fix/auth",
   "model": "claude-opus-5-5",
   "forkedFrom": "8f0c1d2e-0000-4000-8000-000000000000",
   "state": "idle",
@@ -1257,7 +1255,6 @@ Each row carries `_meta.jetbrains.air` with the flat row fields of the RFDs. `ar
 }
 ```
 
-- `createdAt` is the first timestamp of the transcript, as the SDK's `createdAt`.
 - `lastPromptAt` is the time of the last real user prompt in the transcript tail: prompt text (the predicate of the SDK title extractor) or an image or a document, but not a tool result, a meta or compact summary record, a slash command or an interrupt. When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
 - `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
 - `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
@@ -1342,18 +1339,20 @@ It tells the client to read the first page of that `cwd` again.
 The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
 Names and semantics follow them; the transport differs, and so does the `archived` list filter (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
 
-| Extension                                                                                                                   | RFD                                                                                                       |
-| --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| capability `sessionIndex` (`_meta.jetbrains.air`)                                                                           | `sessionCapabilities.list.limit`, `.changes`; `sessionCapabilities.archive`; client `session.listChanged` |
-| `_meta.jetbrains.air.list.limit`                                                                                            | `session/list` `limit`                                                                                    |
-| `_meta.jetbrains.air.list.includeWorktrees`                                                                                 | `session/list` `includeWorktrees`                                                                         |
-| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                                                 | `session/list` `archived` (#2161), a boolean there                                                        |
-| row `_meta.jetbrains.air.createdAt`, `lastPromptAt`, `gitBranch`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names                                                                    |
-| row `_meta.jetbrains.air.archived`                                                                                          | `SessionInfo.archived` (#2161)                                                                            |
-| `session_info_update` `_meta.jetbrains.air.archived`                                                                        | `SessionInfoUpdate.archived` (#2161)                                                                      |
-| `_session/list_changed { cwd }`                                                                                             | `session/list_changed { cwd }`                                                                            |
-| `_session/archive`, `_session/unarchive`                                                                                    | `session/archive`, `session/unarchive` (#2161)                                                            |
-| `_session/rename`                                                                                                           | client-set titles (#1987)                                                                                 |
+| Extension                                                                                         | RFD                                                                                                       |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`, `.changes`; `sessionCapabilities.archive`; client `session.listChanged` |
+| `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                                                    |
+| `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                                                         |
+| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                                                        |
+| row `_meta.jetbrains.air.lastPromptAt`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names                                                                    |
+| row `_meta.jetbrains.air.archived`                                                                | `SessionInfo.archived` (#2161)                                                                            |
+| `session_info_update` `_meta.jetbrains.air.archived`                                              | `SessionInfoUpdate.archived` (#2161)                                                                      |
+| `_session/list_changed { cwd }`                                                                   | `session/list_changed { cwd }`                                                                            |
+| `_session/archive`, `_session/unarchive`                                                          | `session/archive`, `session/unarchive` (#2161)                                                            |
+| `_session/rename`                                                                                 | client-set titles (#1987)                                                                                 |
+
+The session list extensions RFD also defines the row fields `createdAt` and `gitBranch`; the session index does not send them.
 
 ### Relation to ACP RFD #2161
 

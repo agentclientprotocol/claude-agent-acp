@@ -5,7 +5,7 @@
  * worktree of its repository: one `readdir` per project directory and one
  * `stat` per transcript, no long-lived cache. The metadata of a transcript is
  * cached by `(path, mtime, size)` in an LRU and read on a miss with the SDK
- * `getSessionInfo` (titles, sidecar, branch) plus one head and tail read for
+ * `getSessionInfo` (titles, sidecar) plus one head and tail read for
  * what the SDK does not report (see {@link scanTranscript}). Misses are read in
  * parallel batches.
  *
@@ -42,11 +42,10 @@ import {
   readHeadTail,
   relocatedCwd,
   scanTranscriptFile,
-  titleFields,
   transcriptProjectCwd,
+  transcriptTitle,
   type HeadTail,
   type PreviousScan,
-  type TitleFields,
   type TranscriptFacts,
 } from "./transcript-scan.js";
 import { DirListings, statFiles } from "./dir-listing.js";
@@ -129,7 +128,6 @@ export type TranscriptCandidate = {
 /** The cached metadata of one transcript. */
 type TranscriptMetadata = {
   title: string;
-  gitBranch?: string;
   /** The cwd read from the transcript, when it encodes to the directory name. */
   fileCwd?: string;
   /** The session this transcript was continued in, from its tail. */
@@ -147,7 +145,6 @@ export type IndexRow = {
    *  `updatedAt`. Never later than `updatedAt`, so never later than the
    *  transcript mtime. */
   orderAtMs: number;
-  gitBranch?: string;
   facts: TranscriptFacts;
   mtimeMs: number;
   archived: boolean;
@@ -221,7 +218,6 @@ function toRow({ candidate, metadata }: Resolved, cwd: string, archived: boolean
     title: metadata.title,
     updatedAtMs: metadata.updatedAtMs,
     orderAtMs: Math.min(metadata.facts.lastPromptAt ?? metadata.updatedAtMs, metadata.updatedAtMs),
-    gitBranch: metadata.gitBranch,
     facts: metadata.facts,
     mtimeMs: candidate.mtimeMs,
   };
@@ -798,14 +794,13 @@ export class SessionIndex {
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);
     if (fileCwd) this.dirCwds.set(candidate.dirName, fileCwd);
-    const { summary, gitBranch } = await this.titleOf(candidate, headTail, fileCwd);
+    const summary = await this.titleOf(candidate, headTail, fileCwd);
     // No title at all: the SDK does not list it either.
     if (!summary) return null;
     const lastMessageAt = facts.lastMessageAt ?? candidate.mtimeMs;
     const continuedIn = continuedInSessionId(headTail.tail);
     return {
       title: sanitizeTitle(summary),
-      ...(gitBranch && { gitBranch }),
       ...(fileCwd && { fileCwd }),
       ...(continuedIn && { continuedIn }),
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
@@ -814,16 +809,16 @@ export class SessionIndex {
   }
 
   /**
-   * The title and branch of the listed transcript. The SDK `getSessionInfo`
+   * The title of the listed transcript. The SDK `getSessionInfo`
    * reads the first copy of the session that its search finds; its answer is
    * used only when that copy is the listed file (same size and mtime), else
-   * the fields come from the listed file itself.
+   * the title comes from the listed file itself.
    */
   private async titleOf(
     candidate: TranscriptCandidate,
     headTail: HeadTail,
     fileCwd: string | undefined,
-  ): Promise<TitleFields> {
+  ): Promise<string | undefined> {
     const dir = [fileCwd, candidate.projectPath].find(
       (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
     );
@@ -835,15 +830,12 @@ export class SessionIndex {
       info.fileSize === candidate.size &&
       info.lastModified === Math.trunc(candidate.mtimeMs)
     ) {
-      return {
-        summary: info.summary,
-        ...(info.gitBranch && { gitBranch: info.gitBranch }),
-      };
+      return info.summary;
     }
     const sidecar = hasTailCustomTitle(headTail.tail)
       ? undefined
       : await readSidecarTitle(candidate.filePath, candidate.sessionId);
-    return titleFields(headTail, sidecar);
+    return transcriptTitle(headTail, sidecar);
   }
 
   /** Whether a successor of a continued transcript holds history: the SDK
