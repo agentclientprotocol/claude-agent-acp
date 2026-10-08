@@ -368,8 +368,10 @@ export class AsyncTaskRuntime {
       ) {
         // This replace-semantics level is itself the authoritative liveness
         // boundary. Close immediately so a lost terminal edge cannot leave a
-        // permanent running card; a following task_notification may correct
-        // the best-effort stopped state to completed/failed.
+        // permanent running card. Since SDK 0.3.292 a finishing task's level
+        // follows its terminal edges, so this is a lost or late edge; a late
+        // task_notification still corrects the best-effort stopped state to
+        // completed/failed.
         await this.finish(task, "stopped", undefined, "level");
       }
     }
@@ -660,8 +662,9 @@ export class AsyncTaskRuntime {
   ): Promise<void> {
     if (task.ignored) return;
     if (isTerminal(task.state)) {
-      // A level event may precede the authoritative terminal edge. Correct its
-      // best-effort stopped state if that edge later arrives.
+      // A level event can precede a late terminal edge (older CLIs sent the
+      // level first). Correct its best-effort stopped state if that edge
+      // later arrives.
       if (task.terminalSource !== "level" || source !== "event") return;
     }
     const previous = {

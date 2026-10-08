@@ -17,6 +17,7 @@ import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from
 import type { ToolResultContext, ToolResultFacts, ToolUse, ToolUseFacts } from "./facts.js";
 import { reporterFor } from "./reporters/index.js";
 import { resolveSkillPath } from "./reporters/interaction.js";
+import { grepPath } from "./reporters/search.js";
 
 export type ToolCallUpdate = SessionNotification["update"];
 
@@ -442,13 +443,17 @@ export class AcpToolCallRenderer {
 
   /**
    * Whether AIR shows [toolUse] as the list of viewed files: a read or a
-   * search with a path in its locations or in the `path` of its input.
+   * search with a path in its locations or in the `path` of its input (Grep
+   * also takes `file_path`, see {@link grepPath}).
    */
   private namesViewedFile(toolUse: ToolUse): boolean {
     const facts = this.facts(toolUse);
     if (facts.kind !== "read" && facts.kind !== "search") return false;
     if (facts.locations?.some((location) => location.path)) return true;
-    const path = (toolUse.input as { path?: unknown } | undefined)?.path;
+    const path =
+      toolUse.name === "Grep"
+        ? grepPath(toolUse.input)
+        : (toolUse.input as { path?: unknown } | undefined)?.path;
     return typeof path === "string" && path.length > 0;
   }
 

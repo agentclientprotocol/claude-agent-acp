@@ -17715,6 +17715,38 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await agent.sessions["test-session"]?.consumer;
     });
 
+    it("ignores a late notification of the earlier run after the resume", async () => {
+      const { agent, updates, release, start } = run(
+        [
+          { ...taskUpdated("running"), run_id: "run-2" },
+          sendMessageResult(),
+          { ...taskNotification("agent-1"), run_id: "run-1" },
+          { ...taskUpdated("completed"), run_id: "run-1" },
+        ],
+        { subagents: true },
+      );
+      const { second } = await start();
+      const session = agent.sessions["test-session"]!;
+      // Let the stream run past the late frames to the gate.
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(session.activeTurn?.deferredSettle).toBeDefined();
+      expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+      });
+      expect(session.nativeSubagentsByTaskId?.get("agent-1")?.terminalState).toBeUndefined();
+      expect(
+        updates.flatMap((n) =>
+          n.update.sessionUpdate === "subagent_state_update" ? [n.update.subagentSessionId] : [],
+        ),
+      ).toEqual(["agent-1"]);
+
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      await session.consumer;
+    });
+
     it("ends the hold of the SendMessage turn at cancel()", async () => {
       const { agent, release, notified, start } = run([sendMessageResult()]);
       const { second } = await start();
