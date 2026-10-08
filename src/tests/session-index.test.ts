@@ -17,6 +17,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn, type ChildProcess } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
+import type { SessionInfo } from "@agentclientprotocol/sdk";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
@@ -930,7 +931,7 @@ async function registerHolder(pid: number, sessionId: string, extra: object = {}
   );
 }
 
-/** Lets a subscription read its first rows. */
+/** Lets the watchers of a subscription settle. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 300));
 
 async function waitFor(predicate: () => boolean, timeoutMs = 8000): Promise<boolean> {
@@ -1068,28 +1069,28 @@ describe("_session/list/subscribe", () => {
   it("sends a state flip of the registry, a rename, archive, unarchive and a delete", async () => {
     const session = await writeTranscript({ prompt: "Old title" });
     const { rowsOf, changes, agent } = await subscribedAgent();
-    const last = () => rowsOf(session.id).at(-1)!;
+    // The last row sent satisfies `check` (the watch may also report the
+    // transcript's creation, just before subscribe, as its first change).
+    const lastIs = (check: (row: SessionInfo) => boolean) =>
+      waitFor(() => {
+        const row = rowsOf(session.id).at(-1);
+        return row !== undefined && check(row);
+      });
 
     await registerHolder(process.pid, session.id, liveCli("busy"));
-    expect(await waitFor(() => rowsOf(session.id).length === 1)).toBe(true);
-    expect(airRow(last()).state).toBe("running");
+    expect(await lastIs((row) => airRow(row).state === "running")).toBe(true);
     await registerHolder(process.pid, session.id, liveCli("waiting"));
-    expect(await waitFor(() => rowsOf(session.id).length === 2)).toBe(true);
-    expect(airRow(last()).state).toBe("requires_action");
+    expect(await lastIs((row) => airRow(row).state === "requires_action")).toBe(true);
     await fs.rm(path.join(configDir, "sessions", `${process.pid}.json`));
-    expect(await waitFor(() => rowsOf(session.id).length === 3)).toBe(true);
-    expect(airRow(last()).state).toBe("idle");
+    expect(await lastIs((row) => airRow(row).state === "idle")).toBe(true);
 
     await agent.renameSessionTitle({ sessionId: session.id, title: "New title" });
-    expect(await waitFor(() => rowsOf(session.id).length === 4)).toBe(true);
-    expect(last().title).toBe("New title");
+    expect(await lastIs((row) => row.title === "New title")).toBe(true);
 
     await agent.archiveSession({ sessionId: session.id });
-    expect(await waitFor(() => rowsOf(session.id).length === 5)).toBe(true);
-    expect(airRow(last()).archived).toBe(true);
+    expect(await lastIs((row) => airRow(row).archived === true)).toBe(true);
     await agent.unarchiveSession({ sessionId: session.id });
-    expect(await waitFor(() => rowsOf(session.id).length === 6)).toBe(true);
-    expect(airRow(last()).archived).toBe(false);
+    expect(await lastIs((row) => airRow(row).archived === false)).toBe(true);
 
     await agent.deleteSession({ sessionId: session.id });
     expect(await waitFor(() => changes().some((c) => c.removed.includes(session.id)))).toBe(true);
@@ -1300,10 +1301,15 @@ describe("_session/list/subscribe", () => {
     await agent.dispose();
   });
 
-  /** A subscription manager over a real index whose first rows read slowly. */
+  /** A subscription manager over a real index whose first read of rows is slow. */
   function slowFirstRows(
     delayMs: number,
-    options: { minSessionIntervalMs?: number; rescanMs?: number; failFirstRead?: boolean } = {},
+    options: {
+      minSessionIntervalMs?: number;
+      rescanMs?: number;
+      failFirstRead?: boolean;
+      now?: () => number;
+    } = {},
   ) {
     const service = new SessionIndexService({ logError: () => {} });
     const sent: { at: number; changes: ListChanges }[] = [];
@@ -1315,6 +1321,7 @@ describe("_session/list/subscribe", () => {
       projectDirs: service.index.projectDirs.bind(service.index),
       enumerateFiles: service.index.enumerateFiles.bind(service.index),
       continuedIn: service.index.continuedIn.bind(service.index),
+      cachedRowsOf: service.index.cachedRowsOf.bind(service.index),
       isRead: (candidate: Parameters<typeof service.index.isRead>[0]) =>
         failing ? false : service.index.isRead(candidate),
       rowsOf: async (...args: Parameters<typeof service.index.rowsOf>) => {
@@ -1342,18 +1349,23 @@ describe("_session/list/subscribe", () => {
       },
       logError: () => {},
       minSessionIntervalMs: options.minSessionIntervalMs,
+      now: options.now,
       rescanMs: options.rescanMs,
     });
-    return { subscriptions, sent, rowsRead };
+    /** What a client reads with session/list before it subscribes. */
+    const list = (cwd = workspace) =>
+      service.index.list({ cwd, limit: 50, archived: "all", archivedIds: new Set() });
+    return { subscriptions, sent, rowsRead, list, service };
   }
 
-  it("hides a session continued in a successor that got history before the first read", async () => {
+  it("hides a listed session continued in a successor that got history during a read", async () => {
     const successorId = randomUUID();
     const predecessor = await writeTranscript({
       trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
     });
     const stub = await writeTranscript({ sessionId: successorId });
-    const { subscriptions, sent } = slowFirstRows(400);
+    const { subscriptions, sent, list } = slowFirstRows(400);
+    await list();
     await subscriptions.subscribe(workspace);
     await fs.appendFile(
       stub.file,
@@ -1366,7 +1378,7 @@ describe("_session/list/subscribe", () => {
     subscriptions.dispose();
   });
 
-  it("shows a session continued in a successor deleted before the first read", async () => {
+  it("shows a session continued in a successor deleted after it was listed", async () => {
     const successorId = randomUUID();
     const predecessor = await writeTranscript({
       trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
@@ -1378,11 +1390,8 @@ describe("_session/list/subscribe", () => {
         "\n",
     );
     // The successor has history: the list hides the predecessor.
-    const { agent } = await indexAgent();
-    expect((await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId)).toEqual(
-      [successorId],
-    );
-    const { subscriptions, sent } = slowFirstRows(400);
+    const { subscriptions, sent, list } = slowFirstRows(400);
+    expect((await list()).rows.map((row) => row.sessionId)).toEqual([successorId]);
     await subscriptions.subscribe(workspace);
     await fs.rm(successor.file);
     const shown = () =>
@@ -1391,10 +1400,11 @@ describe("_session/list/subscribe", () => {
     subscriptions.dispose();
   });
 
-  it("reads again a transcript that could not be read for the first rows", async () => {
+  it("reads again a transcript whose first read failed", async () => {
     const session = await writeTranscript({});
     const { subscriptions, sent } = slowFirstRows(0, { rescanMs: 500, failFirstRead: true });
     await subscriptions.subscribe(workspace);
+    await fs.appendFile(session.file, promptRecord(session.id, "Next") + "\n");
     const shown = () =>
       sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === session.id));
     expect(await waitFor(shown)).toBe(true);
@@ -1443,7 +1453,9 @@ describe("_session/list/subscribe", () => {
     await fs.mkdir(path.join(repo, ".git"), { recursive: true });
     await fs.mkdir(linked, { recursive: true });
     const inLinked = await writeTranscript({ cwd: linked });
-    const { subscriptions, sent } = slowFirstRows(0, { rescanMs: 400 });
+    const { subscriptions, sent, list } = slowFirstRows(0, { rescanMs: 400 });
+    // The client's list of the repository read the transcript of the other path.
+    await list(repo);
     await subscriptions.subscribe(repo);
     await settle();
     expect(sent).toEqual([]);
@@ -1491,7 +1503,7 @@ describe("_session/list/subscribe", () => {
     subscriptions.dispose();
   });
 
-  it("sends a rename made while the first rows are read", async () => {
+  it("sends a rename made while the first read runs", async () => {
     const session = await writeTranscript({ prompt: "Before" });
     const { subscriptions, sent } = slowFirstRows(400);
     await subscriptions.subscribe(workspace);
@@ -1505,6 +1517,225 @@ describe("_session/list/subscribe", () => {
         changes.sessions.some((s) => s.sessionId === session.id && s.title === "After"),
       );
     expect(await waitFor(renamed)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("reads no transcript to subscribe, nor on a rescan of unchanged ones", async () => {
+    const sessions: { id: string; file: string }[] = [];
+    for (let i = 0; i < 12; i++) sessions.push(await writeTranscript({}));
+    // Past the events of these writes, which a new watch may still get.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { subscriptions, sent, rowsRead, service } = slowFirstRows(0, { rescanMs: 300 });
+    vi.mocked(getSessionInfo).mockClear();
+    await subscriptions.subscribe(workspace);
+    // Past the rescan after the watchers opened, and a few periodic ones.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(rowsRead).toEqual([]);
+    expect(sent).toEqual([]);
+    expect(vi.mocked(getSessionInfo)).not.toHaveBeenCalled();
+    const files = await service.index.enumerateFiles([workspace]);
+    expect(files).toHaveLength(12);
+    expect(files.filter((file) => service.index.isRead(file))).toEqual([]);
+
+    await fs.appendFile(sessions[4]!.file, promptRecord(sessions[4]!.id, "Next") + "\n");
+    expect(await waitFor(() => sent.length > 0)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // Only the changed session was read, by its event and by none of the rescans.
+    expect(new Set(rowsRead.flat())).toEqual(new Set([sessions[4]!.id]));
+    expect(
+      (await service.index.enumerateFiles([workspace]))
+        .filter((file) => service.index.isRead(file))
+        .map((file) => file.sessionId),
+    ).toEqual([sessions[4]!.id]);
+    subscriptions.dispose();
+  });
+
+  it("sends the first change of a session in full, then not updatedAt alone", async () => {
+    const session = await writeTranscript({ prompt: "Before", lastMessageAt: Date.now() - 60_000 });
+    const { subscriptions, sent } = slowFirstRows(0, { minSessionIntervalMs: 300 });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    // A message that changes nothing but updatedAt: the first change is sent.
+    await fs.appendFile(session.file, assistantRecord(session.id, null) + "\n");
+    expect(await waitFor(() => sent.length === 1)).toBe(true);
+    expect(sent[0]!.changes.sessions.map((s) => [s.sessionId, s.title])).toEqual([
+      [session.id, "Before"],
+    ]);
+    // Another one is no change.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await fs.appendFile(session.file, assistantRecord(session.id, null) + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(sent).toHaveLength(1);
+    subscriptions.dispose();
+  });
+
+  it.each([
+    { continued: false, beforeRescan: false, evicted: false },
+    { continued: false, beforeRescan: true, evicted: false },
+    { continued: false, beforeRescan: true, evicted: true },
+    { continued: true, beforeRescan: false, evicted: false },
+  ])(
+    "sends the state of a listed live session that ages without an event (%o)",
+    async ({ continued, beforeRescan, evicted }) => {
+      const id = randomUUID();
+      // An unfinished turn of an SDK session in another process; continued
+      // in a session that has no transcript, so the list still shows it.
+      const session = await writeTranscript({
+        sessionId: id,
+        mtimeMs: Date.now(),
+        trailer: [
+          JSON.parse(promptRecord(id, "Working", Date.now())),
+          ...(continued ? [{ type: "continued-in", continuedInSessionId: randomUUID() }] : []),
+        ],
+      });
+      await registerHolder(process.pid, session.id, { entrypoint: "sdk-ts" });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      let offset = 0;
+      const { subscriptions, sent, list, rowsRead, service } = slowFirstRows(0, {
+        rescanMs: 300,
+        now: () => Date.now() + offset,
+      });
+      const listed = (await list()).rows;
+      expect(listed.map((row) => row.sessionId)).toEqual([session.id]);
+      await subscriptions.subscribe(workspace);
+      // The index drops its metadata before the first rescan.
+      if (evicted) service.index.invalidate([session.file]);
+      if (!beforeRescan) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        expect(sent).toEqual([]);
+      }
+      // Past the time an unfinished turn counts as running.
+      offset = 11 * 60 * 1000;
+      expect(await waitFor(() => sent.length > 0)).toBe(true);
+      const row = sent[0]!.changes.sessions[0]!;
+      expect(row.sessionId).toBe(session.id);
+      expect(airRow(row).state).toBeUndefined();
+      // From the metadata the list read: no transcript read for the row.
+      if (!continued) expect(rowsRead).toEqual([]);
+      subscriptions.dispose();
+    },
+  );
+
+  it("removes a sent continued session whose cached metadata went when its successor gets history", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({ sessionId: successorId });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { subscriptions, sent, service } = slowFirstRows(0, { minSessionIntervalMs: 0 });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    // An event of it that leaves it continued.
+    await fs.appendFile(
+      predecessor.file,
+      JSON.stringify({ type: "continued-in", continuedInSessionId: successorId }) + "\n",
+    );
+    const shown = () =>
+      sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === predecessor.id));
+    expect(await waitFor(shown)).toBe(true);
+    // The index no longer holds its metadata (evicted).
+    service.index.invalidate([predecessor.file]);
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(
+      await waitFor(() => sent.some(({ changes }) => changes.removed.includes(predecessor.id))),
+    ).toBe(true);
+    subscriptions.dispose();
+  }, 15_000);
+
+  it("removes a listed continued session whose cached metadata went when its successor gets history", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({ sessionId: successorId });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { subscriptions, sent, service, list } = slowFirstRows(0);
+    expect((await list()).rows.map((row) => row.sessionId)).toContain(predecessor.id);
+    await subscriptions.subscribe(workspace);
+    await settle();
+    // The index no longer holds its metadata (evicted), and no event read it.
+    service.index.invalidate([predecessor.file]);
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(
+      await waitFor(() => sent.some(({ changes }) => changes.removed.includes(predecessor.id))),
+    ).toBe(true);
+    subscriptions.dispose();
+  }, 15_000);
+
+  it("checks a live continued session hidden by its successor once, not on every rescan", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      mtimeMs: Date.now(),
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    await writeTranscript({
+      sessionId: successorId,
+      trailer: [{ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }],
+    });
+    await registerHolder(process.pid, predecessor.id, { entrypoint: "sdk-ts" });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { subscriptions, sent, list, rowsRead } = slowFirstRows(0, { rescanMs: 300 });
+    expect((await list()).rows.map((row) => row.sessionId)).toEqual([successorId]);
+    await subscriptions.subscribe(workspace);
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    expect(rowsRead.flat().filter((id) => id === predecessor.id)).toHaveLength(1);
+    expect(sent).toEqual([]);
+    subscriptions.dispose();
+  });
+
+  it("forgets a removal it sent once the transcript is deleted", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({ sessionId: successorId });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const { subscriptions, sent } = slowFirstRows(0, { minSessionIntervalMs: 0 });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    const subscription = () => [...(subscriptions as any).subscriptions.values()][0];
+    await fs.appendFile(
+      predecessor.file,
+      JSON.stringify({ type: "continued-in", continuedInSessionId: successorId }) + "\n",
+    );
+    const shown = () =>
+      sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === predecessor.id));
+    expect(await waitFor(shown)).toBe(true);
+    // Hidden by its successor: removed, and remembered as removed.
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(
+      await waitFor(() => sent.some(({ changes }) => changes.removed.includes(predecessor.id))),
+    ).toBe(true);
+    expect(subscription().sent.get(predecessor.id)?.signature).toBeNull();
+    await fs.rm(predecessor.file);
+    expect(await waitFor(() => !subscription().sent.has(predecessor.id))).toBe(true);
+    subscriptions.dispose();
+  }, 15_000);
+
+  it("forgets a hidden session created after subscribe once it is deleted", async () => {
+    const { subscriptions, sent } = slowFirstRows(0);
+    await subscriptions.subscribe(workspace);
+    await settle();
+    const watch = () => [...(subscriptions as any).watches.values()][0];
+    const hidden = await writeTranscript({ sidechain: true });
+    expect(await waitFor(() => watch().born.has(hidden.id))).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await fs.rm(hidden.file);
+    expect(await waitFor(() => !watch().born.has(hidden.id))).toBe(true);
+    expect(sent).toEqual([]);
     subscriptions.dispose();
   });
 
@@ -1526,27 +1757,25 @@ describe("_session/list/subscribe", () => {
     subscriptions.dispose();
   });
 
-  it("does not read an archived session again on a rescan", async () => {
+  it("does not read an archived session on a rescan", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
     await agent.archiveSession({ sessionId: session.id });
+    // Past the events of the archive, which a new watch may still get.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     const { subscriptions, rowsRead } = slowFirstRows(0, { rescanMs: 300 });
     await subscriptions.subscribe(workspace);
-    // The first read, and the events of the archive that the watch may get late.
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    const read = rowsRead.length;
-    expect(rowsRead[0]).toEqual([session.id]);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
+    await new Promise((resolve) => setTimeout(resolve, 1800));
     // Several rescans since, and nothing changed.
-    expect(rowsRead.length).toBe(read);
+    expect(rowsRead).toEqual([]);
     subscriptions.dispose();
   });
 
-  it("keeps working after events that arrive while the first rows are read", async () => {
+  it("keeps working after events that arrive while the first read runs", async () => {
     const session = await writeTranscript({});
     const { subscriptions, sent } = slowFirstRows(600);
     await subscriptions.subscribe(workspace);
-    // Past the quiet period, before the first rows.
+    // Past the quiet period: the first read runs.
     await fs.appendFile(session.file, promptRecord(session.id, "During") + "\n");
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(await waitFor(() => sent.length === 1)).toBe(true);
@@ -1556,7 +1785,7 @@ describe("_session/list/subscribe", () => {
     subscriptions.dispose();
   });
 
-  it("removes a session deleted before the first rows were read", async () => {
+  it("removes a session never sent when its transcript is deleted", async () => {
     const session = await writeTranscript({});
     const { subscriptions, sent } = slowFirstRows(400);
     await subscriptions.subscribe(workspace);
@@ -1586,7 +1815,9 @@ describe("_session/list/subscribe", () => {
       trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
     });
     const stub = await writeTranscript({ sessionId: successorId });
-    const { rowsOf, changes, agent } = await subscribedAgent();
+    const { changes, agent } = await subscribedAgent();
+    // The client lists it.
+    await agent.listSessions({ cwd: workspace });
     await fs.appendFile(
       stub.file,
       JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
@@ -1595,7 +1826,13 @@ describe("_session/list/subscribe", () => {
     expect(await waitFor(() => changes().some((c) => c.removed.includes(predecessor.id)))).toBe(
       true,
     );
-    expect(rowsOf(predecessor.id)).toEqual([]);
+    // Nothing shows it after (its creation just before subscribe may have).
+    const all = changes();
+    const lastRemoved = all.findLastIndex((c) => c.removed.includes(predecessor.id));
+    const lastShown = all.findLastIndex((c) =>
+      c.sessions.some((row) => row.sessionId === predecessor.id),
+    );
+    expect(lastShown).toBeLessThan(lastRemoved);
     await agent.dispose();
   });
 
@@ -1606,12 +1843,12 @@ describe("_session/list/subscribe", () => {
     expect(handlesOf(agent)).toBeUndefined();
   });
 
-  it("sends a session that changed while the first rows were read", async () => {
+  it("sends a session that changed right after subscribe", async () => {
     const sessions: { id: string; file: string }[] = [];
     for (let i = 0; i < 20; i++) sessions.push(await writeTranscript({}));
     const { agent, notifications } = await indexAgent();
     await agent.subscribeSessionList({ cwd: workspace });
-    // Right after subscribe returns, before the first rows are read.
+    // Right after subscribe returns.
     await fs.appendFile(sessions[7]!.file, promptRecord(sessions[7]!.id, "Meanwhile") + "\n");
     expect(
       await waitFor(() =>
@@ -2822,14 +3059,23 @@ describe("paths that share a project directory", () => {
     // A change of the dotted path's session is no change of the dashed list.
     const { subscriptionId } = await agent.subscribeSessionList({ cwd: dashed });
     await settle();
+    const named = () =>
+      changesFor(notifications, subscriptionId).flatMap((c) => [
+        ...c.sessions.map((s) => s.sessionId),
+        ...c.removed,
+      ]);
     await fs.appendFile(mine.file, promptRecord(mine.id, "Mine") + "\n");
     await new Promise((resolve) => setTimeout(resolve, 1500));
-    expect(changesFor(notifications, subscriptionId)).toEqual([]);
-    await fs.appendFile(theirs.file, promptRecord(theirs.id, "Theirs") + "\n");
-    expect(await waitFor(() => changesFor(notifications, subscriptionId).length > 0)).toBe(true);
-    expect(changesFor(notifications, subscriptionId)[0]!.sessions.map((s) => s.sessionId)).toEqual([
-      theirs.id,
-    ]);
+    expect(named()).not.toContain(mine.id);
+    const promptAt = Date.now() - 1000;
+    await fs.appendFile(theirs.file, promptRecord(theirs.id, "Theirs", promptAt) + "\n");
+    const sent = () =>
+      changesFor(notifications, subscriptionId).flatMap((c) =>
+        c.sessions.filter((s) => airRow(s).lastPromptAt === new Date(promptAt).toISOString()),
+      );
+    expect(await waitFor(() => sent().length > 0)).toBe(true);
+    expect(sent().map((s) => s.sessionId)).toEqual([theirs.id]);
+    expect(named()).not.toContain(mine.id);
     await agent.dispose();
   }, 10_000);
 
@@ -2848,12 +3094,15 @@ describe("paths that share a project directory", () => {
       JSON.stringify({ type: "relocated", sessionId: mine.id, relocatedCwd: dashed }) + "\n",
     );
     const added = () =>
-      changesFor(notifications, fromDashed.subscriptionId).flatMap((c) => c.sessions);
+      changesFor(notifications, fromDashed.subscriptionId)
+        .flatMap((c) => c.sessions)
+        .filter((s) => s.sessionId === mine.id);
     const removed = () =>
       changesFor(notifications, fromDotted.subscriptionId).flatMap((c) => c.removed);
     expect(await waitFor(() => added().length > 0 && removed().length > 0)).toBe(true);
     expect(added().map((s) => [s.sessionId, s.cwd])).toEqual([[mine.id, dashed]]);
-    expect(removed()).toEqual([mine.id]);
+    // It may also name the other path's session, never listed here.
+    expect(removed()).toContain(mine.id);
     await agent.dispose();
   });
 });
@@ -3203,7 +3452,9 @@ describe("session index cost", () => {
     vi.mocked(getSessionInfo).mockClear();
     await fs.appendFile(sessions[3]!.file, promptRecord(sessions[3]!.id, "Next") + "\n");
     expect(await waitFor(() => changes.length > 0)).toBe(true);
-    expect(vi.mocked(getSessionInfo).mock.calls.map(([id]) => id)).toEqual([sessions[3]!.id]);
+    // At most the changed one (it may have been read already, for its
+    // creation just before subscribe).
+    for (const [id] of vi.mocked(getSessionInfo).mock.calls) expect(id).toBe(sessions[3]!.id);
     service.dispose();
   });
 });

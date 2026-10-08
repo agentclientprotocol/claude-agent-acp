@@ -561,6 +561,48 @@ export class SessionIndex {
   }
 
   /**
+   * The rows of `candidates` (as {@link rowsOf}) that the metadata cache
+   * alone gives, read from it at once, and the lower-case ids of the
+   * candidates it gives no answer for: nothing cached at the candidate's
+   * stat, no cwd known, or continued in another session (whether the
+   * successor hides it depends on the successor now). Reads no transcript.
+   */
+  async cachedRowsOf(
+    paths: readonly string[],
+    candidates: readonly TranscriptCandidate[],
+    archivedIds: ReadonlySet<string>,
+  ): Promise<{ rows: IndexRow[]; unknown: Set<string> }> {
+    const unknown = new Set<string>();
+    const resolved: { item: Resolved; cwd: string }[] = [];
+    for (const candidate of candidates) {
+      const id = candidate.sessionId.toLowerCase();
+      const cached = this.metadata.peek(candidate.filePath);
+      if (
+        !cached ||
+        cached.mtimeMs !== candidate.mtimeMs ||
+        cached.size !== candidate.size ||
+        cached.ino !== candidate.ino ||
+        cached.metadata?.continuedIn
+      ) {
+        unknown.add(id);
+        continue;
+      }
+      if (!cached.metadata) continue;
+      const cwd = cached.metadata.fileCwd ?? this.fallbackCwd(candidate);
+      if (cwd) resolved.push({ item: { candidate, metadata: cached.metadata }, cwd });
+      else unknown.add(id);
+    }
+    const inScope = scopeOf(paths);
+    const rows: IndexRow[] = [];
+    for (const { item, cwd } of resolved) {
+      if (!(await inScope(cwd))) continue;
+      const id = item.candidate.sessionId.toLowerCase();
+      rows.push(toRow(item, cwd, archivedIds.has(id)));
+    }
+    return { rows, unknown };
+  }
+
+  /**
    * Reads `candidates` in order into rows, sorted. With a finite `wanted`,
    * stops once `wanted` rows are certain to come first (a candidate's order
    * key is at most its mtime, so `candidates` must be in mtime order then).

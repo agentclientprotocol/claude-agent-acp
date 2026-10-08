@@ -1356,8 +1356,8 @@ From then on the agent sends `_session/list/changes` notifications for the sessi
 - `cwd` is required and must be an absolute path; a missing, non-string or relative `cwd` is `-32602`. Other parameters are ignored.
 - The scope is the sessions of `cwd` and of the same subdirectory in every existing linked worktree of its repository, as a list with `includeWorktrees: true` resolves it, in any archive state. Sidechain and subagent transcripts are left out, as in the list.
 - `sessions` holds the full current row of each session in scope that appeared, or whose `title`, `lastPromptAt`, `state`, `lastTurnEndedAt`, `cost`, `model`, `forkedFrom` or `archived` changed since the last row sent for it on this subscription. A row is exactly the row of `session/list`, `_meta.jetbrains.air` included.
-- A change of `updatedAt` alone sends nothing; the new `updatedAt` comes with the next change.
-- `removed` holds the ids of sessions that left the scope: deleted (the transcript is gone), or moved to a path outside it.
+- After subscribe, the first change of each session sends its row in full, even when only `updatedAt` changed. From then on, a change of `updatedAt` alone sends nothing; the new `updatedAt` comes with the next change.
+- `removed` holds the ids of sessions that left the scope: deleted (the transcript is gone), or moved to a path outside it. It may name a session the client does not list (one it never listed, one the list hides, such as a session continued in another one when that one changes); the client ignores such an id.
 - Archive and unarchive are row changes (`archived`): their title records are a transcript change, and the removal of an archive marker is one too. The agent applies no archive filter: the client filters.
 - A session is sent at most once a second per subscription. All changes of one pass go in one notification per subscription.
 - Changes are tracked from the moment subscribe returns: the client subscribes first, then reads the first page with `session/list`. A row the page also holds may be sent.
@@ -1371,8 +1371,9 @@ It is idempotent, and an unknown id also returns `{}`.
 - A connection has at most 128 subscriptions. The 129th subscribe is `-32602` with `data.reason: "too_many_subscriptions"`.
 - A second subscription of the same `cwd` is independent: it has its own id, its own unsubscribe and its own notifications.
 - The adapter watches, without recursion, the project directories of the scope, the projects directory (for a new project directory), `<config>/sessions` and `<config>/acp/archived` (the archive markers), and the nearest existing parent of any of these that does not exist yet. All subscriptions of one `cwd` share that watching, which ends with the last of them.
-- The first subscription of a `cwd` stats every transcript of the scope before it returns, then reads the row of each in the background, newest first; `session/list` shares these reads.
-- A transcript event names the file: only that transcript is read again. A registry event names the record: only the sessions whose record changed get their `state` recomputed.
+- Subscribe reads no session row. The first subscription of a `cwd` opens the watchers, stats every transcript of the scope, and reads the registry and the archive markers before it returns.
+- A transcript event names the file: only that transcript is read. A registry event names the record: only the sessions whose record changed get their `state` recomputed (their row is read on their first event). A session continued in a changed one is read again too.
+- The rescan reads a transcript only when its stat changed, its archive marker came or went, or its last read failed. A session that a live process holds and that no event read gets its row, for its aging `state`, from what `session/list` already read; a worktree that came or went re-resolves only the sessions read before, by an event or by `session/list`.
 - `session/list` starts or renews nothing.
 
 ### Delete and close
