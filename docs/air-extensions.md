@@ -1236,7 +1236,9 @@ The new methods answer it with `-32601`.
 - With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.
   A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
   A row's `cwd` is the session's own directory, so it can be a worktree path.
-- A row's `title` is the effective title of its transcript, as AIR resolves it: the last `agentName`, else the custom title (the last `custom-title` record, the CLI's `custom-title.json` sidecar), else the generated title, the last prompt or the first prompt. The `[archived] ` prefix of an archived session is not part of it (see [Archive](#archive)).
+- A row's `title` is the effective title of its transcript. A named session ranks its names as AIR does: the last top-level `agentName` of any record, else the last `customTitle` of a `custom-title` record (tail, the CLI's `custom-title.json` sidecar, head). A session without a name has the title the SDK gives it: the AI title, the last prompt, a summary or the first prompt (AIR ranks the first prompt above the last one).
+  Names are read from the 64 KB head and tail, as the SDK reads titles; the CLI writes its title records again as the transcript grows. When the tail has a custom title but no agent name, the 4 MB before the tail are searched for one.
+  The `[archived] ` prefix of an archived session is not part of the title (see [Archive](#archive)).
 - Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
 - A session copied to two project directories is listed once, from the larger file; its title comes from that file.
 - A transcript continued in another session (a `continued-in` record) whose successor has history is not listed, as in the SDK list.
@@ -1277,8 +1279,9 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 
 `_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
 
-- A blank title is `-32602`. The adapter collapses whitespace and cuts the title at 256 characters, like list titles.
-- The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix, so a rename does not unarchive it.
+- A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
+- The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
+- A session that runs here on a CLI without the `rename_session` control request is refused with `-32600`: its CLI holds the title and would write it back.
 - A session this connection runs is renamed through its CLI (`rename_session` control request), which writes the records and the sidecar of its own transcript.
   A title generation in flight finishes first, and no generated title replaces the new one, also after a reload.
   The adapter then sends `session_info_update { title }`.
@@ -1304,7 +1307,9 @@ The archive state lives in the session title, in the format of AIR's own Claude 
   {"type":"agent-name","agentName":"[archived] Fix the parser","sessionId":"…"}
   ```
 
-  A transcript already in the requested state gets nothing. A `custom-title.json` sidecar that the session has is rewritten with the same title; none is created.
+  A transcript already in the requested state gets nothing. A `custom-title.json` sidecar that the session has is rewritten with the same title (also one left in the other state next to a transcript already in the requested state); none is created.
+  The current title is the effective title of each transcript; for a session that runs here, the title last stored through its CLI, which may not have written all of it yet.
+  A new session archived before it has a title gets `[archived] Session …`, and keeps `Session …` as its name once unarchived: no title is generated for a named session.
 
 - The list shows the title without the prefix, and so does the `session_info_update { title }` of a loaded session. Another client, and the `claude --resume` picker, show the title as stored, with the prefix.
 - A session marked archived by a marker file `<config>/acp/archived/<sessionId>` is archived too. Archive, unarchive and delete remove the marker; the adapter never writes one.
@@ -1312,7 +1317,7 @@ The archive state lives in the session title, in the format of AIR's own Claude 
 - Neither loads, resumes, closes or cancels the session: a session that runs on this connection keeps running.
   Closing, loading or resuming a session does not change its archive state.
   AIR's native Claude path stops the session's processes before it archives; the adapter leaves them running and refuses a session held elsewhere instead (below).
-- A session this connection runs is retitled through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one.
+- A session this connection runs is retitled through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. Its copies in other project directories get the records from the adapter as a best effort: a copy whose last line is incomplete is left alone, and an archive marker of the session is then kept.
 - A session that another live process holds is refused with `data.reason: "thread_active_writer"`, with the holder rules of [Rename](#rename): that process holds the title in memory and would write it back.
 - After either, a session loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes.
 - Neither changes `updatedAt` or the list order: the title records are metadata.
@@ -1343,7 +1348,7 @@ It tells the client to read the first page of that `cwd` again.
 `session/delete`:
 
 - a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete, then its archive marker. Anything left behind fails the request and keeps the marker. A session that another live process holds is refused with `thread_active_writer`, as for rename; a session that runs here is checked after its CLI is closed. An unknown session is `-32002`, also when an archive marker was left over (the marker is dropped).
-- an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first, and its CLI is waited for, as for a `sessionIndex` client's delete; a session that another live process holds is refused with `thread_active_writer`. The list hides archived sessions (an archived custom title, or an archive marker) from such a client too. A session without a transcript fails with the error of the SDK delete, as before.
+- an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first, and its CLI is waited for, as for a `sessionIndex` client's delete; a session that another live process holds is refused with `thread_active_writer`. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived, and those with an archive marker. That list does not read agent names. A session without a transcript fails with the error of the SDK delete, as before.
   A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
 - any other client: the SDK delete, as before.
 
