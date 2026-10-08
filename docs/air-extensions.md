@@ -994,6 +994,20 @@ When an announced task leaves that list, the adapter reports `stopped`.
 A later terminal event can correct that state to `completed` or `failed`.
 At shutdown, the adapter finishes each open task as `failed` or `stopped`.
 
+### Autonomous turn
+
+Claude Code can start a turn of its own after the prompt ended, for example to answer the notification of a finished background task.
+ACP v1 has no session state, so the adapter publishes such a turn as an async task.
+The task has the id `autonomous-turn-<uuid>`, the name `Claude is working`, `taskType: "turn"`, and `showInTranscript: false`.
+Its description is the summary of the last task notification, when there is one.
+The task starts at the SDK `running` state while no prompt is active or queued.
+When the state stays `running`, as it does while background agents run, it starts at the first root output with no prompt open.
+It ends `completed` at the result of the turn or at the SDK `idle` state, and `failed` at an error result.
+A coalesced placeholder result (`num_turns: 0`) does not end it.
+A prompt that the turn takes in ends the task, because that prompt owns the turn now.
+A stop request interrupts the turn instead of stopping an SDK task.
+It returns `{ "stopped": false }` while a prompt waits for its turn, because the interrupt would drop that prompt.
+
 ### Stop request
 
 The client sends `_session/async_task/stop`:

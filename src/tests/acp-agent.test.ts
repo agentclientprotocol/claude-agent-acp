@@ -23254,6 +23254,233 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await agent.sessions["test-session"]?.consumer;
     });
   });
+  describe("autonomous turn as an async task", () => {
+    const airAgent = async (capabilities: string[] = ["asyncTasks"]) => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities } } },
+        },
+      });
+      const asyncTaskUpdates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate.startsWith("async_task_") ? [update as any] : [],
+        );
+      return { agent, updates, asyncTaskUpdates };
+    };
+
+    const shellNotification = () => ({
+      ...taskNotification("bg-1"),
+      summary: 'Background command "sleep 20" completed (exit code 0)',
+    });
+
+    it("publishes a turn that Claude Code runs after end_turn and ends it at its result", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield assistantText("started it");
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield shellNotification();
+          yield running();
+          yield assistantText("it finished");
+          // A coalesced placeholder does not end the turn.
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0 });
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "run it in the background" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+      expect(asyncTaskUpdates()).toEqual([]);
+
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      const [spawned, ...rest] = asyncTaskUpdates();
+      expect(spawned).toEqual({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: expect.stringMatching(/^autonomous-turn-/),
+        name: "Claude is working",
+        taskType: "turn",
+        description: 'Background command "sleep 20" completed (exit code 0)',
+        showInTranscript: false,
+        canStop: true,
+      });
+      expect(rest).toEqual([
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: spawned.asyncTaskId,
+          state: "completed",
+        },
+      ]);
+    });
+
+    it("starts at the first output when the state never left running", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          await woken;
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+    });
+
+    it("ends the turn task when a prompt is folded into the turn", async () => {
+      const { agent, updates, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let autonomousRunning = () => {};
+      const autonomous = new Promise<void>((resolve) => (autonomousRunning = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          autonomousRunning();
+          yield userEcho((await iter.next()).value);
+          yield assistantText("answer to the folded prompt");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await autonomous;
+      const second = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and this" }],
+      });
+      expect(second.stopReason).toBe("end_turn");
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+      const kinds = updates.map(({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+          ? update.content.text
+          : update.sessionUpdate,
+      );
+      expect(kinds.indexOf("async_task_state_update")).toBeLessThan(
+        kinds.indexOf("answer to the folded prompt"),
+      );
+    });
+
+    it("interrupts the turn when the client stops its task", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let finish = () => {};
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          await finished;
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            subtype: "error_during_execution",
+            is_error: true,
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await waitFor(() => asyncTaskUpdates().length === 1);
+      const session = agent.sessions["test-session"]!;
+      const asyncTaskId = asyncTaskUpdates()[0].asyncTaskId;
+
+      await expect(
+        agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId }),
+      ).resolves.toEqual({ stopped: true });
+      expect(session.query.interrupt).toHaveBeenCalledTimes(1);
+      expect(session.query.stopTask).not.toHaveBeenCalled();
+      finish();
+      await session.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "stopped",
+      ]);
+    });
+
+    it("publishes nothing to a client without async tasks", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent([]);
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          yield running();
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+      expect(asyncTaskUpdates()).toEqual([]);
+    });
+  });
 });
 
 describe("turn steering (_session/steering)", () => {

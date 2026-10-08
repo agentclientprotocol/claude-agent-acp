@@ -4394,7 +4394,18 @@ export class ClaudeAcpAgent {
     if (!session || !asyncTasks?.claimStop(params.asyncTaskId)) return { stopped: false };
 
     try {
-      await session.query.stopTask(params.asyncTaskId);
+      if (asyncTasks.isAutonomousTurn(params.asyncTaskId)) {
+        // The task stands for a turn that Claude Code started on its own, so
+        // stopping it interrupts that turn. A prompt that waits for its turn
+        // would be folded into it, and the interrupt would drop that prompt.
+        if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+          asyncTasks.releaseStop(params.asyncTaskId);
+          return { stopped: false };
+        }
+        await session.query.interrupt();
+      } else {
+        await session.query.stopTask(params.asyncTaskId);
+      }
       await asyncTasks.taskStopped(params.asyncTaskId);
       return { stopped: true };
     } catch (error) {
@@ -4983,6 +4994,7 @@ export class ClaudeAcpAgent {
       if (!head) {
         return;
       }
+      if (asyncTasks.autonomousTurnOpen) await asyncTasks.autonomousTurnEnded("completed");
       activateTurn(head);
     };
 
@@ -5943,6 +5955,21 @@ export class ClaudeAcpAgent {
 
         this.startAutonomousCycle(params.sessionId, session, message);
 
+        // From CLI 2.1.270 the state stays `running` while background agents
+        // run, so a turn that their notification starts has no `running`
+        // transition. Its first output with no prompt open starts its task.
+        if (
+          asyncTasks.enabled &&
+          !asyncTasks.autonomousTurnOpen &&
+          (message.type === "assistant" || message.type === "stream_event") &&
+          message.parent_tool_use_id === null &&
+          !session.cancelled &&
+          !session.activeTurn &&
+          !firstUnsettledQueuedTurn()
+        ) {
+          await asyncTasks.autonomousTurnStarted();
+        }
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -6091,6 +6118,20 @@ export class ClaudeAcpAgent {
                 sessionIndex.noteSessionState(session, previousState, message.state);
                 if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
                 this.sessionIndex.onOwnSessionChanged(params.sessionId);
+                // With no prompt active or queued, the agent runs a turn of
+                // its own, for example for a task notification. The client
+                // sees it as an async task (see autonomousTurnStarted).
+                if (
+                  asyncTasks.enabled &&
+                  message.state === "running" &&
+                  previousState !== "running" &&
+                  !session.activeTurn &&
+                  !firstUnsettledQueuedTurn()
+                ) {
+                  await asyncTasks.autonomousTurnStarted();
+                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
+                  await asyncTasks.autonomousTurnEnded("completed");
+                }
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -6799,6 +6840,15 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // A placeholder result (`num_turns: 0`, see below) comes before
+            // the followup that answers it, so the autonomous turn goes on.
+            if (
+              isAutonomousResult &&
+              asyncTasks.autonomousTurnOpen &&
+              (message.num_turns > 0 || message.is_error)
+            ) {
+              await asyncTasks.autonomousTurnEnded(message.is_error ? "failed" : "completed");
+            }
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -7793,6 +7843,10 @@ export class ClaudeAcpAgent {
                   // mid-message, so deltas already streamed belong to the turn
                   // being activated — clearing would forget them and let its
                   // result re-emit the answer.
+                  // A prompt folded into an autonomous turn owns that turn now.
+                  if (asyncTasks.autonomousTurnOpen) {
+                    await asyncTasks.autonomousTurnEnded("completed");
+                  }
                   activateTurn(queued);
                 }
                 break;

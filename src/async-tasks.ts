@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
@@ -39,6 +40,12 @@ type AsyncTask = {
   terminalSource?: TerminalSource;
   /** The optional fields that the client holds now, as JSON. */
   published: Map<string, string>;
+  /**
+   * Whether the task stands for a model turn that Claude Code started on its
+   * own, see {@link AsyncTaskRuntime.autonomousTurnStarted}. The SDK knows no
+   * such task, so its background task list never ends it.
+   */
+  autonomousTurn: boolean;
 };
 
 type TaskIdentity = { taskId?: unknown; task_id?: unknown };
@@ -121,6 +128,10 @@ export class AsyncTaskRuntime {
    * The oldest entries are dropped.
    */
   private readonly outputPathsByToolCall = new Map<string, string[]>();
+  /** The task of the autonomous turn that runs now. */
+  private autonomousTurn?: AsyncTask;
+  /** The summary of the last task notification, which usually starts the next autonomous turn. */
+  private lastNotificationSummary?: string;
 
   constructor(
     readonly enabled: boolean,
@@ -300,6 +311,7 @@ export class AsyncTaskRuntime {
     const state = taskState(message.status);
     if (!taskId || !state || state === "running" || state === "paused") return;
 
+    this.lastNotificationSummary = nonBlankString(message.summary) ?? this.lastNotificationSummary;
     const task = this.task(taskId);
     const wasTerminal = isTerminal(task.state);
     const correctsLevelState = wasTerminal && task.terminalSource === "level";
@@ -363,6 +375,7 @@ export class AsyncTaskRuntime {
       if (
         (task.announced || task.held) &&
         !task.ignored &&
+        !task.autonomousTurn &&
         !isTerminal(task.state) &&
         !live.has(task.id)
       ) {
@@ -378,6 +391,7 @@ export class AsyncTaskRuntime {
   }
 
   async finishAll(state: Extract<AsyncTaskState, "failed" | "stopped">): Promise<void> {
+    this.autonomousTurn = undefined;
     const errors: unknown[] = [];
     for (const task of this.tasks.values()) {
       if ((task.announced || task.held) && !task.ignored && !isTerminal(task.state)) {
@@ -412,6 +426,7 @@ export class AsyncTaskRuntime {
     const task = this.tasks.get(taskId);
     if (!task || !task.announced || task.ignored || task.stopAnnounced) return;
     task.stopAnnounced = true;
+    if (this.autonomousTurn === task) this.autonomousTurn = undefined;
     // No terminal summary: a stopped task leaves the Async Tasks panel at once,
     // so anything said there is said to nobody.
     await this.finish(task, "stopped", undefined, "event");
@@ -436,6 +451,47 @@ export class AsyncTaskRuntime {
         this.options.notices ?? false,
       ),
     );
+  }
+
+  /**
+   * Publishes a model turn that Claude Code started with no prompt open, for
+   * example to answer a task notification. ACP v1 has no session state, and
+   * the client already got the stop reason of its last prompt, so this task is
+   * the only sign that the agent works. The tool calls of the turn are in the
+   * transcript already, so the task is not shown there. Does nothing while
+   * such a task is open.
+   */
+  async autonomousTurnStarted(): Promise<void> {
+    if (!this.enabled || this.autonomousTurn) return;
+    const task = this.task(`autonomous-turn-${randomUUID()}`);
+    task.autonomousTurn = true;
+    task.startedObserved = true;
+    task.name = "Claude is working";
+    task.taskType = "turn";
+    task.description =
+      this.lastNotificationSummary ?? "Claude Code started a turn without a prompt.";
+    task.showInTranscript = false;
+    this.lastNotificationSummary = undefined;
+    this.autonomousTurn = task;
+    await this.announce(task, { withoutToolCall: true });
+  }
+
+  /** Whether the task of an autonomous turn is open. */
+  get autonomousTurnOpen(): boolean {
+    return this.autonomousTurn !== undefined;
+  }
+
+  /** Ends the task of the autonomous turn that runs now, if there is one. */
+  async autonomousTurnEnded(state: "completed" | "failed"): Promise<void> {
+    const task = this.autonomousTurn;
+    if (!task) return;
+    this.autonomousTurn = undefined;
+    await this.finish(task, state, undefined, "event");
+  }
+
+  /** Whether the task stands for an autonomous turn, which a stop interrupts. */
+  isAutonomousTurn(taskId: string): boolean {
+    return this.tasks.get(taskId)?.autonomousTurn === true;
   }
 
   /** Whether a task of the tool call went to the background, so the client gets it. */
@@ -488,6 +544,8 @@ export class AsyncTaskRuntime {
   clear(): void {
     this.tasks.clear();
     this.outputPathsByToolCall.clear();
+    this.autonomousTurn = undefined;
+    this.lastNotificationSummary = undefined;
   }
 
   /**
@@ -520,6 +578,7 @@ export class AsyncTaskRuntime {
       stopAnnounced: false,
       state: "running",
       published: new Map(),
+      autonomousTurn: false,
     };
     this.tasks.set(taskId, task);
     return task;
