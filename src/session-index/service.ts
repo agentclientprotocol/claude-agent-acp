@@ -15,18 +15,21 @@ import {
   RequestError,
   type ListSessionsRequest,
   type ListSessionsResponse,
-  type SessionInfo,
 } from "@agentclientprotocol/sdk";
 import {
   deleteSession as sdkDeleteSession,
   getSessionInfo as sdkGetSessionInfo,
 } from "@anthropic-ai/claude-agent-sdk";
-import { airExtensionMeta, withAirMeta } from "../air-extension.js";
+import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
-import { deriveActivity, selectCost, type OwnSessionState } from "./activity.js";
+import type { OwnSessionState } from "./activity.js";
 import { readArchivedSessionIds, removeArchiveMarker } from "./archive-markers.js";
 import { isArchivedTitle, storedTitle, titleRecords } from "./archive-title.js";
-import { LIST_CHANGED_METHOD, ListChangedWatcher } from "./list-changed.js";
+import {
+  ListSubscriptions,
+  type ListChanges,
+  type ListSubscribeResponse,
+} from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
   canonicalPath,
@@ -53,8 +56,8 @@ import {
   type GetSessionInfo,
   type ListCursor,
 } from "./session-index.js";
+import { sessionInfoOf } from "./session-info.js";
 
-export { LIST_CHANGED_METHOD };
 export const SESSION_RENAME_METHOD = "_session/rename";
 export const SESSION_ARCHIVE_METHOD = "_session/archive";
 export const SESSION_UNARCHIVE_METHOD = "_session/unarchive";
@@ -66,10 +69,6 @@ const CURSOR_VERSION = 5;
 
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
-
-function iso(ms: number | undefined): string | undefined {
-  return ms === undefined || !Number.isFinite(ms) ? undefined : new Date(ms).toISOString();
-}
 
 export function sessionNotFound(sessionId: string): RequestError {
   return new RequestError(RESOURCE_NOT_FOUND, `Session not found: ${sessionId}`, { sessionId });
@@ -442,16 +441,18 @@ export type SessionIndexDeps = {
   deleteSession?: (sessionId: string) => Promise<void>;
   registry?: LiveSessionRegistry;
   now?: () => number;
-  /** Sends `_session/list_changed`. */
-  notifyListChanged: (params: { cwd: string }) => Promise<void>;
+  /** What this connection knows of a session it runs. */
+  ownSessionState?: (sessionId: string) => OwnSessionState | undefined;
+  /** Sends `_session/list/changes`. */
+  notifyListChanges?: (changes: ListChanges) => Promise<void>;
   logError: (message: string, error: unknown) => void;
 };
 
 export class SessionIndexService {
   readonly index: SessionIndex;
   readonly registry: LiveSessionRegistry;
-  private watcher?: ListChangedWatcher;
-  /** Set for good by {@link dispose}: no watcher is started after it. */
+  private subscriptions?: ListSubscriptions;
+  /** Set for good by {@link dispose}: no subscription is made after it. */
   private disposed = false;
   /** The mutation in flight per session, which the next one waits for. */
   private readonly mutations = new Map<string, Promise<unknown>>();
@@ -490,43 +491,10 @@ export class SessionIndexService {
       archivedIds,
     });
     const live = await livePromise;
-    // A list without a cwd is not watched.
-    if (cwd) this.watch(cwd, includeWorktrees);
     const now = this.now();
-    const sessions: SessionInfo[] = rows.map((row) => {
-      const ownState = own(row.sessionId);
-      const activity = deriveActivity({
-        own: ownState,
-        live: live.get(row.sessionId),
-        facts: row.facts,
-        transcriptMtimeMs: row.mtimeMs,
-        now,
-      });
-      const cost = selectCost(ownState, row.facts);
-      const { facts } = row;
-      // The row fields of the session list extensions RFD and RFD #2161, flat;
-      // each is omitted when unknown, except `archived`.
-      const fields: Record<string, unknown> = {
-        archived: row.archived,
-        lastPromptAt: iso(facts.lastPromptAt),
-        model: facts.model,
-        forkedFrom: facts.forkedFrom,
-        state: activity?.state,
-        lastTurnEndedAt: activity?.lastTurnEndedAt,
-        cost: cost === undefined ? undefined : { amount: cost, currency: "USD" },
-      };
-      let meta: Record<string, unknown> | undefined;
-      for (const [key, value] of Object.entries(fields)) {
-        if (value !== undefined) meta = withAirMeta(meta, key, value);
-      }
-      return {
-        sessionId: row.sessionId,
-        cwd: row.cwd,
-        title: row.title,
-        updatedAt: new Date(row.updatedAtMs).toISOString(),
-        _meta: meta,
-      };
-    });
+    const sessions = rows.map((row) =>
+      sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
+    );
     const last = rows[rows.length - 1];
     return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
   }
@@ -752,27 +720,36 @@ export class SessionIndexService {
     });
   }
 
-  dispose(): void {
-    this.disposed = true;
-    this.watcher?.dispose();
-    this.watcher = undefined;
-  }
-
-  private watch(cwd: string, includeWorktrees: boolean): void {
-    // A list that was in flight when the connection closed starts nothing.
-    if (this.disposed) return;
-    this.watcher ??= new ListChangedWatcher({
-      projectDirs: async (watchedCwd, worktrees) => {
-        const paths = await this.index.listedPaths(watchedCwd, worktrees);
-        const dirs = await this.index.projectDirs(paths);
-        return { dirNames: dirs.map(({ dirName }) => dirName), paths };
-      },
-      transcripts: (watchedCwd, worktrees) => this.index.scopeFingerprint(watchedCwd, worktrees),
-      notify: (changedCwd) => this.deps.notifyListChanged({ cwd: changedCwd }),
+  /** `_session/list/subscribe`: pushes the changed rows of `cwd` (an
+   *  absolute path) until {@link unsubscribeList} or {@link dispose}. */
+  subscribeList(cwd: string): Promise<ListSubscribeResponse> {
+    if (this.disposed) {
+      return Promise.reject(RequestError.internalError(undefined, "The connection is closed"));
+    }
+    this.subscriptions ??= new ListSubscriptions({
+      index: this.index,
+      registry: this.registry,
+      own: (sessionId) => this.deps.ownSessionState?.(sessionId),
+      archivedIds: readArchivedSessionIds,
+      notify: (changes) => this.deps.notifyListChanges?.(changes) ?? Promise.resolve(),
       logError: this.deps.logError,
     });
-    void this.watcher
-      .onListed(cwd, includeWorktrees)
-      .catch((error) => this.deps.logError("session list watch failed", error));
+    return this.subscriptions.subscribe(cwd);
+  }
+
+  /** `_session/list/unsubscribe`. Idempotent. */
+  unsubscribeList(subscriptionId: string): void {
+    this.subscriptions?.unsubscribe(subscriptionId);
+  }
+
+  /** A session this connection runs changed what its row shows. */
+  ownSessionChanged(sessionId: string): void {
+    this.subscriptions?.ownSessionChanged(sessionId);
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.subscriptions?.dispose();
+    this.subscriptions = undefined;
   }
 }

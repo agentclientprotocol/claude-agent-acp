@@ -26,7 +26,13 @@ import {
 import { scanTranscriptFile } from "../session-index/transcript-scan.js";
 import { LiveSessionRegistry } from "../session-index/live-registry.js";
 import { repositoryWorktrees } from "../session-index/worktrees.js";
-import { ListChangedWatcher } from "../session-index/list-changed.js";
+import {
+  ListSubscriptions,
+  MAX_SUBSCRIPTIONS,
+  parseListSubscribeRequest,
+  parseListUnsubscribeRequest,
+  type ListChanges,
+} from "../session-index/list-subscriptions.js";
 import { SessionTitles } from "../session-titles.js";
 import { initializeClient } from "./helpers.js";
 import { mockSessionState } from "./session-doubles.js";
@@ -192,7 +198,12 @@ const airCapabilities = (response: { _meta?: Record<string, unknown> | null }) =
   (response._meta as any)?.jetbrains?.air?.capabilities as string[] | undefined;
 
 describe("sessionIndex negotiation", () => {
-  const indexCapabilities = ["sessionIndex", "sessionArchive", "sessionRename"];
+  const indexCapabilities = [
+    "sessionIndex",
+    "sessionArchive",
+    "sessionRename",
+    "sessionListSubscribe",
+  ];
   const baseline = [
     "sessionFailure",
     "agentFileChangeReport",
@@ -910,68 +921,6 @@ describe("session/delete per client", () => {
   });
 });
 
-describe("_session/list_changed", () => {
-  const waitFor = async (predicate: () => boolean, timeoutMs = 3000) => {
-    const start = Date.now();
-    while (!predicate()) {
-      if (Date.now() - start > timeoutMs) return false;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    return true;
-  };
-
-  it("notifies a sessionIndex client once per burst of changes in a listed cwd", async () => {
-    const session = await writeTranscript({});
-    const { agent, notifications } = await indexAgent();
-    await agent.listSessions({ cwd: workspace });
-    // Let the watcher take its baseline.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    for (let i = 0; i < 5; i++) await fs.appendFile(session.file, "{}\n");
-    expect(await waitFor(() => notifications.length > 0)).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(notifications).toEqual([
-      { method: "_session/list_changed", params: { cwd: workspace } },
-    ]);
-    await agent.dispose();
-  });
-
-  it("never watches or notifies for a client without sessionIndex", async () => {
-    const session = await writeTranscript({});
-    const { agent, notifications } = createAgent();
-    await initializeClient(agent, air());
-    await agent.listSessions({ cwd: workspace });
-    await fs.appendFile(session.file, "{}\n");
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    expect(notifications.filter((n) => n.method === "_session/list_changed")).toEqual([]);
-  });
-
-  it("debounces with a maximum wait and skips unchanged state", async () => {
-    const session = await writeTranscript({});
-    const notified: string[] = [];
-    const watcher = new ListChangedWatcher({
-      projectDirs: async () => ({ dirNames: [encodeProjectPath(workspace)], paths: [workspace] }),
-      notify: async (cwd) => {
-        notified.push(cwd);
-      },
-      debounceMs: 100,
-      maxWaitMs: 250,
-      rescanMs: 60_000,
-    });
-    await watcher.onListed(workspace);
-    // Keep writing faster than the debounce: the max wait still flushes.
-    const writer = setInterval(() => fsSync.appendFileSync(session.file, "{}\n"), 30);
-    expect(await waitFor(() => notified.length > 0, 2000)).toBe(true);
-    clearInterval(writer);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const settled = notified.length;
-    // An event without a change (a touch of another file) sends nothing.
-    await fs.writeFile(path.join(path.dirname(session.file), "notes.txt"), "x");
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(notified.length).toBe(settled);
-    watcher.dispose();
-  });
-});
-
 /** Registers `pid` as a live CLI holding `sessionId`. */
 async function registerHolder(pid: number, sessionId: string, extra: object = {}) {
   await fs.mkdir(path.join(configDir, "sessions"), { recursive: true });
@@ -980,6 +929,637 @@ async function registerHolder(pid: number, sessionId: string, extra: object = {}
     JSON.stringify({ pid, sessionId, updatedAt: Date.now(), ...extra }),
   );
 }
+
+/** Lets a subscription read its first rows. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 300));
+
+async function waitFor(predicate: () => boolean, timeoutMs = 8000): Promise<boolean> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return true;
+}
+
+/** An interactive CLI record whose status is newer than any transcript. */
+const liveCli = (status: string) => ({
+  kind: "interactive",
+  entrypoint: "cli",
+  status,
+  statusUpdatedAt: Date.now() + 60_000,
+});
+
+function promptRecord(sessionId: string, text: string, at = Date.now()): string {
+  return JSON.stringify({
+    type: "user",
+    sessionId,
+    cwd: workspace,
+    uuid: randomUUID(),
+    timestamp: new Date(at).toISOString(),
+    message: { role: "user", content: text },
+  });
+}
+
+function assistantRecord(sessionId: string, stopReason: string | null, at = Date.now()): string {
+  return JSON.stringify({
+    type: "assistant",
+    sessionId,
+    cwd: workspace,
+    uuid: randomUUID(),
+    timestamp: new Date(at).toISOString(),
+    message: { role: "assistant", content: [{ type: "text", text: "z" }], stop_reason: stopReason },
+  });
+}
+
+const airRow = (info: { _meta?: Record<string, unknown> | null }) =>
+  (info._meta as any)?.jetbrains?.air as Record<string, unknown>;
+
+describe("_session/list/subscribe", () => {
+  const changesOf = (notifications: { method: string; params: Record<string, unknown> }[]) =>
+    notifications
+      .filter((n) => n.method === "_session/list/changes")
+      .map((n) => n.params as unknown as ListChanges);
+
+  async function subscribedAgent(cwd = workspace) {
+    const created = await indexAgent();
+    const { subscriptionId } = await created.agent.subscribeSessionList({ cwd });
+    await settle();
+    const changes = () => changesOf(created.notifications);
+    const rowsOf = (sessionId: string) =>
+      changes().flatMap((change) => change.sessions.filter((s) => s.sessionId === sessionId));
+    return { ...created, subscriptionId, changes, rowsOf };
+  }
+
+  const handlesOf = (agent: ClaudeAcpAgent) =>
+    (agent as any).sessionIndex.service.subscriptions as ListSubscriptions | undefined;
+
+  it("takes an absolute cwd and ignores other parameters", () => {
+    for (const params of [{}, { cwd: 1 }, { cwd: "relative/dir" }, { cwd: "" }, null]) {
+      expect(() => parseListSubscribeRequest(params)).toThrow(
+        expect.objectContaining({ code: -32602 }),
+      );
+    }
+    expect(parseListSubscribeRequest({ cwd: "/repo", archived: "all", limit: 3 })).toEqual({
+      cwd: "/repo",
+    });
+    expect(() => parseListUnsubscribeRequest({})).toThrow(
+      expect.objectContaining({ code: -32602 }),
+    );
+  });
+
+  it("answers method-not-found without sessionIndex", async () => {
+    const { agent } = createAgent();
+    await initializeClient(agent, air());
+    await expect(agent.subscribeSessionList({ cwd: workspace })).rejects.toMatchObject({
+      code: -32601,
+    });
+    await expect(agent.unsubscribeSessionList({ subscriptionId: "x" })).rejects.toMatchObject({
+      code: -32601,
+    });
+  });
+
+  it("refuses the 129th subscription of a connection", async () => {
+    const { agent } = await indexAgent();
+    const ids: string[] = [];
+    for (let i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+      ids.push((await agent.subscribeSessionList({ cwd: workspace })).subscriptionId);
+    }
+    expect(new Set(ids).size).toBe(MAX_SUBSCRIPTIONS);
+    await expect(agent.subscribeSessionList({ cwd: workspace })).rejects.toMatchObject({
+      code: -32602,
+      data: { reason: "too_many_subscriptions" },
+    });
+    expect(await agent.unsubscribeSessionList({ subscriptionId: ids[0]! })).toEqual({});
+    // Idempotent, and an unknown id is no error.
+    expect(await agent.unsubscribeSessionList({ subscriptionId: ids[0]! })).toEqual({});
+    expect(await agent.unsubscribeSessionList({ subscriptionId: "unknown" })).toEqual({});
+    await agent.subscribeSessionList({ cwd: workspace });
+    // One watch of the cwd for all of them.
+    expect(handlesOf(agent)!.openHandles().watches).toBe(1);
+    await agent.dispose();
+  });
+
+  it("sends a created session, a prompt and a turn end, but not updatedAt alone", async () => {
+    const { rowsOf, changes, subscriptionId, agent } = await subscribedAgent();
+    const session = await writeTranscript({ prompt: "First", lastMessageAt: Date.now() - 5000 });
+    expect(await waitFor(() => rowsOf(session.id).length === 1)).toBe(true);
+    expect(changes()[0]).toMatchObject({ subscriptionId, removed: [] });
+    expect(rowsOf(session.id)[0]).toMatchObject({ title: "First", cwd: workspace });
+    expect(airRow(rowsOf(session.id)[0]!)).toMatchObject({ archived: false, state: "idle" });
+
+    const promptAt = Date.now() - 1000;
+    await fs.appendFile(session.file, promptRecord(session.id, "Second", promptAt) + "\n");
+    expect(await waitFor(() => rowsOf(session.id).length === 2)).toBe(true);
+    expect(airRow(rowsOf(session.id)[1]!).lastPromptAt).toBe(new Date(promptAt).toISOString());
+
+    const endedAt = Date.now() - 500;
+    await fs.appendFile(session.file, assistantRecord(session.id, "end_turn", endedAt) + "\n");
+    expect(await waitFor(() => rowsOf(session.id).length === 3)).toBe(true);
+    expect(airRow(rowsOf(session.id)[2]!).lastTurnEndedAt).toBe(new Date(endedAt).toISOString());
+
+    // A message that changes nothing but updatedAt.
+    await fs.appendFile(session.file, assistantRecord(session.id, null) + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(rowsOf(session.id)).toHaveLength(3);
+    await agent.dispose();
+  }, 60_000);
+
+  it("sends a state flip of the registry, a rename, archive, unarchive and a delete", async () => {
+    const session = await writeTranscript({ prompt: "Old title" });
+    const { rowsOf, changes, agent } = await subscribedAgent();
+    const last = () => rowsOf(session.id).at(-1)!;
+
+    await registerHolder(process.pid, session.id, liveCli("busy"));
+    expect(await waitFor(() => rowsOf(session.id).length === 1)).toBe(true);
+    expect(airRow(last()).state).toBe("running");
+    await registerHolder(process.pid, session.id, liveCli("waiting"));
+    expect(await waitFor(() => rowsOf(session.id).length === 2)).toBe(true);
+    expect(airRow(last()).state).toBe("requires_action");
+    await fs.rm(path.join(configDir, "sessions", `${process.pid}.json`));
+    expect(await waitFor(() => rowsOf(session.id).length === 3)).toBe(true);
+    expect(airRow(last()).state).toBe("idle");
+
+    await agent.renameSessionTitle({ sessionId: session.id, title: "New title" });
+    expect(await waitFor(() => rowsOf(session.id).length === 4)).toBe(true);
+    expect(last().title).toBe("New title");
+
+    await agent.archiveSession({ sessionId: session.id });
+    expect(await waitFor(() => rowsOf(session.id).length === 5)).toBe(true);
+    expect(airRow(last()).archived).toBe(true);
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(await waitFor(() => rowsOf(session.id).length === 6)).toBe(true);
+    expect(airRow(last()).archived).toBe(false);
+
+    await agent.deleteSession({ sessionId: session.id });
+    expect(await waitFor(() => changes().some((c) => c.removed.includes(session.id)))).toBe(true);
+    await agent.dispose();
+  }, 60_000);
+
+  it("sends the SDK state of a session this connection runs at once, and its close", async () => {
+    const session = await writeTranscript({});
+    const { rowsOf, agent } = await subscribedAgent();
+    // Past the interval of a row sent for the creation of the transcript.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const loaded = mockSessionState({}, agent, session.id) as any;
+    loaded.lastSessionState = "running";
+    agent.sessions[session.id] = loaded;
+    const started = Date.now();
+    (agent as any).sessionIndex.onOwnSessionChanged(session.id);
+    const running = () => rowsOf(session.id).some((row) => airRow(row).state === "running");
+    expect(await waitFor(running)).toBe(true);
+    expect(Date.now() - started).toBeLessThan(150);
+    // The query closes: the row shows the transcript's state again.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    loaded.input = { end: () => {} };
+    loaded.query = { close: () => {} };
+    (agent as any).closeQueryStream(loaded);
+    const idle = () => rowsOf(session.id).some((row) => airRow(row).state === "idle");
+    expect(await waitFor(idle)).toBe(true);
+    delete agent.sessions[session.id];
+    await agent.dispose();
+  });
+
+  it("coalesces the changes of a session to one a second", async () => {
+    const session = await writeTranscript({});
+    const service = new SessionIndexService({ logError: () => {} });
+    const sent: { at: number; changes: ListChanges }[] = [];
+    const subscriptions = new ListSubscriptions({
+      index: service.index,
+      registry: service.registry,
+      own: () => undefined,
+      archivedIds: async () => new Set(),
+      notify: async (changes) => {
+        sent.push({ at: Date.now(), changes });
+      },
+      logError: () => {},
+      debounceMs: 30,
+      maxWaitMs: 100,
+      minSessionIntervalMs: 500,
+    });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    // A new prompt every 40 ms for 1.6 s: each one changes lastPromptAt.
+    const start = Date.now();
+    let lastAt = 0;
+    while (Date.now() - start < 1600) {
+      lastAt = Date.now() - 100_000;
+      await fs.appendFile(session.file, promptRecord(session.id, "again", lastAt) + "\n");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    const times = sent
+      .filter(({ changes }) => changes.sessions.some((s) => s.sessionId === session.id))
+      .map(({ at }) => at);
+    expect(times.length).toBeGreaterThanOrEqual(3);
+    expect(times.length).toBeLessThanOrEqual(5);
+    for (let i = 1; i < times.length; i++) {
+      expect(times[i]! - times[i - 1]!).toBeGreaterThanOrEqual(480);
+    }
+    // The last sent row is the last prompt.
+    const lastRow = sent.at(-1)!.changes.sessions.at(-1)!;
+    expect(airRow(lastRow).lastPromptAt).toBe(new Date(lastAt).toISOString());
+    subscriptions.dispose();
+  }, 10_000);
+
+  it("shares one watcher between two subscriptions of a cwd, each notified", async () => {
+    const { agent, notifications } = await indexAgent();
+    const handles = () => handlesOf(agent)!.openHandles();
+    const first = await agent.subscribeSessionList({ cwd: workspace });
+    const session = await writeTranscript({});
+    await settle();
+    const one = handles();
+    const second = await agent.subscribeSessionList({ cwd: workspace });
+    expect(handles()).toMatchObject({ watches: 1, watchers: one.watchers });
+    const notifiedIds = () =>
+      changesOf(notifications)
+        .filter((c) => c.sessions.length > 0)
+        .map((c) => c.subscriptionId);
+
+    await fs.appendFile(session.file, promptRecord(session.id, "Again") + "\n");
+    expect(
+      await waitFor(
+        () =>
+          notifiedIds().includes(first.subscriptionId) &&
+          notifiedIds().includes(second.subscriptionId),
+      ),
+    ).toBe(true);
+
+    await agent.unsubscribeSessionList(first);
+    expect(handles()).toMatchObject({ watches: 1, watchers: one.watchers });
+    const before = notifiedIds().length;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await fs.appendFile(session.file, promptRecord(session.id, "Once more") + "\n");
+    expect(await waitFor(() => notifiedIds().length > before)).toBe(true);
+    expect(notifiedIds().slice(before)).toEqual([second.subscriptionId]);
+
+    await agent.unsubscribeSessionList(second);
+    expect(handles()).toEqual({ watches: 0, watchers: 0, timers: 0 });
+    await agent.dispose();
+  }, 10_000);
+
+  it("leaves no watcher or timer after the connection closes", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await subscribedAgent();
+    const subscriptions = handlesOf(agent)!;
+    expect(subscriptions.openHandles().watchers).toBeGreaterThan(0);
+    // A change in flight when the connection closes.
+    await fs.appendFile(session.file, promptRecord(session.id, "Late") + "\n");
+    await agent.dispose();
+    expect(subscriptions.openHandles()).toEqual({ watches: 0, watchers: 0, timers: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(subscriptions.openHandles()).toEqual({ watches: 0, watchers: 0, timers: 0 });
+  });
+
+  it("covers the same subdirectory of every linked worktree", async () => {
+    const repo = path.join(workspace, "repo");
+    const linked = path.join(workspace, "linked");
+    const meta = path.join(repo, ".git", "worktrees", "linked");
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(linked, { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(linked, ".git")}\n`);
+    await fs.writeFile(path.join(linked, ".git"), `gitdir: ${meta}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    // The worktree's project directory exists before the subscription.
+    await writeTranscript({ cwd: linked });
+    const { rowsOf, changes, agent } = await subscribedAgent(repo);
+    const inLinked = await writeTranscript({ cwd: linked });
+    const inRepo = await writeTranscript({ cwd: repo });
+    const elsewhere = await writeTranscript({ cwd: workspace });
+    expect(
+      await waitFor(() => rowsOf(inLinked.id).length === 1 && rowsOf(inRepo.id).length === 1),
+    ).toBe(true);
+    expect(rowsOf(inLinked.id)[0]!.cwd).toBe(linked);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(changes().flatMap((c) => c.sessions.map((s) => s.sessionId))).not.toContain(
+      elsewhere.id,
+    );
+    await agent.dispose();
+  });
+
+  /** A subscription manager over a real index whose first rows read slowly. */
+  function slowFirstRows(
+    delayMs: number,
+    options: { minSessionIntervalMs?: number; rescanMs?: number; failFirstRead?: boolean } = {},
+  ) {
+    const service = new SessionIndexService({ logError: () => {} });
+    const sent: { at: number; changes: ListChanges }[] = [];
+    const rowsRead: string[][] = [];
+    let slow = true;
+    let failing = false;
+    const index = {
+      listedPaths: service.index.listedPaths.bind(service.index),
+      projectDirs: service.index.projectDirs.bind(service.index),
+      enumerateFiles: service.index.enumerateFiles.bind(service.index),
+      continuedIn: service.index.continuedIn.bind(service.index),
+      isRead: (candidate: Parameters<typeof service.index.isRead>[0]) =>
+        failing ? false : service.index.isRead(candidate),
+      rowsOf: async (...args: Parameters<typeof service.index.rowsOf>) => {
+        rowsRead.push(args[1].map((candidate) => candidate.sessionId));
+        if (slow) {
+          slow = false;
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          // A first read that fails: no row, and nothing cached.
+          if (options.failFirstRead) {
+            failing = true;
+            setTimeout(() => (failing = false), 100);
+            return [];
+          }
+        }
+        return service.index.rowsOf(...args);
+      },
+    };
+    const subscriptions = new ListSubscriptions({
+      index,
+      registry: service.registry,
+      own: () => undefined,
+      archivedIds: async () => new Set(),
+      notify: async (changes) => {
+        sent.push({ at: Date.now(), changes });
+      },
+      logError: () => {},
+      minSessionIntervalMs: options.minSessionIntervalMs,
+      rescanMs: options.rescanMs,
+    });
+    return { subscriptions, sent, rowsRead };
+  }
+
+  it("hides a session continued in a successor that got history before the first read", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({ sessionId: successorId });
+    const { subscriptions, sent } = slowFirstRows(400);
+    await subscriptions.subscribe(workspace);
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(
+      await waitFor(() => sent.some(({ changes }) => changes.removed.includes(predecessor.id))),
+    ).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("shows a session continued in a successor deleted before the first read", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const successor = await writeTranscript({ sessionId: successorId });
+    await fs.appendFile(
+      successor.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    // The successor has history: the list hides the predecessor.
+    const { agent } = await indexAgent();
+    expect((await agent.listSessions({ cwd: workspace })).sessions.map((s) => s.sessionId)).toEqual(
+      [successorId],
+    );
+    const { subscriptions, sent } = slowFirstRows(400);
+    await subscriptions.subscribe(workspace);
+    await fs.rm(successor.file);
+    const shown = () =>
+      sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === predecessor.id));
+    expect(await waitFor(shown)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("reads again a transcript that could not be read for the first rows", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(0, { rescanMs: 500, failFirstRead: true });
+    await subscriptions.subscribe(workspace);
+    const shown = () =>
+      sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === session.id));
+    expect(await waitFor(shown)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("sends a registry change that lands while the registry is read first", async () => {
+    const session = await writeTranscript({});
+    await registerHolder(process.pid, session.id, liveCli("idle"));
+    const service = new SessionIndexService({ logError: () => {} });
+    let first = true;
+    const registry = {
+      readFiles: async (...args: Parameters<typeof service.registry.readFiles>) => {
+        if (first) {
+          first = false;
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        return service.registry.readFiles(...args);
+      },
+    };
+    const sent: ListChanges[] = [];
+    const subscriptions = new ListSubscriptions({
+      index: service.index,
+      registry,
+      own: () => undefined,
+      archivedIds: async () => new Set(),
+      notify: async (changes) => {
+        sent.push(changes);
+      },
+      logError: () => {},
+    });
+    await subscriptions.subscribe(workspace);
+    await registerHolder(process.pid, session.id, liveCli("busy"));
+    const running = () =>
+      sent.some((c) =>
+        c.sessions.some((s) => s.sessionId === session.id && airRow(s).state === "running"),
+      );
+    expect(await waitFor(running)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("sends the sessions of a worktree linked after subscribe that shares the directory", async () => {
+    const repo = path.join(workspace, "repo.a");
+    const linked = path.join(workspace, "repo-a");
+    expect(encodeProjectPath(repo)).toBe(encodeProjectPath(linked));
+    await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+    await fs.mkdir(linked, { recursive: true });
+    const inLinked = await writeTranscript({ cwd: linked });
+    const { subscriptions, sent } = slowFirstRows(0, { rescanMs: 400 });
+    await subscriptions.subscribe(repo);
+    await settle();
+    expect(sent).toEqual([]);
+    // `git worktree add` of the other path.
+    const meta = path.join(repo, ".git", "worktrees", "linked");
+    await fs.mkdir(meta, { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(linked, ".git")}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    await fs.writeFile(path.join(linked, ".git"), `gitdir: ${meta}\n`);
+    const shown = () =>
+      sent.some(({ changes }) => changes.sessions.some((s) => s.sessionId === inLinked.id));
+    expect(await waitFor(shown)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("watches a project directory that was replaced", async () => {
+    const session = await writeTranscript({});
+    const dir = path.dirname(session.file);
+    const { subscriptions, sent } = slowFirstRows(0);
+    await subscriptions.subscribe(workspace);
+    await settle();
+    await fs.rename(dir, `${dir}.old`);
+    await fs.mkdir(dir);
+    await fs.copyFile(path.join(`${dir}.old`, path.basename(session.file)), session.file);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const before = sent.length;
+    await fs.appendFile(session.file, promptRecord(session.id, "In the new directory") + "\n");
+    expect(await waitFor(() => sent.length > before, 3000)).toBe(true);
+    subscriptions.dispose();
+    await fs.rm(`${dir}.old`, { recursive: true, force: true });
+  });
+
+  it("removes a session deleted after the first read took its row", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(400);
+    await subscriptions.subscribe(workspace);
+    // Its row is read (the delay is inside the first read), then it goes.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await fs.appendFile(session.file, promptRecord(session.id, "Changed") + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    await fs.rm(session.file);
+    expect(
+      await waitFor(() => sent.some(({ changes }) => changes.removed.includes(session.id))),
+    ).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("sends a rename made while the first rows are read", async () => {
+    const session = await writeTranscript({ prompt: "Before" });
+    const { subscriptions, sent } = slowFirstRows(400);
+    await subscriptions.subscribe(workspace);
+    await fs.appendFile(
+      session.file,
+      JSON.stringify({ type: "custom-title", customTitle: "After", sessionId: session.id }) + "\n",
+    );
+    await writeCustomTitleSidecar(session.file, "After");
+    const renamed = () =>
+      sent.some(({ changes }) =>
+        changes.sessions.some((s) => s.sessionId === session.id && s.title === "After"),
+      );
+    expect(await waitFor(renamed)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("keeps a row whose transcript cannot be read for now, and reads it again", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(0, { rescanMs: 700 });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    await fs.appendFile(session.file, promptRecord(session.id, "Unreadable") + "\n");
+    await fs.chmod(session.file, 0o000);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      expect(sent.flatMap(({ changes }) => changes.removed)).toEqual([]);
+    } finally {
+      await fs.chmod(session.file, 0o644);
+    }
+    expect(await waitFor(() => sent.some(({ changes }) => changes.sessions.length > 0))).toBe(true);
+    expect(sent.flatMap(({ changes }) => changes.removed)).toEqual([]);
+    subscriptions.dispose();
+  });
+
+  it("does not read an archived session again on a rescan", async () => {
+    const session = await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.archiveSession({ sessionId: session.id });
+    const { subscriptions, rowsRead } = slowFirstRows(0, { rescanMs: 300 });
+    await subscriptions.subscribe(workspace);
+    // The first read, and the events of the archive that the watch may get late.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const read = rowsRead.length;
+    expect(rowsRead[0]).toEqual([session.id]);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    // Several rescans since, and nothing changed.
+    expect(rowsRead.length).toBe(read);
+    subscriptions.dispose();
+  });
+
+  it("keeps working after events that arrive while the first rows are read", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(600);
+    await subscriptions.subscribe(workspace);
+    // Past the quiet period, before the first rows.
+    await fs.appendFile(session.file, promptRecord(session.id, "During") + "\n");
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await waitFor(() => sent.length === 1)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    await fs.appendFile(session.file, promptRecord(session.id, "After") + "\n");
+    expect(await waitFor(() => sent.length === 2)).toBe(true);
+    subscriptions.dispose();
+  });
+
+  it("removes a session deleted before the first rows were read", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(400);
+    await subscriptions.subscribe(workspace);
+    await fs.rm(session.file);
+    expect(await waitFor(() => sent.some(({ changes }) => changes.removed.length > 0))).toBe(true);
+    expect(sent.flatMap(({ changes }) => changes.removed)).toEqual([session.id]);
+    subscriptions.dispose();
+  });
+
+  it("holds a removal back for the interval of the session", async () => {
+    const session = await writeTranscript({});
+    const { subscriptions, sent } = slowFirstRows(0, { minSessionIntervalMs: 800 });
+    await subscriptions.subscribe(workspace);
+    await settle();
+    await fs.appendFile(session.file, promptRecord(session.id, "Last") + "\n");
+    expect(await waitFor(() => sent.length === 1)).toBe(true);
+    await fs.rm(session.file);
+    expect(await waitFor(() => sent.length === 2)).toBe(true);
+    expect(sent[1]!.changes.removed).toEqual([session.id]);
+    expect(sent[1]!.at - sent[0]!.at).toBeGreaterThanOrEqual(780);
+    subscriptions.dispose();
+  });
+
+  it("hides a continued session once its successor has history", async () => {
+    const successorId = randomUUID();
+    const predecessor = await writeTranscript({
+      trailer: [{ type: "continued-in", continuedInSessionId: successorId }],
+    });
+    const stub = await writeTranscript({ sessionId: successorId });
+    const { rowsOf, changes, agent } = await subscribedAgent();
+    await fs.appendFile(
+      stub.file,
+      JSON.stringify({ type: "user", parentUuid: null, sessionId: successorId, cwd: workspace }) +
+        "\n",
+    );
+    expect(await waitFor(() => changes().some((c) => c.removed.includes(predecessor.id)))).toBe(
+      true,
+    );
+    expect(rowsOf(predecessor.id)).toEqual([]);
+    await agent.dispose();
+  });
+
+  it("is not started by session/list", async () => {
+    await writeTranscript({});
+    const { agent } = await indexAgent();
+    await agent.listSessions({ cwd: workspace });
+    expect(handlesOf(agent)).toBeUndefined();
+  });
+
+  it("sends a session that changed while the first rows were read", async () => {
+    const sessions: { id: string; file: string }[] = [];
+    for (let i = 0; i < 20; i++) sessions.push(await writeTranscript({}));
+    const { agent, notifications } = await indexAgent();
+    await agent.subscribeSessionList({ cwd: workspace });
+    // Right after subscribe returns, before the first rows are read.
+    await fs.appendFile(sessions[7]!.file, promptRecord(sessions[7]!.id, "Meanwhile") + "\n");
+    expect(
+      await waitFor(() =>
+        changesOf(notifications).some((c) =>
+          c.sessions.some((s) => s.sessionId === sessions[7]!.id),
+        ),
+      ),
+    ).toBe(true);
+    await agent.dispose();
+  });
+});
 
 describe("ownership of a session for delete and rename", () => {
   it("checks the registry for a session whose query closed here", async () => {
@@ -1087,7 +1667,6 @@ describe("session index service lifecycle", () => {
   it("starts no watcher after dispose, also for a list in flight", async () => {
     await writeTranscript({});
     const service = new SessionIndexService({
-      notifyListChanged: async () => {},
       logError: () => {},
     });
     const inFlight = service.list({ cwd: workspace }, () => undefined);
@@ -1252,32 +1831,29 @@ describe("long project paths that share a prefix", () => {
     expect(page.sessions.map((s) => s.sessionId).sort()).toEqual([own.id, cliCopy.id].sort());
   });
 
-  it("does not notify a cwd of a live record of another long path", async () => {
+  it("does not change a subscription on a live record of another long path", async () => {
     const mine = path.join(longBase(), "mine");
     const theirs = path.join(longBase(), "theirs");
-    await writeTranscript({ cwd: mine });
-    await writeTranscript({ cwd: theirs });
+    const own = await writeTranscript({ cwd: mine });
+    const other = await writeTranscript({ cwd: theirs });
     await fs.mkdir(path.join(configDir, "sessions"), { recursive: true });
-    const notified: string[] = [];
+    const changes: ListChanges[] = [];
     const service = new SessionIndexService({
-      notifyListChanged: async ({ cwd }) => {
-        notified.push(cwd);
+      notifyListChanges: async (change) => {
+        changes.push(change);
       },
       logError: () => {},
     });
-    await service.list({ cwd: mine }, () => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await registerHolder(process.pid, randomUUID(), { cwd: theirs });
+    await service.subscribeList(mine);
+    await settle();
+    await registerHolder(process.pid, other.id, liveCli("busy"));
     await new Promise((resolve) => setTimeout(resolve, 1500));
-    expect(notified).toEqual([]);
-    await registerHolder(process.pid, randomUUID(), { cwd: mine });
-    const start = Date.now();
-    while (notified.length === 0 && Date.now() - start < 3000) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    expect(notified).toEqual([mine]);
+    expect(changes).toEqual([]);
+    await registerHolder(process.ppid, own.id, liveCli("busy"));
+    expect(await waitFor(() => changes.length > 0)).toBe(true);
+    expect(changes[0]!.sessions.map((s) => s.sessionId)).toEqual([own.id]);
     service.dispose();
-  });
+  }, 15_000);
 });
 
 describe("session title after an explicit rename", () => {
@@ -1360,7 +1936,6 @@ describe("empty transcripts on delete", () => {
       (error: Error) => error,
     );
     const service = new SessionIndexService({
-      notifyListChanged: async () => {},
       logError: () => {},
     });
     await expect(archiveInsteadOfDelete(id, service)).rejects.toThrow(sdkError!.message);
@@ -1641,7 +2216,6 @@ describe("a CLI child of this process that does not exit", () => {
     await registerHolder(child.pid!, session.id, { entrypoint: "sdk-ts" });
     const service = new SessionIndexService({
       registry: new LiveSessionRegistry({ ownChildExitTimeoutMs: 200 }),
-      notifyListChanged: async () => {},
       logError: () => {},
     });
     await expect(service.assertNotHeldElsewhere(session.id)).rejects.toMatchObject({
@@ -2119,19 +2693,6 @@ describe("session list extensions RFD", () => {
     const original = rows.find((row) => row.sessionId === parent.id);
     expect((original!._meta as any).jetbrains.air).not.toHaveProperty("forkedFrom");
   });
-
-  it("does not watch a list without a cwd", async () => {
-    await writeTranscript({});
-    const service = new SessionIndexService({
-      notifyListChanged: async () => {},
-      logError: () => {},
-    });
-    await service.list({}, () => undefined);
-    expect((service as any).watcher).toBeUndefined();
-    await service.list({ cwd: workspace }, () => undefined);
-    expect((service as any).watcher).toBeDefined();
-    service.dispose();
-  });
 });
 
 describe("load and resume of a session that another process holds", () => {
@@ -2169,7 +2730,15 @@ describe("load and resume of a session that another process holds", () => {
 });
 
 describe("paths that share a project directory", () => {
-  it("are listed and watched apart", async () => {
+  const changesFor = (
+    notifications: { method: string; params: Record<string, unknown> }[],
+    subscriptionId: string,
+  ) =>
+    notifications
+      .map((n) => n.params as unknown as ListChanges)
+      .filter((change) => change.subscriptionId === subscriptionId);
+
+  it("are listed and subscribed apart", async () => {
     const dotted = path.join(workspace, "app.v2");
     const dashed = path.join(workspace, "app-v2");
     expect(encodeProjectPath(dotted)).toBe(encodeProjectPath(dashed));
@@ -2187,51 +2756,64 @@ describe("paths that share a project directory", () => {
       expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[id, cwd]]);
     }
 
-    // Watched by the last list: the dashed path. A change of the dotted
-    // path's session is no change of that list.
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await fs.appendFile(mine.file, "{}\n");
+    // A change of the dotted path's session is no change of the dashed list.
+    const { subscriptionId } = await agent.subscribeSessionList({ cwd: dashed });
+    await settle();
+    await fs.appendFile(mine.file, promptRecord(mine.id, "Mine") + "\n");
     await new Promise((resolve) => setTimeout(resolve, 1500));
-    expect(notifications.filter((n) => n.params.cwd === dashed)).toEqual([]);
-    await fs.appendFile(theirs.file, "{}\n");
-    const start = Date.now();
-    while (!notifications.some((n) => n.params.cwd === dashed) && Date.now() - start < 3000) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    expect(notifications.some((n) => n.params.cwd === dashed)).toBe(true);
+    expect(changesFor(notifications, subscriptionId)).toEqual([]);
+    await fs.appendFile(theirs.file, promptRecord(theirs.id, "Theirs") + "\n");
+    expect(await waitFor(() => changesFor(notifications, subscriptionId).length > 0)).toBe(true);
+    expect(changesFor(notifications, subscriptionId)[0]!.sessions.map((s) => s.sessionId)).toEqual([
+      theirs.id,
+    ]);
     await agent.dispose();
-  });
+  }, 10_000);
 
-  it("hint a watched path when a session of the other path moves into it", async () => {
+  it("move a session from one path's subscription to the other's", async () => {
     const dotted = path.join(workspace, "app.v2");
     const dashed = path.join(workspace, "app-v2");
     const mine = await writeTranscript({ cwd: dotted });
     await writeTranscript({ cwd: dashed });
     const { agent, notifications } = await indexAgent();
-    await agent.listSessions({ cwd: dotted });
-    await agent.listSessions({ cwd: dashed });
+    const fromDotted = await agent.subscribeSessionList({ cwd: dotted });
+    const fromDashed = await agent.subscribeSessionList({ cwd: dashed });
+    await settle();
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
     await fs.appendFile(
       mine.file,
       JSON.stringify({ type: "relocated", sessionId: mine.id, relocatedCwd: dashed }) + "\n",
     );
-    const start = Date.now();
-    while (!notifications.some((n) => n.params.cwd === dashed) && Date.now() - start < 3000) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    expect(notifications.some((n) => n.params.cwd === dashed)).toBe(true);
+    const added = () =>
+      changesFor(notifications, fromDashed.subscriptionId).flatMap((c) => c.sessions);
+    const removed = () =>
+      changesFor(notifications, fromDotted.subscriptionId).flatMap((c) => c.removed);
+    expect(await waitFor(() => added().length > 0 && removed().length > 0)).toBe(true);
+    expect(added().map((s) => [s.sessionId, s.cwd])).toEqual([[mine.id, dashed]]);
+    expect(removed()).toEqual([mine.id]);
     await agent.dispose();
   });
 });
 
 describe("a relocation out of the project directory", () => {
-  it("keeps the session in the change hint, as the list keeps showing it", async () => {
+  it("keeps the session in a subscription, as the list keeps showing it", async () => {
     const session = await writeTranscript({});
+    const changes: ListChanges[] = [];
     const service = new SessionIndexService({
-      notifyListChanged: async () => {},
+      notifyListChanges: async (change) => {
+        changes.push(change);
+      },
       logError: () => {},
     });
+    await service.subscribeList(workspace);
+    await settle();
+    await fs.appendFile(
+      session.file,
+      JSON.stringify({ type: "relocated", sessionId: session.id, relocatedCwd: "/elsewhere" }) +
+        "\n",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(changes.flatMap((change) => change.removed)).toEqual([]);
     const rows = await service.index.list({
       cwd: workspace,
       limit: 10,
@@ -2239,12 +2821,6 @@ describe("a relocation out of the project directory", () => {
       archivedIds: new Set(),
     });
     expect(rows.rows).toHaveLength(1);
-    await fs.appendFile(
-      session.file,
-      JSON.stringify({ type: "relocated", sessionId: session.id, relocatedCwd: "/elsewhere" }) +
-        "\n",
-    );
-    expect(await service.index.scopeFingerprint(workspace, false)).toHaveLength(1);
     service.dispose();
   });
 });
@@ -2549,16 +3125,22 @@ describe("session index cost", () => {
     expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(120);
   });
 
-  it("computes the change fingerprint without reading transcripts", async () => {
-    for (let i = 0; i < 30; i++) await writeTranscript({});
+  it("reads only the changed transcript for a subscription", async () => {
+    const sessions: { id: string; file: string }[] = [];
+    for (let i = 0; i < 30; i++) sessions.push(await writeTranscript({}));
+    const changes: ListChanges[] = [];
     const service = new SessionIndexService({
-      notifyListChanged: async () => {},
+      notifyListChanges: async (change) => {
+        changes.push(change);
+      },
       logError: () => {},
     });
+    await service.subscribeList(workspace);
+    await settle();
     vi.mocked(getSessionInfo).mockClear();
-    const parts = await service.index.scopeFingerprint(workspace, false);
-    expect(parts).toHaveLength(30);
-    expect(getSessionInfo).not.toHaveBeenCalled();
+    await fs.appendFile(sessions[3]!.file, promptRecord(sessions[3]!.id, "Next") + "\n");
+    expect(await waitFor(() => changes.length > 0)).toBe(true);
+    expect(vi.mocked(getSessionInfo).mock.calls.map(([id]) => id)).toEqual([sessions[3]!.id]);
     service.dispose();
   });
 });

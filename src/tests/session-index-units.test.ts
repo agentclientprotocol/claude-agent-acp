@@ -34,7 +34,6 @@ import {
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
-import { ListChangedWatcher } from "../session-index/list-changed.js";
 import { DirListings, statFiles } from "../session-index/dir-listing.js";
 import { SessionIndex } from "../session-index/session-index.js";
 
@@ -457,6 +456,40 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("reads single records, never a .key file, and reuses a recent start time on request", async () => {
+    const dir = await registryWith({
+      "10.json": {
+        pid: 10,
+        sessionId: "live",
+        procStart: "Mon Jan 1 00:00:00 2026",
+        updatedAt: now,
+      },
+      "10.json.tmp": "{}",
+      "18.abcdef.key": "secret",
+    });
+    const asked: number[][] = [];
+    const registry = new LiveSessionRegistry({
+      dir: () => dir,
+      now: () => now,
+      isAlive: () => true,
+      processStarts: async (pids) => {
+        asked.push(pids);
+        return new Map([[10, "Mon Jan 1 00:00:00 2026"]]);
+      },
+      pidDomain: async () => "darwin",
+    });
+    const read = await registry.readFiles(["10.json", "10.json.tmp", "18.abcdef.key", "11.json"]);
+    expect([...read.keys()].sort()).toEqual(["10.json", "11.json"]);
+    expect(read.get("10.json")?.sessionId).toBe("live");
+    expect(read.get("11.json")).toBeUndefined();
+    await registry.readFiles(["10.json"], { recentStarts: true });
+    expect(asked).toEqual([[10]]);
+    // Without recentStarts, `ps` is asked again.
+    await registry.readFiles(["10.json"]);
+    expect(asked).toEqual([[10], [10]]);
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("reports another process before it waits for a CLI child of this one", async () => {
     const dir = await registryWith({
       "21.json": { pid: 21, sessionId: "both", updatedAt: now },
@@ -722,26 +755,6 @@ describe("row facts of the tail and head", () => {
       ).forkedFrom,
     ).toBe(parent);
     expect(scan(lines(user("x", "2026-01-01T00:00:00Z"))).forkedFrom).toBeUndefined();
-  });
-});
-
-describe("list change watches", () => {
-  it("are keyed by cwd and worktree scope, and a list renews its watch", async () => {
-    const scopes: boolean[] = [];
-    const watcher = new ListChangedWatcher({
-      projectDirs: async (_cwd, includeWorktrees) => {
-        scopes.push(includeWorktrees);
-        return { dirNames: [], paths: [] };
-      },
-      notify: async () => {},
-      rescanMs: 60_000,
-    });
-    await watcher.onListed("/repo");
-    await watcher.onListed("/repo", true);
-    await watcher.onListed("/repo");
-    expect(watcher.watchedCwds()).toEqual(["/repo", "/repo"]);
-    expect(scopes).toEqual([false, true]);
-    watcher.dispose();
   });
 });
 

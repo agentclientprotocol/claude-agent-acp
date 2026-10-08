@@ -37,6 +37,9 @@ const PS_TIMEOUT_MS = 1_000;
 const OWN_CHILD_EXIT_TIMEOUT_MS = 8_000;
 const OWN_CHILD_POLL_MS = 100;
 const RECORD_FILE_PATTERN = /^(\d+)\.json$/;
+/** How long a process start time read with `ps` serves a reader that asks
+ *  for recent ones (see {@link LiveSessionRegistry.readFiles}). */
+const RECENT_START_MS = 10_000;
 
 export type LiveRecord = {
   pid: number;
@@ -190,6 +193,8 @@ export class LiveSessionRegistry {
   private readonly parentPids: (pids: number[]) => Promise<Map<number, number>>;
   private readonly ownPid: number;
   private readonly ownChildExitTimeoutMs: number;
+  /** The start times `ps` gave, by pid, and when. */
+  private readonly starts = new Map<number, { start: string; at: number }>();
 
   constructor(deps: LiveRegistryDeps = {}) {
     this.dir = deps.dir ?? liveRegistryDir;
@@ -262,34 +267,74 @@ export class LiveSessionRegistry {
 
   /** Every live record, several per session when several processes hold it. */
   private async read(): Promise<LiveRecord[]> {
-    const dir = this.dir();
     let names: string[];
     try {
-      names = await fs.readdir(dir);
+      names = await fs.readdir(this.dir());
     } catch {
       return [];
     }
+    return [...(await this.readFiles(names)).values()].filter(
+      (record): record is LiveRecord => record !== undefined,
+    );
+  }
+
+  /**
+   * The live record of each of the registry files `names`, by name:
+   * undefined for a file that is gone or holds no live record. A name that
+   * is not `<pid>.json` (a `.key` file, a temporary file) is never opened and
+   * not in the result. The rules of {@link read} apply. `recentStarts` takes
+   * a start time that `ps` gave in the last 10 s when it matches the record,
+   * so a record that changes often does not run `ps` each time.
+   */
+  async readFiles(
+    names: readonly string[],
+    options: { recentStarts?: boolean } = {},
+  ): Promise<Map<string, LiveRecord | undefined>> {
+    const dir = this.dir();
+    const result = new Map<string, LiveRecord | undefined>();
     const domain = await this.pidDomain();
-    const candidates: { pid: number; raw: RawRecord }[] = [];
+    const candidates: { name: string; pid: number; raw: RawRecord }[] = [];
     await Promise.all(
       names.map(async (name) => {
         const match = RECORD_FILE_PATTERN.exec(name);
         if (!match) return;
+        result.set(name, undefined);
         const pid = Number(match[1]);
         const raw = await readRecord(path.join(dir, name));
         if (!raw || raw.pid !== pid || typeof raw.sessionId !== "string") return;
         if (typeof raw.pidDomain === "string" && raw.pidDomain !== domain) return;
         if (!this.isAlive(pid)) return;
-        candidates.push({ pid, raw });
+        candidates.push({ name, pid, raw });
       }),
     );
-    const needStarts = candidates
-      .filter(({ raw }) => typeof raw.procStart === "string")
-      .map(({ pid }) => pid);
-    const starts = needStarts.length > 0 ? await this.processStarts(needStarts) : new Map();
     const now = this.now();
-    const result: LiveRecord[] = [];
+    const starts = new Map<number, string>();
+    const needStarts: number[] = [];
     for (const { pid, raw } of candidates) {
+      if (typeof raw.procStart !== "string") continue;
+      const recent = this.starts.get(pid);
+      // A start that differs may be a new process under the same pid.
+      if (
+        options.recentStarts &&
+        recent &&
+        now - recent.at < RECENT_START_MS &&
+        recent.start === normalizeStart(raw.procStart)
+      ) {
+        starts.set(pid, recent.start);
+      } else {
+        needStarts.push(pid);
+      }
+    }
+    if (needStarts.length > 0) {
+      for (const [pid, start] of await this.processStarts(needStarts)) {
+        starts.set(pid, start);
+        this.starts.set(pid, { start, at: now });
+      }
+    }
+    for (const [pid, { at }] of this.starts) {
+      if (now - at >= RECENT_START_MS) this.starts.delete(pid);
+    }
+    for (const { name, pid, raw } of candidates) {
       const recorded =
         typeof raw.procStart === "string" ? normalizeStart(raw.procStart) : undefined;
       const actual = starts.get(pid);
@@ -301,7 +346,7 @@ export class LiveSessionRegistry {
         finiteNumber(raw.startedAt) ?? 0,
       );
       if (now - lastSeen > STALE_RECORD_MS && !procStartMatches) continue;
-      const record: LiveRecord = {
+      result.set(name, {
         pid,
         sessionId: raw.sessionId as string,
         cwd: optionalString(raw.cwd),
@@ -309,15 +354,14 @@ export class LiveSessionRegistry {
         entrypoint: optionalString(raw.entrypoint),
         status: optionalString(raw.status),
         statusUpdatedAt: finiteNumber(raw.statusUpdatedAt),
-      };
-      result.push(record);
+      });
     }
     return result;
   }
 }
 
 /** One record per session: the one with the newest status. */
-function bySession(records: readonly LiveRecord[]): LiveSnapshot {
+export function bySession(records: Iterable<LiveRecord>): LiveSnapshot {
   const result = new Map<string, LiveRecord>();
   for (const record of records) {
     const previous = result.get(record.sessionId);

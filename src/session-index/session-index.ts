@@ -60,43 +60,6 @@ export const MAX_LIST_LIMIT = 200;
 /** Entries of the metadata cache: a few hundred bytes each, so the
  *  transcripts of a large history (tens of thousands) stay cached and deep
  *  pages do not read them again. */
-/** How many appended-bytes checks are kept, and run at once. */
-const RELOCATION_CHECK_CACHE_SIZE = 10_000;
-const APPENDED_READ_CONCURRENCY = 16;
-
-/** Runs at most `capacity` tasks at once, the rest in order. */
-class Slots {
-  private running = 0;
-  private readonly waiting: (() => void)[] = [];
-  private head = 0;
-  constructor(private readonly capacity: number) {}
-  async run<T>(task: () => Promise<T>): Promise<T> {
-    if (this.running >= this.capacity) {
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
-    } else {
-      this.running++;
-    }
-    try {
-      return await task();
-    } finally {
-      const next = this.waiting[this.head];
-      if (next) {
-        this.waiting[this.head++] = undefined as never;
-        if (this.head > 1024 && this.head * 2 > this.waiting.length) {
-          this.waiting.splice(0, this.head);
-          this.head = 0;
-        }
-        next();
-      } else {
-        this.running--;
-      }
-    }
-  }
-}
-
-/** The most a change hint reads of what was appended to a transcript
- *  since a list read it; a larger append counts as a change. */
-const MAX_APPENDED_READ = 1024 * 1024;
 const METADATA_CACHE_SIZE = 50_000;
 const READ_BATCH_SIZE = 16;
 /** Transcripts read at most per directory to recover a sibling's cwd. */
@@ -236,6 +199,22 @@ function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCurs
   return compareRows(row, cursor) > 0;
 }
 
+/** One transcript per session id, in any case: the larger file wins. */
+export function onePerSession(candidates: readonly TranscriptCandidate[]): TranscriptCandidate[] {
+  const bySession = new Map<string, TranscriptCandidate>();
+  for (const candidate of candidates) {
+    const key = candidate.sessionId.toLowerCase();
+    const previous = bySession.get(key);
+    if (!previous || candidate.size > previous.size) bySession.set(key, candidate);
+  }
+  return [...bySession.values()];
+}
+
+function byMtimeDescending(a: TranscriptCandidate, b: TranscriptCandidate): number {
+  if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+  return a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0;
+}
+
 /** The title of the CLI's `custom-title.json` sidecar of a transcript. */
 export async function readSidecarTitle(
   filePath: string,
@@ -320,14 +299,12 @@ function scopeOf(paths: readonly string[] | undefined): (cwd: string) => Promise
 export class SessionIndex {
   private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
-  /** What a change hint found in the bytes appended to a transcript since a
-   *  list read it, so a later hint does not read them again. */
-  private readonly relocationChecks = new Lru<
+  /** The metadata reads in flight, by path: a list and a subscription that
+   *  want the same transcript at the same stat read it once. */
+  private readonly reading = new Map<
     string,
-    { fromSize: number; size: number; mtimeMs: number; ino: number; cwd: string | undefined }
-  >(RELOCATION_CHECK_CACHE_SIZE);
-  /** Change hints read appended bytes a few files at a time. */
-  private readonly appendedReads = new Slots(APPENDED_READ_CONCURRENCY);
+    { key: string; promise: Promise<TranscriptMetadata | null> }
+  >();
   /** A cwd that encodes to each project directory name, learned from its
    *  transcripts; it recovers the cwd of a sibling that has none. */
   private readonly dirCwds = new Map<string, string>();
@@ -407,10 +384,9 @@ export class SessionIndex {
     return false;
   }
 
-  /** Every non-empty transcript of `cwd` (with `includeWorktrees` also of
-   *  its worktrees; without a cwd, of all projects), one per session id: the
-   *  larger file wins. */
-  async enumerate(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
+  /** Every non-empty transcript file of `paths` (without, of all projects),
+   *  every copy of a session. */
+  async enumerateFiles(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
     const root = projectsRoot();
     const dirs: { dirName: string; projectPath?: string }[] = paths
       ? await this.projectDirs(paths)
@@ -439,13 +415,13 @@ export class SessionIndex {
         ino: fileStats.ino,
       });
     });
-    const bySession = new Map<string, TranscriptCandidate>();
-    for (const candidate of all) {
-      const key = candidate.sessionId.toLowerCase();
-      const previous = bySession.get(key);
-      if (!previous || candidate.size > previous.size) bySession.set(key, candidate);
-    }
-    return [...bySession.values()];
+    return all;
+  }
+
+  /** Every non-empty transcript of `paths` (without, of all projects), one
+   *  per session id: the larger file wins. */
+  async enumerate(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
+    return onePerSession(await this.enumerateFiles(paths));
   }
 
   /**
@@ -510,6 +486,24 @@ export class SessionIndex {
     return (await this.scanSession(sessionId)).sessionDirs;
   }
 
+  /** Whether `candidate` was read at its stat: its metadata is cached, also
+   *  when it holds no row. False after a failed read. */
+  isRead(candidate: TranscriptCandidate): boolean {
+    const cached = this.metadata.peek(candidate.filePath);
+    return (
+      cached !== undefined &&
+      cached.mtimeMs === candidate.mtimeMs &&
+      cached.size === candidate.size &&
+      cached.ino === candidate.ino
+    );
+  }
+
+  /** The session that the cached metadata of `filePath` says it was
+   *  continued in. */
+  continuedIn(filePath: string): string | undefined {
+    return this.metadata.peek(filePath)?.metadata?.continuedIn;
+  }
+
   /** Drops the cached metadata of `filePaths`. */
   invalidate(filePaths: readonly string[]): void {
     for (const filePath of filePaths) this.metadata.delete(filePath);
@@ -520,17 +514,8 @@ export class SessionIndex {
     const paths = query.cwd
       ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
       : undefined;
-    const inScope = scopeOf(paths);
     const after = query.after;
-    const enumerated = (await this.enumerate(paths)).sort((a, b) =>
-      a.mtimeMs !== b.mtimeMs
-        ? b.mtimeMs - a.mtimeMs
-        : a.sessionId < b.sessionId
-          ? -1
-          : a.sessionId > b.sessionId
-            ? 1
-            : 0,
-    );
+    const enumerated = (await this.enumerate(paths)).sort(byMtimeDescending);
     // A page after a cursor skips, without reading them, the transcripts
     // whose cached order key puts them before the cursor. The archive state
     // comes from the title, so the archive filter applies once a transcript
@@ -540,7 +525,61 @@ export class SessionIndex {
     );
     // One row more than the page tells whether a next page exists, so a
     // cursor never leads to an empty page.
-    const wanted = query.limit + 1;
+    const rows = await this.collectRows(candidates, {
+      inScope: scopeOf(paths),
+      archivedIds: query.archivedIds,
+      archived: query.archived,
+      after,
+      wanted: query.limit + 1,
+      unread: (read) => enumerated.filter((candidate) => !read.has(candidate)),
+    });
+    return { rows: rows.slice(0, query.limit), hasMore: rows.length > query.limit };
+  }
+
+  /**
+   * The rows of `candidates` (one per session, see {@link onePerSession}),
+   * any archive state, as a list of `paths` shows them: a candidate without
+   * a row (no title, a sidechain, continued elsewhere, another path that
+   * shares the project directory) is left out. `siblings` are the other
+   * transcripts of the candidates' directories, read only when a candidate
+   * has no cwd of its own. The metadata cache makes an unchanged transcript
+   * free.
+   */
+  async rowsOf(
+    paths: readonly string[],
+    candidates: readonly TranscriptCandidate[],
+    archivedIds: ReadonlySet<string>,
+    siblings: () => readonly TranscriptCandidate[],
+  ): Promise<IndexRow[]> {
+    return this.collectRows(candidates, {
+      inScope: scopeOf(paths),
+      archivedIds,
+      archived: "all",
+      wanted: Infinity,
+      unread: (read) => siblings().filter((candidate) => !read.has(candidate)),
+    });
+  }
+
+  /**
+   * Reads `candidates` in order into rows, sorted. With a finite `wanted`,
+   * stops once `wanted` rows are certain to come first (a candidate's order
+   * key is at most its mtime, so `candidates` must be in mtime order then).
+   */
+  private async collectRows(
+    candidates: readonly TranscriptCandidate[],
+    options: {
+      inScope: (cwd: string) => Promise<boolean>;
+      /** Sessions archived by a marker file. */
+      archivedIds: ReadonlySet<string>;
+      /** The rows kept by archive state. */
+      archived: ArchivedFilter;
+      after?: ListCursor;
+      wanted: number;
+      /** The transcripts not read, which may supply a sibling's cwd. */
+      unread: (read: ReadonlySet<TranscriptCandidate>) => readonly TranscriptCandidate[];
+    },
+  ): Promise<IndexRow[]> {
+    const { inScope, archivedIds, archived, after, wanted } = options;
     const rows: IndexRow[] = [];
     // Read transcripts without a cwd of their own: a sibling of the same
     // directory may supply it, whichever batch it is read in.
@@ -549,13 +588,9 @@ export class SessionIndex {
       // Another path that encodes to the same project directory is not this
       // cwd (`/a/b` and `/a-b`).
       if (!(await inScope(cwd))) return;
-      const row = toRow(
-        resolved,
-        cwd,
-        query.archivedIds.has(resolved.candidate.sessionId.toLowerCase()),
-      );
-      if (!archivedFilterKeeps(query.archived, row.archived)) return;
-      if (!query.after || isAfter(row, query.after)) rows.push(row);
+      const row = toRow(resolved, cwd, archivedIds.has(resolved.candidate.sessionId.toLowerCase()));
+      if (!archivedFilterKeeps(archived, row.archived)) return;
+      if (!after || isAfter(row, after)) rows.push(row);
     };
     const settlePending = async () => {
       const left: Resolved[] = [];
@@ -599,80 +634,11 @@ export class SessionIndex {
       // supply the cwd.
       await this.learnDirCwds(
         new Set(pending.map(({ candidate }) => candidate.dirName)),
-        enumerated.filter((candidate) => !read.has(candidate)),
+        options.unread(read),
       );
       await settlePending();
     }
-    rows.sort(compareRows);
-    return { rows: rows.slice(0, query.limit), hasMore: rows.length > query.limit };
-  }
-
-  /** The `sessionId:mtime:size` of every transcript that a list of `cwd`
-   *  shows, archived or not, for the change hint: a transcript of another
-   *  path that shares a project directory does not count. The cwd of a
-   *  transcript is the one an earlier list learned; of one that grew since,
-   *  only the appended bytes are read, for a relocation. A transcript no
-   *  list read yet counts. */
-  async scopeFingerprint(cwd: string, includeWorktrees: boolean): Promise<string[]> {
-    const paths = await this.listedPaths(cwd, includeWorktrees);
-    const inScope = scopeOf(paths);
-    const parts = await Promise.all(
-      (await this.enumerate(paths)).map(async (candidate) => {
-        const rowCwd = await this.knownCwd(candidate);
-        if (rowCwd && !(await inScope(rowCwd))) return undefined;
-        return `${candidate.sessionId}:${candidate.mtimeMs}:${candidate.size}`;
-      }),
-    );
-    return parts.filter((part): part is string => part !== undefined).sort();
-  }
-
-  /** The cwd an earlier list learned of `candidate`, followed by a
-   *  relocation appended since; undefined when unknown. */
-  private async knownCwd(candidate: TranscriptCandidate): Promise<string | undefined> {
-    const cached = this.metadata.peek(candidate.filePath);
-    const learned = cached?.metadata?.fileCwd;
-    if (!cached || !learned || cached.ino !== candidate.ino || candidate.size < cached.size) {
-      return undefined;
-    }
-    if (candidate.size === cached.size) {
-      return cached.mtimeMs === candidate.mtimeMs ? learned : undefined;
-    }
-    if (candidate.size - cached.size > MAX_APPENDED_READ) return undefined;
-    const checked = this.relocationChecks.peek(candidate.filePath);
-    if (
-      checked?.fromSize === cached.size &&
-      checked.size === candidate.size &&
-      checked.mtimeMs === candidate.mtimeMs &&
-      checked.ino === candidate.ino
-    ) {
-      return checked.cwd ?? learned;
-    }
-    let relocated: string | undefined;
-    try {
-      relocated = await this.appendedReads.run(async () => {
-        const handle = await fs.open(candidate.filePath, "r");
-        try {
-          const bytes = Buffer.allocUnsafe(candidate.size - cached.size);
-          const { bytesRead } = await handle.read(bytes, 0, bytes.length, cached.size);
-          return relocatedCwd(bytes.subarray(0, bytesRead).toString("utf8"));
-        } finally {
-          await handle.close();
-        }
-      });
-    } catch {
-      return undefined;
-    }
-    // A relocation counts as a list reads it (see readMetadata): only to a
-    // cwd of this project directory.
-    const cwd = await this.recoverCwd(candidate.dirName, [relocated]);
-    this.relocationChecks.set(candidate.filePath, {
-      fromSize: cached.size,
-      size: candidate.size,
-      mtimeMs: candidate.mtimeMs,
-      ino: candidate.ino,
-      cwd,
-    });
-    return cwd ?? learned;
+    return rows.sort(compareRows);
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -760,6 +726,23 @@ export class SessionIndex {
       if (cached.metadata?.fileCwd) this.dirCwds.set(candidate.dirName, cached.metadata.fileCwd);
       return cached.metadata;
     }
+    const key = `${candidate.mtimeMs}:${candidate.size}:${candidate.ino}`;
+    const inFlight = this.reading.get(candidate.filePath);
+    if (inFlight?.key === key) return inFlight.promise;
+    const promise = this.readAndCache(candidate, cached);
+    this.reading.set(candidate.filePath, { key, promise });
+    void promise.finally(() => {
+      if (this.reading.get(candidate.filePath)?.promise === promise) {
+        this.reading.delete(candidate.filePath);
+      }
+    });
+    return promise;
+  }
+
+  private async readAndCache(
+    candidate: TranscriptCandidate,
+    cached: CacheEntry | undefined,
+  ): Promise<TranscriptMetadata | null> {
     let metadata: TranscriptMetadata | null;
     try {
       // The transcript grew since: an earlier scan may still know its last

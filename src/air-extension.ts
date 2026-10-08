@@ -13,8 +13,8 @@ export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
 /**
  * The session index: a bounded, ordered `session/list` with row metadata, and
- * `_session/rename`, `_session/archive`, `_session/unarchive` and
- * `_session/list_changed`. Advertised only to a client that declares it.
+ * `_session/rename`, `_session/archive`, `_session/unarchive` and the list
+ * subscription. Advertised only to a client that declares it.
  */
 export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
 /**
@@ -28,6 +28,12 @@ export const AIR_SESSION_ARCHIVE_CAPABILITY = "sessionArchive";
  * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
  */
 export const AIR_SESSION_RENAME_CAPABILITY = "sessionRename";
+/**
+ * The agent supports `_session/list/subscribe`, `_session/list/unsubscribe`
+ * and `_session/list/changes`. Advertised exactly when
+ * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
+ */
+export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";

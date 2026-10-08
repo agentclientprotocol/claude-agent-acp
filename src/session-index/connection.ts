@@ -22,6 +22,7 @@ import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
   AIR_SESSION_ARCHIVE_CAPABILITY,
   AIR_SESSION_INDEX_CAPABILITY,
+  AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
   AIR_SESSION_RENAME_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
@@ -29,12 +30,21 @@ import {
 import type { OwnSessionState } from "./activity.js";
 import { readArchivedSessionIds } from "./archive-markers.js";
 import { isArchivedTitle, storedTitle, visibleTitle } from "./archive-title.js";
+import {
+  LIST_CHANGES_METHOD,
+  LIST_SUBSCRIBE_METHOD,
+  LIST_UNSUBSCRIBE_METHOD,
+  parseListSubscribeRequest,
+  parseListUnsubscribeRequest,
+  type ListSubscribeRequest,
+  type ListSubscribeResponse,
+  type ListUnsubscribeRequest,
+} from "./list-subscriptions.js";
 import { isSessionId } from "./project-dirs.js";
 import {
   archiveInsteadOfDelete,
   archiveTo,
   renameTo,
-  LIST_CHANGED_METHOD,
   parseRenameSessionRequest,
   parseSessionIdRequest,
   SESSION_ARCHIVE_METHOD,
@@ -115,8 +125,9 @@ export class SessionIndexConnection {
       clientSupportsAirCapability(request.clientCapabilities, AIR_SESSION_INDEX_CAPABILITY)
     ) {
       this.service = new SessionIndexService({
-        notifyListChanged: (params) =>
-          this.host.agent.client.extNotification(LIST_CHANGED_METHOD, params),
+        ownSessionState: (sessionId) => this.ownSessionState(sessionId),
+        notifyListChanges: (changes) =>
+          this.host.agent.client.extNotification(LIST_CHANGES_METHOD, changes),
         logError: (message, error) =>
           this.host.agent.logger.error(`[session-index] ${message}:`, error),
       });
@@ -131,14 +142,15 @@ export class SessionIndexConnection {
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
-   *  itself, archive and rename, all only to a client that declared
-   *  `sessionIndex`. */
+   *  itself, archive, rename and the list subscription, all only to a client
+   *  that declared `sessionIndex`. */
   capabilities(): string[] {
     return this.service
       ? [
           AIR_SESSION_INDEX_CAPABILITY,
           AIR_SESSION_ARCHIVE_CAPABILITY,
           AIR_SESSION_RENAME_CAPABILITY,
+          AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
         ]
       : [];
   }
@@ -149,6 +161,25 @@ export class SessionIndexConnection {
 
   onTeardown(sessionId: string): void {
     this.closedCliSessions.set(sessionId.toLowerCase(), Date.now());
+    // Its row now shows what the registry and the transcript tell.
+    this.service?.ownSessionChanged(sessionId);
+  }
+
+  /** A session this connection runs changed its state, turn end or cost:
+   *  the list subscriptions send it at once. */
+  onOwnSessionChanged(sessionId: string): void {
+    this.service?.ownSessionChanged(sessionId);
+  }
+
+  /** `_session/list/subscribe`. */
+  subscribeList(params: ListSubscribeRequest): Promise<ListSubscribeResponse> {
+    return this.requireService(LIST_SUBSCRIBE_METHOD).subscribeList(params.cwd);
+  }
+
+  /** `_session/list/unsubscribe`. Idempotent. */
+  unsubscribeList(params: ListUnsubscribeRequest): EmptyResponse {
+    this.requireService(LIST_UNSUBSCRIBE_METHOD).unsubscribeList(params.subscriptionId);
+    return {};
   }
 
   /** `session/list` of a `sessionIndex` client; undefined for another one. */
@@ -325,7 +356,6 @@ export class SessionIndexConnection {
 
   private airArchiver(): SessionIndexService {
     this.archiver ??= new SessionIndexService({
-      notifyListChanged: async () => {},
       logError: (message, error) =>
         this.host.agent.logger.error(`[session-index] ${message}:`, error),
     });
@@ -403,14 +433,27 @@ export class SessionIndexConnection {
 
 /** The agent methods behind the session index extension methods. */
 type SessionIndexMethods = {
+  subscribeSessionList(params: ListSubscribeRequest): Promise<ListSubscribeResponse>;
+  unsubscribeSessionList(params: ListUnsubscribeRequest): Promise<EmptyResponse>;
   renameSessionTitle(params: RenameSessionRequest): Promise<EmptyResponse>;
   archiveSession(params: SessionIdRequest): Promise<EmptyResponse>;
   unarchiveSession(params: SessionIdRequest): Promise<EmptyResponse>;
 };
 
-/** Routes `_session/rename`, `_session/archive` and `_session/unarchive`. */
+/** Routes `_session/list/subscribe`, `_session/list/unsubscribe`,
+ *  `_session/rename`, `_session/archive` and `_session/unarchive`. */
 export function onSessionIndexRequests(app: AgentApp, agent: () => SessionIndexMethods): AgentApp {
   return app
+    .onRequest<ListSubscribeRequest, ListSubscribeResponse>(
+      LIST_SUBSCRIBE_METHOD,
+      { parse: parseListSubscribeRequest },
+      (ctx) => agent().subscribeSessionList(ctx.params),
+    )
+    .onRequest<ListUnsubscribeRequest, EmptyResponse>(
+      LIST_UNSUBSCRIBE_METHOD,
+      { parse: parseListUnsubscribeRequest },
+      (ctx) => agent().unsubscribeSessionList(ctx.params),
+    )
     .onRequest<RenameSessionRequest, EmptyResponse>(
       SESSION_RENAME_METHOD,
       { parse: parseRenameSessionRequest },

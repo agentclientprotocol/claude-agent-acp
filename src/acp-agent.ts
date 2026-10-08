@@ -133,6 +133,10 @@ import {
 } from "./air-extension.js";
 import * as sessionIndex from "./session-index/connection.js";
 import type { RenameSessionRequest, SessionIdRequest } from "./session-index/service.js";
+import type {
+  ListSubscribeRequest,
+  ListUnsubscribeRequest,
+} from "./session-index/list-subscriptions.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -2945,7 +2949,14 @@ export class ClaudeAcpAgent {
     return this.sessionIndex.clientTitle(title);
   }
 
-  /** `_session/rename`, `_session/archive`, `_session/unarchive`. */
+  /** `_session/list/subscribe`, `_session/list/unsubscribe`, `_session/rename`,
+   *  `_session/archive`, `_session/unarchive`. */
+  async subscribeSessionList(params: ListSubscribeRequest) {
+    return this.sessionIndex.subscribeList(params);
+  }
+  async unsubscribeSessionList(params: ListUnsubscribeRequest) {
+    return this.sessionIndex.unsubscribeList(params);
+  }
   renameSessionTitle(params: RenameSessionRequest) {
     return this.sessionIndex.rename(params);
   }
@@ -5273,6 +5284,7 @@ export class ClaudeAcpAgent {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
                 sessionIndex.noteSessionState(session, previousState, message.state);
+                this.sessionIndex.onOwnSessionChanged(params.sessionId);
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -6141,6 +6153,7 @@ export class ClaudeAcpAgent {
               }
 
               session.lastTotalCostUsd = message.total_cost_usd;
+              this.sessionIndex.onOwnSessionChanged(params.sessionId);
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
                 await sendUpdate({
@@ -7680,6 +7693,10 @@ export class ClaudeAcpAgent {
       return;
     }
     session.queryClosed = true;
+    // Its list row now shows what the registry and the transcript tell.
+    for (const [sessionId, candidate] of Object.entries(this.sessions)) {
+      if (candidate === session) this.sessionIndex.onOwnSessionChanged(sessionId);
+    }
     session.consumer = undefined;
     session.contextCompaction = undefined;
     session.settingsManager.dispose();
