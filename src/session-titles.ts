@@ -11,11 +11,18 @@
  * `acp-agent.ts` drives it from four places: {@link SessionTitles.onPrompt} and
  * {@link SessionTitles.onAssistantText} to collect text,
  * {@link SessionTitles.onTurnEnd} at `session_state_changed: idle`, and
- * {@link SessionTitles.reset} on `conversation_reset`.
+ * {@link SessionTitles.reset} on `conversation_reset`. The model retitles the
+ * session through {@link SessionTitles.rename}, which the `rename` tool of
+ * `session-tools.ts` calls.
  */
 
 import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
-import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getSessionInfo,
+  renameSession,
+  type Query,
+  type SDKSessionInfo,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
 
 const MAX_TITLE_LENGTH = 256;
@@ -28,14 +35,18 @@ const MAX_TITLE_CONTEXT_LENGTH = 1000;
  *  nothing to gain by asking yet. */
 const MIN_TITLE_CONTEXT_LENGTH = 10;
 
-/** `generateSessionTitle` is present on the SDK's runtime `Query` class but is
- *  not declared in `sdk.d.ts` (0.3.220), so it is reached through this optional
- *  shape rather than the published interface. */
+/** `generateSessionTitle` and `renameSession` are present on the SDK's runtime
+ *  `Query` class but are not declared in `sdk.d.ts` (0.3.287), so they are
+ *  reached through this optional shape rather than the published interface.
+ *  `renameSession` sends the `rename_session` control request: the live CLI
+ *  takes the title into its own state as a user rename, and refuses it when
+ *  `sessionId` is no longer the conversation it is running. */
 type TitleCapableQuery = Query & {
   generateSessionTitle?: (
     description: string,
     options?: { persist?: boolean },
   ) => Promise<string | null>;
+  renameSession?: (title: string, sessionId?: string) => Promise<void>;
 };
 
 /** A title already stored for the session, published when generation is
@@ -83,6 +94,12 @@ export class SessionTitles {
    *  the same field as a user `/rename`, so re-titling could silently overwrite
    *  one. Released by {@link reset}, and when generation yields nothing. */
   private settled = false;
+
+  /** Every title generation in flight. {@link rename} waits them out, so a
+   *  generated title persisted late never lands on top of a chosen one. More
+   *  than one can be in flight: {@link reset} releases the latch without ending
+   *  the generation it started. */
+  private generation?: Promise<void>;
 
   constructor(
     private readonly agent: ClaudeAcpAgent,
@@ -147,9 +164,10 @@ export class SessionTitles {
     if (this.canRequest(session)) {
       this.settled = true;
 
-      void this.requestGenerateTitle(session, fallback).catch((error) => {
+      const generation = this.requestGenerateTitle(session, fallback).catch((error) => {
         this.agent.logger.error(`Session ${this.sessionId}: session title update failed: ${error}`);
       });
+      this.generation = Promise.all([this.generation, generation]).then(() => {});
 
       return;
     }
@@ -159,6 +177,50 @@ export class SessionTitles {
     if (fallback && !this.settled) {
       await this.publish(fallback.title, fallback.lastModified);
     }
+  }
+
+  /** Retitle the session with a title the model chose, store it, and publish it
+   *  at once rather than at turn-end. The stored title is a user rename to the
+   *  CLI, so turn-end adopts it and nothing generates over it. Resolves to the
+   *  title as stored; rejects when the title is blank or cannot be stored. */
+  async rename(session: Session, rawTitle: string): Promise<string> {
+    const title = sanitizeTitle(rawTitle);
+    if (!title) {
+      throw new Error("The title is empty");
+    }
+    await this.generation;
+    // Latched while the title is stored, so no generation starts meanwhile, and
+    // released again if it is not: the session is no more titled than before.
+    const settled = this.settled;
+    this.settled = true;
+    try {
+      await this.store(session, title);
+    } catch (error) {
+      this.settled = settled;
+      throw error;
+    }
+    this.context = undefined;
+    await this.publish(title, Date.now());
+    return title;
+  }
+
+  /** Store a title in the session file. The live CLI is asked first, so its own
+   *  state holds the title too; when there is none, or it has moved on to another
+   *  conversation (a `/clear`), the title is appended to this session's file
+   *  directly — the file `session/list` and `session/load` read under this id. */
+  private async store(session: Session, title: string): Promise<void> {
+    const query = session.query as TitleCapableQuery;
+    if (!session.queryClosed && typeof query.renameSession === "function") {
+      try {
+        await query.renameSession(title, this.sessionId);
+        return;
+      } catch (error) {
+        this.agent.logger.log(
+          `Session ${this.sessionId}: the CLI did not take the title, writing it to the session file: ${error}`,
+        );
+      }
+    }
+    await renameSession(this.sessionId, title, { dir: session.cwd });
   }
 
   /** Read the SDK's stored info for this session. A missing session file or read

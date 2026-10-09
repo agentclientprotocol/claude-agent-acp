@@ -119,6 +119,17 @@ export class SkillReporter implements ToolReporter {
   }
 }
 
+/** The adapter's own `rename` tool. Its result text is the result to show. */
+export class RenameSessionReporter implements ToolReporter {
+  toolUse(input: unknown): ToolUseFacts {
+    const title = (input as { title?: unknown } | undefined)?.title;
+    return {
+      title: typeof title === "string" && title ? `Rename session: ${title}` : "Rename session",
+      kind: "other",
+    };
+  }
+}
+
 /**
  * TodoWrite and the Task* tools. The stream reports them as a plan. Only a
  * permission request surfaces them as a tool call.

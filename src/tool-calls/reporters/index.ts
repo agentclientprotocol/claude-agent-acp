@@ -8,9 +8,11 @@ import {
   ExitPlanModeReporter,
   GenericReporter,
   PlanToolReporter,
+  RenameSessionReporter,
   ReportFindingsReporter,
   SkillReporter,
 } from "./interaction.js";
+import { RENAME_SESSION_WIRE_TOOL_NAME } from "../../session-tools.js";
 import { ReadReporter } from "./read.js";
 import { GlobReporter, GrepReporter } from "./search.js";
 import { WebFetchReporter, WebSearchReporter } from "./web.js";
@@ -38,6 +40,7 @@ const reporters: Record<string, ToolReporter> = {
   ExitPlanMode: new ExitPlanModeReporter(),
   AskUserQuestion: new AskUserQuestionReporter(),
   Skill: new SkillReporter(),
+  [RENAME_SESSION_WIRE_TOOL_NAME]: new RenameSessionReporter(),
 };
 
 /** The tools that control a subagent or a background task. */
@@ -46,7 +49,8 @@ for (const name of AGENT_CONTROL_TOOLS) {
   reporters[name] = new AgentControlReporter(name);
 }
 
-/** The reporter of a tool. MCP tools and unknown tools get the generic reporter. */
+/** The reporter of a tool. MCP tools other than the adapter's own, and unknown
+ *  tools, get the generic reporter. */
 export function reporterFor(toolName: string): ToolReporter {
   return Object.hasOwn(reporters, toolName) ? reporters[toolName] : new GenericReporter(toolName);
 }

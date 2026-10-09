@@ -102,6 +102,11 @@ import {
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
+  createSessionToolsServer,
+  RENAME_SESSION_WIRE_TOOL_NAME,
+  SESSION_TOOLS_SERVER_NAME,
+} from "./session-tools.js";
+import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   AcpSessionNotification,
   asSdkSessionNotification,
@@ -1530,7 +1535,9 @@ export type NewSessionMeta = {
      *   - executable
      * Those parameters will be used and updated to work with ACP:
      *   - hooks (merged with ACP's hooks)
-     *   - mcpServers (merged with ACP's mcpServers)
+     *   - mcpServers (merged with ACP's mcpServers and the adapter's own
+     *     `acp_session` server)
+     *   - allowedTools (merged with the adapter's own tools)
      *   - disallowedTools (merged with ACP's disallowedTools)
      *   - tools (passed through; defaults to claude_code preset if not provided)
      *   - allowDangerouslySkipPermissions (set to `false` to remove bypassPermissions
@@ -9604,7 +9611,18 @@ export class ClaudeAcpAgent {
       mcpServers: {
         ...(userProvidedOptions?.mcpServers || {}),
         ...mcpServers,
+        [SESSION_TOOLS_SERVER_NAME]: createSessionToolsServer({
+          rename: async (title) => {
+            const session = this.sessions[sessionId];
+            if (!session) {
+              throw new Error("Session not found");
+            }
+            return session.titles.rename(session, title);
+          },
+        }),
       },
+      // A title is only the session's own label, so retitling never asks.
+      allowedTools: [...(userProvidedOptions?.allowedTools || []), RENAME_SESSION_WIRE_TOOL_NAME],
       allowDangerouslySkipPermissions: allowBypass,
       permissionMode: initialPermissionMode,
       canUseTool: this.canUseTool(sessionId),

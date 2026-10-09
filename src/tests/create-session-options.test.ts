@@ -8,6 +8,11 @@ import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
+import {
+  RENAME_SESSION_WIRE_TOOL_NAME,
+  SESSION_TOOLS_SERVER_NAME,
+  type SessionToolsHost,
+} from "../session-tools.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -72,6 +77,19 @@ function initializationResponse() {
     ],
   };
 }
+
+/** The host the latest session's tools server was built with. */
+let sessionToolsHost: SessionToolsHost | undefined;
+vi.mock("../session-tools.js", async () => {
+  const actual = await vi.importActual<typeof import("../session-tools.js")>("../session-tools.js");
+  return {
+    ...actual,
+    createSessionToolsServer: (host: SessionToolsHost) => {
+      sessionToolsHost = host;
+      return actual.createSessionToolsServer(host);
+    },
+  };
+});
 
 vi.mock("../tools.js", async () => {
   const actual = await vi.importActual<typeof import("../tools.js")>("../tools.js");
@@ -191,6 +209,42 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.disallowedTools).toContain("WebFetch");
     // ACP's internal disallowed tool should also be present
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
+  });
+
+  describe("session tools", () => {
+    it("adds the adapter's own server and allows its rename tool", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          claudeCode: {
+            options: {
+              allowedTools: ["Read"],
+              mcpServers: { "user-server": { type: "stdio", command: "user" } },
+            },
+          },
+        },
+      });
+
+      expect(capturedOptions!.mcpServers).toHaveProperty("user-server");
+      expect(capturedOptions!.mcpServers![SESSION_TOOLS_SERVER_NAME]).toMatchObject({
+        type: "sdk",
+        name: SESSION_TOOLS_SERVER_NAME,
+      });
+      expect(capturedOptions!.allowedTools).toEqual(["Read", RENAME_SESSION_WIRE_TOOL_NAME]);
+    });
+
+    it("renames the session the server was built for", async () => {
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      const session = agent.sessions[sessionId]!;
+      const rename = vi.spyOn(session.titles, "rename").mockResolvedValue("Stored title");
+
+      await expect(sessionToolsHost!.rename("Chosen title")).resolves.toBe("Stored title");
+      expect(rename).toHaveBeenCalledWith(session, "Chosen title");
+
+      delete agent.sessions[sessionId];
+      await expect(sessionToolsHost!.rename("Too late")).rejects.toThrow("Session not found");
+    });
   });
 
   it("works when user provides no disallowedTools", async () => {
