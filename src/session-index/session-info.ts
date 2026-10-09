@@ -29,7 +29,7 @@ export function sessionInfoOf(
     transcriptMtimeMs: row.mtimeMs,
     now,
   });
-  const cost = selectCost(own, row.facts);
+  const cost = selectCost(own);
   const { facts } = row;
   // The row fields of the session list extensions RFD and RFD #2161, flat;
   // each is omitted when unknown, except `archived`.

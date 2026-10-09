@@ -28,7 +28,6 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 import type { OwnSessionState } from "./activity.js";
-import { readArchivedSessionIds } from "./archive-markers.js";
 import { isArchivedTitle, storedTitle, visibleTitle } from "./archive-title.js";
 import {
   LIST_CHANGES_METHOD,
@@ -40,7 +39,6 @@ import {
   type ListSubscribeResponse,
   type ListUnsubscribeRequest,
 } from "./list-subscriptions.js";
-import { isSessionId } from "./project-dirs.js";
 import {
   archiveInsteadOfDelete,
   archiveTo,
@@ -56,9 +54,6 @@ import {
   type SessionIdRequest,
   type TitleChange,
 } from "./service.js";
-
-/** How long a closed CLI may still be exiting (the SDK kills it after 7 s). */
-const CLOSED_CLI_MEMORY_MS = 30_000;
 
 /** What the session index keeps on each `Session`. */
 export type SessionIndexFields = {
@@ -111,11 +106,7 @@ export class SessionIndexConnection {
   /** The archive behind `session/delete` of an AIR client without
    *  `sessionIndex`: the same writes, without a list or a watcher. */
   private archiver?: SessionIndexService;
-  /** When this connection last closed the CLI of a session, by lower-case
-   *  id: the session index takes a lone registry holder whose parent it
-   *  cannot tell for that CLI while it exits. */
-  readonly closedCliSessions = new Map<string, number>();
-  /** When the query of a session failed here, by lower-case id. */
+  /** When the query of a session failed here, by session id. */
   private readonly failedQueries = new Map<string, number>();
 
   constructor(private readonly host: SessionIndexHost) {}
@@ -168,7 +159,7 @@ export class SessionIndexConnection {
   /** The query of a session that ran here failed (not a cancel): its row
    *  shows `error` until its transcript changes. */
   onQueryFailed(sessionId: string): void {
-    this.failedQueries.set(sessionId.toLowerCase(), Date.now());
+    this.failedQueries.set(sessionId, Date.now());
     if (this.failedQueries.size > 1024) {
       this.failedQueries.delete(this.failedQueries.keys().next().value as string);
     }
@@ -178,11 +169,10 @@ export class SessionIndexConnection {
   /** A turn of a session started here: an earlier failed query of it no
    *  longer counts. */
   onTurnStarted(sessionId: string): void {
-    this.failedQueries.delete(sessionId.toLowerCase());
+    this.failedQueries.delete(sessionId);
   }
 
   onTeardown(sessionId: string): void {
-    this.closedCliSessions.set(sessionId.toLowerCase(), Date.now());
     // Its row now shows what the registry and the transcript tell.
     this.service?.ownSessionChanged(sessionId);
   }
@@ -210,24 +200,18 @@ export class SessionIndexConnection {
   }
 
   /** An AIR client archives with session/delete (see {@link deleteSession}):
-   *  its archived sessions (an archived custom title, or an archive marker)
-   *  stay hidden from the old list, as when the delete removed them. */
-  async hideArchived<T extends { sessionId: string; customTitle?: string }>(
-    sessions: T[],
-  ): Promise<T[]> {
+   *  its archived sessions (an archived custom title) stay hidden from the
+   *  old list, as when the delete removed them. */
+  hideArchived<T extends { customTitle?: string }>(sessions: T[]): T[] {
     if (!this.host.isAirClient()) return sessions;
-    const marked = await readArchivedSessionIds();
-    return sessions.filter(
-      (session) =>
-        !isArchivedTitle(session.customTitle) && !marked.has(session.sessionId.toLowerCase()),
-    );
+    return sessions.filter((session) => !isArchivedTitle(session.customTitle));
   }
 
   /** `_session/rename`: names a session; no generated title replaces it.
    *  An archived session stays archived. */
   async rename(request: RenameSessionRequest): Promise<EmptyResponse> {
     const index = this.requireService(SESSION_RENAME_METHOD);
-    const sessionId = this.indexSessionId(request.sessionId);
+    const { sessionId } = request;
     // As the CLI keeps it, and never with the archive prefix: a rename does
     // not change the archive state.
     const title = storedTitle(request.title, false, sessionId);
@@ -257,11 +241,10 @@ export class SessionIndexConnection {
     params: SessionIdRequest,
     archived: boolean,
   ): Promise<EmptyResponse> {
-    const sessionId = this.indexSessionId(params.sessionId);
+    const { sessionId } = params;
     await this.retitle(index, sessionId, archiveTo(archived), undefined, {
       mayBeUnwritten: this.isUnwrittenSession(sessionId),
       sidecar: "existing",
-      dropMarker: true,
     });
     await this.reportArchived(sessionId, archived);
     return {};
@@ -278,7 +261,7 @@ export class SessionIndexConnection {
     sessionId: string,
     change: TitleChange,
     publish: Parameters<Session["titles"]["setExplicitTitle"]>[0],
-    options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar" | "dropMarker">,
+    options: Pick<RetitleOptions, "mayBeUnwritten" | "sidecar">,
   ): Promise<void> {
     const session = this.host.agent.sessions[sessionId];
     // Decided once a title generation in flight has ended: the query may
@@ -287,8 +270,7 @@ export class SessionIndexConnection {
       const query = session?.query as
         | (Query & { renameSession?: (title: string, sessionId?: string) => Promise<void> })
         | undefined;
-      // A closed session's CLI is gone here, and another process may have
-      // resumed the session since: only a running query is ours.
+      // A closed session's CLI is gone here: only a running query titles it.
       const running = session !== undefined && !session.queryClosed;
       if (running && typeof query?.renameSession !== "function") {
         // Its CLI holds the title and would write it back over ours.
@@ -311,7 +293,6 @@ export class SessionIndexConnection {
         // Without its CLI, a session needs its transcript.
         mayBeUnwritten: live !== undefined && options.mayBeUnwritten,
         live,
-        ownCli: this.ownCliState(sessionId),
       });
     };
     if (session) {
@@ -323,44 +304,24 @@ export class SessionIndexConnection {
 
   /**
    * `session/delete`:
-   * - A `sessionIndex` client deletes for real: every transcript and the
-   *   archive marker. A session that another live process holds is refused.
+   * - A `sessionIndex` client deletes for real: every transcript, whoever
+   *   else has the session open, as the CLI does.
    * - Another AIR client uses delete to mark a session done, and may reopen
    *   it later: the adapter archives it instead (as `_session/archive` does,
    *   after the CLI closed), so the transcript survives.
    * - Every other client: the SDK delete, as before.
    */
-  async deleteSession(request: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    // A sessionIndex client's id matches in any case; every other client's
-    // exactly, as before.
-    const params = this.service
-      ? { ...request, sessionId: this.indexSessionId(request.sessionId) }
-      : request;
-    const session = this.host.agent.sessions[params.sessionId];
-    const loaded = session !== undefined;
-    const running = session !== undefined && !session.queryClosed;
-    // The holder check waits for the CLIs this process started to exit (they
-    // stay registered, and may write, while they do) and refuses a session
-    // that another process holds. A session that runs here is checked once
-    // its CLI is closed: another process may have resumed it meanwhile.
-    // An AIR client without sessionIndex archives instead (see below): the
-    // same holder rules, before the session is torn down.
-    const index = this.service ?? (this.host.isAirClient() ? this.airArchiver() : undefined);
-    if (index && !running) {
-      await index.assertNotHeldElsewhere(params.sessionId, this.ownCliState(params.sessionId));
-    }
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    const loaded = this.host.agent.sessions[params.sessionId] !== undefined;
     // Tear down any active in-memory state first so the on-disk file isn't
     // recreated by an outstanding query writing to it.
     if (loaded) {
       await this.host.teardownSession(params.sessionId);
     }
     if (this.service) {
-      if (running) await this.service.assertNotHeldElsewhere(params.sessionId, "exiting");
       await this.service.delete(params.sessionId, loaded);
-    } else if (index) {
-      await archiveInsteadOfDelete(params.sessionId, index, {
-        ownCli: this.ownCliState(params.sessionId),
-      });
+    } else if (this.host.isAirClient()) {
+      await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
     } else {
       await sdkDeleteSession(params.sessionId);
     }
@@ -384,7 +345,7 @@ export class SessionIndexConnection {
   private ownSessionState(sessionId: string): OwnSessionState | undefined {
     const session = this.host.agent.sessions[sessionId];
     if (!session || session.queryClosed) {
-      const failedAt = this.failedQueries.get(sessionId.toLowerCase());
+      const failedAt = this.failedQueries.get(sessionId);
       return failedAt === undefined ? undefined : { queryFailedAt: failedAt };
     }
     return {
@@ -392,34 +353,9 @@ export class SessionIndexConnection {
       lastTurnEndedAt: session.lastTurnEndedAt,
       // A session loaded again after its query failed here shows the failure
       // until a turn of it starts.
-      lastTurnFailed: session.lastTurnFailed || this.failedQueries.has(sessionId.toLowerCase()),
+      lastTurnFailed: session.lastTurnFailed || this.failedQueries.has(sessionId),
       costUsd: session.lastTotalCostUsd,
     };
-  }
-
-  /**
-   * The id under which the session index handles a session: a UUID is
-   * matched in any case, so the id this connection runs the session under
-   * (normally lower case, like the CLI's transcripts), else the lower-case
-   * UUID. Used by the `sessionIndex` paths only.
-   */
-  private indexSessionId(sessionId: string): string {
-    const sessions = this.host.agent.sessions;
-    if (!isSessionId(sessionId) || sessions[sessionId]) return sessionId;
-    const lower = sessionId.toLowerCase();
-    return Object.keys(sessions).find((key) => key.toLowerCase() === lower) ?? lower;
-  }
-
-  /** Whether this connection runs a CLI for the session (`running`), or
-   *  closed one that may still be exiting (`exiting`). */
-  private ownCliState(sessionId: string): "running" | "exiting" | undefined {
-    const session = this.host.agent.sessions[sessionId];
-    if (session && !session.queryClosed) return "running";
-    if (session) return "exiting";
-    const closedAt = this.closedCliSessions.get(sessionId.toLowerCase());
-    if (closedAt !== undefined && Date.now() - closedAt < CLOSED_CLI_MEMORY_MS) return "exiting";
-    this.closedCliSessions.delete(sessionId.toLowerCase());
-    return undefined;
   }
 
   /** A new session this connection runs that may have no transcript yet: it

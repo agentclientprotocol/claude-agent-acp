@@ -25,12 +25,10 @@ import {
 } from "../session-index/archive-title.js";
 import {
   continuedInSessionId,
-  effectiveTranscriptTitle,
-  lastAgentName,
   readHeadTail,
   scanTranscript,
   scanTranscriptFile,
-  transcriptTitle,
+  sdkTitles,
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
@@ -39,7 +37,7 @@ import { SessionIndex } from "../session-index/session-index.js";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
 const lines = (...entries: object[]) => entries.map((entry) => JSON.stringify(entry)).join("\n");
-const scan = (text: string) => scanTranscript({ head: text, tail: text }, SESSION);
+const scan = (text: string) => scanTranscript({ head: text, tail: text });
 
 const user = (text: string, timestamp: string, extra: object = {}) => ({
   type: "user",
@@ -144,25 +142,22 @@ describe("transcript scan", () => {
     expect(facts.turnState).toBe("finished");
   });
 
-  it("takes the last valid cost-state of this session only", () => {
+  it("reads no cost from a transcript", () => {
     const facts = scan(
-      lines(
-        { type: "cost-state", sessionId: SESSION, totalCostUSD: 1.5 },
-        { type: "cost-state", sessionId: SESSION, totalCostUSD: "bad" },
-        { type: "cost-state", sessionId: "other", totalCostUSD: 9 },
-      ),
+      lines(user("hello", "2026-01-01T00:00:01.000Z"), {
+        type: "cost-state",
+        sessionId: SESSION,
+        totalCostUSD: 1.5,
+      }),
     );
-    expect(facts.costUsd).toBe(1.5);
+    expect(facts).not.toHaveProperty("costUsd");
   });
 
   it("reports the head cwd and the last tail cwd, and a stub without messages", () => {
-    const facts = scanTranscript(
-      {
-        head: lines({ type: "queue-operation" }, { type: "attachment", cwd: "/repo" }),
-        tail: lines({ type: "attachment", cwd: "/repo/sub" }, { type: "last-prompt" }),
-      },
-      SESSION,
-    );
+    const facts = scanTranscript({
+      head: lines({ type: "queue-operation" }, { type: "attachment", cwd: "/repo" }),
+      tail: lines({ type: "attachment", cwd: "/repo/sub" }, { type: "last-prompt" }),
+    });
     expect(facts.headCwd).toBe("/repo");
     expect(facts.tailCwd).toBe("/repo/sub");
     expect(facts.hasMessages).toBe(false);
@@ -205,7 +200,7 @@ describe("transcript scan", () => {
           },
         ) + "\n";
       await fs.writeFile(file, text);
-      const facts = await scanTranscriptFile(file, Buffer.byteLength(text), SESSION);
+      const facts = await scanTranscriptFile(file, Buffer.byteLength(text));
       expect(facts.model).toBe("claude-model-x");
       expect(facts.tailCwd).toBe("/repo");
     } finally {
@@ -385,11 +380,13 @@ describe("activity", () => {
 });
 
 describe("cost", () => {
-  it("prefers the live result, else the transcript, and only a positive amount", () => {
-    expect(selectCost({ costUsd: 2 }, { hasMessages: true, costUsd: 1 })).toBe(2);
-    expect(selectCost({ costUsd: 0 }, { hasMessages: true, costUsd: 1 })).toBe(1);
-    expect(selectCost(undefined, { hasMessages: true, costUsd: 0 })).toBeUndefined();
-    expect(selectCost(undefined, { hasMessages: true })).toBeUndefined();
+  it("is the SDK's amount of a session that runs here, and only a positive one", () => {
+    expect(selectCost({ costUsd: 2 })).toBe(2);
+    expect(selectCost({ costUsd: 0 })).toBeUndefined();
+    expect(selectCost({ costUsd: Number.NaN })).toBeUndefined();
+    // No SDK result yet, or a session that does not run here: no cost.
+    expect(selectCost({ state: "idle" })).toBeUndefined();
+    expect(selectCost(undefined)).toBeUndefined();
   });
 });
 
@@ -531,12 +528,10 @@ describe("live registry", () => {
           [14, "Tue Jan 2 00:00:00 2024"],
         ]),
       pidDomain: async () => "darwin",
-      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1])),
     });
     const snapshot = await registry.snapshot();
     expect([...snapshot.keys()].sort()).toEqual(["live", "old-but-proven"]);
-    expect((await registry.holder("live"))?.pid).toBe(10);
-    expect(await registry.holder("dead")).toBeUndefined();
+    expect(snapshot.get("live")?.pid).toBe(10);
     await fs.rm(dir, { recursive: true, force: true });
   });
 
@@ -574,135 +569,6 @@ describe("live registry", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("reports another process before it waits for a CLI child of this one", async () => {
-    const dir = await registryWith({
-      "21.json": { pid: 21, sessionId: "both", updatedAt: now },
-      "22.json": { pid: 22, sessionId: "both", updatedAt: now },
-    });
-    const registry = new LiveSessionRegistry({
-      dir: () => dir,
-      now: () => now,
-      isAlive: () => true,
-      pidDomain: async () => "darwin",
-      ownPid: 1000,
-      parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 22 ? 1 : 1000])),
-      ownChildExitTimeoutMs: 60_000,
-    });
-    // Our exiting child and another process: the other one holds it, at once.
-    expect((await registry.holder("both"))?.pid).toBe(22);
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  it("waits for a CLI child of this process to exit, and reports one that does not", async () => {
-    const dir = await registryWith({
-      "30.json": { pid: 30, sessionId: "exiting", updatedAt: now },
-      "31.json": { pid: 31, sessionId: "stuck", updatedAt: now },
-    });
-    let exited = false;
-    const registry = new LiveSessionRegistry({
-      dir: () => dir,
-      now: () => now,
-      isAlive: (pid) => pid !== 30 || !exited,
-      pidDomain: async () => "darwin",
-      ownPid: 1000,
-      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1000])),
-      ownChildExitTimeoutMs: 250,
-    });
-    setTimeout(() => (exited = true), 100);
-    expect(await registry.holder("exiting")).toBeUndefined();
-
-    const started = Date.now();
-    expect((await registry.holder("stuck"))?.pid).toBe(31);
-    expect(Date.now() - started).toBeGreaterThanOrEqual(240);
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  describe("a holder whose parent is unknown", () => {
-    const unknownParents = async (records: Record<string, object>, timeoutMs = 150) => {
-      const dir = await registryWith(records);
-      return {
-        dir,
-        registry: new LiveSessionRegistry({
-          dir: () => dir,
-          now: () => now,
-          isAlive: () => true,
-          pidDomain: async () => "win32:host",
-          parentPids: async () => new Map(),
-          ownChildExitTimeoutMs: timeoutMs,
-        }),
-      };
-    };
-
-    it("is another process when this one ran no CLI for the session", async () => {
-      const { dir, registry } = await unknownParents(
-        { "40.json": { pid: 40, sessionId: "s", updatedAt: now } },
-        60_000,
-      );
-      expect((await registry.holder("s"))?.pid).toBe(40);
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-
-    it("is taken for the CLI of this process when it is the only one", async () => {
-      const { dir, registry } = await unknownParents({
-        "41.json": { pid: 41, sessionId: "s", updatedAt: now },
-      });
-      expect(await registry.holder("s", { ownCli: "running" })).toBeUndefined();
-      // An exiting one is waited for, and reported if it stays.
-      const started = Date.now();
-      expect((await registry.holder("s", { ownCli: "exiting" }))?.pid).toBe(41);
-      expect(Date.now() - started).toBeGreaterThanOrEqual(140);
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-
-    it("is another process when two hold the session", async () => {
-      const { dir, registry } = await unknownParents(
-        {
-          "42.json": { pid: 42, sessionId: "s", updatedAt: now },
-          "43.json": { pid: 43, sessionId: "s", updatedAt: now },
-        },
-        60_000,
-      );
-      expect(await registry.holder("s", { ownCli: "running" })).toBeDefined();
-      expect(await registry.holder("s", { ownCli: "exiting" })).toBeDefined();
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-  });
-
-  it("matches a session id in any case", async () => {
-    const id = "abcdef01-2345-4678-89ab-cdef01234567";
-    const dir = await registryWith({ "50.json": { pid: 50, sessionId: id, updatedAt: now } });
-    const registry = new LiveSessionRegistry({
-      dir: () => dir,
-      now: () => now,
-      isAlive: () => true,
-      pidDomain: async () => "darwin",
-      ownPid: 1000,
-      parentPids: async (pids) => new Map(pids.map((pid) => [pid, 1])),
-    });
-    expect((await registry.holder(id.toUpperCase()))?.pid).toBe(50);
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  it("does not count or wait for the CLI child that runs the session", async () => {
-    const dir = await registryWith({
-      "60.json": { pid: 60, sessionId: "running", updatedAt: now },
-      "61.json": { pid: 61, sessionId: "resumed", updatedAt: now },
-      "62.json": { pid: 62, sessionId: "resumed", updatedAt: now },
-    });
-    const registry = new LiveSessionRegistry({
-      dir: () => dir,
-      now: () => now,
-      isAlive: () => true,
-      pidDomain: async () => "darwin",
-      ownPid: 1000,
-      parentPids: async (pids) => new Map(pids.map((pid) => [pid, pid === 62 ? 1 : 1000])),
-      ownChildExitTimeoutMs: 60_000,
-    });
-    expect(await registry.holder("running", { ownCli: "running" })).toBeUndefined();
-    expect((await registry.holder("resumed", { ownCli: "running" }))?.pid).toBe(62);
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
   it("is empty when the registry does not exist", async () => {
     const registry = new LiveSessionRegistry({ dir: () => "/nonexistent/registry" });
     expect((await registry.snapshot()).size).toBe(0);
@@ -726,7 +592,7 @@ describe("first prompt, as the SDK extracts it", () => {
       "Explain the parser",
     );
     expect(firstPrompt(init)).toBe("/init");
-    expect(transcriptTitle({ head: init, tail: init })).toBe("/init");
+    expect(sdkTitles({ head: init, tail: init }).summary).toBe("/init");
   });
 
   it("skips tags, interrupts, meta, compact summaries and tool results", () => {
@@ -754,7 +620,7 @@ describe("first prompt, as the SDK extracts it", () => {
 
   it("titles an image-only first prompt", () => {
     const head = userLine([{ type: "image", source: { type: "base64", data: "x" } }]);
-    expect(transcriptTitle({ head, tail: head })).toBe("Image");
+    expect(sdkTitles({ head, tail: head }).summary).toBe("Image");
   });
 });
 
@@ -909,9 +775,6 @@ describe("directory listings and stats", () => {
     const later = new Date(Date.now() - 30_000);
     await fs.utimes(dir, later, later);
     expect((await listings.names(dir)).sort()).toEqual(["B.jsonl", "a.jsonl"]);
-    expect(await listings.matchingAnyInAll([dir], ["b.JSONL", "missing"])).toEqual([
-      [["B.jsonl"], []],
-    ]);
     // A change just now is seen at once.
     await fs.rm(path.join(dir, "a.jsonl"));
     expect(await listings.names(dir)).toEqual(["B.jsonl"]);
@@ -961,27 +824,26 @@ describe("directory listings and stats", () => {
   });
 });
 
-describe("exact spelling lookup", () => {
-  it("lets the file system resolve the id as given, like the SDK", async () => {
-    const config = await fs.mkdtemp(path.join(os.tmpdir(), "si-spelling-"));
+describe("session id lookup", () => {
+  it("matches a session id exactly, in no other case", async () => {
+    const config = await fs.mkdtemp(path.join(os.tmpdir(), "si-exact-id-"));
     const previous = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = config;
     try {
       const dir = path.join(config, "projects", "-repo");
-      await fs.mkdir(dir, { recursive: true });
       const id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      await fs.mkdir(path.join(dir, id), { recursive: true });
       const file = path.join(dir, `${id}.jsonl`);
       await fs.writeFile(file, lines(user("hi", "2026-01-01T00:00:00.000Z")) + "\n");
       const index = new SessionIndex(async () => undefined);
-      expect(await index.findTranscripts(id, { exactSpelling: true })).toEqual([file]);
+      expect(await index.findTranscripts(id)).toEqual([file]);
+      expect(await index.scanSession(id)).toEqual({
+        transcripts: [{ filePath: file, size: expect.any(Number) }],
+        sessionDirs: [path.join(dir, id)],
+      });
       const upper = id.toUpperCase();
-      const caseInsensitive = await fs
-        .stat(path.join(dir, `${upper}.jsonl`))
-        .then(() => true)
-        .catch(() => false);
-      expect(await index.findTranscripts(upper, { exactSpelling: true })).toEqual(
-        caseInsensitive ? [path.join(dir, `${upper}.jsonl`)] : [],
-      );
+      expect(await index.findTranscripts(upper)).toEqual([]);
+      expect(await index.scanSession(upper)).toEqual({ transcripts: [], sessionDirs: [] });
     } finally {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = previous;
@@ -1023,22 +885,27 @@ describe("archive titles (AIR's Claude format)", () => {
     );
   });
 
-  it("ranks the last top-level agent name above the custom title", () => {
+  it("takes the custom title the SDK reports, never an agent name", () => {
     const lines = (...records: object[]) => records.map((r) => JSON.stringify(r)).join("\n");
     const text = lines(
-      { type: "agent-name", agentName: "First" },
       { type: "custom-title", customTitle: "Custom" },
-      { type: "system", agentName: "Second" },
-      { type: "user", toolUseResult: { agentName: "nested" } },
+      { type: "agent-name", agentName: "[archived] Agent" },
     );
-    expect(lastAgentName(text)).toBe("Second");
-    expect(effectiveTranscriptTitle({ head: text, tail: text }, lastAgentName(text))).toBe(
-      "Second",
-    );
-    const custom = lines({ type: "custom-title", customTitle: "Custom" });
-    expect(effectiveTranscriptTitle({ head: custom, tail: custom }, undefined)).toBe("Custom");
-    // A custom title nested in another record is no title.
-    const nested = lines({ type: "user", toolUseResult: { customTitle: "[archived] Nested" } });
-    expect(effectiveTranscriptTitle({ head: nested, tail: nested }, undefined)).toBeUndefined();
+    expect(sdkTitles({ head: text, tail: text })).toEqual({
+      customTitle: "Custom",
+      summary: "Custom",
+    });
+    // The tail wins over the sidecar, the sidecar over the head.
+    const head = lines({ type: "custom-title", customTitle: "Head" });
+    const tail = lines({ type: "custom-title", customTitle: "Tail" });
+    expect(sdkTitles({ head, tail }, "Sidecar").customTitle).toBe("Tail");
+    expect(sdkTitles({ head, tail: "" }, "Sidecar").customTitle).toBe("Sidecar");
+    expect(sdkTitles({ head, tail: "" }).customTitle).toBe("Head");
+    // A generated title is no custom title.
+    const prompt = lines(user("[archived] Looks archived", "2026-01-01T00:00:00Z"));
+    expect(sdkTitles({ head: prompt, tail: prompt })).toEqual({
+      customTitle: undefined,
+      summary: "[archived] Looks archived",
+    });
   });
 });

@@ -67,7 +67,6 @@ type Listing = {
   /** When the listing was read. */
   readAt: number;
   names: string[];
-  byLowerName?: Map<string, string[]>;
 };
 
 /** A listing read this soon after the directory changed is not trusted:
@@ -95,25 +94,6 @@ export class DirListings {
     return Promise.all(dirs.map(async (dir, i) => (await this.listing(dir, stats[i])).names));
   }
 
-  /** The entry names of each of `dirs` that equal `name` in any case. */
-  async matchingInAll(dirs: readonly string[], name: string): Promise<string[][]> {
-    return (await this.matchingAnyInAll(dirs, [name])).map((byName) => byName[0]!);
-  }
-
-  /** For each of `dirs`, and each of `names`, the entries that equal the
-   *  name in any case: one validation of the listings for all names. */
-  async matchingAnyInAll(dirs: readonly string[], names: readonly string[]): Promise<string[][][]> {
-    const stats = await statFiles(dirs);
-    return Promise.all(
-      dirs.map(async (dir, i) => {
-        const listing = await this.listing(dir, stats[i]);
-        listing.byLowerName ??= byLowerName(listing.names);
-        const index = listing.byLowerName;
-        return names.map((name) => index.get(name.toLowerCase()) ?? []);
-      }),
-    );
-  }
-
   private async listing(dir: string, stats: fs.Stats | undefined): Promise<Listing> {
     if (!stats?.isDirectory()) {
       this.listings.delete(dir);
@@ -139,17 +119,6 @@ export class DirListings {
     this.listings.set(dir, listing);
     return listing;
   }
-}
-
-function byLowerName(names: readonly string[]): Map<string, string[]> {
-  const result = new Map<string, string[]>();
-  for (const name of names) {
-    const key = name.toLowerCase();
-    const list = result.get(key);
-    if (list) list.push(name);
-    else result.set(key, [name]);
-  }
-  return result;
 }
 
 function statOrUndefined(target: string): Promise<fs.Stats | undefined> {

@@ -3,8 +3,7 @@
  *
  * One open reads the first and the last {@link CHUNK_SIZE} bytes, the same
  * window that the SDK reads. The tail gives the time of the last message, the
- * end of the last turn, and the last `cost-state` record. The head and the
- * tail give the `cwd` candidates.
+ * end of the last turn. The head and the tail give the `cwd` candidates.
  *
  * A last message longer than the tail window leaves no message in it: then
  * the tail window grows, up to {@link MAX_TAIL_SIZE}, until it holds one.
@@ -37,8 +36,6 @@ export type TranscriptFacts = {
   /** The last turn ended with an API error (an `isApiErrorMessage`
    *  assistant record), not a user interrupt, and nothing came after it. */
   lastTurnError?: boolean;
-  /** `totalCostUSD` of the last valid `cost-state` record of this session. */
-  costUsd?: number;
   /** The first `cwd` of the head. */
   headCwd?: string;
   /** The last `cwd` of the tail. */
@@ -62,7 +59,7 @@ export type TranscriptFacts = {
 export type HeadTail = { head: string; tail: string };
 
 /** Facts that an earlier scan may have found before the tail window. */
-const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "costUsd"] as const;
+const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt"] as const;
 
 /** What an earlier scan of the same file found, at `size`. */
 export type PreviousScan = { size: number } & Pick<
@@ -114,14 +111,13 @@ export async function readHeadTail(filePath: string, size: number): Promise<Head
 export async function scanTranscriptFile(
   filePath: string,
   size: number,
-  sessionId: string,
   headTail?: HeadTail,
   previous?: PreviousScan,
   /** Tells a file replaced by another of the same size apart (its inode). */
   identity?: number,
 ): Promise<TranscriptFacts> {
   const read = headTail ?? (await readHeadTail(filePath, size));
-  const facts = scanTranscript(read, sessionId);
+  const facts = scanTranscript(read);
   // The file only grew by bytes that the tail covers, and the tail holds no
   // prompt: the appended bytes hold none either, so the earlier search
   // stands (its prompt, or that the last 4 MB held none).
@@ -173,19 +169,21 @@ export async function scanTranscriptFile(
       }
       // A wider tail ends with the same records: what the narrow one found
       // stays, and the wider one adds what lay before it.
-      const wider = scanTranscript({ head: read.head, tail }, sessionId, {
-        wide: true,
-        known: { model: facts.model, tailCwd: facts.tailCwd },
-      });
+      const wider = scanTranscript(
+        { head: read.head, tail },
+        {
+          wide: true,
+          known: { model: facts.model, tailCwd: facts.tailCwd },
+        },
+      );
       const lastPromptAt = wider.lastPromptAt ?? facts.lastPromptAt;
       result = {
         ...wider,
         ...(facts.model !== undefined && { model: facts.model }),
         ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
-        // A turn end or cost the wider tail lacks may lie before it: the
+        // A turn end the wider tail lacks may lie before it: the
         // narrow scan inherited it from an earlier scan of this file.
         lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
-        costUsd: wider.costUsd ?? facts.costUsd,
         hasMessages: facts.hasMessages,
         lastPromptAt,
         // Searched to the start of the file, or found.
@@ -319,7 +317,6 @@ function decodeJsonString(raw: string): string | undefined {
 /** The facts of a transcript, from its head and its tail. */
 export function scanTranscript(
   { head, tail }: HeadTail,
-  sessionId: string,
   options: { wide?: boolean; known?: { model?: string; tailCwd?: string } } = {},
 ): TranscriptFacts {
   const facts: TranscriptFacts = {
@@ -331,7 +328,6 @@ export function scanTranscript(
   if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
 
   const lines = tail.split("\n");
-  let costFound = false;
   let turnEndFound = false;
   let messageFound = false;
   let promptFound = false;
@@ -347,14 +343,12 @@ export function scanTranscript(
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]!;
     if (!line) continue;
-    const isCost = line.includes('"cost-state"');
     const isTurnRecord =
       line.includes('"user"') || line.includes('"assistant"') || line.includes('"system"');
     const hasCwd = searchCwd && facts.tailCwd === undefined && line.includes('"cwd"');
-    if (!isCost && !isTurnRecord && !hasCwd) continue;
+    if (!isTurnRecord && !hasCwd) continue;
     // Everything has been found: stop parsing.
     if (
-      costFound &&
       turnEndFound &&
       messageFound &&
       promptFound &&
@@ -371,7 +365,6 @@ export function scanTranscript(
       messageFound &&
       facts.turnState !== undefined &&
       !hasCwd &&
-      !(isCost && !costFound) &&
       !(!promptFound && mayBePrompt(line)) &&
       !(!modelFound && hasType(line, "assistant")) &&
       !(!turnEndFound && mayEndTurn(line)) &&
@@ -382,18 +375,6 @@ export function scanTranscript(
     const entry = parseLine(line);
     if (!entry) continue;
     if (hasCwd && typeof entry.cwd === "string" && entry.cwd) facts.tailCwd = entry.cwd;
-    if (entry.type === "cost-state") {
-      if (
-        !costFound &&
-        entry.sessionId === sessionId &&
-        typeof entry.totalCostUSD === "number" &&
-        Number.isFinite(entry.totalCostUSD)
-      ) {
-        facts.costUsd = entry.totalCostUSD;
-        costFound = true;
-      }
-      continue;
-    }
     if (entry.isSidechain === true) continue;
     if (!messageFound && (entry.type === "user" || entry.type === "assistant")) {
       messageFound = true;
@@ -477,22 +458,34 @@ export function isSidechainTranscript(head: string): boolean {
   return first.includes('"isSidechain":true') || first.includes('"isSidechain": true');
 }
 
+/** The last `customTitle` of the tail, as the SDK reads it. */
+export function tailCustomTitle(tail: string): string | undefined {
+  return lastField(tail, "customTitle");
+}
+
+/** What the SDK reports as the titles of a session. */
+export type SdkTitles = {
+  /** `SDKSessionInfo.customTitle`: the title the CLI or a client set. */
+  customTitle?: string;
+  /** `SDKSessionInfo.summary`: the custom title, else a generated one. */
+  summary?: string;
+};
+
 /**
- * The title of a transcript from its own head and tail, in the
- * SDK's order: custom title (tail, the sidecar, head), then
- * {@link generatedTitle}. For a transcript the SDK `getSessionInfo` does not
- * read (another copy of the session comes first in its search).
+ * The titles the SDK gives a transcript, from its own head and tail, in the
+ * SDK's order: custom title (tail, the sidecar, head), AI title, then
+ * {@link generatedTitle}. For a transcript that the SDK `getSessionInfo`
+ * does not read (another copy of the session comes first in its search).
+ * The sidecar title counts only when the tail has no custom title.
  */
-export function transcriptTitle(
-  { head, tail }: HeadTail,
-  sidecarTitle?: string,
-): string | undefined {
-  return (
+export function sdkTitles({ head, tail }: HeadTail, sidecarTitle?: string): SdkTitles {
+  const customTitle =
     lastField(tail, "customTitle") ??
     sidecarTitle ??
     lastField(head, "customTitle") ??
-    generatedTitle({ head, tail })
-  );
+    lastField(tail, "aiTitle") ??
+    lastField(head, "aiTitle");
+  return { customTitle, summary: customTitle ?? generatedTitle({ head, tail }) };
 }
 
 /** The title of a transcript without a custom title, in the SDK's order: AI
@@ -504,86 +497,6 @@ export function generatedTitle({ head, tail }: HeadTail): string | undefined {
     lastField(tail, "lastPrompt") ??
     lastField(tail, "summary") ??
     (firstPrompt(head) || mediaPrompt(head) || undefined)
-  );
-}
-
-/** The last non-blank top-level string `field` of the records of `text`,
- *  of records of `type` only when given. */
-function lastRecordField(text: string, field: string, type?: string): string | undefined {
-  const key = `"${field}"`;
-  if (!text.includes(key)) return undefined;
-  const lines = text.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    if (!line.includes(key)) continue;
-    const entry = parseLine(line);
-    if (!entry || (type !== undefined && entry.type !== type)) continue;
-    const value = entry[field];
-    if (typeof value === "string" && value.trim()) return value;
-  }
-  return undefined;
-}
-
-/** The last agent name of `text`: the top-level `agentName` of any record,
- *  which `/rename`, a `rename_session` and AIR write with the custom title,
- *  and which AIR ranks above it. */
-export function lastAgentName(text: string): string | undefined {
-  return lastRecordField(text, "agentName");
-}
-
-/** The last `customTitle` of a `custom-title` record of `text`. */
-export function lastCustomTitle(text: string): string | undefined {
-  return lastRecordField(text, "customTitle", "custom-title");
-}
-
-/**
- * The last agent name of a transcript: in its tail, else, when the tail has
- * a custom title or the head an agent name (the session was named), in the
- * last {@link MAX_TAIL_SIZE} bytes before the tail, else in its head.
- */
-export async function transcriptAgentName(
-  filePath: string,
-  size: number,
-  headTail: HeadTail,
-): Promise<string | undefined> {
-  const inTail = lastAgentName(headTail.tail);
-  if (inTail !== undefined) return inTail;
-  const inHead = lastAgentName(headTail.head);
-  const end = size - Buffer.byteLength(headTail.tail);
-  if (end > CHUNK_SIZE && (inHead !== undefined || lastCustomTitle(headTail.tail) !== undefined)) {
-    const start = Math.max(0, end - MAX_TAIL_SIZE);
-    const handle = await fs.open(filePath, "r");
-    try {
-      const buffer = Buffer.allocUnsafe(end - start);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-      let text = buffer.toString("utf8", 0, bytesRead);
-      if (start > 0) text = text.slice(text.indexOf("\n") + 1);
-      const found = lastAgentName(text);
-      if (found !== undefined) return found;
-    } finally {
-      await handle.close();
-    }
-  }
-  return inHead;
-}
-
-/**
- * The effective title of a transcript, as AIR ranks the named ones: the
- * last agent name (`agentName`, see {@link transcriptAgentName}), else the
- * last custom title (tail, the sidecar, head), else the title the SDK gives
- * a session without a name ({@link generatedTitle}).
- */
-export function effectiveTranscriptTitle(
-  headTail: HeadTail,
-  agentName: string | undefined,
-  sidecarTitle?: string,
-): string | undefined {
-  return (
-    agentName ??
-    lastCustomTitle(headTail.tail) ??
-    sidecarTitle ??
-    lastCustomTitle(headTail.head) ??
-    generatedTitle(headTail)
   );
 }
 
@@ -605,11 +518,6 @@ export async function lastTimestamp(filePath: string, size: number): Promise<num
     if (!Number.isNaN(value)) return value;
   }
   return undefined;
-}
-
-/** Whether the tail carries a custom title of its own. */
-export function hasTailCustomTitle(tail: string): boolean {
-  return lastCustomTitle(tail) !== undefined;
 }
 
 const CONTINUED_IN_MARKER = '"type":"continued-in"';

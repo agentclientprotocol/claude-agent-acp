@@ -7,11 +7,10 @@
  * archive state. All subscriptions of one cwd share one {@link ScopeWatch}:
  * a non-recursive `fs.watch` on each project directory of the scope, the
  * stats of its transcripts, and the row of each session read since. The
- * registry, the archive markers and the projects root are watched once per
- * connection.
+ * registry and the projects root are watched once per connection.
  *
  * Subscribe reads no row: it opens the watchers, stats the transcripts and
- * reads the registry and the archive markers. A row is read on the first
+ * reads the registry. A row is read on the first
  * event of its session and sent unconditionally; later rows are compared
  * with it.
  *
@@ -26,8 +25,8 @@
  * first. Each subscription compares a recomputed row with the last row it
  * sent; a change of `updatedAt` alone is no change. A session is sent at most
  * once a second per subscription. A rescan every 10 s stats the scope again
- * and reads the transcripts whose stat changed (or whose marker came or
- * went, or whose last read failed), which covers events `fs.watch` missed;
+ * and reads the transcripts whose stat changed (or whose last read
+ * failed), which covers events `fs.watch` missed;
  * the state of a live session ages from the metadata the index holds.
  *
  * Delivery is best effort: there is no resync and no sequence number; the
@@ -40,7 +39,6 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { RequestError, type SessionInfo } from "@agentclientprotocol/sdk";
 import type { OwnSessionState } from "./activity.js";
-import { archiveMarkerDir } from "./archive-markers.js";
 import {
   bySession,
   liveRegistryDir,
@@ -49,12 +47,7 @@ import {
   type LiveSnapshot,
 } from "./live-registry.js";
 import { isExactProjectDir, isSessionId, projectDirMatches, projectsRoot } from "./project-dirs.js";
-import {
-  onePerSession,
-  type IndexRow,
-  type SessionIndex,
-  type TranscriptCandidate,
-} from "./session-index.js";
+import { type IndexRow, type SessionIndex, type TranscriptCandidate } from "./session-index.js";
 import { changeSignature, sessionInfoOf } from "./session-info.js";
 
 export const LIST_SUBSCRIBE_METHOD = "_session/list/subscribe";
@@ -114,8 +107,6 @@ export type ListSubscriptionDeps = {
   registry: Pick<LiveSessionRegistry, "readFiles">;
   /** What this connection knows of a session it runs. */
   own: (sessionId: string) => OwnSessionState | undefined;
-  /** The ids of the archived sessions, lower case. */
-  archivedIds: () => Promise<ReadonlySet<string>>;
   notify: (changes: ListChanges) => Promise<void>;
   logError: (message: string, error: unknown) => void;
   now?: () => number;
@@ -134,15 +125,13 @@ type Subscription = {
   watch: ScopeWatch;
   /** When it subscribed, on the {@link ListSubscriptions.seq} clock. */
   since: number;
-  /** What was last sent per session (lower-case id): the row's signature,
-   *  or null for a removal, and the id as the transcript spells it. A
-   *  session without an entry was never sent: its next change is sent
-   *  whatever it is. */
-  sent: Map<string, { signature: string | null; sessionId: string }>;
+  /** What was last sent per session: the row's signature, or null for a
+   *  removal. A session without an entry was never sent: its next change is
+   *  sent whatever it is. */
+  sent: Map<string, string | null>;
   sentAt: Map<string, number>;
-  /** Sessions to compare with `sent` at the next delivery, with the id as
-   *  the transcript spells it. */
-  pending: Map<string, string>;
+  /** Sessions to compare with `sent` at the next delivery. */
+  pending: Set<string>;
   /** Fires when a session held back by the interval may be sent. */
   timer?: ReturnType<typeof setTimeout>;
 };
@@ -157,18 +146,18 @@ type ScopeWatch = {
   dirs: Map<string, WatchedDir>;
   /** Every non-empty transcript file of the scope, as last stat'ed. */
   files: Map<string, TranscriptCandidate>;
-  /** The file paths of each session (lower-case id). */
+  /** The file paths of each session. */
   filesById: Map<string, Set<string>>;
-  /** The sessions (lower-case ids) whose first transcript appeared after
+  /** The sessions whose first transcript appeared after
    *  the watch was ready, on the {@link ListSubscriptions.seq} clock: a
    *  subscription older than that never had them listed. */
   born: Map<string, number>;
-  /** The current row of each session (lower-case id) in the scope that was
+  /** The current row of each session in the scope that was
    *  read since the watch started. */
   rows: Map<string, Row>;
   subscriptions: Set<Subscription>;
   started: Promise<void>;
-  /** The transcripts are stat'ed and the registry and markers read. */
+  /** The transcripts are stat'ed and the registry read. */
   ready: boolean;
   /** When it became ready: about when its client listed the sessions. */
   readyAt: number;
@@ -179,17 +168,13 @@ type ScopeWatch = {
   /** Sessions whose row is presented again: their state may have changed. */
   dirtyStates: Set<string>;
   rescan: boolean;
-  /** The session each session read here is continued in (lower-case ids),
-   *  by its metadata: a change of the successor may show or hide it. */
+  /** The session each session read here is continued in, by its metadata: a change of the successor may show or hide it. */
   successorOf: Map<string, string>;
   /** Live continued sessions that a seed found hidden by their successor,
    *  with the stats of both then: not checked again until one changes. */
   hiddenSeeds: Map<string, string>;
   /** The scope paths the rows were last resolved against. */
   resolvedPaths: string;
-  /** The archive markers the rows were last read with (at first, those of
-   *  the start). */
-  markers: ReadonlySet<string>;
   /** Sessions whose transcript could not be read: kept as they were, and
    *  read again by the next rescan. */
   unreadable: Set<string>;
@@ -247,11 +232,11 @@ function scopeKey(paths: readonly string[]): string {
   return [...paths].sort().join("\0");
 }
 
-/** The lower-case session id of a transcript file name, else undefined. */
+/** The session id of a transcript file name, else undefined. */
 function transcriptId(filename: string): string | undefined {
   if (!filename.endsWith(".jsonl")) return undefined;
   const id = filename.slice(0, -6);
-  return isSessionId(id) ? id.toLowerCase() : undefined;
+  return isSessionId(id) ? id : undefined;
 }
 
 export class ListSubscriptions {
@@ -316,7 +301,7 @@ export class ListSubscriptions {
       since: ++this.seq,
       sent: new Map(),
       sentAt: new Map(),
-      pending: new Map(),
+      pending: new Set(),
     };
     // Counted at once, so concurrent subscribes cannot pass the limit.
     this.subscriptions.set(subscription.id, subscription);
@@ -347,8 +332,7 @@ export class ListSubscriptions {
   }
 
   /** A session this connection runs changed its state, turn end or cost. */
-  ownSessionChanged(sessionId: string): void {
-    const id = sessionId.toLowerCase();
+  ownSessionChanged(id: string): void {
     for (const watch of this.watches.values()) {
       if (watch.ready && watch.rows.has(id)) {
         watch.dirtyStates.add(id);
@@ -404,7 +388,6 @@ export class ListSubscriptions {
       rescan: false,
       successorOf: new Map(),
       hiddenSeeds: new Map(),
-      markers: new Set(),
       unreadable: new Set(),
       resolvedPaths: "",
       again: false,
@@ -416,28 +399,22 @@ export class ListSubscriptions {
     //   or a move out of the scope is a stat that went, the rescan reads only
     //   a transcript whose stat changed, and a session's other copies are
     //   known when its row is read;
-    // - the archive markers: the rescan reads only a session whose marker
-    //   came or went;
     // - the registry: a later change of it is an event of the sessions whose
     //   record changed.
     watch.started = this.refreshDirs(watch).then(async () => {
-      const [files, markers] = await Promise.all([
-        this.deps.index.enumerateFiles(watch.paths),
-        this.deps.archivedIds(),
-      ]);
+      const files = await this.deps.index.enumerateFiles(watch.paths);
       await this.registryLoaded;
       if (watch.closed) return;
       this.setFiles(watch, files);
       this.learnSuccessors(watch);
-      watch.markers = markers;
       watch.resolvedPaths = scopeKey(watch.paths);
       // The rows of the live sessions a list read: their state ages from now.
-      const seeded = await this.liveSeeds(watch, new Set(), markers);
+      const seeded = await this.liveSeeds(watch, new Set());
       if (watch.closed) return;
       watch.ready = true;
       watch.readyAt = this.now();
       for (const row of seeded) {
-        watch.rows.set(row.sessionId.toLowerCase(), this.present(row, watch.readyAt));
+        watch.rows.set(row.sessionId, this.present(row, watch.readyAt));
       }
       // Events of the start, held until now.
       if (
@@ -477,13 +454,12 @@ export class ListSubscriptions {
     if (this.watches.size === 0) this.stopShared();
   }
 
-  /** The registry, the archive markers and the projects root, watched once
-   *  for all cwds, and the rescan. */
+  /** The registry and the projects root, watched once for all cwds, and the
+   *  rescan. */
   private ensureShared(): void {
     if (this.disposed || this.watches.size === 0) return;
     const watchers: [string, (filename: string | null) => void][] = [
       [liveRegistryDir(), (filename) => this.onRegistryEvent(filename)],
-      [archiveMarkerDir(), (filename) => this.onArchiveEvent(filename)],
       [projectsRoot(), (filename) => this.onProjectsRootEvent(filename)],
     ];
     const missing: string[] = [];
@@ -605,19 +581,6 @@ export class ListSubscriptions {
     this.schedule(watch, "debounced");
   }
 
-  private onArchiveEvent(filename: string | null): void {
-    for (const watch of this.watches.values()) {
-      if (filename === null) {
-        watch.rescan = true;
-      } else if (isSessionId(filename)) {
-        watch.dirtyRows.add(filename.toLowerCase());
-      } else {
-        continue;
-      }
-      this.schedule(watch, "debounced");
-    }
-  }
-
   /** A project directory that a scope lacked may have been created. */
   private onProjectsRootEvent(filename: string | null): void {
     if (filename === null) return;
@@ -720,7 +683,7 @@ export class ListSubscriptions {
   }
 
   /** Reads the changed registry records (all with `full`) and returns the
-   *  lower-case ids of the sessions whose record changed. */
+   *  ids of the sessions whose record changed. */
   private async readRegistry(full: boolean): Promise<Set<string>> {
     let names: string[];
     if (full) {
@@ -749,8 +712,8 @@ export class ListSubscriptions {
       if (record) next.set(name, record);
       else next.delete(name);
       if (key(previous) !== key(record)) {
-        if (previous) affected.add(previous.sessionId.toLowerCase());
-        if (record) affected.add(record.sessionId.toLowerCase());
+        if (previous) affected.add(previous.sessionId);
+        if (record) affected.add(record.sessionId);
       }
     }
     this.liveFiles = next;
@@ -844,7 +807,7 @@ export class ListSubscriptions {
     known: ReadonlyMap<string, unknown> = watch.filesById,
   ): void {
     watch.files.set(file.filePath, file);
-    const id = file.sessionId.toLowerCase();
+    const id = file.sessionId;
     if (watch.ready && !known.has(id)) watch.born.set(id, ++this.seq);
     let paths = watch.filesById.get(id);
     if (!paths) watch.filesById.set(id, (paths = new Set()));
@@ -860,7 +823,7 @@ export class ListSubscriptions {
 
   private present(row: IndexRow, now: number): Row {
     const own = this.deps.own(row.sessionId);
-    const id = row.sessionId.toLowerCase();
+    const id = row.sessionId;
     if (own) this.ownShown.add(id);
     else this.ownShown.delete(id);
     const info = sessionInfoOf(row, own, this.live.get(row.sessionId), now);
@@ -901,8 +864,6 @@ export class ListSubscriptions {
 
   private async pass(watch: ScopeWatch, files: boolean): Promise<void> {
     const rescan = files && watch.rescan;
-    /** The archive markers a rescan read. */
-    let markers: ReadonlySet<string> | undefined;
     const dirtyFiles = files ? [...watch.dirtyFiles] : [];
     const rowIds = new Set(files ? watch.dirtyRows : []);
     const stateIds = new Set(watch.dirtyStates);
@@ -945,10 +906,10 @@ export class ListSubscriptions {
             old.size !== file.size ||
             old.ino !== file.ino
           ) {
-            rowIds.add(file.sessionId.toLowerCase());
+            rowIds.add(file.sessionId);
           }
         }
-        for (const gone of before.values()) rowIds.add(gone.sessionId.toLowerCase());
+        for (const gone of before.values()) rowIds.add(gone.sessionId);
         for (const id of rowIds) remember(id);
         this.setFiles(watch, files);
         this.learnSuccessors(watch);
@@ -960,26 +921,20 @@ export class ListSubscriptions {
           // a transcript.
           for (const id of watch.rows.keys()) rowIds.add(id);
           for (const file of files) {
-            if (this.deps.index.isRead(file)) rowIds.add(file.sessionId.toLowerCase());
+            if (this.deps.index.isRead(file)) rowIds.add(file.sessionId);
           }
         }
-        // A marker that came or went (the title records of an archive are a
-        // transcript change), and a transcript that could not be read before.
-        markers = await this.deps.archivedIds();
-        if (watch.closed) return;
-        for (const id of markers) if (!watch.markers.has(id)) rowIds.add(id);
-        for (const id of watch.markers) if (!markers.has(id)) rowIds.add(id);
+        // A transcript that could not be read before.
         for (const id of watch.unreadable) rowIds.add(id);
         watch.unreadable.clear();
         // Only the state of a session that a live process holds depends on
         // the time (an unfinished turn ages). One without a row read here
         // gets it from the metadata the index holds (a list read it), not
         // from its transcript; if it has none, the client did not list it.
-        for (const sessionId of this.live.keys()) {
-          const id = sessionId.toLowerCase();
+        for (const id of this.live.keys()) {
           if (watch.rows.has(id)) agedIds.add(id);
         }
-        seeded = await this.liveSeeds(watch, rowIds, markers);
+        seeded = await this.liveSeeds(watch, rowIds);
         if (watch.closed) return;
         for (const id of this.ownShown) if (watch.rows.has(id)) agedIds.add(id);
       } else if (dirtyFiles.length > 0) {
@@ -1021,47 +976,35 @@ export class ListSubscriptions {
           if (successors.has(successor)) rowIds.add(id);
         }
         for (const file of watch.files.values()) {
-          const successor = this.deps.index.continuedIn(file.filePath)?.toLowerCase();
-          if (successor && successors.has(successor)) rowIds.add(file.sessionId.toLowerCase());
+          const successor = this.deps.index.continuedIn(file.filePath);
+          if (successor && successors.has(successor)) rowIds.add(file.sessionId);
         }
         for (const id of rowIds) remember(id);
         // Before the read below replaces the metadata the index holds.
         shownBefore = await this.shownBefore(watch, priorPaths, rowIds, priorFiles);
         if (watch.closed) return;
-        const candidates: TranscriptCandidate[] = [];
+        const read: TranscriptCandidate[] = [];
         for (const id of rowIds) {
           for (const filePath of watch.filesById.get(id) ?? []) {
             const file = watch.files.get(filePath);
-            if (file) candidates.push(file);
+            if (file) read.push(file);
           }
         }
-        const read = onePerSession(candidates);
-        const archived = markers ?? (await this.deps.archivedIds());
-        const rows = await this.deps.index.rowsOf(watch.paths, read, archived, () => [
+        const rows = await this.deps.index.rowsOf(watch.paths, read, () => [
           ...watch.files.values(),
         ]);
         if (watch.closed) return;
-        if (!markers) {
-          // Only the markers of the sessions read here count as seen: another
-          // marker change is left to its event or the rescan.
-          const seen = new Set(watch.markers);
-          for (const id of rowIds) {
-            if (archived.has(id)) seen.add(id);
-            else seen.delete(id);
-          }
-          watch.markers = seen;
-        }
-        resolved = new Map(rows.map((row) => [row.sessionId.toLowerCase(), row]));
+        resolved = new Map(rows.map((row) => [row.sessionId, row]));
         for (const file of read) {
-          const id = file.sessionId.toLowerCase();
-          const successor = this.deps.index.continuedIn(file.filePath)?.toLowerCase();
+          const id = file.sessionId;
+          const successor = this.deps.index.continuedIn(file.filePath);
           if (successor) watch.successorOf.set(id, successor);
           else if (this.deps.index.isRead(file)) watch.successorOf.delete(id);
         }
         // A transcript there whose read failed is no removal: it keeps its row
         // until a rescan reads it.
         for (const file of read) {
-          const id = file.sessionId.toLowerCase();
+          const id = file.sessionId;
           if (!resolved.has(id) && !this.deps.index.isRead(file)) {
             watch.unreadable.add(id);
             rowIds.delete(id);
@@ -1077,30 +1020,29 @@ export class ListSubscriptions {
       if (rescan) watch.rescan = true;
       throw error;
     }
-    if (markers) watch.markers = markers;
     if (rescan) watch.resolvedPaths = scopeKey(watch.paths);
 
     // From here on synchronous: the rows change and are delivered at once.
     const now = this.now();
-    /** The changed sessions, with the id as the transcript spells it. */
-    const changed = new Map<string, string>();
+    /** The changed sessions. */
+    const changed = new Set<string>();
     /** Sessions without a row now. */
     const absent = new Set<string>();
     for (const id of rowIds) {
       const row = resolved.get(id);
       if (row) {
         watch.rows.set(id, this.present(row, now));
-        changed.set(id, row.sessionId);
+        changed.add(id);
         continue;
       }
       const previous = watch.rows.get(id);
       watch.rows.delete(id);
       if (!previous && !shownBefore.has(id)) continue;
-      changed.set(id, previous?.row.sessionId ?? priorFiles.get(id)![0]!.sessionId);
+      changed.add(id);
       absent.add(id);
     }
     for (const row of seeded) {
-      const id = row.sessionId.toLowerCase();
+      const id = row.sessionId;
       if (rowIds.has(id) || watch.rows.has(id)) continue;
       // As the client listed it, about when the watch became ready: a state
       // that aged since is sent below.
@@ -1115,11 +1057,11 @@ export class ListSubscriptions {
       watch.rows.set(id, next);
       // An event of the session, or a state that aged.
       if (stateIds.has(id) || next.signature !== current.signature) {
-        changed.set(id, next.row.sessionId);
+        changed.add(id);
       }
     }
     for (const subscription of watch.subscriptions) {
-      for (const [id, sessionId] of changed) {
+      for (const id of changed) {
         const born = watch.born.get(id);
         if (
           absent.has(id) &&
@@ -1131,7 +1073,7 @@ export class ListSubscriptions {
           subscription.pending.delete(id);
           continue;
         }
-        subscription.pending.set(id, sessionId);
+        subscription.pending.add(id);
       }
       this.deliver(subscription);
     }
@@ -1143,7 +1085,7 @@ export class ListSubscriptions {
       watch.successorOf.delete(id);
       watch.hiddenSeeds.delete(id);
       for (const subscription of watch.subscriptions) {
-        if (subscription.sent.get(id)?.signature === null && !subscription.pending.has(id)) {
+        if (subscription.sent.get(id) === null && !subscription.pending.has(id)) {
           subscription.sent.delete(id);
         }
       }
@@ -1156,7 +1098,7 @@ export class ListSubscriptions {
   private learnSuccessors(watch: ScopeWatch): void {
     for (const file of watch.files.values()) {
       const successor = this.deps.index.continuedIn(file.filePath);
-      if (successor) watch.successorOf.set(file.sessionId.toLowerCase(), successor.toLowerCase());
+      if (successor) watch.successorOf.set(file.sessionId, successor);
     }
   }
 
@@ -1166,19 +1108,13 @@ export class ListSubscriptions {
    * from their transcripts; one it holds nothing for the client did not
    * list. Reads no transcript: a continued one only checks its successor.
    */
-  private async liveSeeds(
-    watch: ScopeWatch,
-    except: ReadonlySet<string>,
-    markers: ReadonlySet<string>,
-  ): Promise<IndexRow[]> {
-    const seeds: TranscriptCandidate[] = [];
-    for (const sessionId of this.live.keys()) {
-      const id = sessionId.toLowerCase();
-      if (!watch.rows.has(id) && !except.has(id)) seeds.push(...this.filesOf(watch, id));
+  private async liveSeeds(watch: ScopeWatch, except: ReadonlySet<string>): Promise<IndexRow[]> {
+    const read: TranscriptCandidate[] = [];
+    for (const id of this.live.keys()) {
+      if (!watch.rows.has(id) && !except.has(id)) read.push(...this.filesOf(watch, id));
     }
-    if (seeds.length === 0) return [];
-    const read = onePerSession(seeds);
-    const cached = await this.deps.index.cachedRowsOf(watch.paths, read, markers);
+    if (read.length === 0) return [];
+    const cached = await this.deps.index.cachedRowsOf(watch.paths, read);
     // A continued one is shown while its successor has no history: its
     // cached metadata and that check, made again only when the stat of
     // either changed.
@@ -1186,7 +1122,7 @@ export class ListSubscriptions {
       file ? `${file.mtimeMs}:${file.size}:${file.ino}` : "-";
     const continued: { file: TranscriptCandidate; key: string }[] = [];
     for (const file of read) {
-      const id = file.sessionId.toLowerCase();
+      const id = file.sessionId;
       const successor = this.deps.index.continuedIn(file.filePath);
       if (!cached.unknown.has(id) || !this.deps.index.isRead(file) || !successor) continue;
       const successorFile = watch.files.get(
@@ -1199,19 +1135,18 @@ export class ListSubscriptions {
     const rows = await this.deps.index.rowsOf(
       watch.paths,
       continued.map(({ file }) => file),
-      markers,
       () => [],
     );
-    const shown = new Set(rows.map((row) => row.sessionId.toLowerCase()));
+    const shown = new Set(rows.map((row) => row.sessionId));
     for (const { file, key } of continued) {
-      const id = file.sessionId.toLowerCase();
+      const id = file.sessionId;
       if (shown.has(id)) watch.hiddenSeeds.delete(id);
       else watch.hiddenSeeds.set(id, key);
     }
     return [...cached.rows, ...rows];
   }
 
-  /** The transcripts of a session (lower-case id) the watch knows. */
+  /** The transcripts of a session the watch knows. */
   private filesOf(watch: ScopeWatch, id: string): TranscriptCandidate[] {
     const files: TranscriptCandidate[] = [];
     for (const filePath of watch.filesById.get(id) ?? []) {
@@ -1240,12 +1175,8 @@ export class ListSubscriptions {
       if (!watch.rows.has(id)) candidates.push(...(priorFiles.get(id) ?? []));
     }
     if (candidates.length === 0) return new Set();
-    const { rows, unknown } = await this.deps.index.cachedRowsOf(
-      paths,
-      onePerSession(candidates),
-      watch.markers,
-    );
-    for (const row of rows) unknown.add(row.sessionId.toLowerCase());
+    const { rows, unknown } = await this.deps.index.cachedRowsOf(paths, candidates);
+    for (const row of rows) unknown.add(row.sessionId);
     return unknown;
   }
 
@@ -1261,12 +1192,10 @@ export class ListSubscriptions {
     const sessions: SessionInfo[] = [];
     const removed: string[] = [];
     let nextAt = Infinity;
-    for (const [id, sessionId] of subscription.pending) {
+    for (const id of subscription.pending) {
       const current = watch.rows.get(id);
       const sent = subscription.sent.get(id);
-      const unchanged = current
-        ? sent?.signature === current.signature
-        : sent !== undefined && sent.signature === null;
+      const unchanged = current ? sent === current.signature : sent === null;
       if (unchanged) {
         subscription.pending.delete(id);
         continue;
@@ -1279,22 +1208,19 @@ export class ListSubscriptions {
       subscription.pending.delete(id);
       subscription.sentAt.set(id, now);
       if (!current) {
-        removed.push(sent?.sessionId ?? sessionId);
+        removed.push(id);
         // A session with a transcript but no row (hidden, or of another
         // path) is remembered as removed; one without a transcript is
         // forgotten.
         if (watch.filesById.has(id)) {
-          subscription.sent.set(id, { signature: null, sessionId: sent?.sessionId ?? sessionId });
+          subscription.sent.set(id, null);
         } else {
           subscription.sent.delete(id);
         }
         continue;
       }
       sessions.push(current.info);
-      subscription.sent.set(id, {
-        signature: current.signature,
-        sessionId: current.row.sessionId,
-      });
+      subscription.sent.set(id, current.signature);
     }
     this.forgetOldSends(subscription, now);
     if (nextAt !== Infinity) {

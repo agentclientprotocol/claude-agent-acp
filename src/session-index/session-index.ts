@@ -38,18 +38,17 @@ import {
 import {
   continuedInSessionId,
   hasHistory,
-  hasTailCustomTitle,
-  generatedTitle,
   isSidechainTranscript,
-  lastCustomTitle,
   lastTimestamp,
-  transcriptAgentName,
   readHeadTail,
   relocatedCwd,
   scanTranscriptFile,
+  sdkTitles,
+  tailCustomTitle,
   transcriptProjectCwd,
   type HeadTail,
   type PreviousScan,
+  type SdkTitles,
   type TranscriptFacts,
 } from "./transcript-scan.js";
 import { DirListings, statFiles } from "./dir-listing.js";
@@ -96,10 +95,13 @@ export type TranscriptCandidate = {
 type TranscriptMetadata = {
   /** The visible title: without the archive prefix. */
   title: string;
-  /** The effective title carries the archive prefix. */
+  /** The custom title the SDK reports carries the archive prefix. */
   archived: boolean;
   /** The cwd read from the transcript, when it encodes to the directory name. */
   fileCwd?: string;
+  /** The cwd the SDK list checks the transcript by: the last relocation,
+   *  else the first cwd of the head. */
+  projectCwd?: string;
   /** The session this transcript was continued in, from its tail. */
   continuedIn?: string;
   updatedAtMs: number;
@@ -130,9 +132,6 @@ export type ListQuery = {
   limit: number;
   archived: ArchivedFilter;
   after?: ListCursor;
-  /** Sessions archived by a marker file (see archive-markers.ts), besides
-   *  those whose title is archived. */
-  archivedIds: ReadonlySet<string>;
 };
 
 export type GetSessionInfo = (
@@ -182,9 +181,9 @@ function compareRows(a: { orderAtMs: number; sessionId: string }, b: typeof a): 
 
 type Resolved = { candidate: TranscriptCandidate; metadata: TranscriptMetadata };
 
-function toRow({ candidate, metadata }: Resolved, cwd: string, marked: boolean): IndexRow {
+function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
   return {
-    archived: metadata.archived || marked,
+    archived: metadata.archived,
     sessionId: candidate.sessionId,
     cwd,
     title: metadata.title,
@@ -197,17 +196,6 @@ function toRow({ candidate, metadata }: Resolved, cwd: string, marked: boolean):
 
 function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
   return compareRows(row, cursor) > 0;
-}
-
-/** One transcript per session id, in any case: the larger file wins. */
-export function onePerSession(candidates: readonly TranscriptCandidate[]): TranscriptCandidate[] {
-  const bySession = new Map<string, TranscriptCandidate>();
-  for (const candidate of candidates) {
-    const key = candidate.sessionId.toLowerCase();
-    const previous = bySession.get(key);
-    if (!previous || candidate.size > previous.size) bySession.set(key, candidate);
-  }
-  return [...bySession.values()];
 }
 
 function byMtimeDescending(a: TranscriptCandidate, b: TranscriptCandidate): number {
@@ -270,27 +258,68 @@ async function sameDirOnDisk(dirName: string, cwd: string): Promise<boolean> {
   }
 }
 
-/** A path as the file system compares it: case-insensitive on macOS and
- *  Windows, as the SDK assumes there. */
+/** Whether paths are compared ignoring case, as the SDK does on macOS and
+ *  Windows. */
+const CASE_INSENSITIVE_PATHS = process.platform === "darwin" || process.platform === "win32";
+
+/** A path as the SDK compares it: forward slashes, in any case where the
+ *  file system ignores it. */
 function comparable(value: string): string {
-  const normalized = normalizePath(value);
-  return process.platform === "darwin" || process.platform === "win32"
-    ? normalized.toLowerCase()
-    : normalized;
+  const slashed = normalizePath(value).replaceAll("\\", "/");
+  return CASE_INSENSITIVE_PATHS ? slashed.toLowerCase() : slashed;
 }
 
-/** Whether a row cwd is one of `paths` (every cwd is without `paths`): the
- *  same path, or one that resolves to it through symlinks. */
-function scopeOf(paths: readonly string[] | undefined): (cwd: string) => Promise<boolean> {
+/** Whether `a` and `b` are different paths that encode to the same project
+ *  directory name (`/ws/app.v2` and `/ws/app-v2`). */
+function collides(a: string, b: string): boolean {
+  return sameProjectPath(a, b) && comparable(a) !== comparable(b);
+}
+
+/** A path the SDK does not resolve: a `..` segment, or a UNC or device path. */
+function unresolvable(value: string): boolean {
+  return /(^|[\\/])\.\.([\\/]|$)/.test(value) || /^[\\/]{2}/.test(value);
+}
+
+/**
+ * Which transcripts of the project directories of `paths` (every one
+ * without `paths`) the SDK `listSessions` of those paths lists. It leaves out
+ * only a transcript whose cwd (see {@link TranscriptMetadata.projectCwd}) is
+ * another path that encodes to the same directory and still resolves on disk
+ * to such another path; one whose cwd is gone, or lies in one of `paths`, is
+ * listed.
+ */
+function scopeOf(
+  paths: readonly string[] | undefined,
+): (candidate: TranscriptCandidate, metadata: TranscriptMetadata) => Promise<boolean> {
   if (!paths) return async () => true;
-  const wanted = new Set(paths.map(comparable));
+  const own = paths.map(comparable);
   const resolved = new Map<string, Promise<boolean>>();
-  return (cwd) => {
-    if (wanted.has(comparable(cwd))) return Promise.resolve(true);
-    let result = resolved.get(cwd);
+  const hidden = async (cwd: string, projectPath: string): Promise<boolean> => {
+    if (!collides(cwd, projectPath) || unresolvable(cwd) || unresolvable(projectPath)) return false;
+    let real: string;
+    try {
+      real = normalizePath(await fs.realpath(cwd));
+    } catch {
+      return false;
+    }
+    return collides(real, await canonicalPath(projectPath));
+  };
+  return async ({ projectPath }, { projectCwd }) => {
+    if (projectPath === undefined || projectCwd === undefined) return true;
+    const cwd = comparable(projectCwd);
+    if (
+      own.some(
+        (ownPath) =>
+          cwd === ownPath || cwd.startsWith(ownPath.endsWith("/") ? ownPath : `${ownPath}/`),
+      )
+    ) {
+      return true;
+    }
+    const key = `${projectCwd}\0${projectPath}`;
+    let result = resolved.get(key);
     if (!result) {
-      result = canonicalPath(cwd).then((real) => wanted.has(comparable(real)));
-      resolved.set(cwd, result);
+      result = hidden(projectCwd, projectPath).then((isHidden) => !isHidden);
+      resolved.set(key, result);
     }
     return result;
   };
@@ -385,7 +414,8 @@ export class SessionIndex {
   }
 
   /** Every non-empty transcript file of `paths` (without, of all projects),
-   *  every copy of a session. */
+   *  every copy of a session: a list shows the newest one that has a row
+   *  (see {@link collectRows}), as the SDK does. */
   async enumerateFiles(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
     const root = projectsRoot();
     const dirs: { dirName: string; projectPath?: string }[] = paths
@@ -418,17 +448,11 @@ export class SessionIndex {
     return all;
   }
 
-  /** Every non-empty transcript of `paths` (without, of all projects), one
-   *  per session id: the larger file wins. */
-  async enumerate(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
-    return onePerSession(await this.enumerateFiles(paths));
-  }
-
   /**
    * Every transcript (with its size) and every `<sessionId>/` directory
    * (sidecar, subagent transcripts) of the session, in any project
-   * directory and in any spelling of the id: the CLI names files by the id
-   * as it was given. One pass over the (cached) project directory listings.
+   * directory, by the exact id. One pass over the (cached) project directory
+   * listings.
    */
   async scanSession(
     sessionId: string,
@@ -436,11 +460,14 @@ export class SessionIndex {
     if (!isSessionId(sessionId)) return { transcripts: [], sessionDirs: [] };
     const root = projectsRoot();
     const dirs = (await this.listings.names(root)).map((dirName) => path.join(root, dirName));
-    const matching = await this.listings.matchingAnyInAll(dirs, [`${sessionId}.jsonl`, sessionId]);
+    const listed = await this.listings.namesOfAll(dirs);
+    const transcriptName = `${sessionId}.jsonl`;
     const transcriptPaths = dirs.flatMap((dir, i) =>
-      matching[i]![0]!.map((name) => path.join(dir, name)),
+      listed[i]!.includes(transcriptName) ? [path.join(dir, transcriptName)] : [],
     );
-    const dirPaths = dirs.flatMap((dir, i) => matching[i]![1]!.map((name) => path.join(dir, name)));
+    const dirPaths = dirs.flatMap((dir, i) =>
+      listed[i]!.includes(sessionId) ? [path.join(dir, sessionId)] : [],
+    );
     const [transcriptStats, dirStats] = await Promise.all([
       statFiles(transcriptPaths),
       Promise.all(dirPaths.map((dir) => fs.lstat(dir).catch(() => undefined))),
@@ -455,26 +482,11 @@ export class SessionIndex {
   }
 
   /** Every transcript file of `sessionId` (see {@link scanSession}). Empty
-   *  files only with `includeEmpty`. `exactSpelling` looks for the id as
-   *  given only, like the SDK. */
+   *  files only with `includeEmpty`. */
   async findTranscripts(
     sessionId: string,
-    options: { includeEmpty?: boolean; exactSpelling?: boolean } = {},
+    options: { includeEmpty?: boolean } = {},
   ): Promise<string[]> {
-    if (!isSessionId(sessionId)) return [];
-    if (options.exactSpelling) {
-      // The id as given, resolved by the file system like the SDK does (a
-      // case-insensitive one finds another spelling too).
-      const root = projectsRoot();
-      const candidates = (await this.listings.names(root)).map((dirName) =>
-        path.join(root, dirName, `${sessionId}.jsonl`),
-      );
-      const stats = await statFiles(candidates);
-      return candidates.filter((_, i) => {
-        const found = stats[i];
-        return found?.isFile() && (found.size > 0 || options.includeEmpty);
-      });
-    }
     const { transcripts } = await this.scanSession(sessionId);
     return transcripts
       .filter(({ size }) => size > 0 || options.includeEmpty)
@@ -515,19 +527,23 @@ export class SessionIndex {
       ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
       : undefined;
     const after = query.after;
-    const enumerated = (await this.enumerate(paths)).sort(byMtimeDescending);
-    // A page after a cursor skips, without reading them, the transcripts
-    // whose cached order key puts them before the cursor. The archive state
-    // comes from the title, so the archive filter applies once a transcript
-    // is read.
-    const candidates = enumerated.filter(
-      (candidate) => !after || !this.cachedBefore(candidate, after),
-    );
+    const enumerated = (await this.enumerateFiles(paths)).sort(byMtimeDescending);
+    // A page after a cursor skips, without reading them, the sessions whose
+    // newest transcript has a cached order key before the cursor. The
+    // archive state comes from the title, so the archive filter applies once
+    // a transcript is read.
+    const skipped = new Set<string>();
+    const seen = new Set<string>();
+    for (const candidate of enumerated) {
+      if (seen.has(candidate.sessionId)) continue;
+      seen.add(candidate.sessionId);
+      if (after && this.cachedBefore(candidate, after)) skipped.add(candidate.sessionId);
+    }
+    const candidates = enumerated.filter((candidate) => !skipped.has(candidate.sessionId));
     // One row more than the page tells whether a next page exists, so a
     // cursor never leads to an empty page.
     const rows = await this.collectRows(candidates, {
       inScope: scopeOf(paths),
-      archivedIds: query.archivedIds,
       archived: query.archived,
       after,
       wanted: query.limit + 1,
@@ -537,10 +553,10 @@ export class SessionIndex {
   }
 
   /**
-   * The rows of `candidates` (one per session, see {@link onePerSession}),
-   * any archive state, as a list of `paths` shows them: a candidate without
-   * a row (no title, a sidechain, continued elsewhere, another path that
-   * shares the project directory) is left out. `siblings` are the other
+   * The rows of `candidates`, one per session (its newest transcript that has
+   * a row), any archive state, as a list of `paths` shows them: a candidate
+   * without a row (no title, a sidechain, continued elsewhere, another path
+   * that shares the project directory) is left out. `siblings` are the other
    * transcripts of the candidates' directories, read only when a candidate
    * has no cwd of its own. The metadata cache makes an unchanged transcript
    * free.
@@ -548,12 +564,10 @@ export class SessionIndex {
   async rowsOf(
     paths: readonly string[],
     candidates: readonly TranscriptCandidate[],
-    archivedIds: ReadonlySet<string>,
     siblings: () => readonly TranscriptCandidate[],
   ): Promise<IndexRow[]> {
     return this.collectRows(candidates, {
       inScope: scopeOf(paths),
-      archivedIds,
       archived: "all",
       wanted: Infinity,
       unread: (read) => siblings().filter((candidate) => !read.has(candidate)),
@@ -562,20 +576,19 @@ export class SessionIndex {
 
   /**
    * The rows of `candidates` (as {@link rowsOf}) that the metadata cache
-   * alone gives, read from it at once, and the lower-case ids of the
-   * candidates it gives no answer for: nothing cached at the candidate's
-   * stat, no cwd known, or continued in another session (whether the
-   * successor hides it depends on the successor now). Reads no transcript.
+   * alone gives, read from it at once, and the ids of the sessions it gives
+   * no answer for: a transcript of it has nothing cached at its stat, no cwd
+   * known, or is continued in another session (whether the successor hides
+   * it depends on the successor now). Reads no transcript.
    */
   async cachedRowsOf(
     paths: readonly string[],
     candidates: readonly TranscriptCandidate[],
-    archivedIds: ReadonlySet<string>,
   ): Promise<{ rows: IndexRow[]; unknown: Set<string> }> {
     const unknown = new Set<string>();
     const resolved: { item: Resolved; cwd: string }[] = [];
     for (const candidate of candidates) {
-      const id = candidate.sessionId.toLowerCase();
+      const id = candidate.sessionId;
       const cached = this.metadata.peek(candidate.filePath);
       if (
         !cached ||
@@ -593,26 +606,28 @@ export class SessionIndex {
       else unknown.add(id);
     }
     const inScope = scopeOf(paths);
-    const rows: IndexRow[] = [];
+    const newest = new Map<string, { row: IndexRow; mtimeMs: number }>();
     for (const { item, cwd } of resolved) {
-      if (!(await inScope(cwd))) continue;
-      const id = item.candidate.sessionId.toLowerCase();
-      rows.push(toRow(item, cwd, archivedIds.has(id)));
+      const id = item.candidate.sessionId;
+      if (unknown.has(id) || !(await inScope(item.candidate, item.metadata))) continue;
+      const previous = newest.get(id);
+      if (previous && previous.mtimeMs >= item.candidate.mtimeMs) continue;
+      newest.set(id, { row: toRow(item, cwd), mtimeMs: item.candidate.mtimeMs });
     }
-    return { rows, unknown };
+    return { rows: [...newest.values()].map(({ row }) => row), unknown };
   }
 
   /**
-   * Reads `candidates` in order into rows, sorted. With a finite `wanted`,
-   * stops once `wanted` rows are certain to come first (a candidate's order
-   * key is at most its mtime, so `candidates` must be in mtime order then).
+   * Reads `candidates` in order into rows, one per session, sorted. A
+   * session copied to several transcripts shows its newest one that has a
+   * row, as the SDK list does. With a finite `wanted`, stops once `wanted`
+   * rows are certain to come first (a candidate's order key is at most its
+   * mtime, so `candidates` must be in mtime order then).
    */
   private async collectRows(
     candidates: readonly TranscriptCandidate[],
     options: {
-      inScope: (cwd: string) => Promise<boolean>;
-      /** Sessions archived by a marker file. */
-      archivedIds: ReadonlySet<string>;
+      inScope: (candidate: TranscriptCandidate, metadata: TranscriptMetadata) => Promise<boolean>;
       /** The rows kept by archive state. */
       archived: ArchivedFilter;
       after?: ListCursor;
@@ -621,18 +636,27 @@ export class SessionIndex {
       unread: (read: ReadonlySet<TranscriptCandidate>) => readonly TranscriptCandidate[];
     },
   ): Promise<IndexRow[]> {
-    const { inScope, archivedIds, archived, after, wanted } = options;
-    const rows: IndexRow[] = [];
+    const { inScope, archived, after, wanted } = options;
+    /** The row of each session (null: left out by the archive filter or
+     *  the cursor), and the mtime of the transcript it is from. */
+    const bySession = new Map<string, { row: IndexRow | null; mtimeMs: number }>();
+    const rows = () =>
+      [...bySession.values()].flatMap(({ row }) => (row ? [row] : [])).sort(compareRows);
     // Read transcripts without a cwd of their own: a sibling of the same
     // directory may supply it, whichever batch it is read in.
     let pending: Resolved[] = [];
     const accept = async (resolved: Resolved, cwd: string) => {
-      // Another path that encodes to the same project directory is not this
-      // cwd (`/a/b` and `/a-b`).
-      if (!(await inScope(cwd))) return;
-      const row = toRow(resolved, cwd, archivedIds.has(resolved.candidate.sessionId.toLowerCase()));
-      if (!archivedFilterKeeps(archived, row.archived)) return;
-      if (!after || isAfter(row, after)) rows.push(row);
+      // The SDK leaves out another path that encodes to the same project
+      // directory (see scopeOf).
+      if (!(await inScope(resolved.candidate, resolved.metadata))) return;
+      const { sessionId, mtimeMs } = resolved.candidate;
+      const previous = bySession.get(sessionId);
+      if (previous && previous.mtimeMs >= mtimeMs) return;
+      const row = toRow(resolved, cwd);
+      // A newer copy that the filter or the cursor leaves out still hides
+      // an older one.
+      const kept = archivedFilterKeeps(archived, row.archived) && (!after || isAfter(row, after));
+      bySession.set(sessionId, { row: kept ? row : null, mtimeMs });
     };
     const settlePending = async () => {
       const left: Resolved[] = [];
@@ -646,10 +670,12 @@ export class SessionIndex {
     const read = new Set<TranscriptCandidate>();
     let index = 0;
     while (index < candidates.length) {
-      if (rows.length >= wanted) {
-        rows.sort(compareRows);
+      if (bySession.size >= wanted) {
+        const sorted = rows();
         // A candidate's order key is at most its mtime.
-        if (candidates[index]!.mtimeMs < rows[wanted - 1]!.orderAtMs) break;
+        if (sorted.length >= wanted && candidates[index]!.mtimeMs < sorted[wanted - 1]!.orderAtMs) {
+          break;
+        }
       }
       const batch = candidates.slice(index, index + READ_BATCH_SIZE);
       index += batch.length;
@@ -680,7 +706,7 @@ export class SessionIndex {
       );
       await settlePending();
     }
-    return rows.sort(compareRows);
+    return rows();
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it
@@ -817,7 +843,6 @@ export class SessionIndex {
     const facts = await scanTranscriptFile(
       candidate.filePath,
       candidate.size,
-      candidate.sessionId,
       headTail,
       previous,
       candidate.ino,
@@ -831,10 +856,11 @@ export class SessionIndex {
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);
     if (fileCwd) this.dirCwds.set(candidate.dirName, fileCwd);
-    const summary = await this.titleOf(candidate, headTail, fileCwd);
+    const { customTitle, summary } = await this.titlesOf(candidate, headTail, fileCwd);
     // No title at all: the SDK does not list it either.
     if (!summary) return null;
-    const archived = isArchivedTitle(summary);
+    // Archived by its name alone.
+    const archived = isArchivedTitle(customTitle);
     // A last message longer than the tail search still ends with its
     // timestamp; the mtime moves with every metadata record.
     const lastMessageAt =
@@ -842,10 +868,12 @@ export class SessionIndex {
       (await lastTimestamp(candidate.filePath, candidate.size)) ??
       candidate.mtimeMs;
     const continuedIn = continuedInSessionId(headTail.tail);
+    const projectCwd = transcriptProjectCwd(headTail);
     return {
       title: sanitizeTitle(archived ? visibleTitle(summary) : summary),
       archived,
       ...(fileCwd && { fileCwd }),
+      ...(projectCwd && { projectCwd }),
       ...(continuedIn && { continuedIn }),
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
       facts,
@@ -853,25 +881,17 @@ export class SessionIndex {
   }
 
   /**
-   * The effective title of the listed transcript (see
-   * {@link effectiveTranscriptTitle}): the last agent name, else the last
-   * custom title, else the SDK title of a session without a name. The SDK
-   * `getSessionInfo` reads the first copy of the session that its search
-   * finds; its answer is used only when that copy is the listed file (same
-   * size and mtime), else the title comes from the listed file itself.
+   * The titles the SDK reports for the listed transcript (`customTitle` and
+   * `summary` of `getSessionInfo`). The SDK reads the first copy of the
+   * session that its search finds; its answer is used only when that copy is
+   * the listed file (same size and mtime), else the same titles are taken
+   * from the listed file itself (see {@link sdkTitles}).
    */
-  private async titleOf(
+  private async titlesOf(
     candidate: TranscriptCandidate,
     headTail: HeadTail,
     fileCwd: string | undefined,
-  ): Promise<string | undefined> {
-    const agentName = await transcriptAgentName(candidate.filePath, candidate.size, headTail);
-    const sidecar = hasTailCustomTitle(headTail.tail)
-      ? undefined
-      : await readSidecarTitle(candidate.filePath, candidate.sessionId);
-    const named =
-      agentName ?? lastCustomTitle(headTail.tail) ?? sidecar ?? lastCustomTitle(headTail.head);
-    if (named !== undefined) return named;
+  ): Promise<SdkTitles> {
     const dir = [fileCwd, candidate.projectPath].find(
       (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
     );
@@ -883,9 +903,13 @@ export class SessionIndex {
       info.fileSize === candidate.size &&
       info.lastModified === Math.trunc(candidate.mtimeMs)
     ) {
-      return info.summary;
+      return { customTitle: info.customTitle, summary: info.summary };
     }
-    return generatedTitle(headTail);
+    const sidecar =
+      tailCustomTitle(headTail.tail) === undefined
+        ? await readSidecarTitle(candidate.filePath, candidate.sessionId)
+        : undefined;
+    return sdkTitles(headTail, sidecar);
   }
 
   /** Whether a successor of a continued transcript holds history: the SDK

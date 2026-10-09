@@ -2925,7 +2925,7 @@ export class ClaudeAcpAgent {
       limit: SESSION_LIST_PAGE_SIZE + 1,
       offset,
     });
-    const page = await this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
+    const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
     const visible = [];
     for (const session of page) {
       if (!session.cwd) continue;

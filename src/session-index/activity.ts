@@ -1,5 +1,5 @@
 /**
- * The `activity` and `usage` of a session list row.
+ * The `activity` and `cost` of a session list row.
  *
  * A session that this connection runs reports the SDK's own state, and
  * `error` when it is idle and its last turn failed with an error (not a
@@ -121,9 +121,10 @@ export function deriveActivity(input: {
   };
 }
 
-/** The cost of a session: the last result of a session this connection runs,
- *  else the last `cost-state` of the transcript. Only a positive amount. */
-export function selectCost(own: OwnSessionState | undefined, facts: TranscriptFacts) {
-  const amount = own?.costUsd !== undefined && own.costUsd > 0 ? own.costUsd : facts.costUsd;
+/** The cost of a session this connection runs: the `total_cost_usd` the SDK
+ *  gave in its last result. Only a positive amount; none for any other
+ *  session. */
+export function selectCost(own: OwnSessionState | undefined): number | undefined {
+  const amount = own?.costUsd;
   return amount !== undefined && Number.isFinite(amount) && amount > 0 ? amount : undefined;
 }

@@ -9,12 +9,13 @@
  * {"type":"agent-name","agentName":"[archived] Title","sessionId":"…"}
  * ```
  *
- * The effective title of a transcript is the last `agentName`, else the last
- * custom title, else the generated or prompt title. Archive writes the prefix
- * and the current title without it; unarchive writes the title without the
- * prefix. Both are cut to the CLI's 200-character title limit. The records
- * are metadata: they move neither `updatedAt` nor the list order. The
- * `claude --resume` picker shows the prefix.
+ * The archive state is read from the custom title alone, as the SDK reports
+ * it (`SDKSessionInfo.customTitle`); the `agent-name` record is written for
+ * AIR and the CLI, never read. Archive writes the prefix and the current
+ * title without it; unarchive writes the title without the prefix. Both are
+ * cut to the CLI's 200-character title limit. The records are metadata: they
+ * move neither `updatedAt` nor the list order. The `claude --resume` picker
+ * shows the prefix.
  */
 
 /** The title prefix of an archived session. */
@@ -43,12 +44,12 @@ function capTitle(title: string): string {
   return title.length <= CLI_TITLE_LIMIT ? title : title.slice(0, CLI_TITLE_LIMIT).trim();
 }
 
-/** Whether an effective title marks its session archived. */
+/** Whether a custom title marks its session archived. */
 export function isArchivedTitle(title: string | undefined): boolean {
   return title !== undefined && ARCHIVED_PATTERN.test(title);
 }
 
-/** The title shown for an effective title: without the archive prefix,
+/** The title shown for a stored title: without the archive prefix,
  *  removed once, as AIR shows it. */
 export function visibleTitle(title: string): string {
   return title.replace(ARCHIVED_PATTERN, "");

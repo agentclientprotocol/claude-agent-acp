@@ -15,11 +15,8 @@
  *   so a reused pid does not count;
  * - a record older than 24 hours counts only when its `procStart` matches.
  *
- * A snapshot is cached for {@link SNAPSHOT_TTL_MS}. A holder check before a
- * destructive operation asks for a fresh one. A CLI child of this process (one
- * this adapter just closed) is no other writer, but it may still flush the
- * transcript while it exits: the check waits for it to go, and a child that
- * outlives the wait counts as a holder.
+ * A snapshot is cached for {@link SNAPSHOT_TTL_MS}. The records tell only the
+ * `state` of a session list row; no operation is refused for them.
  */
 
 import { execFile } from "node:child_process";
@@ -32,10 +29,6 @@ import { errorCode } from "./project-dirs.js";
 const SNAPSHOT_TTL_MS = 5_000;
 const STALE_RECORD_MS = 24 * 60 * 60 * 1000;
 const PS_TIMEOUT_MS = 1_000;
-/** The SDK closes a CLI with stdin EOF, SIGTERM after 2 s and SIGKILL 5 s
- *  later: this covers all of it. */
-const OWN_CHILD_EXIT_TIMEOUT_MS = 8_000;
-const OWN_CHILD_POLL_MS = 100;
 const RECORD_FILE_PATTERN = /^(\d+)\.json$/;
 /** How long a process start time read with `ps` serves a reader that asks
  *  for recent ones (see {@link LiveSessionRegistry.readFiles}). */
@@ -63,12 +56,6 @@ export type LiveRegistryDeps = {
   processStarts?: (pids: number[]) => Promise<Map<number, string>>;
   /** This machine's pid domain, as the CLI computes it. */
   pidDomain?: () => Promise<string>;
-  /** The parent pid of each live pid. */
-  parentPids?: (pids: number[]) => Promise<Map<number, number>>;
-  /** This process's pid, whose CLI children a holder check waits for. */
-  ownPid?: number;
-  /** How long a holder check waits for a CLI child of this process to exit. */
-  ownChildExitTimeoutMs?: number;
 };
 
 /** `<config>/sessions`, where each CLI process registers itself. */
@@ -101,27 +88,6 @@ function defaultProcessStarts(pids: number[]): Promise<Map<number, string>> {
         for (const line of String(stdout ?? "").split("\n")) {
           const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
           if (match) result.set(Number(match[1]), normalizeStart(match[2]!));
-        }
-        resolve(result);
-      },
-    );
-  });
-}
-
-/** The parent pids of `pids`, from one `ps` call. Empty where `ps` is not
- *  available: then no record counts as a child of this process. */
-function defaultParentPids(pids: number[]): Promise<Map<number, number>> {
-  const result = new Map<number, number>();
-  if (pids.length === 0 || process.platform === "win32") return Promise.resolve(result);
-  return new Promise((resolve) => {
-    execFile(
-      "ps",
-      ["-o", "pid=,ppid=", "-p", pids.join(",")],
-      { timeout: PS_TIMEOUT_MS, env: { ...process.env, LC_ALL: "C" } },
-      (_error, stdout) => {
-        for (const line of String(stdout ?? "").split("\n")) {
-          const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-          if (match) result.set(Number(match[1]), Number(match[2]));
         }
         resolve(result);
       },
@@ -190,9 +156,6 @@ export class LiveSessionRegistry {
   private readonly isAlive: (pid: number) => boolean;
   private readonly processStarts: (pids: number[]) => Promise<Map<number, string>>;
   private readonly pidDomain: () => Promise<string>;
-  private readonly parentPids: (pids: number[]) => Promise<Map<number, number>>;
-  private readonly ownPid: number;
-  private readonly ownChildExitTimeoutMs: number;
   /** The start times `ps` gave, by pid, and when. */
   private readonly starts = new Map<number, { start: string; at: number }>();
 
@@ -202,15 +165,12 @@ export class LiveSessionRegistry {
     this.isAlive = deps.isAlive ?? defaultIsAlive;
     this.processStarts = deps.processStarts ?? defaultProcessStarts;
     this.pidDomain = deps.pidDomain ?? defaultPidDomain;
-    this.parentPids = deps.parentPids ?? defaultParentPids;
-    this.ownPid = deps.ownPid ?? process.pid;
-    this.ownChildExitTimeoutMs = deps.ownChildExitTimeoutMs ?? OWN_CHILD_EXIT_TIMEOUT_MS;
   }
 
-  /** The live records by session id. Cached for 5 s unless `fresh`. */
-  snapshot(options: { fresh?: boolean } = {}): Promise<LiveSnapshot> {
+  /** The live records by session id. Cached for 5 s. */
+  snapshot(): Promise<LiveSnapshot> {
     const now = this.now();
-    if (!options.fresh && this.cached && now - this.cached.at < SNAPSHOT_TTL_MS) {
+    if (this.cached && now - this.cached.at < SNAPSHOT_TTL_MS) {
       return this.cached.snapshot;
     }
     const snapshot = this.read()
@@ -218,51 +178,6 @@ export class LiveSessionRegistry {
       .catch(() => new Map<string, LiveRecord>());
     this.cached = { at: now, snapshot };
     return snapshot;
-  }
-
-  /**
-   * A live process that holds `sessionId`, from a fresh read, other than a
-   * CLI child of this process. Session ids match in any case.
-   *
-   * A CLI child of this process (identified by its parent pid) is waited for
-   * (bounded), so that nothing writes the transcript any more when the
-   * caller goes on; one still alive after the wait is returned.
-   *
-   * `ownCli` tells that this process ran a CLI for the session: `running`
-   * (it still runs: it is neither counted nor waited for) or `exiting` (it
-   * was just closed). Where the parent of a holder cannot be told (no `ps`,
-   * as on Windows), a single holder of a session with `ownCli` is taken for
-   * that CLI; any other unidentified holder is returned at once.
-   */
-  async holder(
-    sessionId: string,
-    options: { ownCli?: "running" | "exiting" } = {},
-  ): Promise<LiveRecord | undefined> {
-    const id = sessionId.toLowerCase();
-    const deadline = Date.now() + this.ownChildExitTimeoutMs;
-    for (;;) {
-      let records: LiveRecord[];
-      try {
-        records = (await this.read()).filter((record) => record.sessionId.toLowerCase() === id);
-      } catch {
-        return undefined;
-      }
-      if (records.length === 0) return undefined;
-      const parents = await this.parentPids(records.map(({ pid }) => pid)).catch(
-        () => new Map<number, number>(),
-      );
-      const other = records.find(({ pid }) => {
-        const parent = parents.get(pid);
-        return parent !== undefined && parent !== this.ownPid;
-      });
-      if (other) return other;
-      const unidentified = records.find(({ pid }) => !parents.has(pid));
-      if (unidentified && !(options.ownCli && records.length === 1)) return unidentified;
-      // Only CLI children of this process are left.
-      if (options.ownCli === "running") return undefined;
-      if (Date.now() >= deadline) return records[0];
-      await new Promise((resolve) => setTimeout(resolve, OWN_CHILD_POLL_MS));
-    }
   }
 
   /** Every live record, several per session when several processes hold it. */
