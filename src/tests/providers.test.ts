@@ -527,4 +527,39 @@ describe("providers", () => {
       baseUrl: "https://api.anthropic.com",
     });
   });
+
+  it("recreates live sessions without the cleared provider on logout", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/bin/true");
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://provider.example",
+    });
+    const created = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.logout({});
+
+    expect(originalQuery.close).toHaveBeenCalledOnce();
+    expect(mockQuery).toHaveBeenCalledTimes(2);
+    expect(mockQuery.mock.calls[1][0].options.resume).toBe(created.sessionId);
+    expect(mockQuery.mock.calls[1][0].options.env.ANTHROPIC_BASE_URL).toBe(
+      process.env.ANTHROPIC_BASE_URL,
+    );
+  });
+
+  it("leaves live sessions alone on logout without a routing override", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/bin/true");
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const originalQuery = mockQuery.mock.results[0].value;
+
+    await agent.logout({});
+
+    expect(originalQuery.close).not.toHaveBeenCalled();
+    expect(mockQuery).toHaveBeenCalledOnce();
+  });
 });

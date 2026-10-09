@@ -679,7 +679,40 @@ describe("NativeSubagentRuntime lifecycle", () => {
         "subagent_spawned",
         "worker-1:generation:2",
       ]);
-      expect(route?.(taskUpdate)).toBeNull();
+      // The task outlives the first generation: its updates still reach it.
+      expect(route?.(taskUpdate)).toMatchObject({ sessionId: "worker-1" });
+      const taskState = {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: "shell-1",
+          state: "completed",
+        },
+      } as AcpSessionNotification;
+      expect(route?.(taskState)).toMatchObject({ sessionId: "worker-1" });
+      // A held task can get its tool call id, and so its spawn, after the child finished.
+      const taskSpawned = {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "async_task_spawned",
+          asyncTaskId: "shell-2",
+          name: "npm start",
+          taskType: "shell",
+          description: "npm start",
+          showInTranscript: true,
+          canStop: true,
+        },
+      } as AcpSessionNotification;
+      expect(route?.(taskSpawned)).toMatchObject({ sessionId: "worker-1" });
+      // Every other late update of the finished generation is dropped.
+      const lateOutput = {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "late" },
+        },
+      } as AcpSessionNotification;
+      expect(route?.(lateOutput)).toBeNull();
     });
 
     it("ignores a late update of a completed child without a resume signal", async () => {

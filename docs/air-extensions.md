@@ -860,10 +860,17 @@ The live test only initializes the SDK. It sends no model prompt.
 
 ## Async tasks
 
-Claude can run work in the background, for example a backgrounded Bash command, a workflow, or a monitor.
+Claude can run work in the background, for example a backgrounded Bash command or a workflow.
 The adapter publishes that work as async tasks when the client declares `asyncTasks`.
 Without the capability, the adapter sends no async task update.
 A subagent task (`local_agent`) is not an async task. Native subagent sessions report it.
+A task that a `Monitor` tool call started is not an async task either.
+Monitor streams its output to the model only, so the client gets nothing for it.
+The SDK reports such a task as `local_bash`, so the adapter finds it by the tool of its tool call.
+The `Monitor` tool call stays in the transcript.
+The adapter also ignores a `local_monitor` task.
+A task that a subagent tool call started goes to the subagent session.
+Its spawn, progress and state updates go there also after the subagent finished.
 
 ### Updates
 
@@ -874,12 +881,27 @@ A subagent task (`local_agent`) is not an async task. Native subagent sessions r
 - `async_task_state_update` carries `state` (`running`, `paused`, `completed`, `failed`, or `stopped`) and an optional `summary`.
 - The Bash `tool_call_update` of a backgrounded command carries `_meta.jetbrains.air.asyncTasks.backgrounded: true`.
   The card then shows backgrounded work instead of finished work.
+  Only structured data sets the marker: the `backgroundTaskId` of the tool result, a known background task of the tool call, or a `run_in_background` input.
+
+### Task id and output path
+
+An async task comes only from structured data.
+The sources are `tool_use_result.backgroundTaskId` and the SDK `task_started`, `task_updated`, and `task_notification`.
+The text of a tool result never creates a task, because a foreground command can print any text.
+The output path comes from `output_file` of the SDK events when they have it.
+Otherwise the adapter reads the text of the tool result of the task's own tool call.
+It takes only an absolute path that ends with `tasks/<task id>.output`, followed by a period, whitespace or the end of the text.
+The path starts after the nearest `": "` before that end on the same line, so it can hold spaces.
+A path never holds the end of another path.
+A POSIX, a Windows drive, and a UNC path count. A path across a line does not.
+The tool result can come before or after the SDK names the task.
+A subagent tool result has no `tool_use_result`, so this text is the only path source there.
 
 ### Tool call of a task
 
 The adapter sends `async_task_spawned` only after it knows the tool call that started the task.
 The SDK gives that id as `tool_use_id` of `task_started`, `task_progress`, or `task_notification`.
-The Bash result of a backgrounded command also gives it.
+The structured Bash result of a backgrounded command also gives it.
 Until the id arrives, the adapter holds the task. It sends no update of a held task.
 The progress and state updates of a held task follow its spawn, in their order.
 A held task gets its spawn without `toolCallId` when it ends first, or when the prompt result ends the turn.

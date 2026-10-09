@@ -12,12 +12,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as v1 from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import {
+  forkSession,
   getSessionMessages,
   type Options,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
+import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
 import { acpProtocolRouter } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
@@ -96,6 +98,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       },
     ]),
     getSessionMessages: vi.fn(async () => []),
+    forkSession: vi.fn(async () => ({ sessionId: "99999999-8888-4777-8666-555555555555" })),
     deleteSession: vi.fn(async () => {}),
   };
 });
@@ -276,14 +279,17 @@ describe("ACP protocol routing", () => {
       version: packageJson.version,
     });
     // The session baseline and the session extensions that the v2 surface serves,
-    // without `fork`; the providers methods are not served yet.
+    // and the providers methods.
     expect(response.capabilities?.session).toEqual({
       prompt: { image: {}, embeddedContext: {} },
       mcp: { stdio: {}, http: {} },
       delete: {},
+      fork: {},
       additionalDirectories: {},
     });
-    expect(response.capabilities?.providers).toBeUndefined();
+    expect(response.capabilities?.providers).toEqual({});
+    // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
+    expect(response._meta?.steering).toBeUndefined();
     expect(response.authMethods?.length).toBeGreaterThan(0);
     for (const method of response.authMethods ?? []) {
       expect(method).not.toHaveProperty("id");
@@ -292,6 +298,20 @@ describe("ACP protocol routing", () => {
     }
   });
 });
+
+/** The commands of every session of the mocked SDK, in v2 form. */
+const SESSION_COMMANDS: v2.AvailableCommand[] = [
+  {
+    name: "review",
+    description: "Review a change",
+    input: { type: "text", hint: "<pull request>" },
+  },
+  {
+    name: "mcp",
+    description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+    input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
+  },
+];
 
 describe("ACP v2 sessions", () => {
   it("creates a session with v2 MCP servers, config options, and commands", async () => {
@@ -305,8 +325,9 @@ describe("ACP v2 sessions", () => {
           { type: "http", name: "linear", url: "https://mcp.linear.app/mcp" },
         ],
       });
-      await vi.waitFor(() => expect(client.updates("available_commands_update")).toHaveLength(1));
       await client.authUpdate(1);
+      // The agent's post-setup work runs on a timer.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       return response;
     });
 
@@ -321,19 +342,32 @@ describe("ACP v2 sessions", () => {
       expect(option).not.toHaveProperty("id");
     }
     expect(response.configOptions?.[0]).toMatchObject({ category: "mode", type: "select" });
-    expect(client.updates("available_commands_update")[0].availableCommands).toEqual([
-      {
-        name: "review",
-        description: "Review a change",
-        input: { type: "text", hint: "<pull request>" },
-      },
-      {
-        name: "mcp",
-        description:
-          "Show the MCP servers and their status, or reconnect, enable, or disable a server",
-        input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
-      },
-    ]);
+    // The commands come in the response, so no update repeats them.
+    expect(response.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
+  });
+
+  it("lists the commands in every setup response: resume, resume with replay, and fork", async () => {
+    const client = v2Client();
+    const responses = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const resumed = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      const replayed = await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      const forked = await agent.request(v2.methods.agent.session.fork, { sessionId, cwd });
+      await client.authUpdate(1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { resumed, replayed, forked };
+    });
+
+    expect(responses.resumed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.replayed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.forked.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
   });
 
   it("rejects an MCP transport that v1 cannot express", async () => {
@@ -407,13 +441,14 @@ describe("ACP v2 sessions", () => {
     expect(client.updates("current_mode_update")).toEqual([]);
   });
 
-  it("tells the agent that a v2 client takes notices", async () => {
+  it("tells the agent that a v2 client takes notices and compaction updates", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
       await initializeV2(agent);
       await authUpdate(1);
     });
     expect(clientSupportsNotices(agents[0].clientCapabilities)).toBe(true);
+    expect(clientSupportsCompactionUpdates(agents[0].clientCapabilities)).toBe(true);
   });
 
   it("forwards the URL elicitation of MCP OAuth to a v2 client", async () => {
@@ -747,6 +782,46 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("forks a session into one that the client can prompt at once", async () => {
+    const forkId = "99999999-8888-4777-8666-555555555555";
+    const echoed = scriptTurns(async function* (options) {
+      yield assistantText(options, "Forked.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const fork = await agent.request(v2.methods.agent.session.fork, {
+        sessionId,
+        cwd,
+        mcpServers: [{ type: "http", name: "linear", url: "https://mcp.linear.app/mcp" }],
+      });
+
+      expect(fork.sessionId).toBe(forkId);
+      expect(fork.configOptions?.map((option) => option.configId)).toContain("mode");
+      expect(forkSession).toHaveBeenCalledWith(sessionId, { dir: cwd });
+      // The fork runs as its own Claude Code session, resumed from the copied
+      // transcript, with the MCP servers of the fork request.
+      const forkQuery = sdk.queryOptions.at(-1)!;
+      expect(forkQuery.resume).toBe(forkId);
+      expect(Object.keys(forkQuery.mcpServers ?? {})).toContain("linear");
+
+      // No session/resume needed before the first prompt.
+      const { messageId } = await agent.request(v2.methods.agent.session.prompt, {
+        sessionId: forkId,
+        prompt: text("go on"),
+      });
+      expect(messageId).toBe(echoed[0]);
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter((update) => update.sessionId === forkId)),
+        ).toContain("idle end_turn"),
+      );
+      await client.authUpdate(1);
+    });
+  });
+
   it("replays a Write without the v1 diff that v2 cannot take", async () => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {
@@ -790,6 +865,93 @@ describe("ACP v2 prompts", () => {
     );
   });
 
+  it("reports Claude Code's warnings as live notices", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "system",
+        subtype: "informational",
+        level: "warning",
+        content: "Stop hook blocked continuation\nThe hook said no.",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "Done.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "notice",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(client.updates("notice")).toEqual([
+      {
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "Stop hook blocked continuation",
+        description: "The hook said no.",
+      },
+    ]);
+  });
+
+  it("replays a compaction as one completed compaction_update at its position", async () => {
+    const summary =
+      "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n" +
+      "Summary:\n1. Primary Request and Intent:\n   Count upward.\n\n" +
+      "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.";
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("user", "prompt-uuid", { role: "user", content: text("count") }),
+        {
+          ...transcriptEntry("user", "summary-uuid", { role: "user", content: summary }),
+          isCompactSummary: true,
+        },
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_after",
+          role: "assistant",
+          content: text("4"),
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      // The materialized form only: no in-progress update and no summary
+      // chunks, and the summary between the messages around it.
+      expect(
+        client.sessionUpdates
+          .slice(before)
+          .map(({ update }) => update)
+          .filter((update) => !update.sessionUpdate.endsWith("_chunk")),
+      ).toEqual([
+        { sessionUpdate: "user_message", messageId: "prompt-uuid", content: [] },
+        {
+          sessionUpdate: "compaction_update",
+          compactionId: "summary-uuid",
+          status: "completed",
+          summary: text("1. Primary Request and Intent:\n   Count upward."),
+        },
+        { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
+      ]);
+      await client.authUpdate(1);
+    });
+  });
+
   it("replays the history before it answers session/resume, clearing each message first", async () => {
     const echoed = scriptTurns(
       async function* (options) {
@@ -827,11 +989,8 @@ describe("ACP v2 prompts", () => {
         replayFrom: { type: "start" },
       });
       const replayed = client.sessionUpdates.slice(before).map(({ update }) => update);
-      // The available commands belong to the resume and arrive before its response, not
-      // after it, so nothing straggles past the answer.
-      expect(replayed.at(-1)?.sessionUpdate).toBe("available_commands_update");
       // The prompt's user message replays under the id that its response returned.
-      expect(replayed.slice(0, -1)).toEqual([
+      expect(replayed).toEqual([
         { sessionUpdate: "user_message", messageId, content: [] },
         { sessionUpdate: "user_message_chunk", messageId, content: text("hi")[0] },
         { sessionUpdate: "agent_message", messageId: "msg_answer", content: [] },
@@ -952,7 +1111,63 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("reports a turn that fails after it was taken in as idle with _error, and shows it", async () => {
+  it("reports a tool call whose run was interrupted as cancelled", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bash",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_bash",
+              content: "[Request interrupted by user for tool use]",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const statuses = client
+      .updates("tool_call_update")
+      .filter((update) => update.toolCallId === "toolu_bash" && update.status)
+      .map((update) => update.status);
+    expect(statuses.at(-1)).toBe("cancelled");
+  });
+
+  it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
     });
@@ -961,21 +1176,20 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual([
-      "user_message",
-      "running",
-      "notice",
-      "idle _error",
-    ]);
-    expect(client.updates("notice")).toEqual([
-      { sessionUpdate: "notice", severity: "error", title: "API Error: 529 Overloaded" },
-    ]);
-    expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: -32603 } } },
+    // The stop reason carries the failure, so no notice repeats it. The error
+    // is the one v1 rejects the prompt with.
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
+    expect(client.updates("notice")).toEqual([]);
+    const v1Error = v1.RequestError.internalError(undefined, "API Error: 529 Overloaded");
+    expect(client.updates("state_update").at(-1)).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: expect.objectContaining({ code: v1Error.code, message: v1Error.message }),
     });
   });
 
@@ -988,14 +1202,18 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    // The client owns the login UI, so the notice does not say to run /login.
-    expect(client.updates("notice")[0]).toMatchObject({ title: "Authentication required" });
+    // The code starts the client's sign-in, which owns the login UI, so the
+    // message does not say to run /login.
     expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: v1.RequestError.authRequired().code } } },
+      stopReason: "error",
+      error: {
+        code: v1.RequestError.authRequired().code,
+        message: "Authentication required",
+      },
     });
   });
 
@@ -1162,8 +1380,28 @@ describe("ACP v2 session translation", () => {
 
   it("fails on session updates that it does not translate yet", () => {
     expect(() =>
-      v2SessionUpdate({ sessionUpdate: "compaction_update", compactionId: "c", status: "started" }),
-    ).toThrow("does not translate compaction_update session updates yet");
+      v2SessionUpdate({
+        sessionUpdate: "subagent_state_update",
+        subagentSessionId: "agent_n",
+        state: "failed",
+      }),
+    ).toThrow("does not translate subagent_state_update session updates yet");
+  });
+
+  it("sends compaction updates as they are, which v1 and v2 share", () => {
+    const update = {
+      sessionUpdate: "compaction_update" as const,
+      compactionId: "c",
+      status: "completed",
+      summary: text("The summary."),
+    };
+    expect(v2SessionUpdate(update)).toEqual(update);
+    const chunk = {
+      sessionUpdate: "compaction_summary_chunk" as const,
+      compactionId: "c",
+      content: { type: "text" as const, text: "The" },
+    };
+    expect(v2SessionUpdate(chunk)).toEqual(chunk);
   });
 
   it("reports the plan of the session as one v2 plan", () => {
@@ -1320,6 +1558,25 @@ describe("ACP v2 session translation", () => {
     expect(terminals.split("s", hook)).toEqual({ terminal: [], report: hook });
   });
 
+  it("leaves an exit code that the agent does not know out of the terminal's exit", () => {
+    const terminals = new V2Terminals();
+    terminals.split("s", {
+      sessionUpdate: "tool_call",
+      toolCallId: "toolu_bash",
+      title: "Terminal",
+      _meta: { terminal_info: { terminal_id: "term" } },
+    });
+    const { terminal } = terminals.split("s", {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "failed",
+      _meta: { terminal_exit: { terminal_id: "term", exit_code: null, signal: null } },
+    });
+    expect(terminal).toEqual([
+      { sessionUpdate: "terminal_update", terminalId: "term", exitStatus: {} },
+    ]);
+  });
+
   it("forgets the terminals of a closed session", () => {
     const terminals = new V2Terminals();
     const named = (sessionId: string) =>
@@ -1396,6 +1653,44 @@ describe("ACP v2 session translation", () => {
     expect(() =>
       v2SessionUpdate({ sessionUpdate: "agent_message_chunk", content: text("hi")[0] }),
     ).toThrow("An ACP v2 agent_message_chunk needs a messageId");
+  });
+});
+
+describe("ACP v2 providers", () => {
+  it("lists, sets, and disables the provider", async () => {
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const list = async () => (await agent.request(v2.methods.agent.providers.list, {})).providers;
+      const [native] = await list();
+      expect(native).toMatchObject({
+        providerId: "main",
+        supported: ["anthropic", "bedrock", "vertex"],
+        required: false,
+      });
+
+      await agent.request(v2.methods.agent.providers.set, {
+        providerId: "main",
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      expect((await list())[0].current).toEqual({
+        apiType: "anthropic",
+        baseUrl: "https://gateway.example.com",
+      });
+      await expect(
+        agent.request(v2.methods.agent.providers.set, {
+          providerId: "other",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example.com",
+        }),
+      ).rejects.toMatchObject({ code: -32602 });
+
+      // Disabling restores the native routing.
+      await agent.request(v2.methods.agent.providers.disable, { providerId: "main" });
+      expect((await list())[0].current).toEqual(native.current);
+      await authUpdate(1);
+    });
   });
 });
 

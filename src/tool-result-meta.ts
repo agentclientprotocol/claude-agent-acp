@@ -3,6 +3,16 @@ export type ToolResultMeta = {
   userFeedback?: string;
 };
 
+/**
+ * Whether Claude Code stamped the result because the tool's run was aborted:
+ * `interrupted` when the turn was interrupted, `cancelled` when the call's own
+ * run was stopped, for example as it moved to the background. The other kinds
+ * (`user-rejected`, `permission-rule`, `automode-*`) mean the tool was refused.
+ */
+export function isAbortedToolResult(meta: ToolResultMeta | undefined): boolean {
+  return meta?.nonExecutionKind === "interrupted" || meta?.nonExecutionKind === "cancelled";
+}
+
 /** Validate the SDK's currently untyped tool_result_meta sidecar. Unknown
  * non-execution kinds are preserved so newer CLIs remain forward-compatible. */
 export function parseToolResultMeta(raw: unknown): Map<string, ToolResultMeta> | undefined {

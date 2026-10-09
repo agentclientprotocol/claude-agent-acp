@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.88.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.87.0...v0.88.0) (2026-10-08)
+
+
+### Features
+
+* **deps:** update Claude SDK ([#1276](https://github.com/agentclientprotocol/claude-agent-acp/issues/1276)) ([0304f74](https://github.com/agentclientprotocol/claude-agent-acp/commit/0304f743f85e2505ad5a67c1fe7b7d24f2f9ad23))
+
+## [0.87.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.86.0...v0.87.0) (2026-10-07)
+
+
+### Features
+
+* **deps:** Bump the minor group with 2 updates ([#1260](https://github.com/agentclientprotocol/claude-agent-acp/issues/1260)) ([0724b17](https://github.com/agentclientprotocol/claude-agent-acp/commit/0724b17c581e30b1242cfbec7bce44c21df99525))
+
+
+### Bug Fixes
+
+* async task routing, Monitor tasks, structured task ids, and abandoned tool calls ([#1249](https://github.com/agentclientprotocol/claude-agent-acp/issues/1249)) ([0e83a06](https://github.com/agentclientprotocol/claude-agent-acp/commit/0e83a06c4a8825ba654bddf1ab909d1a773942e2))
+* settle prompts folded into a task-notification cycle ([#1233](https://github.com/agentclientprotocol/claude-agent-acp/issues/1233)) ([390b0b9](https://github.com/agentclientprotocol/claude-agent-acp/commit/390b0b9f8bf0cc0aa7d9273a7b614172c916d3a6))
+
+## [0.86.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.1...v0.86.0) (2026-10-05)
+
+
+### Features
+
+* answer /mcp in chat with the MCP server status and a reconnect ([#1218](https://github.com/agentclientprotocol/claude-agent-acp/issues/1218)) ([190a00f](https://github.com/agentclientprotocol/claude-agent-acp/commit/190a00f68f773315e93630464397944e645616ff))
+* **deps:** Bump @anthropic-ai/claude-agent-sdk to 0.3.287 ([#1224](https://github.com/agentclientprotocol/claude-agent-acp/issues/1224)) ([ddd5f54](https://github.com/agentclientprotocol/claude-agent-acp/commit/ddd5f541879118edb18df7ff09cd6682d455c710))
+
+
+### Bug Fixes
+
+* count a subagent's permission requests as the turn waiting on the user ([#1241](https://github.com/agentclientprotocol/claude-agent-acp/issues/1241)) ([d599333](https://github.com/agentclientprotocol/claude-agent-acp/commit/d599333b722a951553c0efd40a76559b1f32e6ab))
+* drop queued prompts a cancel ends from Claude Code's queue ([#1228](https://github.com/agentclientprotocol/claude-agent-acp/issues/1228)) ([d83f28a](https://github.com/agentclientprotocol/claude-agent-acp/commit/d83f28a4035c5a5e54950fd58c7b73bfc2313664))
+* end a cancelled turn when the force-cancel fires during an update ([#1243](https://github.com/agentclientprotocol/claude-agent-acp/issues/1243)) ([a44c486](https://github.com/agentclientprotocol/claude-agent-acp/commit/a44c486019e98ad478c549c4902e7092f1418d0b))
+* end a closed session's turns before session/close answers ([#1242](https://github.com/agentclientprotocol/claude-agent-acp/issues/1242)) ([b1d6cfc](https://github.com/agentclientprotocol/claude-agent-acp/commit/b1d6cfc6c9fc9ec397e607b68ac100f4d48745b3))
+* end a held turn cancelled mid-followup at its interrupt's idle ([#1229](https://github.com/agentclientprotocol/claude-agent-acp/issues/1229)) ([d3e673b](https://github.com/agentclientprotocol/claude-agent-acp/commit/d3e673b263cf47603a35a50bb3da8b483199f690))
+* excessive message/token_count API calls when probing context window ([#1258](https://github.com/agentclientprotocol/claude-agent-acp/issues/1258)) ([5598efb](https://github.com/agentclientprotocol/claude-agent-acp/commit/5598efbc8ab16720ea79f5c97db40771ad0b317b))
+* replay a session with a Write on the experimental ACP v2 surface ([#1238](https://github.com/agentclientprotocol/claude-agent-acp/issues/1238)) ([22139f7](https://github.com/agentclientprotocol/claude-agent-acp/commit/22139f73c48e621752089a91fb095269493896b1))
+* report a command's exit code only when the tool result says it ([#1252](https://github.com/agentclientprotocol/claude-agent-acp/issues/1252)) ([52a92be](https://github.com/agentclientprotocol/claude-agent-acp/commit/52a92be959f7f8ea90ab08d54bae6900596ab435))
+* restore main-thread agent config option ([#1250](https://github.com/agentclientprotocol/claude-agent-acp/issues/1250)) ([8589a9c](https://github.com/agentclientprotocol/claude-agent-acp/commit/8589a9cf150d8deca6d2f8ef24404d927b3d4828))
+
 ## [0.85.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.0...v0.85.1) (2026-10-01)
 
 

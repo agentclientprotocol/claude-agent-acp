@@ -14,6 +14,7 @@ import * as path from "node:path";
 
 let capturedOptions: Options | undefined;
 let contextUsageResult: (() => Promise<{ rawMaxTokens: number; model?: string }>) | undefined;
+let contextUsageCalls: Array<{ detail?: "summary" | "full" } | undefined> = [];
 let sessionMessages: Record<string, unknown>[];
 let sessionMessagesResult: () => Promise<Record<string, unknown>[]>;
 let initModels: Record<string, unknown>[] | undefined;
@@ -47,8 +48,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
           return initializationResponse();
         },
         setModel: (model: string) => (setModelImpl ? setModelImpl(model) : Promise.resolve()),
-        getContextUsage: () =>
-          contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE),
+        getContextUsage: (opts?: { detail?: "summary" | "full" }) => {
+          contextUsageCalls.push(opts);
+          return contextUsageResult ? contextUsageResult() : Promise.resolve(DEFAULT_CONTEXT_USAGE);
+        },
         mcpServerStatus: () => mcpServerStatusResult(),
         mcpAuthenticate: (serverName: string) => mcpAuthenticateImpl(serverName),
       });
@@ -94,6 +97,7 @@ describe("createSession options merging", () => {
   beforeEach(async () => {
     capturedOptions = undefined;
     contextUsageResult = undefined;
+    contextUsageCalls = [];
     sessionMessages = [];
     sessionMessagesResult = async () => sessionMessages;
     vi.mocked(getSessionMessages).mockClear();
@@ -196,21 +200,6 @@ describe("createSession options merging", () => {
     });
 
     expect(capturedOptions!.disallowedTools).toContain("AskUserQuestion");
-  });
-
-  it("ignores the provider-specific main-thread agent option", async () => {
-    const response = await agent.newSession({
-      cwd: process.cwd(),
-      mcpServers: [],
-      _meta: {
-        claudeCode: {
-          options: { agent: "reviewer" },
-        },
-      },
-    });
-
-    expect(capturedOptions).not.toHaveProperty("agent");
-    expect(response.configOptions?.some((option) => option.id === "agent")).toBe(false);
   });
 
   it("works when user provides empty disallowedTools", async () => {
@@ -464,6 +453,56 @@ describe("createSession options merging", () => {
         type: "preset",
         preset: "claude_code",
       });
+    });
+
+    it("appends AIR custom instructions to the claude_code preset", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: "Follow the project rules." },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Follow the project rules.",
+      });
+    });
+
+    it("ignores malformed AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: 42 },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+      });
+    });
+
+    it("gives the legacy system prompt precedence over AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          systemPrompt: "legacy prompt",
+          jetbrains: {
+            air: { customInstructions: "AIR instructions" },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("legacy prompt");
     });
 
     it("replaces the preset when a string is provided", async () => {
@@ -923,6 +962,15 @@ describe("createSession options merging", () => {
 
       await vi.waitFor(() => expect(sessionFor(response.sessionId).contextWindowSize).toBe(967000));
       expect(sessionFor(response.sessionId).contextWindowAuthoritative).toBe(true);
+    });
+
+    it("asks for the summary context usage so the CLI sends no count_tokens requests", async () => {
+      // The default `full` detail counts each context category with its own
+      // messages/count_tokens request — a burst that hit rate limits on every
+      // model switch — while only `rawMaxTokens` is needed here.
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      await vi.waitFor(() => expect(contextUsageCalls).toEqual([{ detail: "summary" }]));
     });
 
     it("keeps the guessed window when getContextUsage reports a non-positive size", async () => {
