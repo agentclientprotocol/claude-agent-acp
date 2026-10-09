@@ -13,7 +13,6 @@ import {
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
-import { splitNoticeText } from "../session-notices.js";
 import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
@@ -26,10 +25,10 @@ import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
  * - Waiting on a permission request or a question: `requires_action`, and
  *   `running` once none is open.
  * - Ended: `idle` with the stop reason, usage, and `_meta` of the turn.
- * - Failed after it was taken in: `idle` with {@link FAILED_STOP_REASON} and
- *   the JSON-RPC error that v1 answers with in `_meta.claudeCode.error`, and
- *   an error `notice` before it that shows the failure. v2 has no error on
- *   `idle`, and a notice must not be the only report of a failure.
+ * - Failed after it was taken in: `idle` with the `error` stop reason and the
+ *   JSON-RPC error that v1 answers the prompt with, so a client can show its
+ *   message and handle its code as for an error response (for example,
+ *   `-32000` starts the client's sign-in).
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
  *
@@ -74,22 +73,16 @@ export function v2Prompt(
           );
         }
       },
-      failed(error, title) {
+      failed(error) {
         if (!inserted) {
           reject(error);
           return;
         }
-        const failure = jsonRpcError(error);
-        send({
-          sessionUpdate: "notice",
-          severity: "error",
-          ...splitNoticeText(title ?? failure.message, "The turn failed"),
-        });
         send({
           sessionUpdate: "state_update",
           state: "idle",
-          stopReason: FAILED_STOP_REASON,
-          _meta: { claudeCode: { error: failure } },
+          stopReason: "error",
+          error: jsonRpcError(error),
         });
       },
     };
@@ -103,13 +96,6 @@ export function v2Prompt(
     agent.startTurn(request, events).catch(reject);
   });
 }
-
-/**
- * The stop reason of a turn that failed after it was taken in. v2's stop
- * reasons all describe work that ended without an error, and a custom one
- * starts with `_`; clients show it as a generic stop.
- */
-export const FAILED_STOP_REASON = "_error";
 
 /** The JSON-RPC error that v1 answers a failed prompt with. */
 function jsonRpcError(error: unknown): { code: number; message: string; data?: unknown } {

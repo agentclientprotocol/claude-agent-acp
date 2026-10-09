@@ -1083,7 +1083,7 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("reports a turn that fails after it was taken in as idle with _error, and shows it", async () => {
+  it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
     });
@@ -1092,21 +1092,20 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual([
-      "user_message",
-      "running",
-      "notice",
-      "idle _error",
-    ]);
-    expect(client.updates("notice")).toEqual([
-      { sessionUpdate: "notice", severity: "error", title: "API Error: 529 Overloaded" },
-    ]);
-    expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: -32603 } } },
+    // The stop reason carries the failure, so no notice repeats it. The error
+    // is the one v1 rejects the prompt with.
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
+    expect(client.updates("notice")).toEqual([]);
+    const v1Error = v1.RequestError.internalError(undefined, "API Error: 529 Overloaded");
+    expect(client.updates("state_update").at(-1)).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: expect.objectContaining({ code: v1Error.code, message: v1Error.message }),
     });
   });
 
@@ -1119,14 +1118,18 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    // The client owns the login UI, so the notice does not say to run /login.
-    expect(client.updates("notice")[0]).toMatchObject({ title: "Authentication required" });
+    // The code starts the client's sign-in, which owns the login UI, so the
+    // message does not say to run /login.
     expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: v1.RequestError.authRequired().code } } },
+      stopReason: "error",
+      error: {
+        code: v1.RequestError.authRequired().code,
+        message: "Authentication required",
+      },
     });
   });
 
