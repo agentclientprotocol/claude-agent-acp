@@ -43,3 +43,6 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+      - name: Verify queued cancellation and context against the pinned native SDK
+        run: node scripts/native/e2e.mjs

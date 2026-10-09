@@ -1,3 +1,12 @@
+import {
+  RUNTIME_READ_METHOD,
+  RUNTIME_CONTROL_METHOD,
+  parseRuntimeReadRequest,
+  parseRuntimeControlRequest,
+  type RuntimeReadRequest,
+  type RuntimeControlRequest,
+  type RuntimeResponse,
+} from "../desktop-runtime.js";
 /**
  * The experimental draft ACP v2 surface of the adapter.
  *
@@ -56,6 +65,16 @@ export function v2AgentApp(
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
       v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
+    )
+    .onRequest<RuntimeReadRequest, RuntimeResponse>(
+      RUNTIME_READ_METHOD,
+      { parse: parseRuntimeReadRequest },
+      (ctx) => agent.readSessionRuntime(ctx.params, ctx.signal),
+    )
+    .onRequest<RuntimeControlRequest, RuntimeResponse>(
+      RUNTIME_CONTROL_METHOD,
+      { parse: parseRuntimeControlRequest },
+      (ctx) => agent.controlSessionRuntime(ctx.params, ctx.signal),
     )
     .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
     .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))
