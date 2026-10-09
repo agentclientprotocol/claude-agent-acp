@@ -244,7 +244,15 @@ export class SessionIndexConnection {
       mayBeUnwritten: this.isUnwrittenSession(sessionId),
       sidecar: "existing",
     });
-    if (loaded) await this.host.teardownSession(sessionId);
+    if (loaded) {
+      await this.host.teardownSession(sessionId);
+      // The closed CLI may have lost or overwritten the agent name it was
+      // still to write: the transcripts are archived without it once more.
+      await index.retitle(sessionId, archiveTo(true), {
+        mayBeUnwritten: true,
+        sidecar: "existing",
+      });
+    }
     await this.reportArchived(sessionId, true, loaded);
     return {};
   }

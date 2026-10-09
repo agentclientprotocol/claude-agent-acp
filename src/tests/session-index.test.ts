@@ -2970,6 +2970,39 @@ describe("archive state (ACP RFD #2161)", () => {
     expect(interrupt).not.toHaveBeenCalled();
   });
 
+  it("archives and unarchives a running session whose transcript has an agent name", async () => {
+    const session = await writeTranscript({
+      trailer: [
+        ...titleRecords("ignored", "[archived] Fix it"),
+        ...titleRecords("ignored", "Fix it"),
+      ].map((record) => ({ ...record, sessionId: "" })),
+    });
+    const { agent } = await indexAgent();
+    const listed = async () =>
+      (
+        await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "all" }) })
+      ).sessions.map((row) => [row.title, (row._meta as any).jetbrains.air.archived]);
+    const load = () => {
+      agent.sessions[session.id] = runningSession(
+        { cwd: workspace, query: { renameSession: cliRename(session.file, session.id) } },
+        agent,
+        session.id,
+      );
+    };
+
+    // Loading an archived session does not unarchive it: unarchive it live.
+    await agent.archiveSession({ sessionId: session.id });
+    expect(await listed()).toEqual([["Fix it", true]]);
+    load();
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(await listed()).toEqual([["Fix it", false]]);
+
+    // Archive it live: the CLI writes only the custom title.
+    await agent.archiveSession({ sessionId: session.id });
+    expect(agent.sessions[session.id]).toBeUndefined();
+    expect(await listed()).toEqual([["Fix it", true]]);
+  });
+
   it("is not reported for a session not loaded on this connection", async () => {
     const session = await writeTranscript({});
     const { agent, updates } = await indexAgent();

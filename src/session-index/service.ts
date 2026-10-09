@@ -267,6 +267,20 @@ async function ensureTitleRecords(filePath: string, sessionId: string, title: st
   await fs.appendFile(filePath, `${complete ? "" : "\n"}${records}`);
 }
 
+/** Appends the `agent-name` record of `title` when the copy's agent name
+ *  is another one, so its archive state follows `title`. */
+async function ensureAgentName(filePath: string, sessionId: string, title: string) {
+  const { size } = await fs.stat(filePath);
+  const agentName = transcriptAgentName(await readHeadTail(filePath, size));
+  if (agentName === undefined || agentName === title) return;
+  const { last, endsWithNewline } = await lastLines(filePath);
+  const complete = endsWithNewline || last === "";
+  await fs.appendFile(
+    filePath,
+    `${complete ? "" : "\n"}${JSON.stringify({ type: "agent-name", agentName: title, sessionId })}\n`,
+  );
+}
+
 /** The title of one transcript copy as the list reads it (see
  *  {@link effectiveTitle}): its agent name, else the title the SDK reports.
  *  It carries the archive prefix only when the copy is archived: a generated
@@ -545,6 +559,10 @@ export class SessionIndexService {
         if (stored !== undefined) {
           await live.rename(stored);
           live.remember(stored);
+          // The CLI writes the custom title before it answers, the agent name
+          // only later. An older agent name decides the archive state first,
+          // so the copy gets the new one now.
+          if (cli) await ensureAgentName(cli, sessionId, stored);
         } else if (cli) {
           await alignSidecar(cli, current, sessionId);
         }

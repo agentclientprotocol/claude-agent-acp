@@ -1319,8 +1319,9 @@ The archive state lives in the session title, in the format of AIR's own Claude 
 
 - Archive of a session loaded on this connection stops it, as Codex's `thread/archive` unloads its thread:
   1. it cancels the running turn, as `session/cancel` does, and sends the CLI the interrupt;
-  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. Its copies in other project directories get the records from the adapter as a best effort;
+  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. The CLI writes the custom title before it answers and the agent name only later, so when the CLI's transcript has another agent name, the adapter appends the `agent-name` record of the new title to it at once. Its copies in other project directories get the records from the adapter as a best effort;
   3. it closes the session as `session/close` does: the cancelled prompt ends with `cancelled`, and the session is no longer loaded. A later `session/prompt` fails as for a closed session; to work in it again, the client unarchives it and loads it.
+  4. it archives each transcript that the closed CLI left unarchived once more, with the title records.
 
   If the retitle fails, the archive fails and the session stays loaded, with its turn cancelled.
   A new session archived before the CLI wrote its transcript may have none once it is closed: it is then unknown (`-32002`) and not listed.
