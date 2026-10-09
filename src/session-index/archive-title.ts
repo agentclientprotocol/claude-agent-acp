@@ -9,13 +9,13 @@
  * {"type":"agent-name","agentName":"[archived] Title","sessionId":"…"}
  * ```
  *
- * The archive state is read from the custom title alone, as the SDK reports
- * it (`SDKSessionInfo.customTitle`); the `agent-name` record is written for
- * AIR and the CLI, never read. Archive writes the prefix and the current
- * title without it; unarchive writes the title without the prefix. Both are
- * cut to the CLI's 200-character title limit. The records are metadata: they
- * move neither `updatedAt` nor the list order. The `claude --resume` picker
- * shows the prefix.
+ * The archive state follows AIR's native Claude provider (see
+ * {@link effectiveTitle}): the last agent name decides, else the custom title
+ * the SDK reports (`SDKSessionInfo.customTitle`). Archive writes the prefix
+ * and the current title without it; unarchive writes the title without the
+ * prefix. Both are cut to the CLI's 200-character title limit. The records
+ * are metadata: they move neither `updatedAt` nor the list order. The
+ * `claude --resume` picker shows the prefix.
  */
 
 /** The title prefix of an archived session. */
@@ -44,7 +44,8 @@ function capTitle(title: string): string {
   return title.length <= CLI_TITLE_LIMIT ? title : title.slice(0, CLI_TITLE_LIMIT).trim();
 }
 
-/** Whether a custom title marks its session archived. */
+/** Whether a session name (see {@link effectiveTitle}) marks its session
+ *  archived. */
 export function isArchivedTitle(title: string | undefined): boolean {
   return title !== undefined && ARCHIVED_PATTERN.test(title);
 }
@@ -68,6 +69,20 @@ export function storedTitle(title: string, archived: boolean, sessionId: string)
   const visible =
     normalizeStoredTitle(title.replace(ARCHIVED_PREFIXES, "")) || defaultSessionTitle(sessionId);
   return capTitle(archived ? ARCHIVED_TITLE_PREFIX + visible : visible);
+}
+
+/**
+ * The title of a session and its archive state, by the rule of AIR's native
+ * Claude provider: the session's name is its last agent name, else its custom
+ * title, and the session is archived exactly when that name starts with the
+ * prefix. The title is that agent name, else `summary`, the title the SDK
+ * gives the session; it is stored, so it may carry the prefix.
+ */
+export function effectiveTitle(
+  agentName: string | undefined,
+  { customTitle, summary }: { customTitle?: string; summary?: string },
+): { title: string | undefined; archived: boolean } {
+  return { title: agentName ?? summary, archived: isArchivedTitle(agentName ?? customTitle) };
 }
 
 /** The `custom-title` and `agent-name` records of `title`, one per line. */

@@ -18,6 +18,7 @@ import {
   type ListScope,
 } from "../session-index/service.js";
 import {
+  effectiveTitle,
   isArchivedTitle,
   storedTitle,
   titleRecords,
@@ -29,6 +30,7 @@ import {
   scanTranscript,
   scanTranscriptFile,
   sdkTitles,
+  transcriptAgentName,
   type TranscriptFacts,
 } from "../session-index/transcript-scan.js";
 import { firstPrompt } from "../session-index/first-prompt.js";
@@ -906,6 +908,47 @@ describe("archive titles (AIR's Claude format)", () => {
     expect(sdkTitles({ head: prompt, tail: prompt })).toEqual({
       customTitle: undefined,
       summary: "[archived] Looks archived",
+    });
+  });
+
+  it("reads the last top-level agent name of the tail, else of the head", () => {
+    const lines = (...records: object[]) => records.map((r) => JSON.stringify(r)).join("\n");
+    const head = lines({ type: "agent-name", agentName: "Head" });
+    const tail = lines(
+      { type: "agent-name", agentName: "First" },
+      { type: "agent-name", agentName: "Last" },
+      { type: "agent-name", agentName: "  " },
+      { type: "user", toolUseResult: { agentName: "Nested" } },
+      { type: "custom-title", customTitle: "Custom" },
+    );
+    expect(transcriptAgentName({ head, tail })).toBe("Last");
+    expect(
+      transcriptAgentName({ head, tail: lines({ type: "custom-title", customTitle: "C" }) }),
+    ).toBe("Head");
+    expect(transcriptAgentName({ head: "", tail: "" })).toBeUndefined();
+  });
+
+  it("decides the archive state by the agent name first, else the custom title", () => {
+    // The agent name with the prefix, the custom title without: archived.
+    expect(
+      effectiveTitle("[archived] Agent", { customTitle: "Custom", summary: "Custom" }),
+    ).toEqual({ title: "[archived] Agent", archived: true });
+    // The agent name without the prefix, the custom title with it: not archived.
+    expect(
+      effectiveTitle("Agent", { customTitle: "[archived] Custom", summary: "[archived] Custom" }),
+    ).toEqual({ title: "Agent", archived: false });
+    // No agent name: the custom title decides.
+    expect(
+      effectiveTitle(undefined, { customTitle: "[archived] Custom", summary: "[archived] Custom" }),
+    ).toEqual({ title: "[archived] Custom", archived: true });
+    expect(effectiveTitle(undefined, { customTitle: "Custom", summary: "Custom" })).toEqual({
+      title: "Custom",
+      archived: false,
+    });
+    // A generated title is no name.
+    expect(effectiveTitle(undefined, { summary: "[archived] Prompt" })).toEqual({
+      title: "[archived] Prompt",
+      archived: false,
     });
   });
 });

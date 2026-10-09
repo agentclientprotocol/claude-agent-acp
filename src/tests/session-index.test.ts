@@ -845,7 +845,17 @@ describe("_session/archive and _session/unarchive", () => {
     expect((await page("archived")).sessions.map((s) => s.title)).toEqual(["Renamed"]);
   });
 
-  it("read the archive state from the custom title alone, never an agent name", async () => {
+  it("read the archive state from the agent name first, else the custom title, as AIR does", async () => {
+    // The agent name has the prefix, the custom title not: archived.
+    const byAgentName = await writeTranscript({
+      lastMessageAt: Date.parse("2026-01-03T00:00:00Z"),
+      trailer: [
+        { type: "custom-title", customTitle: "Open", sessionId: "" },
+        { type: "agent-name", agentName: "[archived] Open", sessionId: "" },
+      ],
+    });
+    // The custom title has the prefix, the agent name not: not archived,
+    // whichever record comes last.
     const byTitle = await writeTranscript({
       lastMessageAt: Date.parse("2026-01-02T00:00:00Z"),
       trailer: [
@@ -853,11 +863,10 @@ describe("_session/archive and _session/unarchive", () => {
         { type: "custom-title", customTitle: "[archived] Named", sessionId: "" },
       ],
     });
-    const byAgentName = await writeTranscript({
-      trailer: [
-        { type: "custom-title", customTitle: "Open", sessionId: "" },
-        { type: "agent-name", agentName: "[archived] Open", sessionId: "" },
-      ],
+    // No agent name: the custom title decides.
+    const byCustomTitle = await writeTranscript({
+      lastMessageAt: Date.parse("2026-01-01T00:00:00Z"),
+      trailer: [{ type: "custom-title", customTitle: "[archived] Done", sessionId: "" }],
     });
     // A prompt is no name: it never archives a session.
     const byPrompt = await writeTranscript({
@@ -867,22 +876,37 @@ describe("_session/archive and _session/unarchive", () => {
     const { agent } = await indexAgent();
     const rows = async (archived: string) =>
       (await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived }) })).sessions.map(
-        (s) => [s.sessionId, s.title],
+        (s) => [s.sessionId, s.title, airRow(s).archived],
       );
-    expect(await rows("archived")).toEqual([[byTitle.id, "Named"]]);
-    expect(await rows("unarchived")).toEqual([
-      [byAgentName.id, "Open"],
-      [byPrompt.id, "[archived] Looks done"],
+    expect(await rows("archived")).toEqual([
+      [byAgentName.id, "Open", true],
+      [byCustomTitle.id, "Done", true],
     ]);
-    // Archive takes the title as listed.
-    await agent.archiveSession({ sessionId: byAgentName.id });
-    expect(await lastRecords(byAgentName.file)).toEqual(
-      titleRecords(byAgentName.id, "[archived] Open"),
-    );
+    expect(await rows("unarchived")).toEqual([
+      [byTitle.id, "Named", false],
+      [byPrompt.id, "[archived] Looks done", false],
+    ]);
+    // Archive and unarchive take the title and the state as listed, and
+    // write both records.
+    await agent.archiveSession({ sessionId: byTitle.id });
+    expect(await lastRecords(byTitle.file)).toEqual(titleRecords(byTitle.id, "[archived] Named"));
     await agent.archiveSession({ sessionId: byPrompt.id });
     expect(await lastRecords(byPrompt.file)).toEqual(
       titleRecords(byPrompt.id, "[archived] Looks done"),
     );
+    // A rename of a session archived by its agent name keeps the prefix.
+    await agent.renameSessionTitle({ sessionId: byAgentName.id, title: "Renamed" });
+    expect(await lastRecords(byAgentName.file)).toEqual(
+      titleRecords(byAgentName.id, "[archived] Renamed"),
+    );
+    await agent.unarchiveSession({ sessionId: byAgentName.id });
+    expect(await lastRecords(byAgentName.file)).toEqual(titleRecords(byAgentName.id, "Renamed"));
+    await agent.unarchiveSession({ sessionId: byCustomTitle.id });
+    expect(await lastRecords(byCustomTitle.file)).toEqual(titleRecords(byCustomTitle.id, "Done"));
+    expect(await rows("archived")).toEqual([
+      [byTitle.id, "Named", true],
+      [byPrompt.id, "Looks done", true],
+    ]);
   });
 
   it("cut the archived title to the CLI's 200 characters", async () => {
@@ -1087,6 +1111,34 @@ describe("_session/list/subscribe", () => {
     await agent.subscribeSessionList({ cwd: workspace });
     // One watch of the cwd for all of them.
     expect(handlesOf(agent)!.openHandles().watches).toBe(1);
+    await agent.dispose();
+  });
+
+  it("sends the archive state by the agent name first, else the custom title", async () => {
+    const { rowsOf, agent } = await subscribedAgent();
+    const byAgentName = await writeTranscript({
+      trailer: [
+        { type: "custom-title", customTitle: "Open", sessionId: "" },
+        { type: "agent-name", agentName: "[archived] Open", sessionId: "" },
+      ],
+    });
+    const byTitle = await writeTranscript({
+      trailer: [
+        { type: "agent-name", agentName: "Named", sessionId: "" },
+        { type: "custom-title", customTitle: "[archived] Named", sessionId: "" },
+      ],
+    });
+    const byCustomTitle = await writeTranscript({
+      trailer: [{ type: "custom-title", customTitle: "[archived] Done", sessionId: "" }],
+    });
+    const ids = [byAgentName.id, byTitle.id, byCustomTitle.id];
+    expect(await waitFor(() => ids.every((id) => rowsOf(id).length > 0))).toBe(true);
+    const last = (id: string) => rowsOf(id).at(-1)!;
+    expect(ids.map((id) => [last(id).title, airRow(last(id)).archived])).toEqual([
+      ["Open", true],
+      ["Named", false],
+      ["Done", true],
+    ]);
     await agent.dispose();
   });
 
@@ -3662,7 +3714,7 @@ describe("archive in AIR's title format, edge cases", () => {
     );
   });
 
-  it("takes the latest custom title, not an agent name before it", async () => {
+  it("ranks an agent name in the head above a later custom title, as AIR does", async () => {
     const filler = Array.from({ length: 40 }, () => ({
       type: "system",
       subtype: "informational",
@@ -3681,12 +3733,17 @@ describe("archive in AIR's title format, edge cases", () => {
     const [row] = (
       await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "all" }) })
     ).sessions;
-    expect(row!.title).toBe("Plain");
-    expect((row!._meta as any).jetbrains.air.archived).toBe(false);
-    // Already unarchived: nothing is written.
-    const before = await fs.readFile(session.file, "utf8");
+    // The agent name of the head decides, not the custom title of the tail.
+    expect(row!.title).toBe("Done");
+    expect((row!._meta as any).jetbrains.air.archived).toBe(true);
+    // Unarchive writes both records, so the two names agree again.
     await agent.unarchiveSession({ sessionId: session.id });
-    expect(await fs.readFile(session.file, "utf8")).toBe(before);
+    expect(await lastRecords(session.file)).toEqual(titleRecords(session.id, "Done"));
+    const [after] = (
+      await agent.listSessions({ cwd: workspace, _meta: listMeta({ archived: "all" }) })
+    ).sessions;
+    expect(after!.title).toBe("Done");
+    expect((after!._meta as any).jetbrains.air.archived).toBe(false);
   });
 
   it("brings an existing sidecar in line with a transcript already archived", async () => {

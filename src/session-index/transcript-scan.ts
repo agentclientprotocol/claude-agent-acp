@@ -463,6 +463,27 @@ export function tailCustomTitle(tail: string): string | undefined {
   return lastField(tail, "customTitle");
 }
 
+/** The last non-blank top-level `agentName` of the records of `text`, the
+ *  name `/rename`, a `rename_session` and AIR write with the custom title. */
+function lastAgentName(text: string): string | undefined {
+  if (!text.includes('"agentName"')) return undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes('"agentName"')) continue;
+    const value = parseLine(line)?.agentName;
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return undefined;
+}
+
+/** The last agent name of a transcript, as AIR's native Claude provider
+ *  reads it: the top-level `agentName` of any record, from the tail, else
+ *  from the head. */
+export function transcriptAgentName({ head, tail }: HeadTail): string | undefined {
+  return lastAgentName(tail) ?? lastAgentName(head);
+}
+
 /** What the SDK reports as the titles of a session. */
 export type SdkTitles = {
   /** `SDKSessionInfo.customTitle`: the title the CLI or a client set. */

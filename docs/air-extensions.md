@@ -1238,8 +1238,9 @@ The new methods answer it with `-32601`.
 - With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.
   A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
   A row's `cwd` is the session's own directory, so it can be a worktree path.
-- A row's `title` is the title the SDK reports for the session (`summary` of `getSessionInfo`): its custom title (tail, the CLI's `custom-title.json` sidecar, head) or AI title, else the last prompt, a summary or the first prompt.
-  When the SDK reads another copy of the session than the listed transcript, the same title is taken from the listed transcript's 64 KB head and tail. Agent names are not read.
+- A row's `title` is the session's agent name, as AIR's native Claude provider ranks it: the top-level `agentName` of the last record that has one in the transcript's 64 KB tail, else in its 64 KB head.
+  Without one, it is the title the SDK reports for the session (`summary` of `getSessionInfo`): its custom title (tail, the CLI's `custom-title.json` sidecar, head) or AI title, else the last prompt, a summary or the first prompt.
+  When the SDK reads another copy of the session than the listed transcript, the same title is taken from the listed transcript's 64 KB head and tail.
   The `[archived] ` prefix of an archived session is not part of the title (see [Archive](#archive)).
 - Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
 - A session copied to several project directories of the scope is listed once, as the SDK lists it: from its most recently modified transcript that is listed.
@@ -1299,7 +1300,8 @@ Archiving a session stops it; unarchiving does not start it.
 
 The archive state lives in the session title, in the format of AIR's own Claude integration, so AIR's native Claude path and this adapter read and write the same state:
 
-- A session is archived when its name, the custom title the SDK reports for it (`customTitle`), with whitespace collapsed, starts with `[archived] `. Nothing else is read for the archive state: no agent name, and no title that is not a custom title.
+- A session is archived when its name, with whitespace collapsed, starts with `[archived] `. As in AIR's native Claude provider, the name is the agent name (see [List response](#list-response)), else the custom title the SDK reports for it (`customTitle`); the agent name wins when both are there.
+  So an `agent-name` record with the prefix archives a session whose custom title has none, and one without the prefix unarchives a session whose custom title has it. No other title is read for the archive state.
 - Archive appends the title records of `[archived] ` plus the current title without the prefix; unarchive appends those of the title without the prefix. The title is cut to the CLI's limit, its first 200 characters, trimmed; a session without a title is `Session ` plus the first 8 characters of its id.
 - The title records are two lines, appended together to every transcript of the session:
 
@@ -1309,7 +1311,7 @@ The archive state lives in the session title, in the format of AIR's own Claude 
   ```
 
   A transcript already in the requested state gets nothing. A `custom-title.json` sidecar that the adapter finds is rewritten with the same title (also one left in the other state next to a transcript already in the requested state); the adapter creates none. The CLI of a session that runs here writes the sidecar of its own transcript, as for a rename.
-  The current title is the title of each transcript (see [List response](#list-response)), with the prefix only when its custom title has it. For a session that runs here, it is the title last stored through its CLI while the last custom title of its transcript is that title; otherwise the transcript's.
+  The current title is the title of each transcript (see [List response](#list-response)), with the prefix only when the transcript is archived. For a session that runs here, it is the title last stored through its CLI while the last custom title of its transcript is that title; otherwise the transcript's.
   Every `[archived] ` prefix of the current title is removed before one is added, so unarchive also unarchives a title stored with the prefix twice.
   A new session archived before it has a title gets `[archived] Session …`, and keeps `Session …` as its name once unarchived: no title is generated for a named session.
 

@@ -23,7 +23,13 @@ import {
 import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
 import type { OwnSessionState } from "./activity.js";
-import { isArchivedTitle, storedTitle, titleRecords, visibleTitle } from "./archive-title.js";
+import {
+  effectiveTitle,
+  isArchivedTitle,
+  storedTitle,
+  titleRecords,
+  visibleTitle,
+} from "./archive-title.js";
 import {
   ListSubscriptions,
   type ListChanges,
@@ -42,6 +48,7 @@ import {
   readHeadTail,
   sdkTitles,
   tailCustomTitle,
+  transcriptAgentName,
   transcriptProjectCwd,
 } from "./transcript-scan.js";
 import {
@@ -260,9 +267,10 @@ async function ensureTitleRecords(filePath: string, sessionId: string, title: st
   await fs.appendFile(filePath, `${complete ? "" : "\n"}${records}`);
 }
 
-/** The title of one transcript copy as the SDK reports it (see
- *  {@link sdkTitles}). It carries the archive prefix only when its custom
- *  title does: a generated title never archives a session. */
+/** The title of one transcript copy as the list reads it (see
+ *  {@link effectiveTitle}): its agent name, else the title the SDK reports.
+ *  It carries the archive prefix only when the copy is archived: a generated
+ *  title never archives a session. */
 async function copyTitle(filePath: string, sessionId: string): Promise<string | undefined> {
   const { size } = await fs.stat(filePath);
   const headTail = await readHeadTail(filePath, size);
@@ -270,10 +278,11 @@ async function copyTitle(filePath: string, sessionId: string): Promise<string | 
     tailCustomTitle(headTail.tail) === undefined
       ? await readSidecarTitle(filePath, sessionId)
       : undefined;
-  const { customTitle, summary } = sdkTitles(headTail, sidecar);
-  return summary !== undefined && !isArchivedTitle(customTitle) && isArchivedTitle(summary)
-    ? visibleTitle(summary)
-    : summary;
+  const { title, archived } = effectiveTitle(
+    transcriptAgentName(headTail),
+    sdkTitles(headTail, sidecar),
+  );
+  return title !== undefined && !archived && isArchivedTitle(title) ? visibleTitle(title) : title;
 }
 
 /** Rewrites the sidecar of a copy whose title is `current` when the

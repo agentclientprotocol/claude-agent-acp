@@ -22,7 +22,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeTitle } from "../session-titles.js";
-import { isArchivedTitle, visibleTitle } from "./archive-title.js";
+import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,
   encodeProjectPath,
@@ -45,6 +45,7 @@ import {
   scanTranscriptFile,
   sdkTitles,
   tailCustomTitle,
+  transcriptAgentName,
   transcriptProjectCwd,
   type HeadTail,
   type PreviousScan,
@@ -856,11 +857,11 @@ export class SessionIndex {
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);
     if (fileCwd) this.dirCwds.set(candidate.dirName, fileCwd);
-    const { customTitle, summary } = await this.titlesOf(candidate, headTail, fileCwd);
+    const sdk = await this.titlesOf(candidate, headTail, fileCwd);
     // No title at all: the SDK does not list it either.
-    if (!summary) return null;
-    // Archived by its name alone.
-    const archived = isArchivedTitle(customTitle);
+    if (!sdk.summary) return null;
+    // Archived by its name alone: the agent name, else the custom title.
+    const { title = sdk.summary, archived } = effectiveTitle(transcriptAgentName(headTail), sdk);
     // A last message longer than the tail search still ends with its
     // timestamp; the mtime moves with every metadata record.
     const lastMessageAt =
@@ -870,7 +871,7 @@ export class SessionIndex {
     const continuedIn = continuedInSessionId(headTail.tail);
     const projectCwd = transcriptProjectCwd(headTail);
     return {
-      title: sanitizeTitle(archived ? visibleTitle(summary) : summary),
+      title: sanitizeTitle(archived ? visibleTitle(title) : title),
       archived,
       ...(fileCwd && { fileCwd }),
       ...(projectCwd && { projectCwd }),
