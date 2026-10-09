@@ -223,6 +223,7 @@ describe("sessionIndex negotiation", () => {
     "agentFileChangeReport",
     "nativeSubagentSessions",
     "asyncTasks",
+    "customInstructions",
     "recommendedValue",
     "diffPatch",
     "planFile",
