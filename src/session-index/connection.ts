@@ -247,11 +247,19 @@ export class SessionIndexConnection {
     if (loaded) {
       await this.host.teardownSession(sessionId);
       // The closed CLI may have lost or overwritten the agent name it was
-      // still to write: the transcripts are archived without it once more.
-      await index.retitle(sessionId, archiveTo(true), {
-        mayBeUnwritten: true,
-        sidecar: "existing",
-      });
+      // still to write: the transcripts are archived without it once more,
+      // as a best effort, since the CLI took the archived title.
+      try {
+        await index.retitle(sessionId, archiveTo(true), {
+          mayBeUnwritten: true,
+          sidecar: "existing",
+        });
+      } catch (error) {
+        this.host.agent.logger.error(
+          `[session-index] archiving ${sessionId} after its close failed:`,
+          error,
+        );
+      }
     }
     await this.reportArchived(sessionId, true, loaded);
     return {};

@@ -2257,12 +2257,23 @@ describe("session title after an explicit rename", () => {
       lastModified: Date.now(),
     } as any);
     await titles.onTurnEnd(session);
+    // Renamed back to the title the client stored.
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Mine",
+      summary: "Mine",
+      lastModified: Date.now(),
+    } as any);
+    await titles.onTurnEnd(session);
     vi.mocked(getSessionInfo).mockResolvedValueOnce({
       summary: "First prompt",
       lastModified: Date.now(),
     } as any);
     await titles.onTurnEnd(session);
-    expect(updates.map((update) => update.update.title)).toEqual(["Mine", "Renamed in the CLI"]);
+    expect(updates.map((update) => update.update.title)).toEqual([
+      "Mine",
+      "Renamed in the CLI",
+      "Mine",
+    ]);
     expect(generateSessionTitle).not.toHaveBeenCalled();
   });
 });

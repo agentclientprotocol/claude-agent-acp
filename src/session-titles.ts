@@ -174,8 +174,10 @@ export class SessionTitles {
       // No title is generated over the one the client set, but a custom title
       // stored since by someone else (a `/rename`) is adopted, as before.
       const info = await this.readSessionInfo(session);
+      // No client change is in flight, so the stored title is current; an
+      // unchanged one is not published again.
       const stored = info?.customTitle;
-      if (stored && stored !== this.persistedTitle && this.explicit.settledByClient) {
+      if (stored && this.explicit.settledByClient) {
         await this.publish(stored, info.lastModified);
       }
       return;

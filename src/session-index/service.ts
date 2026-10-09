@@ -562,7 +562,15 @@ export class SessionIndexService {
           // The CLI writes the custom title before it answers, the agent name
           // only later. An older agent name decides the archive state first,
           // so the copy gets the new one now.
-          if (cli) await ensureAgentName(cli, sessionId, stored);
+          // A best effort: the CLI took the title, and writes the agent name
+          // itself too.
+          if (cli) {
+            try {
+              await ensureAgentName(cli, sessionId, stored);
+            } catch (error) {
+              this.deps.logError(`writing the agent name of ${sessionId} failed`, error);
+            }
+          }
         } else if (cli) {
           await alignSidecar(cli, current, sessionId);
         }
