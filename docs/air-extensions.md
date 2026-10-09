@@ -1295,6 +1295,7 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
 
 `_session/archive { "sessionId": "…" }` and `_session/unarchive { "sessionId": "…" }` return `{}`.
 Both are idempotent and work for a session that is not loaded.
+Archiving a session stops it; unarchiving does not start it.
 
 The archive state lives in the session title, in the format of AIR's own Claude integration, so AIR's native Claude path and this adapter read and write the same state:
 
@@ -1314,11 +1315,18 @@ The archive state lives in the session title, in the format of AIR's own Claude 
 
 - The list shows the title without the prefix, and so does the `session_info_update { title }` of a loaded session for an AIR client. Another client, and the `claude --resume` picker, show the title as stored, with the prefix.
 
-- Neither loads, resumes, closes or cancels the session: a session that runs on this connection keeps running.
-  Closing, loading or resuming a session does not change its archive state.
-  AIR's native Claude path stops the session's processes before it archives; the adapter leaves them running, and writes the records also when another Claude Code process has the session open, as for [Rename](#rename).
-- A session this connection runs is retitled through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. Its copies in other project directories get the records from the adapter as a best effort.
-- After either, a session loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes.
+- Archive of a session loaded on this connection stops it, as Codex's `thread/archive` unloads its thread:
+  1. it cancels the running turn, as `session/cancel` does, and sends the CLI the interrupt;
+  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. Its copies in other project directories get the records from the adapter as a best effort;
+  3. it closes the session as `session/close` does: the cancelled prompt ends with `cancelled`, and the session is no longer loaded. A later `session/prompt` fails as for a closed session; to work in it again, the client unarchives it and loads it.
+
+  If the retitle fails, the archive fails and the session stays loaded, with its turn cancelled.
+  A new session archived before the CLI wrote its transcript may have none once it is closed: it is then unknown (`-32002`) and not listed.
+
+- Unarchive neither loads nor resumes the session. A session loaded on this connection keeps running and is retitled through its CLI, as for archive.
+- Archive and unarchive of a session that is not loaded here write the title records, also when another Claude Code process has the session open, as for [Rename](#rename). That process keeps running. AIR's native Claude path stops the session's processes before it archives.
+- Closing, loading or resuming a session does not change its archive state.
+- After either, a session that was loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes. An archive sends it once the session is closed, as the last update of the session.
 - Neither changes `updatedAt` or the list order: the title records are metadata.
 - A session without a transcript (unknown, deleted, or removed by the CLI cleanup) is `-32002`. Unarchive never brings back a deleted session.
   Only a new session that runs on this connection and has not finished a turn yet may have no transcript: it can be archived before the CLI writes one, and the CLI writes the title with it.
@@ -1384,7 +1392,7 @@ It is idempotent, and an unknown id also returns `{}`.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
-`session/load`, `session/resume`, `session/prompt`, rename, archive, unarchive and delete all work on a session that another live Claude Code process has open, for every client, as the Claude CLI does.
+`session/load`, `session/resume`, `session/prompt`, rename, archive, unarchive and delete all work on a session that another live Claude Code process has open, for every client, as the Claude CLI does. Archive stops only a session that runs on this connection.
 
 ### Errors
 
@@ -1396,7 +1404,7 @@ It is idempotent, and an unknown id also returns `{}`.
 ### Relation to the RFDs
 
 The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
-Names and semantics follow them; the transport differs, and so does the `archived` list filter (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
+Names and semantics follow them; the transport differs, and so do the `archived` list filter and the archive of a running session (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
 
 | Extension                                                                                         | RFD                                                                    |
 | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -1416,8 +1424,10 @@ Names and semantics follow them; the transport differs, and so does the `archive
 
 ### Relation to ACP RFD #2161
 
-The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, an unchanged `updatedAt`, and execution left alone.
-It differs in transport, until the RFD lands in the SDK, and in the list filter:
+The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, and an unchanged `updatedAt`.
+It differs in transport, until the RFD lands in the SDK, in the list filter, and in execution:
+
+- archive stops a session that runs on this connection, as `session/close` does, where #2161 leaves execution alone. The "Session list extensions" RFD proposes this change to #2161;
 
 - the list parameter has three values, not two: `"unarchived"` is the RFD's `false` (and the default of both), `"all"` its `true`, and `"archived"`, the archived sessions only, has no RFD counterpart;
 - the methods are `_session/archive` and `_session/unarchive`, not `session/archive` and `session/unarchive`;

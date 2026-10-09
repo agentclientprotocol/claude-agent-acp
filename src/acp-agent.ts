@@ -2542,6 +2542,7 @@ export class ClaudeAcpAgent {
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
     agent: this,
     isAirClient: () => this.toolCallCapabilities.air.client,
+    interruptSession: (sessionId) => this.cancelTurns({ sessionId }, { awaitInterrupt: false }),
     teardownSession: (sessionId) => this.teardownSession(sessionId),
   });
 

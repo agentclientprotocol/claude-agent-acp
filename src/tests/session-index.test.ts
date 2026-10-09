@@ -190,6 +190,24 @@ const cliRename = (file: string, sessionId: string) =>
     );
   });
 
+/** A session loaded here whose CLI runs: `query` gets the interrupt and
+ *  close that an archive, which stops the session, calls. */
+function runningSession(
+  overrides: Record<string, any>,
+  agent: ClaudeAcpAgent,
+  sessionId: string,
+): any {
+  return mockSessionState(
+    {
+      ...overrides,
+      query: { interrupt: vi.fn(async () => {}), close: vi.fn(), ...overrides.query },
+      input: { end: vi.fn() },
+    },
+    agent,
+    sessionId,
+  );
+}
+
 const airCapabilities = (response: { _meta?: Record<string, unknown> | null }) =>
   (response._meta as any)?.jetbrains?.air?.capabilities as string[] | undefined;
 
@@ -2391,7 +2409,7 @@ describe("a title record after a torn last line", () => {
     const { agent } = await indexAgent();
     // A running session whose SDK has no rename control request: its CLI
     // holds the title and would write it back.
-    agent.sessions[session.id] = mockSessionState({ cwd: workspace }, agent, session.id) as any;
+    agent.sessions[session.id] = runningSession({ cwd: workspace }, agent, session.id);
     await expect(
       agent.renameSessionTitle({ sessionId: session.id, title: "Later" }),
     ).rejects.toMatchObject({ code: -32600 });
@@ -2763,8 +2781,75 @@ describe("rename of a running session with a copy under another long path", () =
 });
 
 describe("archive state (ACP RFD #2161)", () => {
-  it("is reported to a session loaded here, which keeps running", async () => {
+  it("stops a session loaded here: interrupts it, retitles it through its CLI, then closes it", async () => {
     const session = await writeTranscript({});
+    const { agent, updates } = await indexAgent();
+    const close = vi.fn();
+    const interrupt = vi.fn(async () => {});
+    const rename = cliRename(session.file, session.id);
+    const loaded = mockSessionState(
+      {
+        cwd: workspace,
+        query: { close, interrupt, renameSession: rename },
+        input: { end: vi.fn() },
+      },
+      agent,
+      session.id,
+    ) as any;
+    agent.sessions[session.id] = loaded;
+    const before = await fs.readFile(session.file, "utf8");
+
+    await agent.archiveSession({ sessionId: session.id });
+
+    const archivedMeta = (archived: boolean) => ({
+      sessionId: session.id,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { jetbrains: { air: { version: 1, archived } } },
+      },
+    });
+    expect(updates).toEqual([archivedMeta(true)]);
+    // Interrupted, retitled while its CLI ran, then closed as session/close
+    // (whose cancel interrupts again).
+    expect(interrupt).toHaveBeenCalled();
+    expect(rename.mock.calls).toEqual([["[archived] Fix it", session.id]]);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(interrupt.mock.invocationCallOrder[0]).toBeLessThan(rename.mock.invocationCallOrder[0]!);
+    expect(rename.mock.invocationCallOrder[0]).toBeLessThan(close.mock.invocationCallOrder[0]!);
+    expect(loaded.queryClosed).toBe(true);
+    expect(agent.sessions[session.id]).toBeUndefined();
+    // A prompt fails as for a closed session.
+    await expect(
+      agent.prompt({ sessionId: session.id, prompt: [{ type: "text", text: "go on" }] }),
+    ).rejects.toThrow("Session not found");
+
+    // Unarchive does not reopen it, and reports nothing to the closed session.
+    await agent.unarchiveSession({ sessionId: session.id });
+    expect(agent.sessions[session.id]).toBeUndefined();
+    expect(updates).toEqual([archivedMeta(true)]);
+    expect(rename).toHaveBeenCalledTimes(1);
+    // The CLI wrote the archive title; the adapter wrote the unarchive one.
+    expect(await fs.readFile(session.file, "utf8")).toBe(
+      before +
+        [
+          JSON.stringify({
+            type: "custom-title",
+            customTitle: "[archived] Fix it",
+            sessionId: session.id,
+          }),
+          ...titleRecords(session.id, "Fix it").map((record) => JSON.stringify(record)),
+        ].join("\n") +
+        "\n",
+    );
+  });
+
+  it("is reported to a loaded session on unarchive, which keeps running", async () => {
+    const session = await writeTranscript({
+      trailer: titleRecords("ignored", "[archived] Fix it").map((record) => ({
+        ...record,
+        sessionId: "",
+      })),
+    });
     const { agent, updates } = await indexAgent();
     const close = vi.fn();
     const interrupt = vi.fn(async () => {});
@@ -2775,39 +2860,23 @@ describe("archive state (ACP RFD #2161)", () => {
       session.id,
     ) as any;
     agent.sessions[session.id] = loaded;
-    const before = await fs.readFile(session.file, "utf8");
 
-    await agent.archiveSession({ sessionId: session.id });
     await agent.unarchiveSession({ sessionId: session.id });
 
-    const archivedMeta = (archived: boolean) => ({
-      sessionId: session.id,
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: { jetbrains: { air: { version: 1, archived } } },
+    expect(updates).toEqual([
+      {
+        sessionId: session.id,
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { jetbrains: { air: { version: 1, archived: false } } },
+        },
       },
-    });
-    expect(updates).toEqual([archivedMeta(true), archivedMeta(false)]);
+    ]);
+    expect(rename.mock.calls).toEqual([["Fix it", session.id]]);
     expect(agent.sessions[session.id]).toBe(loaded);
     expect(loaded.queryClosed).toBeFalsy();
     expect(close).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
-    // The CLI titles its own transcript; the adapter does not write it.
-    // The unarchive reads the title the CLI holds, whose agent name the CLI
-    // may not have written yet.
-    expect(rename.mock.calls).toEqual([
-      ["[archived] Fix it", session.id],
-      ["Fix it", session.id],
-    ]);
-    expect(await fs.readFile(session.file, "utf8")).toBe(
-      before +
-        ["[archived] Fix it", "Fix it"]
-          .map((title) =>
-            JSON.stringify({ type: "custom-title", customTitle: title, sessionId: session.id }),
-          )
-          .join("\n") +
-        "\n",
-    );
   });
 
   it("is not reported for a session not loaded on this connection", async () => {
@@ -3143,40 +3212,34 @@ describe("archive of a loaded session without its transcript", () => {
     const stale = randomUUID();
     agent.sessions[stale] = mockSessionState({ queryClosed: true }, agent, stale) as any;
     const finished = randomUUID();
-    agent.sessions[finished] = mockSessionState(
+    agent.sessions[finished] = runningSession(
       { lastTurnEndedAt: Date.now(), query },
       agent,
       finished,
-    ) as any;
+    );
     const resumed = randomUUID();
-    agent.sessions[resumed] = mockSessionState(
-      { resumedFromHistory: true, query },
-      agent,
-      resumed,
-    ) as any;
+    agent.sessions[resumed] = runningSession({ resumedFromHistory: true, query }, agent, resumed);
     for (const sessionId of [stale, finished, resumed]) {
       await expect(agent.archiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
       await expect(agent.unarchiveSession({ sessionId })).rejects.toMatchObject({ code: -32002 });
     }
     expect(updates).toEqual([]);
+    // A failed archive does not close the session.
+    expect(agent.sessions[finished]).toBeDefined();
 
     // The CLI holds the title until it writes the transcript.
     const fresh = randomUUID();
     const rename = vi.fn(async () => {});
-    agent.sessions[fresh] = mockSessionState(
-      { query: { renameSession: rename } },
-      agent,
-      fresh,
-    ) as any;
+    agent.sessions[fresh] = runningSession({ query: { renameSession: rename } }, agent, fresh);
     await agent.archiveSession({ sessionId: fresh });
-    await agent.archiveSession({ sessionId: fresh });
-    await agent.unarchiveSession({ sessionId: fresh });
     const name = `Session ${fresh.slice(0, 8)}`;
-    expect(rename.mock.calls).toEqual([
-      [`[archived] ${name}`, fresh],
-      [name, fresh],
-    ]);
-    expect(updates).toHaveLength(3);
+    expect(rename.mock.calls).toEqual([[`[archived] ${name}`, fresh]]);
+    expect(updates).toHaveLength(1);
+    // The archive closed it: without its CLI, it needs a transcript.
+    expect(agent.sessions[fresh]).toBeUndefined();
+    await expect(agent.archiveSession({ sessionId: fresh })).rejects.toMatchObject({
+      code: -32002,
+    });
   });
 });
 
@@ -3567,26 +3630,23 @@ describe("a transcript without a prompt in its last 4 MB", () => {
 
 describe("archive in AIR's title format, edge cases", () => {
   it("renames a running archived session through its CLI with the prefix kept", async () => {
-    const session = await writeTranscript({});
+    const session = await writeTranscript({
+      trailer: titleRecords("", "[archived] Fix it"),
+    });
     const { agent, updates } = await indexAgent();
     const rename = cliRename(session.file, session.id);
-    agent.sessions[session.id] = mockSessionState(
+    agent.sessions[session.id] = runningSession(
       { cwd: workspace, query: { renameSession: rename } },
       agent,
       session.id,
-    ) as any;
-    await agent.archiveSession({ sessionId: session.id });
+    );
     await agent.renameSessionTitle({ sessionId: session.id, title: "[archived] New" });
-    expect(rename.mock.calls).toEqual([
-      ["[archived] Fix it", session.id],
-      ["[archived] New", session.id],
-    ]);
+    expect(rename.mock.calls).toEqual([["[archived] New", session.id]]);
     expect(updates).toContainEqual({
       sessionId: session.id,
       update: { sessionUpdate: "session_info_update", title: "New" },
     });
   });
-
   it("stores a rename as the CLI keeps it, and never archives by a client title", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
@@ -3716,21 +3776,21 @@ describe("archive in AIR's title format, round two", () => {
   });
 
   it("publishes the title an archived rename stored", async () => {
-    const session = await writeTranscript({});
+    const session = await writeTranscript({
+      trailer: titleRecords("", "[archived] Fix it"),
+    });
     const { agent, updates } = await indexAgent();
-    agent.sessions[session.id] = mockSessionState(
+    agent.sessions[session.id] = runningSession(
       { cwd: workspace, query: { renameSession: cliRename(session.file, session.id) } },
       agent,
       session.id,
-    ) as any;
-    await agent.archiveSession({ sessionId: session.id });
+    );
     await agent.renameSessionTitle({ sessionId: session.id, title: "x".repeat(200) });
     expect(updates.at(-1)).toEqual({
       sessionId: session.id,
       update: { sessionUpdate: "session_info_update", title: "x".repeat(189) },
     });
   });
-
   it("reads the title of a running session from its transcript once the CLI changed it", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
@@ -3741,12 +3801,12 @@ describe("archive in AIR's title format, round two", () => {
         JSON.stringify({ type: "custom-title", customTitle: title, sessionId: session.id }) + "\n",
       );
     });
-    agent.sessions[session.id] = mockSessionState(
+    agent.sessions[session.id] = runningSession(
       { cwd: workspace, query: { renameSession: rename } },
       agent,
       session.id,
-    ) as any;
-    await agent.archiveSession({ sessionId: session.id });
+    );
+    await agent.renameSessionTitle({ sessionId: session.id, title: "First" });
     // A `/rename` in the session, which the adapter does not see.
     await fs.appendFile(
       session.file,
@@ -3756,11 +3816,10 @@ describe("archive in AIR's title format, round two", () => {
     );
     await agent.archiveSession({ sessionId: session.id });
     expect(rename.mock.calls.map(([title]) => title)).toEqual([
-      "[archived] Fix it",
+      "First",
       "[archived] Renamed in the CLI",
     ]);
   });
-
   it("unarchives a resumed session that AIR archived through its CLI", async () => {
     const session = await writeTranscript({ trailer: titleRecords("", "[archived] Done") });
     const { agent } = await indexAgent();
@@ -3816,11 +3875,11 @@ describe("archive in AIR's title format, round three", () => {
     const linkCopy = await writeTranscript({ sessionId: cliCopy.id, cwd: link });
     const { agent } = await indexAgent();
     const rename = cliRename(cliCopy.file, cliCopy.id);
-    agent.sessions[cliCopy.id] = mockSessionState(
+    agent.sessions[cliCopy.id] = runningSession(
       { cwd: link, query: { renameSession: rename } },
       agent,
       cliCopy.id,
-    ) as any;
+    );
     await agent.archiveSession({ sessionId: cliCopy.id });
     expect(rename.mock.calls).toEqual([["[archived] Fix it", cliCopy.id]]);
     expect(await lastRecords(linkCopy.file)).toEqual(titleRecords(cliCopy.id, "[archived] Fix it"));

@@ -91,6 +91,10 @@ export type SessionIndexHost = {
   };
   /** Whether the client is an AIR client. */
   isAirClient(): boolean;
+  /** Cancels the running turns of a session loaded here and sends its CLI
+   *  the interrupt, without awaiting the reply. */
+  interruptSession(sessionId: string): Promise<void>;
+  /** Closes a session loaded here, as `session/close` does. */
   teardownSession(sessionId: string): Promise<void>;
 };
 
@@ -225,28 +229,35 @@ export class SessionIndexConnection {
     return {};
   }
 
-  /** `_session/archive`: hides a session from the default list. Idempotent;
-   *  the session need not be loaded. */
+  /** `_session/archive`: hides a session from the default list and stops
+   *  it. Idempotent; the session need not be loaded. A session loaded here
+   *  is interrupted, retitled through its CLI while that still runs, then
+   *  closed as `session/close` closes it. */
   async archive(params: SessionIdRequest): Promise<EmptyResponse> {
-    return this.setArchived(this.requireService(SESSION_ARCHIVE_METHOD), params, true);
-  }
-
-  /** `_session/unarchive`. Idempotent. */
-  async unarchive(params: SessionIdRequest): Promise<EmptyResponse> {
-    return this.setArchived(this.requireService(SESSION_UNARCHIVE_METHOD), params, false);
-  }
-
-  private async setArchived(
-    index: SessionIndexService,
-    params: SessionIdRequest,
-    archived: boolean,
-  ): Promise<EmptyResponse> {
+    const index = this.requireService(SESSION_ARCHIVE_METHOD);
     const { sessionId } = params;
-    await this.retitle(index, sessionId, archiveTo(archived), undefined, {
+    const loaded = this.host.agent.sessions[sessionId] !== undefined;
+    // No turn goes on after the archive: the interrupt goes to the CLI ahead
+    // of the rename.
+    if (loaded) await this.host.interruptSession(sessionId);
+    await this.retitle(index, sessionId, archiveTo(true), undefined, {
       mayBeUnwritten: this.isUnwrittenSession(sessionId),
       sidecar: "existing",
     });
-    await this.reportArchived(sessionId, archived);
+    if (loaded) await this.host.teardownSession(sessionId);
+    await this.reportArchived(sessionId, true, loaded);
+    return {};
+  }
+
+  /** `_session/unarchive`. Idempotent; it does not load the session. */
+  async unarchive(params: SessionIdRequest): Promise<EmptyResponse> {
+    const index = this.requireService(SESSION_UNARCHIVE_METHOD);
+    const { sessionId } = params;
+    await this.retitle(index, sessionId, archiveTo(false), undefined, {
+      mayBeUnwritten: this.isUnwrittenSession(sessionId),
+      sidecar: "existing",
+    });
+    await this.reportArchived(sessionId, false, this.host.agent.sessions[sessionId] !== undefined);
     return {};
   }
 
@@ -371,11 +382,16 @@ export class SessionIndexConnection {
     );
   }
 
-  /** Tells the client the archive state of a session loaded on this
-   *  connection (`session_info_update` with `_meta.jetbrains.air.archived`,
-   *  RFD #2161's `archived` field). The session itself is not touched. */
-  private async reportArchived(sessionId: string, archived: boolean): Promise<void> {
-    if (!this.host.agent.sessions[sessionId]) return;
+  /** Tells the client the archive state of a session that was loaded on
+   *  this connection (`session_info_update` with
+   *  `_meta.jetbrains.air.archived`, RFD #2161's `archived` field), also
+   *  once the archive closed it. */
+  private async reportArchived(
+    sessionId: string,
+    archived: boolean,
+    loaded: boolean,
+  ): Promise<void> {
+    if (!loaded) return;
     await this.host.agent.client.sessionUpdate({
       sessionId,
       update: {
