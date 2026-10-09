@@ -86,14 +86,19 @@ async function readTail(handle: fs.FileHandle, size: number, window: number): Pr
 export async function readHeadTail(filePath: string, size: number): Promise<HeadTail> {
   const handle = await fs.open(filePath, "r");
   try {
-    const buffer = Buffer.allocUnsafe(CHUNK_SIZE);
-    const first = await handle.read(buffer, 0, Math.min(CHUNK_SIZE, size), 0);
-    const head = buffer.toString("utf8", 0, first.bytesRead);
-    if (size <= CHUNK_SIZE) return { head, tail: head };
-    return { head, tail: await readTail(handle, size, CHUNK_SIZE) };
+    return await readHeadTailOf(handle, size);
   } finally {
     await handle.close();
   }
+}
+
+/** {@link readHeadTail} of a file that is open already. */
+export async function readHeadTailOf(handle: fs.FileHandle, size: number): Promise<HeadTail> {
+  const buffer = Buffer.allocUnsafe(CHUNK_SIZE);
+  const first = await handle.read(buffer, 0, Math.min(CHUNK_SIZE, size), 0);
+  const head = buffer.toString("utf8", 0, first.bytesRead);
+  if (size <= CHUNK_SIZE) return { head, tail: head };
+  return { head, tail: await readTail(handle, size, CHUNK_SIZE) };
 }
 
 /**

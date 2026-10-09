@@ -46,6 +46,7 @@ import {
 } from "./project-dirs.js";
 import {
   readHeadTail,
+  readHeadTailOf,
   sdkTitles,
   tailCustomTitle,
   transcriptAgentName,
@@ -268,17 +269,21 @@ async function ensureTitleRecords(filePath: string, sessionId: string, title: st
 }
 
 /** Appends the `agent-name` record of `title` when the copy's agent name
- *  is another one, so its archive state follows `title`. */
+ *  is another one, so its archive state follows `title`. Reads and appends
+ *  through one handle. */
 async function ensureAgentName(filePath: string, sessionId: string, title: string) {
-  const { size } = await fs.stat(filePath);
-  const agentName = transcriptAgentName(await readHeadTail(filePath, size));
-  if (agentName === undefined || agentName === title) return;
-  const { last, endsWithNewline } = await lastLines(filePath);
-  const complete = endsWithNewline || last === "";
-  await fs.appendFile(
-    filePath,
-    `${complete ? "" : "\n"}${JSON.stringify({ type: "agent-name", agentName: title, sessionId })}\n`,
-  );
+  const handle = await fs.open(filePath, "a+");
+  try {
+    const { size } = await handle.stat();
+    const headTail = await readHeadTailOf(handle, size);
+    const agentName = transcriptAgentName(headTail);
+    if (agentName === undefined || agentName === title) return;
+    const complete = size === 0 || headTail.tail.endsWith("\n");
+    const record = JSON.stringify({ type: "agent-name", agentName: title, sessionId });
+    await handle.appendFile(`${complete ? "" : "\n"}${record}\n`);
+  } finally {
+    await handle.close();
+  }
 }
 
 /** The title of one transcript copy as the list reads it (see
