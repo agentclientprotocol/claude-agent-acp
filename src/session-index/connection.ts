@@ -223,15 +223,6 @@ export class SessionIndexConnection {
     );
   }
 
-  /** A `sessionIndex` client may not open a second writer: loading or
-   *  resuming a session that another live process holds is
-   *  `thread_active_writer`. The CLI that runs the session here does not
-   *  count; another process that resumed it too does. */
-  async assertNoOtherWriter(sessionId: string): Promise<void> {
-    if (!this.service) return;
-    await this.service.assertNotHeldElsewhere(sessionId, this.ownCliState(sessionId));
-  }
-
   /** `_session/rename`: names a session; no generated title replaces it.
    *  An archived session stays archived. */
   async rename(request: RenameSessionRequest): Promise<EmptyResponse> {

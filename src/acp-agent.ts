@@ -2884,7 +2884,6 @@ export class ClaudeAcpAgent {
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    await this.sessionIndex.assertNoOtherWriter(params.sessionId);
     const result = await this.getOrCreateSession(params);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -2894,7 +2893,6 @@ export class ClaudeAcpAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
-    await this.sessionIndex.assertNoOtherWriter(params.sessionId);
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);

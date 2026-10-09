@@ -1387,15 +1387,15 @@ It is idempotent, and an unknown id also returns `{}`.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
-`session/load` and `session/resume` of a `sessionIndex` client refuse a session that another live Claude Code process holds with `thread_active_writer` (the holder rules of [Rename](#rename)), instead of starting a second writer, also when this connection runs the session too. The CLI that runs it here is its own. Other clients open it as before.
+`session/load`, `session/resume` and `session/prompt` open and prompt a session that another live Claude Code process holds, for every client, as the Claude CLI does: `thread_active_writer` is only for the mutations above (rename, archive, unarchive, delete), which write records into a transcript that the other process may be appending to.
 
 ### Errors
 
-| Case                                               | Error                                                               |
-| -------------------------------------------------- | ------------------------------------------------------------------- |
-| Another live Claude Code process holds the session | `-32600` with `data: { reason: "thread_active_writer", sessionId }` |
-| Unknown session                                    | `-32002` with `data: { sessionId }`                                 |
-| Invalid parameters or cursor                       | `-32602`                                                            |
+| Case                                                                                    | Error                                                               |
+| --------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Another live Claude Code process holds the session (rename, archive, unarchive, delete) | `-32600` with `data: { reason: "thread_active_writer", sessionId }` |
+| Unknown session                                                                         | `-32002` with `data: { sessionId }`                                 |
+| Invalid parameters or cursor                                                            | `-32602`                                                            |
 
 ### Relation to the RFDs
 

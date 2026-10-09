@@ -36,7 +36,13 @@ import {
 } from "../session-index/list-subscriptions.js";
 import { SessionTitles } from "../session-titles.js";
 import { initializeClient } from "./helpers.js";
-import { mockSessionState } from "./session-doubles.js";
+import {
+  mockSessionState,
+  successfulResultMessage,
+  userEcho,
+  wrapQuery,
+} from "./session-doubles.js";
+import { Pushable } from "../utils.js";
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -3003,18 +3009,43 @@ describe("load and resume of a session that another process holds", () => {
     return opened;
   };
 
-  it("is thread_active_writer for a sessionIndex client", async () => {
+  it("opens it for a sessionIndex client, as the CLI does", async () => {
     const session = await writeTranscript({});
     await registerHolder(process.pid, session.id);
     const { agent } = await indexAgent();
     const opened = stubOpen(agent);
-    for (const open of [
-      () => agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
-      () => agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
-    ]) {
-      await expect(open()).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
+    await agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    await agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    expect(opened).toHaveBeenCalledTimes(2);
+  });
+
+  it("loads and prompts it for a sessionIndex client", async () => {
+    const session = await writeTranscript({});
+    await registerHolder(process.pid, session.id);
+    const { agent } = await indexAgent();
+    (agent as any).sendAvailableCommandsUpdate = vi.fn(async () => {});
+    const input = new Pushable<any>();
+    async function* turn() {
+      const { value: user } = await input[Symbol.asyncIterator]().next();
+      yield { ...userEcho(user), session_id: session.id };
+      yield successfulResultMessage({ session_id: session.id });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
     }
-    expect(opened).not.toHaveBeenCalled();
+    (agent as any).createSessionWhileReplaying = vi.fn(async () => {
+      agent.sessions[session.id] = mockSessionState(
+        { cwd: workspace, query: wrapQuery(turn()), input },
+        agent,
+        session.id,
+      );
+      return { sessionId: session.id };
+    });
+
+    await agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    const response = await agent.prompt({
+      sessionId: session.id,
+      prompt: [{ type: "text", text: "go on" }],
+    });
+    expect(response.stopReason).toBe("end_turn");
   });
 
   it("opens as before for a client without sessionIndex", async () => {
@@ -3185,19 +3216,17 @@ describe("list cursor scope", () => {
 });
 
 describe("open a session that runs here and that another process resumed", () => {
-  it("is thread_active_writer for a sessionIndex client", async () => {
+  it("opens it for a sessionIndex client", async () => {
     const session = await writeTranscript({});
     const { agent } = await indexAgent();
     agent.sessions[session.id] = mockSessionState({}, agent, session.id) as any;
     await registerHolder(process.pid, session.id);
-    (agent as any).getOrCreateSession = vi.fn();
-    await expect(
-      agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
-    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
-    await expect(
-      agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] }),
-    ).rejects.toMatchObject({ data: { reason: "thread_active_writer" } });
-    expect((agent as any).getOrCreateSession).not.toHaveBeenCalled();
+    (agent as any).getOrCreateSession = vi.fn(async () => ({ sessionId: session.id }));
+    (agent as any).replaySessionHistory = vi.fn(async () => {});
+    (agent as any).sendAvailableCommandsUpdate = vi.fn(async () => {});
+    await agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    await agent.loadSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
+    expect((agent as any).getOrCreateSession).toHaveBeenCalledTimes(2);
   });
 });
 
