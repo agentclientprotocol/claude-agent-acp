@@ -299,6 +299,20 @@ describe("ACP protocol routing", () => {
   });
 });
 
+/** The commands of every session of the mocked SDK, in v2 form. */
+const SESSION_COMMANDS: v2.AvailableCommand[] = [
+  {
+    name: "review",
+    description: "Review a change",
+    input: { type: "text", hint: "<pull request>" },
+  },
+  {
+    name: "mcp",
+    description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+    input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
+  },
+];
+
 describe("ACP v2 sessions", () => {
   it("creates a session with v2 MCP servers, config options, and commands", async () => {
     const client = v2Client();
@@ -311,8 +325,9 @@ describe("ACP v2 sessions", () => {
           { type: "http", name: "linear", url: "https://mcp.linear.app/mcp" },
         ],
       });
-      await vi.waitFor(() => expect(client.updates("available_commands_update")).toHaveLength(1));
       await client.authUpdate(1);
+      // The agent's post-setup work runs on a timer.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       return response;
     });
 
@@ -327,19 +342,32 @@ describe("ACP v2 sessions", () => {
       expect(option).not.toHaveProperty("id");
     }
     expect(response.configOptions?.[0]).toMatchObject({ category: "mode", type: "select" });
-    expect(client.updates("available_commands_update")[0].availableCommands).toEqual([
-      {
-        name: "review",
-        description: "Review a change",
-        input: { type: "text", hint: "<pull request>" },
-      },
-      {
-        name: "mcp",
-        description:
-          "Show the MCP servers and their status, or reconnect, enable, or disable a server",
-        input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
-      },
-    ]);
+    // The commands come in the response, so no update repeats them.
+    expect(response.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
+  });
+
+  it("lists the commands in every setup response: resume, resume with replay, and fork", async () => {
+    const client = v2Client();
+    const responses = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const resumed = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      const replayed = await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      const forked = await agent.request(v2.methods.agent.session.fork, { sessionId, cwd });
+      await client.authUpdate(1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { resumed, replayed, forked };
+    });
+
+    expect(responses.resumed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.replayed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.forked.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
   });
 
   it("rejects an MCP transport that v1 cannot express", async () => {

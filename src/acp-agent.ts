@@ -18,6 +18,7 @@ import {
   InitializeResponse,
   ListProvidersRequest,
   ListProvidersResponse,
+  McpServer,
   LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
@@ -2796,11 +2797,7 @@ export class ClaudeAcpAgent {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
     });
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(response.sessionId);
-      startMcpAuthentication(this, response.sessionId, params.mcpServers);
-    }, 0);
+    this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
   }
 
@@ -2875,11 +2872,7 @@ export class ClaudeAcpAgent {
     if (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(params.sessionId);
-      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
-    }, 0);
+    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
   }
 
@@ -2897,11 +2890,8 @@ export class ClaudeAcpAgent {
     }
     timing.phase("replay");
 
-    // Send available commands after replay so it doesn't interleave with history
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(params.sessionId);
-      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
-    }, 0);
+    // After the replay, so the commands do not interleave with the history.
+    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
 
     return result;
   }
@@ -8802,22 +8792,44 @@ export class ClaudeAcpAgent {
     };
   }
 
-  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+  /**
+   * The slash commands of the session `sessionId`, as `available_commands_update`
+   * lists them. The SDK reads them from Claude Code's initialization, which
+   * session setup already awaited. Empty when the session does not exist.
+   */
+  async availableCommands(sessionId: string): Promise<AvailableCommand[]> {
     const session = this.sessions[sessionId];
-    if (!session) return;
+    if (!session) return [];
     const commands = await session.query.supportedCommands();
+    return getAvailableSlashCommands(
+      commands,
+      session.terminalSlashCommands,
+      this.toolCallCapabilities.air.client ? session.cwd : undefined,
+      (session.skillPaths ??= new Map()),
+    );
+  }
+
+  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+    if (!this.sessions[sessionId]) return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(
-          commands,
-          session.terminalSlashCommands,
-          this.toolCallCapabilities.air.client ? session.cwd : undefined,
-          (session.skillPaths ??= new Map()),
-        ),
+        availableCommands: await this.availableCommands(sessionId),
       },
     });
+  }
+
+  /**
+   * The work that follows a session setup response: the session's commands,
+   * and MCP server authentication. A v2 client gets the commands in the setup
+   * response itself (`src/v2/agent.ts`), so it gets no update with them here.
+   */
+  private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+    setTimeout(() => {
+      if (!this.v2) this.sendAvailableCommandsUpdate(sessionId);
+      startMcpAuthentication(this, sessionId, mcpServers);
+    }, 0);
   }
 
   private async updateConfigOption(
