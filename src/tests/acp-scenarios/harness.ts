@@ -98,7 +98,10 @@ type QueryOptions = {
     input: Record<string, unknown>,
     extra: Record<string, unknown>,
   ) => Promise<unknown>;
-  hooks?: Record<string, { hooks: ((input: any, id: string, opts: any) => Promise<unknown>)[] }[]>;
+  hooks?: Record<
+    string,
+    { matcher?: string; hooks: ((input: any, id: string, opts: any) => Promise<unknown>)[] }[]
+  >;
 };
 
 /** What a scenario script reads and calls. */
@@ -116,8 +119,13 @@ export interface ScriptContext {
     toolUseID: string,
     extra?: Record<string, unknown>,
   ): Promise<unknown>;
-  /** Calls every hook callback that the agent registered for the event. */
+  /**
+   * Calls the hook callbacks that the agent registered for the event, whose
+   * `matcher`, like Claude Code's, matches the `tool_name` of the input.
+   */
   hook(event: string, input: Record<string, unknown>, toolUseID?: string): Promise<void>;
+  /** Calls the PreToolUse hooks of a tool use, which run before it runs. */
+  preToolUse(toolUseID: string, toolName: string, input: unknown): Promise<void>;
   /** Calls the PostToolUse hooks of a tool use. */
   postToolUse(
     toolUseID: string,
@@ -194,6 +202,13 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       }),
     async hook(event, input, toolUseID) {
       for (const matcher of options.hooks?.[event] ?? []) {
+        if (
+          matcher.matcher &&
+          typeof input.tool_name === "string" &&
+          !new RegExp(`^(?:${matcher.matcher})$`).test(input.tool_name)
+        ) {
+          continue;
+        }
         for (const callback of matcher.hooks) {
           await callback(
             { hook_event_name: event, session_id: sessionId, cwd: script.cwd, ...input },
@@ -202,6 +217,13 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
           );
         }
       }
+    },
+    preToolUse(toolUseID, toolName, input) {
+      return ctx.hook(
+        "PreToolUse",
+        { tool_name: toolName, tool_input: input, tool_use_id: toolUseID },
+        toolUseID,
+      );
     },
     postToolUse(toolUseID, toolName, input, response) {
       return ctx.hook(
@@ -960,6 +982,8 @@ export async function* toolCall(
 ) {
   const parent = outcome.parent ?? null;
   yield* assistantTurn(`msg_${tool.id}`, [{ type: "tool_use", ...tool }], parent);
+  // Claude Code runs the PreToolUse hooks before it asks for permission.
+  await ctx.preToolUse(tool.id, tool.name, tool.input);
   if (outcome.ask) {
     await ctx.canUseTool(
       tool.name,

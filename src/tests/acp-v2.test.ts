@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1110,6 +1110,118 @@ describe("ACP v2 prompts", () => {
       "idle cancelled",
     ]);
   });
+
+  // Hook callbacks bypass the SDK's message queue, so the hook can also come
+  // before the agent has seen the streamed tool_use.
+  it.each([
+    ["after the streamed tool_use", false],
+    ["before the streamed tool_use", true],
+  ])(
+    "shows an auto-approved Edit's exact patch before the Edit runs, with the hook %s",
+    async (_, hookFirst) => {
+      const file = path.join(cwd, "app.ts");
+      await writeFile(file, "line 1\nconst value = 1;\nline 3\n");
+      const input = {
+        file_path: file,
+        old_string: "const value = 1;",
+        new_string: "const value = 2;",
+      };
+      scriptTurns(async function* (options) {
+        const toolUse = {
+          type: "assistant",
+          message: {
+            id: "msg_edit",
+            type: "message",
+            role: "assistant",
+            model: "claude-sonnet-4-6",
+            content: [{ type: "tool_use", id: "toolu_edit", name: "Edit", input }],
+            stop_reason: "tool_use",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        // Claude Code runs the PreToolUse hooks and waits for them; no
+        // permission request comes for an auto-approved Edit.
+        const preToolUse = async () => {
+          for (const matcher of options.hooks?.PreToolUse ?? []) {
+            for (const hook of matcher.hooks) {
+              await hook(
+                {
+                  hook_event_name: "PreToolUse",
+                  session_id: options.sessionId!,
+                  cwd,
+                  tool_name: "Edit",
+                  tool_input: input,
+                  tool_use_id: "toolu_edit",
+                } as never,
+                "toolu_edit",
+                { signal: new AbortController().signal },
+              );
+            }
+          }
+        };
+        if (hookFirst) await preToolUse();
+        yield toolUse;
+        if (!hookFirst) await preToolUse();
+        // The Edit runs.
+        await writeFile(file, "line 1\nconst value = 2;\nline 3\n");
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_edit",
+                content: "The file has been updated.",
+              },
+            ],
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: options.sessionId,
+        };
+        yield result(options);
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await client.authUpdate(1);
+      });
+
+      const edits = client
+        .updates("tool_call_update")
+        .filter((update) => update.toolCallId === "toolu_edit");
+      const withPatch = edits.findIndex((update) =>
+        update.content?.some((item) => item.type === "diff"),
+      );
+      // The patch of the file before the Edit: after it, old_string no longer
+      // matches, and no patch could be built.
+      expect(edits[withPatch]?.content).toEqual([
+        expect.objectContaining({
+          changes: [{ operation: "modify", path: file, fileType: "text" }],
+          patch: {
+            format: "git_patch",
+            text: expect.stringContaining("-const value = 1;\n+const value = 2;\n"),
+          },
+        }),
+      ]);
+      // It arrives before the Edit's result.
+      expect(withPatch).toBeLessThan(edits.findIndex((update) => update.status === "completed"));
+      // The client got the tool call once, with its title, and the stream did
+      // not replace the patch.
+      expect(edits[0]).toMatchObject({ title: expect.any(String) });
+      expect(
+        edits.slice(withPatch + 1).some((update) => update.content && update.content.length === 0),
+      ).toBe(false);
+    },
+  );
 
   it("reports a tool call whose run was interrupted as cancelled", async () => {
     scriptTurns(async function* (options) {

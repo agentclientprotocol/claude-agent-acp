@@ -66,6 +66,7 @@ import {
   FastModeState,
   getSessionMessages,
   getSubagentMessages,
+  HookCallback,
   listSessions,
   McpServerConfig,
   McpServerStatus,
@@ -76,6 +77,7 @@ import {
   Options,
   PermissionMode,
   PermissionResult,
+  PreToolUseHookInput,
   Query,
   query,
   SDKAssistantMessageError,
@@ -8429,6 +8431,106 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /**
+   * The owner of a tool use that Claude Code reports outside the stream, in
+   * `canUseTool` or a hook, for the subagent `agentID` or the root session.
+   * `parentToolUseId` is the Agent/Task tool call that spawned the subagent,
+   * as the streamed subagent path stamps it in `_meta.claudeCode` (see
+   * `liveBackgroundTasks`). `toolCallSessionId` is the session of an eagerly
+   * emitted tool call and of its requests: the subagent's child session once
+   * it is announced, else the root session. In the rare SDK ordering where
+   * the callback beats the spawning Agent/Task frame, the root keeps it; the
+   * later frame announces the child with its correct nested lineage.
+   */
+  private toolUseOwner(
+    session: Session,
+    sessionId: string,
+    agentID: string | undefined,
+  ): { parentToolUseId?: string; toolCallSessionId: string } {
+    const parentToolUseId = agentID
+      ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
+      : undefined;
+    const child =
+      clientSupportsSubagents(this.clientCapabilities) && agentID
+        ? session.nativeSubagentsByTaskId?.get(agentID)
+        : undefined;
+    return {
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+      toolCallSessionId: child?.announced ? child.sessionId : sessionId,
+    };
+  }
+
+  /**
+   * The PreToolUse hook of a v2 connection, for Edit and Write: the tool call
+   * shows the exact patch of the change before the tool runs.
+   *
+   * A v2 diff cannot hold the input's snippet, so without it an auto-approved
+   * Edit or Write would show its change only once it is done. Claude Code runs
+   * the tool only after the hook returns, so the file is as it was before the
+   * change, as for the approval patch of a permission request (which runs
+   * after this hook, and shows the same patch). The hook makes no permission
+   * decision, and a failure only leaves the preview out.
+   */
+  private fileChangePreviewHook(sessionId: string): HookCallback {
+    return async (input, toolUseID) => {
+      if (input.hook_event_name === "PreToolUse" && toolUseID) {
+        await this.previewFileChange(sessionId, input, toolUseID).catch((error) =>
+          this.logger.error(`Session ${sessionId}: failed to preview ${toolUseID}: ${error}`),
+        );
+      }
+      return { continue: true };
+    };
+  }
+
+  private async previewFileChange(
+    sessionId: string,
+    input: PreToolUseHookInput,
+    toolUseID: string,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+    const content = await previewPatchContent(input.tool_name, toolInput, session.cwd, "v2");
+    if (!content) return;
+    const { parentToolUseId, toolCallSessionId } = this.toolUseOwner(
+      session,
+      sessionId,
+      input.agent_id,
+    );
+    // Hook callbacks bypass the stream, so the hook can come before the
+    // streamed tool_use, as `canUseTool` can: then the tool call goes out
+    // with the patch.
+    if (!session.emittedToolCalls.has(toolUseID)) {
+      await this.ensureToolCallEmitted(
+        sessionId,
+        input.tool_name,
+        toolUseID,
+        toolInput,
+        parentToolUseId,
+        undefined,
+        toolCallSessionId,
+        content,
+      );
+      return;
+    }
+    const update: SessionNotification["update"] = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: toolUseID,
+      content,
+    };
+    if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
+    const fields = toolCallFieldsOf(session);
+    if (!fields.apply(update)) return;
+    // The streamed input must not replace the patch, as for an approval patch.
+    fields.pinContent(toolUseID, content);
+    // The stream's router sends it to the session that holds the tool call.
+    if (session.nativeSubagentDeliver) {
+      await session.nativeSubagentDeliver({ sessionId, update });
+    } else {
+      await this.client.sessionUpdate({ sessionId: toolCallSessionId, update });
+    }
+  }
+
   canUseTool(sessionId: string): CanUseTool {
     return async (
       toolName,
@@ -8457,25 +8559,11 @@ export class ClaudeAcpAgent {
         };
       }
 
-      // When the tool call originates inside a subagent, attribute the eagerly
-      // emitted tool_call (and the permission request itself) to the Agent/Task
-      // tool call that spawned the subagent, mirroring the streamed subagent
-      // path's `_meta.claudeCode.parentToolUseId` (see `liveBackgroundTasks`).
-      const parentToolUseId = agentID
-        ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
-        : undefined;
-      const permissionSessionId =
-        clientSupportsSubagents(this.clientCapabilities) && agentID
-          ? (() => {
-              const child = session.nativeSubagentsByTaskId?.get(agentID);
-              // A request must never target a child session before its
-              // subagent_spawned notification. In the rare SDK ordering where
-              // canUseTool beats the spawning Agent/Task frame, keep the
-              // permission on the root session; the later frame will announce
-              // the child with correct nested lineage.
-              return child?.announced ? child.sessionId : sessionId;
-            })()
-          : sessionId;
+      const { parentToolUseId, toolCallSessionId: permissionSessionId } = this.toolUseOwner(
+        session,
+        sessionId,
+        agentID,
+      );
       if (agentID && !parentToolUseId) {
         // The attribution rests on task_started.task_id === canUseTool's
         // agentID for subagent tasks (documented since SDK 0.3.292, which
@@ -9650,6 +9738,17 @@ export class ClaudeAcpAgent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
+        // On v2, an Edit or Write shows its exact patch before it runs, also
+        // when no permission request shows it (`fileChangePreviewHook`): a v2
+        // diff cannot hold the input's snippet.
+        ...(this.v2
+          ? {
+              PreToolUse: [
+                ...(userProvidedOptions?.hooks?.PreToolUse || []),
+                { matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] },
+              ],
+            }
+          : {}),
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
