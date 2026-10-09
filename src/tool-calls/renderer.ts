@@ -4,6 +4,7 @@ import type {
   SessionNotification,
   ToolCallContent,
   ToolCallLocation,
+  ToolCallStatus,
 } from "@agentclientprotocol/sdk";
 import {
   AIR_COMMAND_TITLE_KEY,
@@ -12,6 +13,7 @@ import {
   withAirMeta,
 } from "../air-extension.js";
 import { exitPlanModeRawOutput } from "../exit-plan.js";
+import { isAbortedToolResult, type ToolResultMeta } from "../tool-result-meta.js";
 import { ClientCapabilities } from "./client-capabilities.js";
 import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from "./content.js";
 import type { ToolResultContext, ToolResultFacts, ToolUse, ToolUseFacts } from "./facts.js";
@@ -23,6 +25,19 @@ export type ToolCallUpdate = SessionNotification["update"];
 
 /** The id suffix of the call that clears the plan file of an approved plan for AIR. */
 const PLAN_FILE_CLEAR_SUFFIX = ":plan-file-clear";
+
+/**
+ * ACP v2's `cancelled` tool call status. v1's statuses have no such value, and
+ * the agent builds its reports in v1 types, so it travels as a v1 status. Only
+ * a v2 client gets it, and the v2 surface sends it as it is
+ * (`src/v2/tool-call.ts`).
+ */
+const V2_CANCELLED = "cancelled" as unknown as ToolCallStatus;
+
+/** Whether `status` ends a tool call: `completed`, `failed`, or, on v2, `cancelled`. */
+export function isFinalToolCallStatus(status: ToolCallStatus | null | undefined): boolean {
+  return status === "completed" || status === "failed" || status === V2_CANCELLED;
+}
 
 /** The `_meta` of a tool call report. */
 export type ToolUpdateMeta = {
@@ -133,6 +148,17 @@ export class AcpToolCallRenderer {
     replay = false,
   ): AcpToolCallRenderer {
     return new AcpToolCallRenderer(ClientCapabilities.from(capabilities), replay);
+  }
+
+  /**
+   * The status of a tool result. `nonExecution` is why Claude Code stamped an
+   * error result instead of the tool's output. A run that was aborted is
+   * `cancelled` for a v2 client, which has that status; every other client
+   * gets `failed`, with the kind in `_meta.claudeCode.nonExecutionKind`.
+   */
+  resultStatus(isError: boolean, nonExecution: ToolResultMeta | undefined): ToolCallStatus {
+    if (!isError) return "completed";
+    return this.capabilities.v2 && isAbortedToolResult(nonExecution) ? V2_CANCELLED : "failed";
   }
 
   /** The facts of a tool use. */
@@ -369,7 +395,7 @@ export class AcpToolCallRenderer {
   result(
     toolUse: ToolUse,
     result: ResultBlock,
-    options: { structured?: unknown; nonExecution?: Record<string, unknown> } = {},
+    options: { structured?: unknown; nonExecution?: ToolResultMeta } = {},
   ): ToolCallUpdate[] {
     const { _meta: resultMeta, ...fields } = this.resultFields(toolUse, result, options.structured);
     // AIR shows a read or a search that names a path as the list of viewed
@@ -419,7 +445,7 @@ export class AcpToolCallRenderer {
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      status: result.is_error === true ? "failed" : "completed",
+      status: this.resultStatus(result.is_error === true, options.nonExecution),
       ...(rawOutput !== undefined ? { rawOutput } : {}),
       ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,

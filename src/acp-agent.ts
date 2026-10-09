@@ -260,7 +260,11 @@ import { backgroundedBashToolCall } from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
-import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
+import {
+  AcpToolCallRenderer,
+  isFinalToolCallStatus,
+  type ToolUpdateMeta,
+} from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
 import {
   nodeToWebReadable,
@@ -4039,8 +4043,7 @@ export class ClaudeAcpAgent {
         if (
           claudeMeta?.parentToolUseId ||
           routedNotification.sessionId !== params.sessionId ||
-          update.status === "completed" ||
-          update.status === "failed"
+          isFinalToolCallStatus(update.status)
         ) {
           // A later stream frame can attribute an eager permission call to a
           // child. It must no longer count as this turn's foreground work.
@@ -4069,7 +4072,7 @@ export class ClaudeAcpAgent {
       if (
         toolCallId &&
         update.sessionUpdate === "tool_call_update" &&
-        (update.status === "completed" || update.status === "failed")
+        isFinalToolCallStatus(update.status)
       ) {
         session.eagerToolCallSessions?.delete(toolCallId);
         session.dispatchedToolCalls?.delete(toolCallId);
@@ -11319,10 +11322,10 @@ export function toAcpNotifications(
               update: {
                 toolCallId: chunk.tool_use_id,
                 sessionUpdate: "tool_call_update" as const,
-                status:
-                  "is_error" in chunk && chunk.is_error
-                    ? ("failed" as const)
-                    : ("completed" as const),
+                status: renderer.resultStatus(
+                  "is_error" in chunk && chunk.is_error === true,
+                  nonExecution,
+                ),
                 rawOutput: chunk.content,
               },
             });
@@ -11354,10 +11357,10 @@ export function toAcpNotifications(
               } satisfies ToolUpdateMeta,
               toolCallId: chunk.tool_use_id,
               sessionUpdate: "tool_call_update" as const,
-              status:
-                "is_error" in chunk && chunk.is_error
-                  ? ("failed" as const)
-                  : ("completed" as const),
+              status: renderer.resultStatus(
+                "is_error" in chunk && chunk.is_error === true,
+                nonExecution,
+              ),
               rawOutput: chunk.content,
             },
           });
@@ -11411,7 +11414,7 @@ export function toAcpNotifications(
           const [finalUpdate, ...rest] = renderer
             .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
               structured: toolUseResult,
-              nonExecution: nonExecution as Record<string, unknown> | undefined,
+              nonExecution,
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {

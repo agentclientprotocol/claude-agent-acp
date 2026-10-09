@@ -5528,6 +5528,76 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  it("releases a tool call that ends cancelled on v2, as one that ends failed", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      { v2: true },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          message: {
+            id: "msg-bash",
+            model: "claude-sonnet-4-5",
+            role: "assistant",
+            type: "message",
+            stop_reason: "tool_use",
+            content: [
+              { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+            ],
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        },
+        {
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          // The user interrupted the turn while the command ran.
+          tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bash",
+                content: "[Request interrupted by user for tool use]",
+                is_error: true,
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates
+        .map(({ update }) => update)
+        .filter(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && "status" in update && update.status,
+        )
+        .at(-1),
+    ).toMatchObject({ toolCallId: "toolu_bash", status: "cancelled" });
+    // The agent stops tracking the call once it ends, whichever way.
+    expect(agent.sessions["test-session"]?.dispatchedToolCalls?.has("toolu_bash")).toBe(false);
+  });
+
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,

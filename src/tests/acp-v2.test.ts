@@ -1083,6 +1083,62 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("reports a tool call whose run was interrupted as cancelled", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bash",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_bash",
+              content: "[Request interrupted by user for tool use]",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const statuses = client
+      .updates("tool_call_update")
+      .filter((update) => update.toolCallId === "toolu_bash" && update.status)
+      .map((update) => update.status);
+    expect(statuses.at(-1)).toBe("cancelled");
+  });
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
