@@ -673,6 +673,8 @@ type Turn = {
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
   foregroundToolCallIds?: Set<string>;
+  /** Shared publication for concurrent cancellation settlement paths. */
+  cancelledToolCleanup?: Promise<void>;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -4722,6 +4724,9 @@ export class ClaudeAcpAgent {
           );
           return;
         }
+      } else if (result.stopReason === "cancelled") {
+        await this.failCancelledForegroundTools(params.sessionId, session, turn);
+        if (turn.settled || session.activeTurn !== turn) return;
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -7355,6 +7360,54 @@ export class ClaudeAcpAgent {
     await this.cancelTurns(params, { awaitInterrupt: true });
   }
 
+  /** Cancelled settlement can run in the consumer or directly in cancelTurns. */
+  private failCancelledForegroundTools(
+    sessionId: string,
+    session: Session,
+    turn: Turn,
+  ): Promise<void> {
+    if (turn.cancelledToolCleanup) return turn.cancelledToolCleanup;
+    const backgroundTools = new Set(
+      [...session.liveBackgroundTasks.values()].map((task) => task.parentToolUseId),
+    );
+    const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
+      (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
+    );
+    for (const toolCallId of unfinished) {
+      session.emittedToolCalls.delete(toolCallId);
+      unregisterHookCallback(toolCallId);
+      delete session.toolUseCache[toolCallId];
+      session.toolCallFields?.delete(toolCallId);
+      session.dispatchedToolCalls?.delete(toolCallId);
+    }
+    const publish =
+      session.nativeSubagentDeliver ??
+      (async (notification: AcpSessionNotification) =>
+        this.client.sessionUpdate(asSdkSessionNotification(notification)));
+    turn.cancelledToolCleanup = (async () => {
+      for (const toolCallId of unfinished) {
+        await publish({
+          sessionId,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            status: "failed",
+            content: [
+              {
+                type: "content",
+                content: {
+                  type: "text",
+                  text: "The turn was cancelled before this tool call finished.",
+                },
+              },
+            ],
+          },
+        });
+      }
+    })();
+    return turn.cancelledToolCleanup;
+  }
+
   /** Cancel the session's turns and interrupt the SDK query. With
    *  `awaitInterrupt: false` the interrupt is sent, but its reply is not
    *  awaited. `teardownSession` uses that: it closes the query right after, and
@@ -7532,9 +7585,12 @@ export class ClaudeAcpAgent {
         session.lastSessionState === "running" || session.lastSessionState === "requires_action";
       if (
         active &&
+        !active.settled &&
         (active.settling || (isHeldOpen(active) && !followupLive)) &&
         (active.deferredSettle ?? active.settlingOutcome)
       ) {
+        const outcome = cancelledOutcome(session, active);
+        const cancelledTools = this.failCancelledForegroundTools(params.sessionId, session, active);
         session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
@@ -7567,7 +7623,16 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve(cancelledOutcome(session, active));
+        try {
+          await cancelledTools;
+        } catch (error) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to publish cancelled tool state`,
+            error,
+          );
+        } finally {
+          active.resolve(outcome);
+        }
       }
     }
 
