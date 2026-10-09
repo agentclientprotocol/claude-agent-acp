@@ -14,7 +14,7 @@ import {
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import { splitNoticeText } from "../session-notices.js";
-import type { TurnEvents, TurnOutcome } from "../turn-events.js";
+import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
  * Starts a turn for `params`, and answers when Claude Code takes the prompt
@@ -126,14 +126,19 @@ function jsonRpcError(error: unknown): { code: number; message: string; data?: u
   };
 }
 
+/**
+ * The `idle` of a turn that ended. Every stop reason the agent reports is one
+ * of v2's own, so the state is typed as those members of `IdleStateUpdate`:
+ * the type checker matches each stop reason to its member, which it cannot do
+ * against the whole union with its custom and unknown members.
+ */
 function idle({ stopReason, usage, _meta }: TurnOutcome): v2.SessionUpdate {
-  return {
-    sessionUpdate: "state_update",
-    state: "idle",
+  const state: Extract<v2.IdleStateUpdate, { stopReason: StopReason }> = {
     stopReason,
     ...(usage ? { usage } : {}),
     ...(_meta ? { _meta } : {}),
   };
+  return { sessionUpdate: "state_update", state: "idle", ...state };
 }
 
 /**
