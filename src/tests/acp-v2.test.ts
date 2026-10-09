@@ -1381,11 +1381,11 @@ describe("ACP v2 session translation", () => {
   it("fails on session updates that it does not translate yet", () => {
     expect(() =>
       v2SessionUpdate({
-        sessionUpdate: "subagent_state_update",
-        subagentSessionId: "agent_n",
-        state: "failed",
+        sessionUpdate: "subagent_update",
+        sessionId: "agent_n",
+        state: { state: "idle" },
       }),
-    ).toThrow("does not translate subagent_state_update session updates yet");
+    ).toThrow("does not translate subagent_update session updates yet");
   });
 
   it("sends compaction updates as they are, which v1 and v2 share", () => {

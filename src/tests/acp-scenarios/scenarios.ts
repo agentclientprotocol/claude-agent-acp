@@ -597,8 +597,9 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
-    // With native subagent sessions, AIR gets subagent_spawned, the child tool
-    // calls in the child session, and a failed subagent_state_update.
+    // With native subagent sessions, AIR gets an announcing subagent_update,
+    // the child tool calls in the child session, and a failed subagent_update
+    // state patch.
     name: "subagent-native-sessions",
     turns: [
       async function* (ctx) {

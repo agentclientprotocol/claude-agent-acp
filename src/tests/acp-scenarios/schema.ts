@@ -29,8 +29,12 @@ export const EXTENSION_SESSION_UPDATES = new Set([
   "async_task_spawned",
   "async_task_progress",
   "async_task_state_update",
-  "subagent_spawned",
-  "subagent_state_update",
+  // RFD #1992's rework merged subagent_spawned/subagent_state_update into
+  // one upsert-style subagent_update, and added session_message /
+  // session_message_chunk for directed messages (e.g. a subagent's prompt).
+  "subagent_update",
+  "session_message",
+  "session_message_chunk",
 ]);
 
 /** A validator of one ACP schema, which knows every format the schema uses. */
