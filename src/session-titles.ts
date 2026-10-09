@@ -170,8 +170,18 @@ export class SessionTitles {
    *  not possible do we fall back to `summary`, which for an SDK-driven session
    *  is just the raw first prompt. */
   async onTurnEnd(session: Session): Promise<void> {
-    // A title the client set is final; the session info read below could
-    // still hold the previous one.
+    if (this.explicit.settledByClient) {
+      // No title is generated over the one the client set, but a custom title
+      // stored since by someone else (a `/rename`) is adopted, as before.
+      const info = await this.readSessionInfo(session);
+      const stored = info?.customTitle;
+      if (stored && stored !== this.persistedTitle && this.explicit.settledByClient) {
+        await this.publish(stored, info.lastModified);
+      }
+      return;
+    }
+    // While a client title change is in flight, the session info read below
+    // could still hold the previous title.
     if (this.explicit.active) return;
     const info = await this.readSessionInfo(session);
     if (this.explicit.active) return;

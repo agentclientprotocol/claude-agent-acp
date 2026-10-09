@@ -2227,6 +2227,44 @@ describe("session title after an explicit rename", () => {
     await titles.onTurnEnd(session);
     expect(updates.map((update) => update.update.title)).toEqual(["Mine"]);
   });
+
+  it("adopts a title stored later by someone else, and generates none", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const generateSessionTitle = vi.fn(async () => "Generated");
+    const session: any = {
+      queryClosed: false,
+      cancelled: false,
+      cwd: "/nowhere",
+      query: { generateSessionTitle },
+    };
+    agent.sessions.s1 = session;
+    await titles.setExplicitTitle("Mine", async () => "Mine");
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Mine",
+      summary: "Mine",
+      lastModified: Date.now(),
+    } as any);
+    await titles.onTurnEnd(session);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      customTitle: "Renamed in the CLI",
+      summary: "Renamed in the CLI",
+      lastModified: Date.now(),
+    } as any);
+    await titles.onTurnEnd(session);
+    vi.mocked(getSessionInfo).mockResolvedValueOnce({
+      summary: "First prompt",
+      lastModified: Date.now(),
+    } as any);
+    await titles.onTurnEnd(session);
+    expect(updates.map((update) => update.update.title)).toEqual(["Mine", "Renamed in the CLI"]);
+    expect(generateSessionTitle).not.toHaveBeenCalled();
+  });
 });
 
 describe("worktrees after git worktree move", () => {

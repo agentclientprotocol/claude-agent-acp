@@ -18,6 +18,12 @@ export class ExplicitTitle {
     return this.named || this.pending > 0;
   }
 
+  /** Whether a client named the session and no rename is in flight: a title
+   *  stored since by someone else (a `/rename`) may still be adopted. */
+  get settledByClient(): boolean {
+    return this.named && this.pending === 0;
+  }
+
   reset(): void {
     this.named = false;
   }
