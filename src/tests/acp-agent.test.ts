@@ -54,7 +54,8 @@ import {
 import { SessionTitles } from "../session-titles.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "../usage-markdown.js";
 import { Pushable } from "../utils.js";
-import { initializeClient } from "./helpers.js";
+import { initializeClient, makeMockQuery } from "./helpers.js";
+import * as agentSdk from "@anthropic-ai/claude-agent-sdk";
 import {
   deleteSession,
   forkSession,
@@ -766,6 +767,114 @@ describe.skipIf(!process.env.RUN_INTEGRATION_TESTS)("ACP subprocess integration"
     expect(picked).not.toEqual("");
     expect(client.takeReceivedText().toLowerCase()).toContain(picked.toLowerCase());
   }, 60000);
+});
+
+describe("Central auth settings integration", () => {
+  let fixture: string;
+  let originalConfigDir: string | undefined;
+  let agent: ClaudeAcpAgent;
+  let notification: ReturnType<typeof vi.fn>;
+  let querySpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    fixture = await mkdtemp(path.join(os.tmpdir(), "central-auth-integration-"));
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = path.join(fixture, "user");
+    await mkdir(process.env.CLAUDE_CONFIG_DIR);
+    await mkdir(path.join(fixture, ".claude"));
+    await writeFile(
+      path.join(process.env.CLAUDE_CONFIG_DIR, "settings.json"),
+      JSON.stringify({ apiKeyHelper: "central proxy start" }),
+    );
+    notification = vi.fn(async () => {});
+    agent = new ClaudeAcpAgent(
+      { sessionUpdate: async () => {}, extNotification: notification } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    querySpy = vi.spyOn(agentSdk, "query").mockImplementation(
+      () =>
+        makeMockQuery({
+          initializationResult: async () => ({
+            models: [{ value: "id", displayName: "name", description: "description" }],
+            account: { apiProvider: "firstParty", apiKeySource: "apiKeyHelper" },
+          }),
+        }) as unknown as agentSdk.Query,
+    );
+  });
+
+  afterEach(async () => {
+    for (const sessionId of Object.keys(agent.sessions)) await agent.closeSession({ sessionId });
+    querySpy.mockRestore();
+    if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(fixture, { recursive: true, force: true });
+  });
+
+  it("uses the local project override instead of an unused user Central helper", async () => {
+    await writeFile(
+      path.join(fixture, ".claude", "settings.json"),
+      JSON.stringify({ apiKeyHelper: "central proxy start" }),
+    );
+    await writeFile(
+      path.join(fixture, ".claude", "settings.local.json"),
+      JSON.stringify({ apiKeyHelper: "ordinary-helper" }),
+    );
+    await agent.newSession({ cwd: fixture, mcpServers: [] });
+    expect(notification).toHaveBeenLastCalledWith("_auth/status_update", {
+      authStatus: { kind: "api_key", label: "Anthropic API key", detail: "API key helper" },
+    });
+  });
+
+  it.each(["central proxy start", "", "ordinary-helper"])(
+    "honors the programmatic helper override %j",
+    async (helper) => {
+      await writeFile(
+        path.join(fixture, ".claude", "settings.json"),
+        JSON.stringify({ apiKeyHelper: "decentralized proxy start" }),
+      );
+      await agent.newSession({
+        cwd: fixture,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { apiKeyHelper: helper } } } },
+      });
+      expect(notification).toHaveBeenLastCalledWith("_auth/status_update", {
+        authStatus:
+          helper === "central proxy start"
+            ? { kind: "gateway", label: "JetBrains Air Gateway" }
+            : { kind: "api_key", label: "Anthropic API key", detail: "API key helper" },
+      });
+    },
+  );
+
+  it("does not let a late SDK result restore the previous helper name", async () => {
+    let finishOld!: (value: any) => void;
+    const oldAccount = new Promise<any>((resolve) => {
+      finishOld = resolve;
+    });
+    querySpy.mockImplementationOnce(() =>
+      makeMockQuery({ initializationResult: () => oldAccount }),
+    );
+    const oldSession = agent.newSession({
+      cwd: fixture,
+      mcpServers: [],
+      _meta: { claudeCode: { options: { settings: { apiKeyHelper: "ordinary-helper" } } } },
+    });
+    await vi.waitFor(() => expect(querySpy).toHaveBeenCalledOnce());
+    await agent.newSession({ cwd: fixture, mcpServers: [] });
+    finishOld({
+      models: [{ value: "id", displayName: "name", description: "description" }],
+      account: { apiKeySource: "apiKeyHelper" },
+    });
+    await oldSession;
+    expect(notification.mock.calls).toEqual([
+      [
+        "_auth/status_update",
+        {
+          authStatus: { kind: "gateway", label: "JetBrains Air Gateway" },
+        },
+      ],
+    ]);
+  });
 });
 
 describe("tool conversions", () => {
@@ -4047,7 +4156,11 @@ describe("permission request cancellation", () => {
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -10666,7 +10779,11 @@ describe("session/close", () => {
         availableModels: [],
       },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -10761,7 +10878,11 @@ describe("session/delete", () => {
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -10883,7 +11004,11 @@ describe("getOrCreateSession param change detection", () => {
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -15147,7 +15272,11 @@ describe("post-error recovery", () => {
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -15518,6 +15647,8 @@ describe("post-error recovery", () => {
       },
       {
         settingsManager: {
+          getApiKeyHelper: () => undefined,
+          getCwd: () => "/test",
           dispose: vi.fn(() => {
             throw new Error("dispose boom");
           }),
@@ -20811,7 +20942,11 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       modes: { currentModeId: "default", availableModes: [] },
       models: { currentModelId: "default", availableModels: [] },
       modelInfos: [],
-      settingsManager: { dispose: vi.fn() } as any,
+      settingsManager: {
+        dispose: vi.fn(),
+        getApiKeyHelper: () => undefined,
+        getCwd: () => "/test",
+      } as any,
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
@@ -22714,7 +22849,11 @@ describe("agent selection config option", () => {
         modes: { currentModeId: "default", availableModes: [] },
         models: { currentModelId: "default", availableModels: [] },
         modelInfos: [],
-        settingsManager: { dispose: vi.fn() } as any,
+        settingsManager: {
+          dispose: vi.fn(),
+          getApiKeyHelper: () => undefined,
+          getCwd: () => "/test",
+        } as any,
         accumulatedUsage: {
           inputTokens: 0,
           outputTokens: 0,

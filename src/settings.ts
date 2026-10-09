@@ -177,6 +177,10 @@ export class SettingsManager {
     return this.effective;
   }
 
+  getApiKeyHelper(settingsOverride?: Settings): string | undefined {
+    return settingsOverride?.apiKeyHelper ?? this.effective.apiKeyHelper;
+  }
+
   /**
    * `deniedModels` entries from the managed tier, the only tier the CLI
    * honors them from.

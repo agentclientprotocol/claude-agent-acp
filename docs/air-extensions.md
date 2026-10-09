@@ -200,6 +200,20 @@ The adapter keeps them where they are.
 | `quota`                 | `PromptResponse._meta.quota`                                                                                                              | Token usage of the turn, also split by model.                                      |
 | `authStatus`            | `initialize` response `agentCapabilities._meta.authStatus`                                                                                | The agent pushes `_auth/status_update`. The object carries no payload.             |
 
+## Auth source display
+
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+
+A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
+
+```json
+{ "authStatus": { "kind": "gateway", "label": "JetBrains Air Gateway" } }
+```
+
+Matching is case-insensitive and accepts multiple whitespace characters between `proxy` and `start`. The command's flags, URL, host and route are not checked. This is a weak display heuristic, not proof of configuration provenance, account ownership or entitlement. Inactive helpers and external cloud backends retain their existing classification. No helper command, key, headers, private route or inferred account is included in this payload.
+
+Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
+
 ## Zed conventions
 
 The adapter keeps these Zed and upstream conventions unchanged for every client.

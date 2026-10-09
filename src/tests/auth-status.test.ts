@@ -6,6 +6,9 @@ import type { AuthStatus } from "../auth-status.js";
 import { fromAccountInfo, fromCliStatus, mergeAuthStatus, sameIdentity } from "../auth-status.js";
 import { DEFAULT_CONTEXT_USAGE, makeMockQuery } from "./helpers.js";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import * as os from "node:os";
 
 const mockQuery = vi.hoisted(() => vi.fn());
 
@@ -142,6 +145,52 @@ function scriptedTurnQuery(args: any, account: Record<string, unknown>) {
 }
 
 describe("auth status mappers", () => {
+  it.each([
+    "central proxy start",
+    "/opt/tools/central proxy start --arbitrary-flag",
+    "CeNtRaL ProXy   StArT --return-key",
+    "central.exe proxy\tstart",
+  ])("names the active Central helper %j without exposing its command", (helper) => {
+    const expected = { kind: "gateway", label: "JetBrains Air Gateway" };
+    expect(fromCliStatus(CLI_KEY_HELPER_AND_SUBSCRIPTION, helper)).toEqual(expected);
+    expect(
+      fromAccountInfo(
+        { apiProvider: "firstParty", apiKeySource: "apiKeyHelper", subscriptionType: "max" },
+        helper,
+      ),
+    ).toEqual(expected);
+  });
+
+  it.each([
+    undefined,
+    "",
+    "decentralized proxy start",
+    "centralized proxy start",
+    "central proxy stop",
+    "another proxy start",
+    "central proxy starter",
+  ])("keeps a non-Central helper %j human readable", (helper) => {
+    expect(fromCliStatus(CLI_API_KEY, helper)).toEqual({
+      kind: "api_key",
+      label: "Anthropic API key",
+      detail: "API key helper",
+    });
+  });
+
+  it("does not use an inactive helper or override an external backend", () => {
+    const helper = "central proxy start";
+    expect(fromCliStatus(CLI_BEDROCK, helper)).toEqual({ kind: "external", label: "AWS Bedrock" });
+    expect(fromCliStatus(CLI_LOGGED_OUT, helper)).toEqual({ kind: "none", label: "Not logged in" });
+    expect(fromAccountInfo({ apiProvider: "firstParty", apiKeySource: "env" }, helper)).toEqual({
+      kind: "api_key",
+      label: "Anthropic API key",
+      detail: "env",
+    });
+    expect(fromAccountInfo({ apiKeySource: "futureInternalIdentifier" }, helper)).toEqual({
+      kind: "api_key",
+      label: "Anthropic API key",
+    });
+  });
   it("maps a first-party subscription account", () => {
     expect(
       fromAccountInfo({
@@ -188,7 +237,7 @@ describe("auth status mappers", () => {
     expect(fromCliStatus(CLI_KEY_HELPER_AND_SUBSCRIPTION)).toEqual({
       kind: "api_key",
       label: "Anthropic API key",
-      detail: "apiKeyHelper",
+      detail: "API key helper",
     });
     expect(
       fromAccountInfo({
@@ -201,7 +250,7 @@ describe("auth status mappers", () => {
     ).toEqual({
       kind: "api_key",
       label: "Anthropic API key",
-      detail: "apiKeyHelper",
+      detail: "API key helper",
     });
   });
 
@@ -244,7 +293,7 @@ describe("auth status mappers", () => {
     expect(fromCliStatus(CLI_API_KEY)).toEqual({
       kind: "api_key",
       label: "Anthropic API key",
-      detail: "apiKeyHelper",
+      detail: "API key helper",
     });
     expect(fromCliStatus(CLI_LOGGED_OUT)).toEqual({
       kind: "none",
@@ -298,7 +347,7 @@ describe("auth status mappers", () => {
     // Key sources identify api_key payloads.
     expect(
       sameIdentity(
-        { kind: "api_key", label: "Anthropic API key", detail: "apiKeyHelper" },
+        { kind: "api_key", label: "Anthropic API key", detail: "API key helper" },
         { kind: "api_key", label: "Anthropic API key", detail: "env" },
       ),
     ).toBe(false);
@@ -317,6 +366,8 @@ describe("auth status over ACP", () => {
    *  Each probe captures the output configured when it was spawned. */
   let deferStatus: boolean;
   let pendingStatus: Array<() => void>;
+  let configDir: string;
+  let originalConfigDir: string | undefined;
 
   /** Let every already-scheduled promise chain run to completion. */
   function settle() {
@@ -343,7 +394,10 @@ describe("auth status over ACP", () => {
     }
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    configDir = await fs.mkdtemp(path.join(os.tmpdir(), "auth-status-test-"));
+    process.env.CLAUDE_CONFIG_DIR = configDir;
     // Skip native-binary resolution; the exec itself is mocked.
     process.env.CLAUDE_CODE_EXECUTABLE = "claude";
     statusStdout = CLI_SUBSCRIPTION;
@@ -382,7 +436,16 @@ describe("auth status over ACP", () => {
     } as unknown as AcpClient);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const sessionId of Object.keys(agent.sessions)) {
+      await agent.closeSession({ sessionId });
+    }
+    if (originalConfigDir === undefined) {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    } else {
+      process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    }
+    await fs.rm(configDir, { recursive: true, force: true });
     delete process.env.CLAUDE_CODE_EXECUTABLE;
     vi.resetAllMocks();
   });
@@ -424,6 +487,71 @@ describe("auth status over ACP", () => {
     await settle();
     return response;
   }
+
+  it("pushes Central from the effective pre-session settings and suppresses duplicates", async () => {
+    await fs.writeFile(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({
+        apiKeyHelper: "central proxy start --return-key",
+        env: { ANTHROPIC_BASE_URL: "https://example.invalid/private-route" },
+      }),
+    );
+    statusStdout = CLI_API_KEY;
+    await initialize();
+    await vi.waitFor(() =>
+      expect(lastPush()).toEqual({ kind: "gateway", label: "JetBrains Air Gateway" }),
+    );
+    const sessionId = await scriptedSession({
+      apiProvider: "firstParty",
+      apiKeySource: "apiKeyHelper",
+    });
+    await promptOnce(sessionId);
+    expect(updates()).toHaveLength(1);
+    expect(JSON.stringify(updates())).not.toContain("private-route");
+    expect(JSON.stringify(updates())).not.toContain("return-key");
+  });
+
+  it("discards a late probe when programmatic settings replace the active helper", async () => {
+    await fs.writeFile(
+      path.join(configDir, "settings.json"),
+      JSON.stringify({ apiKeyHelper: "ordinary-helper" }),
+    );
+    statusStdout = CLI_API_KEY;
+    deferStatus = true;
+    await initialize();
+    mockQuery.mockImplementation((args: any) =>
+      scriptedTurnQuery(args, { apiKeySource: "apiKeyHelper" }),
+    );
+    const { sessionId } = await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        claudeCode: {
+          options: {
+            settings: { apiKeyHelper: "central proxy start" },
+            env: { ANTHROPIC_BASE_URL: "https://example.invalid/override" },
+          },
+        },
+      },
+    });
+    await flushStatus();
+    expect(lastPush()).toEqual({ kind: "gateway", label: "JetBrains Air Gateway" });
+    expect(updates()).toHaveLength(1);
+    expect(statusCalls().at(-1)?.[2]).toMatchObject({
+      cwd: process.cwd(),
+      env: { ANTHROPIC_BASE_URL: "https://example.invalid/override" },
+    });
+    expect(statusCalls().at(-1)?.[1]).toEqual([
+      "auth",
+      "status",
+      "--json",
+      "--settings",
+      JSON.stringify({ apiKeyHelper: "central proxy start" }),
+    ]);
+    await promptOnce(sessionId);
+    await flushStatus();
+    expect(updates()).toHaveLength(1);
+  });
 
   it("pushes the logged-out CLI verdict even though the probe exits non-zero", async () => {
     statusStdout = CLI_LOGGED_OUT;
@@ -580,7 +708,7 @@ describe("auth status over ACP", () => {
         authStatus: {
           kind: "api_key",
           label: "Anthropic API key",
-          detail: "apiKeyHelper",
+          detail: "API key helper",
         },
       },
       {
@@ -615,7 +743,7 @@ describe("auth status over ACP", () => {
     expect(agent.currentAuthStatus).toEqual({
       kind: "api_key",
       label: "Anthropic API key",
-      detail: "apiKeyHelper",
+      detail: "API key helper",
     });
   });
 
@@ -647,7 +775,7 @@ describe("auth status over ACP", () => {
     expect(agent.currentAuthStatus).toEqual({
       kind: "api_key",
       label: "Anthropic API key",
-      detail: "apiKeyHelper",
+      detail: "API key helper",
     });
   });
 
