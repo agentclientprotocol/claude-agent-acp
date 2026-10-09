@@ -2228,6 +2228,28 @@ describe("session title after an explicit rename", () => {
     expect(updates.map((update) => update.update.title)).toEqual(["Mine"]);
   });
 
+  it("never publishes a title read before a later client rename", async () => {
+    const updates: any[] = [];
+    const agent: any = {
+      client: { sessionUpdate: async (update: unknown) => updates.push(update) },
+      logger: { error: () => {} },
+      sessions: {},
+    };
+    const titles = new SessionTitles(agent, "s1");
+    const session: any = { queryClosed: false, cancelled: false, cwd: "/nowhere", query: {} };
+    agent.sessions.s1 = session;
+    await titles.setExplicitTitle("First", async () => "First");
+    let resolveInfo!: (info: any) => void;
+    vi.mocked(getSessionInfo).mockImplementationOnce(
+      () => new Promise((resolve) => (resolveInfo = resolve)),
+    );
+    const turnEnd = titles.onTurnEnd(session);
+    await titles.setExplicitTitle("Second", async () => "Second");
+    resolveInfo({ customTitle: "First", summary: "First", lastModified: Date.now() });
+    await turnEnd;
+    expect(updates.map((update) => update.update.title)).toEqual(["First", "Second"]);
+  });
+
   it("adopts a title stored later by someone else, and generates none", async () => {
     const updates: any[] = [];
     const agent: any = {

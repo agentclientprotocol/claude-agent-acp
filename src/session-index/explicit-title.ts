@@ -10,6 +10,8 @@ export class ExplicitTitle {
   private named = false;
   /** Renames in flight. */
   private pending = 0;
+  /** Renames started so far, to tell that one ran between two reads. */
+  private started = 0;
   /** The title generation in flight. */
   private generation?: Promise<void>;
 
@@ -22,6 +24,11 @@ export class ExplicitTitle {
    *  stored since by someone else (a `/rename`) may still be adopted. */
   get settledByClient(): boolean {
     return this.named && this.pending === 0;
+  }
+
+  /** Changes with every rename that starts. */
+  get renames(): number {
+    return this.started;
   }
 
   reset(): void {
@@ -43,6 +50,7 @@ export class ExplicitTitle {
    *  generate a title. */
   async apply(persist: () => Promise<boolean>, restore: () => void): Promise<void> {
     this.pending++;
+    this.started++;
     try {
       await this.generation;
       if (await persist()) this.named = true;
