@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { query, type ModelInfo, type Query } from "@anthropic-ai/claude-agent-sdk";
-import { buildModelConfigOption, getAvailableModels } from "../session-model.js";
+import {
+  applyAvailableModelsAllowlist,
+  buildModelConfigOption,
+  getAvailableModels,
+} from "../session-model.js";
 
 const OPUS: ModelInfo = {
   value: "opus[1m]",
@@ -150,6 +154,68 @@ describe("versioned model display names", () => {
       "model-presentation-test",
     );
     expect(state.availableModels.map((model) => model.name)).toEqual(["Opus (1M context)", "Opus"]);
+  });
+
+  it("distinguishes allowlisted aliases and pins that inherit the same SDK label", async () => {
+    const sdkModels: ModelInfo[] = [
+      { value: "default", displayName: "Default (recommended)", description: "" },
+      {
+        value: "opus",
+        resolvedModel: "claude-opus-5-5",
+        displayName: "Opus 5.5",
+        description: "For complex work and everyday tasks",
+      },
+      { value: "haiku", displayName: "Haiku", description: "Fast" },
+    ];
+    const ids = ["claude-opus-5-5[1m]", "claude-opus-5-5", "opus[1m]", "opus", "haiku"];
+    const models = applyAvailableModelsAllowlist(sdkModels, ids);
+    const setModel = vi.fn();
+    const state = await getAvailableModels(
+      { setModel } as unknown as Query,
+      models,
+      sdkModels,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    const expected = [
+      "Default (recommended)",
+      ...ids.slice(0, 4).map((id) => `Opus 5.5 (${id})`),
+      "Haiku",
+    ];
+    expect(state.availableModels.map((model) => model.name)).toEqual(expected);
+    expect(state.availableModels.map((model) => model.modelId)).toEqual(["default", ...ids]);
+    expect(state.currentModelId).toBe("default");
+    expect(state.availableModels.slice(1, 5).map((model) => model.description)).toEqual(
+      Array(4).fill(sdkModels[1].description),
+    );
+    const option = buildModelConfigOption(state, models, false);
+    expect(option).toMatchObject({ currentValue: "default" });
+    expect(option.type === "select" && option.options.map((model) => model.name)).toEqual(expected);
+    expect(sdkModels[1].displayName).toBe("Opus 5.5");
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes identical custom labels without changing their model IDs", async () => {
+    const models: ModelInfo[] = [
+      { value: "provider-a", displayName: "My model", description: "First endpoint" },
+      { value: "provider-b", displayName: "My model", description: "Second endpoint" },
+    ];
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+    expect(state.availableModels).toEqual([
+      { modelId: "provider-a", name: "My model (provider-a)", description: "First endpoint" },
+      { modelId: "provider-b", name: "My model (provider-b)", description: "Second endpoint" },
+    ]);
   });
 });
 

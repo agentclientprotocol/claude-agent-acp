@@ -496,12 +496,20 @@ export async function getAvailableModels(
   for (const name of displayNames) {
     displayNameCounts.set(name, (displayNameCounts.get(name) ?? 0) + 1);
   }
+  const names = models.map((model, index) =>
+    displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+  );
+  const nameCounts = new Map<string, number>();
+  for (const name of names) {
+    nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+  }
 
   return {
     availableModels: models.map((model, index) => ({
       modelId: model.value,
-      name:
-        displayNameCounts.get(displayNames[index]) === 1 ? displayNames[index] : model.displayName,
+      // Allowlisted aliases can inherit the same SDK label. Keep every ID
+      // selectable, but distinguish the rows for clients that show only names.
+      name: nameCounts.get(names[index]) === 1 ? names[index] : `${names[index]} (${model.value})`,
       description: model.description,
     })),
     currentModelId: currentModel.value,
