@@ -73,6 +73,68 @@ describe("incomplete foreground tools", () => {
     expect(logError).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { type: "advisor_result", text: "Check the queue ordering." },
+    { type: "advisor_redacted_result", encrypted_content: "opaque-advice" },
+    { type: "advisor_tool_result_error", error_code: "overloaded" },
+  ])("settles an advisor call with a $type result", async (content) => {
+    const advisorId = "srvtoolu_advisor";
+    const { prompt, updates, logError } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      const start = toolStart(advisorId);
+      start.event.content_block = {
+        type: "server_tool_use",
+        id: advisorId,
+        name: "advisor",
+        input: {},
+      };
+      yield start;
+      yield {
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: {
+          role: "assistant",
+          usage: successfulResultMessage().usage,
+          content: [{ type: "advisor_tool_result", tool_use_id: advisorId, content }],
+        },
+      };
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const terminal = updates.find(
+      (u) => u.toolCallId === advisorId && ["completed", "failed"].includes(u.status),
+    );
+    expect(terminal).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      status: content.type === "advisor_tool_result_error" ? "failed" : "completed",
+    });
+    const rendered = JSON.stringify(terminal);
+    if (content.type === "advisor_result") expect(rendered).toContain(content.text);
+    if (content.type === "advisor_tool_result_error")
+      expect(rendered).toContain(content.error_code);
+    expect(rendered).not.toContain("opaque-advice");
+    expect(hasHookCallback(advisorId)).toBe(false);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("still fails an advisor call without a result", async () => {
+    const { prompt } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      const start = toolStart("srvtoolu_advisor");
+      start.event.content_block = {
+        type: "server_tool_use",
+        id: "srvtoolu_advisor",
+        name: "advisor",
+        input: {},
+      };
+      yield start;
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).rejects.toMatchObject({ data: { errorKind: "incomplete_tool_call" } });
+  });
+
   it("allows a tool explicitly handed off to a background task", async () => {
     const { prompt, updates } = createTestSession(backgroundToolMessages);
 
