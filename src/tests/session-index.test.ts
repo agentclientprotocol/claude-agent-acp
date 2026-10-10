@@ -263,6 +263,7 @@ describe("sessionIndex negotiation", () => {
     expect(nonAir._meta).toMatchObject({
       steering: { supported: true },
       sessionRewind: { version: 1 },
+      runtime: { version: 1 },
     });
     expect(airCapabilities(nonAir)).toBeUndefined();
   });

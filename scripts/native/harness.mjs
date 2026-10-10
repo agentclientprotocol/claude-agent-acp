@@ -56,6 +56,7 @@ export async function fixture(
   const temp = join(root, "tmp");
   await Promise.all([cwd, config, temp].map((p) => mkdir(p, { recursive: true })));
   const requests = [],
+    countRequests = [],
     children = [],
     faults = [];
   let toolStep = 0;
@@ -70,6 +71,7 @@ export async function fixture(
         assert.equal(req.headers["x-api-key"], "native-e2e-dummy-key");
         assert.ok(Array.isArray(body.messages) && body.messages.length > 0);
         requests.push(body);
+        await f.beforeReply?.(body, requests.length - 1);
         const last = textOf(body.messages.at(-1).content);
         let block = {
           type: "text",
@@ -127,8 +129,11 @@ export async function fixture(
         event("message_stop", {});
         res.end();
       } else if (path.endsWith("/messages/count_tokens")) {
+        assert.equal(req.method, "POST");
+        assert.equal(req.headers["x-api-key"], "native-e2e-dummy-key");
+        countRequests.push(body);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ input_tokens: 30 }));
+        res.end(JSON.stringify({ input_tokens: f.countTokens?.(body) ?? 30 }));
       } else {
         // Incidental native account/telemetry requests never reach a real service.
         res.writeHead(403, { "Content-Type": "application/json" });
@@ -182,6 +187,7 @@ export async function fixture(
     config,
     env,
     requests,
+    countRequests,
     faults,
     children,
     capabilities,
@@ -195,8 +201,8 @@ export async function fixture(
       model,
       promptSuggestions: false,
     },
-    spawn(script) {
-      const child = spawn(process.execPath, [script], {
+    spawn(script, args = []) {
+      const child = spawn(process.execPath, [script, ...args], {
         cwd,
         env,
         windowsHide: true,
@@ -358,12 +364,18 @@ export class AcpClient {
     });
     assert.equal(result.protocolVersion, 1);
     for (const name of this.f.capabilities) assert.equal(result._meta[name].version, 1);
+    this.capabilities = result._meta;
   }
   async create(options = {}, mcpServers = []) {
     this.params = {
       cwd: this.f.cwd,
       mcpServers,
-      _meta: { claudeCode: { options: { ...this.f.options, ...options } } },
+      _meta: {
+        claudeCode: {
+          ...(this.f.rawMessages ? { emitRawSDKMessages: true } : {}),
+          options: { ...this.f.options, ...options },
+        },
+      },
     };
     const result = await this.request("session/new", this.params);
     assert.match(result.sessionId, /^[0-9a-f-]{36}$/);

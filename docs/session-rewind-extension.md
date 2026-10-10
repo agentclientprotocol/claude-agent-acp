@@ -84,9 +84,9 @@ npm run test:native:rewind
 ```
 
 The rewind command builds this checkout and runs only `first`, `historical`,
-`latest` and `sdk-contract`. The full extension checkout also provides separate
-file restore, runtime and MCP scenarios through `test:native`; those are excluded
-by `test:native:rewind`. It starts the real pinned SDK/native CLI with a loopback
+`latest` and `sdk-contract`. This integrated checkout also provides file restore, runtime, MCP, queue cancellation
+and full-context scenarios through `test:native`. The shared SDK contract verifies
+both rewind and queued cancellation; the three focused rewind cases remain available. It starts the real pinned SDK/native CLI with a loopback
 streaming provider and an allowlisted child environment. Temporary homes, Claude
 config, workspaces and child temporary files use fresh system temporary directories.
 User settings and inherited credentials
@@ -99,7 +99,7 @@ exact authored context of the next prompt. The SDK contract worker checks the
 private `Query.request` response envelope and `transport.waitForExit` against an
 actual native process exit. These are offline protocol tests, not model-quality
 or network-sandbox tests. The CI native job runs compatibility regressions and
-all four native cases on Ubuntu and Windows independently of the existing job.
+the complete integrated native suite on Ubuntu and Windows independently of the existing job.
 
 Every failed assertion, unknown case, process failure or cleanup failure exits
 nonzero. Only completed cases print `PASS`. Individual core cases may be selected

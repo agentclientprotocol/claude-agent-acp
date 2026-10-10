@@ -6,6 +6,7 @@
  * fields as on origin/main. {@link compareWithBaseline} allows only these
  * differences, and returns every other difference as a violation:
  *
+ * - Initialize adds the runtime discovery metadata (queue cancellation and context reads).
  * - A key that exists only for AIR is gone (see {@link AIR_ONLY_META_KEYS}).
  *   A `session_info_update` that carried only such a key is not sent.
  * - A `tool_call_update` leaves out a top-level field whose value did not

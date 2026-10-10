@@ -17,7 +17,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Interactive (and background) terminals
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
-- Optional [native session controls](docs/native-session-controls.md): conversation rewind, file checkpoints, structured runtime access and host MCP replacement
+- Optional [native session controls](docs/native-session-controls.md): conversation rewind, file checkpoints, structured runtime access, host MCP replacement, and [queued prompt cancellation/context diagnostics](docs/queued-message-context-controls.md)
 - `/mcp` in the chat: the MCP server status as a list. The adapter runs `/mcp reconnect`, `/mcp enable`, and `/mcp disable` through the SDK control API, because Claude Code refuses them in SDK mode. A reconnect of an ACP server that needs authentication starts MCP OAuth through URL elicitation
 - Session-scoped long-running goals for AIR through the [goal extension](docs/air-extensions.md#goal) under `_meta.jetbrains.air.goal`
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/air-extensions.md#session-failure)

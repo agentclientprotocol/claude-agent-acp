@@ -4,7 +4,14 @@ import { raceTimeoutAndAbort } from "./utils.js";
 
 export const RUNTIME_READ_METHOD = "_session/runtime/read";
 export const RUNTIME_CONTROL_METHOD = "_session/runtime/control";
-export const RUNTIME_READS = ["context", "usage", "mcp", "commands", "agents"] as const;
+export const RUNTIME_READS = [
+  "context",
+  "usage",
+  "mcp",
+  "commands",
+  "agents",
+  "queuedMessages",
+] as const;
 export const RUNTIME_CONTROLS = [
   "reloadSkills",
   "reloadPlugins",
@@ -12,18 +19,21 @@ export const RUNTIME_CONTROLS = [
   "reconnectMcp",
   "toggleMcp",
   "backgroundTask",
+  "cancelQueuedMessage",
 ] as const;
 
-export type RuntimeReadRequest = {
-  sessionId: string;
-  resource: (typeof RUNTIME_READS)[number];
-};
+export type RuntimeReadRequest = { sessionId: string } & (
+  | { resource: "context"; detail?: "summary" | "full" }
+  | { resource: "queuedMessages" }
+  | { resource: Exclude<(typeof RUNTIME_READS)[number], "context" | "queuedMessages"> }
+);
 export type RuntimeControlRequest = { sessionId: string } & (
   | { action: "reloadSkills" | "reloadOutputStyles" }
   | { action: "reloadPlugins"; holdOnCacheImpact: boolean }
   | { action: "reconnectMcp"; serverName: string }
   | { action: "toggleMcp"; serverName: string; enabled: boolean }
   | { action: "backgroundTask"; toolUseId: string }
+  | { action: "cancelQueuedMessage"; messageId: string }
 );
 export type RuntimeResponse =
   | { version: 1; status: "ok"; data: unknown }
@@ -41,6 +51,12 @@ export function runtimeCapability() {
     controlMethod: RUNTIME_CONTROL_METHOD,
     reads: [...RUNTIME_READS],
     controls: [...RUNTIME_CONTROLS],
+    context: { details: ["summary", "full"], defaultDetail: "summary", fullMayUseNetwork: true },
+    queuedMessages: {
+      scope: "adapter_prompts",
+      runtimeSupport: "checked_on_request",
+      cancellation: "pending_only",
+    },
   };
 }
 
@@ -71,18 +87,40 @@ function keys(params: Record<string, unknown>, allowed: string[]): void {
 
 export function parseRuntimeReadRequest(value: unknown): RuntimeReadRequest {
   const params = record(value);
-  keys(params, ["sessionId", "resource"]);
+  keys(
+    params,
+    params.resource === "context" ? ["sessionId", "resource", "detail"] : ["sessionId", "resource"],
+  );
   const sessionId = identifier(params.sessionId, "sessionId");
   if (!RUNTIME_READS.includes(params.resource as RuntimeReadRequest["resource"])) {
     throw RequestError.invalidParams(undefined, "Unknown runtime resource");
   }
-  return { sessionId, resource: params.resource as RuntimeReadRequest["resource"] };
+  if (params.resource === "context") {
+    if (params.detail !== undefined && params.detail !== "summary" && params.detail !== "full")
+      throw RequestError.invalidParams(undefined, "detail must be summary or full");
+    return { sessionId, resource: "context", detail: params.detail ?? "summary" };
+  }
+  if (params.resource === "queuedMessages") return { sessionId, resource: "queuedMessages" };
+  return {
+    sessionId,
+    resource: params.resource as Exclude<
+      RuntimeReadRequest["resource"],
+      "context" | "queuedMessages"
+    >,
+  };
 }
 
 export function parseRuntimeControlRequest(value: unknown): RuntimeControlRequest {
   const params = record(value);
   const sessionId = identifier(params.sessionId, "sessionId");
   switch (params.action) {
+    case "cancelQueuedMessage":
+      keys(params, ["sessionId", "action", "messageId"]);
+      return {
+        sessionId,
+        action: params.action,
+        messageId: identifier(params.messageId, "messageId"),
+      };
     case "reloadSkills":
     case "reloadOutputStyles":
       keys(params, ["sessionId", "action"]);
@@ -141,14 +179,18 @@ const CONTROL_METHODS = {
   reconnectMcp: "reconnectMcpServer",
   toggleMcp: "toggleMcpServer",
   backgroundTask: "backgroundTasks",
+  cancelQueuedMessage: "cancelAsyncMessage",
 } as const;
 export type RuntimeQuery = Partial<
   Pick<
     Query,
     | (typeof READ_METHODS)[keyof typeof READ_METHODS]
-    | (typeof CONTROL_METHODS)[keyof typeof CONTROL_METHODS]
+    | Exclude<(typeof CONTROL_METHODS)[keyof typeof CONTROL_METHODS], "cancelAsyncMessage">
   >
->;
+> & {
+  /** SDK 0.3.293 implements this outside its public Query type. */
+  cancelAsyncMessage?: (uuid: string) => Promise<unknown>;
+};
 
 /** MCP launch configuration can contain environment credentials and headers.
  * Only presentation fields cross this status boundary. */
@@ -165,7 +207,7 @@ export function runtimeMcpStatus(servers: McpServerStatus[]) {
 
 export async function readRuntime(
   query: RuntimeQuery,
-  request: RuntimeReadRequest,
+  request: Exclude<RuntimeReadRequest, { resource: "queuedMessages" }>,
   signal: AbortSignal,
   isCurrent: () => boolean = () => true,
   timeoutMs = 5000,
@@ -178,7 +220,7 @@ export async function readRuntime(
   const operation = async (): Promise<unknown> => {
     switch (request.resource) {
       case "context":
-        return query.getContextUsage!({ detail: "summary" });
+        return query.getContextUsage!({ detail: request.detail ?? "summary" });
       case "usage": {
         const usage = await query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET!({
           skipBehaviors: true,
@@ -243,6 +285,16 @@ export async function controlRuntime(
       await query.toggleMcpServer!(request.serverName, request.enabled);
       data = { completed: true };
       break;
+    case "cancelQueuedMessage": {
+      const cancelled = await query.cancelAsyncMessage!(request.messageId);
+      if (typeof cancelled !== "boolean")
+        throw RequestError.internalError(
+          undefined,
+          "Invalid native cancellation acknowledgement; outcome unknown",
+        );
+      data = { messageId: request.messageId, cancelled };
+      break;
+    }
     case "backgroundTask":
       data = { backgrounded: await query.backgroundTasks!(request.toolUseId) };
       break;

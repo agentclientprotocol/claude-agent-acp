@@ -5,6 +5,9 @@ session. Discover them in initialize's top-level `_meta.sessionRewind`,
 `_meta.sessionRewindFiles`, `_meta.runtime`, and `_meta.sessionMcp`.
 They do not implement the whole Claude Desktop UI or cloud chat service.
 
+本提案在一个分支中整合对话回退、文件 checkpoint、运行状态/刷新、MCP 替换、
+单条排队消息撤回与 summary/full 上下文诊断；`test:native` 统一运行全部十项原生用例。
+
 ## Conversation rewind
 
 `_session/rewind` accepts:
@@ -73,24 +76,29 @@ transaction combining conversation and file rewinds.
 ## Structured runtime access
 
 `_session/runtime/read` accepts `{sessionId,resource}`. Resources are `context`
-(summary), `usage` (skip behaviors), `mcp`, `commands`, and `agents`. It uses the
+(summary by default, explicit `detail: "full"` for native category counts),
+`usage` (skip behaviors), `mcp`, `commands`, `agents`, and `queuedMessages`.
+Full context may use the provider token-count API; other resources reject detail. It uses the
 current query without starting a prompt. Reads have a five-second deadline and
 reject stale query results. MCP launch configuration, headers, environment and
 raw diagnostic errors are omitted.
 
 `_session/runtime/control` accepts `{sessionId,action,...}`:
 
-| Action             | Additional fields                                |
-| ------------------ | ------------------------------------------------ |
-| reloadSkills       | none                                             |
-| reloadPlugins      | holdOnCacheImpact, optional boolean default true |
-| reloadOutputStyles | none                                             |
-| reconnectMcp       | serverName                                       |
-| toggleMcp          | serverName, enabled                              |
-| backgroundTask     | toolUseId (one explicit tool)                    |
+| Action              | Additional fields                                |
+| ------------------- | ------------------------------------------------ |
+| reloadSkills        | none                                             |
+| reloadPlugins       | holdOnCacheImpact, optional boolean default true |
+| reloadOutputStyles  | none                                             |
+| reconnectMcp        | serverName                                       |
+| toggleMcp           | serverName, enabled                              |
+| backgroundTask      | toolUseId (one explicit tool)                    |
+| cancelQueuedMessage | messageId (one pending adapter prompt)           |
 
 Controls are mutually exclusive with session lifecycle changes. Except for
-`backgroundTask`, busy sessions are refused. Skills/plugins refresh the adapter's
+`backgroundTask` and pending-only `cancelQueuedMessage`, busy sessions are refused.
+Queue inventory/context reads and single cancellation remain available while a provider
+change waits for accepted turns. See [queue and context contracts](queued-message-context-controls.md). Skills/plugins refresh the adapter's
 available commands and agent config options. A currently selected removed agent
 is retained until the client changes it. Responses use version 1 and status
 `ok` with data or `unavailable` with a reason. Unsupported Query methods are
@@ -170,7 +178,9 @@ The suite asserts:
 - MCP replacement, protected servers, revision fencing, connected status after
   recreation, and close during a genuinely pending MCP handshake. Interrupted
   replacement must fail and its MCP process must exit before recovery succeeds.
-- A separate worker exercises the real private `Query.request` envelope and
+- Native pending-message cancellation preserves the foreground and a queued survivor;
+  context summary avoids counting while explicit full reaches the loopback count endpoint.
+- A separate worker exercises `cancelAsyncMessage`, the real private `Query.request` envelope and
   `transport.waitForExit` plus actual exit state. SDK shape drift, unsupported
   controls, timeouts and malformed acknowledgements cannot count as success.
 
@@ -179,10 +189,10 @@ wrong targets, missing exit evidence and lifecycle fences. The independent CI
 `native` job runs this and the complete native suite on Node 24, on Ubuntu and
 Windows; it does not depend on the existing upstream build job.
 
-For a core rewind-only checkout, `test:native:rewind` (or, after a build,
+For focused rewind checks, `test:native:rewind` (or, after a build,
 `node scripts/native/e2e.mjs --rewind-only`) runs only `first`, `historical`,
-`latest` and `sdk-contract`. It discovers only the rewind capability and does
-not invoke file/runtime/MCP extensions. Individual cases can also be selected:
+`latest` and `sdk-contract`. The shared SDK worker also verifies queued cancellation; the other three cases
+exercise rewind. The default `test:native` runs all ten cases in this integrated checkout. Individual cases can also be selected:
 
 ```sh
 node scripts/native/e2e.mjs historical files

@@ -53,6 +53,18 @@ try {
   }
   assert.equal(resultSeen, true);
   assert.ok(q.transport.process && typeof q.transport.process.once === "function");
+
+  assert.equal(typeof q.cancelAsyncMessage, "function", "SDK cancellation method disappeared");
+  assert.equal(
+    await q.cancelAsyncMessage(uuid),
+    false,
+    "a completed/dequeued message cannot be dropped",
+  );
+  assert.equal(
+    await q.cancelAsyncMessage(randomUUID()),
+    false,
+    "an absent message cannot be dropped",
+  );
   // Exercise the raw private envelope as well as the production bridge.
   const refused = await q.request({
     subtype: "rewind_conversation",
@@ -87,7 +99,15 @@ try {
       /^SIG[A-Z0-9]+$/.test(transport.process.signalCode ?? ""),
     "observer must correspond to actual OS exit",
   );
-  console.log(JSON.stringify({ request: true, rewind: true, exit: true }));
+  console.log(
+    JSON.stringify({
+      request: true,
+      rewind: true,
+      exit: true,
+      cancelledDequeued: false,
+      cancelledAbsent: false,
+    }),
+  );
 } finally {
   release();
   q.close();

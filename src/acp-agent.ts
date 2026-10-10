@@ -699,6 +699,8 @@ function parseSteerRequest(params: unknown): SteerRequest {
  *  queued user messages back in submission order, so `turnQueue[0]` is the turn
  *  currently running. */
 type Turn = {
+  /** The count-lane debt seeded by a concurrent session/cancel, if any. */
+  runtimeCancellationDebt?: { generation: number; counted: boolean };
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
@@ -945,6 +947,8 @@ export type Session = {
    *  lane); a count can't express command coalescing — N queued commands can
    *  fold into ONE turn emitting one result, leaving a stale skip of N-1. */
   pendingOrphanResults?: number;
+  /** Incremented when activation clears debt, so a late ACK cannot debit a new batch. */
+  orphanGeneration?: number;
   /** UUIDs of cancelled-before-echo commands that can still emit Claude's
    * empty user-interruption diagnostic. Interrupt receipts and command
    * lifecycle frames remove commands that were dropped before dispatch; the
@@ -2989,8 +2993,29 @@ export class ClaudeAcpAgent {
             (shutdown ??= (async () => {
               if (!session || !query) return;
               this.nativeShutdownFences.add(sessionId);
+              if (session.query !== query) {
+                query.close();
+                await awaitNativeExit(query);
+                this.nativeShutdownFences.delete(sessionId);
+                return;
+              }
               if (session.mcpState) session.mcpState.uncertain = true;
               this.closeQueryStream(session);
+              session.cancelController?.abort();
+              for (const turn of session.turnQueue ?? []) {
+                if (turn.settled) continue;
+                turn.localCommandAbort?.abort();
+                session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
+                turn.settled = true;
+                turn.reject(
+                  RequestError.internalError(
+                    undefined,
+                    "Native cancellation outcome unknown; reload required",
+                  ),
+                );
+              }
+              session.turnQueue = [];
+              session.activeTurn = undefined;
               await awaitNativeExit(query);
               this.nativeShutdownFences.delete(sessionId);
             })());
@@ -3065,11 +3090,28 @@ export class ClaudeAcpAgent {
     params: RuntimeReadRequest,
     signal: AbortSignal,
   ): Promise<RuntimeResponse> {
-    if (this.providerUpdate) await this.providerUpdate;
+    if (
+      params.resource !== "queuedMessages" &&
+      params.resource !== "context" &&
+      this.providerUpdate
+    )
+      await this.providerUpdate;
     return this.sessionMutations.runExclusive(params.sessionId, async () => {
       const session = this.sessions[params.sessionId];
       if (!session || session.queryClosed)
         return { version: 1, status: "unavailable", reason: "stale" };
+      if (params.resource === "queuedMessages") {
+        if (signal.aborted) return { version: 1, status: "unavailable", reason: "cancelled" };
+        return {
+          version: 1,
+          status: "ok",
+          data: {
+            messages: this.queuedRuntimeTurns(session).map((turn) => ({
+              messageId: turn.promptUuid,
+            })),
+          },
+        };
+      }
       const query = session.query;
       return readRuntime(
         query,
@@ -3083,23 +3125,60 @@ export class ClaudeAcpAgent {
     });
   }
 
+  /** An observed pending prompt can still be dequeued by the CLI before control arrives. */
+  private queuedRuntimeTurns(session: Session): Turn[] {
+    return (session.turnQueue ?? []).filter(
+      (turn) =>
+        turn !== session.activeTurn &&
+        !turn.settled &&
+        !turn.settling &&
+        !turn.commandStarted &&
+        !turn.insertedReported &&
+        !turn.commandFinished &&
+        !turn.steeredUuids?.size,
+    );
+  }
+
   async controlSessionRuntime(
     params: RuntimeControlRequest,
     signal?: AbortSignal,
   ): Promise<RuntimeResponse> {
-    if (this.providerUpdate) await this.providerUpdate;
+    // A provider change may be waiting for the very prompt being withdrawn.
+    if (params.action !== "cancelQueuedMessage" && this.providerUpdate) await this.providerUpdate;
     return this.runNativeMutation(
       params.sessionId,
       async (mutationSignal) => {
         const session = this.sessions[params.sessionId];
         if (!session || session.queryClosed)
           return { version: 1, status: "unavailable", reason: "stale" };
-        const busy = sessionMutationBusy(session);
-        if (busy && params.action !== "backgroundTask")
-          throw RequestError.invalidParams({ reason: busy }, "Session is busy");
+        let queuedTurn: Turn | undefined;
+        if (params.action === "cancelQueuedMessage") {
+          queuedTurn = this.queuedRuntimeTurns(session).find(
+            (turn) => turn.promptUuid === params.messageId,
+          );
+          if (!queuedTurn)
+            throw RequestError.invalidParams(undefined, "Message is not a pending adapter prompt");
+        } else {
+          const busy = sessionMutationBusy(session);
+          if (busy && params.action !== "backgroundTask")
+            throw RequestError.invalidParams({ reason: busy }, "Session is busy");
+        }
         const query = session.query;
+        if (queuedTurn)
+          queuedTurn.runtimeCancellationDebt = {
+            generation: session.orphanGeneration ?? 0,
+            counted: false,
+          };
         mutationSignal.throwIfAborted();
-        const result = await controlRuntime(query, params);
+        let result: RuntimeResponse;
+        try {
+          result = await controlRuntime(query, params);
+        } catch (error) {
+          // A failed ACK can follow a successful native drop. Keeping the
+          // queue alive could assign the next result to the dropped turn.
+          if (queuedTurn && session.query === query) this.closeQueryStream(session);
+          throw error;
+        }
         if (
           mutationSignal.aborted ||
           this.sessions[params.sessionId] !== session ||
@@ -3107,6 +3186,39 @@ export class ClaudeAcpAgent {
           session.queryClosed
         ) {
           return { version: 1, status: "unavailable", reason: "stale" };
+        }
+        if (
+          queuedTurn &&
+          result.status === "ok" &&
+          (result.data as { cancelled: boolean }).cancelled
+        ) {
+          // The stream and session/cancel may settle this turn while the ACK is pending.
+          // A native true ACK means no result is owed; do not create an orphan debt.
+          const debt = queuedTurn.runtimeCancellationDebt;
+          if (debt && debt.generation === (session.orphanGeneration ?? 0) && debt.counted) {
+            session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - 1);
+            debt.counted = false;
+          }
+          session.orphanCommands?.delete(queuedTurn.promptUuid);
+          session.pendingEmptyInterruptionDiagnosticCommands?.delete(queuedTurn.promptUuid);
+          if (!queuedTurn.settled) {
+            if (
+              session.activeTurn === queuedTurn ||
+              queuedTurn.commandStarted ||
+              queuedTurn.insertedReported
+            ) {
+              this.closeQueryStream(session);
+              throw RequestError.internalError(
+                undefined,
+                "Native cancellation conflicts with message execution",
+              );
+            }
+            session.fileChangeReporter?.finish(queuedTurn.fileChangeReport, "cancelled");
+            queuedTurn.localCommandAbort?.abort();
+            queuedTurn.settled = true;
+            session.turnQueue = (session.turnQueue ?? []).filter((turn) => turn !== queuedTurn);
+            queuedTurn.resolve({ stopReason: "cancelled" });
+          }
         }
         if (
           result.status === "ok" &&
@@ -4671,6 +4783,7 @@ export class ClaudeAcpAgent {
       compaction.resume();
       if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
+      session.orphanGeneration = (session.orphanGeneration ?? 0) + 1;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
       // the endedPerLevel field doc): armed at the first activation,
@@ -5496,6 +5609,20 @@ export class ClaudeAcpAgent {
                 queued.commandFinished = frame.state as NonNullable<Turn["commandFinished"]>;
               }
               if (frame.state === "cancelled") {
+                // The terminal frame can precede the control ACK. A pending
+                // command dropped before dispatch will never produce a result.
+                if (
+                  queued?.runtimeCancellationDebt &&
+                  !queued.commandStarted &&
+                  !queued.insertedReported &&
+                  session.activeTurn !== queued
+                ) {
+                  session.fileChangeReporter?.finish(queued.fileChangeReport, "cancelled");
+                  queued.localCommandAbort?.abort();
+                  queued.settled = true;
+                  session.turnQueue = (session.turnQueue ?? []).filter((turn) => turn !== queued);
+                  queued.resolve({ stopReason: "cancelled" });
+                }
                 // Ambiguous by design (dup-over-loss): dropped before
                 // dispatch (no result will ever come — safe to forget) vs
                 // consumed into a turn that was aborted/failed. For the
@@ -7878,6 +8005,12 @@ export class ClaudeAcpAgent {
           turn.promptUuid,
           turn.commandStarted ? "started" : "pending",
         );
+        if (!lifecycleLane && turn.runtimeCancellationDebt) {
+          turn.runtimeCancellationDebt = {
+            generation: session.orphanGeneration ?? 0,
+            counted: true,
+          };
+        }
       }
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
@@ -8025,7 +8158,13 @@ export class ClaudeAcpAgent {
     if (Array.isArray(receipt?.still_queued) && orphanedTurns.length > 0) {
       const stillQueued = new Set(receipt.still_queued);
       const droppedTurns = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid));
-      const droppedCount = droppedTurns.length;
+      const droppedCount = droppedTurns.filter((turn) => {
+        const debt = turn.runtimeCancellationDebt;
+        return !debt || (debt.counted && debt.generation === (session.orphanGeneration ?? 0));
+      }).length;
+      for (const turn of droppedTurns) {
+        if (turn.runtimeCancellationDebt) turn.runtimeCancellationDebt.counted = false;
+      }
       for (const turn of droppedTurns) {
         session.pendingEmptyInterruptionDiagnosticCommands?.delete(turn.promptUuid);
       }
@@ -9755,7 +9894,7 @@ export class ClaudeAcpAgent {
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
-    if (this.nativeShutdownFences.has(params.sessionId))
+    if (this.disposing || this.nativeShutdownFences.has(params.sessionId))
       throw RequestError.invalidRequest(
         undefined,
         "Native shutdown unconfirmed; reconnect required",
