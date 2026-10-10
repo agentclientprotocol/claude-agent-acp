@@ -1,4 +1,27 @@
 import { boundedNativeMutation, awaitNativeExit } from "./native-mutation.js";
+import {
+  SESSION_MCP_SET_METHOD,
+  SESSION_MCP_STATE_METHOD,
+  parseSessionMcpSetRequest,
+  parseSessionMcpStateRequest,
+  sessionMcpCapability,
+  sessionMcpState,
+  setSessionMcpServers,
+  type SessionMcpState,
+  type SessionMcpSetRequest,
+} from "./session-mcp-set.js";
+import {
+  runtimeCapability,
+  readRuntime,
+  controlRuntime,
+  RUNTIME_READ_METHOD,
+  RUNTIME_CONTROL_METHOD,
+  parseRuntimeReadRequest,
+  parseRuntimeControlRequest,
+  type RuntimeReadRequest,
+  type RuntimeControlRequest,
+  type RuntimeResponse,
+} from "./desktop-runtime.js";
 import { SessionMutationLock } from "./session-mutation-lock.js";
 import { readSessionHistory } from "./session-history.js";
 import {
@@ -6,11 +29,19 @@ import {
   parseSessionRewindRequest,
   SESSION_REWIND_METHOD,
   SESSION_REWIND_CAPABILITY,
+  sessionMutationBusy,
   isAuthoredUserMessage,
   type SessionRewindRequest,
   type SessionRewindResponse,
   type SessionRewindDependencies,
 } from "./session-rewind.js";
+import {
+  rewindSessionFiles,
+  parseSessionRewindFilesRequest,
+  SESSION_REWIND_FILES_METHOD,
+  type SessionRewindFilesRequest,
+  type SessionRewindFilesResponse,
+} from "./session-rewind-files.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -978,6 +1009,7 @@ export type Session = {
   sessionFingerprint: string;
   /** Original ACP parameters used to recreate this query with a new provider. */
   creationParams?: NewSessionRequest;
+  mcpState?: SessionMcpState;
   settingsManager: SettingsManager;
   /** Higher-priority programmatic settings passed to query(). Retained so
    * model switches resolve effort from the same effective settings as the SDK. */
@@ -2515,6 +2547,7 @@ async function waitForMcpAuthentication(
 export class ClaudeAcpAgent {
   private readonly sessionMutations = new SessionMutationLock();
   private readonly nativeShutdownFences = new Set<string>();
+  private readonly mcpRevisions = new Map<string, number>();
   nativeMutationTimeoutMs = 15_000;
   private disposing = false;
   sessions: {
@@ -2823,6 +2856,8 @@ export class ClaudeAcpAgent {
               } satisfies GoalCapability,
             )
           : {}),
+        runtime: runtimeCapability(),
+        sessionMcp: sessionMcpCapability(),
         sessionRewind: {
           version: 1,
           method: SESSION_REWIND_METHOD,
@@ -2832,6 +2867,13 @@ export class ClaudeAcpAgent {
           interruptIfRunning: true,
           changesFiles: false,
           runtimeSupport: "checked_on_request",
+        },
+        sessionRewindFiles: {
+          version: 1,
+          method: SESSION_REWIND_FILES_METHOD,
+          dryRun: true,
+          changesConversation: false,
+          requiresCheckpoints: true,
         },
         steering: {
           supported: true,
@@ -2947,6 +2989,7 @@ export class ClaudeAcpAgent {
             (shutdown ??= (async () => {
               if (!session || !query) return;
               this.nativeShutdownFences.add(sessionId);
+              if (session.mcpState) session.mcpState.uncertain = true;
               this.closeQueryStream(session);
               await awaitNativeExit(query);
               this.nativeShutdownFences.delete(sessionId);
@@ -2968,6 +3011,162 @@ export class ClaudeAcpAgent {
     } finally {
       signal?.removeEventListener("abort", abort);
     }
+  }
+
+  async readSessionMcpState(params: { sessionId: string }) {
+    return this.sessionMutations.runExclusive(params.sessionId, async () => {
+      const state = this.sessions[params.sessionId]?.mcpState;
+      if (!state) throw RequestError.invalidParams(undefined, "Session not found");
+      return sessionMcpState(state);
+    });
+  }
+
+  async setSessionMcp(params: SessionMcpSetRequest, signal?: AbortSignal) {
+    if (this.providerUpdate) await this.providerUpdate;
+    return this.runNativeMutation(
+      params.sessionId,
+      async (mutationSignal) => {
+        const session = this.sessions[params.sessionId];
+        if (!session?.mcpState || !session.creationParams)
+          throw RequestError.invalidParams(undefined, "Session not found");
+        const busy = sessionMutationBusy(session);
+        if (busy) throw RequestError.invalidRequest({ reason: busy }, "Session is busy or closed");
+        const query = session.query;
+        mutationSignal.throwIfAborted();
+        const result = await setSessionMcpServers(
+          query,
+          session.mcpState,
+          params,
+          params.sessionId,
+          () => this.closeQueryStream(session),
+          () => !mutationSignal.aborted && !session.queryClosed && session.query === query,
+        );
+        if (
+          this.sessions[params.sessionId] !== session ||
+          session.query !== query ||
+          session.queryClosed
+        )
+          throw RequestError.internalError(undefined, "Session changed; reload before retrying");
+        if (result.status === "ok" || result.status === "partial") {
+          session.creationParams = {
+            ...session.creationParams,
+            mcpServers: session.mcpState.hostServers,
+          };
+          session.sessionFingerprint = computeSessionFingerprint(session.creationParams);
+          this.mcpRevisions.set(params.sessionId, session.mcpState.revision);
+        }
+        return result;
+      },
+      signal,
+    );
+  }
+
+  async readSessionRuntime(
+    params: RuntimeReadRequest,
+    signal: AbortSignal,
+  ): Promise<RuntimeResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    return this.sessionMutations.runExclusive(params.sessionId, async () => {
+      const session = this.sessions[params.sessionId];
+      if (!session || session.queryClosed)
+        return { version: 1, status: "unavailable", reason: "stale" };
+      const query = session.query;
+      return readRuntime(
+        query,
+        params,
+        signal,
+        () =>
+          this.sessions[params.sessionId] === session &&
+          session.query === query &&
+          !session.queryClosed,
+      );
+    });
+  }
+
+  async controlSessionRuntime(
+    params: RuntimeControlRequest,
+    signal?: AbortSignal,
+  ): Promise<RuntimeResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    return this.runNativeMutation(
+      params.sessionId,
+      async (mutationSignal) => {
+        const session = this.sessions[params.sessionId];
+        if (!session || session.queryClosed)
+          return { version: 1, status: "unavailable", reason: "stale" };
+        const busy = sessionMutationBusy(session);
+        if (busy && params.action !== "backgroundTask")
+          throw RequestError.invalidParams({ reason: busy }, "Session is busy");
+        const query = session.query;
+        mutationSignal.throwIfAborted();
+        const result = await controlRuntime(query, params);
+        if (
+          mutationSignal.aborted ||
+          this.sessions[params.sessionId] !== session ||
+          session.query !== query ||
+          session.queryClosed
+        ) {
+          return { version: 1, status: "unavailable", reason: "stale" };
+        }
+        if (
+          result.status === "ok" &&
+          (params.action === "reloadSkills" || params.action === "reloadPlugins")
+        ) {
+          session.skillPaths = new Map();
+          const agents = await query.supportedAgents();
+          if (
+            mutationSignal.aborted ||
+            this.sessions[params.sessionId] !== session ||
+            session.query !== query ||
+            session.queryClosed
+          )
+            return { version: 1, status: "unavailable", reason: "stale" };
+          session.agents = agents.filter(
+            (a) => !BUILTIN_AGENT_NAMES.has(a.name) && a.name !== DEFAULT_AGENT_ID,
+          );
+          // Preserve a currently selected persona removed by reload until the user
+          // explicitly changes it; do not silently switch the native query.
+          if (
+            session.currentAgent !== DEFAULT_AGENT_ID &&
+            !session.agents.some((a) => a.name === session.currentAgent)
+          ) {
+            session.agents.push({
+              name: session.currentAgent,
+              description: "Current agent (no longer listed)",
+            });
+          }
+          const agentOption = buildConfigOptions(
+            session.modes,
+            session.models,
+            session.modelInfos,
+            undefined,
+            session.agents,
+            session.currentAgent,
+          ).find((option) => option.id === AGENT_CONFIG_ID);
+          session.configOptions = session.configOptions.filter(
+            (option) => option.id !== AGENT_CONFIG_ID,
+          );
+          if (agentOption) session.configOptions.push(agentOption);
+          await this.sendAvailableCommandsUpdate(params.sessionId);
+          if (
+            mutationSignal.aborted ||
+            session.queryClosed ||
+            this.sessions[params.sessionId] !== session
+          ) {
+            return { version: 1, status: "unavailable", reason: "stale" };
+          }
+          await this.client.sessionUpdate({
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "config_option_update",
+              configOptions: session.configOptions,
+            },
+          });
+        }
+        return result;
+      },
+      signal,
+    );
   }
 
   private rewindDependencies(): SessionRewindDependencies {
@@ -3000,6 +3199,18 @@ export class ClaudeAcpAgent {
     return this.runNativeMutation(
       params.sessionId,
       () => rewindClaudeSession(params, this.rewindDependencies()),
+      signal,
+    );
+  }
+
+  async rewindFiles(
+    params: SessionRewindFilesRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionRewindFilesResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    return this.runNativeMutation(
+      params.sessionId,
+      () => rewindSessionFiles(params, this.rewindDependencies()),
       signal,
     );
   }
@@ -10278,6 +10489,17 @@ export class ClaudeAcpAgent {
         cwd: params.cwd,
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,
+        mcpState: {
+          revision: this.mcpRevisions.has(sessionId) ? this.mcpRevisions.get(sessionId)! + 1 : 0,
+          hostServers: params.mcpServers,
+          // Main historically permits ACP servers to override options of the
+          // same name. Those names belong to the host, not the protected set.
+          protectedServers: Object.fromEntries(
+            Object.entries(userProvidedOptions?.mcpServers ?? {}).filter(
+              ([name]) => !Object.hasOwn(mcpServers, name),
+            ),
+          ),
+        },
         settingsManager,
         effortSettingsOverride: configuredSettingsObject,
         titles: new SessionTitles(this, sessionId),
@@ -10337,6 +10559,7 @@ export class ClaudeAcpAgent {
         accountKind: fromAccountInfo(initializationResult.account)?.kind,
         fileChangeReporter,
       };
+      this.mcpRevisions.set(sessionId, this.sessions[sessionId].mcpState!.revision);
       timing.phase("register");
       this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
 
@@ -11983,10 +12206,35 @@ export function v1AgentApp(
       onAgent(agent);
     })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
+    .onRequest<{ sessionId: string }, ReturnType<typeof sessionMcpState>>(
+      SESSION_MCP_STATE_METHOD,
+      { parse: parseSessionMcpStateRequest },
+      (ctx) => agent.readSessionMcpState(ctx.params),
+    )
+    .onRequest<SessionMcpSetRequest, Awaited<ReturnType<typeof setSessionMcpServers>>>(
+      SESSION_MCP_SET_METHOD,
+      { parse: parseSessionMcpSetRequest },
+      (ctx) => agent.setSessionMcp(ctx.params, ctx.signal),
+    )
+    .onRequest<RuntimeReadRequest, RuntimeResponse>(
+      RUNTIME_READ_METHOD,
+      { parse: parseRuntimeReadRequest },
+      (ctx) => agent.readSessionRuntime(ctx.params, ctx.signal),
+    )
+    .onRequest<RuntimeControlRequest, RuntimeResponse>(
+      RUNTIME_CONTROL_METHOD,
+      { parse: parseRuntimeControlRequest },
+      (ctx) => agent.controlSessionRuntime(ctx.params, ctx.signal),
+    )
     .onRequest<SessionRewindRequest, SessionRewindResponse>(
       SESSION_REWIND_METHOD,
       { parse: parseSessionRewindRequest },
       (ctx) => agent.rewindSession(ctx.params, ctx.signal),
+    )
+    .onRequest<SessionRewindFilesRequest, SessionRewindFilesResponse>(
+      SESSION_REWIND_FILES_METHOD,
+      { parse: parseSessionRewindFilesRequest },
+      (ctx) => agent.rewindFiles(ctx.params, ctx.signal),
     )
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))

@@ -10,6 +10,7 @@ import {
   type SessionRewindDependencies,
   type SessionHistoryPoint,
 } from "../session-rewind.js";
+import { rewindSessionFiles, parseSessionRewindFilesRequest } from "../session-rewind-files.js";
 
 vi.mock("../session-history.js", () => ({ readSessionHistory: vi.fn() }));
 function point(id: string, text = id): SessionHistoryPoint {
@@ -39,8 +40,13 @@ function fixture() {
   const request = vi.fn(async (r: Record<string, unknown>) => ({
     response: { rewound: true, targetMessageUuid: r.target_message_uuid },
   }));
+  const rewindFiles = vi.fn(async () => ({
+    canRewind: true,
+    filesChanged: ["file.txt"],
+    skippedLinks: 1,
+  }));
   const session: RewindSessionState = {
-    query: { request } as unknown as Query,
+    query: { request, rewindFiles } as unknown as Query,
     turnQueue: [],
   };
   const deps: SessionRewindDependencies = {
@@ -50,7 +56,7 @@ function fixture() {
     committed: vi.fn(),
     messageIdForGrouping: (m) => m.uuid,
   };
-  return { session, deps, request };
+  return { session, deps, request, rewindFiles };
 }
 beforeEach(() => {
   vi.mocked(readSessionHistory).mockReset();
@@ -263,4 +269,23 @@ describe("native conversation rewind", () => {
       }),
     ).toThrow();
   });
+});
+describe("independent native file restore", () => {
+  it("requires an explicit dry-run selection", () => {
+    expect(() =>
+      parseSessionRewindFilesRequest({ sessionId: "sid", beforeMessage: point("u1") }),
+    ).toThrow();
+  });
+  it.each([true, false])(
+    "forwards dryRun=%s and partial restore evidence without rewinding the chat",
+    async (dryRun) => {
+      const f = fixture();
+      expect(
+        await rewindSessionFiles({ sessionId: "sid", beforeMessage: point("u1"), dryRun }, f.deps),
+      ).toMatchObject({ canRewind: true, skippedLinks: 1, dryRun });
+      expect(f.rewindFiles).toHaveBeenCalledWith("u1", { dryRun });
+      expect(f.request).not.toHaveBeenCalled();
+      expect(f.deps.committed).not.toHaveBeenCalled();
+    },
+  );
 });

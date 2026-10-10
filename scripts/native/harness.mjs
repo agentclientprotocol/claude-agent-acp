@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { join, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -34,10 +35,21 @@ export function textOf(content) {
         .map((b) => b.text)
         .join("");
 }
-export async function fixture(name, capabilities = ["sessionRewind"]) {
-  const fixtureParent = join(repo, "node_modules", ".native-rewind");
-  await mkdir(fixtureParent, { recursive: true });
-  const root = await mkdtemp(join(fixtureParent, "case-"));
+export function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === "ESRCH") return false;
+    throw error;
+  }
+}
+
+export async function fixture(
+  name,
+  capabilities = ["sessionRewind", "sessionRewindFiles", "runtime", "sessionMcp"],
+) {
+  const root = await mkdtemp(join(tmpdir(), "claude-native-e2e-"));
   const cwd = join(root, "workspace");
   const home = join(root, "home");
   const config = join(home, ".claude");
@@ -46,6 +58,7 @@ export async function fixture(name, capabilities = ["sessionRewind"]) {
   const requests = [],
     children = [],
     faults = [];
+  let toolStep = 0;
   const server = createServer(async (req, res) => {
     try {
       let raw = "";
@@ -58,10 +71,24 @@ export async function fixture(name, capabilities = ["sessionRewind"]) {
         assert.ok(Array.isArray(body.messages) && body.messages.length > 0);
         requests.push(body);
         const last = textOf(body.messages.at(-1).content);
-        const block = {
+        let block = {
           type: "text",
           text: f.injectWrongReply ? "WRONG_NATIVE_REPLY" : `NATIVE_REPLY_${requests.length - 1}`,
         };
+        if (name === "files" && toolStep < 2) {
+          const tool =
+            toolStep++ === 0
+              ? { name: "Read", input: { file_path: join(cwd, "tracked.txt") } }
+              : {
+                  name: "Edit",
+                  input: {
+                    file_path: join(cwd, "tracked.txt"),
+                    old_string: "ORIGINAL",
+                    new_string: "CHANGED",
+                  },
+                };
+          block = { type: "tool_use", id: `tool_${toolStep}`, ...tool };
+        }
         const message = {
           id: "msg_mock_" + randomUUID().replaceAll("-", ""),
           type: "message",
@@ -160,6 +187,7 @@ export async function fixture(name, capabilities = ["sessionRewind"]) {
     capabilities,
     options: {
       title: "Native contract test",
+      enableFileCheckpointing: true,
       settingSources: [],
       tools: [],
       strictMcpConfig: true,
@@ -236,9 +264,20 @@ export async function fixture(name, capabilities = ["sessionRewind"]) {
       }
       server.closeAllConnections();
       await new Promise((r) => server.close(r));
+      // MCP fixtures append every launch, including replacements of the same name.
+      // Observe only: never kill a potentially recycled PID from an old marker.
+      for (const marker of (await readdir(root)).filter((name) => name.endsWith(".pid"))) {
+        for (const pid of (await readFile(join(root, marker), "utf8"))
+          .trim()
+          .split("\n")
+          .map(Number)) {
+          assert.ok(Number.isSafeInteger(pid) && pid > 0);
+          await until(() => !alive(pid), `owned MCP ${marker} exit`, 5_000);
+        }
+      }
       // root is the exact mkdtemp result, never a caller-supplied directory.
-      assert.equal(relative(resolve(fixtureParent), root).startsWith(".."), false);
-      assert.ok(isAbsolute(root) && root !== resolve(fixtureParent));
+      assert.equal(relative(resolve(tmpdir()), root).startsWith(".."), false);
+      assert.ok(isAbsolute(root) && root !== resolve(tmpdir()));
       await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     },
   };

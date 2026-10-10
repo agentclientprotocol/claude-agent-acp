@@ -67,5 +67,5 @@ jobs:
       - name: Reject incompatible SDK acknowledgements
         run: npm run test:native:compat
 
-      - name: Run isolated same-session rewind and private SDK contract
-        run: npm run test:native:rewind
+      - name: Run isolated native E2E and private SDK contract
+        run: npm run test:native
