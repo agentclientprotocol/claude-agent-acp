@@ -68,6 +68,60 @@ describe("Claude permission options and response mapping", () => {
     ]);
   });
 
+  // The Agent SDK's suggestions for `mkdir -p probe-dir/inner` in manual mode, as it handed them to canUseTool.
+  const mkdirSuggestions = [
+    {
+      type: "addRules" as const,
+      rules: [{ toolName: "Bash", ruleContent: "mkdir -p probe-dir/inner" }],
+      behavior: "allow" as const,
+      destination: "localSettings" as const,
+    },
+    {
+      type: "addDirectories" as const,
+      directories: ["/workspace/probe-dir"],
+      destination: "session" as const,
+    },
+    { type: "setMode" as const, mode: "acceptEdits" as const, destination: "session" as const },
+  ];
+
+  it("shows a shell ask's rules and directories as Claude Code does, leaving a suggested mode switch out", () => {
+    const changeSet = normalizeDurablePermissionChangeSet(mkdirSuggestions);
+    expect(build("Bash", changeSet, { command: "mkdir -p probe-dir/inner" })).toEqual([
+      { optionId: PERMISSION_OPTION_ID.allowOnce, name: "Yes", kind: "allow_once" },
+      {
+        optionId: PERMISSION_OPTION_ID.allowWithUpdates,
+        name: "Yes, and allow access to probe-dir/ and mkdir -p probe-dir/inner commands",
+        kind: "allow_always",
+      },
+      { optionId: PERMISSION_OPTION_ID.reject, name: "No", kind: "reject_once" },
+    ]);
+  });
+
+  it("offers auto mode on a shell ask while auto is available and off, unless an ask rule forced it", () => {
+    const context = {
+      toolName: "Bash",
+      input: { command: "mkdir -p probe-dir/inner" },
+      cwd: "/workspace",
+      durableChangeSet: normalizeDurablePermissionChangeSet(mkdirSuggestions),
+      availableModes: ["default", "acceptEdits", "plan", "auto"],
+      currentMode: "default",
+    };
+    const names = (
+      overrides: Partial<typeof context> & { allowPersistentOptions?: boolean } = {},
+    ) => buildClaudePermissionOptions({ ...context, ...overrides }).map((option) => option.name);
+    expect(names()).toEqual([
+      "Yes",
+      "Yes, and allow access to probe-dir/ and mkdir -p probe-dir/inner commands",
+      "Yes, and switch to auto mode",
+      "No",
+    ]);
+    expect(names({ currentMode: "auto" })).not.toContain("Yes, and switch to auto mode");
+    expect(names({ availableModes: ["default", "acceptEdits", "plan"] })).not.toContain(
+      "Yes, and switch to auto mode",
+    );
+    expect(names({ allowPersistentOptions: false })).not.toContain("Yes, and switch to auto mode");
+  });
+
   it.each([
     [
       "Bash",

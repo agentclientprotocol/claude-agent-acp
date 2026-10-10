@@ -1,7 +1,14 @@
 import type { PermissionOption } from "@agentclientprotocol/sdk";
 import path from "node:path";
 import type { DurablePermissionChangeSet } from "../normalization.js";
-import { plainString, type PermissionOptionContext, withOptionalUpdate } from "./shared.js";
+import {
+  allowOnce,
+  allowWithUpdates,
+  PERMISSION_OPTION_ID,
+  plainString,
+  type PermissionOptionContext,
+  reject,
+} from "./shared.js";
 
 function permissionRulePrefix(value: string): string {
   return value.endsWith(":*") ? value.slice(0, -2) : value;
@@ -100,14 +107,48 @@ function shellSuggestionsLabel(
   return undefined;
 }
 
+/** The suggestions a shell ask shows, as Claude Code's own prompt does (its displayed types): rules and
+ *  directories. A mode switch among them is not shown; the prompt offers auto mode as an option of its own. */
+export function displayedShellUpdates(
+  changeSet: DurablePermissionChangeSet,
+): DurablePermissionChangeSet | undefined {
+  const updates = changeSet.updates.filter(
+    (update) => update.type === "addRules" || update.type === "addDirectories",
+  );
+  return updates.length > 0 ? { updates } : undefined;
+}
+
+/** Claude Code offers auto mode on a shell ask the session could have let through in auto mode: auto is
+ *  available and not already on, and no ask rule of the user's forced the prompt. */
+function offersAutoMode(context: PermissionOptionContext): boolean {
+  return (
+    context.allowPersistentOptions !== false &&
+    context.availableModes?.includes("auto") === true &&
+    context.currentMode !== "auto" &&
+    context.currentMode !== "bypassPermissions"
+  );
+}
+
 function buildShellPermissionOptions(
   context: PermissionOptionContext,
   toolName: "Bash" | "PowerShell",
 ): PermissionOption[] {
-  const name = context.durableChangeSet
-    ? shellSuggestionsLabel(toolName, context.durableChangeSet)
-    : undefined;
-  return withOptionalUpdate(context.durableChangeSet, name, "Yes", "No");
+  const displayed = context.durableChangeSet && displayedShellUpdates(context.durableChangeSet);
+  const name = displayed ? shellSuggestionsLabel(toolName, displayed) : undefined;
+  return [
+    allowOnce(),
+    ...(name ? [allowWithUpdates(name)] : []),
+    ...(offersAutoMode(context)
+      ? [
+          {
+            optionId: PERMISSION_OPTION_ID.switchToAuto,
+            name: "Yes, and switch to auto mode",
+            kind: "allow_always" as const,
+          },
+        ]
+      : []),
+    reject(),
+  ];
 }
 
 export function buildBashPermissionOptions(context: PermissionOptionContext): PermissionOption[] {
