@@ -115,6 +115,8 @@ Claude Agent SDK remains pinned to 0.3.293. It preserves custom instructions,
 event-loop yielding, v2 commands in setup responses, the v2 `error` stop reason,
 and `cancelled` status for interrupted tool calls.
 
+Unsupported archive requests are rejected before cancelling native work or waiting
+for its reservation. They leave the active control and live prompts unchanged.
 Session index operations share the native-control reservation. Rename and
 unarchive wait for an in-flight control; archive and delete cancel it and wait
 for shutdown. All four reject an unconfirmed native exit before changing storage.
@@ -125,7 +127,8 @@ that capability archives on `session/delete`; other clients use SDK deletion.
 本次基于上游 `4e1fc1e`（适配器 0.89.1、ACP SDK 1.8.0），Claude Agent SDK
 仍锁定 0.3.293。保留上游自定义指令、事件循环让步、v2 setup commands、正式
 error 停止原因与工具 cancelled 状态。索引改名/归档/取消归档/删除共享原生
-控制互斥锁，退出未确认时禁止修改存储。已协商 sessionIndex 的 AIR 客户端
+控制互斥锁，退出未确认时禁止修改存储。未协商 index 的 archive 请求先返回
+method-not-found，不取消已有控制或影响仍在运行的消息。已协商 sessionIndex 的 AIR 客户端
 执行永久删除；未协商的 AIR 客户端在 session/delete 时归档；其它客户端
 继续使用 SDK 删除。close 保持幂等。
 

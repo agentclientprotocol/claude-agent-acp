@@ -1,3 +1,4 @@
+import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { createHash } from "node:crypto";
 import { PROTOCOL_VERSION as V2_PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2";
 import type { Query, SessionMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -28,7 +29,7 @@ beforeEach(() => {
 });
 
 /** Exercise both ACP routers; replace only native history and the query. */
-async function connect(version: 1 | 2) {
+async function connect(version: 1 | 2, clientCapabilities: ClientCapabilities = {}) {
   const incoming = new TransformStream();
   const outgoing = new TransformStream();
   let agent!: ClaudeAcpAgent;
@@ -85,7 +86,7 @@ async function connect(version: 1 | 2) {
   const initialized = await send(
     "initialize",
     version === 1
-      ? { protocolVersion: 1, clientCapabilities: {} }
+      ? { protocolVersion: 1, clientCapabilities }
       : {
           protocolVersion: V2_PROTOCOL_VERSION,
           info: { name: "rewind-wire-test", version: "1" },
@@ -136,6 +137,52 @@ describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
       await c.close();
     }
   });
+
+  it.each(["plain", "air-without-index"])(
+    "rejects unsupported archive without aborting a native control (%s)",
+    async (client) => {
+      const capabilities =
+        client === "plain"
+          ? {}
+          : {
+              _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionArchive"] } } },
+            };
+      const c = await connect(version, capabilities);
+      const ack = Promise.withResolvers<{
+        response: { rewound: boolean; targetMessageUuid: string };
+      }>();
+      c.request.mockReturnValue(ack.promise);
+      let settled = false;
+      const control = c.send("_session/rewind", requestParams).then(
+        (result) => {
+          settled = true;
+          return { result };
+        },
+        (error) => {
+          settled = true;
+          return { error };
+        },
+      );
+      try {
+        await vi.waitFor(() => expect(c.request).toHaveBeenCalledOnce());
+        await expect(c.send("_session/archive", { sessionId: "sid" })).rejects.toMatchObject({
+          code: -32601,
+        });
+        expect(c.query.close).not.toHaveBeenCalled();
+        expect(c.session.queryClosed).not.toBe(true);
+        expect(settled).toBe(false);
+        ack.resolve({ response: { rewound: true, targetMessageUuid: "user-1" } });
+        await expect(control).resolves.toMatchObject({
+          result: { rewound: true, sessionId: "sid" },
+        });
+        expect(c.query.close).not.toHaveBeenCalled();
+      } finally {
+        ack.resolve({ response: { rewound: true, targetMessageUuid: "user-1" } });
+        await control;
+        await c.close();
+      }
+    },
+  );
 
   it("holds dispose until the interrupted rewind's native process exits", async () => {
     const c = await connect(version);
@@ -202,6 +249,7 @@ describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
       const mutate = vi.fn(async () => ({}));
       Object.assign(c.agent(), {
         sessionIndex: {
+          assertArchiveSupported: vi.fn(),
           archive: mutate,
           deleteSession: mutate,
           dispose: vi.fn(),
@@ -252,7 +300,9 @@ describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
   });
 
   it("keeps same-ID recreation fenced when native exit cannot be confirmed", async () => {
-    const c = await connect(version);
+    const c = await connect(version, {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionIndex"] } } },
+    });
     c.agent().nativeMutationTimeoutMs = 20;
     Object.assign(c.query, { transport: undefined, [Symbol.asyncDispose]: async () => {} });
     c.request.mockReturnValue(new Promise(() => {}));
@@ -268,11 +318,20 @@ describe.each([1, 2] as const)("ACP v%s core rewind wire", (version) => {
       });
       for (const change of [
         () => c.agent().renameSessionTitle({ sessionId: "sid", title: "Unsafe rename" }),
-        () => c.agent().archiveSession({ sessionId: "sid" }),
         () => c.agent().unarchiveSession({ sessionId: "sid" }),
         () => c.agent().deleteSession({ sessionId: "sid" }),
       ]) {
         await expect(change()).rejects.toThrow("shutdown unconfirmed");
+      }
+      if (version === 1) {
+        await expect(c.send("_session/archive", { sessionId: "sid" })).rejects.toMatchObject({
+          code: -32600,
+          message: expect.stringContaining("shutdown unconfirmed"),
+        });
+      } else {
+        await expect(c.agent().archiveSession({ sessionId: "sid" })).rejects.toMatchObject({
+          code: -32601,
+        });
       }
       expect(c.request).toHaveBeenCalledOnce();
     } finally {

@@ -3110,7 +3110,8 @@ export class ClaudeAcpAgent {
   renameSessionTitle(params: RenameSessionRequest) {
     return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.rename(params));
   }
-  archiveSession(params: SessionIdRequest) {
+  async archiveSession(params: SessionIdRequest) {
+    this.sessionIndex.assertArchiveSupported();
     this.sessionMutations.cancelExclusive(params.sessionId);
     return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.archive(params));
   }
