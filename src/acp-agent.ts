@@ -9631,32 +9631,26 @@ export class ClaudeAcpAgent {
     // into the query.
     const resolvedProvider = this.resolveProviderConfig();
     const providerEnv = createEnvForProvider(resolvedProvider);
-    const configuredSettings =
-      userProvidedOptions?.settings ??
-      (modelConfig
-        ? {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          }
-        : undefined);
-    const configuredSettingsObject =
-      typeof configuredSettings === "string"
+    const providedSettings = userProvidedOptions?.settings;
+    const providedSettingsObject =
+      typeof providedSettings === "string"
         ? (JSON.parse(
-            await fs.readFile(path.resolve(params.cwd, configuredSettings), "utf8"),
+            await fs.readFile(path.resolve(params.cwd, providedSettings), "utf8"),
           ) as Settings)
-        : configuredSettings;
+        : providedSettings;
+    const configuredSettingsObject = modelConfig
+      ? { ...modelConfig, ...providedSettingsObject }
+      : providedSettingsObject;
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
-    let settings = configuredSettings;
-    if (resolvedProvider) {
-      const baseSettings = configuredSettingsObject;
-      settings = {
-        ...baseSettings,
-        apiKeyHelper: "",
-        env: { ...baseSettings?.env, ...providerEnv },
-      };
-    }
+    const settings = resolvedProvider
+      ? {
+          ...configuredSettingsObject,
+          apiKeyHelper: "",
+          env: { ...configuredSettingsObject?.env, ...providerEnv },
+        }
+      : configuredSettingsObject;
     const env = {
       ...process.env,
       ...userProvidedOptions?.env,
