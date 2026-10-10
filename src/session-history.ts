@@ -18,6 +18,14 @@ export async function readSessionHistory(
     ? await getSessionMessages(sessionId, { includeSystemMessages: true })
     : await getSessionMessages(sessionId);
   if (messages.length === 0) return messages;
+  const rows = await readLocalSessionRows(sessionId);
+  return rows ? applyRewindAnchor(messages, rows) : messages;
+}
+
+/** Read native-owned storage, never the live query's in-memory history. */
+export async function readLocalSessionRows(
+  sessionId: string,
+): Promise<SessionStoreEntry[] | undefined> {
   // Remote/fileless SDK sessions have no local JSONL anchor to interpret.
   // A failed read of an existing transcript must still propagate.
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new Error("Invalid session id for local history");
@@ -36,7 +44,7 @@ export async function readSessionHistory(
       if ((error as { code?: string }).code !== "ENOENT") throw error;
     }
   }
-  if (!local) return messages;
+  if (!local) return undefined;
   const rows: SessionStoreEntry[] = [];
   await importSessionToStore(
     sessionId,
@@ -48,7 +56,7 @@ export async function readSessionHistory(
     },
     { includeSubagents: false },
   );
-  return applyRewindAnchor(messages, rows);
+  return rows;
 }
 
 export function applyRewindAnchor(

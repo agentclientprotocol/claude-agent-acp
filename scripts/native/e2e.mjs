@@ -58,10 +58,27 @@ async function awaitConnected(c, expected) {
 }
 
 async function rewind(f, index) {
+  f.rawMessages = true;
   let c = await fresh(f);
   const expected = [];
   for (let i = 0; i < 3; i++) {
+    const start = c.messages.length;
     await c.prompt(`NATIVE_USER_${i}`);
+    // ACP result settlement precedes the CLI's trailing idle. The semantic
+    // guard assertions below intentionally require idle; busy is NOT success.
+    await until(
+      () =>
+        c.messages
+          .slice(start)
+          .some(
+            (frame) =>
+              frame.method === "_claude/sdkMessage" &&
+              frame.params.message.type === "system" &&
+              frame.params.message.subtype === "session_state_changed" &&
+              frame.params.message.state === "idle",
+          ),
+      "native idle after rewind fixture prompt",
+    );
     expected.push(
       { role: "user", text: `NATIVE_USER_${i}` },
       { role: "assistant", text: `NATIVE_REPLY_${i}` },
@@ -91,6 +108,11 @@ async function rewind(f, index) {
       code: -32602,
     });
   assert.deepEqual(await rpc(c, "_session/rewind", params), { rewound: true, sessionId: c.sid });
+  const persisted = (await f.transcript(c.sid)).findLast(
+    (row) => row.type === "last-prompt" && row.explicit === true,
+  );
+  assert.equal(persisted?.rewound, true, "ACP success requires the native anchor on disk");
+  assert.equal(persisted.leafUuid, target ? history[target - 1].uuid : null);
   assert.equal(f.requests.length, 3, "rewind must not resend");
   const sid = c.sid,
     loadParams = c.params,
@@ -552,11 +574,13 @@ for (const name of selected.length ? selected : rewindOnly ? rewindCases : Objec
   const f = await fixture(name, rewindOnly ? ["sessionRewind"] : undefined);
   f.injectWrongReply = injectWrongReply;
   const start = Date.now();
+  let caseError;
   try {
     await cases[name](f);
     assert.deepEqual(f.faults, [], "local provider or ACP protocol failed");
     console.log(`PASS ${name} (${Date.now() - start}ms)`);
   } catch (error) {
+    caseError = error;
     failed++;
     console.error(`FAIL ${name}:`, error);
     console.error("provider requests", f.requests.length, "faults", f.faults);
@@ -567,7 +591,10 @@ for (const name of selected.length ? selected : rewindOnly ? rewindCases : Objec
       await f.cleanup();
     } catch (error) {
       failed++;
+      caseError ??= error;
       console.error(`FAIL ${name} cleanup:`, error);
+    } finally {
+      await f.saveEvidence(caseError);
     }
   }
 }

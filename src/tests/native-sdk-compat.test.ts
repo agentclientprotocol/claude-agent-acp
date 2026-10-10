@@ -11,6 +11,10 @@ import {
 import { setSessionMcpServers, type SessionMcpState } from "../session-mcp-set.js";
 
 vi.mock("../session-history.js", () => ({ readSessionHistory: vi.fn() }));
+vi.mock("../session-rewind-persistence.js", () => ({
+  prepareRewindPersistence: vi.fn(async () => ({ sessionId: "sid", anchors: [], retained: [] })),
+  confirmRewindPersistence: vi.fn(async () => {}),
+}));
 
 describe("pinned SDK private rewind acknowledgement compatibility", () => {
   it.each([{}, { request: null }, { request: true }, { request: {} }])(

@@ -5,8 +5,8 @@ session. Discover them in initialize's top-level `_meta.sessionRewind`,
 `_meta.sessionRewindFiles`, `_meta.runtime`, and `_meta.sessionMcp`.
 They do not implement the whole Claude Desktop UI or cloud chat service.
 
-本提案在一个分支中整合对话回退、文件 checkpoint、运行状态/刷新、MCP 替换、
-单条排队消息撤回与 summary/full 上下文诊断；`test:native` 统一运行全部十项原生用例。
+���᰸��һ����֧�����϶Ի����ˡ��ļ� checkpoint������״̬/ˢ�¡�MCP �滻��
+�����Ŷ���Ϣ������ summary/full ��������ϣ�`test:native` ͳһ����ȫ��ʮ��ԭ��������
 
 ## Conversation rewind
 
@@ -34,7 +34,14 @@ retaining the session ID. No replacement prompt is sent, and no file is restored
 A native explicit history anchor is persisted before success; a subsequent
 process can resume it before any new prompt has been submitted. The adapter reads
 that anchor when the SDK history helper would otherwise replay the old branch.
-Transcript writes belong exclusively to Claude Code.
+Transcript writes belong exclusively to Claude Code. The native ACK can precede
+its asynchronous local flush: the adapter holds the mutation reservation for a
+bounded readback (up to five seconds), requiring a new explicit rewind anchor and
+the exact retained user/assistant prefix before returning success. This confirms
+cold-read visibility, not fsync/power-loss durability. Missing local persistence
+is refused before mutation with `persistence_unavailable`; missing, divergent or
+unreadable confirmation after ACK closes the query and requires reload. The
+adapter never retries the mutation or writes an anchor.
 
 `beforeMessage` must identify a human-authored user message. `resumeAtMessage` is
 required for a non-first prompt and is validated against the preceding authored
@@ -48,7 +55,9 @@ cannot be matched are refused rather than guessed.
 
 Success is `{ "rewound": true, "sessionId": "same-id" }`. A native refusal or
 busy/unsupported state returns `rewound:false` and a `reason`. Invalid guards
-return JSON-RPC invalid params. A lost/invalid ACK closes the query and returns an
+return JSON-RPC invalid params once the session is idle. Busy refusal takes
+precedence over semantic fingerprint validation; prompt completion can precede
+the native trailing idle event. A lost/invalid ACK closes the query and returns an
 error; reload is required. Active or queued turns are refused by default. Explicit
 `interruptIfRunning:true` first validates the target, cancels the turns, waits for
 settlement, and sends the most recently observed user UUID as the native stale
@@ -223,13 +232,13 @@ Close remains idempotent. The upstream deletion policy is unchanged: an AIR
 client that negotiated `sessionIndex` permanently deletes; an AIR client without
 that capability archives on `session/delete`; other clients use SDK deletion.
 
-本次基于上游 `4e1fc1e`（适配器 0.89.1、ACP SDK 1.8.0），Claude Agent SDK
-仍锁定 0.3.293。保留上游自定义指令、事件循环让步、v2 setup commands、正式
-error 停止原因与工具 cancelled 状态。索引改名/归档/取消归档/删除共享原生
-控制互斥锁，退出未确认时禁止修改存储。未协商 index 的 archive 请求先返回
-method-not-found，不取消已有控制或影响仍在运行的消息。已协商 sessionIndex 的 AIR 客户端
-执行永久删除；未协商的 AIR 客户端在 session/delete 时归档；其它客户端
-继续使用 SDK 删除。close 保持幂等。
+���λ������� `4e1fc1e`�������� 0.89.1��ACP SDK 1.8.0����Claude Agent SDK
+������ 0.3.293�����������Զ���ָ��¼�ѭ���ò���v2 setup commands����ʽ
+error ֹͣԭ���빤�� cancelled ״̬����������/�鵵/ȡ���鵵/ɾ������ԭ��
+���ƻ��������˳�δȷ��ʱ��ֹ�޸Ĵ洢��δЭ�� index �� archive �����ȷ���
+method-not-found����ȡ�����п��ƻ�Ӱ���������е���Ϣ����Э�� sessionIndex �� AIR �ͻ���
+ִ������ɾ����δЭ�̵� AIR �ͻ����� session/delete ʱ�鵵�������ͻ���
+����ʹ�� SDK ɾ����close �����ݵȡ�
 
 ## Attribution
 
@@ -240,3 +249,8 @@ https://github.com/agentclientprotocol/claude-agent-acp/pull/1126.
 The implementation uses native same-ID rewind instead of that PR's session
 recreation approach. This refresh targets upstream main `4e1fc1e` (0.89.1)
 with ACP SDK 1.8.0 and Claude Agent SDK 0.3.293.
+
+For diagnostics, `NATIVE_E2E_KEEP=1` retains the isolated fixture after process
+cleanup and writes `evidence.json` with protocol frames, actual responses,
+stdout/stderr, local provider requests and before/after code hashes. Normal runs
+remove their fixtures. Retained data contains only the synthetic offline prompts.

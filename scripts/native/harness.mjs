@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve, relative, isAbsolute } from "node:path";
@@ -58,7 +58,36 @@ export async function fixture(
   const requests = [],
     countRequests = [],
     children = [],
-    faults = [];
+    faults = [],
+    protocol = [];
+  const keepEvidence = process.env.NATIVE_E2E_KEEP === "1";
+  const hashes = async () => {
+    const paths = [
+      "scripts/native/e2e.mjs",
+      "scripts/native/harness.mjs",
+      "dist/index.js",
+      "dist/acp-agent.js",
+      "dist/session-rewind.js",
+      "dist/session-history.js",
+      "dist/session-rewind-persistence.js",
+      "dist/resumed-session.js",
+      "dist/native-rewind-control.js",
+      "dist/native-mutation.js",
+      "node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs",
+    ];
+    return Object.fromEntries(
+      await Promise.all(
+        paths.map(async (p) => [
+          p,
+          createHash("sha256")
+            .update(await readFile(join(repo, p)))
+            .digest("hex"),
+        ]),
+      ),
+    );
+  };
+  const startedAt = new Date().toISOString();
+  const beforeHashes = keepEvidence ? await hashes() : undefined;
   let toolStep = 0;
   const server = createServer(async (req, res) => {
     try {
@@ -190,7 +219,47 @@ export async function fixture(
     countRequests,
     faults,
     children,
+    protocol,
+    keepEvidence,
     capabilities,
+    async saveEvidence(error) {
+      if (!keepEvidence) return;
+      await writeFile(
+        join(root, "evidence.json"),
+        JSON.stringify(
+          {
+            name,
+            root,
+            repo,
+            startedAt,
+            finishedAt: new Date().toISOString(),
+            node: process.version,
+            error: error && {
+              name: error.name,
+              message: error.message,
+              stack: error.stack,
+              actual: error.actual,
+              expected: error.expected,
+            },
+            beforeHashes,
+            afterHashes: await hashes(),
+            protocol,
+            requests,
+            countRequests,
+            children: children.map((child) => ({
+              pid: child.pid,
+              exitCode: child.exitCode,
+              signalCode: child.signalCode,
+              stdout: child.stdoutText,
+              stderr: child.stderrText,
+            })),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      console.error(`EVIDENCE ${name}: ${root}`);
+    },
     options: {
       title: "Native contract test",
       enableFileCheckpointing: true,
@@ -210,6 +279,11 @@ export async function fixture(
         stdio: ["pipe", "pipe", "pipe"],
       });
       children.push(child);
+      child.stdoutText = "";
+      if (keepEvidence)
+        child.stdout.on("data", (b) => {
+          child.stdoutText += b;
+        });
       child.stderrText = "";
       child.stderr.on("data", (b) => {
         child.stderrText += b;
@@ -284,7 +358,8 @@ export async function fixture(
       // root is the exact mkdtemp result, never a caller-supplied directory.
       assert.equal(relative(resolve(tmpdir()), root).startsWith(".."), false);
       assert.ok(isAbsolute(root) && root !== resolve(tmpdir()));
-      await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+      if (!keepEvidence)
+        await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
     },
   };
   return f;
@@ -306,6 +381,13 @@ export class AcpClient {
         buffer = buffer.slice(index + 1);
         try {
           const message = JSON.parse(line);
+          if (f.keepEvidence)
+            f.protocol.push({
+              at: new Date().toISOString(),
+              pid: this.child.pid,
+              direction: "from-adapter",
+              message,
+            });
           this.messages.push(message);
           if (message.id !== undefined && !message.method) {
             const p = this.pending.get(message.id);
@@ -353,6 +435,13 @@ export class AcpClient {
         reject(new Error(`Timeout: ${method}\n${this.child.stderrText.slice(-6000)}`));
       }, timeout);
       this.pending.set(id, { resolve, reject, timer });
+      if (this.f.keepEvidence)
+        this.f.protocol.push({
+          at: new Date().toISOString(),
+          pid: this.child.pid,
+          direction: "to-adapter",
+          message: { jsonrpc: "2.0", id, method, params },
+        });
       this.child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
   }

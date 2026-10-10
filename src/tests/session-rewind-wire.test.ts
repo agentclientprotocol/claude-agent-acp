@@ -6,8 +6,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { v1AgentApp, type ClaudeAcpAgent, type Session } from "../acp-agent.js";
 import { v2AgentApp } from "../v2/agent.js";
 import { readSessionHistory } from "../session-history.js";
+import {
+  prepareRewindPersistence,
+  confirmRewindPersistence,
+} from "../session-rewind-persistence.js";
 
 vi.mock("../session-history.js", () => ({ readSessionHistory: vi.fn() }));
+vi.mock("../session-rewind-persistence.js", () => ({
+  prepareRewindPersistence: vi.fn(async () => ({ sessionId: "sid", anchors: [], retained: [] })),
+  confirmRewindPersistence: vi.fn(async () => {}),
+}));
 
 const requestParams = {
   sessionId: "sid",
@@ -19,6 +27,10 @@ const requestParams = {
 };
 
 beforeEach(() => {
+  vi.mocked(prepareRewindPersistence)
+    .mockReset()
+    .mockResolvedValue({ sessionId: "sid", anchors: [], retained: [] });
+  vi.mocked(confirmRewindPersistence).mockReset().mockResolvedValue();
   vi.mocked(readSessionHistory).mockResolvedValue([
     {
       uuid: "user-1",
@@ -105,6 +117,56 @@ async function connect(version: 1 | 2, clientCapabilities: ClientCapabilities = 
 }
 
 describe.each([1, 2] as const)("ACP v%s rewind wire", (version) => {
+  it("returns actual busy before semantic validation until trailing native idle", async () => {
+    const c = await connect(version);
+    const invalid = {
+      ...requestParams,
+      beforeMessage: {
+        ...requestParams.beforeMessage,
+        messageFingerprint: "sha256:" + "0".repeat(64),
+      },
+    };
+    try {
+      c.session.lastSessionState = "running";
+      expect(await c.send("_session/rewind", invalid)).toEqual({ rewound: false, reason: "busy" });
+      expect(readSessionHistory).not.toHaveBeenCalled();
+      expect(c.request).not.toHaveBeenCalled();
+      c.session.lastSessionState = "idle";
+      await expect(c.send("_session/rewind", invalid)).rejects.toMatchObject({ code: -32602 });
+      expect(c.request).not.toHaveBeenCalled();
+    } finally {
+      await c.close();
+    }
+  });
+  it("holds the reservation after ACK until the persisted prefix is confirmed", async () => {
+    const c = await connect(version);
+    const persisted = Promise.withResolvers<void>();
+    vi.mocked(confirmRewindPersistence).mockReturnValue(persisted.promise);
+    const rename = vi.fn(async () => ({}));
+    Object.assign(c.agent(), {
+      sessionIndex: { rename, dispose: vi.fn(), onTeardown: vi.fn(), onOwnSessionChanged: vi.fn() },
+    });
+    try {
+      let done = false;
+      const pending = c.send("_session/rewind", requestParams).then((response) => {
+        done = true;
+        return response;
+      });
+      await vi.waitFor(() => expect(confirmRewindPersistence).toHaveBeenCalledOnce());
+      const renamed = c.agent().renameSessionTitle({ sessionId: "sid", title: "Kept title" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(done).toBe(false);
+      expect(rename).not.toHaveBeenCalled();
+      persisted.resolve();
+      await expect(pending).resolves.toMatchObject({ rewound: true });
+      await renamed;
+      expect(rename).toHaveBeenCalledOnce();
+      expect(c.request).toHaveBeenCalledOnce();
+    } finally {
+      persisted.resolve();
+      await c.close();
+    }
+  });
   it("rewinds through the router while preserving the same session", async () => {
     const c = await connect(version);
     try {

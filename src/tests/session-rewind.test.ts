@@ -2,6 +2,10 @@ import { createHash } from "node:crypto";
 import type { Query, SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readSessionHistory } from "../session-history.js";
+import {
+  prepareRewindPersistence,
+  confirmRewindPersistence,
+} from "../session-rewind-persistence.js";
 import { nativeRewind, NativeRewindUncertain } from "../native-rewind-control.js";
 import {
   parseSessionRewindRequest,
@@ -13,6 +17,10 @@ import {
 import { rewindSessionFiles, parseSessionRewindFilesRequest } from "../session-rewind-files.js";
 
 vi.mock("../session-history.js", () => ({ readSessionHistory: vi.fn() }));
+vi.mock("../session-rewind-persistence.js", () => ({
+  prepareRewindPersistence: vi.fn(async () => ({ sessionId: "sid", anchors: [], retained: [] })),
+  confirmRewindPersistence: vi.fn(async () => {}),
+}));
 function point(id: string, text = id): SessionHistoryPoint {
   return {
     messageId: id,
@@ -59,10 +67,58 @@ function fixture() {
   return { session, deps, request, rewindFiles };
 }
 beforeEach(() => {
+  vi.mocked(prepareRewindPersistence)
+    .mockReset()
+    .mockResolvedValue({ sessionId: "sid", anchors: [], retained: [] });
+  vi.mocked(confirmRewindPersistence).mockReset().mockResolvedValue();
   vi.mocked(readSessionHistory).mockReset();
   vi.mocked(readSessionHistory).mockResolvedValue(history);
 });
 describe("native conversation rewind", () => {
+  it("does not commit a native ACK until persistence has been confirmed", async () => {
+    const f = fixture();
+    const persisted = Promise.withResolvers<void>();
+    vi.mocked(confirmRewindPersistence).mockReturnValue(persisted.promise);
+    const pending = rewindClaudeSession({ sessionId: "sid", beforeMessage: point("u1") }, f.deps);
+    await vi.waitFor(() => expect(confirmRewindPersistence).toHaveBeenCalledOnce());
+    expect(f.request).toHaveBeenCalledOnce();
+    expect(f.deps.committed).not.toHaveBeenCalled();
+    persisted.resolve();
+    await expect(pending).resolves.toMatchObject({ rewound: true });
+    expect(f.deps.committed).toHaveBeenCalledOnce();
+  });
+  it.each(["timed out", "divergent prefix", "read failed"])(
+    "invalidates %s after ACK without retrying",
+    async (reason) => {
+      const f = fixture();
+      vi.mocked(confirmRewindPersistence).mockRejectedValue(new Error(reason));
+      await expect(
+        rewindClaudeSession({ sessionId: "sid", beforeMessage: point("u1") }, f.deps),
+      ).rejects.toThrow(reason);
+      expect(f.request).toHaveBeenCalledOnce();
+      expect(f.deps.committed).not.toHaveBeenCalled();
+      expect(f.deps.invalidate).toHaveBeenCalledOnce();
+    },
+  );
+  it("does not mutate if local persistence cannot be confirmed", async () => {
+    const f = fixture();
+    vi.mocked(prepareRewindPersistence).mockResolvedValue(undefined);
+    expect(
+      await rewindClaudeSession({ sessionId: "sid", beforeMessage: point("u1") }, f.deps),
+    ).toEqual({ rewound: false, reason: "persistence_unavailable" });
+    expect(f.request).not.toHaveBeenCalled();
+  });
+  it("rejects a session closed while persistence was pending", async () => {
+    const f = fixture();
+    vi.mocked(confirmRewindPersistence).mockImplementation(async () => {
+      f.session.queryClosed = true;
+    });
+    await expect(
+      rewindClaudeSession({ sessionId: "sid", beforeMessage: point("u1") }, f.deps),
+    ).rejects.toThrow("Session changed");
+    expect(f.deps.committed).not.toHaveBeenCalled();
+    expect(f.deps.invalidate).toHaveBeenCalledOnce();
+  });
   it("clears the first prompt without creating a session or supplying a boundary", async () => {
     const f = fixture();
     expect(

@@ -3,6 +3,10 @@ import type { Query, SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 import { readSessionHistory } from "./session-history.js";
 import {
+  prepareRewindPersistence,
+  confirmRewindPersistence,
+} from "./session-rewind-persistence.js";
+import {
   nativeRewind,
   NativeRewindUnsupported,
   NativeRewindUncertain,
@@ -119,6 +123,12 @@ export async function rewindClaudeSession(
   const nowBusy = sessionMutationBusy(session);
   if (nowBusy) return { rewound: false, reason: nowBusy };
   const target = resolveTarget(messages, p, deps.messageIdForGrouping);
+  const persistence = await prepareRewindPersistence(p.sessionId, messages, target.uuid);
+  if (!persistence) return { rewound: false, reason: "persistence_unavailable" };
+  if (deps.getSession(p.sessionId) !== session || session.query !== query)
+    return { rewound: false, reason: "state_changed" };
+  const busyAfterRead = sessionMutationBusy(session);
+  if (busyAfterRead) return { rewound: false, reason: busyAfterRead };
   const last =
     session.lastObservedUserMessageUuid ?? messages.findLast(isAuthoredUserMessage)?.uuid;
   if (!last) return { rewound: false, reason: "target_not_found" };
@@ -127,8 +137,17 @@ export async function rewindClaudeSession(
     if (!result.rewound) return { rewound: false, reason: result.reason ?? "native_refused" };
     if (result.targetMessageUuid !== target.uuid)
       throw new NativeRewindUncertain("CLI rewound a different message; reload required");
-    if (deps.getSession(p.sessionId) !== session || session.query !== query || session.queryClosed)
-      throw new NativeRewindUncertain("Session changed while rewinding; reload required");
+    const assertCurrent = () => {
+      if (
+        deps.getSession(p.sessionId) !== session ||
+        session.query !== query ||
+        session.queryClosed
+      )
+        throw new NativeRewindUncertain("Session changed while rewinding; reload required");
+    };
+    assertCurrent();
+    await confirmRewindPersistence(persistence, assertCurrent);
+    assertCurrent();
     deps.committed(p.sessionId);
     return { rewound: true, sessionId: p.sessionId };
   } catch (error) {
@@ -136,7 +155,7 @@ export async function rewindClaudeSession(
       session.nativeRewindUnsupported = true;
       return { rewound: false, reason: "unsupported" };
     }
-    // A missing acknowledgement is not proof of no mutation. Close the stale
+    // A missing acknowledgement or persistence proof is not proof of no mutation. Close the stale
     // query and require reload; never retry the operation or report success.
     deps.invalidate(session);
     throw error;
