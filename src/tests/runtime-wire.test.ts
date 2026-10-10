@@ -1,3 +1,4 @@
+import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as V2_PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it, vi } from "vitest";
@@ -5,7 +6,7 @@ import { v1AgentApp, type ClaudeAcpAgent, type Session } from "../acp-agent.js";
 import { v2AgentApp } from "../v2/agent.js";
 
 /** Real ACP routers, with only the native Query replaced. No subprocess or prompt. */
-async function connect(version: 1 | 2) {
+async function connect(version: 1 | 2, clientCapabilities: ClientCapabilities = {}) {
   const incoming = new TransformStream();
   const outgoing = new TransformStream();
   let agent!: ClaudeAcpAgent;
@@ -84,7 +85,7 @@ async function connect(version: 1 | 2) {
   await connection.send(
     "initialize",
     version === 1
-      ? { protocolVersion: 1, clientCapabilities: {} }
+      ? { protocolVersion: 1, clientCapabilities }
       : {
           protocolVersion: V2_PROTOCOL_VERSION,
           info: { name: "wire-test", version: "1" },
@@ -259,6 +260,54 @@ describe.each([1, 2] as const)("ACP v%s runtime wire", (version) => {
       await c.close();
     }
   });
+  it.each(["plain", "air-without-index"])(
+    "rejects unsupported archive without aborting a native reload (%s)",
+    async (client) => {
+      const capabilities =
+        client === "plain"
+          ? {}
+          : {
+              _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionArchive"] } } },
+            };
+      const c = await connect(version, capabilities);
+      const ack = Promise.withResolvers<never>();
+      vi.mocked(c.query.reloadSkills).mockReturnValue(ack.promise);
+      let settled = false;
+      const control = c
+        .send("_session/runtime/control", {
+          sessionId: "sid",
+          action: "reloadSkills",
+        })
+        .then(
+          (result) => {
+            settled = true;
+            return { result };
+          },
+          (error) => {
+            settled = true;
+            return { error };
+          },
+        );
+      try {
+        await vi.waitFor(() => expect(c.query.reloadSkills).toHaveBeenCalledOnce());
+        await expect(c.send("_session/archive", { sessionId: "sid" })).rejects.toMatchObject({
+          code: -32601,
+        });
+        expect(c.query.close).not.toHaveBeenCalled();
+        expect(c.query.interrupt).not.toHaveBeenCalled();
+        expect(c.session.queryClosed).not.toBe(true);
+        expect(settled).toBe(false);
+        ack.resolve({ commands: [], agents: [] } as never);
+        await expect(control).resolves.toMatchObject({ result: { status: "ok" } });
+        expect(c.query.close).not.toHaveBeenCalled();
+      } finally {
+        ack.resolve({ commands: [], agents: [] } as never);
+        await control;
+        await c.close();
+      }
+    },
+  );
+
   it("keeps another lifecycle mutation behind a native reload", async () => {
     const c = await connect(version);
     let finish!: () => void;
