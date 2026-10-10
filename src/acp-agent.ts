@@ -10534,6 +10534,22 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
     .map(([key, value]) => `${key}: ${value}`)
     .join("\n");
 
+  // Claude Code derives its own `Authorization: Bearer <token>` header from
+  // ANTHROPIC_AUTH_TOKEN, so an `Authorization: Bearer` gateway credential must
+  // not also land in ANTHROPIC_CUSTOM_HEADERS — the session would send two
+  // conflicting Authorization headers and the gateway rejects the request.
+  // Route it through ANTHROPIC_AUTH_TOKEN instead (anthropic path below).
+  // Non-Bearer Authorization values keep the legacy custom-header passthrough.
+  const isAuthorizationBearer = ([key, value]: [string, string]) =>
+    key.trim().toLowerCase() === "authorization" && /^bearer\s/i.test(value);
+  const bearerToken = Object.entries(config.headers)
+    .find(isAuthorizationBearer)?.[1]
+    .match(/^bearer\s+(.+)$/i)?.[1];
+  const customHeadersWithoutAuthorization = Object.entries(config.headers)
+    .filter((entry) => !isAuthorizationBearer(entry))
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\n");
+
   if (config.apiType === "bedrock") {
     return {
       ...resetRouting,
@@ -10566,8 +10582,10 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
   return {
     ...resetRouting,
     ANTHROPIC_BASE_URL: config.baseUrl,
-    ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: "acp-proxy", // Bypass local Claude login checks
+    ANTHROPIC_CUSTOM_HEADERS: customHeadersWithoutAuthorization,
+    // Real gateway Bearer credential when provided; the placeholder otherwise
+    // bypasses the CLI's local Claude login checks.
+    ANTHROPIC_AUTH_TOKEN: bearerToken ?? "acp-proxy",
   };
 }
 
