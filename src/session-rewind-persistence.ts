@@ -1,4 +1,8 @@
-import type { SessionMessage, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
+import {
+  getSessionMessages,
+  type SessionMessage,
+  type SessionStoreEntry,
+} from "@anthropic-ai/claude-agent-sdk";
 import { applyRewindAnchor, readLocalSessionRows } from "./session-history.js";
 import { NativeRewindUncertain } from "./native-rewind-control.js";
 
@@ -61,17 +65,38 @@ export async function confirmRewindPersistence(
           if (before.anchors.some((anchor, i) => JSON.stringify(current[i]) !== anchor))
             throw uncertain("changed outside the reserved mutation");
           if (current.length > before.anchors.length) {
-            if (current.at(-1)?.rewound !== true) throw uncertain("has no rewind anchor");
-            // Include every on-disk main-chain conversation row, including any
-            // unexpected new branch; filtering only the old SDK messages could
-            // hide a concurrent append. Ignore duplicate flushes of the same UUID.
+            const latest = current.at(-1)!;
+            if (
+              latest.rewound !== true ||
+              (latest.leafUuid !== null && typeof latest.leafUuid !== "string")
+            )
+              throw uncertain("has no rewind anchor");
+            // Resolve the CURRENT raw retained chain first, keeping hidden rows
+            // as parents. Do not intersect with old SDK-visible UUIDs: a new
+            // appended branch must remain in the snapshot being verified.
             const unique = new Map<string, SessionStoreEntry>();
-            for (const row of rows)
-              if (main(row) && conversation(row) && row.uuid) unique.set(row.uuid, row);
-            const retained = applyRewindAnchor(
-              [...unique.values()] as unknown as SessionMessage[],
-              rows,
-            ).map((message) => message.uuid);
+            for (const row of rows) if (main(row) && row.uuid) unique.set(row.uuid, row);
+            const chain = new Set(
+              applyRewindAnchor([...unique.values()] as unknown as SessionMessage[], rows).map(
+                (message) => message.uuid,
+              ),
+            );
+            // Normalize this one disk snapshot with the same pinned SDK reader
+            // as the expected history. Raw isMeta/tool/system visibility is not
+            // equivalent to testing type=user|assistant. Metadata without UUIDs
+            // remains available to the SDK's delivery/visibility classification.
+            const visible = await getSessionMessages(before.sessionId, {
+              includeSystemMessages: true,
+              sessionStore: {
+                load: async () => rows.filter((row) => !row.uuid || chain.has(row.uuid)),
+                append: async () => {
+                  throw uncertain("reader attempted a write");
+                },
+              },
+            });
+            if (expired) return;
+            assertCurrent();
+            const retained = visible.filter(conversation).map((message) => message.uuid);
             if (
               retained.length !== before.retained.length ||
               retained.some((uuid, i) => uuid !== before.retained[i])
