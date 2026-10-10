@@ -197,6 +197,27 @@ To check the runner's failure path, run
 `node scripts/native/e2e.mjs --rewind-only first --inject-wrong-reply`.
 This deliberately corrupts the local provider reply and must exit 1.
 
+## Upstream compatibility
+
+This refresh targets upstream main `4e1fc1e` (adapter 0.89.1, ACP SDK 1.8.0).
+Claude Agent SDK remains pinned to 0.3.293. It preserves custom instructions,
+event-loop yielding, v2 commands in setup responses, the v2 `error` stop reason,
+and `cancelled` status for interrupted tool calls.
+
+Session index operations share the native-control reservation. Rename and
+unarchive wait for an in-flight control; archive and delete cancel it and wait
+for shutdown. All four reject an unconfirmed native exit before changing storage.
+Close remains idempotent. The upstream deletion policy is unchanged: an AIR
+client that negotiated `sessionIndex` permanently deletes; an AIR client without
+that capability archives on `session/delete`; other clients use SDK deletion.
+
+本次基于上游 `4e1fc1e`（适配器 0.89.1、ACP SDK 1.8.0），Claude Agent SDK
+仍锁定 0.3.293。保留上游自定义指令、事件循环让步、v2 setup commands、正式
+error 停止原因与工具 cancelled 状态。索引改名/归档/取消归档/删除共享原生
+控制互斥锁，退出未确认时禁止修改存储。已协商 sessionIndex 的 AIR 客户端
+执行永久删除；未协商的 AIR 客户端在 session/delete 时归档；其它客户端
+继续使用 SDK 删除。close 保持幂等。
+
 ## Attribution
 
 The compatible beforeMessage/resumeAtMessage contract and the original session
@@ -204,4 +225,5 @@ reservation design build on Nikita Ashikhmin's PR1126, head
 `95efec238d4388569266afba06ee70720e0d646b`:
 https://github.com/agentclientprotocol/claude-agent-acp/pull/1126.
 The implementation uses native same-ID rewind instead of that PR's session
-recreation approach and is based on upstream main `966be7a` (0.88.0).
+recreation approach. This refresh targets upstream main `4e1fc1e` (0.89.1)
+with ACP SDK 1.8.0 and Claude Agent SDK 0.3.293.
