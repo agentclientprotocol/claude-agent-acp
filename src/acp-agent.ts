@@ -1,3 +1,16 @@
+import { boundedNativeMutation, awaitNativeExit } from "./native-mutation.js";
+import { SessionMutationLock } from "./session-mutation-lock.js";
+import { readSessionHistory } from "./session-history.js";
+import {
+  rewindClaudeSession,
+  parseSessionRewindRequest,
+  SESSION_REWIND_METHOD,
+  SESSION_REWIND_CAPABILITY,
+  isAuthoredUserMessage,
+  type SessionRewindRequest,
+  type SessionRewindResponse,
+  type SessionRewindDependencies,
+} from "./session-rewind.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -63,7 +76,6 @@ import {
   CanUseTool,
   FastModeDisabledReason,
   FastModeState,
-  getSessionMessages,
   getSubagentMessages,
   listSessions,
   McpServerConfig,
@@ -80,9 +92,9 @@ import {
   SDKAssistantMessageError,
   SDKActiveGoalMessage,
   SDKMessage,
+  SessionMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
-  SessionMessage,
   SDKUserMessage,
   Settings,
   SlashCommand,
@@ -846,7 +858,12 @@ type Turn = {
  *  while the CLI starts. The session record then takes the same objects. */
 type ReplayState = Pick<
   Session,
-  "cwd" | "taskState" | "forwardSubagentText" | "messageIdToUuid" | "sessionFailureState"
+  | "cwd"
+  | "taskState"
+  | "forwardSubagentText"
+  | "messageIdToUuid"
+  | "sessionFailureState"
+  | "lastObservedUserMessageUuid"
 >;
 
 /** A replay that runs before its session record exists. */
@@ -953,6 +970,8 @@ export type Session = {
    *  hanging (or silently restarting a consumer that resolves `end_turn`
    *  without ever reaching the model). */
   queryClosed?: boolean;
+  nativeRewindUnsupported?: boolean;
+  lastObservedUserMessageUuid?: string;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
    *  used to detect when loadSession/resumeSession is called with changed values. */
@@ -2494,6 +2513,10 @@ async function waitForMcpAuthentication(
 }
 
 export class ClaudeAcpAgent {
+  private readonly sessionMutations = new SessionMutationLock();
+  private readonly nativeShutdownFences = new Set<string>();
+  nativeMutationTimeoutMs = 15_000;
+  private disposing = false;
   sessions: {
     [key: string]: Session;
   };
@@ -2789,6 +2812,7 @@ export class ClaudeAcpAgent {
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
+                SESSION_REWIND_CAPABILITY,
                 ...this.sessionIndex.capabilities(),
               ),
               AIR_GOAL_KEY,
@@ -2799,6 +2823,16 @@ export class ClaudeAcpAgent {
               } satisfies GoalCapability,
             )
           : {}),
+        sessionRewind: {
+          version: 1,
+          method: SESSION_REWIND_METHOD,
+          sameSession: true,
+          durable: true,
+          firstMessage: true,
+          interruptIfRunning: true,
+          changesFiles: false,
+          runtimeSupport: "checked_on_request",
+        },
         steering: {
           supported: true,
         },
@@ -2866,7 +2900,12 @@ export class ClaudeAcpAgent {
     }
     timing.phase("session-ready");
     const replayed = await replay;
-    if (!replayed.ok) throw replayed.error;
+    if (!replayed.ok) {
+      // A failed replay must not leave a live query that can accept prompts
+      // against history the client was unable to see.
+      await this.teardownSession(params.sessionId);
+      throw replayed.error;
+    }
     return {
       sessionId: response.sessionId,
       modes: response.modes,
@@ -2883,8 +2922,98 @@ export class ClaudeAcpAgent {
     });
   }
 
+  private async runNativeMutation<T>(
+    sessionId: string,
+    operation: (signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    try {
+      return await this.sessionMutations.runExclusive(
+        sessionId,
+        async () => {
+          if (this.disposing || this.nativeShutdownFences.has(sessionId))
+            throw RequestError.invalidRequest(
+              undefined,
+              "Native session is closing; reconnect required",
+            );
+          const session = this.sessions[sessionId];
+          const query = session?.query;
+          let shutdown: Promise<void> | undefined;
+          const close = () =>
+            (shutdown ??= (async () => {
+              if (!session || !query) return;
+              this.nativeShutdownFences.add(sessionId);
+              this.closeQueryStream(session);
+              await awaitNativeExit(query);
+              this.nativeShutdownFences.delete(sessionId);
+            })());
+          try {
+            return await boundedNativeMutation(
+              operation,
+              close,
+              controller,
+              this.nativeMutationTimeoutMs,
+            );
+          } catch (error) {
+            if (session?.queryClosed) await close();
+            throw error;
+          }
+        },
+        abort,
+      );
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  private rewindDependencies(): SessionRewindDependencies {
+    return {
+      getSession: (id) => this.sessions[id],
+      cancel: (id) => this.cancel({ sessionId: id }),
+      invalidate: (session) => this.closeQueryStream(session as Session),
+      committed: (id) => {
+        const session = this.sessions[id];
+        if (!session) return;
+        session.messageIdToUuid.clear();
+        session.lastObservedUserMessageUuid = undefined;
+        session.toolUseCache = {};
+        session.toolCallFields?.clear();
+        session.taskState.clear();
+        session.sessionFailureState = createSessionFailureState();
+        session.contextCompaction = undefined;
+        session.nativeSubagentRuntime?.clear();
+        session.asyncTaskRuntime?.clear();
+      },
+      messageIdForGrouping,
+    };
+  }
+
+  async rewindSession(
+    params: SessionRewindRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionRewindResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    return this.runNativeMutation(
+      params.sessionId,
+      () => rewindClaudeSession(params, this.rewindDependencies()),
+      signal,
+    );
+  }
+
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.resumeSessionUnderMutation(params),
+    );
+  }
+
+  private async resumeSessionUnderMutation(
+    params: ResumeSessionRequest,
+  ): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -2892,8 +3021,14 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.loadSessionUnderMutation(params),
+    );
+  }
+
+  private async loadSessionUnderMutation(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);
@@ -2956,14 +3091,33 @@ export class ClaudeAcpAgent {
   async unsubscribeSessionList(params: ListUnsubscribeRequest) {
     return this.sessionIndex.unsubscribeList(params);
   }
+  private runSessionIndexMutation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    return this.sessionMutations.runExclusive(sessionId, async () => {
+      // A failed exit confirmation leaves a writer that may still change the transcript.
+      if (this.nativeShutdownFences.has(sessionId)) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Native shutdown unconfirmed; reconnect required",
+        );
+      }
+      if (this.disposing) {
+        throw RequestError.invalidRequest(undefined, "Agent connection is closing");
+      }
+      return operation();
+    });
+  }
+
   renameSessionTitle(params: RenameSessionRequest) {
-    return this.sessionIndex.rename(params);
+    return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.rename(params));
   }
   archiveSession(params: SessionIdRequest) {
-    return this.sessionIndex.archive(params);
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.archive(params));
   }
   unarchiveSession(params: SessionIdRequest) {
-    return this.sessionIndex.unarchive(params);
+    return this.runSessionIndexMutation(params.sessionId, () =>
+      this.sessionIndex.unarchive(params),
+    );
   }
 
   /**
@@ -3444,6 +3598,16 @@ export class ClaudeAcpAgent {
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
     if (this.providerUpdate) await this.providerUpdate;
+    const reservation = this.sessionMutations.reservePrompt(params.sessionId);
+    const release = typeof reservation === "function" ? reservation : await reservation;
+    try {
+      return await this.startTurnUnderMutation(params, events);
+    } finally {
+      release();
+    }
+  }
+
+  private async startTurnUnderMutation(params: PromptRequest, events: TurnEvents): Promise<void> {
     let session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -3816,6 +3980,17 @@ export class ClaudeAcpAgent {
    *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
    *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    const reservation = this.sessionMutations.reservePrompt(params.sessionId);
+    const release = typeof reservation === "function" ? reservation : await reservation;
+    try {
+      return await this.steerUnderMutation(params);
+    } finally {
+      release();
+    }
+  }
+
+  private async steerUnderMutation(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
     let session = this.sessions[sessionId];
     if (!session) {
@@ -6764,6 +6939,8 @@ export class ClaudeAcpAgent {
             const mappedMessageId = messageIdForGrouping(message);
             if (mappedMessageId && typeof message.uuid === "string" && message.uuid.length > 0) {
               session.messageIdToUuid.set(mappedMessageId, message.uuid);
+              if (isAuthoredUserMessage(message as unknown as SessionMessage))
+                session.lastObservedUserMessageUuid = message.uuid;
             }
 
             // A replayed user message echoes a queued turn back in submission
@@ -7776,11 +7953,28 @@ export class ClaudeAcpAgent {
   /** Tear down all active sessions. Called when the ACP connection closes. */
   async dispose(): Promise<void> {
     this.sessionIndex.dispose();
-    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    this.disposing = true;
+    for (const id of Object.keys(this.sessions)) this.sessionMutations.cancelExclusive(id);
+    await Promise.all(
+      Object.keys(this.sessions).map((id) =>
+        this.sessionMutations.runExclusive(id, () => this.teardownSession(id)),
+      ),
+    );
   }
 
   /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    // A pending provider update waits for active turns. Close must be able to
+    // cancel those turns; the per-session lock serializes actual recreation.
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.closeSessionUnderMutation(params),
+    );
+  }
+
+  private async closeSessionUnderMutation(
+    params: CloseSessionRequest,
+  ): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       return {};
     }
@@ -7790,7 +7984,10 @@ export class ClaudeAcpAgent {
 
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    return this.sessionIndex.deleteSession(params);
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    return this.runSessionIndexMutation(params.sessionId, () =>
+      this.sessionIndex.deleteSession(params),
+    );
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -7901,7 +8098,7 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    const messages = resumedMessages ?? (await readSessionHistory(sessionId));
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
@@ -8141,6 +8338,8 @@ export class ClaudeAcpAgent {
       const replaySession = replayState();
       if (replaySession && replayMessageId && message.uuid) {
         replaySession.messageIdToUuid.set(replayMessageId, message.uuid);
+        if (isAuthoredUserMessage(message))
+          replaySession.lastObservedUserMessageUuid = message.uuid;
       }
 
       // The live prompt loop converts the synthetic "Please run /login"
@@ -8876,7 +9075,10 @@ export class ClaudeAcpAgent {
   async availableCommands(sessionId: string): Promise<AvailableCommand[]> {
     const session = this.sessions[sessionId];
     if (!session) return [];
-    const commands = await session.query.supportedCommands();
+    const query = session.query;
+    const commands = await query.supportedCommands();
+    if (this.sessions[sessionId] !== session || session.query !== query || session.queryClosed)
+      return [];
     return getAvailableSlashCommands(
       commands,
       session.terminalSlashCommands,
@@ -8886,12 +9088,17 @@ export class ClaudeAcpAgent {
   }
 
   private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
-    if (!this.sessions[sessionId]) return;
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const query = session.query;
+    const commands = await this.availableCommands(sessionId);
+    if (this.sessions[sessionId] !== session || session.query !== query || session.queryClosed)
+      return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: await this.availableCommands(sessionId),
+        availableCommands: commands,
       },
     });
   }
@@ -9336,12 +9543,17 @@ export class ClaudeAcpAgent {
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
+    if (this.nativeShutdownFences.has(params.sessionId))
+      throw RequestError.invalidRequest(
+        undefined,
+        "Native shutdown unconfirmed; reconnect required",
+      );
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
-      if (fingerprint === existingSession.sessionFingerprint) {
+      if (!existingSession.queryClosed && fingerprint === existingSession.sessionFingerprint) {
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,
@@ -9435,6 +9647,13 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
     } = {},
   ): Promise<NewSessionResponse> {
+    const boundId =
+      creationOpts.publicSessionId ?? creationOpts.resume ?? creationOpts.reuseSessionId;
+    if (this.disposing || (boundId && this.nativeShutdownFences.has(boundId)))
+      throw RequestError.invalidRequest(
+        undefined,
+        "Native shutdown unconfirmed; reconnect required",
+      );
     const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -10110,6 +10329,7 @@ export class ClaudeAcpAgent {
         emittedAssistantText: false,
         owedTrailingIdles: 0,
         messageIdToUuid: creationOpts.replayState?.messageIdToUuid ?? new Map(),
+        lastObservedUserMessageUuid: creationOpts.replayState?.lastObservedUserMessageUuid,
         sessionFailureState:
           creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
@@ -10151,25 +10371,31 @@ export class ClaudeAcpAgent {
 
       this.providerConfig = config;
       for (const [sessionId, session] of sessions) {
-        if (this.sessions[sessionId] !== session || !session.creationParams) {
-          continue;
-        }
-        this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
-        this.closeQueryStream(session);
-        delete this.sessions[sessionId];
-        try {
-          await this.createSession(session.creationParams, {
-            resume: sessionId,
-            permissionMode: session.modes.currentModeId as PermissionMode,
-          });
-        } catch (error) {
-          // One session that cannot come back must not abort the switch. The
-          // `--hide-claude-auth` guard makes this a normal outcome of
-          // `providers/disable`: the override kept a subscription account
-          // usable, and creation refuses without it. The session is already
-          // gone, so tell the client why and go on to the next one.
-          this.reportSessionLostOnProviderUpdate(sessionId, session, error);
-        }
+        await this.sessionMutations.runExclusive(sessionId, async () => {
+          if (
+            this.nativeShutdownFences.has(sessionId) ||
+            this.sessions[sessionId] !== session ||
+            !session.creationParams
+          ) {
+            return;
+          }
+          this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
+          this.closeQueryStream(session);
+          delete this.sessions[sessionId];
+          try {
+            await this.createSession(session.creationParams, {
+              resume: sessionId,
+              permissionMode: session.modes.currentModeId as PermissionMode,
+            });
+          } catch (error) {
+            // One session that cannot come back must not abort the switch. The
+            // `--hide-claude-auth` guard makes this a normal outcome of
+            // `providers/disable`: the override kept a subscription account
+            // usable, and creation refuses without it. The session is already
+            // gone, so tell the client why and go on to the next one.
+            this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+          }
+        });
       }
     });
     // Sessions and prompts await `providerUpdate` before they run. A rejected
@@ -11756,6 +11982,11 @@ export function v1AgentApp(
       onAgent(agent);
     })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
+    .onRequest<SessionRewindRequest, SessionRewindResponse>(
+      SESSION_REWIND_METHOD,
+      { parse: parseSessionRewindRequest },
+      (ctx) => agent.rewindSession(ctx.params, ctx.signal),
+    )
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
     .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))

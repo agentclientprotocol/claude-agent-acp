@@ -233,6 +233,7 @@ describe("sessionIndex negotiation", () => {
     "recommendedValue",
     "diffPatch",
     "planFile",
+    "sessionRewind",
   ];
 
   it("is advertised with sessionArchive and sessionRename only to an AIR client that declares it", async () => {
@@ -259,7 +260,11 @@ describe("sessionIndex negotiation", () => {
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    expect(nonAir._meta).toEqual({ steering: { supported: true } });
+    expect(nonAir._meta).toMatchObject({
+      steering: { supported: true },
+      sessionRewind: { version: 1 },
+    });
+    expect(airCapabilities(nonAir)).toBeUndefined();
   });
 
   it("is not advertised under ACP v2", async () => {

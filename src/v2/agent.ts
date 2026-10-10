@@ -1,3 +1,9 @@
+import {
+  SESSION_REWIND_METHOD,
+  parseSessionRewindRequest,
+  type SessionRewindRequest,
+  type SessionRewindResponse,
+} from "../session-rewind.js";
 /**
  * The experimental draft ACP v2 surface of the adapter.
  *
@@ -57,6 +63,11 @@ export function v2AgentApp(
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
       v2InitializeResponse(await agent.initialize(v1InitializeRequest(params))),
+    )
+    .onRequest<SessionRewindRequest, SessionRewindResponse>(
+      SESSION_REWIND_METHOD,
+      { parse: parseSessionRewindRequest },
+      (ctx) => agent.rewindSession(ctx.params, ctx.signal),
     )
     .onRequest(v2.methods.agent.auth.login, ({ params }) => agent.authenticate(params))
     .onRequest(v2.methods.agent.auth.logout, ({ params }) => agent.logout(params))

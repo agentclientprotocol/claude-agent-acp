@@ -238,6 +238,12 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   const matches = (wanted: Recorded, actual: Recorded | undefined): boolean => {
     if (!actual || actual.kind !== wanted.kind) return false;
     if (canonical(actual) === canonical(wanted)) return true;
+    if (wanted.kind === "initialize") {
+      const payload = actual.payload as Json;
+      const meta = { ...((payload._meta as Json) ?? {}) };
+      delete meta.sessionRewind;
+      return canonical({ ...actual, payload: { ...payload, _meta: meta } }) === canonical(wanted);
+    }
     const want = updateOf(wanted);
     const got = updateOf(actual);
     if (!want || !got || want.sessionUpdate !== got.sessionUpdate) return false;

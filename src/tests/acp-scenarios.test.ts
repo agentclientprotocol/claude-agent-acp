@@ -552,7 +552,10 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       const initialize = zed("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
       expect(initialize.agentCapabilities._meta.claudeCode).toEqual({ promptQueueing: true });
-      expect(initialize._meta).toEqual({ steering: { supported: true } });
+      expect(initialize._meta).toMatchObject({
+        steering: { supported: true },
+        sessionRewind: { version: 1 },
+      });
     });
 
     it("sends terminal-auth commands that rerun this adapter with --cli", () => {
@@ -594,7 +597,7 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     it("gets the AIR capabilities and the goal capability under jetbrains.air", () => {
       const initialize = air("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
-      expect(initialize._meta).toEqual({
+      expect(initialize._meta).toMatchObject({
         jetbrains: {
           air: {
             version: 1,
