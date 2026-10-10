@@ -1,3 +1,4 @@
+import { AutonomousSteering } from "./autonomous-steering.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -1243,6 +1244,8 @@ export type Session = {
    *  yields none, and a pre-counted debt that never drains would mask one
    *  future issue-#825 detection. */
   lastSessionState?: "idle" | "running" | "requires_action";
+  /** Live SDK cycle evidence and ownership of steers sent without a user Turn. */
+  autonomousSteering?: AutonomousSteering;
   /** How many trailing `session_state_changed: idle` messages are already
    *  accounted for: every result is followed by one (user-turn results that
    *  terminate a turn — settle, reject, or orphan skip — and autonomous
@@ -3827,13 +3830,17 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
-    // "A turn is running" = the queue holds an unsettled turn. This covers both
-    // the activated turn and one just submitted but not yet echoed/activated,
-    // which is exactly the window in which steering is meaningful. This check
-    // and the active-path push below stay in one synchronous section so the
-    // turn cannot settle in the gap between deciding to inject and enqueueing.
+    // User turns also cover the submitted-but-not-echoed window. A cycle
+    // started by Claude Code has no queued Turn: require a live consumer and
+    // a running state not yet closed by a result, idle, cancellation, or EOF.
+    // Keep this check and input.push in one synchronous section.
     const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
-    if (!turnInFlight) {
+    const autonomousRunning =
+      session.consumer !== undefined &&
+      !session.cancelled &&
+      !session.abortController.signal.aborted &&
+      session.autonomousSteering?.isRunning;
+    if (!turnInFlight && !autonomousRunning) {
       const promptRequest: PromptRequest = {
         sessionId,
         prompt: params.prompt,
@@ -3874,14 +3881,18 @@ export class ClaudeAcpAgent {
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
     // (see Turn.steeredEchoes).
-    (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
-    (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
-    // A turn already held for background subagents has a recorded outcome the
-    // steer supersedes: move it into the steer lane so one lane owns settlement.
-    // The idle handler re-applies the hold through the subagent gate.
-    if (turnInFlight.deferredSettle !== undefined) {
-      turnInFlight.steeredSettle = turnInFlight.deferredSettle;
-      turnInFlight.deferredSettle = undefined;
+    if (turnInFlight) {
+      (turnInFlight.steeredEchoes ??= new Set()).add(steeredUuid);
+      (turnInFlight.steeredUuids ??= new Set()).add(steeredUuid);
+      // A turn already held for background subagents has a recorded outcome the
+      // steer supersedes: move it into the steer lane so one lane owns settlement.
+      // The idle handler re-applies the hold through the subagent gate.
+      if (turnInFlight.deferredSettle !== undefined) {
+        turnInFlight.steeredSettle = turnInFlight.deferredSettle;
+        turnInFlight.deferredSettle = undefined;
+      }
+    } else {
+      session.autonomousSteering!.add(steeredUuid);
     }
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
@@ -3914,6 +3925,7 @@ export class ClaudeAcpAgent {
     // turn "cancelled" even when query.next() is wedged and never yields again
     // (issue #680). The consumer re-arms it after each fire.
     session.cancelController = new AbortController();
+    session.autonomousSteering = new AutonomousSteering();
     session.consumer = this.runConsumer(session, { sessionId });
     session.consumer.catch((error) => {
       this.logger.error(`Session ${sessionId}: consumer terminated unexpectedly: ${error}`);
@@ -4279,6 +4291,7 @@ export class ClaudeAcpAgent {
      *  interrupt (no orphan emitted) — drop the stale count so a later echo-less
      *  result isn't wrongly skipped. */
     const activateTurn = (turn: Turn) => {
+      session.autonomousSteering?.promptStarted();
       session.activeTurn = turn;
       session.cancelled = false;
       compaction.resume();
@@ -5063,6 +5076,10 @@ export class ClaudeAcpAgent {
           const frame = message as unknown as { command_uuid: string; state: string };
           switch (frame.state) {
             case "started": {
+              session.autonomousSteering?.started(frame.command_uuid);
+              if (findUnsettledTurn(frame.command_uuid)) {
+                session.autonomousSteering?.promptStarted();
+              }
               // Remember dispatch on the live turn so a cancel() that orphans
               // it seeds the right state (see Turn.commandStarted)...
               const queued = findUnsettledTurn(frame.command_uuid);
@@ -5100,6 +5117,7 @@ export class ClaudeAcpAgent {
             case "discarded":
             case "refused":
             case "cancelled": {
+              session.autonomousSteering?.finished(frame.command_uuid, frame.state);
               // Terminal frames. Latch the fate on a still-queued turn so a
               // later cancel() doesn't seed an orphan entry for a command
               // whose one-and-only terminal frame has already been consumed
@@ -5285,6 +5303,7 @@ export class ClaudeAcpAgent {
                 break;
               }
               case "session_state_changed": {
+                session.autonomousSteering?.stateChanged(message.state);
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
                 sessionIndex.noteSessionState(session, previousState, message.state);
@@ -5733,6 +5752,7 @@ export class ClaudeAcpAgent {
                 // actually ends. Deliberately do not add a quiet-period timer: the
                 // iterator has no replay/live boundary, so a timeout could publish
                 // while a slow replay is still in flight.
+                session.autonomousSteering?.stop();
                 pendingWorkerShutdown = true;
                 break;
               case "elicitation_complete": {
@@ -5933,6 +5953,7 @@ export class ClaudeAcpAgent {
             }
             break;
           case "result": {
+            const answeredAutonomousSteers = session.autonomousSteering?.result(message);
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -5946,7 +5967,9 @@ export class ClaudeAcpAgent {
             // ran, so its result answers the prompt (see answersPendingPrompt).
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
-            const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            const isAutonomousResult =
+              (startedByClaudeCode || (answeredAutonomousSteers?.size ?? 0) > 0) &&
+              !answersPendingPrompt(message);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -5998,22 +6021,25 @@ export class ClaudeAcpAgent {
                     leaveSteerLane(steeredTurn);
                   }
                 }
-                // Once the submitted goal command has produced its own result,
-                // no older runtime update can still precede it in the ordered
-                // SDK stream. Stop suppressing updates even when this runtime
-                // omitted the matching active_goal notification entirely.
-                if (session.pendingGoalUpdate?.started) {
-                  const pendingGoalUpdate = session.pendingGoalUpdate;
-                  session.pendingGoalUpdate = undefined;
-                  const goalCommandFailed =
-                    message.is_error ||
-                    message.stop_reason === "refusal" ||
-                    ("result" in message &&
-                      message.is_error &&
-                      message.result.includes("Please run /login"));
-                  if (goalCommandFailed) {
-                    await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
-                  }
+              }
+              // A goal sent by autonomous steering also owns its result, even
+              // without a user Turn or echo. Clear or roll back only that goal.
+              const pendingGoalUpdate = session.pendingGoalUpdate;
+              const answeredUuids =
+                message.user_message_uuids ??
+                (message.user_message_uuid === undefined ? undefined : [message.user_message_uuid]);
+              if (
+                isCurrentConsumer() &&
+                !session.queryClosed &&
+                pendingGoalUpdate &&
+                (answeredUuids !== undefined
+                  ? answeredUuids.includes(pendingGoalUpdate.commandUuid)
+                  : (!isAutonomousResult && pendingGoalUpdate.started) ||
+                    answeredAutonomousSteers?.has(pendingGoalUpdate.commandUuid))
+              ) {
+                session.pendingGoalUpdate = undefined;
+                if (message.is_error || message.stop_reason === "refusal") {
+                  await this.publishGoal(params.sessionId, pendingGoalUpdate.previous ?? null);
                 }
               }
 
@@ -6204,6 +6230,61 @@ export class ClaudeAcpAgent {
               // failActive a live turn (the held one, or the user's next
               // prompt) whose own result recorded a different outcome.
               if (isAutonomousResult) {
+                if (
+                  isCurrentConsumer() &&
+                  !session.queryClosed &&
+                  answeredAutonomousSteers &&
+                  [...answeredAutonomousSteers.values()].some((command) => !command.cancelled)
+                ) {
+                  if (
+                    message.stop_reason !== "refusal" &&
+                    [...answeredAutonomousSteers.values()].some(
+                      (command) => !command.cancelled && !command.superseded,
+                    )
+                  ) {
+                    // A late steer must not overwrite the index outcome of a
+                    // newer prompt that already took over this session.
+                    session.lastTurnFailed = message.is_error || message.subtype !== "success";
+                    this.sessionIndex.onOwnSessionChanged(params.sessionId);
+                  }
+                  // The steer has no prompt response to carry an error or a
+                  // cached, result-only answer. Deliver it at session scope
+                  // without settling or charging a newer user Turn.
+                  const failureText =
+                    "result" in message ? message.result : message.errors.join(", ");
+                  let text: string | undefined;
+                  if (message.stop_reason === "refusal") {
+                    text = lastRefusalExplanation ?? failureText;
+                  } else if (message.is_error) {
+                    if (supportsAirSessionFailures(this.clientCapabilities)) {
+                      await publishSessionFailure("provider_error", {
+                        turnScoped: false,
+                        title: failureText || message.subtype,
+                      });
+                    } else if (!deliveredAssistantText) {
+                      text = failureText || message.subtype;
+                    }
+                  } else if (
+                    "result" in message &&
+                    !deliveredAssistantText &&
+                    !deliveredCompactionOutput &&
+                    (message.usage.output_tokens ?? 0) === 0
+                  ) {
+                    text = message.result;
+                  }
+                  if (text) {
+                    await sendUpdate({
+                      sessionId: params.sessionId,
+                      update: {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text },
+                        messageId: messageIdForGrouping(message),
+                      },
+                    });
+                    // This text is the steer's, not a queued prompt's answer.
+                    session.emittedAssistantText = deliveredAssistantText;
+                  }
+                }
                 // A held turn's followup can itself plan: the subagent
                 // finishes, the model writes the plan and calls ExitPlanMode
                 // inside the task-notification cycle, and the user answers it
@@ -6450,9 +6531,7 @@ export class ClaudeAcpAgent {
                   // token fields (see snapshotFromUsage), and the replay lane
                   // was reported from exactly such a backend — treat a missing
                   // count as the replay signature rather than silently disabling
-                  // the fallback there. (Autonomous results never get here —
-                  // they exit at the early break above — so no background
-                  // prose can be injected into the feed.)
+                  // the fallback there. (Unrequested autonomous results never use this fallback.)
                   const shouldForwardResult =
                     session.activeTurn?.isLocalOnlyCommand ||
                     (!deliveredAssistantText &&
@@ -6773,6 +6852,7 @@ export class ClaudeAcpAgent {
             // is still promoted — activateTurn() clears the flag. The turn's own
             // echo is then dropped from the feed (the client already shows it).
             if (message.type === "user" && "uuid" in message && message.uuid) {
+              session.autonomousSteering?.started(message.uuid);
               if (session.pendingGoalUpdate?.commandUuid === message.uuid) {
                 session.pendingGoalUpdate.started = true;
               }
@@ -7370,6 +7450,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    const abandonedAutonomousSteers = session.autonomousSteering?.cancel() ?? [];
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -7406,7 +7487,7 @@ export class ClaudeAcpAgent {
     }
     // The user messages this cancel abandons while Claude Code may still have
     // them queued: they are dropped from its queue before the interrupt.
-    const abandoned: string[] = [];
+    const abandoned: string[] = [...abandonedAutonomousSteers];
     // A priority steer may still be queued in the SDK when cancellation
     // settles its owning turn. Its later echo matches no live turn, and its
     // result must be skipped rather than promoted onto the next prompt.
@@ -7708,6 +7789,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.queryClosed = true;
+    session.autonomousSteering?.close();
     // Its list row now shows what the registry and the transcript tell.
     for (const [sessionId, candidate] of Object.entries(this.sessions)) {
       if (candidate === session) this.sessionIndex.onOwnSessionChanged(sessionId);
