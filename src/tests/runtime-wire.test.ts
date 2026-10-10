@@ -1,3 +1,4 @@
+import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { PROTOCOL_VERSION as V2_PROTOCOL_VERSION } from "@agentclientprotocol/sdk/experimental/v2";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import { describe, expect, it, vi } from "vitest";
@@ -6,7 +7,7 @@ import { v2AgentApp } from "../v2/agent.js";
 import type { RuntimeQuery } from "../desktop-runtime.js";
 
 /** Real ACP routers, with only the native Query replaced. No subprocess or prompt. */
-async function connect(version: 1 | 2) {
+async function connect(version: 1 | 2, clientCapabilities: ClientCapabilities = {}) {
   const incoming = new TransformStream();
   const outgoing = new TransformStream();
   let agent!: ClaudeAcpAgent;
@@ -83,7 +84,7 @@ async function connect(version: 1 | 2) {
   const initialized = await connection.send(
     "initialize",
     version === 1
-      ? { protocolVersion: 1, clientCapabilities: {} }
+      ? { protocolVersion: 1, clientCapabilities }
       : {
           protocolVersion: V2_PROTOCOL_VERSION,
           info: { name: "wire-test", version: "1" },
@@ -103,6 +104,76 @@ function pendingTurn(messageId: string) {
 }
 
 describe.each([1, 2] as const)("ACP v%s runtime wire", (version) => {
+  it.each(["plain", "air-without-index"])(
+    "rejects unsupported archive without aborting a native control (%s)",
+    async (client) => {
+      const capabilities =
+        client === "plain"
+          ? {}
+          : {
+              _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionArchive"] } } },
+            };
+      const c = await connect(version, capabilities);
+      const foreground = pendingTurn("foreground");
+      const target = pendingTurn("target");
+      const survivor = pendingTurn("survivor");
+      c.session.turnQueue = [foreground, target, survivor];
+      c.session.activeTurn = foreground;
+      const ack = Promise.withResolvers<boolean>();
+      c.query.cancelAsyncMessage = vi.fn(() => ack.promise);
+      let settled = false;
+      const control = c
+        .send("_session/runtime/control", {
+          sessionId: "sid",
+          action: "cancelQueuedMessage",
+          messageId: "target",
+        })
+        .then(
+          (result) => {
+            settled = true;
+            return { result };
+          },
+          (error) => {
+            settled = true;
+            return { error };
+          },
+        );
+      try {
+        await vi.waitFor(() => expect(c.query.cancelAsyncMessage).toHaveBeenCalledOnce());
+        await expect(c.send("_session/archive", { sessionId: "sid" })).rejects.toMatchObject({
+          code: -32601,
+        });
+        expect(c.query.close).not.toHaveBeenCalled();
+        expect(c.query.interrupt).not.toHaveBeenCalled();
+        expect(c.session.queryClosed).not.toBe(true);
+        expect(settled).toBe(false);
+        expect(c.session.turnQueue).toEqual([foreground, target, survivor]);
+        for (const turn of [foreground, target, survivor]) {
+          expect(turn.settled).toBe(false);
+          expect(turn.reject).not.toHaveBeenCalled();
+          expect(turn.resolve).not.toHaveBeenCalled();
+        }
+        ack.resolve(true);
+        await expect(control).resolves.toMatchObject({
+          result: { status: "ok", data: { cancelled: true } },
+        });
+        expect(target.resolve).toHaveBeenCalledWith({ stopReason: "cancelled" });
+        expect(c.session.turnQueue).toEqual([foreground, survivor]);
+        expect(c.session.activeTurn).toBe(foreground);
+        for (const turn of [foreground, survivor]) {
+          expect(turn.settled).toBe(false);
+          expect(turn.reject).not.toHaveBeenCalled();
+          expect(turn.resolve).not.toHaveBeenCalled();
+        }
+        expect(c.query.close).not.toHaveBeenCalled();
+      } finally {
+        ack.resolve(true);
+        await control;
+        await c.close();
+      }
+    },
+  );
+
   it("advertises full context and single queued-message operations", async () => {
     const c = await connect(version);
     try {
@@ -462,6 +533,7 @@ describe.each([1, 2] as const)("ACP v%s runtime wire", (version) => {
       if (method === "archiveSession" || method === "deleteSession") {
         Object.assign(c.agent(), {
           sessionIndex: {
+            assertArchiveSupported: vi.fn(),
             archive: storage,
             deleteSession: storage,
             dispose: vi.fn(),
@@ -494,7 +566,9 @@ describe.each([1, 2] as const)("ACP v%s runtime wire", (version) => {
     },
   );
   it("refuses a same-ID reload after unconfirmed native shutdown", async () => {
-    const c = await connect(version);
+    const c = await connect(version, {
+      _meta: { jetbrains: { air: { version: 1, capabilities: ["sessionIndex"] } } },
+    });
     c.session.turnQueue = [pendingTurn("one")];
     Object.assign(c.query, {
       transport: {
@@ -517,11 +591,20 @@ describe.each([1, 2] as const)("ACP v%s runtime wire", (version) => {
       ).rejects.toThrow("shutdown unconfirmed");
       for (const change of [
         () => c.agent().renameSessionTitle({ sessionId: "sid", title: "Unsafe rename" }),
-        () => c.agent().archiveSession({ sessionId: "sid" }),
         () => c.agent().unarchiveSession({ sessionId: "sid" }),
         () => c.agent().deleteSession({ sessionId: "sid" }),
       ]) {
         await expect(change()).rejects.toThrow("shutdown unconfirmed");
+      }
+      if (version === 1) {
+        await expect(c.send("_session/archive", { sessionId: "sid" })).rejects.toMatchObject({
+          code: -32600,
+          message: expect.stringContaining("shutdown unconfirmed"),
+        });
+      } else {
+        await expect(c.agent().archiveSession({ sessionId: "sid" })).rejects.toMatchObject({
+          code: -32601,
+        });
       }
     } finally {
       await c.close();
