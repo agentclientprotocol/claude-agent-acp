@@ -3354,6 +3354,7 @@ describe("open a session that runs here and that another process resumed", () =>
     agent.sessions[session.id] = mockSessionState({}, agent, session.id) as any;
     await registerHolder(process.pid, session.id);
     (agent as any).getOrCreateSession = vi.fn(async () => ({ sessionId: session.id }));
+    (agent as any).getOrCreateSessionLocked = (agent as any).getOrCreateSession;
     (agent as any).replaySessionHistory = vi.fn(async () => {});
     (agent as any).sendAvailableCommandsUpdate = vi.fn(async () => {});
     await agent.resumeSession({ sessionId: session.id, cwd: workspace, mcpServers: [] });
