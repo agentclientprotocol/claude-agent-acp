@@ -4327,9 +4327,9 @@ describe("titles by the SDK's rule", () => {
       trailer: [],
     });
     await fs.appendFile(session.file, `${filler}\n${title}\n${tail}\n`);
-    const { size } = await fs.stat(session.file);
-    const window = size - 64 * 1024;
-    const start = (await fs.readFile(session.file, "utf8")).indexOf(title);
+    const bytes = await fs.readFile(session.file);
+    const window = bytes.length - 64 * 1024;
+    const start = bytes.indexOf(title);
     expect(start).toBeLessThan(window);
     expect(start + title.indexOf('"customTitle"')).toBeGreaterThan(window);
     expect(start).toBeGreaterThan(64 * 1024);
