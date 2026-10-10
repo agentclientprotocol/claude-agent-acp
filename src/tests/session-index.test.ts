@@ -259,7 +259,11 @@ describe("sessionIndex negotiation", () => {
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    expect(nonAir._meta).toEqual({ steering: { supported: true } });
+    expect(nonAir._meta).toMatchObject({
+      steering: { supported: true },
+      runtime: { version: 1 },
+    });
+    expect(airCapabilities(nonAir)).toBeUndefined();
   });
 
   it("is not advertised under ACP v2", async () => {

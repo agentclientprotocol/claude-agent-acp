@@ -1,3 +1,17 @@
+import { boundedNativeMutation, awaitNativeExit } from "./native-mutation.js";
+import { SessionMutationLock } from "./session-mutation-lock.js";
+import {
+  runtimeCapability,
+  readRuntime,
+  controlRuntime,
+  RUNTIME_READ_METHOD,
+  RUNTIME_CONTROL_METHOD,
+  parseRuntimeReadRequest,
+  parseRuntimeControlRequest,
+  type RuntimeReadRequest,
+  type RuntimeControlRequest,
+  type RuntimeResponse,
+} from "./desktop-runtime.js";
 import {
   agent as acpAgent,
   AgentApp,
@@ -656,6 +670,8 @@ function parseSteerRequest(params: unknown): SteerRequest {
  *  queued user messages back in submission order, so `turnQueue[0]` is the turn
  *  currently running. */
 type Turn = {
+  /** The count-lane debt seeded by a concurrent session/cancel, if any. */
+  runtimeCancellationDebt?: { generation: number; counted: boolean };
   /** uuid stamped on the pushed `SDKUserMessage`; the SDK echoes it back so the
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
@@ -897,6 +913,8 @@ export type Session = {
    *  lane); a count can't express command coalescing — N queued commands can
    *  fold into ONE turn emitting one result, leaving a stale skip of N-1. */
   pendingOrphanResults?: number;
+  /** Incremented when activation clears debt, so a late ACK cannot debit a new batch. */
+  orphanGeneration?: number;
   /** UUIDs of cancelled-before-echo commands that can still emit Claude's
    * empty user-interruption diagnostic. Interrupt receipts and command
    * lifecycle frames remove commands that were dropped before dispatch; the
@@ -2494,6 +2512,10 @@ async function waitForMcpAuthentication(
 }
 
 export class ClaudeAcpAgent {
+  private readonly sessionMutations = new SessionMutationLock();
+  private readonly nativeShutdownFences = new Set<string>();
+  nativeMutationTimeoutMs = 15_000;
+  private disposing = false;
   sessions: {
     [key: string]: Session;
   };
@@ -2799,6 +2821,7 @@ export class ClaudeAcpAgent {
               } satisfies GoalCapability,
             )
           : {}),
+        runtime: runtimeCapability(),
         steering: {
           supported: true,
         },
@@ -2883,8 +2906,211 @@ export class ClaudeAcpAgent {
     });
   }
 
+  private async runNativeMutation<T>(
+    sessionId: string,
+    operation: (signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) controller.abort();
+    try {
+      return await this.sessionMutations.runExclusive(
+        sessionId,
+        async () => {
+          if (this.disposing || this.nativeShutdownFences.has(sessionId))
+            throw RequestError.invalidRequest(
+              undefined,
+              "Native session is closing; reconnect required",
+            );
+          const session = this.sessions[sessionId];
+          const query = session?.query;
+          let shutdown: Promise<void> | undefined;
+          const close = () =>
+            (shutdown ??= (async () => {
+              if (!session || !query) return;
+              this.nativeShutdownFences.add(sessionId);
+              if (session.query !== query) {
+                query.close();
+                await awaitNativeExit(query);
+                this.nativeShutdownFences.delete(sessionId);
+                return;
+              }
+              this.closeQueryStream(session);
+              session.cancelController?.abort();
+              for (const turn of session.turnQueue ?? []) {
+                if (turn.settled) continue;
+                turn.localCommandAbort?.abort();
+                session.fileChangeReporter?.finish(turn.fileChangeReport, "providerError");
+                turn.settled = true;
+                turn.reject(
+                  RequestError.internalError(
+                    undefined,
+                    "Native cancellation outcome unknown; reload required",
+                  ),
+                );
+              }
+              session.turnQueue = [];
+              session.activeTurn = undefined;
+              await awaitNativeExit(query);
+              this.nativeShutdownFences.delete(sessionId);
+            })());
+          try {
+            return await boundedNativeMutation(
+              operation,
+              close,
+              controller,
+              this.nativeMutationTimeoutMs,
+            );
+          } catch (error) {
+            if (session?.queryClosed) await close();
+            throw error;
+          }
+        },
+        abort,
+      );
+    } finally {
+      signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  async readSessionRuntime(
+    params: RuntimeReadRequest,
+    signal: AbortSignal,
+  ): Promise<RuntimeResponse> {
+    return this.sessionMutations.runExclusive(params.sessionId, async () => {
+      const session = this.sessions[params.sessionId];
+      if (!session || session.queryClosed)
+        return { version: 1, status: "unavailable", reason: "stale" };
+      if (params.resource === "queuedMessages") {
+        if (signal.aborted) return { version: 1, status: "unavailable", reason: "cancelled" };
+        return {
+          version: 1,
+          status: "ok",
+          data: {
+            messages: this.queuedRuntimeTurns(session).map((turn) => ({
+              messageId: turn.promptUuid,
+            })),
+          },
+        };
+      }
+      const query = session.query;
+      return readRuntime(
+        query,
+        params,
+        signal,
+        () =>
+          this.sessions[params.sessionId] === session &&
+          session.query === query &&
+          !session.queryClosed,
+      );
+    });
+  }
+
+  /** An observed pending prompt can still be dequeued by the CLI before control arrives. */
+  private queuedRuntimeTurns(session: Session): Turn[] {
+    return (session.turnQueue ?? []).filter(
+      (turn) =>
+        turn !== session.activeTurn &&
+        !turn.settled &&
+        !turn.settling &&
+        !turn.commandStarted &&
+        !turn.insertedReported &&
+        !turn.commandFinished &&
+        !turn.steeredUuids?.size,
+    );
+  }
+
+  async controlSessionRuntime(
+    params: RuntimeControlRequest,
+    signal?: AbortSignal,
+  ): Promise<RuntimeResponse> {
+    return this.runNativeMutation(
+      params.sessionId,
+      async (mutationSignal) => {
+        const session = this.sessions[params.sessionId];
+        if (!session || session.queryClosed)
+          return { version: 1, status: "unavailable", reason: "stale" };
+        const queuedTurn = this.queuedRuntimeTurns(session).find(
+          (turn) => turn.promptUuid === params.messageId,
+        );
+        if (!queuedTurn) {
+          throw RequestError.invalidParams(undefined, "Message is not a pending adapter prompt");
+        }
+        const query = session.query;
+        if (queuedTurn)
+          queuedTurn.runtimeCancellationDebt = {
+            generation: session.orphanGeneration ?? 0,
+            counted: false,
+          };
+        mutationSignal.throwIfAborted();
+        let result: RuntimeResponse;
+        try {
+          result = await controlRuntime(query, params);
+        } catch (error) {
+          // A failed ACK can follow a successful native drop. Keeping the
+          // queue alive could assign the next result to the dropped turn.
+          if (session.query === query) this.closeQueryStream(session);
+          throw error;
+        }
+        if (
+          mutationSignal.aborted ||
+          this.sessions[params.sessionId] !== session ||
+          session.query !== query ||
+          session.queryClosed
+        ) {
+          return { version: 1, status: "unavailable", reason: "stale" };
+        }
+        if (
+          queuedTurn &&
+          result.status === "ok" &&
+          (result.data as { cancelled: boolean }).cancelled
+        ) {
+          // The stream and session/cancel may settle this turn while the ACK is pending.
+          // A native true ACK means no result is owed; do not create an orphan debt.
+          const debt = queuedTurn.runtimeCancellationDebt;
+          if (debt && debt.generation === (session.orphanGeneration ?? 0) && debt.counted) {
+            session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - 1);
+            debt.counted = false;
+          }
+          session.orphanCommands?.delete(queuedTurn.promptUuid);
+          session.pendingEmptyInterruptionDiagnosticCommands?.delete(queuedTurn.promptUuid);
+          if (!queuedTurn.settled) {
+            if (
+              session.activeTurn === queuedTurn ||
+              queuedTurn.commandStarted ||
+              queuedTurn.insertedReported
+            ) {
+              this.closeQueryStream(session);
+              throw RequestError.internalError(
+                undefined,
+                "Native cancellation conflicts with message execution",
+              );
+            }
+            session.fileChangeReporter?.finish(queuedTurn.fileChangeReport, "cancelled");
+            queuedTurn.localCommandAbort?.abort();
+            queuedTurn.settled = true;
+            session.turnQueue = (session.turnQueue ?? []).filter((turn) => turn !== queuedTurn);
+            queuedTurn.resolve({ stopReason: "cancelled" });
+          }
+        }
+        return result;
+      },
+      signal,
+    );
+  }
+
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.resumeSessionUnderMutation(params),
+    );
+  }
+
+  private async resumeSessionUnderMutation(
+    params: ResumeSessionRequest,
+  ): Promise<ResumeSessionResponse> {
     const result = await this.getOrCreateSession(params);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -2892,8 +3118,14 @@ export class ClaudeAcpAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     if (this.providerUpdate) await this.providerUpdate;
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.loadSessionUnderMutation(params),
+    );
+  }
+
+  private async loadSessionUnderMutation(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    const timing = new SessionTiming(this.logger, "load", params.sessionId);
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);
@@ -2956,14 +3188,33 @@ export class ClaudeAcpAgent {
   async unsubscribeSessionList(params: ListUnsubscribeRequest) {
     return this.sessionIndex.unsubscribeList(params);
   }
+  private runSessionIndexMutation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    return this.sessionMutations.runExclusive(sessionId, async () => {
+      // A failed exit confirmation leaves a writer that may still change the transcript.
+      if (this.nativeShutdownFences.has(sessionId)) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Native shutdown unconfirmed; reconnect required",
+        );
+      }
+      if (this.disposing) {
+        throw RequestError.invalidRequest(undefined, "Agent connection is closing");
+      }
+      return operation();
+    });
+  }
+
   renameSessionTitle(params: RenameSessionRequest) {
-    return this.sessionIndex.rename(params);
+    return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.rename(params));
   }
   archiveSession(params: SessionIdRequest) {
-    return this.sessionIndex.archive(params);
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    return this.runSessionIndexMutation(params.sessionId, () => this.sessionIndex.archive(params));
   }
   unarchiveSession(params: SessionIdRequest) {
-    return this.sessionIndex.unarchive(params);
+    return this.runSessionIndexMutation(params.sessionId, () =>
+      this.sessionIndex.unarchive(params),
+    );
   }
 
   /**
@@ -3444,6 +3695,16 @@ export class ClaudeAcpAgent {
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
     if (this.providerUpdate) await this.providerUpdate;
+    const reservation = this.sessionMutations.reservePrompt(params.sessionId);
+    const release = typeof reservation === "function" ? reservation : await reservation;
+    try {
+      return await this.startTurnUnderMutation(params, events);
+    } finally {
+      release();
+    }
+  }
+
+  private async startTurnUnderMutation(params: PromptRequest, events: TurnEvents): Promise<void> {
     let session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -3816,6 +4077,17 @@ export class ClaudeAcpAgent {
    *  `session/prompt`. Without the opt-in, the existing detached `prompt()` and
    *  `startedNewTurn` result are preserved for compatibility. */
   async steer(params: SteerRequest): Promise<SteerResponse> {
+    if (this.providerUpdate) await this.providerUpdate;
+    const reservation = this.sessionMutations.reservePrompt(params.sessionId);
+    const release = typeof reservation === "function" ? reservation : await reservation;
+    try {
+      return await this.steerUnderMutation(params);
+    } finally {
+      release();
+    }
+  }
+
+  private async steerUnderMutation(params: SteerRequest): Promise<SteerResponse> {
     const sessionId = params.sessionId;
     let session = this.sessions[sessionId];
     if (!session) {
@@ -4284,6 +4556,7 @@ export class ClaudeAcpAgent {
       compaction.resume();
       if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
+      session.orphanGeneration = (session.orphanGeneration ?? 0) + 1;
       session.orphanCommands?.clear();
       // Two-phase sweep of registry entries the level signal ended (see
       // the endedPerLevel field doc): armed at the first activation,
@@ -5109,6 +5382,20 @@ export class ClaudeAcpAgent {
                 queued.commandFinished = frame.state as NonNullable<Turn["commandFinished"]>;
               }
               if (frame.state === "cancelled") {
+                // The terminal frame can precede the control ACK. A pending
+                // command dropped before dispatch will never produce a result.
+                if (
+                  queued?.runtimeCancellationDebt &&
+                  !queued.commandStarted &&
+                  !queued.insertedReported &&
+                  session.activeTurn !== queued
+                ) {
+                  session.fileChangeReporter?.finish(queued.fileChangeReport, "cancelled");
+                  queued.localCommandAbort?.abort();
+                  queued.settled = true;
+                  session.turnQueue = (session.turnQueue ?? []).filter((turn) => turn !== queued);
+                  queued.resolve({ stopReason: "cancelled" });
+                }
                 // Ambiguous by design (dup-over-loss): dropped before
                 // dispatch (no result will ever come — safe to forget) vs
                 // consumed into a turn that was aborted/failed. For the
@@ -7489,6 +7776,12 @@ export class ClaudeAcpAgent {
           turn.promptUuid,
           turn.commandStarted ? "started" : "pending",
         );
+        if (!lifecycleLane && turn.runtimeCancellationDebt) {
+          turn.runtimeCancellationDebt = {
+            generation: session.orphanGeneration ?? 0,
+            counted: true,
+          };
+        }
       }
       session.turnQueue = session.turnQueue.filter(
         (turn) => turn === session.activeTurn && !turn.settled,
@@ -7636,7 +7929,13 @@ export class ClaudeAcpAgent {
     if (Array.isArray(receipt?.still_queued) && orphanedTurns.length > 0) {
       const stillQueued = new Set(receipt.still_queued);
       const droppedTurns = orphanedTurns.filter((turn) => !stillQueued.has(turn.promptUuid));
-      const droppedCount = droppedTurns.length;
+      const droppedCount = droppedTurns.filter((turn) => {
+        const debt = turn.runtimeCancellationDebt;
+        return !debt || (debt.counted && debt.generation === (session.orphanGeneration ?? 0));
+      }).length;
+      for (const turn of droppedTurns) {
+        if (turn.runtimeCancellationDebt) turn.runtimeCancellationDebt.counted = false;
+      }
       for (const turn of droppedTurns) {
         session.pendingEmptyInterruptionDiagnosticCommands?.delete(turn.promptUuid);
       }
@@ -7776,11 +8075,28 @@ export class ClaudeAcpAgent {
   /** Tear down all active sessions. Called when the ACP connection closes. */
   async dispose(): Promise<void> {
     this.sessionIndex.dispose();
-    await Promise.all(Object.keys(this.sessions).map((id) => this.teardownSession(id)));
+    this.disposing = true;
+    for (const id of Object.keys(this.sessions)) this.sessionMutations.cancelExclusive(id);
+    await Promise.all(
+      Object.keys(this.sessions).map((id) =>
+        this.sessionMutations.runExclusive(id, () => this.teardownSession(id)),
+      ),
+    );
   }
 
   /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    // A pending provider update waits for active turns. Close must be able to
+    // cancel those turns; the per-session lock serializes actual recreation.
+    return this.sessionMutations.runExclusive(params.sessionId, () =>
+      this.closeSessionUnderMutation(params),
+    );
+  }
+
+  private async closeSessionUnderMutation(
+    params: CloseSessionRequest,
+  ): Promise<CloseSessionResponse> {
     if (!this.sessions[params.sessionId]) {
       return {};
     }
@@ -7790,7 +8106,10 @@ export class ClaudeAcpAgent {
 
   /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    return this.sessionIndex.deleteSession(params);
+    this.sessionMutations.cancelExclusive(params.sessionId);
+    return this.runSessionIndexMutation(params.sessionId, () =>
+      this.sessionIndex.deleteSession(params),
+    );
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -9336,12 +9655,17 @@ export class ClaudeAcpAgent {
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
+    if (this.disposing || this.nativeShutdownFences.has(params.sessionId))
+      throw RequestError.invalidRequest(
+        undefined,
+        "Native shutdown unconfirmed; reconnect required",
+      );
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
     if (existingSession) {
       const fingerprint = computeSessionFingerprint(params);
-      if (fingerprint === existingSession.sessionFingerprint) {
+      if (!existingSession.queryClosed && fingerprint === existingSession.sessionFingerprint) {
         return {
           sessionId: params.sessionId,
           modes: existingSession.modes,
@@ -9435,6 +9759,13 @@ export class ClaudeAcpAgent {
       replayState?: ReplayState;
     } = {},
   ): Promise<NewSessionResponse> {
+    const boundId =
+      creationOpts.publicSessionId ?? creationOpts.resume ?? creationOpts.reuseSessionId;
+    if (this.disposing || (boundId && this.nativeShutdownFences.has(boundId)))
+      throw RequestError.invalidRequest(
+        undefined,
+        "Native shutdown unconfirmed; reconnect required",
+      );
     const createStartedAt = performance.now();
     // Validate `cwd` up front. The ACP spec requires an absolute path, and the
     // directory must actually exist on the machine running the agent. Without
@@ -10151,25 +10482,31 @@ export class ClaudeAcpAgent {
 
       this.providerConfig = config;
       for (const [sessionId, session] of sessions) {
-        if (this.sessions[sessionId] !== session || !session.creationParams) {
-          continue;
-        }
-        this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
-        this.closeQueryStream(session);
-        delete this.sessions[sessionId];
-        try {
-          await this.createSession(session.creationParams, {
-            resume: sessionId,
-            permissionMode: session.modes.currentModeId as PermissionMode,
-          });
-        } catch (error) {
-          // One session that cannot come back must not abort the switch. The
-          // `--hide-claude-auth` guard makes this a normal outcome of
-          // `providers/disable`: the override kept a subscription account
-          // usable, and creation refuses without it. The session is already
-          // gone, so tell the client why and go on to the next one.
-          this.reportSessionLostOnProviderUpdate(sessionId, session, error);
-        }
+        await this.sessionMutations.runExclusive(sessionId, async () => {
+          if (
+            this.nativeShutdownFences.has(sessionId) ||
+            this.sessions[sessionId] !== session ||
+            !session.creationParams
+          ) {
+            return;
+          }
+          this.logger.log(`Recreating Claude session ${sessionId} for provider update`);
+          this.closeQueryStream(session);
+          delete this.sessions[sessionId];
+          try {
+            await this.createSession(session.creationParams, {
+              resume: sessionId,
+              permissionMode: session.modes.currentModeId as PermissionMode,
+            });
+          } catch (error) {
+            // One session that cannot come back must not abort the switch. The
+            // `--hide-claude-auth` guard makes this a normal outcome of
+            // `providers/disable`: the override kept a subscription account
+            // usable, and creation refuses without it. The session is already
+            // gone, so tell the client why and go on to the next one.
+            this.reportSessionLostOnProviderUpdate(sessionId, session, error);
+          }
+        });
       }
     });
     // Sessions and prompts await `providerUpdate` before they run. A rejected
@@ -11756,6 +12093,16 @@ export function v1AgentApp(
       onAgent(agent);
     })
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
+    .onRequest<RuntimeReadRequest, RuntimeResponse>(
+      RUNTIME_READ_METHOD,
+      { parse: parseRuntimeReadRequest },
+      (ctx) => agent.readSessionRuntime(ctx.params, ctx.signal),
+    )
+    .onRequest<RuntimeControlRequest, RuntimeResponse>(
+      RUNTIME_CONTROL_METHOD,
+      { parse: parseRuntimeControlRequest },
+      (ctx) => agent.controlSessionRuntime(ctx.params, ctx.signal),
+    )
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
     .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
