@@ -10790,12 +10790,13 @@ describe("session/close", () => {
     expect(session.abortController.signal.aborted).toBe(true);
   });
 
-  it("should throw when closing a non-existent session", async () => {
+  it("is idempotent for a session that is not loaded here", async () => {
     const agent = createMockAgent();
 
-    await expect(agent.closeSession({ sessionId: "non-existent" })).rejects.toThrow(
-      "Session not found",
-    );
+    await expect(agent.closeSession({ sessionId: "non-existent" })).resolves.toEqual({});
+    injectSession(agent, "session-1");
+    await agent.closeSession({ sessionId: "session-1" });
+    await expect(agent.closeSession({ sessionId: "session-1" })).resolves.toEqual({});
   });
 
   it("should not affect other sessions when closing one", async () => {

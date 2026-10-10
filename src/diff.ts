@@ -569,9 +569,50 @@ function textLines(text: string): string[] {
  * its time budget.
  */
 function filePatch(oldText: string | null, newText: string): FilePatch | undefined {
-  const hunks = diffHunks(oldText, newText);
+  const hunks = memoizedDiffHunks(oldText, newText);
   if (!hunks || hunks.length === 0) return undefined;
   return { change: oldText === null ? "create" : "update", hunks };
+}
+
+/** The number of recent line diffs that {@link memoizedDiffHunks} keeps. */
+const DIFF_MEMO_SIZE = 4;
+
+/** Recent line diffs not read again yet, the most recent last. A text of at
+ *  most {@link MAX_PATCH_FILE_BYTES} is held until it is read again or later
+ *  diffs push it out. */
+const diffMemo: { oldText: string | null; newText: string; hunks: PatchHunk[] }[] = [];
+
+/**
+ * {@link diffHunks} of a recent pair of texts again, without a second diff.
+ *
+ * The approval of an Edit or Write diffs the file against the predicted text,
+ * and the PostToolUse hook diffs the same texts once Claude wrote them. On a
+ * large file each diff can block the event loop for its whole time budget.
+ * Only a diff that completed is remembered: one that ran out of its budget
+ * says nothing about the texts, so a later call diffs them again. The hunks
+ * are shared, and no caller changes them.
+ */
+function memoizedDiffHunks(oldText: string | null, newText: string): PatchHunk[] | undefined {
+  const index = diffMemo.findIndex(
+    (entry) => entry.oldText === oldText && entry.newText === newText,
+  );
+  if (index >= 0) {
+    // The hook is normally the last reader of a pair, so the entry goes: the
+    // memo does not hold two large texts longer than needed.
+    const [entry] = diffMemo.splice(index, 1);
+    return entry.hunks;
+  }
+  const hunks = diffHunks(oldText, newText);
+  if (hunks) {
+    diffMemo.push({ oldText, newText, hunks });
+    if (diffMemo.length > DIFF_MEMO_SIZE) diffMemo.shift();
+  }
+  return hunks;
+}
+
+/** Forget the remembered line diffs. For tests. */
+export function clearDiffMemo(): void {
+  diffMemo.length = 0;
 }
 
 /**

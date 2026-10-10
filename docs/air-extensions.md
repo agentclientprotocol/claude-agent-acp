@@ -24,6 +24,7 @@ It describes only this adapter.
 - [Agent file-change report](#agent-file-change-report)
 - [Session failure](#session-failure)
 - [Native subagent sessions](#native-subagent-sessions)
+- [Session index](#session-index)
 - [Context compaction](#context-compaction)
 - [Question custom answers](#question-custom-answers)
 - [Session fork point](#session-fork-point)
@@ -135,22 +136,26 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 }
 ```
 
-The agent list does not depend on the capabilities that AIR declares.
-An extension is active only when the client declared its capability.
+The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionArchive`, `sessionRename` and `sessionListSubscribe`, only for a client that declared `sessionIndex`.
+An extension is active only when the client declared its capability. The client does not declare `sessionArchive`, `sessionRename` and `sessionListSubscribe`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### Capabilities
 
-| Capability               | Advertised | What the adapter does when the client declares it                                       | Section                                                 |
-| ------------------------ | ---------- | --------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `diffPatch`              | yes        | Sends an exact Git patch in the diff block of an Edit or a Write.                       | [Diff patch](#diff-patch)                               |
-| `sessionFailure`         | yes        | Sends warnings and errors as typed transcript records.                                  | [Session failure](#session-failure)                     |
-| `recommendedValue`       | yes        | Replaces the `default` model and effort rows with concrete values and a recommendation. | [Recommended config values](#recommended-config-values) |
-| `asyncTasks`             | yes        | Publishes background work that is not a subagent as async tasks.                        | [Async tasks](#async-tasks)                             |
-| `agentFileChangeReport`  | yes        | Accepts a report request on `session/prompt` and sends the changed file list.           | [Agent file-change report](#agent-file-change-report)   |
-| `nativeSubagentSessions` | yes        | Reports an Agent or Task subagent as a native ACP child session.                        | [Native subagent sessions](#native-subagent-sessions)   |
-| `planFile`               | yes        | Sends the path of the plan file in place of the plan text of an ExitPlanMode.           | [Plan file](#plan-file)                                 |
-| `rawInputRendering`      | no         | Sends no display copy of readable input in `content`. The client renders `rawInput`.    | [Tool call contract](#tool-call-contract)               |
+| Capability               | Advertised          | What the adapter does when the client declares it                                                            | Section                                                 |
+| ------------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------- |
+| `diffPatch`              | yes                 | Sends an exact Git patch in the diff block of an Edit or a Write.                                            | [Diff patch](#diff-patch)                               |
+| `sessionFailure`         | yes                 | Sends warnings and errors as typed transcript records.                                                       | [Session failure](#session-failure)                     |
+| `recommendedValue`       | yes                 | Replaces the `default` model and effort rows with concrete values and a recommendation.                      | [Recommended config values](#recommended-config-values) |
+| `asyncTasks`             | yes                 | Publishes background work that is not a subagent as async tasks.                                             | [Async tasks](#async-tasks)                             |
+| `agentFileChangeReport`  | yes                 | Accepts a report request on `session/prompt` and sends the changed file list.                                | [Agent file-change report](#agent-file-change-report)   |
+| `nativeSubagentSessions` | yes                 | Reports an Agent or Task subagent as a native ACP child session.                                             | [Native subagent sessions](#native-subagent-sessions)   |
+| `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                | [Plan file](#plan-file)                                 |
+| `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                    | [Session index](#session-index)                         |
+| `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`. | [Archive](#archive)                                     |
+| `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                           | [Rename](#rename)                                       |
+| `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                   | [List subscription](#list-subscription)                 |
+| `rawInputRendering`      | no                  | Sends no display copy of readable input in `content`. The client renders `rawInput`.                         | [Tool call contract](#tool-call-contract)               |
 
 The adapter ignores `planContentDelta`.
 Claude does not stream a plan, so the adapter never sends `contentDelta` (see [Plan file](#plan-file)).
@@ -1176,6 +1181,262 @@ This section covers only the AIR bridge.
 - Without either signal, Agent and Task stay ordinary tool calls. AIR gets `_meta.jetbrains.air.subagent: true` on them.
   Child interactions stay on the root session.
 - A client that uses the older `_meta["subagent-transcript"]` capability or the `forwardSubagentText` session option keeps the flat child transcript.
+
+## Session index
+
+The session index makes `session/list` a bounded, ordered page with row metadata, and adds rename, archive and a list subscription.
+
+### Activation
+
+AIR declares `sessionIndex` in `_meta.jetbrains.air.capabilities`.
+Unlike the other capabilities, the agent advertises `sessionIndex` only to a client that declared it, and never under ACP v2.
+Exactly when it advertises `sessionIndex`, the agent also advertises `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`) and `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`).
+The client does not declare these three; declaring them without `sessionIndex` enables nothing.
+Everything in this section applies only to such a client, except where [Delete and close](#delete-and-close) says otherwise.
+A client without the capability gets the `session/list` of before: the SDK `listSessions` call, pages of 1000 by file mtime, `offset:N` cursors, and no row `_meta`.
+It gets no new notification, and the adapter starts no watcher for it.
+The new methods answer it with `-32601`.
+
+### List request
+
+```json
+{
+  "cwd": "/Users/me/repo",
+  "cursor": null,
+  "_meta": {
+    "jetbrains": {
+      "air": {
+        "version": 1,
+        "list": { "limit": 50, "includeWorktrees": false, "archived": "unarchived" }
+      }
+    }
+  }
+}
+```
+
+- `limit` is an integer of at least 1; omitted or `null` is 50. The adapter clamps it to 200 and never returns more. Another value (a string, a fraction, 0 or less) is `-32602`.
+- `includeWorktrees` is a boolean, `false` when omitted or `null`. Another value is `-32602`.
+  Without it, the page holds the sessions that the SDK `listSessions` lists for `cwd`: the transcripts of its project directory (`cwd` with symlinks resolved, encoded as the CLI names the directory).
+  As in the SDK, a transcript there whose cwd (its last `relocated` cwd, else its first `cwd`) is another path that encodes to the same name (`/ws/app.v2` and `/ws/app-v2`, `/a/b` and `/a-b`) is left out only while that path still exists and resolves to another path; once it is gone, the session is listed under `cwd`.
+  With `true`, the page also holds the sessions of the same subdirectory of `cwd` in every other existing worktree of its repository, as the Codex TUI expands a cwd: for `/repo/packages/a`, `/wt1/packages/a` if that directory exists. For a cwd at a worktree root, that is the worktree roots.
+- `archived` and `includeWorktrees` treat `null` as omitted.
+- `archived` is one of three strings: `"unarchived"` lists the unarchived sessions only, `"archived"` the archived sessions only, and `"all"` both together, in one order.
+  Omitted or `null` is `"unarchived"`. Any other value, including a boolean, is `-32602`.
+  The filter applies before pagination.
+- Without `cwd` the page holds the sessions of all projects.
+
+### List response
+
+- Rows are ordered by the last user activity descending, then by session id: `lastPromptAt`, else `updatedAt` for a row without it.
+  A session the agent kept working on after the last prompt does not move up, as in Codex Desktop and the AIR session tree.
+  With `archived: "all"`, archived and unarchived rows merge on the same key.
+- Every row has `updatedAt`: the time of the last message of any kind, capped at the transcript mtime.
+  A rename, an archive, or another metadata record moves neither `updatedAt` nor the order.
+- The cursor is opaque. It holds the position (the order key and session id of the last row) and the `cwd`, `includeWorktrees` and `archived` it was issued for; another value of any of them rejects it with `-32602`. `limit` may change from page to page.
+- A deleted session is never listed, whatever `archived` says.
+- A page with `nextCursor` is never empty, and a page never repeats a row of the pages before it.
+- With `includeWorktrees`, the worktrees come from `<git-common-dir>/worktrees/*/gitdir`, without running git; a worktree whose directory no longer exists is left out.
+  A path longer than the CLI's 200-character directory name limit matches directories by name prefix, so such a directory counts only when one of its transcripts belongs to the path (its last `relocated` cwd, else its first `cwd`), as the SDK checks.
+  A row's `cwd` is the session's own directory, so it can be a worktree path.
+- A row's `title` is the session's agent name, as AIR's native Claude provider ranks it: the top-level `agentName` of the last record that has one in the transcript's 64 KB tail, else in its 64 KB head.
+  Without one, it is the title the SDK reports for the session (`summary` of `getSessionInfo`): its custom title (tail, the CLI's `custom-title.json` sidecar, head) or AI title, else the last prompt, a summary or the first prompt.
+  When the SDK reads another copy of the session than the listed transcript, the same title is taken from the listed transcript's 64 KB head and tail.
+  The `[archived] ` prefix of an archived session is not part of the title (see [Archive](#archive)).
+- Sidechain and subagent transcripts, transcripts without a message, and transcripts without a title are not listed.
+- A session copied to several project directories of the scope is listed once, as the SDK lists it: from its most recently modified transcript that is listed.
+- A transcript continued in another session (a `continued-in` record) whose successor has history is not listed, as in the SDK list.
+- On macOS a project directory whose name differs from the cwd's encoding in case only is the cwd's directory, as the file system resolves it for the SDK.
+- A row's `cwd` comes from the transcript (the last `relocated` record, else the first `cwd`, else the last `cwd` or one of its parents) when it encodes to the project directory name.
+  Otherwise it is the requested path of that directory, else the `cwd` of another session in the same directory, read further if the page does not hold one.
+- `updatedAt` needs the last message and the order key the last prompt: when the 64 KB tail window lacks either, the window grows up to 4 MB to find it, reading only the new bytes each step. A last message longer than that gives the last `timestamp` of the file's last 64 KB, so title records appended after it move nothing.
+  The directory name is never decoded.
+
+Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archived` is always there (see [Archive](#archive)); every other field is omitted when unknown:
+
+```json
+{
+  "archived": false,
+  "lastPromptAt": "2026-10-06T09:57:40.000Z",
+  "model": "claude-opus-5-5",
+  "forkedFrom": "8f0c1d2e-0000-4000-8000-000000000000",
+  "state": "idle",
+  "lastTurnEndedAt": "2026-10-06T09:58:10.000Z",
+  "cost": { "amount": 1.23, "currency": "USD" }
+}
+```
+
+- `lastPromptAt` is the time of the last real user prompt in the transcript tail: prompt text (the predicate of the SDK title extractor) or an image or a document, but not a tool result, a meta or compact summary record, a slash command or an interrupt. When a long answer or tool output follows the last prompt, the tail window grows (256 KB, 1 MB, 4 MB) to find it; it is omitted only when the last 4 MB hold no prompt.
+- `model` is the model of the last assistant message in the tail; messages the CLI makes up (`<synthetic>`) do not count.
+- `forkedFrom` is the parent session id that the SDK `forkSession` and the CLI fork write on every copied record (`forkedFrom.sessionId`). Sessions started any other way have none.
+- `state` is `running`, `idle`, `requires_action`, or `error`, never `unknown`. `error` means the session is not running and its last turn ended with an error; a user cancel or interrupt is no error, and a new turn clears it:
+  - a session this connection runs: the SDK `session_state_changed` state; `error` instead of `idle` when its last turn failed (an error result, `is_error` or an `error_*` subtype, that was not a cancel). A session whose query failed here (not a cancel) is reported as any other session, but `error` until its transcript shows a prompt or a turn end after the failure, unless a busy or waiting interactive CLI holds it;
+  - a session no live Claude Code process holds: `idle`, or `error` when its last turn ended with an API error (an assistant record with `isApiErrorMessage: true`, also when the CLI's turn-end records follow it, with no prompt after it);
+  - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`, or `error` after such an API error;
+  - any other held session: `idle` after a finished turn (an assistant `end_turn`, a user interrupt, or the CLI turn-end records), `error` after a turn that ended with an API error, `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
+- The live processes come from `<config>/sessions/<pid>.json`, with the liveness rules of Claude Desktop: `kill(pid, 0)` (or `EPERM`), a matching `procStart`, no foreign `pidDomain`, and records older than 24 hours only with a matching `procStart`.
+  The adapter never reads the `.key` files there and never changes the directory.
+- `lastTurnEndedAt` is when the last turn ended.
+- `cost` is the `total_cost_usd` that the SDK gave in the last result of a session this connection runs, when it is greater than 0. Any other session has no `cost`: the adapter neither reads nor estimates one from a transcript.
+
+### Rename
+
+`_session/rename { "sessionId": "…", "title": "…" }` returns `{}`.
+
+- A blank title is `-32602`. The adapter collapses whitespace and keeps the first 200 characters, trimmed, as the CLI does. An `[archived] ` prefix of the requested title is dropped: a rename never changes the archive state.
+- The title is stored as the title records of [Archive](#archive): a `custom-title` and an `agent-name` record. An archived session keeps its `[archived] ` prefix (and the title is cut to 200 characters with it), so a rename does not unarchive it.
+- A session that runs here on a CLI without the `rename_session` control request is refused with `-32600`: its CLI holds the title and would write it back.
+- A session this connection runs is renamed through its CLI (`rename_session` control request), which writes the records and the sidecar of its own transcript.
+  A title generation in flight finishes first, and no generated title replaces the new one, also after a reload.
+  The adapter then sends `session_info_update { title }` with the title as stored, without the archive prefix.
+  Copies of the session in other project directories get the records and sidecar from the adapter.
+- Any other session gets the records in every transcript of the session and the CLI's `custom-title.json` sidecar next to each (mode 0600, written atomically).
+- As with the CLI's `/rename`, the records are written whether or not another Claude Code process has the session open. A transcript whose last line is incomplete gets a newline before the records.
+
+### Archive
+
+`_session/archive { "sessionId": "…" }` and `_session/unarchive { "sessionId": "…" }` return `{}`.
+Both are idempotent and work for a session that is not loaded.
+Archiving a session stops it; unarchiving does not start it.
+
+The archive state lives in the session title, in the format of AIR's own Claude integration, so AIR's native Claude path and this adapter read and write the same state:
+
+- A session is archived when its name, with whitespace collapsed, starts with `[archived] `. As in AIR's native Claude provider, the name is the agent name (see [List response](#list-response)), else the custom title the SDK reports for it (`customTitle`); the agent name wins when both are there.
+  So an `agent-name` record with the prefix archives a session whose custom title has none, and one without the prefix unarchives a session whose custom title has it. No other title is read for the archive state.
+- Archive appends the title records of `[archived] ` plus the current title without the prefix; unarchive appends those of the title without the prefix. The title is cut to the CLI's limit, its first 200 characters, trimmed; a session without a title is `Session ` plus the first 8 characters of its id.
+- The title records are two lines, appended together to every transcript of the session:
+
+  ```json
+  {"type":"custom-title","customTitle":"[archived] Fix the parser","sessionId":"…"}
+  {"type":"agent-name","agentName":"[archived] Fix the parser","sessionId":"…"}
+  ```
+
+  A transcript already in the requested state gets nothing. A `custom-title.json` sidecar that the adapter finds is rewritten with the same title (also one left in the other state next to a transcript already in the requested state); the adapter creates none. The CLI of a session that runs here writes the sidecar of its own transcript, as for a rename.
+  The current title is the title of each transcript (see [List response](#list-response)), with the prefix only when the transcript is archived. For a session that runs here, it is the title last stored through its CLI while the last custom title of its transcript is that title; otherwise the transcript's.
+  Every `[archived] ` prefix of the current title is removed before one is added, so unarchive also unarchives a title stored with the prefix twice.
+  A new session archived before it has a title gets `[archived] Session …`, and keeps `Session …` as its name once unarchived: no title is generated for a named session.
+
+- The list shows the title without the prefix, and so does the `session_info_update { title }` of a loaded session for an AIR client. Another client, and the `claude --resume` picker, show the title as stored, with the prefix.
+
+- Archive of a session loaded on this connection stops it, as Codex's `thread/archive` unloads its thread:
+  1. it cancels the running turn, as `session/cancel` does, and sends the CLI the interrupt;
+  2. it retitles the session through its CLI (`rename_session`), as for [Rename](#rename): the CLI keeps the title in memory and writes it again, so only its own write cannot be overtaken. A title generation in flight finishes first, and no generated title replaces the archived one. The CLI writes the custom title before it answers and the agent name only later, so when the CLI's transcript has another agent name, the adapter appends the `agent-name` record of the new title to it at once. Its copies in other project directories get the records from the adapter as a best effort;
+  3. it closes the session as `session/close` does: the cancelled prompt ends with `cancelled`, and the session is no longer loaded. A later `session/prompt` fails as for a closed session; to work in it again, the client unarchives it and loads it.
+  4. it archives each transcript that the closed CLI left unarchived once more, with the title records.
+
+  If the retitle fails, the archive fails and the session stays loaded, with its turn cancelled.
+  A new session archived before the CLI wrote its transcript may have none once it is closed: it is then unknown (`-32002`) and not listed.
+
+- Unarchive neither loads nor resumes the session. A session loaded on this connection keeps running and is retitled through its CLI, as for archive.
+- Archive and unarchive of a session that is not loaded here write the title records, also when another Claude Code process has the session open, as for [Rename](#rename). That process keeps running. AIR's native Claude path stops the session's processes before it archives.
+- Closing, loading or resuming a session does not change its archive state.
+- After either, a session that was loaded on this connection gets `session_info_update` with `_meta.jetbrains.air.archived` set to the new state; no standard field changes. An archive sends it once the session is closed, as the last update of the session.
+- Neither changes `updatedAt` or the list order: the title records are metadata.
+- A session without a transcript (unknown, deleted, or removed by the CLI cleanup) is `-32002`. Unarchive never brings back a deleted session.
+  Only a new session that runs on this connection and has not finished a turn yet may have no transcript: it can be archived before the CLI writes one, and the CLI writes the title with it.
+  A loaded session whose query ended, that finished a turn, or that was loaded, resumed or forked from history needs its transcript.
+- Rename, archive, unarchive and delete of one session run one at a time.
+
+In all of the session index methods and in `session/delete`, a session id matches exactly: a transcript is the file named by the id as given.
+Loading an archived session does not unarchive it.
+The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or not.
+
+### List subscription
+
+`_session/list/subscribe { "cwd": "…" }` returns `{ "subscriptionId": "…" }`.
+From then on the agent sends `_session/list/changes` notifications for the sessions of that `cwd`:
+
+```json
+{
+  "subscriptionId": "5b0c…",
+  "sessions": [
+    {
+      "sessionId": "…",
+      "cwd": "/Users/me/repo",
+      "title": "…",
+      "updatedAt": "…",
+      "_meta": { "jetbrains": { "air": { "version": 1, "archived": false, "state": "running" } } }
+    }
+  ],
+  "removed": ["…"]
+}
+```
+
+- `cwd` is required and must be an absolute path; a missing, non-string or relative `cwd` is `-32602`. Other parameters are ignored.
+- The scope is the sessions of `cwd` and of the same subdirectory in every existing linked worktree of its repository, as a list with `includeWorktrees: true` resolves it, in any archive state. Sidechain and subagent transcripts are left out, as in the list.
+- `sessions` holds the full current row of each session in scope that appeared, or whose `title`, `lastPromptAt`, `state`, `lastTurnEndedAt`, `cost`, `model`, `forkedFrom` or `archived` changed since the last row sent for it on this subscription. A row is exactly the row of `session/list`, `_meta.jetbrains.air` included.
+- After subscribe, the first change of each session sends its row in full, even when only `updatedAt` changed. From then on, a change of `updatedAt` alone sends nothing; the new `updatedAt` comes with the next change.
+- `removed` holds the ids of sessions that left the scope: deleted (the transcript is gone), or moved to a path outside it. It may name a session the client does not list (one it never listed, one the list hides, such as a session continued in another one when that one changes); the client ignores such an id.
+- Archive and unarchive are row changes (`archived`): their title records are a transcript change. The agent applies no archive filter: the client filters.
+- A session is sent at most once a second per subscription. All changes of one pass go in one notification per subscription.
+- Changes are tracked from the moment subscribe returns: the client subscribes first, then reads the first page with `session/list`. A row the page also holds may be sent.
+- A transcript change is sent 150 ms after the last change of a burst, at most 1 s after the first; the state of a session that this connection runs is sent at once.
+- Delivery is best effort: there is no resync and no sequence number. A rescan every 10 s, and one 1 s after the adapter starts watching a project directory, sends any difference it finds as a normal change. The client should still read the list now and then.
+
+`_session/list/unsubscribe { "subscriptionId": "…" }` returns `{}`.
+It is idempotent, and an unknown id also returns `{}`.
+
+- A subscription lives until unsubscribe or until the connection closes; it has no time limit.
+- A connection has at most 128 subscriptions. The 129th subscribe is `-32602` with `data.reason: "too_many_subscriptions"`.
+- A second subscription of the same `cwd` is independent: it has its own id, its own unsubscribe and its own notifications.
+- The adapter watches, without recursion, the project directories of the scope, the projects directory (for a new project directory), `<config>/sessions`, and the nearest existing parent of any of these that does not exist yet. All subscriptions of one `cwd` share that watching, which ends with the last of them.
+- Subscribe reads no session row. The first subscription of a `cwd` opens the watchers, stats every transcript of the scope, and reads the registry before it returns.
+- A transcript event names the file: only that transcript is read. A registry event names the record: only the sessions whose record changed get their `state` recomputed (their row is read on their first event). A session continued in a changed one is read again too.
+- The rescan reads a transcript only when its stat changed or its last read failed. A session that a live process holds and that no event read gets its row, for its aging `state`, from what `session/list` already read; a worktree that came or went re-resolves only the sessions read before, by an event or by `session/list`.
+- `session/list` starts or renews nothing.
+
+### Delete and close
+
+`session/delete`:
+
+- a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002`.
+- an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript fails with the error of the SDK delete, as before.
+  A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
+- any other client: the SDK delete, as before.
+
+`session/close` of a session that is not loaded returns `{}` for every client.
+
+`session/load`, `session/resume`, `session/prompt`, rename, archive, unarchive and delete all work on a session that another live Claude Code process has open, for every client, as the Claude CLI does. Archive stops only a session that runs on this connection.
+
+### Errors
+
+| Case                         | Error                               |
+| ---------------------------- | ----------------------------------- |
+| Unknown session              | `-32002` with `data: { sessionId }` |
+| Invalid parameters or cursor | `-32602`                            |
+
+### Relation to the RFDs
+
+The session index is the `_meta` form of two ACP RFDs: "Session list extensions: limit, order, row metadata and change hints" and "Session Archive and Unarchive" (#2161).
+Names and semantics follow them; the transport differs, and so do the `archived` list filter and the archive of a running session (see [Relation to ACP RFD #2161](#relation-to-acp-rfd-2161)):
+
+| Extension                                                                                         | RFD                                                                    |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`                                       |
+| capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)                                  |
+| capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)                                 |
+| `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                 |
+| `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                      |
+| `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                     |
+| row `_meta.jetbrains.air.lastPromptAt`, `model`, `forkedFrom`, `state`, `lastTurnEndedAt`, `cost` | `SessionInfo` fields of the same names; the RFD `state` has no `error` |
+| row `_meta.jetbrains.air.archived`                                                                | `SessionInfo.archived` (#2161)                                         |
+| `session_info_update` `_meta.jetbrains.air.archived`                                              | `SessionInfoUpdate.archived` (#2161)                                   |
+| capability `sessionListSubscribe`, `_session/list/subscribe`, `_session/list/unsubscribe`         | none                                                                   |
+| `_session/list/changes { subscriptionId, sessions, removed }`                                     | none                                                                   |
+| `_session/archive`, `_session/unarchive`                                                          | `session/archive`, `session/unarchive` (#2161)                         |
+| `_session/rename`                                                                                 | `session/set_title` (#1987)                                            |
+
+### Relation to ACP RFD #2161
+
+The archive follows the semantics of the ACP "Session Archive and Unarchive" RFD (#2161): the archive state of every row, the state report in `session_info_update`, idempotency, `-32002` for unknown and deleted sessions, and an unchanged `updatedAt`.
+It differs in transport, until the RFD lands in the SDK, in the list filter, and in execution:
+
+- archive stops a session that runs on this connection, as `session/close` does, where #2161 leaves execution alone. The "Session list extensions" RFD proposes this change to #2161;
+
+- the list parameter has three values, not two: `"unarchived"` is the RFD's `false` (and the default of both), `"all"` its `true`, and `"archived"`, the archived sessions only, has no RFD counterpart;
+- the methods are `_session/archive` and `_session/unarchive`, not `session/archive` and `session/unarchive`;
+- the capability is `sessionArchive` in `_meta.jetbrains.air.capabilities`, advertised together with `sessionIndex`, not `sessionCapabilities.archive`;
+- the list parameter is `_meta.jetbrains.air.list.archived`, and the state is `_meta.jetbrains.air.archived` on rows and in `session_info_update`, not the `archived` fields;
+- an AIR client without `sessionIndex` still archives with `session/delete` (see [Delete and close](#delete-and-close)), which the RFD asks clients not to do.
 
 ## Context compaction
 

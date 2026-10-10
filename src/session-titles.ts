@@ -17,6 +17,7 @@
 import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
+import { ExplicitTitle } from "./session-index/explicit-title.js";
 
 const MAX_TITLE_LENGTH = 256;
 
@@ -42,7 +43,22 @@ type TitleCapableQuery = Query & {
  *  unavailable or yields nothing. */
 type TitleFallback = { title: string; lastModified: number };
 
+/** How much of a long text {@link sanitizeTitle} reads first. Collapsed, it
+ *  is longer than a title unless it is mostly whitespace. */
+const TITLE_SCAN_LENGTH = 4096;
+
 export function sanitizeTitle(text: string): string {
+  if (text.length > TITLE_SCAN_LENGTH) {
+    // A stored summary can be a whole first prompt of megabytes. The title
+    // depends only on the start of the text: collapsing the whitespace of a
+    // prefix gives a prefix of the collapsed text. Two more characters than a
+    // title hold at least one that is not a space (spaces are collapsed), so
+    // the full text is longer than a title and gets the same cut.
+    const head = text.slice(0, TITLE_SCAN_LENGTH).replace(/\s+/g, " ").trimStart();
+    if (head.length >= MAX_TITLE_LENGTH + 2) {
+      return head.slice(0, MAX_TITLE_LENGTH - 1) + "…";
+    }
+  }
   // Replace newlines and collapse whitespace
   const sanitized = text
     .replace(/[\r\n]+/g, " ")
@@ -84,6 +100,27 @@ export class SessionTitles {
    *  one. Released by {@link reset}, and when generation yields nothing. */
   private settled = false;
 
+  /** The title a client set, which no generated title replaces. */
+  private readonly explicit = new ExplicitTitle();
+
+  /** The title last stored through {@link setExplicitTitle}, as stored
+   *  (with the archive prefix of an archived session): the title the CLI
+   *  holds. */
+  private persistedTitle?: string;
+
+  /** Client title changes in flight, and the title state before the first. */
+  private explicitChanges = 0;
+  private beforeExplicit?: { settled: boolean; context: string | undefined };
+
+  get storedTitle(): string | undefined {
+    return this.persistedTitle;
+  }
+
+  /** The title last published, as the client shows it. */
+  get shownTitle(): string | undefined {
+    return this.lastTitle;
+  }
+
   constructor(
     private readonly agent: ClaudeAcpAgent,
     private readonly sessionId: string,
@@ -115,8 +152,10 @@ export class SessionTitles {
    *  `conversation_reset`, which mounts a fresh transcript. */
   reset(): void {
     this.settled = false;
+    this.explicit.reset();
     this.context = undefined;
     this.lastTitle = undefined;
+    this.persistedTitle = undefined;
   }
 
   /** Turn-end title handling. `idle` is the SDK's turn-over signal, so it is
@@ -131,7 +170,24 @@ export class SessionTitles {
    *  not possible do we fall back to `summary`, which for an SDK-driven session
    *  is just the raw first prompt. */
   async onTurnEnd(session: Session): Promise<void> {
+    if (this.explicit.settledByClient) {
+      // No title is generated over the one the client set, but a custom title
+      // stored since by someone else (a `/rename`) is adopted, as before.
+      const renames = this.explicit.renames;
+      const info = await this.readSessionInfo(session);
+      // No client change ran during the read, so the stored title is current;
+      // an unchanged one is not published again.
+      const stored = info?.customTitle;
+      if (stored && this.explicit.settledByClient && this.explicit.renames === renames) {
+        await this.publish(stored, info.lastModified);
+      }
+      return;
+    }
+    // While a client title change is in flight, the session info read below
+    // could still hold the previous title.
+    if (this.explicit.active) return;
     const info = await this.readSessionInfo(session);
+    if (this.explicit.active) return;
 
     if (info?.customTitle) {
       this.settled = true;
@@ -147,9 +203,13 @@ export class SessionTitles {
     if (this.canRequest(session)) {
       this.settled = true;
 
-      void this.requestGenerateTitle(session, fallback).catch((error) => {
-        this.agent.logger.error(`Session ${this.sessionId}: session title update failed: ${error}`);
-      });
+      this.explicit.track(
+        this.requestGenerateTitle(session, fallback).catch((error) => {
+          this.agent.logger.error(
+            `Session ${this.sessionId}: session title update failed: ${error}`,
+          );
+        }),
+      );
 
       return;
     }
@@ -159,6 +219,54 @@ export class SessionTitles {
     if (fallback && !this.settled) {
       await this.publish(fallback.title, fallback.lastModified);
     }
+  }
+
+  /** Applies a title that the client chose (a rename, an archive or an
+   *  unarchive). Settles the title for good, waits for a generation in flight
+   *  so that its persisted title cannot land after this one, persists the
+   *  title with `persist`, which returns what it stored, if anything, and
+   *  publishes `title` unless it is undefined. A change that stored and
+   *  publishes nothing leaves the title state as it was. */
+  async setExplicitTitle(
+    publish: string | ((stored: string | undefined) => string) | undefined,
+    persist: () => Promise<string | undefined | void>,
+  ): Promise<void> {
+    // The state before the first of overlapping changes, which a change that
+    // fails or names nothing puts back.
+    if (this.explicitChanges++ === 0) {
+      this.beforeExplicit = { settled: this.settled, context: this.context };
+    }
+    const previous = this.beforeExplicit!;
+    this.settled = true;
+    this.context = undefined;
+    let stored: string | undefined;
+    try {
+      await this.explicit.apply(
+        async () => {
+          stored = (await persist()) ?? undefined;
+          if (stored !== undefined) this.persistedTitle = stored;
+          return stored !== undefined || publish !== undefined;
+        },
+        () => {
+          this.settled = previous.settled;
+          this.context ??= previous.context;
+        },
+      );
+    } finally {
+      if (--this.explicitChanges === 0) this.beforeExplicit = undefined;
+    }
+    const title = typeof publish === "function" ? publish(stored) : publish;
+    if (title === undefined) return;
+    this.lastTitle = title;
+    await this.agent.client.sessionUpdate({
+      sessionId: this.sessionId,
+      update: { sessionUpdate: "session_info_update", title },
+    });
+  }
+
+  /** Records a title the CLI took, as soon as it took it. */
+  rememberStoredTitle(title: string): void {
+    this.persistedTitle = title;
   }
 
   /** Read the SDK's stored info for this session. A missing session file or read
@@ -174,7 +282,7 @@ export class SessionTitles {
 
   /** Notify the client of a title, unless it is the one we last sent. */
   private async publish(rawTitle: string, lastModified: number): Promise<void> {
-    const title = sanitizeTitle(rawTitle);
+    const title = sanitizeTitle(this.agent.clientTitle?.(rawTitle) ?? rawTitle);
     if (title === this.lastTitle) {
       return;
     }
@@ -226,8 +334,8 @@ export class SessionTitles {
     }
 
     // A session torn down or replaced while the title was in flight must not
-    // adopt it.
-    if (this.agent.sessions[this.sessionId] !== session) {
+    // adopt it, and a title the client set meanwhile wins.
+    if (this.agent.sessions[this.sessionId] !== session || this.explicit.active) {
       return;
     }
 
