@@ -4248,6 +4248,42 @@ describe("the pages of one list", () => {
     );
   });
 
+  it("reads every copy of a session that a later page reaches", async () => {
+    const sessions = await project(30);
+    // A session with a copy among the second page and an older one in
+    // another project, which gets a new prompt after the first page.
+    const id = randomUUID();
+    await writeTranscript({ sessionId: id, lastMessageAt: base - 14.5 * 60_000 });
+    const older = await writeTranscript({
+      sessionId: id,
+      cwd: path.join(workspace, "other"),
+      lastMessageAt: base - 90 * 60_000,
+    });
+    const past = (Date.now() - 60_000) / 1000;
+    await fs.utimes(projectDir(), past, past);
+    await fs.utimes(path.dirname(older.file), past, past);
+    await fs.utimes(path.dirname(projectDir()), past, past);
+    const { agent } = await indexAgent();
+    const enumerate = enumerations(agent);
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await agent.listSessions({ cursor, _meta: listMeta({ limit: 10 }) });
+      pages.push(page.sessions.map((s) => s.sessionId));
+      cursor = page.nextCursor ?? undefined;
+      if (pages.length === 1) {
+        await fs.appendFile(older.file, promptRecord(id, "Resumed") + "\n");
+      }
+    } while (cursor);
+    expect(enumerate).toHaveBeenCalledTimes(1);
+    // Its newest copy now comes before the first page's cursor.
+    expect(pages.flat()).toEqual(sessions.map((session) => session.id));
+    const fresh = await agent.listSessions({ _meta: listMeta({ limit: 1 }) });
+    expect(fresh.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+      [id, path.join(workspace, "other")],
+    ]);
+  });
+
   it("enumerates again once a transcript is added or removed", async () => {
     const sessions = await project(30);
     const { agent } = await indexAgent();
@@ -4266,5 +4302,45 @@ describe("the pages of one list", () => {
     expect(listed.indexOf(added!.id)).toBe(listed.indexOf(sessions[25]!.id) + 1);
     expect(listed).not.toContain(sessions[29]!.id);
     expect(listed).toHaveLength(30);
+  });
+});
+
+describe("titles by the SDK's rule", () => {
+  it("finds a custom title whose record starts before the tail window", async () => {
+    const id = randomUUID();
+    // Past the head window.
+    let filler = assistantRecord(id, null);
+    while (filler.length < 70_000) filler += "\n" + assistantRecord(id, null);
+    // The cut line of the last 64 KB, which the SDK still searches.
+    const title = JSON.stringify({
+      type: "custom-title",
+      padding: "p".repeat(10_000),
+      customTitle: "Across the boundary",
+      sessionId: id,
+    });
+    // About 60 KB after it: the window starts within its padding.
+    let tail = assistantRecord(id, null);
+    while (tail.length < 60_000) tail += "\n" + assistantRecord(id, null);
+    const session = await writeTranscript({
+      sessionId: id,
+      prompt: "First prompt",
+      trailer: [],
+    });
+    await fs.appendFile(session.file, `${filler}\n${title}\n${tail}\n`);
+    const { size } = await fs.stat(session.file);
+    const window = size - 64 * 1024;
+    const start = (await fs.readFile(session.file, "utf8")).indexOf(title);
+    expect(start).toBeLessThan(window);
+    expect(start + title.indexOf('"customTitle"')).toBeGreaterThan(window);
+    expect(start).toBeGreaterThan(64 * 1024);
+    const sdk = await vi
+      .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+        "@anthropic-ai/claude-agent-sdk",
+      )
+      .then((module) => module.getSessionInfo(id, { dir: workspace }));
+    expect(sdk!.summary).toBe("Across the boundary");
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.title)).toEqual(["Across the boundary"]);
   });
 });

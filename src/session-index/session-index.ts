@@ -163,6 +163,19 @@ function pageKey(query: ListQuery, cursor: ListCursor): string {
   ]);
 }
 
+/** The candidates of each session. */
+function copiesBySession(
+  candidates: readonly TranscriptCandidate[],
+): Map<string, TranscriptCandidate[]> {
+  const copies = new Map<string, TranscriptCandidate[]>();
+  for (const candidate of candidates) {
+    const known = copies.get(candidate.sessionId);
+    if (known) known.push(candidate);
+    else copies.set(candidate.sessionId, [candidate]);
+  }
+  return copies;
+}
+
 /** `candidates` as they are on disk now; one that is gone or empty is left
  *  out. */
 async function restat(candidates: readonly TranscriptCandidate[]): Promise<TranscriptCandidate[]> {
@@ -718,10 +731,11 @@ export class SessionIndex {
    * rows are certain to come first (a candidate's order key is at most its
    * mtime, so `candidates` must be in mtime order then).
    *
-   * With `restat`, each candidate is stat'ed again just before it is read:
-   * `candidates` are an earlier enumeration. Their mtimes still bound the
-   * order keys: a transcript that changed since either kept its order key
-   * (no new prompt) or got one newer than any listed before.
+   * With `restat`, `candidates` are an earlier enumeration: each is stat'ed
+   * again just before it is read, together with the other copies of its
+   * session, any of which may be its newest one now. Their mtimes still
+   * bound the order keys: a transcript that changed since either kept its
+   * order key (no new prompt) or got one newer than any listed before.
    */
   private async collectRows(
     candidates: readonly TranscriptCandidate[],
@@ -769,6 +783,8 @@ export class SessionIndex {
       pending = left;
     };
     const read = new Set<string>();
+    /** With `restat`: the copies of each session. */
+    const copies = options.restat ? copiesBySession(candidates) : undefined;
     let index = 0;
     while (index < candidates.length) {
       if (bySession.size >= wanted) {
@@ -780,7 +796,13 @@ export class SessionIndex {
       }
       const next = candidates.slice(index, index + READ_BATCH_SIZE);
       index += next.length;
-      const batch = options.restat ? await restat(next) : next;
+      const batch = copies
+        ? await restat(
+            [...new Set(next.flatMap(({ sessionId }) => copies.get(sessionId)!))].filter(
+              ({ filePath }) => !read.has(filePath),
+            ),
+          )
+        : next;
       const resolved = await Promise.all(
         batch.map(async (candidate) => {
           read.add(candidate.filePath);
@@ -997,7 +1019,7 @@ export class SessionIndex {
    */
   private async titlesOf(candidate: TranscriptCandidate, headTail: HeadTail): Promise<SdkTitles> {
     const sidecar =
-      tailCustomTitle(headTail.tail) === undefined
+      tailCustomTitle(headTail) === undefined
         ? await readSidecarTitle(candidate.filePath, candidate.sessionId)
         : undefined;
     return sdkTitles(headTail, sidecar);

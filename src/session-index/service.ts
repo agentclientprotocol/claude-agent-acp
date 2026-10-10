@@ -291,7 +291,7 @@ async function copyTitle(filePath: string, sessionId: string): Promise<string | 
   const { size } = await fs.stat(filePath);
   const headTail = await readHeadTail(filePath, size);
   const sidecar =
-    tailCustomTitle(headTail.tail) === undefined
+    tailCustomTitle(headTail) === undefined
       ? await readSidecarTitle(filePath, sessionId)
       : undefined;
   const { title, archived } = effectiveTitle(

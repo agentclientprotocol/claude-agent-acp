@@ -56,7 +56,15 @@ export type TranscriptFacts = {
   hasMessages: boolean;
 };
 
-export type HeadTail = { head: string; tail: string };
+export type HeadTail = {
+  head: string;
+  /** The last 64 KB from their first whole line on; the whole file when it
+   *  fits in the head. */
+  tail: string;
+  /** The last 64 KB as the SDK searches them, with the cut line before
+   *  `tail`; absent when that is `tail`. */
+  sdkTail?: string;
+};
 
 /** Facts that an earlier scan may have found before the tail window. */
 const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt"] as const;
@@ -69,14 +77,18 @@ export type PreviousScan = { size: number } & Pick<
 
 /** The last `window` bytes of a file of `size` bytes, without the first,
  *  cut line. The whole file when it fits. */
-async function readTail(handle: fs.FileHandle, size: number, window: number): Promise<string> {
+async function readTail(
+  handle: fs.FileHandle,
+  size: number,
+  window: number,
+): Promise<{ raw: string; tail: string }> {
   const length = Math.min(window, size);
   const buffer = Buffer.allocUnsafe(length);
   const { bytesRead } = await handle.read(buffer, 0, length, size - length);
   const raw = buffer.toString("utf8", 0, bytesRead);
-  if (length === size) return raw;
+  if (length === size) return { raw, tail: raw };
   const newline = raw.indexOf("\n");
-  return newline >= 0 ? raw.slice(newline + 1) : "";
+  return { raw, tail: newline >= 0 ? raw.slice(newline + 1) : "" };
 }
 
 /** The first and the last 64 KB of the first `size` bytes of `filePath`:
@@ -98,7 +110,8 @@ export async function readHeadTailOf(handle: fs.FileHandle, size: number): Promi
   const first = await handle.read(buffer, 0, Math.min(CHUNK_SIZE, size), 0);
   const head = buffer.toString("utf8", 0, first.bytesRead);
   if (size <= CHUNK_SIZE) return { head, tail: head };
-  return { head, tail: await readTail(handle, size, CHUNK_SIZE) };
+  const { raw, tail } = await readTail(handle, size, CHUNK_SIZE);
+  return raw === tail ? { head, tail } : { head, tail, sdkTail: raw };
 }
 
 /**
@@ -464,8 +477,8 @@ export function isSidechainTranscript(head: string): boolean {
 }
 
 /** The last `customTitle` of the tail, as the SDK reads it. */
-export function tailCustomTitle(tail: string): string | undefined {
-  return lastField(tail, "customTitle");
+export function tailCustomTitle({ tail, sdkTail }: HeadTail): string | undefined {
+  return lastField(sdkTail ?? tail, "customTitle");
 }
 
 /** The last non-blank top-level `agentName` of the records of `text`, the
@@ -504,7 +517,11 @@ export type SdkTitles = {
  * file, without its lookup of the file. The sidecar title counts only when
  * the tail has no custom title.
  */
-export function sdkTitles({ head, tail }: HeadTail, sidecarTitle?: string): SdkTitles {
+export function sdkTitles(
+  { head, tail: wholeLines, sdkTail }: HeadTail,
+  sidecarTitle?: string,
+): SdkTitles {
+  const tail = sdkTail ?? wholeLines;
   const customTitle =
     lastField(tail, "customTitle") ??
     sidecarTitle ??
