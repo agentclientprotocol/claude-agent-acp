@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import { appendTitleContext } from "../session-titles.js";
+import { appendTitleContext, sanitizeTitle } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import { getSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
@@ -15,6 +15,36 @@ import {
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
   return { ...actual, getSessionInfo: vi.fn() };
+});
+
+describe("sanitizeTitle", () => {
+  /** The sanitizer before it learned to read only the start of a long text. */
+  function fullScanTitle(text: string): string {
+    const sanitized = text
+      .replace(/[\r\n]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    return sanitized.length <= 256 ? sanitized : sanitized.slice(0, 255) + "…";
+  }
+
+  it("gives a long text the same title as a scan of the whole text", () => {
+    const texts = [
+      "lorem ipsum dolor sit amet\n".repeat(400_000),
+      " \n\t".repeat(3000) + "word ".repeat(2000),
+      // The cut of the scanned prefix falls inside a run of whitespace.
+      "x".repeat(300) + " ".repeat(5000) + "tail",
+      // Mostly whitespace: the prefix collapses below a title's length.
+      "a ".repeat(100) + " ".repeat(10_000) + "b".repeat(300),
+      " ".repeat(10_000) + "short",
+      "\u00a0\ufeff".repeat(2100) + "😀".repeat(2000),
+      "y".repeat(4095) + "😀".repeat(10),
+      "z".repeat(257) + " ".repeat(4096),
+      "z".repeat(256) + " ".repeat(4096),
+    ];
+    for (const text of texts) {
+      expect(sanitizeTitle(text)).toBe(fullScanTitle(text));
+    }
+  });
 });
 
 describe("SDK title generation contract", () => {

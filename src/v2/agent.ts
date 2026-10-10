@@ -25,6 +25,7 @@ import {
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
+  v2AvailableCommands,
   v2ConfigOptions,
   v2NewSessionResponse,
   v2ResumeSessionResponse,
@@ -66,17 +67,24 @@ export function v2AgentApp(
     .onRequest(v2.methods.agent.providers.disable, ({ params }) =>
       agent.unstable_disableProvider(params),
     )
-    .onRequest(v2.methods.agent.session.new, async ({ params }) =>
-      v2NewSessionResponse(await agent.newSession(v1NewSessionRequest(params))),
-    )
+    .onRequest(v2.methods.agent.session.new, async ({ params }) => {
+      const response = await agent.newSession(v1NewSessionRequest(params));
+      return {
+        ...v2NewSessionResponse(response),
+        ...(await setupCommands(agent, response.sessionId, logger)),
+      };
+    })
     .onRequest(v2.methods.agent.session.list, ({ params }) => agent.listSessions(params))
     .onRequest(v2.methods.agent.session.resume, async ({ params }) => {
       const restore = v1RestoreSessionRequest(params);
-      return v2ResumeSessionResponse(
+      const response =
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
-          : await client.replaying(params.sessionId, () => agent.loadSession(restore.request)),
-      );
+          : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
+      return {
+        ...v2ResumeSessionResponse(response),
+        ...(await setupCommands(agent, params.sessionId, logger)),
+      };
     })
     .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
       const requests = v1ForkSessionRequests(params);
@@ -84,6 +92,7 @@ export function v2AgentApp(
       return {
         sessionId,
         ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
+        ...(await setupCommands(agent, sessionId, logger)),
       };
     })
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
@@ -104,6 +113,28 @@ export function v2AgentApp(
       }),
     )
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+}
+
+/**
+ * The `availableCommands` of a setup response, so a client can show the
+ * session's commands without waiting for an update. The agent sends a v1
+ * client the same list as an `available_commands_update` after the response,
+ * and a v2 client none (`ClaudeAcpAgent.afterSetupResponse`). Later changes
+ * still arrive as updates. An empty list is left out, as the draft asks. The
+ * commands are optional, so a failure to read them does not fail the setup.
+ */
+async function setupCommands(
+  agent: ClaudeAcpAgent,
+  sessionId: string,
+  logger: Logger | undefined,
+): Promise<{ availableCommands?: v2.AvailableCommand[] }> {
+  try {
+    const commands = await agent.availableCommands(sessionId);
+    return commands.length > 0 ? { availableCommands: v2AvailableCommands(commands) } : {};
+  } catch (error) {
+    (logger ?? console).error(`Session ${sessionId}: failed to read the session's commands`, error);
+    return {};
+  }
 }
 
 /**

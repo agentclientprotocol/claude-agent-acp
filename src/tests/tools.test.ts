@@ -3788,6 +3788,63 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("reports an aborted run as cancelled to a v2 client, and as failed to every other client", () => {
+    const status = (kind: string, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [deniedResult] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolResultMeta: [{ id: "toolu_bash", non_execution_kind: kind }],
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status("interrupted", v2)).toMatchObject({
+      status: "cancelled",
+      _meta: { claudeCode: { nonExecutionKind: "interrupted" } },
+    });
+    expect(status("cancelled", v2)).toMatchObject({ status: "cancelled" });
+    // A refused tool did not run because of a decision: it failed.
+    for (const kind of ["user-rejected", "permission-rule", "automode-blocked"]) {
+      expect(status(kind, v2)).toMatchObject({ status: "failed" });
+    }
+    // v1 has no cancelled status.
+    expect(status("interrupted")).toMatchObject({ status: "failed" });
+    expect(status("interrupted", ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
+    // TodoWrite renders as a plan, so only the permission flow emits its tool call.
+    const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_result", tool_use_id: "toolu_todo", content: "stopped", is_error: true },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_todo: todoWrite },
+      mockClient,
+      mockLogger,
+      {
+        toolResultMeta: [{ id: "toolu_todo", non_execution_kind: "interrupted" }],
+        emittedToolCalls: new Set(["toolu_todo"]),
+        toolCallCapabilities: ToolCallCapabilities.from({}, { v2: true }),
+      },
+    );
+
+    expect(notifications[0]?.update).toMatchObject({
+      toolCallId: "toolu_todo",
+      status: "cancelled",
+    });
+  });
+
   it("attributes entries by tool_use_id, so only the flagged result in a batch is stamped", () => {
     const toolUseCache: ToolUseCache = {
       toolu_bash: bashToolUse,

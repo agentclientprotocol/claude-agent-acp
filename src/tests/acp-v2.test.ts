@@ -299,6 +299,20 @@ describe("ACP protocol routing", () => {
   });
 });
 
+/** The commands of every session of the mocked SDK, in v2 form. */
+const SESSION_COMMANDS: v2.AvailableCommand[] = [
+  {
+    name: "review",
+    description: "Review a change",
+    input: { type: "text", hint: "<pull request>" },
+  },
+  {
+    name: "mcp",
+    description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
+    input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
+  },
+];
+
 describe("ACP v2 sessions", () => {
   it("creates a session with v2 MCP servers, config options, and commands", async () => {
     const client = v2Client();
@@ -311,8 +325,9 @@ describe("ACP v2 sessions", () => {
           { type: "http", name: "linear", url: "https://mcp.linear.app/mcp" },
         ],
       });
-      await vi.waitFor(() => expect(client.updates("available_commands_update")).toHaveLength(1));
       await client.authUpdate(1);
+      // The agent's post-setup work runs on a timer.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       return response;
     });
 
@@ -327,19 +342,32 @@ describe("ACP v2 sessions", () => {
       expect(option).not.toHaveProperty("id");
     }
     expect(response.configOptions?.[0]).toMatchObject({ category: "mode", type: "select" });
-    expect(client.updates("available_commands_update")[0].availableCommands).toEqual([
-      {
-        name: "review",
-        description: "Review a change",
-        input: { type: "text", hint: "<pull request>" },
-      },
-      {
-        name: "mcp",
-        description:
-          "Show the MCP servers and their status, or reconnect, enable, or disable a server",
-        input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
-      },
-    ]);
+    // The commands come in the response, so no update repeats them.
+    expect(response.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
+  });
+
+  it("lists the commands in every setup response: resume, resume with replay, and fork", async () => {
+    const client = v2Client();
+    const responses = await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      const resumed = await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      const replayed = await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      const forked = await agent.request(v2.methods.agent.session.fork, { sessionId, cwd });
+      await client.authUpdate(1);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { resumed, replayed, forked };
+    });
+
+    expect(responses.resumed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.replayed.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(responses.forked.availableCommands).toEqual(SESSION_COMMANDS);
+    expect(client.updates("available_commands_update")).toEqual([]);
   });
 
   it("rejects an MCP transport that v1 cannot express", async () => {
@@ -1083,7 +1111,63 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
-  it("reports a turn that fails after it was taken in as idle with _error, and shows it", async () => {
+  it("reports a tool call whose run was interrupted as cancelled", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bash",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_bash",
+              content: "[Request interrupted by user for tool use]",
+              is_error: true,
+            },
+          ],
+        },
+        tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const statuses = client
+      .updates("tool_call_update")
+      .filter((update) => update.toolCallId === "toolu_bash" && update.status)
+      .map((update) => update.status);
+    expect(statuses.at(-1)).toBe("cancelled");
+  });
+
+  it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });
     });
@@ -1092,21 +1176,20 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    expect(turnTrace(client.sessionUpdates)).toEqual([
-      "user_message",
-      "running",
-      "notice",
-      "idle _error",
-    ]);
-    expect(client.updates("notice")).toEqual([
-      { sessionUpdate: "notice", severity: "error", title: "API Error: 529 Overloaded" },
-    ]);
-    expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: -32603 } } },
+    // The stop reason carries the failure, so no notice repeats it. The error
+    // is the one v1 rejects the prompt with.
+    expect(turnTrace(client.sessionUpdates)).toEqual(["user_message", "running", "idle error"]);
+    expect(client.updates("notice")).toEqual([]);
+    const v1Error = v1.RequestError.internalError(undefined, "API Error: 529 Overloaded");
+    expect(client.updates("state_update").at(-1)).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: expect.objectContaining({ code: v1Error.code, message: v1Error.message }),
     });
   });
 
@@ -1119,14 +1202,18 @@ describe("ACP v2 prompts", () => {
       await initializeV2(agent);
       const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
       await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
-      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle _error"));
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle error"));
       await client.authUpdate(1);
     });
 
-    // The client owns the login UI, so the notice does not say to run /login.
-    expect(client.updates("notice")[0]).toMatchObject({ title: "Authentication required" });
+    // The code starts the client's sign-in, which owns the login UI, so the
+    // message does not say to run /login.
     expect(client.updates("state_update").at(-1)).toMatchObject({
-      _meta: { claudeCode: { error: { code: v1.RequestError.authRequired().code } } },
+      stopReason: "error",
+      error: {
+        code: v1.RequestError.authRequired().code,
+        message: "Authentication required",
+      },
     });
   });
 

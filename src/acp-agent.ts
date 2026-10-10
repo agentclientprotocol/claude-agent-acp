@@ -18,6 +18,7 @@ import {
   InitializeResponse,
   ListProvidersRequest,
   ListProvidersResponse,
+  McpServer,
   LlmProtocol,
   ListSessionsRequest,
   ListSessionsResponse,
@@ -60,7 +61,6 @@ import {
   AccountInfo,
   AgentInfo,
   CanUseTool,
-  deleteSession,
   FastModeDisabledReason,
   FastModeState,
   getSessionMessages,
@@ -120,6 +120,8 @@ import {
 } from "./native-subagents.js";
 import {
   AIR_ASYNC_TASKS_CAPABILITY,
+  AIR_CUSTOM_INSTRUCTIONS_CAPABILITY,
+  airCustomInstructions,
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
@@ -129,6 +131,12 @@ import {
   clientSupportsAirCapability,
   withAirMeta,
 } from "./air-extension.js";
+import * as sessionIndex from "./session-index/connection.js";
+import type { RenameSessionRequest, SessionIdRequest } from "./session-index/service.js";
+import type {
+  ListSubscribeRequest,
+  ListUnsubscribeRequest,
+} from "./session-index/list-subscriptions.js";
 import {
   AsyncTaskRuntime,
   backgroundBashTaskFromToolResult,
@@ -258,9 +266,14 @@ import { backgroundedBashToolCall } from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
-import { AcpToolCallRenderer, type ToolUpdateMeta } from "./tool-calls/renderer.js";
+import {
+  AcpToolCallRenderer,
+  isFinalToolCallStatus,
+  type ToolUpdateMeta,
+} from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
 import {
+  messageLoopYielder,
   nodeToWebReadable,
   nodeToWebWritable,
   Pushable,
@@ -399,6 +412,31 @@ function settleLiveBackgroundTask(session: Session, taskId: string): void {
     const oldest = resumable.keys().next().value;
     if (oldest !== undefined) resumable.delete(oldest);
   }
+}
+
+/** The number of tasks whose latest run a session remembers (see
+ *  `taskRunIds`). */
+const MAX_TASK_RUN_IDS = 1024;
+
+/** Records `runId` as the latest run of `taskId`, and returns true when it
+ *  names a run that opened before the latest one seen. Such a frame is late:
+ *  a resumed task keeps its `task_id` and gets a new `run_id` (SDK 0.3.292+),
+ *  and a queued `task_notification` of the finished run can arrive after the
+ *  resume. Applied, it would close the new run. Run ids of one task sort in
+ *  run order by plain string comparison. Frames without one (older CLIs)
+ *  are never late. */
+function isLateTaskRun(session: Session, taskId: string, runId: string | undefined): boolean {
+  if (runId === undefined) return false;
+  const runs = (session.taskRunIds ??= new Map());
+  const latest = runs.get(taskId);
+  if (latest !== undefined && runId < latest) return true;
+  runs.delete(taskId);
+  runs.set(taskId, runId);
+  if (runs.size > MAX_TASK_RUN_IDS) {
+    const oldest = runs.keys().next().value;
+    if (oldest !== undefined) runs.delete(oldest);
+  }
+  return false;
 }
 
 /** The structured replacement for the text of a local command that Claude
@@ -703,7 +741,8 @@ type Turn = {
    *  example through SendMessage) counts as a spawn of this turn.
    *  A turn only waits on its OWN spawned subagents: a long-running agent
    *  from an earlier turn must not stall every later prompt's settlement.
-   *  Known residual: task_started carries no lineage, so a spawn made by a
+   *  Known residual: task_started names no turn (its `parent_task_id`
+   *  names only a launching subagent), so a spawn made by a
    *  PREVIOUS turn's followup chain while a later turn happens to be held
    *  is attributed to the holder — extending that hold behind a foreign
    *  chain. Bounded: the hold still ends at drain, hand-off, or cancel. */
@@ -797,8 +836,7 @@ type Turn = {
    *  clear-context restart keeps the `_meta.quota` rows it earned pre-restart. */
   carriedModelUsage?: ModelTokenTally;
   resolve: (outcome: TurnOutcome) => void;
-  /** `title` describes the failure for the user (see `TurnEvents.failed`). */
-  reject: (error: unknown, title?: string) => void;
+  reject: (error: unknown) => void;
   /** Settles once the turn has ended or failed. */
   completion?: Promise<void>;
 };
@@ -1145,6 +1183,10 @@ export type Session = {
    *  and its permission requests keep their attribution. Bounded by
    *  `MAX_RESUMABLE_SUBAGENTS`, oldest first. */
   resumableSubagents?: Map<string, { parentToolUseId?: string }>;
+  /** The latest `run_id` seen on each task's events, so a late frame of an
+   *  earlier run is dropped (see `isLateTaskRun`). Run ids are per CLI
+   *  process, as is a session. Bounded by `MAX_TASK_RUN_IDS`, oldest first. */
+  taskRunIds?: Map<string, string>;
   /** Native ACP subagent sessions negotiated through PR #1992. Records are
    *  retained for the parent session lifetime so late child output cannot be
    *  rebound to another task after the SDK prunes its live-task registry. */
@@ -1153,8 +1195,9 @@ export type Session = {
    *  the corresponding native ACP child session. */
   nativeSubagentTaskIdByToolUseId?: Map<string, string>;
   /** Captures the ACP session in which an Agent/Task tool call was made. This
-   *  supplies the immediate parent for nested `task_started` notifications,
-   *  whose SDK payload has no lineage field of its own. */
+   *  supplies the immediate parent for nested `task_started` notifications.
+   *  Their `parent_task_id` (SDK 0.3.292+) names the launching subagent too,
+   *  but is not read yet. */
   nativeSubagentParentByToolUseId?: Map<string, string>;
   /** Session-owned lifecycle controller shared by the consumer, cancel, reset,
    *  and teardown paths. */
@@ -1254,7 +1297,7 @@ export type Session = {
   needsSignOutRespawn?: boolean;
   /** The in-flight recreation, so turns that arrive together share one. */
   signOutRespawn?: Promise<void>;
-};
+} & sessionIndex.SessionIndexFields;
 
 /** Result-message origin kinds that mark an AUTONOMOUS cycle — work the
  *  model did on its own (a task-notification followup, a peer/coordinator/
@@ -1273,7 +1316,11 @@ export type Session = {
  *  (the result is skipped, its trailing idle absorbed as owed, so the
  *  #825 detector can't fire); misrouting an autonomous result into the
  *  user lane is the bounded misattribution class this set exists to
- *  reduce. */
+ *  reduce.
+ *
+ *  Exception: a result from one of these origins that names a pending prompt
+ *  in `user_message_uuids` consumed that folded prompt and takes the user
+ *  lane (see the result handler). */
 const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set([
   "task-notification",
   "peer",
@@ -2502,6 +2549,13 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
+  /** The session index (docs/air-extensions.md, "Session index"). */
+  private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
+    agent: this,
+    isAirClient: () => this.toolCallCapabilities.air.client,
+    interruptSession: (sessionId) => this.cancelTurns({ sessionId }, { awaitInterrupt: false }),
+    teardownSession: (sessionId) => this.teardownSession(sessionId),
+  });
 
   constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
     this.v2 = options.v2 ?? false;
@@ -2570,6 +2624,7 @@ export class ClaudeAcpAgent {
     this.toolCallCapabilities = ToolCallClientCapabilities.from(request.clientCapabilities, {
       v2: this.v2,
     });
+    this.sessionIndex.negotiate(request, { v2: this.v2 });
 
     // Learn the auth identity in the background: `initialize` never waits on
     // the CLI probe, and no snapshot rides in its response. When the probe
@@ -2747,9 +2802,11 @@ export class ClaudeAcpAgent {
                 AGENT_FILE_CHANGE_REPORT_CAPABILITY,
                 AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
                 AIR_ASYNC_TASKS_CAPABILITY,
+                AIR_CUSTOM_INSTRUCTIONS_CAPABILITY,
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
+                ...this.sessionIndex.capabilities(),
               ),
               AIR_GOAL_KEY,
               {
@@ -2778,11 +2835,7 @@ export class ClaudeAcpAgent {
       }
       return this.createSession(params, { resume });
     });
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(response.sessionId);
-      startMcpAuthentication(this, response.sessionId, params.mcpServers);
-    }, 0);
+    this.afterSetupResponse(response.sessionId, params.mcpServers);
     return response;
   }
 
@@ -2858,11 +2911,7 @@ export class ClaudeAcpAgent {
     while (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
-    // Needs to happen after we return the session
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(params.sessionId);
-      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
-    }, 0);
+    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
     return result;
   }
 
@@ -2882,11 +2931,8 @@ export class ClaudeAcpAgent {
     });
     timing.phase("replay");
 
-    // Send available commands after replay so it doesn't interleave with history
-    setTimeout(() => {
-      this.sendAvailableCommandsUpdate(params.sessionId);
-      startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
-    }, 0);
+    // After the replay, so the commands do not interleave with the history.
+    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
 
     return result;
   }
@@ -2897,6 +2943,8 @@ export class ClaudeAcpAgent {
    * reads the start and the end only of the transcripts of the page.
    */
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    const indexed = this.sessionIndex.list(params);
+    if (indexed) return indexed;
     const offset = sessionListOffset(params.cursor);
     // One more session than the page tells whether a next page exists.
     const sdkSessions = await listSessions({
@@ -2904,10 +2952,11 @@ export class ClaudeAcpAgent {
       limit: SESSION_LIST_PAGE_SIZE + 1,
       offset,
     });
-    const sessions = [];
-    for (const session of sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE)) {
+    const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
+    const visible = [];
+    for (const session of page) {
       if (!session.cwd) continue;
-      sessions.push({
+      visible.push({
         sessionId: session.sessionId,
         cwd: session.cwd,
         title: sanitizeTitle(session.summary),
@@ -2915,8 +2964,32 @@ export class ClaudeAcpAgent {
       });
     }
     return sdkSessions.length > SESSION_LIST_PAGE_SIZE
-      ? { sessions, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
-      : { sessions };
+      ? { sessions: visible, nextCursor: `offset:${offset + SESSION_LIST_PAGE_SIZE}` }
+      : { sessions: visible };
+  }
+
+  /** A stored session title as this client shows it (see
+   *  {@link sessionIndex.SessionIndexConnection.clientTitle}). */
+  clientTitle(title: string): string {
+    return this.sessionIndex.clientTitle(title);
+  }
+
+  /** `_session/list/subscribe`, `_session/list/unsubscribe`, `_session/rename`,
+   *  `_session/archive`, `_session/unarchive`. */
+  async subscribeSessionList(params: ListSubscribeRequest) {
+    return this.sessionIndex.subscribeList(params);
+  }
+  async unsubscribeSessionList(params: ListUnsubscribeRequest) {
+    return this.sessionIndex.unsubscribeList(params);
+  }
+  renameSessionTitle(params: RenameSessionRequest) {
+    return this.sessionIndex.rename(params);
+  }
+  archiveSession(params: SessionIdRequest) {
+    return this.sessionIndex.archive(params);
+  }
+  unarchiveSession(params: SessionIdRequest) {
+    return this.sessionIndex.unarchive(params);
   }
 
   /**
@@ -3277,6 +3350,7 @@ export class ClaudeAcpAgent {
     // provider routing set via `providers/set`. Neither touches the on-disk
     // credential store, so dropping these references is the whole logout for
     // those paths.
+    const hadRoutingOverride = this.resolveProviderConfig() !== null;
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
     // Any probe already running read the pre-logout world; the bump makes its
@@ -3292,8 +3366,8 @@ export class ClaudeAcpAgent {
     // For the Claude/Console login methods the credentials live in the native
     // CLI's store (keychain or config dir), which only the binary can clear.
     // `claude auth logout` is non-interactive and idempotent.
-    const cliPath = await claudeCliPath();
     try {
+      const cliPath = await claudeCliPath();
       await execFileAsync(cliPath, ["auth", "logout"]);
     } catch (error) {
       const stderr =
@@ -3304,6 +3378,16 @@ export class ClaudeAcpAgent {
         { stderr: stderr || undefined },
         `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    } finally {
+      // The cleared provider or gateway routing is baked into the env of every
+      // live query, so recreate them the way `providers/disable` does: after
+      // the active turns settle, resuming each session under its id. Done even
+      // when the CLI logout failed, because the override is already gone. A
+      // plain CLI login needs nothing here: the running CLI picks up the
+      // logout by itself.
+      if (hadRoutingOverride) {
+        await this.enqueueProviderUpdate(undefined);
+      }
     }
 
     // Re-read the store rather than assuming "none": an API key from the env
@@ -3456,8 +3540,8 @@ export class ClaudeAcpAgent {
         events.ended(outcome);
         completeTurn();
       },
-      reject: (error, title) => {
-        events.failed(error, title);
+      reject: (error) => {
+        events.failed(error);
         completeTurn();
       },
     };
@@ -4021,8 +4105,7 @@ export class ClaudeAcpAgent {
         if (
           claudeMeta?.parentToolUseId ||
           routedNotification.sessionId !== params.sessionId ||
-          update.status === "completed" ||
-          update.status === "failed"
+          isFinalToolCallStatus(update.status)
         ) {
           // A later stream frame can attribute an eager permission call to a
           // child. It must no longer count as this turn's foreground work.
@@ -4051,7 +4134,7 @@ export class ClaudeAcpAgent {
       if (
         toolCallId &&
         update.sessionUpdate === "tool_call_update" &&
-        (update.status === "completed" || update.status === "failed")
+        isFinalToolCallStatus(update.status)
       ) {
         session.eagerToolCallSessions?.delete(toolCallId);
         session.dispatchedToolCalls?.delete(toolCallId);
@@ -4430,6 +4513,44 @@ export class ClaudeAcpAgent {
     const findUnsettledTurn = (uuid: string) =>
       (session.turnQueue ?? []).find((t) => t.promptUuid === uuid && !t.settled);
 
+    /** Whether this result is the answer to a prompt that is still waiting.
+     *
+     *  Claude Code can start a turn on its own, for example when a background
+     *  task finishes. If the user sends a prompt while that turn runs, Claude
+     *  Code adds the prompt to the running turn. The turn's result is still
+     *  marked as a background result, but it lists the uuids of the prompts it
+     *  answered.
+     *
+     *  A turn held open for its background subagents already has its result,
+     *  so a result that names it does not answer it. */
+    const answersPendingPrompt = (message: {
+      user_message_uuid?: string;
+      user_message_uuids?: string[];
+    }): boolean => {
+      // Newer CLIs list every prompt the turn answered. Older ones name only
+      // the last one.
+      let answeredPromptUuids: string[] = [];
+      if (Array.isArray(message.user_message_uuids)) {
+        answeredPromptUuids = message.user_message_uuids;
+      } else if (typeof message.user_message_uuid === "string") {
+        answeredPromptUuids = [message.user_message_uuid];
+      }
+
+      for (const promptUuid of answeredPromptUuids) {
+        const turn = findUnsettledTurn(promptUuid);
+        if (turn === undefined) {
+          // Not a prompt of this session, or it was answered already.
+          continue;
+        }
+        if (isHeldOpen(turn)) {
+          // This turn already has its result and only waits for its subagents.
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
+
     /** The first queued turn still awaiting its outcome, if any — the single
      *  spelling of "a prompt is pending" shared by the head promotion and
      *  the autonomous stretch-close guard. */
@@ -4670,7 +4791,7 @@ export class ClaudeAcpAgent {
 
     /** Reject the active turn (auth required, error result, …) without tearing
      *  down the consumer: the stream continues to idle and later turns proceed. */
-    const failActive = (error: unknown, title?: string) => {
+    const failActive = (error: unknown) => {
       disarmForceCancel(session);
       const turn = session.activeTurn;
       if (!turn || turn.settled) {
@@ -4689,7 +4810,7 @@ export class ClaudeAcpAgent {
       // start the next stretch clean, or its stale delivery record would
       // suppress the next turn's issue-#453 result-text fallback.
       session.emittedAssistantText = false;
-      turn.reject(error, title);
+      turn.reject(error);
     };
 
     /** Complete a negotiated terminal failure on the prompt response itself,
@@ -4706,6 +4827,11 @@ export class ClaudeAcpAgent {
       error: unknown,
       title?: string,
     ) => {
+      if (!session.cancelled) {
+        // The turn ends with an error: its list row shows `error`.
+        session.lastTurnFailed = true;
+        this.sessionIndex.onOwnSessionChanged(params.sessionId);
+      }
       if (session.activeTurn && !session.activeTurn.settled) {
         await compaction.interrupt();
       }
@@ -4718,7 +4844,7 @@ export class ClaudeAcpAgent {
         return;
       }
       if (!supportsAirSessionFailures(this.clientCapabilities)) {
-        failActive(error, title);
+        failActive(error);
         return;
       }
       if (!session.activeTurn || session.activeTurn.settled) {
@@ -4730,7 +4856,7 @@ export class ClaudeAcpAgent {
       }
       const failure = await createSessionFailure(kind, { title });
       if (!failure) {
-        failActive(error, title);
+        failActive(error);
         return;
       }
       sessionFailures.recordActive(failure);
@@ -4782,6 +4908,14 @@ export class ClaudeAcpAgent {
 
     try {
       while (true) {
+        // A backlog of buffered SDK messages drains without a macrotask
+        // boundary (each await resolves in a microtask), which would starve
+        // timers and incoming requests, `session/cancel` among them, until
+        // the backlog is gone. Give the event loop a turn when this stretch
+        // has run past its budget. Messages keep their order: the next one is
+        // pulled only after the pause.
+        const pause = messageLoopYielder.maybeYield();
+        if (pause) await pause;
         pendingNext ??= session.query
           .next()
           .then((result) => ({ kind: "message" as const, result }));
@@ -5183,6 +5317,9 @@ export class ClaudeAcpAgent {
               case "session_state_changed": {
                 const previousState = session.lastSessionState;
                 session.lastSessionState = message.state;
+                sessionIndex.noteSessionState(session, previousState, message.state);
+                if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
+                this.sessionIndex.onOwnSessionChanged(params.sessionId);
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -5489,6 +5626,12 @@ export class ClaudeAcpAgent {
               case "files_persisted":
                 break;
               case "task_progress":
+                if (isLateTaskRun(session, message.task_id, message.run_id)) {
+                  this.logger.log(
+                    `Ignoring task_progress for task ${message.task_id} from earlier run ${message.run_id}`,
+                  );
+                  break;
+                }
                 await asyncTasks.taskProgress({
                   task_id: message.task_id,
                   description: message.description,
@@ -5499,6 +5642,12 @@ export class ClaudeAcpAgent {
                 });
                 break;
               case "task_started":
+                if (isLateTaskRun(session, message.task_id, message.run_id)) {
+                  this.logger.log(
+                    `Ignoring task_started for task ${message.task_id} from earlier run ${message.run_id}`,
+                  );
+                  break;
+                }
                 // For subagent tasks `task_id` is the subagent's agent id (the
                 // SDK keys its task registry by agent id) and `tool_use_id` is
                 // the Agent/Task tool_use that spawned it — recorded so the
@@ -5540,6 +5689,12 @@ export class ClaudeAcpAgent {
                 });
                 break;
               case "task_notification":
+                if (isLateTaskRun(session, message.task_id, message.run_id)) {
+                  this.logger.log(
+                    `Ignoring task_notification for task ${message.task_id} from earlier run ${message.run_id}`,
+                  );
+                  break;
+                }
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(
@@ -5563,6 +5718,12 @@ export class ClaudeAcpAgent {
                 settleLiveTask(message.task_id);
                 break;
               case "task_updated":
+                if (isLateTaskRun(session, message.task_id, message.run_id)) {
+                  this.logger.log(
+                    `Ignoring task_updated for task ${message.task_id} from earlier run ${message.run_id}`,
+                  );
+                  break;
+                }
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
@@ -5762,10 +5923,12 @@ export class ClaudeAcpAgent {
                 // turn's settlement forever. Growth of retained
                 // (endedPerLevel) subagent entries is bounded by the
                 // activation-time sweep in activateTurn, not here. It never
-                // ADDS entries (the payload carries no attribution or
-                // subagent marker), so the unspecified ordering vs. the edge
+                // ADDS entries (an entry carries no tool_use_id, so it cannot
+                // supply the parent tool call), so the ordering vs. the edge
                 // bookends is safe: a level that precedes its task_started
-                // simply no-ops here.
+                // simply no-ops here, and since SDK 0.3.292 a finishing
+                // task's level follows its settle bookends, which already
+                // removed the entry.
                 if (session.liveBackgroundTasks.size > 0) {
                   const live = new Set(message.tasks.map((t) => t.task_id));
                   for (const [taskId, record] of session.liveBackgroundTasks) {
@@ -5809,8 +5972,11 @@ export class ClaudeAcpAgent {
             // the user's prompt's. Autonomous results must never touch the
             // user-turn lifecycle (stop reason, settles, failActive,
             // slash-command output forwarding), though their cost is real.
-            const isAutonomousResult =
+            // The exception: the user's prompt was added to that turn while it
+            // ran, so its result answers the prompt (see answersPendingPrompt).
+            const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
+            const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -6021,6 +6187,8 @@ export class ClaudeAcpAgent {
                 }
               }
 
+              session.lastTotalCostUsd = message.total_cost_usd;
+              this.sessionIndex.onOwnSessionChanged(params.sessionId);
               // Send usage_update notification
               if (lastAssistantTotalUsage !== null) {
                 await sendUpdate({
@@ -6251,6 +6419,12 @@ export class ClaudeAcpAgent {
                 await settleOrDefer(turnOutcome(session, "end_turn"));
                 break;
               }
+
+              // An error result ends the turn with an error, unless it was
+              // cancelled: the session's list row shows `error` once idle.
+              session.lastTurnFailed =
+                !session.cancelled && (message.is_error || message.subtype !== "success");
+              this.sessionIndex.onOwnSessionChanged(params.sessionId);
 
               if (!message.is_error && lastAssistantModel !== null) {
                 const activeTurnId = session.activeTurn?.promptUuid;
@@ -7082,6 +7256,10 @@ export class ClaudeAcpAgent {
       // inline via failActive and never reach here. Reject every in-flight turn;
       // if the process is gone, tear the session down so the client starts fresh.
       const message = error instanceof Error ? error.message : String(error);
+      if (!session.cancelled) {
+        session.lastTurnFailed = true;
+        this.sessionIndex.onQueryFailed(params.sessionId);
+      }
       const processDied =
         error instanceof Error &&
         (message.includes("ProcessTransport") ||
@@ -7593,6 +7771,10 @@ export class ClaudeAcpAgent {
       return;
     }
     session.queryClosed = true;
+    // Its list row now shows what the registry and the transcript tell.
+    for (const [sessionId, candidate] of Object.entries(this.sessions)) {
+      if (candidate === session) this.sessionIndex.onOwnSessionChanged(sessionId);
+    }
     session.consumer = undefined;
     session.contextCompaction = undefined;
     session.settingsManager.dispose();
@@ -7641,6 +7823,7 @@ export class ClaudeAcpAgent {
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
     delete this.sessions[sessionId];
+    this.sessionIndex.onTeardown(sessionId);
     const ended = await raceTimeoutAndAbort(
       turnsEnded,
       TEARDOWN_TURN_END_TIMEOUT_MS,
@@ -7657,6 +7840,7 @@ export class ClaudeAcpAgent {
   dispose(): Promise<void> {
     if (this.disposal) return this.disposal;
     this.disposing = true;
+    this.sessionIndex.dispose();
     // Drain accepted creators and cancel current turns that a provider change
     // may be waiting on, without allowing teardown to race a replacement.
     const sessionIds = new Set([
@@ -7675,6 +7859,7 @@ export class ClaudeAcpAgent {
     return this.disposal;
   }
 
+  /** Idempotent: a session that is not loaded here is already closed. */
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     this.exitPlan.cancel(params.sessionId);
     // Same lock as getOrCreateSession: a close racing a concurrent load/resume
@@ -7682,23 +7867,18 @@ export class ClaudeAcpAgent {
     // comment).
     return this.withSessionLifecycleLock(params.sessionId, async () => {
       if (!this.sessions[params.sessionId]) {
-        throw new Error("Session not found");
+        return {};
       }
       await this.teardownSession(params.sessionId);
       return {};
     });
   }
 
+  /** Per client: see {@link sessionIndex.SessionIndexConnection.deleteSession}. */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     this.exitPlan.cancel(params.sessionId);
     return this.withSessionLifecycleLock(params.sessionId, async () => {
-      // Tear down any active in-memory state first so the on-disk file isn't
-      // recreated by an outstanding query writing to it.
-      if (this.sessions[params.sessionId]) {
-        await this.teardownSession(params.sessionId);
-      }
-      await deleteSession(params.sessionId);
-      return {};
+      return this.sessionIndex.deleteSession(params);
     });
   }
 
@@ -8027,6 +8207,10 @@ export class ClaudeAcpAgent {
     };
 
     const replayMessage = async (message: SessionMessage): Promise<void> => {
+      // A long history is sent in order, but with event-loop turns in between,
+      // so other sessions and incoming requests are not starved meanwhile.
+      const pause = messageLoopYielder.maybeYield();
+      if (pause) await pause;
       if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
@@ -8458,12 +8642,12 @@ export class ClaudeAcpAgent {
             })()
           : sessionId;
       if (agentID && !parentToolUseId) {
-        // The attribution rests on an undocumented SDK invariant
-        // (task_started.task_id === canUseTool's agentID for subagent tasks;
-        // verified against the bundled CLI). Should an SDK bump break it — or
-        // the consumer lose the race with task_started — the lookup misses and
-        // the request goes out unattributed; log it so the regression is
-        // observable rather than silent.
+        // The attribution rests on task_started.task_id === canUseTool's
+        // agentID for subagent tasks (documented since SDK 0.3.292, which
+        // defines a subagent's `agent_id` as its task id). Should the consumer
+        // lose the race with task_started, the lookup misses and the request
+        // goes out unattributed; log it so the miss is observable rather than
+        // silent.
         this.logger.log(
           `[claude-agent-acp] No parent tool_use recorded for subagent ${agentID}; ` +
             `sending the ${toolName} permission request unattributed`,
@@ -8773,22 +8957,44 @@ export class ClaudeAcpAgent {
     };
   }
 
-  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+  /**
+   * The slash commands of the session `sessionId`, as `available_commands_update`
+   * lists them. The SDK reads them from Claude Code's initialization, which
+   * session setup already awaited. Empty when the session does not exist.
+   */
+  async availableCommands(sessionId: string): Promise<AvailableCommand[]> {
     const session = this.sessions[sessionId];
-    if (!session) return;
+    if (!session) return [];
     const commands = await session.query.supportedCommands();
+    return getAvailableSlashCommands(
+      commands,
+      session.terminalSlashCommands,
+      this.toolCallCapabilities.air.client ? session.cwd : undefined,
+      (session.skillPaths ??= new Map()),
+    );
+  }
+
+  private async sendAvailableCommandsUpdate(sessionId: string): Promise<void> {
+    if (!this.sessions[sessionId]) return;
     await this.client.sessionUpdate({
       sessionId,
       update: {
         sessionUpdate: "available_commands_update",
-        availableCommands: getAvailableSlashCommands(
-          commands,
-          session.terminalSlashCommands,
-          this.toolCallCapabilities.air.client ? session.cwd : undefined,
-          (session.skillPaths ??= new Map()),
-        ),
+        availableCommands: await this.availableCommands(sessionId),
       },
     });
+  }
+
+  /**
+   * The work that follows a session setup response: the session's commands,
+   * and MCP server authentication. A v2 client gets the commands in the setup
+   * response itself (`src/v2/agent.ts`), so it gets no update with them here.
+   */
+  private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
+    setTimeout(() => {
+      if (!this.v2) this.sendAvailableCommandsUpdate(sessionId);
+      startMcpAuthentication(this, sessionId, mcpServers);
+    }, 0);
   }
 
   private async updateConfigOption(
@@ -9417,7 +9623,11 @@ export class ClaudeAcpAgent {
       }
     }
 
-    let systemPrompt: Options["systemPrompt"] = { type: "preset", preset: "claude_code" };
+    const customInstructions = airCustomInstructions(params._meta);
+    let systemPrompt: Options["systemPrompt"] =
+      customInstructions === undefined
+        ? { type: "preset", preset: "claude_code" }
+        : { type: "preset", preset: "claude_code", append: customInstructions };
     if (params._meta?.systemPrompt) {
       const customPrompt = params._meta.systemPrompt;
       if (typeof customPrompt === "string") {
@@ -9953,6 +10163,7 @@ export class ClaudeAcpAgent {
         query: q,
         input: input,
         cancelled: false,
+        resumedFromHistory: creationOpts.resume !== undefined,
         cwd: params.cwd,
         sessionFingerprint: computeSessionFingerprint(params),
         creationParams: params,
@@ -11315,10 +11526,10 @@ export function toAcpNotifications(
               update: {
                 toolCallId: chunk.tool_use_id,
                 sessionUpdate: "tool_call_update" as const,
-                status:
-                  "is_error" in chunk && chunk.is_error
-                    ? ("failed" as const)
-                    : ("completed" as const),
+                status: renderer.resultStatus(
+                  "is_error" in chunk && chunk.is_error === true,
+                  nonExecution,
+                ),
                 rawOutput: chunk.content,
               },
             });
@@ -11350,10 +11561,10 @@ export function toAcpNotifications(
               } satisfies ToolUpdateMeta,
               toolCallId: chunk.tool_use_id,
               sessionUpdate: "tool_call_update" as const,
-              status:
-                "is_error" in chunk && chunk.is_error
-                  ? ("failed" as const)
-                  : ("completed" as const),
+              status: renderer.resultStatus(
+                "is_error" in chunk && chunk.is_error === true,
+                nonExecution,
+              ),
               rawOutput: chunk.content,
             },
           });
@@ -11407,7 +11618,7 @@ export function toAcpNotifications(
           const [finalUpdate, ...rest] = renderer
             .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
               structured: toolUseResult,
-              nonExecution: nonExecution as Record<string, unknown> | undefined,
+              nonExecution,
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {
@@ -11654,7 +11865,7 @@ export function v1AgentApp(
   onAgent: (agent: ClaudeAcpAgent) => void,
 ): AgentApp {
   let agent!: ClaudeAcpAgent;
-  return acpAgent({ name: "claude-code-acp" })
+  const app = acpAgent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       agent = new ClaudeAcpAgent(new ClientConnection(connection.client), logger);
       onAgent(agent);
@@ -11693,6 +11904,7 @@ export function v1AgentApp(
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
     );
+  return sessionIndex.onSessionIndexRequests(app, () => agent);
 }
 
 /** Serves ACP v1 on stdio. */

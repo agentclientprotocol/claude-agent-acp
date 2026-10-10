@@ -5528,6 +5528,76 @@ describe("subagent permission attribution (issue #851)", () => {
     };
   }
 
+  it("releases a tool call that ends cancelled on v2, as one that ends failed", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      { v2: true },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    injectGeneratorSession(
+      agent,
+      makeGenerator([
+        {
+          type: "assistant",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          message: {
+            id: "msg-bash",
+            model: "claude-sonnet-4-5",
+            role: "assistant",
+            type: "message",
+            stop_reason: "tool_use",
+            content: [
+              { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+            ],
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        },
+        {
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: null,
+          // The user interrupted the turn while the command ran.
+          tool_result_meta: [{ id: "toolu_bash", non_execution_kind: "interrupted" }],
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bash",
+                content: "[Request interrupted by user for tool use]",
+                is_error: true,
+              },
+            ],
+          },
+        },
+        successResult(),
+      ]),
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+    expect(
+      updates
+        .map(({ update }) => update)
+        .filter(
+          (update) =>
+            update.sessionUpdate === "tool_call_update" && "status" in update && update.status,
+        )
+        .at(-1),
+    ).toMatchObject({ toolCallId: "toolu_bash", status: "cancelled" });
+    // The agent stops tracking the call once it ends, whichever way.
+    expect(agent.sessions["test-session"]?.dispatchedToolCalls?.has("toolu_bash")).toBe(false);
+  });
+
   it("records task_started's task_id → tool_use_id mapping while consuming the stream", async () => {
     const agent = new ClaudeAcpAgent(
       { sessionUpdate: vi.fn(async () => {}) } as unknown as AcpClient,
@@ -10406,6 +10476,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "customInstructions",
         "recommendedValue",
         "diffPatch",
         "planFile",
@@ -10428,6 +10499,7 @@ describe("logout", () => {
         "agentFileChangeReport",
         "nativeSubagentSessions",
         "asyncTasks",
+        "customInstructions",
         "recommendedValue",
         "diffPatch",
         "planFile",
@@ -10718,12 +10790,13 @@ describe("session/close", () => {
     expect(session.abortController.signal.aborted).toBe(true);
   });
 
-  it("should throw when closing a non-existent session", async () => {
+  it("is idempotent for a session that is not loaded here", async () => {
     const agent = createMockAgent();
 
-    await expect(agent.closeSession({ sessionId: "non-existent" })).rejects.toThrow(
-      "Session not found",
-    );
+    await expect(agent.closeSession({ sessionId: "non-existent" })).resolves.toEqual({});
+    injectSession(agent, "session-1");
+    await agent.closeSession({ sessionId: "session-1" });
+    await expect(agent.closeSession({ sessionId: "session-1" })).resolves.toEqual({});
   });
 
   it("should not affect other sessions when closing one", async () => {
@@ -17853,6 +17926,38 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await agent.sessions["test-session"]?.consumer;
     });
 
+    it("ignores a late notification of the earlier run after the resume", async () => {
+      const { agent, updates, release, start } = run(
+        [
+          { ...taskUpdated("running"), run_id: "run-2" },
+          sendMessageResult(),
+          { ...taskNotification("agent-1"), run_id: "run-1" },
+          { ...taskUpdated("completed"), run_id: "run-1" },
+        ],
+        { subagents: true },
+      );
+      const { second } = await start();
+      const session = agent.sessions["test-session"]!;
+      // Let the stream run past the late frames to the gate.
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(session.activeTurn?.deferredSettle).toBeDefined();
+      expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+      });
+      expect(session.nativeSubagentsByTaskId?.get("agent-1")?.terminalState).toBeUndefined();
+      expect(
+        updates.flatMap((n) =>
+          n.update.sessionUpdate === "subagent_state_update" ? [n.update.subagentSessionId] : [],
+        ),
+      ).toEqual(["agent-1"]);
+
+      release();
+      await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+      await session.consumer;
+    });
+
     it("ends the hold of the SendMessage turn at cancel()", async () => {
       const { agent, release, notified, start } = run([sendMessageResult()]);
       const { second } = await start();
@@ -18683,6 +18788,237 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] }),
     ).rejects.toMatchObject({ code: -32603 });
     await agent.sessions["test-session"]?.consumer;
+  });
+
+  describe("a prompt folded into an autonomous cycle", () => {
+    // A prompt sent while the CLI runs an autonomous cycle is folded into that
+    // cycle between tool rounds. The cycle's result keeps its autonomous origin
+    // but names the folded send in user_message_uuids, so it is that prompt's
+    // result — skipping it as autonomous would hang the prompt forever.
+
+    /** The CLI keeps its stream open after the cycle, so an unsettled prompt
+     *  hangs instead of being swept up by the stream ending. */
+    function liveStream() {
+      let end!: () => void;
+      const ended = new Promise<void>((resolve) => (end = resolve));
+      return { ended, end };
+    }
+
+    it("settles a prompt the CLI folded into a task-notification cycle", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield assistantText("folded answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("settles a folded prompt the CLI never echoed", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          yield running();
+          yield assistantText("autonomous work");
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          // No echo: the turn is still queued when the stamped result arrives.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("hands off a held turn and settles the prompt folded into its followup", async () => {
+      const agent = createMockAgent();
+      const stream = liveStream();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const u1 = await iter.next();
+          yield userEcho(u1.value);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage(); // first prompt held for agent-1
+          yield idle();
+          // The second prompt arrives while the first is held; the subagent's
+          // followup cycle then consumes it.
+          const u2 = await iter.next();
+          yield taskNotification("agent-1");
+          yield userEcho(u2.value);
+          yield assistantText("summary and answer");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: u2.value.uuid,
+            user_message_uuids: [u2.value.uuid],
+          });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      const first = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+      const second = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      await expect(first).resolves.toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+      const secondResponse = await second;
+      expect(secondResponse.stopReason).toBe("end_turn");
+      expect(secondResponse.usage?.inputTokens).toBe(10);
+      expect(secondResponse.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a task-notification result naming no pending prompt off the user turn", async () => {
+      const agent = createMockAgent();
+      const unrelatedUuid = randomUUID();
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          // An autonomous cycle's result names a send that is not a pending
+          // prompt, so it must not settle the user's turn or lend it tokens.
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            user_message_uuid: unrelatedUuid,
+            user_message_uuids: [unrelatedUuid],
+            usage: {
+              input_tokens: 100,
+              output_tokens: 50,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield resultMessage();
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "question" }],
+      });
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      await agent.sessions["test-session"]?.consumer;
+    });
+
+    it("keeps a held turn open when a followup result names its own prompt", async () => {
+      // A held turn already has its result, so a followup result naming its
+      // uuid is the cycle's own, not a fold into the turn: it must neither
+      // settle the hold nor lend the turn its tokens while a subagent lives.
+      const agent = createMockAgent();
+      const stream = liveStream();
+      let checkpointReached = false;
+      let resume!: () => void;
+      const resumed = new Promise<void>((resolve) => (resume = resolve));
+
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: userMessage } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(userMessage);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield subagentStarted("agent-2");
+          yield resultMessage(); // held for both subagents
+          yield idle();
+          yield taskNotification("agent-1");
+          yield assistantText("partial summary");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            num_turns: 1,
+            user_message_uuid: userMessage.uuid,
+            user_message_uuids: [userMessage.uuid],
+          });
+          yield idle();
+          checkpointReached = true;
+          await resumed;
+          yield taskNotification("agent-2");
+          yield assistantText("final summary");
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 1 });
+          yield idle();
+          await stream.ended;
+        }
+        return messageGenerator();
+      });
+
+      let resolved = false;
+      const prompt = agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "explore" }] })
+        .then((r) => {
+          resolved = true;
+          return r;
+        });
+
+      await waitFor(() => checkpointReached);
+      // Let a premature settle propagate to the prompt before checking it.
+      await new Promise((r) => setTimeout(r, 0));
+      expect(resolved).toBe(false);
+      resume();
+
+      const response = await prompt;
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.inputTokens).toBe(10);
+      expect(response.usage?.outputTokens).toBe(5);
+      stream.end();
+      await agent.sessions["test-session"]?.consumer;
+    });
   });
 });
 

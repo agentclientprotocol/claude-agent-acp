@@ -107,6 +107,8 @@ export interface ScriptContext {
   /** The session id that the agent passed to the SDK. */
   sessionId: string;
   options: QueryOptions;
+  /** The uuid of the prompt the current turn answers, as the agent sent it. */
+  promptUuid?: string;
   /** Calls `canUseTool` like Claude Code does before it runs a tool. */
   canUseTool(
     toolName: string,
@@ -215,6 +217,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       const next = await iterator.next();
       if (next.done) return;
       const user = next.value;
+      ctx.promptUuid = user.uuid;
       yield {
         type: "user",
         message: user.message,
@@ -430,8 +433,8 @@ export interface ScenarioRunV2 {
   normalized: WireRecorded[];
   /**
    * `passes` when every prompt turn ended with a stop reason other than
-   * `_error`, or else why the scenario stopped: the error of a rejected
-   * request, or the notice of a turn that failed.
+   * `error`, or else why the scenario stopped: the error of a rejected
+   * request, or of a turn that failed.
    */
   status: string;
 }
@@ -459,9 +462,10 @@ export async function runScenarioV2(
   const methodsOfClientRequests = new Map<string | number, string>();
   let recording = true;
   let sessionId: string | undefined;
-  // The stop reasons of the session's idle state updates, and its notices.
+  // The stop reasons of the session's idle state updates, and the error
+  // messages of the failed ones.
   const idles: unknown[] = [];
-  const notices: string[] = [];
+  const failures: string[] = [];
 
   const each = (message: v2.AnyWireMessage) =>
     (Array.isArray(message) ? message : [message]) as Record<string, any>[];
@@ -495,12 +499,14 @@ export async function runScenarioV2(
         sessionUpdate: string;
         state?: string;
         stopReason?: unknown;
-        title?: string;
+        error?: { message?: string } | null;
       };
       if (update.sessionUpdate === "state_update" && update.state === "idle") {
         idles.push(update.stopReason);
+        if (update.stopReason === "error") {
+          failures.push(update.error?.message ?? "the turn failed");
+        }
       }
-      if (update.sessionUpdate === "notice" && update.title) notices.push(update.title);
     })
     .onRequest(v2.methods.client.session.requestPermission, ({ params }) =>
       permissionAnswer(scenario, params.options),
@@ -556,8 +562,8 @@ export async function runScenarioV2(
             stop("the turn reported no idle state");
             return;
           }
-          if (idles[idlesBefore] === "_error") {
-            stop(notices.at(-1) ?? "the turn failed");
+          if (idles[idlesBefore] === "error") {
+            stop(failures.at(-1) ?? "the turn failed");
             return;
           }
           await settle();

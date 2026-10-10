@@ -223,6 +223,16 @@ describe("parseMcpCommand", () => {
       expect(parseMcpCommand(text)).toBeNull();
     }
   });
+
+  it("reads past any leading whitespace, as before the prefix check", () => {
+    expect(parseMcpCommand("\n\t\u00a0\ufeff /mcp enable  my\nserver ")).toEqual({
+      action: "enable",
+      all: false,
+      server: "my server",
+    });
+    expect(parseMcpCommand("\u2028/mcp")).toEqual({ action: "status" });
+    expect(parseMcpCommand(`hello ${"word ".repeat(100_000)}/mcp`)).toBeNull();
+  });
 });
 
 const LONG_ERROR =

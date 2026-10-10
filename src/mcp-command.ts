@@ -29,6 +29,10 @@ export type McpCommand =
  *  or `/mcp disable` with an optional server name or `all`. Any other `/mcp`
  *  argument gives null, and the prompt gets no replacement. */
 export function parseMcpCommand(text: string): McpCommand | null {
+  // The first word is `/mcp` only when the text starts with it after the
+  // leading whitespace. Checking that first keeps a long prompt from being
+  // split into words. `trimStart` removes the characters that `\s` matches.
+  if (!text.trimStart().startsWith("/mcp")) return null;
   const words = text.trim().split(/\s+/);
   if (words[0] !== "/mcp") return null;
   if (words.length === 1) return { action: "status" };

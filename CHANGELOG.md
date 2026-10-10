@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.89.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.88.0...v0.89.0) (2026-10-09)
+
+
+### Features
+
+* add the AIR sessionIndex extension for fast session lists ([#1268](https://github.com/agentclientprotocol/claude-agent-acp/issues/1268)) ([03d84f6](https://github.com/agentclientprotocol/claude-agent-acp/commit/03d84f6663a2f561b3c59bc30e622e085b869024))
+* **deps:** Bump @agentclientprotocol/sdk to 1.8.0 ([#1287](https://github.com/agentclientprotocol/claude-agent-acp/issues/1287)) ([446a721](https://github.com/agentclientprotocol/claude-agent-acp/commit/446a7217fa2654a9bcfaff9ddbfcdf2917cef024))
+* Support custom instructions for agent sessions via meta ([#1177](https://github.com/agentclientprotocol/claude-agent-acp/issues/1177)) ([908c994](https://github.com/agentclientprotocol/claude-agent-acp/commit/908c994901b857918c23655670468298f6bbd33b))
+
+
+### Bug Fixes
+
+* recreate live sessions on logout when it clears a provider or gateway override ([#1278](https://github.com/agentclientprotocol/claude-agent-acp/issues/1278)) ([966be7a](https://github.com/agentclientprotocol/claude-agent-acp/commit/966be7abe60435f2f1c6379a5255ea7d533a1a20))
+* report a failed turn with the error stop reason on the experimental ACP v2 surface ([#1288](https://github.com/agentclientprotocol/claude-agent-acp/issues/1288)) ([060bdb2](https://github.com/agentclientprotocol/claude-agent-acp/commit/060bdb212a9354f2dd0c88e4234a7659aeb6d27e))
+* report an interrupted tool call as cancelled on the experimental ACP v2 surface ([#1289](https://github.com/agentclientprotocol/claude-agent-acp/issues/1289)) ([55c3106](https://github.com/agentclientprotocol/claude-agent-acp/commit/55c3106c60f58909af76f75df9f6c5815dcf0021))
+
+## [0.88.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.87.0...v0.88.0) (2026-10-08)
+
+
+### Features
+
+* **deps:** update Claude SDK ([#1276](https://github.com/agentclientprotocol/claude-agent-acp/issues/1276)) ([0304f74](https://github.com/agentclientprotocol/claude-agent-acp/commit/0304f743f85e2505ad5a67c1fe7b7d24f2f9ad23))
+
+## [0.87.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.86.0...v0.87.0) (2026-10-07)
+
+
+### Features
+
+* **deps:** Bump the minor group with 2 updates ([#1260](https://github.com/agentclientprotocol/claude-agent-acp/issues/1260)) ([0724b17](https://github.com/agentclientprotocol/claude-agent-acp/commit/0724b17c581e30b1242cfbec7bce44c21df99525))
+
+
+### Bug Fixes
+
+* async task routing, Monitor tasks, structured task ids, and abandoned tool calls ([#1249](https://github.com/agentclientprotocol/claude-agent-acp/issues/1249)) ([0e83a06](https://github.com/agentclientprotocol/claude-agent-acp/commit/0e83a06c4a8825ba654bddf1ab909d1a773942e2))
+* settle prompts folded into a task-notification cycle ([#1233](https://github.com/agentclientprotocol/claude-agent-acp/issues/1233)) ([390b0b9](https://github.com/agentclientprotocol/claude-agent-acp/commit/390b0b9f8bf0cc0aa7d9273a7b614172c916d3a6))
+
 ## [0.86.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.85.1...v0.86.0) (2026-10-05)
 
 
