@@ -20,6 +20,9 @@
  * - A registry event names the record: only that record is read, and only
  *   the sessions whose record changed get their `state` recomputed.
  * - A session this connection runs reports its SDK state at once.
+ * - A session whose transcripts this connection wrote (a rename, archive,
+ *   unarchive or delete) is stat'ed and read again at once, without waiting
+ *   for its transcript event.
  *
  * Events are coalesced: 150 ms after the last one, at most 1 s after the
  * first. Each subscription compares a recomputed row with the last row it
@@ -342,6 +345,27 @@ export class ListSubscriptions {
         watch.dirtyRows.add(id);
         this.schedule(watch, "now");
       }
+    }
+  }
+
+  /**
+   * This connection wrote the transcripts of a session: a rename, archive,
+   * unarchive or delete. Its transcripts are stat'ed and its row read again
+   * at once, as a transcript event would after its quiet period; the event
+   * that follows finds the row unchanged and sends nothing more. A copy the
+   * watch does not know yet is left to its event.
+   */
+  sessionWritten(id: string): void {
+    for (const watch of this.watches.values()) {
+      if (!watch.ready) {
+        // Read when the watch is ready, as the events of its start.
+        watch.dirtyRows.add(id);
+        continue;
+      }
+      const files = watch.filesById.get(id);
+      if (!files) continue;
+      for (const filePath of files) watch.dirtyFiles.add(filePath);
+      this.schedule(watch, "now");
     }
   }
 

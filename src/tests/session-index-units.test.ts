@@ -837,7 +837,7 @@ describe("session id lookup", () => {
       await fs.mkdir(path.join(dir, id), { recursive: true });
       const file = path.join(dir, `${id}.jsonl`);
       await fs.writeFile(file, lines(user("hi", "2026-01-01T00:00:00.000Z")) + "\n");
-      const index = new SessionIndex(async () => undefined);
+      const index = new SessionIndex();
       expect(await index.findTranscripts(id)).toEqual([file]);
       expect(await index.scanSession(id)).toEqual({
         transcripts: [{ filePath: file, size: expect.any(Number) }],

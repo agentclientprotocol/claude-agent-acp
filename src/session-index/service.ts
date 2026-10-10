@@ -16,10 +16,7 @@ import {
   type ListSessionsRequest,
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk";
-import {
-  deleteSession as sdkDeleteSession,
-  getSessionInfo as sdkGetSessionInfo,
-} from "@anthropic-ai/claude-agent-sdk";
+import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
 import type { OwnSessionState } from "./activity.js";
@@ -34,6 +31,7 @@ import {
   ListSubscriptions,
   type ListChanges,
   type ListSubscribeResponse,
+  type ListSubscriptionDeps,
 } from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
@@ -59,7 +57,6 @@ import {
   readSidecarTitle,
   SessionIndex,
   type ArchivedFilter,
-  type GetSessionInfo,
   type ListCursor,
 } from "./session-index.js";
 import { sessionInfoOf } from "./session-info.js";
@@ -426,7 +423,6 @@ export type RetitleOptions = {
 };
 
 export type SessionIndexDeps = {
-  getSessionInfo?: GetSessionInfo;
   deleteSession?: (sessionId: string) => Promise<void>;
   registry?: LiveSessionRegistry;
   now?: () => number;
@@ -434,6 +430,11 @@ export type SessionIndexDeps = {
   ownSessionState?: (sessionId: string) => OwnSessionState | undefined;
   /** Sends `_session/list/changes`. */
   notifyListChanges?: (changes: ListChanges) => Promise<void>;
+  /** The timing of the list subscriptions, for tests. */
+  listSubscriptionTiming?: Pick<
+    ListSubscriptionDeps,
+    "debounceMs" | "maxWaitMs" | "rescanMs" | "minSessionIntervalMs"
+  >;
   logError: (message: string, error: unknown) => void;
 };
 
@@ -449,7 +450,7 @@ export class SessionIndexService {
   private readonly deleteSession: (sessionId: string) => Promise<void>;
 
   constructor(private readonly deps: SessionIndexDeps) {
-    this.index = new SessionIndex(deps.getSessionInfo ?? sdkGetSessionInfo);
+    this.index = new SessionIndex();
     this.registry = deps.registry ?? new LiveSessionRegistry();
     this.now = deps.now ?? Date.now;
     this.deleteSession = deps.deleteSession ?? ((id) => sdkDeleteSession(id));
@@ -588,6 +589,9 @@ export class SessionIndexService {
         stored = await this.titleCopies(sessionId, transcripts, change, options.sidecar);
       }
       return stored;
+    }).finally(() => {
+      // Whatever was written, also by a change that failed part way.
+      this.subscriptions?.sessionWritten(sessionId);
     });
   }
 
@@ -666,6 +670,7 @@ export class SessionIndexService {
         }
       } finally {
         this.index.invalidate(all);
+        this.subscriptions?.sessionWritten(sessionId);
       }
     });
   }
@@ -682,6 +687,7 @@ export class SessionIndexService {
       own: (sessionId) => this.deps.ownSessionState?.(sessionId),
       notify: (changes) => this.deps.notifyListChanges?.(changes) ?? Promise.resolve(),
       logError: this.deps.logError,
+      ...this.deps.listSubscriptionTiming,
     });
     return this.subscriptions.subscribe(cwd);
   }

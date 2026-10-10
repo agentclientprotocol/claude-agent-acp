@@ -500,9 +500,9 @@ export type SdkTitles = {
 /**
  * The titles the SDK gives a transcript, from its own head and tail, in the
  * SDK's order: custom title (tail, the sidecar, head), AI title, then
- * {@link generatedTitle}. For a transcript that the SDK `getSessionInfo`
- * does not read (another copy of the session comes first in its search).
- * The sidecar title counts only when the tail has no custom title.
+ * {@link generatedTitle}: what the SDK `getSessionInfo` reports for this
+ * file, without its lookup of the file. The sidecar title counts only when
+ * the tail has no custom title.
  */
 export function sdkTitles({ head, tail }: HeadTail, sidecarTitle?: string): SdkTitles {
   const customTitle =

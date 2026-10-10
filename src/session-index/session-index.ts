@@ -1,13 +1,14 @@
 /**
  * The session list of a `sessionIndex` client.
  *
- * Each list enumerates the transcripts of the requested cwd and of every
+ * A list enumerates the transcripts of the requested cwd and of every
  * worktree of its repository: one `readdir` per project directory and one
- * `stat` per transcript, no long-lived cache. The metadata of a transcript is
- * cached by `(path, mtime, size)` in an LRU and read on a miss with the SDK
- * `getSessionInfo` (titles, sidecar) plus one head and tail read for
- * what the SDK does not report (see {@link scanTranscript}). Misses are read in
- * parallel batches.
+ * `stat` per transcript. The pages after a cursor reuse that enumeration for
+ * a short while (see {@link SessionIndex.reusableListing}). The metadata of a transcript is
+ * cached by `(path, mtime, size)` in an LRU and read on a miss from one head
+ * and tail read (the titles by the SDK's rule, see {@link sdkTitles}; the
+ * facts, see {@link scanTranscriptFile}) and the title sidecar. Misses are
+ * read in parallel batches.
  *
  * Order is the last user activity descending, then session id: the time of
  * the last real user prompt (`lastPromptAt`), else `updatedAt`. `updatedAt`
@@ -20,7 +21,6 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeTitle } from "../session-titles.js";
 import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
@@ -66,6 +66,10 @@ const READ_BATCH_SIZE = 16;
 const MAX_CWD_PROBES_PER_DIR = 64;
 /** How long a directory that gave no cwd is not probed again. */
 const NO_CWD_RETRY_MS = 60_000;
+/** How long the pages after a list reuse its enumeration. */
+const LISTING_REUSE_MS = 30_000;
+/** Enumerations kept for the next page of their list. */
+const MAX_REUSABLE_LISTINGS = 8;
 
 /** Which sessions a list holds by archive state: `unarchived` the
  *  unarchived ones only, `archived` the archived ones only, `all` both in one
@@ -135,10 +139,47 @@ export type ListQuery = {
   after?: ListCursor;
 };
 
-export type GetSessionInfo = (
-  sessionId: string,
-  options: { dir?: string },
-) => Promise<SDKSessionInfo | undefined>;
+/** The transcripts of a list scope as one enumeration found them. */
+type Listing = {
+  /** The scope paths; undefined for every project. */
+  paths: string[] | undefined;
+  /** The directories read: the projects root, then each project directory. */
+  dirs: string[];
+  /** The names each of `dirs` had, as {@link DirListings} returned them. */
+  names: string[][];
+  /** Newest mtime first. */
+  candidates: TranscriptCandidate[];
+  /** When it was enumerated. */
+  at: number;
+};
+
+/** The key of the page of `query` that follows `cursor`. */
+function pageKey(query: ListQuery, cursor: ListCursor): string {
+  return JSON.stringify([
+    query.cwd ?? null,
+    query.includeWorktrees ?? false,
+    cursor.orderAtMs,
+    cursor.sessionId,
+  ]);
+}
+
+/** `candidates` as they are on disk now; one that is gone or empty is left
+ *  out. */
+async function restat(candidates: readonly TranscriptCandidate[]): Promise<TranscriptCandidate[]> {
+  const stats = await statFiles(candidates.map(({ filePath }) => filePath));
+  return candidates.flatMap((candidate, i) => {
+    const now = stats[i];
+    if (!now?.isFile() || now.size === 0) return [];
+    if (
+      now.mtimeMs === candidate.mtimeMs &&
+      now.size === candidate.size &&
+      now.ino === candidate.ino
+    ) {
+      return [candidate];
+    }
+    return [{ ...candidate, mtimeMs: now.mtimeMs, size: now.size, ino: now.ino }];
+  });
+}
 
 type CacheEntry = {
   mtimeMs: number;
@@ -346,8 +387,16 @@ export class SessionIndex {
   /** Directories whose transcripts gave no cwd, by the directory mtime and
    *  when that was learned. */
   private readonly dirsWithoutCwd = new Map<string, { mtimeMs: number; at: number }>();
+  /** The enumeration of each list with a next page, by {@link pageKey}. */
+  private readonly nextPages = new Lru<string, Listing>(MAX_REUSABLE_LISTINGS);
 
-  constructor(private readonly getSessionInfo: GetSessionInfo) {}
+  /** Transcripts read so far (metadata cache misses). */
+  private reads = 0;
+
+  /** How many transcripts the index has read, for tests and diagnostics. */
+  get transcriptsRead(): number {
+    return this.reads;
+  }
 
   /** The paths whose sessions a list of `cwd` shows: `cwd`, and with
    *  `includeWorktrees` the same subdirectory of every other existing
@@ -418,14 +467,21 @@ export class SessionIndex {
    *  every copy of a session: a list shows the newest one that has a row
    *  (see {@link collectRows}), as the SDK does. */
   async enumerateFiles(paths?: readonly string[]): Promise<TranscriptCandidate[]> {
+    return (await this.enumerate(paths)).candidates;
+  }
+
+  /** {@link enumerateFiles}, with the directory listings it was made from. */
+  private async enumerate(
+    paths?: readonly string[],
+  ): Promise<{ dirs: string[]; names: string[][]; candidates: TranscriptCandidate[] }> {
     const root = projectsRoot();
+    const rootNames = await this.listings.names(root);
     const dirs: { dirName: string; projectPath?: string }[] = paths
       ? await this.projectDirs(paths)
-      : (await this.listings.names(root)).map((dirName) => ({ dirName }));
+      : rootNames.map((dirName) => ({ dirName }));
     // All directories' names first, then one bounded run of stats.
-    const listed = await this.listings.namesOfAll(
-      dirs.map(({ dirName }) => path.join(root, dirName)),
-    );
+    const dirPaths = dirs.map(({ dirName }) => path.join(root, dirName));
+    const listed = await this.listings.namesOfAll(dirPaths);
     const files = dirs.flatMap(({ dirName, projectPath }, i) =>
       listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6))).map(
         (name) => ({ name, filePath: path.join(root, dirName, name), dirName, projectPath }),
@@ -446,7 +502,7 @@ export class SessionIndex {
         ino: fileStats.ino,
       });
     });
-    return all;
+    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates: all };
   }
 
   /**
@@ -524,11 +580,10 @@ export class SessionIndex {
 
   /** One page of rows, plus whether more rows follow the page. */
   async list(query: ListQuery): Promise<{ rows: IndexRow[]; hasMore: boolean }> {
-    const paths = query.cwd
-      ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
-      : undefined;
     const after = query.after;
-    const enumerated = (await this.enumerateFiles(paths)).sort(byMtimeDescending);
+    const reused = after ? await this.reusableListing(query, after) : undefined;
+    const listing = reused ?? (await this.freshListing(query));
+    const { paths, candidates: enumerated } = listing;
     // A page after a cursor skips, without reading them, the sessions whose
     // newest transcript has a cached order key before the cursor. The
     // archive state comes from the title, so the archive filter applies once
@@ -548,9 +603,47 @@ export class SessionIndex {
       archived: query.archived,
       after,
       wanted: query.limit + 1,
-      unread: (read) => enumerated.filter((candidate) => !read.has(candidate)),
+      unread: (read) => enumerated.filter((candidate) => !read.has(candidate.filePath)),
+      restat: reused !== undefined,
     });
-    return { rows: rows.slice(0, query.limit), hasMore: rows.length > query.limit };
+    const page = rows.slice(0, query.limit);
+    const hasMore = rows.length > query.limit;
+    const last = page.at(-1);
+    if (hasMore && last) this.nextPages.set(pageKey(query, last), listing);
+    return { rows: page, hasMore };
+  }
+
+  /** Enumerates the scope of `query`, newest mtime first. */
+  private async freshListing(query: ListQuery): Promise<Listing> {
+    const at = Date.now();
+    const paths = query.cwd
+      ? await this.listedPaths(query.cwd, query.includeWorktrees ?? false)
+      : undefined;
+    const { dirs, names, candidates } = await this.enumerate(paths);
+    return { paths, dirs, names, candidates: candidates.sort(byMtimeDescending), at };
+  }
+
+  /**
+   * The enumeration of the earlier page of `query` that ended at `cursor`,
+   * while it is recent and no directory of it has changed its entries: a
+   * transcript was neither added nor removed (see {@link DirListings}, which
+   * returns the same names until then). Which transcripts the page reads is
+   * stat'ed again (see {@link collectRows}), so a page made from it is as
+   * fresh as one from a new enumeration: a transcript that grew since moves
+   * up, out of the pages after the cursor, or keeps its place. A page of
+   * thousands of transcripts then stats some hundreds, not all of them.
+   */
+  private async reusableListing(
+    query: ListQuery,
+    cursor: ListCursor,
+  ): Promise<Listing | undefined> {
+    const key = pageKey(query, cursor);
+    const listing = this.nextPages.peek(key);
+    if (!listing) return undefined;
+    this.nextPages.delete(key);
+    if (Date.now() - listing.at > LISTING_REUSE_MS) return undefined;
+    const names = await this.listings.namesOfAll(listing.dirs);
+    return names.every((current, i) => current === listing.names[i]) ? listing : undefined;
   }
 
   /**
@@ -571,7 +664,7 @@ export class SessionIndex {
       inScope: scopeOf(paths),
       archived: "all",
       wanted: Infinity,
-      unread: (read) => siblings().filter((candidate) => !read.has(candidate)),
+      unread: (read) => siblings().filter((candidate) => !read.has(candidate.filePath)),
     });
   }
 
@@ -624,6 +717,11 @@ export class SessionIndex {
    * row, as the SDK list does. With a finite `wanted`, stops once `wanted`
    * rows are certain to come first (a candidate's order key is at most its
    * mtime, so `candidates` must be in mtime order then).
+   *
+   * With `restat`, each candidate is stat'ed again just before it is read:
+   * `candidates` are an earlier enumeration. Their mtimes still bound the
+   * order keys: a transcript that changed since either kept its order key
+   * (no new prompt) or got one newer than any listed before.
    */
   private async collectRows(
     candidates: readonly TranscriptCandidate[],
@@ -633,8 +731,10 @@ export class SessionIndex {
       archived: ArchivedFilter;
       after?: ListCursor;
       wanted: number;
-      /** The transcripts not read, which may supply a sibling's cwd. */
-      unread: (read: ReadonlySet<TranscriptCandidate>) => readonly TranscriptCandidate[];
+      /** The transcripts not read (by path), which may supply a sibling's
+       *  cwd. */
+      unread: (read: ReadonlySet<string>) => readonly TranscriptCandidate[];
+      restat?: boolean;
     },
   ): Promise<IndexRow[]> {
     const { inScope, archived, after, wanted } = options;
@@ -668,7 +768,7 @@ export class SessionIndex {
       }
       pending = left;
     };
-    const read = new Set<TranscriptCandidate>();
+    const read = new Set<string>();
     let index = 0;
     while (index < candidates.length) {
       if (bySession.size >= wanted) {
@@ -678,11 +778,12 @@ export class SessionIndex {
           break;
         }
       }
-      const batch = candidates.slice(index, index + READ_BATCH_SIZE);
-      index += batch.length;
+      const next = candidates.slice(index, index + READ_BATCH_SIZE);
+      index += next.length;
+      const batch = options.restat ? await restat(next) : next;
       const resolved = await Promise.all(
         batch.map(async (candidate) => {
-          read.add(candidate);
+          read.add(candidate.filePath);
           const metadata = await this.metadataOf(candidate);
           if (!metadata || (await this.continuedElsewhere(candidate, metadata))) return undefined;
           return { candidate, metadata };
@@ -704,6 +805,7 @@ export class SessionIndex {
       await this.learnDirCwds(
         new Set(pending.map(({ candidate }) => candidate.dirName)),
         options.unread(read),
+        options.restat ?? false,
       );
       await settlePending();
     }
@@ -733,10 +835,11 @@ export class SessionIndex {
   /** Reads the unread transcripts of `dirNames` until each directory has a
    *  known cwd, at most {@link MAX_CWD_PROBES_PER_DIR} per directory. A
    *  directory that gives none is not read again for a while, unless it
-   *  changes. */
+   *  changes. `restat` as in {@link collectRows}. */
   private async learnDirCwds(
     dirNames: ReadonlySet<string>,
     unread: readonly TranscriptCandidate[],
+    restatFirst: boolean,
   ): Promise<void> {
     const root = projectsRoot();
     const now = Date.now();
@@ -761,8 +864,9 @@ export class SessionIndex {
     });
     while (remaining.length > 0) {
       remaining = remaining.filter((candidate) => !this.dirCwds.has(candidate.dirName));
-      const batch = remaining.slice(0, READ_BATCH_SIZE);
-      remaining = remaining.slice(batch.length);
+      const next = remaining.slice(0, READ_BATCH_SIZE);
+      remaining = remaining.slice(next.length);
+      const batch = restatFirst ? await restat(next) : next;
       await Promise.all(batch.map((candidate) => this.metadataOf(candidate)));
     }
     for (const [dirName, mtimeMs] of mtimes) {
@@ -839,6 +943,7 @@ export class SessionIndex {
     candidate: TranscriptCandidate,
     previous?: PreviousScan,
   ): Promise<TranscriptMetadata | null> {
+    this.reads++;
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
     const facts = await scanTranscriptFile(
@@ -857,7 +962,7 @@ export class SessionIndex {
       ...(facts.tailCwd ? pathAndAncestors(facts.tailCwd) : []),
     ]);
     if (fileCwd) this.dirCwds.set(candidate.dirName, fileCwd);
-    const sdk = await this.titlesOf(candidate, headTail, fileCwd);
+    const sdk = await this.titlesOf(candidate, headTail);
     // No title at all: the SDK does not list it either.
     if (!sdk.summary) return null;
     // Archived by its name alone: the agent name, else the custom title.
@@ -882,30 +987,15 @@ export class SessionIndex {
   }
 
   /**
-   * The titles the SDK reports for the listed transcript (`customTitle` and
-   * `summary` of `getSessionInfo`). The SDK reads the first copy of the
-   * session that its search finds; its answer is used only when that copy is
-   * the listed file (same size and mtime), else the same titles are taken
-   * from the listed file itself (see {@link sdkTitles}).
+   * The titles the SDK gives the listed transcript (`customTitle` and
+   * `summary` of its `getSessionInfo`), by the SDK's rule from the head and
+   * tail read here and the sidecar (see {@link sdkTitles}). Not through the
+   * SDK itself: its lookup of the transcript reads the whole project
+   * directory on every call, which made each page of a large project cost a
+   * listing of every transcript per row, and it may read another copy of the
+   * session than the listed one.
    */
-  private async titlesOf(
-    candidate: TranscriptCandidate,
-    headTail: HeadTail,
-    fileCwd: string | undefined,
-  ): Promise<SdkTitles> {
-    const dir = [fileCwd, candidate.projectPath].find(
-      (cwd) => cwd !== undefined && isExactProjectDir(candidate.dirName, cwd),
-    );
-    const info = await this.getSessionInfo(candidate.sessionId, dir ? { dir } : {}).catch(
-      () => undefined,
-    );
-    if (
-      info &&
-      info.fileSize === candidate.size &&
-      info.lastModified === Math.trunc(candidate.mtimeMs)
-    ) {
-      return { customTitle: info.customTitle, summary: info.summary };
-    }
+  private async titlesOf(candidate: TranscriptCandidate, headTail: HeadTail): Promise<SdkTitles> {
     const sidecar =
       tailCustomTitle(headTail.tail) === undefined
         ? await readSidecarTitle(candidate.filePath, candidate.sessionId)
