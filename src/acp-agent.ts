@@ -2905,8 +2905,9 @@ export class ClaudeAcpAgent {
     }
     timing.phase("replay");
 
-    // After the replay, so the commands do not interleave with the history.
-    this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
+    // v2 includes commands in the response; older clients need the update before it.
+    if (!this.v2) await this.sendAvailableCommandsUpdate(params.sessionId);
+    startMcpAuthentication(this, params.sessionId, params.mcpServers ?? []);
 
     return result;
   }

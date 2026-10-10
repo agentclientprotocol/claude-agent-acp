@@ -350,7 +350,19 @@ export class SessionIndexConnection {
     } else if (this.host.isAirClient()) {
       await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
     } else {
-      await sdkDeleteSession(params.sessionId);
+      try {
+        await sdkDeleteSession(params.sessionId);
+      } catch (error) {
+        // Missing transcripts are already deleted; unrelated SDK failures must propagate.
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          message !== `Invalid sessionId: ${params.sessionId}` &&
+          message !== `Session ${params.sessionId} not found in any project directory` &&
+          !message.startsWith(`Session ${params.sessionId} not found in project directory for `)
+        ) {
+          throw error;
+        }
+      }
     }
     return {};
   }
