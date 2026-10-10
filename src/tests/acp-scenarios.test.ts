@@ -22,6 +22,7 @@
  * to `acp-scenarios/origin-main/`.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { runtimeCapability } from "../desktop-runtime.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -552,7 +553,12 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
       const initialize = zed("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
       expect(initialize.agentCapabilities._meta.claudeCode).toEqual({ promptQueueing: true });
-      expect(initialize._meta).toEqual({ steering: { supported: true } });
+      expect(initialize._meta).toMatchObject({
+        steering: { supported: true },
+        runtime: runtimeCapability(),
+        sessionRewind: { version: 1 },
+        sessionRewindFiles: { version: 1 },
+      });
     });
 
     it("sends terminal-auth commands that rerun this adapter with --cli", () => {
@@ -594,7 +600,7 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
     it("gets the AIR capabilities and the goal capability under jetbrains.air", () => {
       const initialize = air("session-setup").find((record) => record.kind === "initialize")!
         .payload as Record<string, any>;
-      expect(initialize._meta).toEqual({
+      expect(initialize._meta).toMatchObject({
         jetbrains: {
           air: {
             version: 1,

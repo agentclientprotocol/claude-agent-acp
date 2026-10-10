@@ -6,6 +6,7 @@
  * fields as on origin/main. {@link compareWithBaseline} allows only these
  * differences, and returns every other difference as a violation:
  *
+ * - Initialize adds the runtime discovery metadata (queue cancellation and context reads).
  * - A key that exists only for AIR is gone (see {@link AIR_ONLY_META_KEYS}).
  *   A `session_info_update` that carried only such a key is not sent.
  * - A `tool_call_update` leaves out a top-level field whose value did not
@@ -238,6 +239,13 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   const matches = (wanted: Recorded, actual: Recorded | undefined): boolean => {
     if (!actual || actual.kind !== wanted.kind) return false;
     if (canonical(actual) === canonical(wanted)) return true;
+    if (wanted.kind === "initialize") {
+      const payload = actual.payload as Json;
+      const meta = { ...((payload._meta as Json) ?? {}) };
+      for (const key of ["runtime", "sessionRewind", "sessionRewindFiles", "sessionMcp"])
+        delete meta[key];
+      return canonical({ ...actual, payload: { ...payload, _meta: meta } }) === canonical(wanted);
+    }
     const want = updateOf(wanted);
     const got = updateOf(actual);
     if (!want || !got || want.sessionUpdate !== got.sessionUpdate) return false;
