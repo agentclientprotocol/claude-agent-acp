@@ -1590,6 +1590,11 @@ const PROVIDER_ID = "main";
 const DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const DEFAULT_VERTEX_BASE_URL = "https://aiplatform.googleapis.com";
 
+function normalizeSessionListDir(dir: string | undefined): string | undefined {
+  if (dir === undefined) return undefined;
+  return /^\/mnt\/[a-z](?:\/|$)/i.test(dir) ? dir.toLowerCase() : dir;
+}
+
 /**
  * Vertex needs project + region that the standard `providers/set` payload
  * (`apiType`/`baseUrl`/`headers`) does not model, so clients pass them through
@@ -2922,7 +2927,7 @@ export class ClaudeAcpAgent {
     const offset = sessionListOffset(params.cursor);
     // One more session than the page tells whether a next page exists.
     const sdkSessions = await listSessions({
-      dir: params.cwd ?? undefined,
+      dir: normalizeSessionListDir(params.cwd ?? undefined),
       limit: SESSION_LIST_PAGE_SIZE + 1,
       offset,
     });
