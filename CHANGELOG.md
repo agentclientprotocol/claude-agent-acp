@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.89.1](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.89.0...v0.89.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* push renamed sessions to list subscribers and reuse one listing across pages ([#1293](https://github.com/agentclientprotocol/claude-agent-acp/issues/1293)) ([92abb8f](https://github.com/agentclientprotocol/claude-agent-acp/commit/92abb8fd4db862c465c4b3a49ea32dac0720de2c))
+
 ## [0.89.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.88.0...v0.89.0) (2026-10-09)
 
 
