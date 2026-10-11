@@ -558,6 +558,18 @@ type AsyncTaskStopRequest = {
   asyncTaskId: string;
 };
 
+type AsyncTaskOutputRequest = AsyncTaskStopRequest & { offset: number };
+type AsyncTaskOutputResponse = { text: string; nextOffset: number };
+
+function parseAsyncTaskOutputRequest(value: unknown): AsyncTaskOutputRequest {
+  const request = parseAsyncTaskStopRequest(value);
+  const offset = (value as Record<string, unknown>).offset ?? 0;
+  if (typeof offset !== "number" || !Number.isSafeInteger(offset) || offset < 0) {
+    throw RequestError.invalidParams(undefined, "Invalid output offset");
+  }
+  return { ...request, offset };
+}
+
 type AsyncTaskStopResponse = {
   stopped: boolean;
 };
@@ -3887,6 +3899,12 @@ export class ClaudeAcpAgent {
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
     return { outcome: "injected" };
+  }
+
+  async readAsyncTaskOutput(params: AsyncTaskOutputRequest): Promise<AsyncTaskOutputResponse> {
+    const runtime = this.sessions[params.sessionId]?.asyncTaskRuntime;
+    if (!runtime) throw RequestError.invalidParams(undefined, "Background task session not found");
+    return runtime.readOutput(params.asyncTaskId, params.offset);
   }
 
   async stopAsyncTask(params: AsyncTaskStopRequest): Promise<AsyncTaskStopResponse> {
@@ -11783,6 +11801,11 @@ export function v1AgentApp(
       ASYNC_TASK_STOP_METHOD,
       { parse: parseAsyncTaskStopRequest },
       (ctx) => agent.stopAsyncTask(ctx.params),
+    )
+    .onRequest<AsyncTaskOutputRequest, AsyncTaskOutputResponse>(
+      "_session/async_task/output",
+      { parse: parseAsyncTaskOutputRequest },
+      (ctx) => agent.readAsyncTaskOutput(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,

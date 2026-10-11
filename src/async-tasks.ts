@@ -1,3 +1,4 @@
+import { open } from "node:fs/promises";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
@@ -482,6 +483,23 @@ export class AsyncTaskRuntime {
     if (!this.enabled) return;
     for (const task of this.tasks.values()) {
       if (task.held) await this.announce(task, { withoutToolCall: true });
+    }
+  }
+
+  async readOutput(taskId: string, offset: number): Promise<{ text: string; nextOffset: number }> {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid output offset");
+    const task = this.tasks.get(taskId);
+    if (!this.enabled || !task?.announced || task.ignored)
+      throw new Error("Background task not found in this session");
+    // Never accept a client-provided path: only the owning SDK task can name its log.
+    if (!task.outputFilePath) throw new Error("Native task has not supplied an output path");
+    const file = await open(task.outputFilePath, "r");
+    try {
+      const buffer = Buffer.alloc(65536);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, offset);
+      return { text: buffer.subarray(0, bytesRead).toString(), nextOffset: offset + bytesRead };
+    } finally {
+      await file.close();
     }
   }
 

@@ -922,6 +922,15 @@ At shutdown, the adapter finishes each open task as `failed` or `stopped`.
 
 ### Stop request
 
+Clients can read the native log through `_session/async_task/output` with
+`{ "sessionId": "…", "asyncTaskId": "…", "offset": 0 }`. The response is
+`{ "text": "…", "nextOffset": 123 }`. Offsets are nonnegative safe integers
+in bytes; each page reads at most 64 KiB. The adapter resolves the path from
+an announced task in that session, never from a client-provided path. Unknown
+tasks and tasks without a native log path return errors. Completed tasks remain
+readable while their owning session registry is retained. This request does not
+start a model turn or wait for the task to finish.
+
 The client sends `_session/async_task/stop`:
 
 ```json
