@@ -270,9 +270,12 @@ describe.skipIf(baselineDir)("ACP scenarios", () => {
         version: "<version>",
         command: "<executable>",
       });
-      expect(normalize({ version: "9.9.9", command: "/usr/bin/node" }, cwd, session)).toEqual({
+      // /usr/bin/node can be the running executable on Linux, so it is not
+      // a reliable negative control for exact executable normalization.
+      const otherExecutable = `${process.execPath}.different-executable`;
+      expect(normalize({ version: "9.9.9", command: otherExecutable }, cwd, session)).toEqual({
         version: "9.9.9",
-        command: "/usr/bin/node",
+        command: otherExecutable,
       });
     });
 
