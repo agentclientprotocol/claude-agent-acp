@@ -4121,6 +4121,10 @@ export class ClaudeAcpAgent {
       if (!blocks) streamedBlocksByParent.set(key, (blocks = []));
       return blocks;
     };
+    // The streams, keyed like streamedBlocksByParent, that dropped a delta
+    // after a cancel since their record last reset, so the record no longer
+    // matches what the client got (see the stream_event case).
+    const droppedStreams = new Set<string>();
     // A client gets the consolidated subagent text when it negotiated the
     // transcript extension or the `forwardSubagentText` session option. AIR
     // also gets it with native subagent sessions, and AIR gets no streamed
@@ -5928,6 +5932,7 @@ export class ClaudeAcpAgent {
                   subagents.discardPending(message.tool_use_id);
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
+                  droppedStreams.delete(message.tool_use_id);
                 }
                 await endBackgroundTerminal(message.task_id);
                 settleLiveTask(message.task_id);
@@ -5961,7 +5966,10 @@ export class ClaudeAcpAgent {
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
                   )?.parentToolUseId;
-                  if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
+                  if (parentToolUseId) {
+                    streamedBlocksByParent.delete(parentToolUseId);
+                    droppedStreams.delete(parentToolUseId);
+                  }
                   await endBackgroundTerminal(message.task_id);
                   settleLiveTask(message.task_id);
                 } else if (
@@ -6920,43 +6928,14 @@ export class ClaudeAcpAgent {
               // reset, and the synthetic-auth/system/local-command paths
               // `break` early too. Block indices restart at 0 each message, so
               // leftover entries would otherwise collide with this message's
-              // blocks and re-emit (or truncate) already-streamed text. Gated on
-              // `parent_tool_use_id === null` so a subagent stream can't clear
-              // the top-level record. Fires once, before any of this message's
-              // blocks, so it doesn't disturb the mid-message turn-activation
-              // path the way resetting on turn activation would.
+              // blocks and re-emit (or truncate) already-streamed text. Keyed by
+              // the stream, so a subagent's message can't clear the top-level
+              // record. Fires once, before any of this message's blocks, so it
+              // doesn't disturb the mid-message turn-activation path the way
+              // resetting on turn activation would. The record's drop latch
+              // (see below) resets with it.
               streamedBlocksOf(message.parent_tool_use_id).length = 0;
-            }
-            // Accumulate the text/thinking actually streamed live, so the
-            // `assistant` case below can diff its assembled blocks against what
-            // already reached the client as chunks and forward only the
-            // remainder. Each stream (top level or one subagent) keeps its own
-            // record, so a subagent cannot attribute content to another stream.
-            // Contiguous deltas of the same block (same index and type) extend
-            // the current entry; anything else opens a new one.
-            if (message.event.type === "content_block_delta") {
-              const delta = message.event.delta;
-              const chunk =
-                delta.type === "text_delta"
-                  ? { type: "text" as const, text: delta.text }
-                  : delta.type === "thinking_delta"
-                    ? { type: "thinking" as const, text: delta.thinking }
-                    : undefined;
-              // Skip empty deltas (some gateways emit empty thinking chunks —
-              // #793): appending "" is a no-op, but pushing a "" entry would
-              // create a block the consolidated handler's `text.length > 0`
-              // guard can never consume, stalling the diff cursor and
-              // re-emitting the next block as a duplicate.
-              if (chunk?.text) {
-                const index = message.event.index;
-                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
-                const last = streamedBlocks[streamedBlocks.length - 1];
-                if (last && last.index === index && last.type === chunk.type) {
-                  last.text += chunk.text;
-                } else {
-                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
-                }
-              }
+              droppedStreams.delete(message.parent_tool_use_id ?? "");
             }
             if (
               message.parent_tool_use_id === null &&
@@ -7014,6 +6993,67 @@ export class ClaudeAcpAgent {
                     size: session.contextWindowSize,
                   }),
                 });
+              }
+            }
+            // After a cancel, output streams to the client until the client is
+            // told that the stopped work ended (see workEndReported), so what
+            // the interrupt flushes before then still goes out, as both
+            // protocol versions allow. After that, while the window after the
+            // cancel is open, streamed text, thinking and tool calls are
+            // dropped like the consolidated messages they belong to (see the
+            // `cancelled` check in the user/assistant case). Otherwise the
+            // answer to a prompt the cancel abandoned, which Claude Code had
+            // already taken off its queue, would stream to the client after the
+            // cancel was reported.
+            //
+            // Where the consolidated message delivers the text (the same
+            // condition as in the user/assistant case), a stream that loses a
+            // delta keeps dropping until the record below resets: at the next
+            // message, or when a consolidated message consumes the record. If
+            // the next prompt's echo ends the window mid-block, the record then
+            // stays empty and the consolidated message delivers the block's
+            // whole text once. A record holding only the block's tail is not a
+            // prefix of the text, so the text would be sent again (see
+            // unstreamedRemainder).
+            const streamKey = message.parent_tool_use_id ?? "";
+            if (session.cancelled && this.workEndReported(params.sessionId, session)) {
+              if (message.parent_tool_use_id === null || forwardsSubagentText()) {
+                droppedStreams.add(streamKey);
+              }
+              break;
+            }
+            if (droppedStreams.has(streamKey)) {
+              break;
+            }
+            // Accumulate the text/thinking actually streamed live, so the
+            // `assistant` case below can diff its assembled blocks against what
+            // already reached the client as chunks and forward only the
+            // remainder. Each stream (top level or one subagent) keeps its own
+            // record, so a subagent cannot attribute content to another stream.
+            // Contiguous deltas of the same block (same index and type) extend
+            // the current entry; anything else opens a new one.
+            if (message.event.type === "content_block_delta") {
+              const delta = message.event.delta;
+              const chunk =
+                delta.type === "text_delta"
+                  ? { type: "text" as const, text: delta.text }
+                  : delta.type === "thinking_delta"
+                    ? { type: "thinking" as const, text: delta.thinking }
+                    : undefined;
+              // Skip empty deltas (some gateways emit empty thinking chunks —
+              // #793): appending "" is a no-op, but pushing a "" entry would
+              // create a block the consolidated handler's `text.length > 0`
+              // guard can never consume, stalling the diff cursor and
+              // re-emitting the next block as a duplicate.
+              if (chunk?.text) {
+                const index = message.event.index;
+                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
+                const last = streamedBlocks[streamedBlocks.length - 1];
+                if (last && last.index === index && last.type === chunk.type) {
+                  last.text += chunk.text;
+                } else {
+                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
+                }
               }
             }
             for (const notification of streamEventToAcpNotifications(
@@ -7335,6 +7375,7 @@ export class ClaudeAcpAgent {
               const streamed = streamedBlocksOf(message.parent_tool_use_id);
               content = unstreamedRemainder(message.message.content, streamed);
               streamed.length = 0;
+              droppedStreams.delete(message.parent_tool_use_id ?? "");
             } else if (message.type === "assistant") {
               // Nested text/thinking stays internal for a client that does
               // not get subagent text.
@@ -8781,6 +8822,14 @@ export class ClaudeAcpAgent {
     );
     if (queued && !session.msgLifecycleV1) return;
     this.startForeground(sessionId, AUTONOMOUS_CYCLE);
+  }
+
+  /** Whether the client has been told that the session's work ended: on v2 by
+   *  an idle state, so no foreground work is open, including a cycle that
+   *  Claude Code started on its own; on v1 by the response to the turn's
+   *  prompt, so no turn is active. */
+  private workEndReported(sessionId: string, session: Session): boolean {
+    return this.foregroundEvents ? !this.foregroundWork.has(sessionId) : !session.activeTurn;
   }
 
   /** End the session's model cycle that Claude Code started on its own, if one
@@ -10799,26 +10848,36 @@ function cancelledOutcome(session: Session, turn: Turn | null | undefined): Turn
 
 /** Whether the model request that `status` (a `status: requesting` frame)
  *  starts may belong to the work a cancel stopped. It may while:
- *  - a turn is unsettled: the stopped turn, whose result is still to come, or
- *    a queued prompt, which the cancel abandons (one that arrived while the
- *    cancel awaited is recorded only when the cancel sweeps the queue) or
- *    whose echo ends the cancel right after its request anyway;
+ *  - a turn in {@link Session.cancelledPrompts} is unsettled: the stopped
+ *    turn, whose result is still to come;
  *  - the orphan accounting still expects the result of an abandoned prompt
  *    that Claude Code may still run, which it can fold into its own
  *    follow-up after that follow-up's first request;
  *  - the request serves one of {@link Session.cancelledPrompts}, as an
  *    abandoned prompt's request does even when the interrupt receipt left it
- *    out of the orphan accounting. */
+ *    out of the orphan accounting;
+ *  - the request serves an unsettled prompt. One that arrived while the cancel
+ *    awaited is recorded only when the cancel sweeps the queue, and its echo
+ *    ends the cancel right after its request when the cancel does not.
+ *  A prompt that is merely queued does not make another request belong to
+ *  the stopped work: a follow-up that Claude Code runs before a prompt sent
+ *  after the cancel names no prompt. */
 function servesCancelledWork(session: Session, status: object): boolean {
   const cancelled = session.cancelledPrompts;
   if (!cancelled) return false;
-  if ((session.turnQueue ?? []).some((turn) => !turn.settled)) return true;
+  const unsettled = (session.turnQueue ?? []).filter((turn) => !turn.settled);
+  if (unsettled.some((turn) => cancelled.has(turn.promptUuid))) return true;
   if ((session.pendingOrphanResults ?? 0) > 0 || (session.orphanCommands?.size ?? 0) > 0) {
     return true;
   }
   const served = (status as { user_message_uuids?: unknown }).user_message_uuids;
   return (
-    Array.isArray(served) && served.some((uuid) => typeof uuid === "string" && cancelled.has(uuid))
+    Array.isArray(served) &&
+    served.some(
+      (uuid) =>
+        typeof uuid === "string" &&
+        (cancelled.has(uuid) || unsettled.some((turn) => turn.promptUuid === uuid)),
+    )
   );
 }
 
