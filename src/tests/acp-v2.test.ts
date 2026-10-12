@@ -1279,6 +1279,38 @@ describe("ACP v2 prompts", () => {
     expect(statuses.at(-1)).toBe("cancelled");
   });
 
+  it("reports a tool call that Claude dropped before it ran as cancelled", async () => {
+    scriptTurns(async function* (options) {
+      // Claude starts a tool_use, but no complete assistant message holds it,
+      // so it never runs.
+      yield stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_dropped", name: "Bash", input: {} },
+      });
+      yield assistantText(options, "Here is the answer.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const dropped = client
+      .updates("tool_call_update")
+      .filter((update) => update.toolCallId === "toolu_dropped" && update.status);
+    expect(dropped.map((update) => update.status)).toEqual(["pending", "cancelled"]);
+    expect(JSON.stringify(dropped.at(-1)?.content)).toContain(
+      "Claude stopped this tool call before it ran.",
+    );
+    // It is not a failure of the turn.
+    expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
+  });
+
   it("reports a turn that fails after it was taken in as idle with the error stop reason", async () => {
     scriptTurns(async function* (options) {
       yield result(options, { is_error: true, result: "API Error: 529 Overloaded" });

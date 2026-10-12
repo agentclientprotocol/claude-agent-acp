@@ -592,6 +592,29 @@ export class AcpToolCallRenderer {
   }
 
   /**
+   * The report that closes a tool call when the turn ends without its result.
+   * If Claude dropped it before it ran (`ran` is false: its tool_use never
+   * reached a complete assistant message, for example because Claude switched
+   * to a steering message), a v2 client gets `cancelled` and every other
+   * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
+   * returned no result, it failed.
+   */
+  unfinished(call: { toolCallId: string; ran: boolean }): ToolCallUpdate {
+    return {
+      sessionUpdate: "tool_call_update",
+      toolCallId: call.toolCallId,
+      status: !call.ran && this.capabilities.v2 ? V2_CANCELLED : "failed",
+      content: [
+        textContent(
+          call.ran
+            ? "Claude ended the turn without returning a result for this tool."
+            : "Claude stopped this tool call before it ran.",
+        ),
+      ],
+    };
+  }
+
+  /**
    * The report of a tool progress beat. The field tracker sends the
    * `in_progress` status once, so a later beat carries only the progress.
    */

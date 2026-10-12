@@ -3820,6 +3820,38 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("closes a tool call that Claude dropped before it ran as cancelled on v2, and as failed elsewhere", () => {
+    const unfinished = (ran: boolean, capabilities?: ToolCallCapabilities) =>
+      new AcpToolCallRenderer(capabilities).unfinished({ toolCallId: "toolu_bash", ran });
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(unfinished(false, v2)).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "cancelled",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "Claude stopped this tool call before it ran." },
+        },
+      ],
+    });
+    // A tool that ran but returned no result failed, also on v2.
+    expect(unfinished(true, v2)).toMatchObject({
+      status: "failed",
+      content: [
+        {
+          content: { text: "Claude ended the turn without returning a result for this tool." },
+        },
+      ],
+    });
+    // v1 has no cancelled status.
+    expect(unfinished(false)).toMatchObject({ status: "failed" });
+    expect(unfinished(false, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
   it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
     // TodoWrite renders as a plan, so only the permission flow emits its tool call.
     const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };

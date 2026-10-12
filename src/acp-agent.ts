@@ -4666,9 +4666,14 @@ export class ClaudeAcpAgent {
         const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
           (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
         );
-        /** Closes a tool call as failed. Returns false when the turn ended meanwhile. */
-        const failToolCall = async (toolCallId: string, text: string): Promise<boolean> => {
-          // A late hook must not overwrite the failure we are about to send.
+        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+        /**
+         * Closes a tool call that the turn ended without a result for
+         * (`AcpToolCallRenderer.unfinished`). Returns false when the turn
+         * ended meanwhile.
+         */
+        const closeUnfinished = async (toolCallId: string, ran: boolean): Promise<boolean> => {
+          // A late hook must not overwrite the report we are about to send.
           unregisterHookCallback(toolCallId);
           session.emittedToolCalls.delete(toolCallId);
           delete session.toolUseCache[toolCallId];
@@ -4676,12 +4681,7 @@ export class ClaudeAcpAgent {
           session.dispatchedToolCalls?.delete(toolCallId);
           await sendUpdate({
             sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId,
-              status: "failed",
-              content: [{ type: "content", content: { type: "text", text } }],
-            },
+            update: renderer.unfinished({ toolCallId, ran }),
           });
           // Cancellation can arrive while we await the client update.
           if (turn.settled || session.activeTurn !== turn) return false;
@@ -4697,7 +4697,7 @@ export class ClaudeAcpAgent {
         const abandoned = unfinished.filter((id) => !session.dispatchedToolCalls?.has(id));
         const stuck = unfinished.filter((id) => session.dispatchedToolCalls?.has(id));
         for (const toolCallId of abandoned) {
-          if (!(await failToolCall(toolCallId, "Claude stopped this tool call before it ran."))) {
+          if (!(await closeUnfinished(toolCallId, false))) {
             return;
           }
         }
@@ -4708,12 +4708,7 @@ export class ClaudeAcpAgent {
           );
           // Fail every unfinished tool before reporting one error for the prompt.
           for (const toolCallId of stuck) {
-            if (
-              !(await failToolCall(
-                toolCallId,
-                "Claude ended the turn without returning a result for this tool.",
-              ))
-            ) {
+            if (!(await closeUnfinished(toolCallId, true))) {
               return;
             }
           }
