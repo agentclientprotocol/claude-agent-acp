@@ -32,6 +32,8 @@ export function v2SessionUpdate(
     case "session_info_update":
     case "usage_update":
     case "notice":
+    case "compaction_update":
+    case "compaction_summary_chunk":
       return update;
     case "agent_message_chunk":
     case "agent_thought_chunk":

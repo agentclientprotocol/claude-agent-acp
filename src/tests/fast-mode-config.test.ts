@@ -151,7 +151,7 @@ describe("normalizeFastModeDisabledReason", () => {
 
 describe("buildConfigOptions Fast mode", () => {
   it("omits the Fast mode option when the model does not support it", () => {
-    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, {
+    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: false,
       enabled: false,
       useBooleanOption: true,
@@ -160,12 +160,12 @@ describe("buildConfigOptions Fast mode", () => {
   });
 
   it("omits the Fast mode option when no fast mode state is provided", () => {
-    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined);
+    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default");
     expect(options.find((o) => o.id === FAST_MODE_CONFIG_ID)).toBeUndefined();
   });
 
   it("surfaces a boolean toggle when supported and the client opted in", () => {
-    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, {
+    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: true,
       enabled: true,
       useBooleanOption: true,
@@ -174,7 +174,7 @@ describe("buildConfigOptions Fast mode", () => {
   });
 
   it("surfaces a select fallback when supported but the client did not opt in", () => {
-    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, {
+    const options = buildConfigOptions(MODES, MODELS, MODEL_INFOS, undefined, [], "default", {
       supported: true,
       enabled: false,
       useBooleanOption: false,

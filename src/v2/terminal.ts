@@ -23,7 +23,7 @@ interface TerminalMeta {
   terminal_info?: { terminal_id: string };
   terminal_output?: { terminal_id: string; data: string };
   terminal_output_delta?: { terminal_id: string; data: string };
-  terminal_exit?: { terminal_id: string; exit_code: number; signal: string | null };
+  terminal_exit?: { terminal_id: string; exit_code: number | null; signal: string | null };
 }
 
 const TERMINAL_KEYS = [
@@ -70,7 +70,7 @@ export class V2Terminals {
           ...(exit
             ? {
                 exitStatus: {
-                  exitCode: exit.exit_code,
+                  ...(exit.exit_code != null ? { exitCode: exit.exit_code } : {}),
                   ...(exit.signal != null ? { signal: exit.signal } : {}),
                 },
               }

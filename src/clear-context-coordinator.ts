@@ -5,7 +5,7 @@ import type {
   PermissionMode,
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { DEFAULT_MODEL_ID } from "./session-config-ids.js";
+import { DEFAULT_AGENT_ID, DEFAULT_MODEL_ID } from "./session-config-ids.js";
 
 export type ClearContextReset = {
   toolUseId: string;
@@ -37,6 +37,7 @@ export type ClearContextSession<Turn extends ClearContextTurn = ClearContextTurn
   accumulatedModelUsage?: Record<string, Usage>;
   models: { currentModelId: string };
   configOptions: SessionConfigOption[];
+  currentAgent: string;
   fastModeEnabled: boolean;
   effortPinnedLevel?: string;
   activeTurn?: Turn | null;
@@ -88,6 +89,7 @@ function restartParams<Session extends ClearContextSession>(session: Session): N
           ...(session.models.currentModelId !== DEFAULT_MODEL_ID
             ? { model: session.models.currentModelId }
             : {}),
+          ...(session.currentAgent !== DEFAULT_AGENT_ID ? { agent: session.currentAgent } : {}),
           ...(session.effortPinnedLevel !== undefined
             ? { effort: session.effortPinnedLevel as EffortLevel }
             : {}),

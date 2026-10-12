@@ -41,11 +41,11 @@ export interface TurnEvents {
    */
   ended(outcome: TurnOutcome): void;
   /**
-   * The turn failed. Without {@link inserted} before, Claude Code was not seen
-   * taking the prompt in. `title`, when the agent has one, describes the
-   * failure for the user in plain text, such as "API Error: 529 Overloaded".
+   * The turn failed with `error`, the JSON-RPC error that v1 answers the
+   * prompt with. Without {@link inserted} before, Claude Code was not seen
+   * taking the prompt in.
    */
-  failed(error: unknown, title?: string): void;
+  failed(error: unknown): void;
 }
 
 /** Why a turn ended. Every ACP version has these reasons. */

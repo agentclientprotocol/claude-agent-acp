@@ -10,8 +10,10 @@ import type { ToolReporter, ToolResultContext, ToolResultFacts, ToolUseFacts } f
 export class WebFetchReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
     const fetch = input as WebFetchInput | undefined;
+    // `offset` reads on through a page too long for one call (CLI 2.1.290+).
+    const from = fetch?.offset ? ` (from char ${fetch.offset})` : "";
     return {
-      title: fetch?.url ? `Fetch ${fetch.url}` : "Fetch",
+      title: fetch?.url ? `Fetch ${fetch.url}${from}` : "Fetch",
       kind: "fetch",
       ...(fetch?.prompt ? { display: [textContent(fetch.prompt)] } : {}),
     };

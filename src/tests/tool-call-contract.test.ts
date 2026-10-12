@@ -165,6 +165,20 @@ describe("the ACP tool call contract", () => {
     ]);
   });
 
+  it("reads the Grep file_path alias like path", () => {
+    const aliased = report(
+      air,
+      "Grep",
+      { pattern: "a", file_path: "/work/src" },
+      { content: "a.ts" },
+    );
+    expect(aliased.call.title).toBe('grep "a" /work/src');
+    expect(aliased.updates[0]).not.toHaveProperty("content");
+
+    const both = report(terminalAir, "Grep", { pattern: "a", path: "/p", file_path: "/f" });
+    expect(both.call.title).toBe('grep "a" /p');
+  });
+
   it("keeps the Read error text for AIR", () => {
     const { updates } = report(
       terminalAir,
@@ -254,6 +268,13 @@ describe("the ACP tool call contract", () => {
     expect(report(air, "WebFetch", input).call.content).toEqual([]);
   });
 
+  it("shows the WebFetch offset in the title", () => {
+    const input = { url: "https://e.com", prompt: "Summarize", offset: 100000 };
+    expect(report(terminalAir, "WebFetch", input).call.title).toBe(
+      "Fetch https://e.com (from char 100000)",
+    );
+  });
+
   it("reports WebSearch hits from the structured result", () => {
     const { updates } = report(
       terminalAir,
@@ -279,6 +300,11 @@ describe("the ACP tool call contract", () => {
     });
     expect(zedCall._meta.claudeCode).not.toHaveProperty("subagent");
     expect(report(air, "Task", input).call.content).toEqual([]);
+  });
+
+  it("shows a requested Agent effort in the title", () => {
+    const input = { description: "Explore", prompt: "Inspect", effort: "high" };
+    expect(report(terminalAir, "Agent", input).call.title).toBe("Explore (high effort)");
   });
 
   it("reports TodoWrite as a plan, not as a tool call", () => {
@@ -696,7 +722,7 @@ describe("background Bash", () => {
   };
 
   it("marks the tool call of a command that became an async task", () => {
-    expect(backgroundedBashToolCall(completed, { task_id: "b1", tool_use_id: "t" }, true)).toEqual({
+    expect(backgroundedBashToolCall(completed, new Set(["t"]), true)).toEqual({
       ...completed,
       update: {
         ...completed.update,
@@ -705,9 +731,11 @@ describe("background Bash", () => {
     });
   });
 
+  it("marks only a tool call that went to the background", () => {
+    expect(backgroundedBashToolCall(completed, new Set(["other"]), true)).toBe(completed);
+  });
+
   it("sends no marker to a client without the asyncTasks capability", () => {
-    expect(backgroundedBashToolCall(completed, { task_id: "b1", tool_use_id: "t" }, false)).toBe(
-      completed,
-    );
+    expect(backgroundedBashToolCall(completed, new Set(["t"]), false)).toBe(completed);
   });
 });

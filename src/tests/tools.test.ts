@@ -920,11 +920,12 @@ describe("Bash terminal output", () => {
       });
     });
 
-    it("should route failed commands through the terminal when supportsTerminalOutput is true", () => {
+    it("should route failed commands through the terminal with the code their text names", () => {
+      // Claude Code's text of a command that exited with a failing code.
       const toolResult: ToolResultBlockParam = {
         type: "tool_result",
         tool_use_id: "toolu_bash",
-        content: "some error output",
+        content: "Exit code 2\nsome error output",
         is_error: true,
       };
       const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
@@ -932,8 +933,8 @@ describe("Bash terminal output", () => {
       expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
       expect(update._meta).toEqual({
         terminal_info: { terminal_id: "toolu_bash" },
-        terminal_output: { terminal_id: "toolu_bash", data: "some error output" },
-        terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+        terminal_output: { terminal_id: "toolu_bash", data: "Exit code 2\nsome error output" },
+        terminal_exit: { terminal_id: "toolu_bash", exit_code: 2, signal: null },
       });
     });
 
@@ -1050,13 +1051,13 @@ describe("Bash terminal output", () => {
         const update = toolUpdateFromToolResult(toolResult, bashToolUse, true);
 
         // Failed Bash commands skip the early error return and reach the Bash
-        // case so the client receives terminal output with a non-zero exit code
-        // instead of plain markdown details.
+        // case so the client receives terminal output instead of plain
+        // markdown details. A failure whose text names no exit code has none.
         expect(update.content).toEqual([{ type: "terminal", terminalId: "toolu_bash" }]);
         expect(update._meta).toEqual({
           terminal_info: { terminal_id: "toolu_bash" },
           terminal_output: { terminal_id: "toolu_bash", data: "command not found: bad_cmd" },
-          terminal_exit: { terminal_id: "toolu_bash", exit_code: 1, signal: null },
+          terminal_exit: { terminal_id: "toolu_bash", exit_code: null, signal: null },
         });
       });
 
@@ -2393,7 +2394,7 @@ describe("PowerShell terminal output", () => {
       _meta: {
         terminal_exit: {
           terminal_id: id,
-          exit_code: 1,
+          exit_code: null,
           signal: null,
         },
       },
@@ -3787,6 +3788,63 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("reports an aborted run as cancelled to a v2 client, and as failed to every other client", () => {
+    const status = (kind: string, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [deniedResult] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolResultMeta: [{ id: "toolu_bash", non_execution_kind: kind }],
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status("interrupted", v2)).toMatchObject({
+      status: "cancelled",
+      _meta: { claudeCode: { nonExecutionKind: "interrupted" } },
+    });
+    expect(status("cancelled", v2)).toMatchObject({ status: "cancelled" });
+    // A refused tool did not run because of a decision: it failed.
+    for (const kind of ["user-rejected", "permission-rule", "automode-blocked"]) {
+      expect(status(kind, v2)).toMatchObject({ status: "failed" });
+    }
+    // v1 has no cancelled status.
+    expect(status("interrupted")).toMatchObject({ status: "failed" });
+    expect(status("interrupted", ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
+    // TodoWrite renders as a plan, so only the permission flow emits its tool call.
+    const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_result", tool_use_id: "toolu_todo", content: "stopped", is_error: true },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_todo: todoWrite },
+      mockClient,
+      mockLogger,
+      {
+        toolResultMeta: [{ id: "toolu_todo", non_execution_kind: "interrupted" }],
+        emittedToolCalls: new Set(["toolu_todo"]),
+        toolCallCapabilities: ToolCallCapabilities.from({}, { v2: true }),
+      },
+    );
+
+    expect(notifications[0]?.update).toMatchObject({
+      toolCallId: "toolu_todo",
+      status: "cancelled",
+    });
+  });
+
   it("attributes entries by tool_use_id, so only the flagged result in a batch is stamped", () => {
     const toolUseCache: ToolUseCache = {
       toolu_bash: bashToolUse,
@@ -4076,7 +4134,7 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       ]);
     });
 
-    it("re-establishes the abort notice and a failing exit code for interrupted commands", () => {
+    it("re-establishes the abort notice and no exit code for interrupted commands", () => {
       const update = toolUpdateFromToolResult(rawWithHint, bashToolUse, true, {
         ...structured,
         stdout: "partial output",
@@ -4089,7 +4147,7 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       });
       expect(update._meta?.terminal_exit).toEqual({
         terminal_id: "toolu_bash",
-        exit_code: 1,
+        exit_code: null,
         signal: null,
       });
     });
@@ -4105,6 +4163,67 @@ describe("structured tool_use_result rendering (Read/Bash/WebSearch)", () => {
       expect(update._meta?.terminal_output).toEqual({
         terminal_id: "toolu_bash",
         data: "clipped stdout\n[Output truncated (38100 bytes total): full output saved to /tmp/tool-results/abc.txt]",
+      });
+    });
+
+    describe("exit codes", () => {
+      const text = (content: string, is_error = false): ToolResultBlockParam => ({
+        type: "tool_result",
+        tool_use_id: "toolu_bash",
+        content,
+        is_error,
+      });
+      const exitCode = (
+        clientCapabilities: ClientCapabilities,
+        result: ToolResultBlockParam,
+        toolUseResult?: unknown,
+      ) =>
+        new AcpToolCallRenderer(ToolCallCapabilities.from(clientCapabilities)).resultFields(
+          bashToolUse,
+          result as Parameters<AcpToolCallRenderer["resultFields"]>[1],
+          toolUseResult,
+        )._meta?.terminal_exit?.exit_code;
+      const zed: ClientCapabilities = { _meta: { terminal_output: true } };
+      const air: ClientCapabilities = {
+        _meta: { ...AIR_CLIENT._meta, terminal_output_delta: true },
+      };
+
+      // The command, its result, the code that Zed gets (null when the result
+      // does not say it), and the number that AIR always got.
+      it.each<[string, ToolResultBlockParam, unknown, number | null, number]>([
+        ["a success", text("pushed ok"), structured, 0, 0],
+        ["a failure that names its code", text("Exit code 2\nboom", true), undefined, 2, 1],
+        [
+          "a failure that names no code",
+          text("Permission to use Bash has been denied.", true),
+          undefined,
+          null,
+          1,
+        ],
+        [
+          "an interrupted command",
+          text("partial"),
+          { ...structured, stdout: "partial", interrupted: true },
+          null,
+          1,
+        ],
+        [
+          "a backgrounded command",
+          text("Command running in background with ID: bash_1."),
+          { ...structured, stdout: "", backgroundTaskId: "bash_1" },
+          null,
+          0,
+        ],
+        [
+          "a non-zero code that Claude Code accepted as a success",
+          text("No matches found"),
+          { ...structured, stdout: "", returnCodeInterpretation: "No matches found" },
+          null,
+          0,
+        ],
+      ])("%s", (_name, result, toolUseResult, zedCode, airCode) => {
+        expect(exitCode(zed, result, toolUseResult)).toBe(zedCode);
+        expect(exitCode(air, result, toolUseResult)).toBe(airCode);
       });
     });
   });

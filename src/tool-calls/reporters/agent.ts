@@ -7,8 +7,10 @@ import type { ToolReporter, ToolResultContext, ToolResultFacts, ToolUseFacts } f
 export class AgentReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
     const agent = input as Partial<AgentInput> | undefined;
+    // `effort` is set only when the user asked for one (CLI 2.1.292+).
+    const effort = agent?.effort ? ` (${agent.effort} effort)` : "";
     return {
-      title: agent?.description ? agent.description : "Task",
+      title: (agent?.description ? agent.description : "Task") + effort,
       kind: "think",
       ...(typeof agent?.prompt === "string" ? { display: [textContent(agent.prompt)] } : {}),
     };

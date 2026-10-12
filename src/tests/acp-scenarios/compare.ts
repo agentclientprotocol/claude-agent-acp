@@ -19,6 +19,10 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - A `terminal_exit` has a `null` exit code where origin/main sent a code
+ *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
+ *   failure that names no code or an interrupted command, 0 for a
+ *   backgrounded command.
  */
 import type { Recorded } from "./harness.js";
 
@@ -159,6 +163,32 @@ function withoutAdapterCommands(want: Json, got: Json): Json {
   };
 }
 
+/**
+ * `wanted` with the unknown exit code of `actual`, when origin/main sent a code
+ * in the `terminal_exit` of the same tool call.
+ */
+function withUnknownExitCode(wanted: Recorded, actual: Recorded | undefined): Recorded {
+  const want = updateOf(wanted);
+  const got = actual ? updateOf(actual) : undefined;
+  const wantExit = (want?._meta as Json | undefined)?.terminal_exit as Json | undefined;
+  const gotExit = (got?._meta as Json | undefined)?.terminal_exit as Json | undefined;
+  if (
+    !want ||
+    !wantExit ||
+    !gotExit ||
+    got?.toolCallId !== want.toolCallId ||
+    typeof wantExit.exit_code !== "number" ||
+    gotExit.exit_code !== null
+  ) {
+    return wanted;
+  }
+  const update = {
+    ...want,
+    _meta: { ...(want._meta as Json), terminal_exit: { ...wantExit, exit_code: null } },
+  };
+  return { ...wanted, payload: { ...(wanted.payload as Json), update } } as Recorded;
+}
+
 function isAppended(key: string): boolean {
   return APPENDED_META_KEYS.has(key.slice("_meta.".length));
 }
@@ -263,7 +293,8 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
     return true;
   };
 
-  for (const wanted of expected) {
+  for (const recorded of expected) {
+    const wanted = withUnknownExitCode(recorded, current[next]);
     if (matches(wanted, current[next])) {
       remember(updateOf(wanted));
       next++;

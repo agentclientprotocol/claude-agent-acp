@@ -33,7 +33,20 @@ export class GrepReporter implements ToolReporter {
     if (grep?.type) label += ` --type=${grep.type}`;
     if (grep?.multiline) label += " -P";
     if (grep?.pattern) label += ` "${grep.pattern}"`;
-    if (grep?.path) label += ` ${grep.path}`;
+    const path = grepPath(input);
+    if (path) label += ` ${path}`;
     return { title: label, kind: "search" };
   }
+}
+
+/**
+ * Reads a Grep input's path the way the CLI validates it. Since CLI 2.1.292
+ * the CLI accepts `file_path` for `path`. The streamed tool use keeps the
+ * original key. The canonical key wins when both spellings are present.
+ */
+export function grepPath(input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const raw = input as Record<string, unknown>;
+  if (typeof raw.path === "string") return raw.path;
+  return typeof raw.file_path === "string" ? raw.file_path : undefined;
 }

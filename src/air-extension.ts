@@ -2,6 +2,7 @@ export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 export const AIR_SESSION_FAILURE_CAPABILITY = "sessionFailure";
 export const AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY = "recommendedValue";
+export const AIR_CUSTOM_INSTRUCTIONS_CAPABILITY = "customInstructions";
 export const AIR_DIFF_PATCH_CAPABILITY = "diffPatch";
 /** AIR renders `rawInput` itself and needs no display copy of the input. */
 export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
@@ -10,6 +11,29 @@ export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
  * file, and AIR reads the plan from it.
  */
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
+/**
+ * The session index: a bounded, ordered `session/list` with row metadata, and
+ * `_session/rename`, `_session/archive`, `_session/unarchive` and the list
+ * subscription. Advertised only to a client that declares it.
+ */
+export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
+/**
+ * The agent supports `_session/archive` and `_session/unarchive`. Advertised
+ * exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not
+ * declare it.
+ */
+export const AIR_SESSION_ARCHIVE_CAPABILITY = "sessionArchive";
+/**
+ * The agent supports `_session/rename`. Advertised exactly when
+ * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
+ */
+export const AIR_SESSION_RENAME_CAPABILITY = "sessionRename";
+/**
+ * The agent supports `_session/list/subscribe`, `_session/list/unsubscribe`
+ * and `_session/list/changes`. Advertised exactly when
+ * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
+ */
+export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
@@ -118,6 +142,13 @@ export function clientSupportsAirCapability(capabilities: unknown, capability: s
     Array.isArray(advertised) &&
     advertised.includes(capability)
   );
+}
+
+/** Read custom instructions from `session/new` metadata. */
+export function airCustomInstructions(meta: unknown): string | undefined {
+  const air = airExtensionMeta(meta);
+  const instructions = air?.[AIR_CUSTOM_INSTRUCTIONS_CAPABILITY];
+  return typeof instructions === "string" ? instructions : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

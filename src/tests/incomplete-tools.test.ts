@@ -120,6 +120,40 @@ describe("incomplete foreground tools", () => {
     expect(updates.some((u) => u.toolCallId === toolCallId && u.status === "failed")).toBe(false);
   });
 
+  it("closes a streamed tool_use that never reached a complete message without a failure", async () => {
+    const { prompt, updates, logError, agent } = createTestSession(abandonedToolMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    const failed = updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0].content[0].content.text).toBe("Claude stopped this tool call before it ran.");
+    expect(logError).not.toHaveBeenCalled();
+    expect(hasHookCallback(toolCallId)).toBe(false);
+    expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+    expect(agent.sessions[sessionId].toolUseCache).toEqual({});
+  });
+
+  it("closes an abandoned tool_use and still fails the turn for an unfinished tool", async () => {
+    const { prompt, updates } = createTestSession(abandonedAndUnfinishedToolMessages);
+
+    await expect(prompt()).rejects.toMatchObject({
+      data: { errorKind: "incomplete_tool_call" },
+      message: expect.stringMatching(/second-tool/),
+    });
+    const failedText = (id: string) =>
+      updates.find((u) => u.toolCallId === id && u.status === "failed")?.content[0].content.text;
+    expect(failedText(toolCallId)).toBe("Claude stopped this tool call before it ran.");
+    expect(failedText("second-tool")).toContain("without returning a result");
+  });
+
+  it("closes a tool_use that Claude abandoned for a steering message", async () => {
+    const { prompt, updates, logError } = createTestSession(steeredAbandonedToolMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(updates).toContainEqual(expect.objectContaining({ toolCallId, status: "failed" }));
+    expect(logError).not.toHaveBeenCalled();
+  });
+
   it("preserves an existing SDK failure", async () => {
     const { prompt } = createTestSession(sdkFailureMessages);
 
@@ -137,6 +171,33 @@ function toolStart(id = toolCallId, parent: string | null = null) {
       type: "content_block_start",
       index: 0,
       content_block: { type: "tool_use", id, name: "Bash", input: {} },
+    },
+  };
+}
+
+/** The complete assistant message that sends the tool_use to the tool runner. */
+function toolUse(id = toolCallId) {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "assistant",
+      usage: successfulResultMessage().usage,
+      content: [{ type: "tool_use", id, name: "Bash", input: { command: "echo test" } }],
+    },
+  };
+}
+
+function assistantText(text: string) {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "assistant",
+      usage: successfulResultMessage().usage,
+      content: [{ type: "text", text }],
     },
   };
 }
@@ -190,7 +251,8 @@ async function* unfinishedToolMessages(input: Pushable<any>, ending: "result" | 
     ...toolStart(),
     event: { type: "content_block_stop", index: 0 },
   };
-  // The input block closed, but no tool_result arrived. Returning ends the stream.
+  yield toolUse();
+  // The tool ran, but no tool_result arrived. Returning ends the stream.
   if (ending === "result") yield successfulResultMessage();
 }
 
@@ -198,6 +260,7 @@ async function* toolBeforeUserEchoMessages(input: Pushable<any>) {
   const { value } = await input[Symbol.asyncIterator]().next();
   yield toolStart();
   yield userEcho(value);
+  yield toolUse();
   yield successfulResultMessage();
 }
 
@@ -291,6 +354,8 @@ async function* incompleteThenSuccessfulTurnMessages(input: Pushable<any>) {
   yield userEcho((await messages.next()).value);
   yield toolStart();
   yield toolStart("second-tool");
+  yield toolUse();
+  yield toolUse("second-tool");
   yield successfulResultMessage();
   yield { type: "system", subtype: "session_state_changed", state: "idle" };
 
@@ -318,4 +383,32 @@ async function* sdkFailureMessages(input: Pushable<any>) {
     is_error: true,
     errors: ["original failure"],
   });
+}
+
+async function* abandonedToolMessages(input: Pushable<any>) {
+  yield* echoNextPrompt(input);
+  // Claude starts a tool_use, but no complete message ever holds it.
+  yield toolStart();
+  yield assistantText("Here is the answer.");
+  yield successfulResultMessage();
+}
+
+async function* abandonedAndUnfinishedToolMessages(input: Pushable<any>) {
+  yield* echoNextPrompt(input);
+  yield toolStart();
+  yield toolStart("second-tool");
+  yield toolUse("second-tool");
+  yield successfulResultMessage();
+}
+
+async function* steeredAbandonedToolMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  const messages = input[Symbol.asyncIterator]();
+  yield userEcho((await messages.next()).value);
+  yield toolStart();
+  await expect(
+    agent.steer({ sessionId, prompt: [{ type: "text", text: "answer first" }] }),
+  ).resolves.toEqual({ outcome: "injected" });
+  yield userEcho((await messages.next()).value);
+  yield assistantText("Done as you asked.");
+  yield successfulResultMessage();
 }

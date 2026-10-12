@@ -136,6 +136,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       MODEL_INFOS,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -174,6 +176,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       { ...MODELS, currentModelId: "opus" },
       MODEL_INFOS,
       "high",
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -194,6 +198,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       MODEL_INFOS.filter((model) => model.value === "default"),
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -217,6 +223,8 @@ describe("buildConfigOptions recommended values presentation", () => {
         MODELS,
         infos,
         undefined,
+        [],
+        "default",
         undefined,
         RECOMMENDED_PRESENTATION,
       );
@@ -240,6 +248,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       infos,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
@@ -259,6 +269,8 @@ describe("buildConfigOptions recommended values presentation", () => {
       MODELS,
       infos,
       undefined,
+      [],
+      "default",
       undefined,
       RECOMMENDED_PRESENTATION,
     );
