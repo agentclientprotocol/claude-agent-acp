@@ -229,6 +229,11 @@ export class SessionIndexConnection {
     return {};
   }
 
+  /** Check negotiation before the caller cancels any in-flight native work. */
+  assertArchiveSupported(): void {
+    this.requireService(SESSION_ARCHIVE_METHOD);
+  }
+
   /** `_session/archive`: hides a session from the default list and stops
    *  it. Idempotent; the session need not be loaded. A session loaded here
    *  is interrupted, retitled through its CLI while that still runs, then

@@ -1,4 +1,5 @@
-import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { readSessionHistory } from "./session-history.js";
+import { type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { access, open, readdir } from "node:fs/promises";
 import path from "node:path";
 import { claudeConfigDir } from "./paths.js";
@@ -57,7 +58,7 @@ export async function readResumedSession(
     // Deliberately search all project directories, matching replaySessionHistory.
     // A client may reopen a session from a worktree or normalized path that is
     // different from the directory under which Claude persisted the transcript.
-    const messages = await getSessionMessages(sessionId);
+    const messages = await readSessionHistory(sessionId);
     const model = resumedModelFromTranscript(messages);
     timing.phase("read-transcript", ` messages=${messages.length} model=${model ?? "unknown"}`);
     return { messages, model };
@@ -161,6 +162,10 @@ async function lastTailRecords(filePath: string, withModel: boolean): Promise<Re
 
 type TranscriptRecord = {
   type?: unknown;
+  uuid?: unknown;
+  parentUuid?: unknown;
+  explicit?: unknown;
+  leafUuid?: unknown;
   isSidechain?: unknown;
   message?: { model?: unknown };
   permissionMode?: unknown;
@@ -188,6 +193,7 @@ class TailScan {
   readonly tail: ResumedTail = {};
   private modeDone = false;
   private planExited = false;
+  private retainedParent: string | null | undefined;
 
   constructor(private readonly withModel: boolean) {}
 
@@ -200,6 +206,22 @@ class TailScan {
       if (parsed === undefined) parsed = parseMainThreadRecord(line);
       return parsed ?? undefined;
     };
+    const anchor = record('"last-prompt"');
+    if (
+      anchor?.type === "last-prompt" &&
+      anchor.explicit === true &&
+      (anchor.leafUuid === null || typeof anchor.leafUuid === "string")
+    ) {
+      // Older anchors belong to discarded branches. Follow only the newest one.
+      if (this.retainedParent === undefined) this.retainedParent = anchor.leafUuid;
+      return this.retainedParent === null;
+    }
+    if (this.retainedParent !== undefined) {
+      if (this.retainedParent === null) return true;
+      const entry = record('"uuid"');
+      if (entry?.uuid !== this.retainedParent) return false;
+      this.retainedParent = typeof entry.parentUuid === "string" ? entry.parentUuid : null;
+    }
     if (this.withModel && this.tail.model === undefined) {
       const entry = record('"assistant"');
       if (entry?.type === "assistant") this.tail.model = concreteModel(entry.message?.model);

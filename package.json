@@ -39,8 +39,12 @@
     "test": "vitest",
     "test:integration": "RUN_INTEGRATION_TESTS=true vitest run",
     "test:run": "vitest run",
+    "test:native": "npm run build && node scripts/native/e2e.mjs",
+    "test:native:rewind": "npm run build && node scripts/native/e2e.mjs --rewind-only",
+    "test:native:compat": "vitest run src/tests/native-sdk-compat.test.ts src/tests/native-mutation.test.ts src/tests/session-rewind.test.ts src/tests/session-mcp-set.test.ts src/tests/runtime-wire.test.ts src/tests/runtime-wire-queue.test.ts src/tests/desktop-runtime.test.ts src/tests/desktop-runtime-queue.test.ts src/tests/queued-turns.test.ts src/tests/runtime-maintainer.test.ts src/tests/session-rewind-wire.test.ts src/tests/session-history.test.ts src/tests/session-rewind-persistence.test.ts src/tests/session-mutation-lock.test.ts scripts/native/checkpoint-preview.test.mjs --maxWorkers=1 --no-file-parallelism",
     "test:coverage": "vitest run --coverage",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:native:queue-context": "npm run build && node scripts/native/e2e.mjs context-full queue-cancel sdk-contract"
   },
   "keywords": [
     "claude",

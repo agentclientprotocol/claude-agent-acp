@@ -84,6 +84,31 @@ describe("readResumedTail", () => {
   });
   const userLine = (text: string) => ({ type: "user", message: { role: "user", content: text } });
 
+  it("restores model and mode from the retained branch after repeated native rewind", async () => {
+    await transcript("rewound", [
+      { type: "user", uuid: "u1", parentUuid: null, permissionMode: "default" },
+      record("kept-model", { uuid: "a1", parentUuid: "u1" }),
+      { type: "user", uuid: "u2", parentUuid: "a1", permissionMode: "plan" },
+      record("discarded-model", { uuid: "a2", parentUuid: "u2" }),
+      { type: "last-prompt", explicit: true, leafUuid: "a2" },
+      { type: "last-prompt", explicit: true, leafUuid: "a1" },
+      { type: "system", uuid: "late-log", parentUuid: "a2" },
+    ]);
+    expect(await readResumedTail("rewound")).toEqual({
+      model: "kept-model",
+      permissionMode: "default",
+    });
+  });
+
+  it("restores neither discarded model nor permission after first-message rewind", async () => {
+    await transcript("empty-rewind", [
+      { type: "user", uuid: "u1", parentUuid: null, permissionMode: "plan" },
+      record("discarded-model", { uuid: "a1", parentUuid: "u1" }),
+      { type: "last-prompt", explicit: true, leafUuid: null },
+    ]);
+    expect(await readResumedTail("empty-rewind")).toEqual({});
+  });
+
   it("reads the last real main-thread model across many backward reads", async () => {
     // The model record is followed by about 3 MB of later records.
     await transcript("long", [

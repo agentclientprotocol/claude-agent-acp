@@ -10480,6 +10480,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "sessionRewind",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
@@ -10503,6 +10504,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "sessionRewind",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
