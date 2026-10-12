@@ -39,9 +39,19 @@ export interface TurnEvents {
 
 /**
  * The foreground work of a session: what a client would wait for before it
- * sends the next prompt. A prompt's turn is the session's foreground work from
- * {@link TurnEvents.inserted} until it ends or fails. One piece of work runs at
- * a time, and the next starts with {@link running}.
+ * sends the next prompt. One piece of work runs at a time, and the next starts
+ * with {@link running}. The work is either:
+ *
+ * - A prompt's turn, from {@link TurnEvents.inserted} until its result, or
+ *   until it fails or is cancelled. A turn that v1 holds open for the
+ *   background subagents it spawned (`Turn.deferredSettle`) ends its work at
+ *   its result all the same: the hold only delays v1's answer.
+ * - A model cycle that Claude Code starts on its own while no work runs: for
+ *   example, its follow-up after a background command or subagent finished,
+ *   or its answer to a message from another session. It runs until its result.
+ *
+ * A prompt that Claude Code takes in while a cycle runs takes the cycle over:
+ * the cycle reports nothing more, and the turn reports from there.
  */
 export interface ForegroundEvents {
   /** The work started, or works again after it waited for the user. */

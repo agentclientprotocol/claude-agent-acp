@@ -17172,6 +17172,67 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     await agent.sessions["test-session"]?.consumer;
   });
 
+  it("resumes a held turn's foreground work for a steer, and ends it again at the steered result", async () => {
+    const foreground: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async () => {} } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+      {
+        foreground: () => ({
+          running: () => foreground.push("running"),
+          awaitingUser: () => foreground.push("awaitingUser"),
+          ended: (outcome) =>
+            foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
+          failed: () => foreground.push("failed"),
+        }),
+      },
+    );
+    injectGeneratorSession(agent, (input) => {
+      async function* messageGenerator() {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield running();
+        yield subagentStarted("agent-1");
+        yield resultMessage(); // held for agent-1
+        yield idle();
+        // The steer runs as a cycle of the held turn.
+        yield userEcho((await iter.next()).value);
+        yield assistantText("Steered answer");
+        yield resultMessage();
+        // The steered turn settles at an idle, held again for agent-1.
+        yield idle();
+        yield taskNotification("agent-1");
+        yield assistantText("promised summary");
+        yield resultMessage({ origin: { kind: "task-notification" } });
+        yield idle();
+      }
+      return messageGenerator();
+    });
+
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "explore" }],
+    });
+    await vi.waitFor(() =>
+      expect(agent.sessions["test-session"]?.activeTurn?.deferredSettle).toBeDefined(),
+    );
+    await agent.steer({ sessionId: "test-session", prompt: [{ type: "text", text: "also X" }] });
+
+    expect((await turn).stopReason).toBe("end_turn");
+    await agent.sessions["test-session"]?.consumer;
+    expect(foreground).toEqual([
+      "running",
+      "ended end_turn 15",
+      // The steer resumes the turn's work, which ends at the steered result
+      // with the turn's usage, both of its cycles.
+      "running",
+      "ended end_turn 30",
+      // The follow-up after the subagent finished is a cycle of its own.
+      "running",
+      "ended end_turn 15",
+    ]);
+  });
+
   describe("ExitPlanMode answered inside a held turn's followup (issue #1167)", () => {
     // Plan mode + a background Explore agent: the user turn's result holds,
     // the subagent finishes, and the model writes the plan and calls
@@ -17332,7 +17393,8 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           foreground: () => ({
             running: () => foreground.push("running"),
             awaitingUser: () => foreground.push("awaitingUser"),
-            ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+            ended: (outcome) =>
+              foreground.push(`ended ${outcome.stopReason} ${outcome.usage?.totalTokens}`),
             failed: () => foreground.push("failed"),
           }),
         },
@@ -17390,8 +17452,19 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
 
       await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
 
-      // The restart replaces the session behind the id; the work stays with the id.
-      expect(foreground).toEqual(["running", "awaitingUser", "running", "ended max_tokens"]);
+      // The turn's work ends at its result, though v1's answer is held. The
+      // follow-up that plans is a cycle, which the continuation takes over
+      // without a new `running`. The restart replaces the session behind the
+      // id; the work stays with the id.
+      expect(foreground).toEqual([
+        "running",
+        "ended end_turn 15",
+        "running",
+        "awaitingUser",
+        "running",
+        // The turn's usage: the carried 15 and the continuation's.
+        "ended max_tokens 30",
+      ]);
     });
 
     it("cancels the held turn when the user keeps planning", async () => {
@@ -17416,6 +17489,40 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.totalTokens).toBe(15);
       expect(createSession).not.toHaveBeenCalled();
       expect(agent.sessions["test-session"].pendingExitPlanModeInterruption).toBeUndefined();
+    });
+
+    it("ends the follow-up cycle cancelled, not failed, when the user keeps planning", async () => {
+      const foreground: string[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async () => {} } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+        {
+          foreground: () => ({
+            running: () => foreground.push("running"),
+            awaitingUser: () => foreground.push("awaitingUser"),
+            ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+            failed: () => foreground.push("failed"),
+          }),
+        },
+      );
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield* heldTurnPlanningFollowup(first);
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "plan" }],
+      });
+
+      expect(response.stopReason).toBe("cancelled");
+      // The turn's work ended at its result; the follow-up that planned is a
+      // cycle, which the error-shaped diagnostic of the answer ends cancelled.
+      expect(foreground).toEqual(["running", "ended end_turn", "running", "ended cancelled"]);
     });
   });
 

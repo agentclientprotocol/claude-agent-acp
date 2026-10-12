@@ -1328,6 +1328,12 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
   "observer-activity",
 ]);
 
+/** The foreground work of a session (see ForegroundEvents): a prompt's turn,
+ *  or a model cycle that Claude Code started on its own. At most one cycle
+ *  runs at a time, so a constant names it. */
+const AUTONOMOUS_CYCLE = "autonomous-cycle";
+type ForegroundOwner = Turn | typeof AUTONOMOUS_CYCLE;
+
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
@@ -2547,7 +2553,7 @@ export class ClaudeAcpAgent {
    */
   private readonly foregroundWork = new Map<
     string,
-    { owner: Turn; events: ForegroundEvents; awaitingUser: boolean }
+    { owner: ForegroundOwner; events: ForegroundEvents; awaitingUser: boolean }
   >();
   /** The session index (docs/air-extensions.md, "Session index"). */
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
@@ -3903,6 +3909,8 @@ export class ClaudeAcpAgent {
     if (turnInFlight.deferredSettle !== undefined) {
       turnInFlight.steeredSettle = turnInFlight.deferredSettle;
       turnInFlight.deferredSettle = undefined;
+      // The held turn's work had ended at its result; the steer resumes it.
+      this.startForeground(sessionId, turnInFlight);
     }
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
@@ -4656,6 +4664,8 @@ export class ClaudeAcpAgent {
         turnAwaitingSubagents(session.activeTurn)
       ) {
         session.activeTurn.deferredSettle = outcome;
+        // The hold delays v1's answer; the turn's work ended at its result.
+        this.endForeground(params.sessionId, session.activeTurn, { outcome });
       } else {
         await settleActive(outcome);
       }
@@ -4856,6 +4866,7 @@ export class ClaudeAcpAgent {
     /** Reject every in-flight turn — used when the stream dies. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
+      this.endAutonomousCycle(params.sessionId, { error });
       const turns = session.activeTurn
         ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
         : [...(session.turnQueue ?? [])];
@@ -5030,6 +5041,12 @@ export class ClaudeAcpAgent {
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
           );
+          this.endAutonomousCycle(
+            params.sessionId,
+            session.cancelled
+              ? { outcome: { stopReason: "cancelled" } }
+              : { error: RequestError.internalError(undefined, SESSION_ENDED_MESSAGE) },
+          );
           await settleActive(
             session.cancelled
               ? cancelledOutcome(session, inFlight)
@@ -5181,6 +5198,8 @@ export class ClaudeAcpAgent {
           continue;
         }
 
+        this.startAutonomousCycle(params.sessionId, session, message);
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -5330,6 +5349,17 @@ export class ClaudeAcpAgent {
                   session.owedTrailingIdles = 0;
                 }
                 if (message.state === "idle") {
+                  // A model cycle that Claude Code started on its own normally
+                  // ends at its result. An idle that no earlier result owes
+                  // means that result will not come (the stream dropped
+                  // mid-cycle, as for a turn in issue #825), so the cycle ends
+                  // here. An owed idle belongs to an earlier result: it can lag
+                  // past the cycle's first output.
+                  if (session.owedTrailingIdles === 0) {
+                    this.endAutonomousCycle(params.sessionId, {
+                      outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
+                    });
+                  }
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -5409,8 +5439,11 @@ export class ClaudeAcpAgent {
                     // Via the subagent gate, not settleActive: a steered turn
                     // can also have spawned background subagents, which own it
                     // from here (settles now if none is live, holds otherwise).
+                    const outcome = session.activeTurn.steeredSettle;
                     const steered: Turn = session.activeTurn;
-                    steered.deferredSettle = steered.steeredSettle;
+                    steered.deferredSettle = outcome;
+                    // A hold delays v1's answer; the turn's work ends here.
+                    this.endForeground(params.sessionId, steered, { outcome });
                     leaveSteerLane(steered);
                     await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
@@ -6195,6 +6228,36 @@ export class ClaudeAcpAgent {
                 });
               }
 
+              // A model cycle that Claude Code started on its own ends at its
+              // result, after its usage, also after a cancel. A turn that
+              // Claude Code takes in takes the cycle over, so a cycle that
+              // still runs owns this result, whatever its origin says. A
+              // placeholder result (`num_turns: 0`, see the autonomous lane
+              // below) comes before the shared followup runs, so it ends
+              // nothing. The diagnostic of an ExitPlanMode answer that
+              // interrupted the cycle ends it `cancelled`, as it ends a turn,
+              // unless a held turn continues the accepted plan in a fresh
+              // context: that turn takes the cycle over (see the autonomous
+              // lane below).
+              const exitPlanInterruption =
+                pendingExitPlanModeInterruption !== undefined &&
+                isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption);
+              const continuesPlan =
+                exitPlanInterruption &&
+                isHeldOpen(session.activeTurn) &&
+                pendingExitPlanContextReset?.toolUseId ===
+                  pendingExitPlanModeInterruption?.toolUseId;
+              if (!continuesPlan && !(isAutonomousResult && message.num_turns === 0)) {
+                this.endAutonomousCycle(
+                  params.sessionId,
+                  autonomousCycleEnd(
+                    message,
+                    resultModelUsage,
+                    session.cancelled || exitPlanInterruption,
+                  ),
+                );
+              }
+
               if (session.cancelled) {
                 session.pendingExitPlanModeInterruption = undefined;
                 session.pendingExitPlanContextReset = undefined;
@@ -6243,8 +6306,11 @@ export class ClaudeAcpAgent {
                   ) {
                     // The fresh query has none of this one's background
                     // tasks, so the hold can never drain there: drop it, and
-                    // let the continuation's own result settle the turn.
+                    // let the continuation's own result settle the turn. The
+                    // continuation is the turn's work again, which takes
+                    // over the follow-up cycle that planned it.
                     (heldTurn as Turn).deferredSettle = undefined;
+                    this.startForeground(params.sessionId, heldTurn as Turn);
                     await this.exitPlan.restart(
                       params.sessionId,
                       session,
@@ -7756,6 +7822,9 @@ export class ClaudeAcpAgent {
     } catch (error) {
       this.logger.error(`Session ${sessionId}: cancellation failed during teardown`, error);
     }
+    // The turns end before this returns; so does a model cycle that Claude
+    // Code started on its own, which no turn waits for.
+    this.endAutonomousCycle(sessionId, { outcome: { stopReason: "cancelled" } });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
     // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
     // below doesn't touch it. Since we're tearing the session down anyway, wake
@@ -8402,19 +8471,29 @@ export class ClaudeAcpAgent {
   }
 
   /** Make `owner` the foreground work of the session `sessionId` (see
-   *  {@link ForegroundEvents}), which reports `running`. */
-  private startForeground(sessionId: string, owner: Turn): void {
-    if (!this.foregroundEvents || this.foregroundWork.get(sessionId)?.owner === owner) return;
+   *  {@link ForegroundEvents}): it reports `running`, then waits at once if a
+   *  request is open. If work already runs, it goes on under `owner` and
+   *  reports nothing new: a turn takes over a cycle that Claude Code started on
+   *  its own, and only the owner's end ends the work. */
+  private startForeground(sessionId: string, owner: ForegroundOwner): void {
+    if (!this.foregroundEvents) return;
+    const current = this.foregroundWork.get(sessionId);
+    if (current) {
+      current.owner = owner;
+      return;
+    }
     const events = this.foregroundEvents(sessionId);
     this.foregroundWork.set(sessionId, { owner, events, awaitingUser: false });
     events.running();
+    const session = this.sessions[sessionId];
+    if (session) this.syncAwaitingUser(sessionId, session);
   }
 
   /** End the foreground work of the session `sessionId` with `outcome`, or as
    *  failed with `error`, if `owner` is that work. */
   private endForeground(
     sessionId: string,
-    owner: Turn,
+    owner: ForegroundOwner,
     end: { outcome: TurnOutcome } | { error: unknown },
   ): void {
     const work = this.foregroundWork.get(sessionId);
@@ -8422,6 +8501,36 @@ export class ClaudeAcpAgent {
     this.foregroundWork.delete(sessionId);
     if ("outcome" in end) work.events.ended(end.outcome);
     else work.events.failed(end.error);
+  }
+
+  /** Start a model cycle that Claude Code started on its own as the foreground
+   *  work (see {@link ForegroundEvents}) when `message` is its first output:
+   *  model output of the main conversation (not a subagent's) while no work
+   *  runs. That includes a turn that v1 holds for its background subagents,
+   *  whose work ended at its result, so its follow-up is a cycle. Output after
+   *  a cancel is dropped, so it starts nothing. */
+  private startAutonomousCycle(sessionId: string, session: Session, message: SDKMessage): void {
+    if (!this.foregroundEvents || this.foregroundWork.has(sessionId) || session.cancelled) return;
+    if (message.type !== "assistant" && message.type !== "stream_event") return;
+    if (message.parent_tool_use_id !== null) return;
+    // A turn that Claude Code started is the foreground work already. Without
+    // lifecycle frames, a queued turn's output can come before its echo, so
+    // output while a turn is queued may be that turn's. With them, a turn that
+    // Claude Code has not started has no output yet.
+    const queued = (session.turnQueue ?? []).some(
+      (turn) => !turn.settled && turn !== session.activeTurn,
+    );
+    if (queued && !session.msgLifecycleV1) return;
+    this.startForeground(sessionId, AUTONOMOUS_CYCLE);
+  }
+
+  /** End the session's model cycle that Claude Code started on its own, if one
+   *  runs. */
+  private endAutonomousCycle(
+    sessionId: string,
+    end: { outcome: TurnOutcome } | { error: unknown },
+  ): void {
+    this.endForeground(sessionId, AUTONOMOUS_CYCLE, end);
   }
 
   /** Forward a permission request to the client, wiring the tool call's
@@ -10432,15 +10541,62 @@ function cancelledOutcome(session: Session, turn: Turn | null | undefined): Turn
  *  so the rows can total more than `token_count`. They are the fuller picture,
  *  not a decomposition of it. */
 function turnQuotaMeta(session: Session) {
+  return quotaMeta(session.accumulatedUsage, session.accumulatedModelUsage);
+}
+
+/** `_meta.quota` for work that spent `usage` in its main agent loop and
+ *  `modelUsage` by model (see {@link turnQuotaMeta}). */
+function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefined) {
   return {
     quota: {
-      token_count: quotaTokenCount(session.accumulatedUsage),
-      model_usage: Object.entries(session.accumulatedModelUsage ?? {}).map(([model, usage]) => ({
+      token_count: quotaTokenCount(usage),
+      model_usage: Object.entries(modelUsage ?? {}).map(([model, usage]) => ({
         model,
         token_count: quotaTokenCount(usage),
       })),
     },
   };
+}
+
+/** How a model cycle that Claude Code started on its own ended, read from its
+ *  result as a turn's is: a refusal, the token limit, and the turn and budget
+ *  limits are their stop reasons, an error result fails the cycle, and a
+ *  cancel ends it `cancelled`. The usage and `_meta.quota` are the result's
+ *  own, `modelUsage` its increment by model, since autonomous results stay out
+ *  of the turn tally. */
+function autonomousCycleEnd(
+  result: Extract<SDKMessage, { type: "result" }>,
+  modelUsage: ModelTokenTally,
+  cancelled: boolean,
+): { outcome: TurnOutcome } | { error: unknown } {
+  // Typed non-null, but third-party backends have been observed omitting
+  // usage token fields (see snapshotFromUsage).
+  const tally: AccumulatedUsage = {
+    inputTokens: result.usage.input_tokens ?? 0,
+    outputTokens: result.usage.output_tokens ?? 0,
+    cachedReadTokens: result.usage.cache_read_input_tokens ?? 0,
+    cachedWriteTokens: result.usage.cache_creation_input_tokens ?? 0,
+  };
+  const ended = (stopReason: StopReason) => ({
+    outcome: {
+      stopReason,
+      usage: { ...tally, totalTokens: tallyTotal(tally) },
+      _meta: quotaMeta(tally, modelUsage),
+    },
+  });
+  if (cancelled) return ended("cancelled");
+  if (result.stop_reason === "refusal") return ended("refusal");
+  if (result.stop_reason === "max_tokens") return ended("max_tokens");
+  if (result.is_error) {
+    const text =
+      result.subtype === "success" ? result.result : result.errors.join(", ") || result.subtype;
+    return { error: RequestError.internalError(undefined, text) };
+  }
+  return ended(
+    result.subtype === "success" || result.subtype === "error_during_execution"
+      ? "end_turn"
+      : "max_turn_requests",
+  );
 }
 
 /** One `token_count` object. `cachedInputTokens` is cache reads, matching

@@ -402,6 +402,36 @@ describe("turn events", () => {
     expect(foreground).toEqual(["running", "awaitingUser", "running", "ended end_turn"]);
   });
 
+  it("reports work that starts while a request is open as waiting at once", async () => {
+    let atStart: string[] = [];
+    scriptQuery(async function* (input, options) {
+      const { value } = await input.next();
+      // A request that no work opened, such as a background task's. The user
+      // answers it only once the test resolves `backgroundAnswer`.
+      const background = options.canUseTool!(
+        "Bash",
+        { command: "sleep 60" },
+        { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
+      );
+      await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
+      yield lifecycle(value.uuid, "started", options.sessionId!);
+      // Before the prompt's echo, which would report the request too.
+      atStart = [...foreground];
+      backgroundAnswer.resolve();
+      await background;
+      yield echo(value, options.sessionId!);
+      yield result(options.sessionId!);
+      await input.next();
+    });
+    const sessionId = await newSession();
+    const turn = recordEvents();
+
+    await agent.startTurn(prompt(sessionId, "list files"), turn.events);
+    await turn.done;
+
+    expect(atStart).toEqual(["running", "awaitingUser"]);
+  });
+
   it("awaits the user while any request in the session is open, also one opened before the turn", async () => {
     const first = recordEvents();
     const second = recordEvents();

@@ -80,11 +80,12 @@ export function v2Prompt(
  *   code as for an error response (for example, `-32000` starts the client's
  *   sign-in).
  *
- * A prompt's turn stays the foreground work while it is held for the
- * background subagents it spawned (`Turn.deferredSettle`), so `idle` waits for
- * them too. The hold exists for v1, whose clients stop listening at the prompt
- * response. v2 allows background updates while idle, so it could report `idle`
- * at the turn's result instead (step 6 in `docs/acp-v2.md`).
+ * The work is a prompt's turn or a model cycle that Claude Code started on its
+ * own, such as its follow-up after a background subagent finished. A turn's
+ * work ends at its result, also when v1 holds the turn's answer for the
+ * background subagents it spawned (`Turn.deferredSettle`): v2 allows
+ * background updates while idle, so the subagents' output and requests arrive
+ * after `idle`, and their follow-up is a cycle of its own.
  */
 export function v2Foreground(send: (update: v2.SessionUpdate) => void): ForegroundEvents {
   return {
