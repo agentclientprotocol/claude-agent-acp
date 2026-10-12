@@ -858,7 +858,19 @@ type PendingReplay = {
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
+  /** Set by a cancel. While it is set, the consumer treats what arrives as the
+   *  work the cancel stopped: it drops main-thread `assistant` and `user`
+   *  messages (streamed text still goes out), skips results, and starts no
+   *  model cycle. Cleared when the next prompt's turn activates,
+   *  or when Claude Code starts a model request that serves none of
+   *  {@link Session.cancelledPrompts} (see the `status` case of the
+   *  consumer), such as its follow-up after a background command finished. */
   cancelled: boolean;
+  /** The prompts whose work the cancel stopped: the turns it settled as
+   *  cancelled, and their steers. Recorded when the cancel arrives, before the
+   *  orphan accounting, which can undercount a prompt that Claude Code had
+   *  already taken off its queue. */
+  cancelledPrompts?: Set<string>;
   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
    *  processing; later entries are queued and will be echoed in order. */
   turnQueue?: Turn[];
@@ -930,6 +942,16 @@ export type Session = {
    *  cancel() routes orphan accounting to `orphanCommands` (exact, per-uuid)
    *  instead of `pendingOrphanResults` (count, coalescing-blind). */
   msgLifecycleV1?: boolean;
+  /** True once a `system`/init advertised the request_marker_lists_v1
+   *  capability: each `status: requesting` frame, which starts a model
+   *  request, then lists the prompts the request serves in
+   *  `user_message_uuids`, and leaves the field out for a request that serves
+   *  none, such as a cycle that Claude Code started on its own. */
+  requestMarkerListsV1?: boolean;
+  /** A main-thread model request started (`status: requesting`) since the
+   *  last result, so a model cycle runs. Read only with
+   *  {@link Session.requestMarkerListsV1}. */
+  modelRequestSinceResult?: boolean;
   /** Latched from `system`/init `terminal_slash_commands` (CLI 2.1.232+):
    *  names of advertised slash commands whose UX is bound to the CLI's own
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
@@ -4310,6 +4332,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      session.cancelledPrompts = undefined;
       compaction.resume();
       if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
@@ -4380,7 +4403,10 @@ export class ClaudeAcpAgent {
      *  a stamp naming an orphaned command consumes the result outright, and a
      *  stamp naming anything else positively refutes "this is a dead turn's
      *  result", so the dup-over-loss one-skip must not eat it. */
-    const ensureActiveTurn = async (resultUserMessageUuid?: string) => {
+    const ensureActiveTurn = async (
+      resultUserMessageUuid?: string,
+      resultUserMessageUuids?: readonly string[],
+    ) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -4406,8 +4432,8 @@ export class ClaudeAcpAgent {
       }
       // Orphan accounting runs BEFORE the head check: an orphan's echo-less
       // result can arrive with an EMPTY queue (the common post-cancel
-      // timeline — the active turn settled at the interrupt's idle and the
-      // user hasn't typed yet), and it must still be consumed here. Skipping
+      // timeline — the cancelled turn settled at its interrupted result and
+      // the user hasn't typed yet), and it must still be consumed here. Skipping
       // the bookkeeping when there is nothing to promote would leave a
       // phantom entry/count that swallows the next live echo-less result
       // (e.g. /compact) instead.
@@ -4475,6 +4501,14 @@ export class ClaudeAcpAgent {
           }
         }
       }
+      // A result that names a prompt a cancel stopped is that prompt's, even
+      // when the orphan accounting above lost track of it: the interrupt
+      // receipt leaves out a prompt that Claude Code had already taken off its
+      // queue. It must not settle the prompt sent after the cancel.
+      const stamps =
+        resultUserMessageUuids ??
+        (resultUserMessageUuid !== undefined ? [resultUserMessageUuid] : []);
+      if (stamps.some((uuid) => session.cancelledPrompts?.has(uuid))) return;
       const head = firstUnsettledQueuedTurn();
       if (!head) {
         return;
@@ -4965,9 +4999,9 @@ export class ClaudeAcpAgent {
                 this.trackOrphanCommand(session, active.promptUuid, "zombie");
               }
             } else if (active.commandResultSeen) {
-              // Its result was already consumed (dropped at the cancelled
-              // guard); only the terminal frame is outstanding, which no-ops
-              // with no entry. Nothing to track.
+              // Its result was already consumed (at the cancelled guard);
+              // only the terminal frame is outstanding, which no-ops with no
+              // entry. Nothing to track.
             } else {
               // The wedged turn WAS dispatched (it's active), so track it
               // "started": its late result (if the SDK recovers) is skipped
@@ -5211,6 +5245,9 @@ export class ClaudeAcpAgent {
                 if (message.capabilities?.includes("msg_lifecycle_v1")) {
                   session.msgLifecycleV1 = true;
                 }
+                if (message.capabilities?.includes("request_marker_lists_v1")) {
+                  session.requestMarkerListsV1 = true;
+                }
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
@@ -5254,6 +5291,25 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "status": {
+                // A model request that serves none of the prompts a cancel
+                // stopped is new work, such as Claude Code's follow-up after a
+                // background command finished. It comes after the stopped
+                // work's result: Claude Code ends the interrupted turn first,
+                // then runs any prompt it had already taken off its queue (its
+                // request names it, so the cancel still drops it), then its own
+                // follow-ups, whose requests name no prompt.
+                if (
+                  message.status === "requesting" &&
+                  session.cancelled &&
+                  session.requestMarkerListsV1 &&
+                  !servesCancelledWork(session, message)
+                ) {
+                  session.cancelled = false;
+                  session.cancelledPrompts = undefined;
+                  // The stopped work's tail has drained, as at activation.
+                  compaction.resume();
+                }
+                if (message.status === "requesting") session.modelRequestSinceResult = true;
                 if (message.status === "compacting") {
                   await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
@@ -5369,9 +5425,9 @@ export class ClaudeAcpAgent {
                   // the time it arrives the SDK may have echoed the NEXT turn
                   // and activated it — settling now would resolve that new
                   // turn prematurely with end_turn and ~zero usage, dropping
-                  // its real result. A cancelled turn relies on `idle`: its
-                  // `result` is dropped at the `session.cancelled` guard, so
-                  // it never settles at a result and must settle here.
+                  // its real result. A cancelled turn settles at its
+                  // interrupted result (at the `session.cancelled` guard); one
+                  // whose result never came settles here.
                   //
                   // An idle that is NOT owed while the active turn is still
                   // unsettled is the issue #825 signature: `idle` is the SDK's
@@ -5383,12 +5439,9 @@ export class ClaudeAcpAgent {
                   // the turn NOW so its session/prompt gets a terminal
                   // response, instead of leaving it hanging until the next
                   // prompt drains the wreckage.
-                  // A cancelled turn still consumed tokens: its dropped result
-                  // already fed the accumulator (the usage tally at the result
-                  // handler runs before the `session.cancelled` guard), so
-                  // report it — clients metering spend would otherwise lose
-                  // the interrupted turn's tokens entirely (issue #844). Zero
-                  // when the cancel pre-empted the result (wedge/force-cancel).
+                  // A cancelled turn reaches this with no result of its own,
+                  // so its usage is zero (wedge/force-cancel), or, for a held
+                  // turn, the usage its result recorded (issue #844).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
                     // A held turn's result passed long ago; this idle is the
                     // trailer of the followup cycle the cancel interrupted,
@@ -5983,6 +6036,7 @@ export class ClaudeAcpAgent {
             }
             break;
           case "result": {
+            session.modelRequestSinceResult = false;
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -6024,7 +6078,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                await ensureActiveTurn(message.user_message_uuid);
+                await ensureActiveTurn(message.user_message_uuid, message.user_message_uuids);
                 // A result that names a steer consumed it (see
                 // Turn.steeredEchoes), so the steered work is done: retire
                 // its echo — the CLI may never have replayed it — and, with
@@ -6088,13 +6142,10 @@ export class ClaudeAcpAgent {
               // orphan skip) and the SDK follows it with a trailing
               // `session_state_changed: idle` — record the debt so the idle
               // handler absorbs that idle rather than reading it as a turn the
-              // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
-              // turn's own result. It is dropped at the `session.cancelled`
-              // guard, and either the idle itself settles the turn (consuming
-              // the trailer) or the next echo's hand-off does (which records
-              // the debt there instead) — counting here too would double it.
-              // Results skipped while cancelled with NO active turn — orphaned
-              // queued turns the SDK still ran, or a force-cancelled turn's
+              // SDK abandoned (issue #825). That includes the result of a
+              // cancelled turn, which settles it at the `session.cancelled`
+              // guard below. Results skipped while cancelled with NO active
+              // turn — orphaned queued turns the SDK still ran, or a force-cancelled turn's
               // late result after the backstop settled it — get no such settle,
               // so their trailers must be counted here or they'd later be read
               // as the next healthy turn being abandoned and false-fail it.
@@ -6107,22 +6158,18 @@ export class ClaudeAcpAgent {
               // but a held turn settling AT a followup result unblocks the
               // client at exactly that point, making the race the common
               // case.
-              // The cancelled-ACTIVE-turn exclusion applies only to that
-              // turn's OWN result — a followup result arriving inside the
-              // cancel window still gets its own trailer and must be counted,
-              // or that idle would later false-fail the next prompt.
-              // A second exclusion: a steered turn's own results (see
+              // One exclusion: a steered turn's own results (see
               // Turn.steeredEchoes). One idle covers the whole interrupted +
               // steered sequence and that idle settles the turn, so counting
               // either result would leave a debt that swallows it. Autonomous
               // results inside a steered turn keep their own trailers, and so
               // does a result that named the steer: it took the turn out of the
-              // steer lane above and settles at the result, not the idle.
-              const owesTrailingIdle = isAutonomousResult || !isSteering(session.activeTurn);
-              if (
-                owesTrailingIdle &&
-                (isAutonomousResult || !session.cancelled || !session.activeTurn)
-              ) {
+              // steer lane above and settles at the result, not the idle. So
+              // does a cancelled steered turn's result, which settles it at the
+              // `session.cancelled` guard below.
+              const owesTrailingIdle =
+                isAutonomousResult || !isSteering(session.activeTurn) || session.cancelled;
+              if (owesTrailingIdle) {
                 session.owedTrailingIdles++;
               }
 
@@ -6253,7 +6300,7 @@ export class ClaudeAcpAgent {
                   autonomousCycleEnd(
                     message,
                     resultModelUsage,
-                    session.cancelled || exitPlanInterruption,
+                    session.cancelled || exitPlanInterruption || isAbortedResult(message),
                   ),
                 );
               }
@@ -6264,6 +6311,22 @@ export class ClaudeAcpAgent {
                 if (!isAutonomousResult) {
                   await clearFailuresFromEarlierTurns();
                   stopReason = "cancelled";
+                }
+                // The cancelled turn ends at the result of the work the
+                // interrupt stopped: its own result, or for a turn held open
+                // for its subagents (see Turn.deferredSettle), its follow-up's
+                // aborted one. A follow-up result that is not aborted, such as
+                // a placeholder or one that ended before the interrupt landed,
+                // belongs to other work. Claude Code ends the stopped work
+                // first, then goes on with its queue, so the idle can come
+                // much later, after a follow-up. That idle, the next echo's
+                // hand-off, and the force-cancel backstop settle a turn whose
+                // result never comes.
+                const active = session.activeTurn;
+                const stoppedWork =
+                  !isAutonomousResult || (isHeldOpen(active) && isAbortedResult(message));
+                if (active && !active.settled && stoppedWork) {
+                  await settleActive(cancelledOutcome(session, active));
                 }
                 break;
               }
@@ -6650,9 +6713,10 @@ export class ClaudeAcpAgent {
               // subagent never holds the prompt hostage.
               //
               // is_error/auth already settled via failActive (activeTurn is null
-              // then, so both branches no-op); cancellation is left to the
-              // idle/abort path. settleActive is idempotent, so a duplicate
-              // idle is a no-op.
+              // then, so both branches no-op); a cancelled turn settles at
+              // the `session.cancelled` guard above, or on the idle/abort
+              // path when its result never comes. settleActive is idempotent,
+              // so a duplicate idle is a no-op.
               //
               // A result also closes this compaction lifecycle — before the
               // settle, so a `cancelled` terminal for an entity the runtime
@@ -6867,7 +6931,7 @@ export class ClaudeAcpAgent {
                 if (session.activeTurn !== queued) {
                   if (session.activeTurn) {
                     // Hand off the previous turn. If a cancel is pending for it
-                    // (its trailing idle hasn't arrived yet), settle it
+                    // (neither its result nor its idle has arrived), settle it
                     // "cancelled" per the ACP contract rather than "end_turn" —
                     // otherwise a cancel followed quickly by the next prompt
                     // would report the cancelled turn as a normal completion.
@@ -7453,6 +7517,14 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // Before anything awaits, so a model request that the consumer reads in
+    // the meantime is already judged against these prompts.
+    session.cancelledPrompts ??= new Set();
+    for (const turn of session.turnQueue ?? []) {
+      if (turn.settled) continue;
+      session.cancelledPrompts.add(turn.promptUuid);
+      for (const uuid of turn.steeredUuids ?? []) session.cancelledPrompts.add(uuid);
+    }
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -7507,9 +7579,10 @@ export class ClaudeAcpAgent {
     // never decrements the count) to miss.
     const lifecycleLane = session.msgLifecycleV1 === true;
     // Settle queued turns that haven't started yet (no echo seen) right away —
-    // they have no in-flight SDK work to interrupt. The active turn is settled
-    // by the consumer when it observes the interrupt's trailing idle (or via the
-    // backstop below). Mirrors the old pendingMessages cancellation.
+    // they have no in-flight SDK work to interrupt. The consumer settles the
+    // active turn at its interrupted result, or at the idle when that never
+    // comes (or via the backstop below). Mirrors the old pendingMessages
+    // cancellation.
     const orphanedTurns: Turn[] = [];
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
@@ -7604,15 +7677,19 @@ export class ClaudeAcpAgent {
     // whose session sits idle gets no trailing idle (the interrupt emits
     // nothing; with no state events consumed yet, the same is assumed).
     // A held turn whose followup cycle is live (running, or blocked on a
-    // permission request) is left to that idle, like any live turn: the
-    // interrupt still flushes the cycle's output, which must reach the client
-    // before the turn ends cancelled. The captured outcome preserves usage and
-    // metadata (issue #844), while reporter state makes a late checkpoint
-    // response harmless.
+    // permission request) is left to that cycle's interrupted result, like any
+    // live turn, or to the idle when no result comes. The captured outcome
+    // preserves usage and metadata (issue #844), while reporter state makes a
+    // late checkpoint response harmless.
+    // Since CLI 2.1.270, Claude Code reports `running` for as long as
+    // background agents live, so the session state cannot tell a live
+    // followup from a hold. With request markers, a followup is live when one
+    // of its model requests started after the turn's result.
     {
       const active = session.activeTurn;
-      const followupLive =
-        session.lastSessionState === "running" || session.lastSessionState === "requires_action";
+      const followupLive = session.requestMarkerListsV1
+        ? session.modelRequestSinceResult === true
+        : session.lastSessionState === "running" || session.lastSessionState === "requires_action";
       if (
         active &&
         (active.settling || (isHeldOpen(active) && !followupLive)) &&
@@ -7655,7 +7732,7 @@ export class ClaudeAcpAgent {
     }
 
     // A steered active turn (see Turn.steeredEchoes) settles "cancelled" in the
-    // consumer at the interrupt's trailing idle, like any live turn. But the
+    // consumer at its interrupted result, or at the idle, like any live turn. But the
     // steer lane pays for its last result's trailer by settling on it, which
     // this cancel pre-empts, so count that trailer here or it arrives un-owed
     // against the next prompt and false-fails it (issue #825). Over-counting
@@ -7692,6 +7769,9 @@ export class ClaudeAcpAgent {
 
     // Before the interrupt: once it stops the running turn, Claude Code starts
     // the next queued message right away.
+    // A prompt or steer that arrived while this cancel awaited is abandoned
+    // too, after the record above was taken.
+    for (const uuid of abandoned) (session.cancelledPrompts ??= new Set()).add(uuid);
     this.dropQueuedMessages(params.sessionId, session.query, abandoned);
     const interrupt = session.query.interrupt();
     if (!options.awaitInterrupt) {
@@ -8507,8 +8587,8 @@ export class ClaudeAcpAgent {
    *  work (see {@link ForegroundEvents}) when `message` is its first output:
    *  model output of the main conversation (not a subagent's) while no work
    *  runs. That includes a turn that v1 holds for its background subagents,
-   *  whose work ended at its result, so its follow-up is a cycle. Output after
-   *  a cancel is dropped, so it starts nothing. */
+   *  whose work ended at its result, so its follow-up is a cycle. Output of
+   *  the work a cancel stopped starts nothing (see Session.cancelled). */
   private startAutonomousCycle(sessionId: string, session: Session, message: SDKMessage): void {
     if (!this.foregroundEvents || this.foregroundWork.has(sessionId) || session.cancelled) return;
     if (message.type !== "assistant" && message.type !== "stream_event") return;
@@ -10529,6 +10609,31 @@ function cancelledOutcome(session: Session, turn: Turn | null | undefined): Turn
   };
 }
 
+/** Whether the model request that `status` (a `status: requesting` frame)
+ *  starts may belong to the work a cancel stopped. It may while:
+ *  - a turn is unsettled: the stopped turn, whose result is still to come, or
+ *    a queued prompt, which the cancel abandons (one that arrived while the
+ *    cancel awaited is recorded only when the cancel sweeps the queue) or
+ *    whose echo ends the cancel right after its request anyway;
+ *  - the orphan accounting still expects the result of an abandoned prompt
+ *    that Claude Code may still run, which it can fold into its own
+ *    follow-up after that follow-up's first request;
+ *  - the request serves one of {@link Session.cancelledPrompts}, as an
+ *    abandoned prompt's request does even when the interrupt receipt left it
+ *    out of the orphan accounting. */
+function servesCancelledWork(session: Session, status: object): boolean {
+  const cancelled = session.cancelledPrompts;
+  if (!cancelled) return false;
+  if ((session.turnQueue ?? []).some((turn) => !turn.settled)) return true;
+  if ((session.pendingOrphanResults ?? 0) > 0 || (session.orphanCommands?.size ?? 0) > 0) {
+    return true;
+  }
+  const served = (status as { user_message_uuids?: unknown }).user_message_uuids;
+  return (
+    Array.isArray(served) && served.some((uuid) => typeof uuid === "string" && cancelled.has(uuid))
+  );
+}
+
 /** `_meta.quota` for a prompt response: what the turn spent, shaped like
  *  codex-acp's (snake_case container keys, camelCase counters) so a client
  *  reads one shape from either agent.
@@ -10556,6 +10661,14 @@ function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefi
       })),
     },
   };
+}
+
+/** Whether Claude Code ended the work of `result` because an interrupt
+ *  stopped it, while the model streamed or while a tool ran. */
+function isAbortedResult(result: Extract<SDKMessage, { type: "result" }>): boolean {
+  return (
+    result.terminal_reason === "aborted_streaming" || result.terminal_reason === "aborted_tools"
+  );
 }
 
 /** How a model cycle that Claude Code started on its own ended, read from its

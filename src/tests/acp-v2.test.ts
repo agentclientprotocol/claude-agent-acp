@@ -2048,6 +2048,235 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
 
     expect(atClose).toEqual([...endedTurn, "running", "agent_message_chunk", "idle cancelled"]);
   });
+
+  // After an interrupt, CLI 2.1.293 ends the interrupted work with an aborted
+  // result, then goes on with its queue, and each model request starts with a
+  // `status: requesting` frame that lists the prompts it serves.
+
+  /** Claude Code's `system`/init, advertising that its requests list their prompts. */
+  const markersInit = (options: Options) => ({
+    type: "system",
+    subtype: "init",
+    capabilities: ["request_marker_lists_v1"],
+    session_id: options.sessionId,
+  });
+  /** The frame that starts a model request serving `prompts`. */
+  const requesting = (options: Options, ...prompts: string[]) => ({
+    type: "system",
+    subtype: "status",
+    status: "requesting",
+    ...(prompts.length > 0 ? { user_message_uuids: prompts } : {}),
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  });
+  /** How a result ends work that an interrupt stopped while the model streamed. */
+  const ABORTED = {
+    subtype: "error_during_execution",
+    is_error: true,
+    stop_reason: null,
+    terminal_reason: "aborted_streaming",
+  };
+
+  it("ends a cancelled turn at its result and reports the follow-up after it as a cycle", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_1", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "Starting" },
+      });
+      await interrupted.promise;
+      yield result(options, ABORTED);
+      // A command that the turn backgrounded finished while it ran, so
+      // Claude Code runs its follow-up next, with no idle in between.
+      yield requesting(options);
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("reports a follow-up that Claude Code runs after a cancel while nothing ran", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      await interrupted.promise;
+      // An interrupt while nothing runs makes Claude Code report idle again.
+      yield idleState(options);
+      yield requesting(options);
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("reports the compaction of a follow-up that Claude Code runs after a cancel", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      await interrupted.promise;
+      yield idleState(options);
+      // The follow-up's request compacts the context before the model runs.
+      yield requesting(options);
+      yield {
+        type: "system",
+        subtype: "status",
+        status: "compacting",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "compact_boundary",
+        compact_metadata: { trigger: "auto", pre_tokens: 1000, post_tokens: 100, duration_ms: 7 },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "system",
+        subtype: "status",
+        status: null,
+        compact_result: "success",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(client.updates("compaction_update").length).toBeGreaterThan(0);
+  });
+
+  it("reports a later cycle after the client cancelled one", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield assistantText(options, "Started two builds in the background.");
+      yield result(options);
+      yield idleState(options);
+      yield requesting(options);
+      yield assistantText(options, "The first build", "msg_first");
+      await interrupted.promise;
+      yield followupResult(options, ABORTED);
+      yield idleState(options);
+      yield requesting(options);
+      yield assistantText(options, "The second build passed.", "msg_second");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(3, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          ...endedTurn,
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("ends a cycle that the interrupt stopped cancelled, when Claude Code had started it before the cancel arrived", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield assistantText(options, "Started two builds in the background.");
+      yield result(options);
+      yield idleState(options);
+      yield requesting(options);
+      yield assistantText(options, "The first build passed.", "msg_first");
+      await interrupted.promise;
+      // Claude Code had finished the first cycle and started the second one
+      // when the interrupt arrived, so the interrupt stops the second.
+      yield followupResult(options);
+      yield requesting(options);
+      yield assistantText(options, "The second build", "msg_second");
+      yield followupResult(options, ABORTED);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(3, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          ...endedTurn,
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
 });
 
 describe("ACP v2 session translation", () => {
