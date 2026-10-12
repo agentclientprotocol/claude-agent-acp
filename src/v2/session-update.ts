@@ -55,6 +55,9 @@ export function v2SessionUpdate(
         plan: { type: "items", planId: SESSION_PLAN_ID, entries: update.entries },
         ...(update._meta != null ? { _meta: update._meta } : {}),
       };
+    case "plan_update":
+      // v1's draft plan operations have v2's shape.
+      return update;
     case "current_mode_update":
       // v2 has no modes: the mode is the `mode` config option. Every mode
       // change also reaches the client as a `config_option_update` or in the

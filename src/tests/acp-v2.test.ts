@@ -865,6 +865,52 @@ describe("ACP v2 prompts", () => {
     );
   });
 
+  it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_plan",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_plan",
+              name: "ExitPlanMode",
+              // The transcript keeps the plan that Claude Code adds to the input.
+              input: { plan: "# Plan\n1. Do it", planFilePath: "/plans/p.md" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_plan",
+              content: "User has approved your plan. You can now start coding.",
+            },
+          ],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("plan_update")).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: { type: "markdown", planId: "plan-mode", content: "# Plan\n1. Do it" },
+      },
+    ]);
+  });
+
   it("reports Claude Code's warnings as live notices", async () => {
     scriptTurns(async function* (options) {
       yield {
@@ -2956,6 +3002,14 @@ describe("ACP v2 session translation", () => {
       plan: { type: "items", planId: "plan", entries },
       _meta: meta,
     });
+  });
+
+  it("passes the agent's plan operations through, which have v2's shape", () => {
+    const update = {
+      sessionUpdate: "plan_update" as const,
+      plan: { type: "markdown" as const, planId: "plan-mode", content: "# Plan" },
+    };
+    expect(v2SessionUpdate(update)).toEqual(update);
   });
 
   it("reports a new tool call with an upserting tool_call_update", () => {

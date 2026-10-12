@@ -284,9 +284,11 @@ import {
 } from "./utils.js";
 import {
   acceptedPlanToolResult,
+  approvedPlan,
   ExitPlanCoordinator,
   isExitPlanInterruptionResult,
   observeExitPlanToolResults,
+  planModeUpdate,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -7399,6 +7401,21 @@ export class ClaudeAcpAgent {
                 ),
               );
             }
+            // A plan approved with clearing the context ends its ExitPlanMode
+            // with an error result (shown as completed, see
+            // acceptedPlanToolResult), which toAcpNotifications does not
+            // publish as the session's plan, so publish it here.
+            const contextReset = session.pendingExitPlanContextReset;
+            if (
+              acceptedPlanToolUseId &&
+              contextReset?.toolUseId === acceptedPlanToolUseId &&
+              this.clientCapabilities?.plan
+            ) {
+              await sendUpdate({
+                sessionId: params.sessionId,
+                update: planModeUpdate(contextReset.plan),
+              });
+            }
             break;
           }
           case "tool_progress": {
@@ -12100,6 +12117,19 @@ export function toAcpNotifications(
               stampParentToolUseId(outputUpdate, options.parentToolUseId);
             }
             output.push({ sessionId, update: outputUpdate });
+          }
+          // An approved plan of the main conversation becomes the session's
+          // markdown plan, live and on replay. The adapter's own approval that
+          // clears the context ends the tool with an error result instead;
+          // the consumer publishes that plan.
+          if (
+            toolUse.name === "ExitPlanMode" &&
+            options?.clientCapabilities?.plan &&
+            !options.parentToolUseId &&
+            !("is_error" in chunk && chunk.is_error)
+          ) {
+            const plan = approvedPlan(toolUse.input, toolUseResult);
+            if (plan) output.push({ sessionId, update: planModeUpdate(plan) });
           }
           update = finalUpdate;
         }

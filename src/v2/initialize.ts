@@ -32,6 +32,10 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
       // compaction as a compaction entity rather than as a "Compact
       // conversation" tool call, also on replay.
       session: { configOptions: { boolean: {} }, notices: {}, compaction: {} },
+      // Every v2 client takes `plan_update`, with the draft's markdown and file
+      // plans, and `plan_removed`; v1 asks for the `plan` marker. With it, the
+      // agent shows an approved ExitPlanMode plan as a markdown plan.
+      plan: {},
       // v1 marks terminal auth support with a boolean, v2 with an object.
       auth: {
         terminal: capabilities?.auth?.terminal != null,

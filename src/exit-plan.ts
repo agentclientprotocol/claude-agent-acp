@@ -126,6 +126,37 @@ export function isExitPlanInterruptionResult(
   );
 }
 
+/** The id of the plan that an approved ExitPlanMode publishes. Claude Code
+ * keeps one plan file per session, which a later plan mode rewrites, so each
+ * approval replaces the plan before it. The TodoWrite checklist is a
+ * separate plan. */
+export const PLAN_MODE_PLAN_ID = "plan-mode";
+
+/** The plan that a successful ExitPlanMode result approved: the plan of the
+ * structured `output`, which includes the user's edits, else the plan that
+ * Claude Code adds to the tool's `input` (also in the transcript, which keeps
+ * no structured output for replay). Undefined for a subagent's plan, one that
+ * waits for its team lead, and an empty plan. */
+export function approvedPlan(input: unknown, output: unknown): string | undefined {
+  const result = output as
+    { plan?: unknown; isAgent?: unknown; awaitingLeaderApproval?: unknown } | undefined;
+  if (result?.isAgent === true || result?.awaitingLeaderApproval === true) return undefined;
+  const plan =
+    typeof result?.plan === "string"
+      ? result.plan
+      : (input as { plan?: unknown } | undefined)?.plan;
+  return typeof plan === "string" && plan.trim() !== "" ? plan : undefined;
+}
+
+/** The update that shows an approved plan to a client that supports plan
+ * operations (the `plan` client capability, which every v2 client has). */
+export function planModeUpdate(plan: string): SessionNotification["update"] {
+  return {
+    sessionUpdate: "plan_update",
+    plan: { type: "markdown", planId: PLAN_MODE_PLAN_ID, content: plan },
+  };
+}
+
 /** Claude wraps a rejected ExitPlanMode explanation in a Markdown code fence.
  * Strip exactly one complete outer fence for that tool only. */
 export function exitPlanModeRawOutput(toolName: string, content: unknown): unknown {

@@ -18377,6 +18377,61 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       );
     });
 
+    it("shows a plan approved with clearing the context as the session's markdown plan", async () => {
+      const updates: any[] = [];
+      const agent = new ClaudeAcpAgent(
+        { sessionUpdate: async (n: any) => updates.push(n) } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await initializeClient(agent, { plan: {} });
+      vi.spyOn(agent as any, "createSession").mockImplementation(
+        async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            yield userEcho((await input[Symbol.asyncIterator]().next()).value);
+            yield assistantText("Implemented");
+            yield resultMessage();
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        },
+      );
+      injectGeneratorSession(
+        agent,
+        (input) =>
+          (async function* () {
+            yield* heldTurnPlanningFollowup((await input[Symbol.asyncIterator]().next()).value);
+            yield idle();
+          })(),
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it",
+            mode: "auto",
+          },
+        },
+      );
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
+
+      expect(updates.filter((n) => n.update.sessionUpdate === "plan_update")).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "plan_update",
+            plan: { type: "markdown", planId: "plan-mode", content: "Implement it" },
+          },
+        },
+      ]);
+    });
+
     it("keeps the turn as the session's foreground work across the clear-context restart", async () => {
       const foreground: string[] = [];
       const agent = new ClaudeAcpAgent(
