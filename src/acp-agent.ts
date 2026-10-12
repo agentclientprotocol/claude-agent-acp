@@ -56,7 +56,7 @@ import {
   WriteTextFileResponse,
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
-import type { StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
+import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,
   AgentInfo,
@@ -662,15 +662,12 @@ type Turn = {
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
   promptUuid: string;
-  /** Where the turn reports how it progresses (see {@link TurnEvents}). */
+  /** Where the turn reports how its prompt is answered (see {@link TurnEvents}). */
   events: TurnEvents;
   /** Set once `events.inserted` has been reported. A clear-context restart
    *  activates the same turn again in the fresh session, which must not report
    *  it twice. */
   insertedReported?: boolean;
-  /** Whether the turn last reported that it awaits the user, so that
-   *  `syncAwaitingUser` reports only changes. */
-  awaitingUser?: boolean;
   /** Tools surfaced during this turn, awaiting completion or an explicit
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
@@ -2540,6 +2537,18 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
+  /** See the `foreground` constructor option. */
+  private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
+  /**
+   * The foreground work of each session while it runs, by the session id that
+   * the client knows. A clear-context restart replaces the Claude Code session
+   * behind that id and moves the running turn to it, so the work belongs to the
+   * id, not to a {@link Session}.
+   */
+  private readonly foregroundWork = new Map<
+    string,
+    { owner: Turn; events: ForegroundEvents; awaitingUser: boolean }
+  >();
   /** The session index (docs/air-extensions.md, "Session index"). */
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
     agent: this,
@@ -2548,8 +2557,22 @@ export class ClaudeAcpAgent {
     teardownSession: (sessionId) => this.teardownSession(sessionId),
   });
 
-  constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
+  constructor(
+    client: AcpClient,
+    logger?: Logger,
+    options: {
+      v2?: boolean;
+      /**
+       * Where the agent reports a session's foreground work (see
+       * {@link ForegroundEvents}), called each time work starts in the session
+       * `sessionId`. Without it, nothing reports the work: a v1 client has no
+       * session state, and learns that a turn ended from its prompt response.
+       */
+      foreground?: (sessionId: string) => ForegroundEvents;
+    } = {},
+  ) {
     this.v2 = options.v2 ?? false;
+    this.foregroundEvents = options.foreground;
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
@@ -3426,13 +3449,7 @@ export class ClaudeAcpAgent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     let events!: TurnEvents;
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
-      events = {
-        inserted() {},
-        awaitingUser() {},
-        resumed() {},
-        ended: resolve,
-        failed: reject,
-      };
+      events = { inserted() {}, ended: resolve, failed: reject };
     });
     await this.startTurn(params, events);
     return outcome;
@@ -3513,10 +3530,12 @@ export class ClaudeAcpAgent {
         completeTurn = resolve;
       }),
       resolve: (outcome) => {
+        this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
         completeTurn();
       },
       reject: (error) => {
+        this.endForeground(params.sessionId, turn, { error });
         events.failed(error);
         completeTurn();
       },
@@ -4317,7 +4336,7 @@ export class ClaudeAcpAgent {
       reportInserted(turn);
       // A request can already be open: Claude Code asks for a queued prompt
       // before the consumer reaches its echo.
-      this.syncAwaitingUser(session);
+      this.syncAwaitingUser(params.sessionId, session);
     };
 
     /** Report that Claude Code took the turn's prompt in, once. A turn can be
@@ -4327,6 +4346,7 @@ export class ClaudeAcpAgent {
       if (turn.insertedReported || turn.settled) return;
       turn.insertedReported = true;
       turn.events.inserted(turn.promptUuid);
+      this.startForeground(params.sessionId, turn);
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -8349,35 +8369,59 @@ export class ClaudeAcpAgent {
   /** Mark a client request as blocking on user input for exactly the lifetime
    *  of its promise. Steering consults this session-local count synchronously,
    *  so a message arriving while any permission/elicitation card is open uses
-   *  non-interrupting SDK delivery. The active turn reports that it awaits the
-   *  user while any such request is open (see `syncAwaitingUser`). */
+   *  non-interrupting SDK delivery. The session's foreground work reports that
+   *  it awaits the user while any such request is open (see
+   *  `syncAwaitingUser`). */
   private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
     session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
-    this.syncAwaitingUser(session);
+    this.syncAwaitingUser(sessionId, session);
     try {
       return await request();
     } finally {
       session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
-      this.syncAwaitingUser(session);
+      this.syncAwaitingUser(sessionId, session);
     }
   }
 
-  /** Report whether the session's active turn awaits the user: exactly while
-   *  a permission request or question is open in the session. A request does
-   *  not say which prompt it is for, and Claude Code can ask for a queued
+  /** Report whether the session's foreground work awaits the user: exactly
+   *  while a permission request or question is open in the session. A request
+   *  does not say which prompt it is for, and Claude Code can ask for a queued
    *  prompt before the consumer activates it, so a request is not tied to the
-   *  turn that was active when it opened. Called when the count changes and
+   *  work that was running when it opened. Called when the count changes and
    *  when a turn activates. */
-  private syncAwaitingUser(session: Session): void {
-    const turn = session.activeTurn;
-    if (!turn || turn.settled || !turn.insertedReported) return;
+  private syncAwaitingUser(sessionId: string, session: Session): void {
+    const work = this.foregroundWork.get(sessionId);
+    if (!work) return;
     const waiting = (session.pendingUserInputCount ?? 0) > 0;
-    if (waiting === (turn.awaitingUser ?? false)) return;
-    turn.awaitingUser = waiting;
-    if (waiting) turn.events.awaitingUser();
-    else turn.events.resumed();
+    if (waiting === work.awaitingUser) return;
+    work.awaitingUser = waiting;
+    if (waiting) work.events.awaitingUser();
+    else work.events.running();
+  }
+
+  /** Make `owner` the foreground work of the session `sessionId` (see
+   *  {@link ForegroundEvents}), which reports `running`. */
+  private startForeground(sessionId: string, owner: Turn): void {
+    if (!this.foregroundEvents || this.foregroundWork.get(sessionId)?.owner === owner) return;
+    const events = this.foregroundEvents(sessionId);
+    this.foregroundWork.set(sessionId, { owner, events, awaitingUser: false });
+    events.running();
+  }
+
+  /** End the foreground work of the session `sessionId` with `outcome`, or as
+   *  failed with `error`, if `owner` is that work. */
+  private endForeground(
+    sessionId: string,
+    owner: Turn,
+    end: { outcome: TurnOutcome } | { error: unknown },
+  ): void {
+    const work = this.foregroundWork.get(sessionId);
+    if (work?.owner !== owner) return;
+    this.foregroundWork.delete(sessionId);
+    if ("outcome" in end) work.events.ended(end.outcome);
+    else work.events.failed(end.error);
   }
 
   /** Forward a permission request to the client, wiring the tool call's

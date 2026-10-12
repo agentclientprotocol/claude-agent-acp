@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RequestPermissionRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
-import type { TurnEvents } from "../turn-events.js";
+import type { ForegroundEvents, TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";
 import { randomUUID } from "node:crypto";
 
@@ -137,8 +137,6 @@ function recordEvents(log: string[] = [], label?: string) {
   const push = (entry: string) => log.push(label ? `${label} ${entry}` : entry);
   const events: TurnEvents = {
     inserted: (messageId) => push(`inserted ${messageId}`),
-    awaitingUser: () => push("awaitingUser"),
-    resumed: () => push("resumed"),
     ended: (outcome) => {
       push(`ended ${outcome.stopReason}`);
       done.resolve();
@@ -199,24 +197,37 @@ describe("turn events", () => {
   let backgroundAnswer: PromiseWithResolvers<void>;
   /** Sees each session update; the agent waits until it returns. */
   let onSessionUpdate: (notification: SessionNotification) => Promise<void> | void;
+  /** What the agent reported of the session's foreground work. */
+  let foreground: string[];
 
   beforeEach(async () => {
     vi.resetModules();
     permissionRequests = [];
     backgroundAnswer = Promise.withResolvers<void>();
     onSessionUpdate = () => {};
+    foreground = [];
     const { ClaudeAcpAgent } = await import("../acp-agent.js");
-    agent = new ClaudeAcpAgent({
-      sessionUpdate: async (notification: SessionNotification) => onSessionUpdate(notification),
-      extNotification: async () => {},
-      requestPermission: async (request: RequestPermissionRequest) => {
-        permissionRequests.push(request);
-        await new Promise((resolve) => setTimeout(resolve, 1));
-        if (request.toolCall.toolCallId === "toolu_background") await backgroundAnswer.promise;
-        const allow = request.options.find((option) => option.kind === "allow_once");
-        return { outcome: { outcome: "selected", optionId: allow!.optionId } };
-      },
-    } as unknown as AcpClient);
+    const foregroundEvents: ForegroundEvents = {
+      running: () => foreground.push("running"),
+      awaitingUser: () => foreground.push("awaitingUser"),
+      ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+      failed: () => foreground.push("failed"),
+    };
+    agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: SessionNotification) => onSessionUpdate(notification),
+        extNotification: async () => {},
+        requestPermission: async (request: RequestPermissionRequest) => {
+          permissionRequests.push(request);
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          if (request.toolCall.toolCallId === "toolu_background") await backgroundAnswer.promise;
+          const allow = request.options.find((option) => option.kind === "allow_once");
+          return { outcome: { outcome: "selected", optionId: allow!.optionId } };
+        },
+      } as unknown as AcpClient,
+      undefined,
+      { foreground: () => foregroundEvents },
+    );
   });
 
   afterEach(async () => {
@@ -347,7 +358,48 @@ describe("turn events", () => {
     await turn.done;
 
     expect(permissionRequests).toHaveLength(1);
-    expect(turn.log.slice(1)).toEqual(["awaitingUser", "resumed", "ended end_turn"]);
+    expect(turn.log.slice(1)).toEqual(["ended end_turn"]);
+    expect(foreground).toEqual(["running", "awaitingUser", "running", "ended end_turn"]);
+  });
+
+  it("reports waiting on a request that Claude Code opens for a started turn before its echo", async () => {
+    let whileOpen: string[] = [];
+    scriptQuery(async function* (input, options) {
+      const { value } = await input.next();
+      yield lifecycle(value.uuid, "started", options.sessionId!);
+      // Claude Code asks for the prompt before the consumer reaches its echo.
+      // The user answers it only once the test resolves `backgroundAnswer`.
+      const decision = options.canUseTool!(
+        "Bash",
+        { command: "ls" },
+        { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_background" },
+      );
+      await vi.waitFor(() => expect(permissionRequests).toHaveLength(1));
+      whileOpen = [...foreground];
+      backgroundAnswer.resolve();
+      await decision;
+      yield echo(value, options.sessionId!);
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_background", content: "README.md" }],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId!,
+      };
+      yield result(options.sessionId!);
+      await input.next();
+    });
+    const sessionId = await newSession();
+    const turn = recordEvents();
+
+    await agent.startTurn(prompt(sessionId, "list files"), turn.events);
+    await turn.done;
+
+    expect(whileOpen).toEqual(["running", "awaitingUser"]);
+    expect(foreground).toEqual(["running", "awaitingUser", "running", "ended end_turn"]);
   });
 
   it("awaits the user while any request in the session is open, also one opened before the turn", async () => {
@@ -368,13 +420,13 @@ describe("turn events", () => {
         );
       },
       async function* (options) {
-        atStart = [...second.log];
+        atStart = [...foreground];
         await options.canUseTool(
           "Bash",
           { command: "ls" },
           { signal: new AbortController().signal, suggestions: [], toolUseID: "toolu_ls" },
         );
-        afterOwnAnswer = [...second.log];
+        afterOwnAnswer = [...foreground];
         await backgroundRequest;
         yield {
           type: "user",
@@ -399,11 +451,19 @@ describe("turn events", () => {
     await second.done;
 
     expect(first.log.slice(1)).toEqual(["ended end_turn"]);
-    // Waiting from insertion, through its own answered request, until the
-    // earlier request is answered too.
-    expect(atStart.slice(1)).toEqual(["awaitingUser"]);
-    expect(afterOwnAnswer!.slice(1)).toEqual(["awaitingUser"]);
-    expect(second.log.slice(1)).toEqual(["awaitingUser", "resumed", "ended end_turn"]);
+    // The first turn's work ended before the background request opened, and
+    // the second turn waits from insertion, through its own answered request,
+    // until the earlier request is answered too.
+    const firstWork = ["running", "ended end_turn"];
+    expect(atStart).toEqual([...firstWork, "running", "awaitingUser"]);
+    expect(afterOwnAnswer).toEqual([...firstWork, "running", "awaitingUser"]);
+    expect(foreground).toEqual([
+      ...firstWork,
+      "running",
+      "awaitingUser",
+      "running",
+      "ended end_turn",
+    ]);
   });
 
   it("ends a queued turn that is cancelled before it is inserted, without inserting it", async () => {

@@ -13,31 +13,19 @@ import {
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
-import type { StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
+import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
 /**
  * Starts a turn for `params`, and answers when Claude Code takes the prompt
- * in. `send` delivers a session update of the prompt's session; it must not
- * throw, and must deliver updates in the order it is called, also relative to
- * the agent's own updates.
+ * in, with the id of the user message it became. `send` delivers a session
+ * update of the prompt's session; it must not throw, and must deliver updates
+ * in the order it is called, also relative to the agent's own updates.
  *
- * - Taken in: the prompt's `user_message`, then `running`, then the answer.
- * - Waiting on a permission request or a question: `requires_action`, and
- *   `running` once none is open.
- * - Ended: `idle` with the stop reason, usage, and `_meta` of the turn.
- * - Failed after it was taken in: `idle` with the `error` stop reason and the
- *   JSON-RPC error that v1 answers the prompt with, so a client can show its
- *   message and handle its code as for an error response (for example,
- *   `-32000` starts the client's sign-in).
+ * - Taken in: the prompt's `user_message`, then the answer. From then on, the
+ *   turn is the session's foreground work, which reports its states (see
+ *   {@link v2Foreground}).
  * - Ended or failed before it was taken in: the answer is a JSON-RPC error,
  *   `-32800` for a prompt that a cancel ended in the queue.
- *
- * Deferred decision: a turn whose background subagents still run ends only
- * when they finish (`Turn.deferredSettle`), so `idle` waits for them too. The
- * hold exists for v1, whose clients stop listening at the prompt response.
- * v2 allows background updates while idle, so it could report `idle` at the
- * turn's result instead, with a turn event for the hold. To be decided with
- * async tasks (step 6 in `docs/acp-v2.md`).
  */
 export function v2Prompt(
   agent: ClaudeAcpAgent,
@@ -50,40 +38,21 @@ export function v2Prompt(
       inserted(messageId) {
         inserted = true;
         send({ sessionUpdate: "user_message", messageId, content: params.prompt });
-        send({ sessionUpdate: "state_update", state: "running" });
         resolve({ messageId });
       },
-      awaitingUser() {
-        send({ sessionUpdate: "state_update", state: "requires_action" });
-      },
-      resumed() {
-        send({ sessionUpdate: "state_update", state: "running" });
-      },
       ended(outcome) {
-        if (inserted) {
-          send(idle(outcome));
-        } else if (outcome.stopReason === "cancelled") {
-          reject(RequestError.requestCancelled());
-        } else {
-          reject(
-            RequestError.internalError(
-              { stopReason: outcome.stopReason },
-              "The turn ended before Claude Code took the prompt in",
-            ),
-          );
-        }
+        if (inserted) return;
+        reject(
+          outcome.stopReason === "cancelled"
+            ? RequestError.requestCancelled()
+            : RequestError.internalError(
+                { stopReason: outcome.stopReason },
+                "The turn ended before Claude Code took the prompt in",
+              ),
+        );
       },
       failed(error) {
-        if (!inserted) {
-          reject(error);
-          return;
-        }
-        send({
-          sessionUpdate: "state_update",
-          state: "idle",
-          stopReason: "error",
-          error: jsonRpcError(error),
-        });
+        if (!inserted) reject(error);
       },
     };
     let request: PromptRequest;
@@ -95,6 +64,48 @@ export function v2Prompt(
     }
     agent.startTurn(request, events).catch(reject);
   });
+}
+
+/**
+ * Reports the foreground work of a session (see {@link ForegroundEvents}) as
+ * its `state_update`s. `send` delivers a session update of that session, as
+ * for {@link v2Prompt}.
+ *
+ * - Started: `running`. For a prompt's turn, right after its `user_message`.
+ * - Waiting on a permission request or a question: `requires_action`, and
+ *   `running` once none is open.
+ * - Ended: `idle` with the stop reason, usage, and `_meta` of the work.
+ * - Failed: `idle` with the `error` stop reason and the JSON-RPC error that v1
+ *   answers the prompt with, so a client can show its message and handle its
+ *   code as for an error response (for example, `-32000` starts the client's
+ *   sign-in).
+ *
+ * A prompt's turn stays the foreground work while it is held for the
+ * background subagents it spawned (`Turn.deferredSettle`), so `idle` waits for
+ * them too. The hold exists for v1, whose clients stop listening at the prompt
+ * response. v2 allows background updates while idle, so it could report `idle`
+ * at the turn's result instead (step 6 in `docs/acp-v2.md`).
+ */
+export function v2Foreground(send: (update: v2.SessionUpdate) => void): ForegroundEvents {
+  return {
+    running() {
+      send({ sessionUpdate: "state_update", state: "running" });
+    },
+    awaitingUser() {
+      send({ sessionUpdate: "state_update", state: "requires_action" });
+    },
+    ended(outcome) {
+      send(idle(outcome));
+    },
+    failed(error) {
+      send({
+        sessionUpdate: "state_update",
+        state: "idle",
+        stopReason: "error",
+        error: jsonRpcError(error),
+      });
+    },
+  };
 }
 
 /** The JSON-RPC error that v1 answers a failed prompt with. */

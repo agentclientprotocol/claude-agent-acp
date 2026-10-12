@@ -17314,6 +17314,86 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       );
     });
 
+    it("keeps the turn as the session's foreground work across the clear-context restart", async () => {
+      const foreground: string[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async () => {},
+          requestPermission: async (request: any) => ({
+            outcome: {
+              outcome: "selected",
+              optionId: request.options.find((option: any) => option.kind === "allow_once")
+                .optionId,
+            },
+          }),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+        {
+          foreground: () => ({
+            running: () => foreground.push("running"),
+            awaitingUser: () => foreground.push("awaitingUser"),
+            ended: (outcome) => foreground.push(`ended ${outcome.stopReason}`),
+            failed: () => foreground.push("failed"),
+          }),
+        },
+      );
+      vi.spyOn(agent as any, "createSession").mockImplementation(
+        async (_params: any, options: any) => {
+          const input = new Pushable<any>();
+          async function* freshGenerator() {
+            const next = await input[Symbol.asyncIterator]().next();
+            yield userEcho(next.value);
+            yield running();
+            // The continuation asks for permission in the fresh query.
+            await agent.canUseTool("test-session")(
+              "Bash",
+              { command: "ls" },
+              {
+                signal: new AbortController().signal,
+                suggestions: [],
+                toolUseID: "toolu_ls",
+                requestId: "request-ls",
+              },
+            );
+            yield assistantText("Implemented");
+            yield resultMessage({ stop_reason: "max_tokens" });
+            yield idle();
+          }
+          agent.sessions["test-session"] = mockSessionState({
+            query: wrapQuery(freshGenerator()),
+            input,
+            modes: { currentModeId: options.permissionMode, availableModes: [] },
+            fastModeEnabled: false,
+          });
+          return { sessionId: "test-session" };
+        },
+      );
+      injectGeneratorSession(
+        agent,
+        (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield* heldTurnPlanningFollowup(first);
+            yield idle();
+          }
+          return messageGenerator();
+        },
+        {
+          creationParams: { cwd: "/test", mcpServers: [] },
+          pendingExitPlanContextReset: {
+            toolUseId: "tool-plan",
+            plan: "Implement it",
+            mode: "default",
+          },
+        },
+      );
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "plan" }] });
+
+      // The restart replaces the session behind the id; the work stays with the id.
+      expect(foreground).toEqual(["running", "awaitingUser", "running", "ended max_tokens"]);
+    });
+
     it("cancels the held turn when the user keeps planning", async () => {
       const agent = createMockAgent();
       const createSession = vi.spyOn(agent as any, "createSession");

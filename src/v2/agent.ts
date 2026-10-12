@@ -19,7 +19,7 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
-import { v2Prompt } from "./prompt.js";
+import { v2Foreground, v2Prompt } from "./prompt.js";
 import {
   v1ForkSessionRequests,
   v1NewSessionRequest,
@@ -52,7 +52,13 @@ export function v2AgentApp(
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger, { v2: true });
+      agent = new ClaudeAcpAgent(client, logger, {
+        v2: true,
+        foreground: (sessionId) =>
+          v2Foreground((update) => {
+            void client.send({ sessionId, update });
+          }),
+      });
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
