@@ -18558,6 +18558,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
         parentToolUseId: "toolu_agent-1",
         isSubagent: true,
+        backgrounded: true,
       });
       expect(
         updates.flatMap((n) =>
@@ -18624,6 +18625,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(session.liveBackgroundTasks.get("agent-1")).toEqual({
         parentToolUseId: "toolu_agent-1",
         isSubagent: true,
+        backgrounded: true,
       });
       expect(session.nativeSubagentsByTaskId?.get("agent-1")?.terminalState).toBeUndefined();
       expect(
@@ -20619,7 +20621,7 @@ describe("turn steering (_session/steering)", () => {
 
       resolveUserInput(response);
       await pending;
-      expect(agent.sessions["test-session"].pendingUserInputCount).toBe(0);
+      expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0);
     },
   );
 

@@ -2279,6 +2279,216 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
   });
 });
 
+// The session reports `requires_action` only for a request that blocks its
+// foreground work: the main conversation's, or a subagent's whose spawning tool
+// call waits on it. A subagent in the background asks without blocking it.
+describe("ACP v2 requests that subagents make", () => {
+  const taskStarted = (options: Options, taskId: string, fields: Record<string, unknown>) => ({
+    type: "system",
+    subtype: "task_started",
+    task_id: taskId,
+    tool_use_id: `toolu_${taskId}`,
+    description: "Explore the project",
+    subagent_type: "Explore",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  });
+
+  /** Asks for permission for a Bash call of the subagent `agentID`, and
+   *  resolves once the client answers. */
+  const askFor = (options: Options, agentID: string) =>
+    options.canUseTool!("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: `toolu_ls_${agentID}`,
+      agentID,
+      requestId: randomUUID(),
+    } as Parameters<NonNullable<Options["canUseTool"]>>[2]).catch(() => undefined);
+
+  /** Sends the prompt "hi" and returns the client once the turn is idle. */
+  async function promptToIdle(
+    client: ReturnType<typeof v2Client>,
+    capabilities: v2.ClientCapabilities = {},
+  ) {
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, capabilities);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+    return client;
+  }
+
+  /** One turn in which the subagent `agentID` asks for permission. */
+  function turnWithRequest(tasks: Array<[string, Record<string, unknown>]>, agentID: string) {
+    scriptTurns(async function* (options) {
+      for (const [taskId, fields] of tasks) yield taskStarted(options, taskId, fields);
+      yield assistantText(options, "Exploring.");
+      await askFor(options, agentID);
+      yield result(options);
+      yield idleState(options);
+    });
+  }
+
+  it("keeps the turn running while a background subagent's request is open", async () => {
+    turnWithRequest([["agent-1", { is_backgrounded: true }]], "agent-1");
+    const client = await promptToIdle(v2Client());
+
+    expect(client.permissionRequests).toHaveLength(1);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("keeps the turn running while a background subagent's question is open", async () => {
+    scriptTurns(async function* (options) {
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      yield assistantText(options, "Exploring.");
+      await options.canUseTool!(
+        "AskUserQuestion",
+        {
+          questions: [
+            {
+              question: "Which package?",
+              header: "Package",
+              options: [
+                { label: "core", description: "The core package" },
+                { label: "cli", description: "The CLI" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+        {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "toolu_question",
+          agentID: "agent-1",
+          requestId: randomUUID(),
+        } as Parameters<NonNullable<Options["canUseTool"]>>[2],
+      ).catch(() => undefined);
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptToIdle(v2Client(), { elicitation: { form: {} } });
+
+    expect(client.elicitations).toHaveLength(1);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("reports requires_action while a foreground subagent's request is open", async () => {
+    turnWithRequest([["agent-1", { is_backgrounded: false }]], "agent-1");
+    const client = await promptToIdle(v2Client());
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "requires_action",
+      "running",
+      "idle end_turn",
+    ]);
+  });
+
+  it("keeps the turn running for a foreground subagent that a background subagent launched", async () => {
+    turnWithRequest(
+      [
+        ["agent-1", { is_backgrounded: true }],
+        ["agent-2", { is_backgrounded: false, parent_task_id: "agent-1" }],
+      ],
+      "agent-2",
+    );
+    const client = await promptToIdle(v2Client());
+
+    expect(client.permissionRequests).toHaveLength(1);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("stops waiting for a request once its subagent turns out to run in the background", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let atAnswer: string[] = [];
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Exploring.");
+      // The request can come before the subagent's task_started.
+      const asking = askFor(options, "agent-1");
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("running"));
+      atAnswer = turnTrace(client.sessionUpdates);
+      answer.resolve({ outcome: { outcome: "cancelled" } });
+      await asking;
+      yield result(options);
+      yield idleState(options);
+    });
+    await promptToIdle(client);
+
+    expect(atAnswer).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "requires_action",
+      "running",
+    ]);
+  });
+
+  it("stops waiting for a request once Claude Code moves its subagent to the background", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let atAnswer: string[] = [];
+    scriptTurns(async function* (options) {
+      yield taskStarted(options, "agent-1", { is_backgrounded: false });
+      yield assistantText(options, "Exploring.");
+      const asking = askFor(options, "agent-1");
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+      );
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { is_backgrounded: true },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("running"));
+      atAnswer = turnTrace(client.sessionUpdates);
+      answer.resolve({ outcome: { outcome: "cancelled" } });
+      await asking;
+      yield result(options);
+      yield idleState(options);
+    });
+    await promptToIdle(client);
+
+    expect(atAnswer).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "requires_action",
+      "running",
+    ]);
+  });
+});
+
 describe("ACP v2 session translation", () => {
   it("renames the group id of grouped select options", () => {
     expect(

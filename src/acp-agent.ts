@@ -1058,11 +1058,13 @@ export type Session = {
   /** Whether nested subagent text/thinking is forwarded to the ACP client.
    *  Enabled by either the ACP capability or the pre-existing SDK option. */
   forwardSubagentText: boolean;
-  /** Number of ACP permission/elicitation requests currently awaiting user
-   *  input. This is a counter rather than a boolean because parallel subagents
-   *  can ask concurrently; steering must remain non-interrupting until the last
-   *  request settles. */
-  pendingUserInputCount?: number;
+  /** The ACP permission and elicitation requests that await user input, each
+   *  with the subagent that asked (`agentID`, absent for the main
+   *  conversation and for a request that names no agent). Parallel subagents
+   *  can ask concurrently. Steering stays non-interrupting while any request
+   *  is open; the foreground work awaits the user while one that blocks it is
+   *  open (see {@link blocksForeground}). */
+  openUserInputs?: Set<{ agentID?: string }>;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
@@ -1180,6 +1182,14 @@ export type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
+      /** Whether the task runs in the background, so that the tool call that
+       *  spawned it does not wait on it (`task_started.is_backgrounded`, or a
+       *  later `task_updated` patch). Absent when Claude Code did not say. */
+      backgrounded?: boolean;
+      /** The subagent task whose agent launched this task
+       *  (`task_started.parent_task_id`), absent for one the main conversation
+       *  launched. */
+      parentTaskId?: string;
       /** Absent-from-level lifecycle, one field so the illegal
        *  armed-but-not-ended state is unrepresentable: undefined = live per
        *  the level signal; "ended" = a level omitted the task (holds stop
@@ -3918,7 +3928,7 @@ export class ClaudeAcpAgent {
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
     userMessage.priority =
-      (session.pendingUserInputCount ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
@@ -4617,18 +4627,27 @@ export class ClaudeAcpAgent {
 
     /** Registers a live background task (see `liveBackgroundTasks`). A
      *  subagent is also recorded on the active turn, so that turn holds until
-     *  the subagent settles (see `Turn.spawnedTaskIds`). */
+     *  the subagent settles (see `Turn.spawnedTaskIds`). Its requests may
+     *  already be open, and where it runs decides whether they block the
+     *  foreground work, so that is checked again. */
     const registerLiveTask = (
       taskId: string,
       parentToolUseId: string | undefined,
       isSubagent: boolean,
+      placement: { backgrounded?: boolean; parentTaskId?: string } = {},
     ) => {
-      session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      session.liveBackgroundTasks.set(taskId, {
+        parentToolUseId,
+        isSubagent,
+        ...(placement.backgrounded !== undefined ? { backgrounded: placement.backgrounded } : {}),
+        ...(placement.parentTaskId !== undefined ? { parentTaskId: placement.parentTaskId } : {}),
+      });
       if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
       }
+      this.syncAwaitingUser(params.sessionId, session);
     };
 
     const settleLiveTask = (taskId: string) => settleLiveBackgroundTask(session, taskId);
@@ -4640,7 +4659,8 @@ export class ClaudeAcpAgent {
     const resumeLiveTask = (taskId: string) => {
       if (session.liveBackgroundTasks.has(taskId)) return;
       const settled = session.resumableSubagents?.get(taskId);
-      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true);
+      // Claude Code always resumes a subagent in the background.
+      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true, { backgrounded: true });
     };
 
     /** Whether any background subagent this turn spawned is still live —
@@ -5739,7 +5759,10 @@ export class ClaudeAcpAgent {
                 // turn: a turn only ever waits on its own subagents, and a
                 // spawn during a held-open drain window (an agent chain)
                 // extends that turn's hold.
-                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type);
+                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type, {
+                  backgrounded: message.is_backgrounded,
+                  parentTaskId: message.parent_task_id,
+                });
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
@@ -5798,6 +5821,13 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
+                // A task moved to the background no longer blocks the tool
+                // call that spawned it, nor its requests the foreground work.
+                if (message.patch.is_backgrounded !== undefined) {
+                  const task = session.liveBackgroundTasks.get(message.task_id);
+                  if (task) task.backgrounded = message.patch.is_backgrounded;
+                  this.syncAwaitingUser(params.sessionId, session);
+                }
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
                 // guaranteed per transition — prune on it too so the registry
@@ -8515,35 +8545,42 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  /** Mark a client request as blocking on user input for exactly the lifetime
-   *  of its promise. Steering consults this session-local count synchronously,
-   *  so a message arriving while any permission/elicitation card is open uses
-   *  non-interrupting SDK delivery. The session's foreground work reports that
-   *  it awaits the user while any such request is open (see
-   *  `syncAwaitingUser`). */
-  private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+  /** Mark a client request of the subagent `agentID` (absent for the main
+   *  conversation) as awaiting user input for exactly the lifetime of its
+   *  promise (see `Session.openUserInputs`). Steering consults the open
+   *  requests synchronously, so a message arriving while any permission or
+   *  elicitation card is open uses non-interrupting SDK delivery. */
+  private async withPendingUserInput<T>(
+    sessionId: string,
+    request: () => Promise<T>,
+    agentID?: string,
+  ): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
-    session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
+    const input = agentID !== undefined ? { agentID } : {};
+    (session.openUserInputs ??= new Set()).add(input);
     this.syncAwaitingUser(sessionId, session);
     try {
       return await request();
     } finally {
-      session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
+      session.openUserInputs.delete(input);
       this.syncAwaitingUser(sessionId, session);
     }
   }
 
   /** Report whether the session's foreground work awaits the user: exactly
-   *  while a permission request or question is open in the session. A request
-   *  does not say which prompt it is for, and Claude Code can ask for a queued
-   *  prompt before the consumer activates it, so a request is not tied to the
-   *  work that was running when it opened. Called when the count changes and
-   *  when a turn activates. */
+   *  while a permission request or question that blocks it is open (see
+   *  {@link blocksForeground}). A request does not say which prompt it is for,
+   *  and Claude Code can ask for a queued prompt before the consumer activates
+   *  it, so a request is not tied to the work that was running when it
+   *  opened. Called when a request opens or closes, when a turn activates, and
+   *  when a task registers or moves to the background. */
   private syncAwaitingUser(sessionId: string, session: Session): void {
     const work = this.foregroundWork.get(sessionId);
     if (!work) return;
-    const waiting = (session.pendingUserInputCount ?? 0) > 0;
+    const waiting = [...(session.openUserInputs ?? [])].some((input) =>
+      blocksForeground(session, input.agentID),
+    );
     if (waiting === work.awaitingUser) return;
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
@@ -8625,6 +8662,7 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
     parentToolUseId: string | undefined,
     ownerSessionId: string,
+    agentID: string | undefined,
     toolInput: unknown,
     previewContent?: ToolCallContent[],
   ): Promise<RequestPermissionResponse> {
@@ -8653,8 +8691,10 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(ownerSessionId, () =>
-        raceWithAbort(this.client.requestPermission(params, signal), signal),
+      return await this.withPendingUserInput(
+        ownerSessionId,
+        () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+        agentID,
       );
     } catch (error) {
       if (signal.aborted) {
@@ -8903,6 +8943,7 @@ export class ClaudeAcpAgent {
           toolInput,
           toolUseID,
           signal,
+          agentID,
         );
       }
 
@@ -8996,6 +9037,7 @@ export class ClaudeAcpAgent {
         signal,
         parentToolUseId,
         sessionId,
+        agentID,
         toolInput,
         previewContent,
       );
@@ -9105,6 +9147,7 @@ export class ClaudeAcpAgent {
     toolInput: Record<string, unknown>,
     toolUseID: string,
     signal: AbortSignal,
+    agentID: string | undefined,
   ): Promise<PermissionResult> {
     const questions = extractAskUserQuestions(toolInput);
     if (!questions) {
@@ -9119,8 +9162,10 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withPendingUserInput(sessionId, () =>
-        this.client.createElicitation(createRequest, signal),
+      response = await this.withPendingUserInput(
+        sessionId,
+        () => this.client.createElicitation(createRequest, signal),
+        agentID,
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -10661,6 +10706,26 @@ function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefi
       })),
     },
   };
+}
+
+/** Whether a request that awaits the user for the subagent `agentID` (absent
+ *  for the main conversation) blocks the session's foreground work. The main
+ *  conversation's requests do. So do those of a subagent that runs in the
+ *  foreground of the main conversation, since the tool call that spawned it
+ *  waits on it, and so on up a chain of such subagents. A request of a
+ *  subagent in the background, or nested inside one, does not: the main
+ *  conversation goes on without it. A subagent without a record counts, as
+ *  its request can come before its `task_started`, which checks again. */
+function blocksForeground(session: Session, agentID: string | undefined): boolean {
+  const seen = new Set<string>();
+  for (let id = agentID; id !== undefined && !seen.has(id);) {
+    seen.add(id);
+    const task = session.liveBackgroundTasks.get(id);
+    if (!task) return true;
+    if (task.backgrounded) return false;
+    id = task.parentTaskId;
+  }
+  return true;
 }
 
 /** Whether Claude Code ended the work of `result` because an interrupt
