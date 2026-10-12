@@ -56,6 +56,7 @@ export function v2SessionUpdate(
         ...(update._meta != null ? { _meta: update._meta } : {}),
       };
     case "plan_update":
+    case "plan_removed":
       // v1's draft plan operations have v2's shape.
       return update;
     case "current_mode_update":

@@ -2634,6 +2634,7 @@ export class ClaudeAcpAgent {
       },
       applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      supportsPlanOperations: () => this.clientCapabilities?.plan != null,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
@@ -7401,21 +7402,6 @@ export class ClaudeAcpAgent {
                 ),
               );
             }
-            // A plan approved with clearing the context ends its ExitPlanMode
-            // with an error result (shown as completed, see
-            // acceptedPlanToolResult), which toAcpNotifications does not
-            // publish as the session's plan, so publish it here.
-            const contextReset = session.pendingExitPlanContextReset;
-            if (
-              acceptedPlanToolUseId &&
-              contextReset?.toolUseId === acceptedPlanToolUseId &&
-              this.clientCapabilities?.plan
-            ) {
-              await sendUpdate({
-                sessionId: params.sessionId,
-                update: planModeUpdate(contextReset.plan),
-              });
-            }
             break;
           }
           case "tool_progress": {
@@ -11851,6 +11837,8 @@ export function toAcpNotifications(
     let update: SessionNotification["update"] | null = null;
     // The tool call that this chunk finishes, if it is a tool result.
     let finishedToolCallId: string | undefined;
+    // The plan that this chunk approves, if it is an ExitPlanMode result.
+    let approvedPlanUpdate: SessionNotification["update"] | undefined;
     switch (chunk.type) {
       case "text":
       case "text_delta": {
@@ -12119,9 +12107,10 @@ export function toAcpNotifications(
             output.push({ sessionId, update: outputUpdate });
           }
           // An approved plan of the main conversation becomes the session's
-          // markdown plan, live and on replay. The adapter's own approval that
-          // clears the context ends the tool with an error result instead;
-          // the consumer publishes that plan.
+          // markdown plan, after the tool call's result. An approval that
+          // clears the context ends the tool with an error result instead, and
+          // the restart into the fresh context publishes that plan (see
+          // ExitPlanCoordinator.restart).
           if (
             toolUse.name === "ExitPlanMode" &&
             options?.clientCapabilities?.plan &&
@@ -12129,7 +12118,7 @@ export function toAcpNotifications(
             !("is_error" in chunk && chunk.is_error)
           ) {
             const plan = approvedPlan(toolUse.input, toolUseResult);
-            if (plan) output.push({ sessionId, update: planModeUpdate(plan) });
+            if (plan) approvedPlanUpdate = planModeUpdate(plan);
           }
           update = finalUpdate;
         }
@@ -12173,6 +12162,7 @@ export function toAcpNotifications(
         output.push({ sessionId, update });
       }
     }
+    if (approvedPlanUpdate) output.push({ sessionId, update: approvedPlanUpdate });
     if (finishedToolCallId !== undefined) {
       // The PostToolUse hook can still send the final diff, so the fields
       // stay tracked until its callback leaves the registry.

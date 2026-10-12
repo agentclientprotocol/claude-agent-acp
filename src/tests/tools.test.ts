@@ -4704,19 +4704,41 @@ describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
     plan: { type: "markdown", planId: "plan-mode", content },
   });
 
-  it("shows the approved plan", () => {
-    expect(planUpdates()).toEqual([markdownPlan("Implement it")]);
-  });
-
   it("shows the plan of the structured result, which includes the user's edits", () => {
     const toolUseResult = { plan: "Implement it carefully", isAgent: false, planWasEdited: true };
     expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it carefully")]);
   });
 
-  it("shows the plan on replay from the input, which the transcript keeps", () => {
-    expect(planUpdates({}, { replay: true, registerHooks: false })).toEqual([
+  it("shows the plan of the input, trimmed, when there is no structured result, as on replay", () => {
+    expect(planUpdates({}, {}, { plan: "\nImplement it\n" })).toEqual([
       markdownPlan("Implement it"),
     ]);
+  });
+
+  it("shows the plan of the input when the structured result has none", () => {
+    const toolUseResult = { plan: null, isAgent: false };
+    expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it")]);
+  });
+
+  it("shows the plan after the tool call's result", () => {
+    const toolUseResult = { plan: "Implement it", isAgent: false };
+    const kinds = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "toolu_plan", content: "Approved." }] as any,
+      "user",
+      "test-session",
+      {
+        toolu_plan: {
+          type: "tool_use",
+          id: "toolu_plan",
+          name: "ExitPlanMode",
+          input: { plan: "Implement it" },
+        },
+      },
+      mockClient,
+      mockLogger,
+      { clientCapabilities: { plan: {} }, toolUseResult },
+    ).map(({ update }) => update.sessionUpdate);
+    expect(kinds).toEqual(["tool_call_update", "plan_update"]);
   });
 
   it("shows nothing to a client without plan operations", () => {

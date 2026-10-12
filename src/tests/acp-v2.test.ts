@@ -3010,6 +3010,8 @@ describe("ACP v2 session translation", () => {
       plan: { type: "markdown" as const, planId: "plan-mode", content: "# Plan" },
     };
     expect(v2SessionUpdate(update)).toEqual(update);
+    const removed = { sessionUpdate: "plan_removed" as const, planId: "plan-mode" };
+    expect(v2SessionUpdate(removed)).toEqual(removed);
   });
 
   it("reports a new tool call with an upserting tool_call_update", () => {
