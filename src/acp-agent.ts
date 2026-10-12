@@ -1227,8 +1227,8 @@ export type Session = {
   nativeSubagentTaskIdByToolUseId?: Map<string, string>;
   /** Captures the ACP session in which an Agent/Task tool call was made. This
    *  supplies the immediate parent for nested `task_started` notifications.
-   *  Their `parent_task_id` (SDK 0.3.292+) names the launching subagent too,
-   *  but is not read yet. */
+   *  Their `parent_task_id` (SDK 0.3.292+) names the launching subagent too;
+   *  only {@link blocksForeground} reads it so far. */
   nativeSubagentParentByToolUseId?: Map<string, string>;
   /** Session-owned lifecycle controller shared by the consumer, cancel, reset,
    *  and teardown paths. */
@@ -4650,7 +4650,12 @@ export class ClaudeAcpAgent {
       this.syncAwaitingUser(params.sessionId, session);
     };
 
-    const settleLiveTask = (taskId: string) => settleLiveBackgroundTask(session, taskId);
+    /** Settles a task. Its request may still be open, and an agent without a
+     *  record no longer blocks the foreground work, so that is checked again. */
+    const settleLiveTask = (taskId: string) => {
+      settleLiveBackgroundTask(session, taskId);
+      this.syncAwaitingUser(params.sessionId, session);
+    };
 
     /** Registers a settled subagent again when the SDK resumes it without a
      *  new `task_started`. The active turn is the one that resumed it, so it
@@ -10714,14 +10719,19 @@ function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefi
  *  foreground of the main conversation, since the tool call that spawned it
  *  waits on it, and so on up a chain of such subagents. A request of a
  *  subagent in the background, or nested inside one, does not: the main
- *  conversation goes on without it. A subagent without a record counts, as
- *  its request can come before its `task_started`, which checks again. */
+ *  conversation goes on without it. Nor does one of an agent without a
+ *  record: a teammate, a settled subagent, or one that Claude Code left out
+ *  of its background tasks and the consumer pruned, which only happens to a
+ *  subagent nested in a background one. A subagent that the main
+ *  conversation waits on has a record by the time it asks, as its
+ *  `task_started` comes first; when the consumer reads the request first, the
+ *  `task_started` checks again. */
 function blocksForeground(session: Session, agentID: string | undefined): boolean {
   const seen = new Set<string>();
   for (let id = agentID; id !== undefined && !seen.has(id);) {
     seen.add(id);
     const task = session.liveBackgroundTasks.get(id);
-    if (!task) return true;
+    if (!task) return false;
     if (task.backgrounded) return false;
     id = task.parentTaskId;
   }

@@ -2419,18 +2419,57 @@ describe("ACP v2 requests that subagents make", () => {
     ]);
   });
 
-  it("stops waiting for a request once its subagent turns out to run in the background", async () => {
+  it("waits for a request once its subagent, which asked before its task_started, turns out to run in the foreground", async () => {
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    let beforeTaskStarted: string[] = [];
+    let atAnswer: string[] = [];
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Exploring.");
+      // The consumer can read the request before the subagent's task_started.
+      const asking = askFor(options, "agent-1");
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      beforeTaskStarted = turnTrace(client.sessionUpdates);
+      yield taskStarted(options, "agent-1", { is_backgrounded: false });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+      );
+      atAnswer = turnTrace(client.sessionUpdates);
+      answer.resolve({ outcome: { outcome: "cancelled" } });
+      await asking;
+      yield result(options);
+      yield idleState(options);
+    });
+    await promptToIdle(client);
+
+    expect(beforeTaskStarted).toEqual(["user_message", "running", "agent_message_chunk"]);
+    expect(atAnswer).toEqual(["user_message", "running", "agent_message_chunk", "requires_action"]);
+  });
+
+  it("stops waiting for a request once its foreground subagent settles", async () => {
     const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
     const client = v2Client({
       answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
     });
     let atAnswer: string[] = [];
     scriptTurns(async function* (options) {
+      yield taskStarted(options, "agent-1", { is_backgrounded: false });
       yield assistantText(options, "Exploring.");
-      // The request can come before the subagent's task_started.
       const asking = askFor(options, "agent-1");
-      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
-      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"),
+      );
+      // Claude Code stops the subagent before the client answers.
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "killed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
       await vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("running"));
       atAnswer = turnTrace(client.sessionUpdates);
       answer.resolve({ outcome: { outcome: "cancelled" } });
