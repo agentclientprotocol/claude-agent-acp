@@ -17033,6 +17033,31 @@ describe("output after a cancel", () => {
     };
   }
 
+  /** How Claude Code sends an assistant message of the main conversation with
+   *  one text block: it streams the text, one delta per chunk, then sends the
+   *  whole message. */
+  function answer(...chunks: string[]) {
+    const message = assistant(chunks.join(""));
+    const event = (event: Record<string, unknown>) => ({
+      type: "stream_event",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event,
+    });
+    const { id, model, usage } = message.message;
+    return [
+      event({ type: "message_start", message: { id, model, usage } }),
+      event({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+      ...chunks.map((text) =>
+        event({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
+      ),
+      message,
+      event({ type: "content_block_stop", index: 0 }),
+      event({ type: "message_stop" }),
+    ];
+  }
+
   /** How Claude Code starts the turn of `prompt` (a pushed user message). */
   function startTurn(prompt: { uuid: string }) {
     return [
@@ -17061,7 +17086,7 @@ describe("output after a cancel", () => {
    *  cycle that it starts on its own, after the request that starts it. */
   function followup() {
     return [
-      assistant("The build passed."),
+      ...answer("The build passed."),
       successfulResultMessage({ origin: { kind: "task-notification" } }),
       idle,
     ];
@@ -17101,9 +17126,9 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: prompt } = await iter.next();
         yield* startTurn(prompt);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         await cancelled.promise;
-        yield assistant("Still starting the build."); // what the interrupt flushes
+        yield* answer("Still starting the build."); // what the interrupt flushes
         yield {
           type: "user",
           message: {
@@ -17129,11 +17154,17 @@ describe("output after a cancel", () => {
     await agent.cancel({ sessionId: "test-session" });
     cancelled.resolve();
 
-    // Before Claude Code goes on with the follow-up and reports idle.
+    // Before Claude Code goes on with the follow-up and reports idle, and
+    // after the text that the interrupt flushed.
     await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+    expect(texts).toEqual(["Starting the build.", "Still starting the build."]);
     answered.resolve();
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build passed."]);
+    expect(texts).toEqual([
+      "Starting the build.",
+      "Still starting the build.",
+      "The build passed.",
+    ]);
   });
 
   it("delivers a follow-up that Claude Code runs after a cancel while nothing ran", async () => {
@@ -17143,7 +17174,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: prompt } = await iter.next();
         yield* startTurn(prompt);
-        yield assistant("Started the build in the background.");
+        yield* answer("Started the build in the background.");
         yield stampedResult(prompt.uuid);
         yield lifecycleFrame(prompt.uuid, "completed");
         yield idle;
@@ -17175,7 +17206,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: second } = await iter.next();
         yield lifecycleFrame(second.uuid, "queued");
         await cancelled.promise;
@@ -17185,7 +17216,7 @@ describe("output after a cancel", () => {
         yield lifecycleFrame(second.uuid, "started");
         yield requesting(second.uuid);
         yield userEcho(second);
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid);
         yield lifecycleFrame(second.uuid, "completed");
         yield idle;
@@ -17223,7 +17254,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: second } = await iter.next();
         yield lifecycleFrame(second.uuid, "queued");
         await cancelled.promise;
@@ -17236,7 +17267,7 @@ describe("output after a cancel", () => {
         yield lifecycleFrame(second.uuid, "started");
         yield requesting(second.uuid);
         yield userEcho(second);
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid, {
           usage: {
             input_tokens: 999,
@@ -17247,7 +17278,7 @@ describe("output after a cancel", () => {
         });
         yield lifecycleFrame(second.uuid, "completed");
         yield* startTurn(third);
-        yield assistant("Here is the third answer.");
+        yield* answer("Here is the third answer.");
         yield stampedResult(third.uuid);
         yield lifecycleFrame(third.uuid, "completed");
         yield idle;
@@ -17289,7 +17320,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: second } = await iter.next();
         yield lifecycleFrame(second.uuid, "queued");
         await cancelled.promise;
@@ -17298,10 +17329,10 @@ describe("output after a cancel", () => {
         // Claude Code starts its own follow-up, then folds the still queued
         // second prompt into it, so only later requests name that prompt.
         yield requesting();
-        yield assistant("The build passed, and");
+        yield* answer("The build passed, and");
         yield lifecycleFrame(second.uuid, "started");
         yield requesting(second.uuid);
-        yield assistant("here is the second answer.");
+        yield* answer("here is the second answer.");
         yield successfulResultMessage({
           origin: { kind: "task-notification" },
           user_message_uuid: second.uuid,
@@ -17343,7 +17374,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: second } = await iter.next(); // sent during the cancel
         await cancelDone.promise;
         yield abortedResult(first.uuid);
@@ -17352,7 +17383,7 @@ describe("output after a cancel", () => {
         yield lifecycleFrame(second.uuid, "started");
         yield requesting(second.uuid);
         yield userEcho(second);
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid);
         yield lifecycleFrame(second.uuid, "completed");
         yield idle;
@@ -17398,7 +17429,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: second } = await iter.next();
         yield lifecycleFrame(second.uuid, "queued");
         await cancelled.promise;
@@ -17408,7 +17439,7 @@ describe("output after a cancel", () => {
         yield lifecycleFrame(second.uuid, "started");
         yield requesting(second.uuid);
         yield userEcho(second);
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid);
         yield lifecycleFrame(second.uuid, "completed");
         yield idle;
@@ -17446,7 +17477,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: prompt } = await iter.next();
         yield* startTurn(prompt);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         const { value: steer } = await iter.next();
         await cancelled.promise;
         yield abortedResult(prompt.uuid);
@@ -17455,7 +17486,7 @@ describe("output after a cancel", () => {
         yield lifecycleFrame(steer.uuid, "started");
         yield requesting(steer.uuid);
         yield userEcho(steer);
-        yield assistant("Building it with X too.");
+        yield* answer("Building it with X too.");
         yield stampedResult(steer.uuid);
         yield lifecycleFrame(steer.uuid, "completed");
         yield idle;
@@ -17484,7 +17515,7 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         await iter.next(); // the steer, which the cancel drops from Claude Code's queue
         await cancelled.promise;
         yield abortedResult(first.uuid);
@@ -17492,7 +17523,7 @@ describe("output after a cancel", () => {
         const { value: second } = await iter.next();
         yield* startTurn(second);
         yield idle; // the cancelled turn's trailer, lagging past the next prompt's echo
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid);
         yield lifecycleFrame(second.uuid, "completed");
         yield idle;
@@ -17512,19 +17543,19 @@ describe("output after a cancel", () => {
     expect(texts).toEqual(["Starting the build.", "Here is the second answer."]);
   });
 
-  it("keeps dropping the cancelled turn's output across its next model request", async () => {
+  it("keeps the window open across the cancelled turn's next model request", async () => {
     const cancelled = Promise.withResolvers<void>();
     const { agent, texts } = setup((input) =>
       (async function* () {
         const iter = input[Symbol.asyncIterator]();
         const { value: prompt } = await iter.next();
         yield* startTurn(prompt);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         await cancelled.promise;
         // The turn had moved on to its next model request when the interrupt
-        // arrived.
+        // arrived. Its text streams before the turn ends.
         yield requesting(prompt.uuid);
-        yield assistant("Running the tests.");
+        yield* answer("Running the tests.");
         yield abortedResult(prompt.uuid);
         yield lifecycleFrame(prompt.uuid, "cancelled");
         yield idle;
@@ -17540,7 +17571,7 @@ describe("output after a cancel", () => {
 
     await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
     await consumer;
-    expect(texts).toEqual(["Starting the build.", "The build passed."]);
+    expect(texts).toEqual(["Starting the build.", "Running the tests.", "The build passed."]);
   });
 
   it("does not fail the next prompt on the idle that trails the cancelled turn's result", async () => {
@@ -17550,14 +17581,14 @@ describe("output after a cancel", () => {
         const iter = input[Symbol.asyncIterator]();
         const { value: first } = await iter.next();
         yield* startTurn(first);
-        yield assistant("Starting the build.");
+        yield* answer("Starting the build.");
         await cancelled.promise;
         yield abortedResult(first.uuid);
         yield lifecycleFrame(first.uuid, "cancelled");
         const { value: second } = await iter.next();
         yield* startTurn(second);
         yield idle; // the cancelled turn's trailer, lagging past the next prompt's echo
-        yield assistant("Here is the second answer.");
+        yield* answer("Here is the second answer.");
         yield stampedResult(second.uuid);
         yield lifecycleFrame(second.uuid, "completed");
         yield idle;
@@ -17584,7 +17615,7 @@ describe("output after a cancel", () => {
         const { value: prompt } = await iter.next();
         yield lifecycleInit; // no request_marker_lists_v1
         yield userEcho(prompt);
-        yield assistant("Started the build in the background.");
+        yield* answer("Started the build in the background.");
         yield successfulResultMessage();
         yield idle;
         await cancelled.promise;
@@ -17606,6 +17637,41 @@ describe("output after a cancel", () => {
 
     await consumer;
     expect(texts).toEqual(["Started the build in the background."]);
+  });
+
+  it("delivers the next prompt's answer once when its echo arrives in the middle of its stream", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const { agent, texts } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield lifecycleInit; // no request_marker_lists_v1: output is dropped until the next echo
+        yield userEcho(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield idle;
+        const { value: second } = await iter.next();
+        // The echo comes after the first delta of the answer, which is dropped.
+        const frames = answer("Here is", " the second answer.");
+        frames.splice(3, 0, userEcho(second));
+        yield* frames;
+        yield stampedResult(second.uuid);
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await vi.waitFor(() => expect(texts).toEqual(["Starting the build."]));
+
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    await expect(
+      agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(texts).toEqual(["Starting the build.", "Here is the second answer."]);
   });
 });
 

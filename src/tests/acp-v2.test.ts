@@ -2277,6 +2277,93 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       "idle cancelled",
     ]);
   });
+
+  it("drops the streamed answer to a prompt that Claude Code had taken before the cancel", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    const echo = (options: Options, prompt: { uuid?: string; message: unknown }) => ({
+      type: "user",
+      message: prompt.message,
+      parent_tool_use_id: null,
+      uuid: prompt.uuid,
+      session_id: options.sessionId,
+      isReplay: true,
+    });
+    // How Claude Code sends an answer: it streams the text, then sends the
+    // whole message.
+    const answer = (options: Options, text: string, id: string) => [
+      stream(options, {
+        type: "message_start",
+        message: { id, role: "assistant", content: [], usage: {} },
+      }),
+      stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      }),
+      stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      }),
+      assistantText(options, text, id),
+      stream(options, { type: "content_block_stop", index: 0 }),
+      stream(options, { type: "message_stop" }),
+    ];
+    sdk.run = async function* (prompts, options) {
+      const input = prompts[Symbol.asyncIterator]();
+      const { value: first } = await input.next();
+      yield markersInit(options);
+      yield requesting(options, first.uuid!);
+      yield echo(options, first);
+      yield* answer(options, "Starting the build.", "msg_first");
+      const { value: second } = await input.next();
+      await interrupted.promise;
+      yield result(options, { ...ABORTED, user_message_uuids: [first.uuid] });
+      // Claude Code had already taken the second prompt, so it still runs it.
+      yield requesting(options, second.uuid!);
+      yield echo(options, second);
+      yield* answer(options, "Here is the second answer.", "msg_second");
+      yield result(options, { user_message_uuids: [second.uuid] });
+      yield idleState(options);
+      // A command that the first turn backgrounded finished.
+      yield requesting(options);
+      yield* answer(options, "The build passed.", "msg_followup");
+      yield followupResult(options);
+      yield idleState(options);
+      while (!(await input.next()).done);
+    };
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      const queued = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("and test it"),
+      });
+      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await expect(queued).rejects.toMatchObject({ code: -32800 });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(client.updates("agent_message_chunk").map(({ content }) => content)).toEqual([
+      { type: "text", text: "Starting the build." },
+      { type: "text", text: "The build passed." },
+    ]);
+  });
 });
 
 // The session reports `requires_action` only for a request that blocks its

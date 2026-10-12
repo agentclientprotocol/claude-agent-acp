@@ -4039,6 +4039,9 @@ export class ClaudeAcpAgent {
       if (!blocks) streamedBlocksByParent.set(key, (blocks = []));
       return blocks;
     };
+    // The streams, keyed like streamedBlocksByParent, whose current message
+    // had stream events dropped after a cancel (see the stream_event case).
+    const droppedStreams = new Set<string>();
     // A client gets the consolidated subagent text when it negotiated the
     // transcript extension or the `forwardSubagentText` session option. AIR
     // also gets it with native subagent sessions, and AIR gets no streamed
@@ -5845,6 +5848,7 @@ export class ClaudeAcpAgent {
                   subagents.discardPending(message.tool_use_id);
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
+                  droppedStreams.delete(message.tool_use_id);
                 }
                 await endBackgroundTerminal(message.task_id);
                 settleLiveTask(message.task_id);
@@ -5878,7 +5882,10 @@ export class ClaudeAcpAgent {
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
                   )?.parentToolUseId;
-                  if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
+                  if (parentToolUseId) {
+                    streamedBlocksByParent.delete(parentToolUseId);
+                    droppedStreams.delete(parentToolUseId);
+                  }
                   await endBackgroundTerminal(message.task_id);
                   settleLiveTask(message.task_id);
                 } else if (
@@ -6843,37 +6850,7 @@ export class ClaudeAcpAgent {
               // blocks, so it doesn't disturb the mid-message turn-activation
               // path the way resetting on turn activation would.
               streamedBlocksOf(message.parent_tool_use_id).length = 0;
-            }
-            // Accumulate the text/thinking actually streamed live, so the
-            // `assistant` case below can diff its assembled blocks against what
-            // already reached the client as chunks and forward only the
-            // remainder. Each stream (top level or one subagent) keeps its own
-            // record, so a subagent cannot attribute content to another stream.
-            // Contiguous deltas of the same block (same index and type) extend
-            // the current entry; anything else opens a new one.
-            if (message.event.type === "content_block_delta") {
-              const delta = message.event.delta;
-              const chunk =
-                delta.type === "text_delta"
-                  ? { type: "text" as const, text: delta.text }
-                  : delta.type === "thinking_delta"
-                    ? { type: "thinking" as const, text: delta.thinking }
-                    : undefined;
-              // Skip empty deltas (some gateways emit empty thinking chunks —
-              // #793): appending "" is a no-op, but pushing a "" entry would
-              // create a block the consolidated handler's `text.length > 0`
-              // guard can never consume, stalling the diff cursor and
-              // re-emitting the next block as a duplicate.
-              if (chunk?.text) {
-                const index = message.event.index;
-                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
-                const last = streamedBlocks[streamedBlocks.length - 1];
-                if (last && last.index === index && last.type === chunk.type) {
-                  last.text += chunk.text;
-                } else {
-                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
-                }
-              }
+              droppedStreams.delete(message.parent_tool_use_id ?? "");
             }
             if (
               message.parent_tool_use_id === null &&
@@ -6931,6 +6908,57 @@ export class ClaudeAcpAgent {
                     size: session.contextWindowSize,
                   }),
                 });
+              }
+            }
+            // Until the cancelled turn ends, what its interrupt flushes still
+            // streams to the client, which both protocol versions allow before
+            // the cancelled stop reason. Once it has ended (no active turn) and
+            // the window after the cancel is still open, streamed text,
+            // thinking and tool calls are dropped like the consolidated
+            // messages they belong to (see the `cancelled` check in the
+            // user/assistant case). Otherwise the answer to a prompt the cancel
+            // abandoned, which Claude Code had already taken off its queue,
+            // would stream to the client after the cancelled turn ended.
+            // Once a message loses part of its stream, the rest of that stream
+            // is dropped too, until its next message starts. If the next
+            // prompt's echo ends the dropping mid-message, the record above
+            // stays empty, so the consolidated message delivers the whole text
+            // once. A partial record that is not a prefix of the text would
+            // make it send the text again (see unstreamedRemainder).
+            const streamKey = message.parent_tool_use_id ?? "";
+            if (session.cancelled && !session.activeTurn) droppedStreams.add(streamKey);
+            if (droppedStreams.has(streamKey)) {
+              break;
+            }
+            // Accumulate the text/thinking actually streamed live, so the
+            // `assistant` case below can diff its assembled blocks against what
+            // already reached the client as chunks and forward only the
+            // remainder. Each stream (top level or one subagent) keeps its own
+            // record, so a subagent cannot attribute content to another stream.
+            // Contiguous deltas of the same block (same index and type) extend
+            // the current entry; anything else opens a new one.
+            if (message.event.type === "content_block_delta") {
+              const delta = message.event.delta;
+              const chunk =
+                delta.type === "text_delta"
+                  ? { type: "text" as const, text: delta.text }
+                  : delta.type === "thinking_delta"
+                    ? { type: "thinking" as const, text: delta.thinking }
+                    : undefined;
+              // Skip empty deltas (some gateways emit empty thinking chunks —
+              // #793): appending "" is a no-op, but pushing a "" entry would
+              // create a block the consolidated handler's `text.length > 0`
+              // guard can never consume, stalling the diff cursor and
+              // re-emitting the next block as a duplicate.
+              if (chunk?.text) {
+                const index = message.event.index;
+                const streamedBlocks = streamedBlocksOf(message.parent_tool_use_id);
+                const last = streamedBlocks[streamedBlocks.length - 1];
+                if (last && last.index === index && last.type === chunk.type) {
+                  last.text += chunk.text;
+                } else {
+                  streamedBlocks.push({ index, type: chunk.type, text: chunk.text });
+                }
               }
             }
             for (const notification of streamEventToAcpNotifications(
