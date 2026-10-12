@@ -2364,6 +2364,126 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       { type: "text", text: "The build passed." },
     ]);
   });
+
+  it("reports what the interrupt flushes of a cycle that Claude Code started before idle cancelled", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      yield requesting(options);
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_followup", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "The build" },
+      });
+      await interrupted.promise;
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: " passed." },
+      });
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield stream(options, { type: "message_stop" });
+      yield followupResult(options, ABORTED);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          ...endedTurn,
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
+
+  it("drops the output of a held turn's follow-up that a cancel stopped before it showed any", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield markersInit(options);
+      yield {
+        type: "system",
+        subtype: "task_started",
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        description: "Explore the project",
+        subagent_type: "Explore",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "Exploring in the background.");
+      // The turn's result: v1 holds its answer for the live subagent, and v2
+      // reports idle.
+      yield result(options);
+      yield idleState(options);
+      yield {
+        type: "system",
+        subtype: "task_notification",
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent-1",
+        status: "completed",
+        output_file: "",
+        summary: "done",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      // The follow-up's request starts, and the cancel comes before its output.
+      yield requesting(options);
+      await interrupted.promise;
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_followup", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "The exploration" },
+      });
+      yield followupResult(options, ABORTED);
+      yield idleState(options);
+      // A later cycle shows that the session goes on.
+      yield requesting(options);
+      yield assistantText(options, "The build passed.", "msg_later");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toEqual(endedTurn));
+      await vi.waitFor(() =>
+        expect(agents[0].sessions[sessionId]?.modelRequestSinceResult).toBe(true),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      ...endedTurn,
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+    expect(client.updates("agent_message_chunk").map(({ content }) => content)).toEqual([
+      { type: "text", text: "Exploring in the background." },
+      { type: "text", text: "The build passed." },
+    ]);
+  });
 });
 
 // The session reports `requires_action` only for a request that blocks its
