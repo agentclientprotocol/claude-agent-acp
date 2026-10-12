@@ -1279,6 +1279,69 @@ describe("ACP v2 prompts", () => {
     expect(statuses.at(-1)).toBe("cancelled");
   });
 
+  it("reports a command whose result says interrupted as cancelled", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_bash",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            { type: "tool_use", id: "toolu_bash", name: "Bash", input: { command: "make" } },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      // Claude Code aborted the command for a steering message: a successful
+      // result whose structured output says `interrupted`.
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_bash",
+              content:
+                "Command aborted before execution<error>Command was aborted before completion</error>",
+            },
+          ],
+        },
+        tool_use_result: {
+          stdout: "",
+          stderr: "Command aborted before execution",
+          interrupted: true,
+          isImage: false,
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const statuses = client
+      .updates("tool_call_update")
+      .filter((update) => update.toolCallId === "toolu_bash" && update.status)
+      .map((update) => update.status);
+    expect(statuses.at(-1)).toBe("cancelled");
+  });
+
   it("reports a tool call that Claude dropped before it ran as cancelled", async () => {
     scriptTurns(async function* (options) {
       // Claude starts a tool_use, but no complete assistant message holds it,

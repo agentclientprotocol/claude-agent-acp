@@ -3820,6 +3820,31 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("reports an interrupted command as cancelled to a v2 client, and as completed to every other client", () => {
+    const status = (interrupted: boolean, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [{ type: "tool_result", tool_use_id: "toolu_bash", content: "partial" }] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolUseResult: { stdout: "partial", stderr: "", interrupted, isImage: false },
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status(true, v2)).toMatchObject({ status: "cancelled" });
+    expect(status(false, v2)).toMatchObject({ status: "completed" });
+    // v1 has no cancelled status.
+    expect(status(true)).toMatchObject({ status: "completed" });
+    expect(status(true, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "completed",
+    });
+  });
+
   it("closes a tool call that Claude dropped before it ran as cancelled on v2, and as failed elsewhere", () => {
     const unfinished = (ran: boolean, capabilities?: ToolCallCapabilities) =>
       new AcpToolCallRenderer(capabilities).unfinished({ toolCallId: "toolu_bash", ran });

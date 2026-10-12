@@ -151,14 +151,22 @@ export class AcpToolCallRenderer {
   }
 
   /**
-   * The status of a tool result. `nonExecution` is why Claude Code stamped an
-   * error result instead of the tool's output. A run that was aborted is
-   * `cancelled` for a v2 client, which has that status; every other client
-   * gets `failed`, with the kind in `_meta.claudeCode.nonExecutionKind`.
+   * The status of a tool result. Claude Code reports a run that it aborted in
+   * one of two ways: an error result whose `nonExecution` kind says so (a
+   * cancelled turn), or a command result that says `interrupted` (for example,
+   * a steering message landed just before the command started). Such a run is
+   * `cancelled` for a v2 client, which has that status. Every other client gets
+   * `failed` for the error, with the kind in `_meta.claudeCode.nonExecutionKind`,
+   * and `completed` for the command.
    */
-  resultStatus(isError: boolean, nonExecution: ToolResultMeta | undefined): ToolCallStatus {
-    if (!isError) return "completed";
-    return this.capabilities.v2 && isAbortedToolResult(nonExecution) ? V2_CANCELLED : "failed";
+  resultStatus(
+    isError: boolean,
+    nonExecution: ToolResultMeta | undefined,
+    interrupted = false,
+  ): ToolCallStatus {
+    const aborted = interrupted || (isError && isAbortedToolResult(nonExecution));
+    if (this.capabilities.v2 && aborted) return V2_CANCELLED;
+    return isError ? "failed" : "completed";
   }
 
   /** The facts of a tool use. */
@@ -332,7 +340,14 @@ export class AcpToolCallRenderer {
 
   /** The result fields of a tool result, before the status and the tool name. */
   resultFields(toolUse: ToolUse, result: ResultBlock, structured?: unknown): RenderedResult {
-    const facts = this.resultFacts(toolUse, result, structured);
+    return this.fieldsOfResult(toolUse, result, this.resultFacts(toolUse, result, structured));
+  }
+
+  private fieldsOfResult(
+    toolUse: ToolUse,
+    result: ResultBlock,
+    facts: ToolResultFacts,
+  ): RenderedResult {
     const { command, ...fields } = facts;
     if (!command) return fields;
     // The terminal was announced under the tool_use id (see `toolCall`), so the
@@ -397,7 +412,8 @@ export class AcpToolCallRenderer {
     result: ResultBlock,
     options: { structured?: unknown; nonExecution?: ToolResultMeta } = {},
   ): ToolCallUpdate[] {
-    const { _meta: resultMeta, ...fields } = this.resultFields(toolUse, result, options.structured);
+    const facts = this.resultFacts(toolUse, result, options.structured);
+    const { _meta: resultMeta, ...fields } = this.fieldsOfResult(toolUse, result, facts);
     // AIR shows a read or a search that names a path as the list of viewed
     // files. That view does not show the text of the result, so it stays out.
     const viewedFiles =
@@ -445,7 +461,11 @@ export class AcpToolCallRenderer {
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      status: this.resultStatus(result.is_error === true, options.nonExecution),
+      status: this.resultStatus(
+        result.is_error === true,
+        options.nonExecution,
+        facts.command?.interrupted === true,
+      ),
       ...(rawOutput !== undefined ? { rawOutput } : {}),
       ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,
