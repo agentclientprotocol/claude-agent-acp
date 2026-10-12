@@ -786,7 +786,7 @@ export function backgroundBashTaskFromToolResult(
   content: unknown,
   toolUseResult: unknown,
   toolUses: Record<string, { name: string; input: unknown }>,
-): AsyncTaskStarted | undefined {
+): (AsyncTaskStarted & { taskId: string; toolCallId: string }) | undefined {
   if (!Array.isArray(content)) return undefined;
   const toolResults = content.flatMap(toolResultBlock);
   const bashResults = toolResults.filter((result) => toolUses[result.toolUseId]?.name === "Bash");

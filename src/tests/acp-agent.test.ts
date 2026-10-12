@@ -17609,6 +17609,143 @@ describe("output after a cancel", () => {
   });
 });
 
+// A client that renders terminals (here Zed's terminal extension) sees the
+// terminal of a command in the background run until the command's task ends.
+// AIR shows such a command through its async tasks, so its terminal exits at
+// the Bash result, as before.
+describe("terminal of a command in the background", () => {
+  const idle = { type: "system", subtype: "session_state_changed", state: "idle" };
+  const taskEvent = (subtype: string, fields: Record<string, unknown>) => ({
+    type: "system",
+    subtype,
+    task_id: "bg1",
+    uuid: randomUUID(),
+    session_id: "test-session",
+    ...fields,
+  });
+
+  /** A turn that sends `make test` to the background; the command's task ends
+   *  once `ended` resolves. */
+  function backgroundCommand(ended: Promise<void>) {
+    return (input: Pushable<any>) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        yield userEcho((await iter.next()).value);
+        yield taskEvent("task_started", {
+          task_type: "local_bash",
+          description: "make test",
+          tool_use_id: "toolu_bg",
+          is_backgrounded: true,
+        });
+        yield {
+          type: "assistant",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            id: "msg_bg",
+            role: "assistant",
+            model: "claude-sonnet-4-20250514",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_bg",
+                name: "Bash",
+                input: { command: "make test", run_in_background: true },
+              },
+            ],
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+        };
+        yield {
+          type: "user",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_bg",
+                content: "Command running in background with ID: bg1.",
+              },
+            ],
+          },
+          tool_use_result: {
+            stdout: "",
+            stderr: "",
+            interrupted: false,
+            isImage: false,
+            backgroundTaskId: "bg1",
+          },
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+        yield successfulResultMessage();
+        yield idle;
+        await ended;
+        yield taskEvent("task_updated", { patch: { status: "completed" } });
+        yield taskEvent("task_notification", {
+          tool_use_id: "toolu_bg",
+          status: "completed",
+          output_file: "/tmp/tasks/bg1.output",
+          summary: 'Background command "make test" completed',
+        });
+      })();
+  }
+
+  /** Runs the turn for a client with `capabilities`, and returns the
+   *  `terminal_exit` of each report about the Bash call, with whether it came
+   *  before or after the prompt's answer. */
+  async function terminalExits(capabilities: ClientCapabilities) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => void updates.push(n) } as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, capabilities);
+    const ended = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, backgroundCommand(ended.promise));
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test it" }] });
+    const answeredAt = updates.length;
+    const consumer = agent.sessions["test-session"]!.consumer;
+    ended.resolve();
+    await consumer;
+    return updates.flatMap((notification, index) => {
+      const update = notification.update;
+      const exit =
+        update.sessionUpdate === "tool_call_update" && update.toolCallId === "toolu_bg"
+          ? (update._meta as { terminal_exit?: unknown } | undefined)?.terminal_exit
+          : undefined;
+      return exit ? [{ exit, afterAnswer: index >= answeredAt }] : [];
+    });
+  }
+
+  it("ends the terminal when the command's task ends", async () => {
+    expect(await terminalExits({ _meta: { terminal_output: true } })).toEqual([
+      {
+        exit: { terminal_id: "toolu_bg", exit_code: null, signal: null },
+        afterAnswer: true,
+      },
+    ]);
+  });
+
+  it("ends an AIR client's terminal at the Bash result, as before", async () => {
+    expect(
+      await terminalExits({
+        ...AIR_CLIENT_CAPABILITIES,
+        _meta: { ...AIR_CLIENT_CAPABILITIES._meta, terminal_output: true },
+      }),
+    ).toEqual([
+      { exit: { terminal_id: "toolu_bg", exit_code: 0, signal: null }, afterAnswer: false },
+    ]);
+  });
+});
+
 describe("deferred settlement for live background subagents (issues #864/#866)", () => {
   // A turn whose terminal result arrives while background subagents IT
   // spawned are still live must NOT settle at that result: ACP allows

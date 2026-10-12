@@ -264,7 +264,7 @@ import {
   unregisterHookCallback,
 } from "./tools.js";
 import { previewPatchContent } from "./diff.js";
-import { backgroundedBashToolCall } from "./tool-calls/background.js";
+import { backgroundedBashToolCall, withRunningTerminal } from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
@@ -1206,6 +1206,13 @@ export type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** The display terminals of the commands that went to the background and
+   *  still run, by the id of the command's task: the Bash tool call whose
+   *  terminal it is, and the subagent tool call that ran it, if any. The
+   *  terminal exits when the task ends, not at the tool result (see
+   *  `withRunningTerminal`). Only for a client that renders terminals and is
+   *  not AIR, which shows the command through its async tasks. */
+  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
   /** The parent tool call of each subagent that a settle bookend removed from
    *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
    *  agent id without a new `task_started` (a running `task_updated` patch or
@@ -4650,6 +4657,29 @@ export class ClaudeAcpAgent {
       this.syncAwaitingUser(params.sessionId, session);
     };
 
+    /** Ends the display terminal of a command that went to the background, once
+     *  its task ends (see `Session.backgroundTerminals`). Claude Code reports no
+     *  exit code for it, and `completed` does not mean 0: Claude Code accepts
+     *  some non-zero codes as a success, such as grep's 1. */
+    const endBackgroundTerminal = async (taskId: string) => {
+      const terminal = session.backgroundTerminals?.get(taskId);
+      if (!terminal) return;
+      session.backgroundTerminals!.delete(taskId);
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: terminal.toolCallId,
+          _meta: {
+            ...(terminal.parentToolUseId
+              ? { claudeCode: { parentToolUseId: terminal.parentToolUseId } }
+              : {}),
+            terminal_exit: { terminal_id: terminal.toolCallId, exit_code: null, signal: null },
+          },
+        },
+      });
+    };
+
     const settleLiveTask = (taskId: string) => settleLiveBackgroundTask(session, taskId);
 
     /** Registers a settled subagent again when the SDK resumes it without a
@@ -5811,6 +5841,7 @@ export class ClaudeAcpAgent {
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
                 }
+                await endBackgroundTerminal(message.task_id);
                 settleLiveTask(message.task_id);
                 break;
               case "task_updated":
@@ -5843,6 +5874,7 @@ export class ClaudeAcpAgent {
                     message.task_id,
                   )?.parentToolUseId;
                   if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
+                  await endBackgroundTerminal(message.task_id);
                   settleLiveTask(message.task_id);
                 } else if (
                   message.patch.status === "running" ||
@@ -7228,6 +7260,7 @@ export class ClaudeAcpAgent {
 
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
+            let runningTerminal: string | undefined;
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               const backgroundBashTask = backgroundBashTaskFromToolResult(
@@ -7236,6 +7269,24 @@ export class ClaudeAcpAgent {
                 session.toolUseCache,
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+              // The command's terminal runs until its task ends, unless the
+              // task has ended already (a fast command can end before the tool
+              // result comes).
+              const terminalId = backgroundBashTask?.toolCallId;
+              if (
+                terminalId &&
+                this.toolCallCapabilities.terminalOutput &&
+                !this.toolCallCapabilities.air.client &&
+                session.liveBackgroundTasks.has(backgroundBashTask.taskId)
+              ) {
+                runningTerminal = terminalId;
+                (session.backgroundTerminals ??= new Map()).set(backgroundBashTask.taskId, {
+                  toolCallId: terminalId,
+                  ...(message.parent_tool_use_id
+                    ? { parentToolUseId: message.parent_tool_use_id }
+                    : {}),
+                });
+              }
               await asyncTasks.toolResults(content);
               backgroundedToolCalls = backgroundedBashToolCallIds(
                 content,
@@ -7292,10 +7343,13 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(
-                backgroundedBashToolCall(
-                  acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                  backgroundedToolCalls,
-                  asyncTasks.enabled,
+                withRunningTerminal(
+                  backgroundedBashToolCall(
+                    acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                    backgroundedToolCalls,
+                    asyncTasks.enabled,
+                  ),
+                  runningTerminal,
                 ),
               );
             }

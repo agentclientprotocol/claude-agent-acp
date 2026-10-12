@@ -2489,6 +2489,159 @@ describe("ACP v2 requests that subagents make", () => {
   });
 });
 
+// A Bash call that sends its command to the background returns at once, while
+// the command runs on, so the command's terminal exits when its task ends.
+describe("ACP v2 terminal of a command in the background", () => {
+  const bashUse = (options: Options) => ({
+    type: "assistant",
+    message: {
+      id: "msg_bg",
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_bg",
+          name: "Bash",
+          input: { command: "make test", run_in_background: true },
+        },
+      ],
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  });
+  /** The Bash call's result: the command went on in the background. */
+  const backgrounded = (options: Options) => ({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_bg",
+          content: "Command running in background with ID: bg1.",
+        },
+      ],
+    },
+    tool_use_result: {
+      stdout: "",
+      stderr: "",
+      interrupted: false,
+      isImage: false,
+      backgroundTaskId: "bg1",
+    },
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  });
+  const taskEvent = (options: Options, subtype: string, fields: Record<string, unknown>) => ({
+    type: "system",
+    subtype,
+    task_id: "bg1",
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+    ...fields,
+  });
+  /** The command's task starts; Claude Code sends this before the Bash result. */
+  const taskStarted = (options: Options) =>
+    taskEvent(options, "task_started", {
+      task_type: "local_bash",
+      description: "make test",
+      tool_use_id: "toolu_bg",
+      is_backgrounded: true,
+    });
+  /** The command exits with code 3, which Claude Code names only in the summary. */
+  const taskEnded = (options: Options) => [
+    taskEvent(options, "task_updated", { patch: { status: "failed" } }),
+    taskEvent(options, "task_notification", {
+      tool_use_id: "toolu_bg",
+      status: "failed",
+      output_file: "/tmp/tasks/bg1.output",
+      summary: 'Background command "make test" failed with exit code 3',
+    }),
+  ];
+
+  /** The command's terminal updates (`exit` when one carries the exit) and the
+   *  session's states, in order. */
+  const terminalTrace = (client: ReturnType<typeof v2Client>) =>
+    client.sessionUpdates.flatMap(({ update }) =>
+      update.sessionUpdate === "terminal_update"
+        ? [update.exitStatus ? "exit" : "terminal"]
+        : update.sessionUpdate === "state_update"
+          ? [
+              update.state +
+                ("stopReason" in update && update.stopReason ? ` ${update.stopReason}` : ""),
+            ]
+          : [],
+    );
+
+  async function promptUntilIdle(idles: number) {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates).filter((state) => state.startsWith("idle")),
+        ).toHaveLength(idles),
+      );
+      await client.authUpdate(1);
+    });
+    return client;
+  }
+
+  it("keeps the terminal running after the Bash call, and ends it when the command's task ends", async () => {
+    scriptTurns(async function* (options) {
+      yield taskStarted(options);
+      yield bashUse(options);
+      yield backgrounded(options);
+      yield result(options);
+      yield idleState(options);
+      yield* taskEnded(options);
+      yield assistantText(options, "The tests failed.", "msg_followup");
+      yield result(options, { origin: { kind: "task-notification" } });
+      yield idleState(options);
+    });
+    const client = await promptUntilIdle(2);
+
+    const trace = terminalTrace(client);
+    expect(trace.filter((entry) => entry === "exit")).toHaveLength(1);
+    expect(trace.indexOf("exit")).toBeGreaterThan(trace.indexOf("idle end_turn"));
+    // Claude Code reports no exit code for a command in the background.
+    expect(
+      client.updates("terminal_update").find((update) => update.exitStatus)?.exitStatus,
+    ).toEqual({});
+    expect(
+      client
+        .updates("tool_call_update")
+        .filter((update) => update.toolCallId === "toolu_bg" && update.status)
+        .map((update) => update.status),
+    ).toEqual(["pending", "completed"]);
+  });
+
+  it("ends the terminal at the Bash result when the command's task ended before it", async () => {
+    scriptTurns(async function* (options) {
+      yield taskStarted(options);
+      yield bashUse(options);
+      yield* taskEnded(options);
+      yield backgrounded(options);
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptUntilIdle(1);
+
+    const trace = terminalTrace(client);
+    expect(trace.filter((entry) => entry === "exit")).toHaveLength(1);
+    expect(trace.indexOf("exit")).toBeLessThan(trace.indexOf("idle end_turn"));
+  });
+});
+
 describe("ACP v2 session translation", () => {
   it("renames the group id of grouped select options", () => {
     expect(
