@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { AcpClient, toAcpNotifications, ToolUseCache } from "../acp-agent.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
-import { backgroundedBashToolCall } from "../tool-calls/background.js";
+import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";
 import { ChangedMetaFilter } from "../tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "../tool-calls/field-tracker.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";
@@ -737,5 +737,30 @@ describe("background Bash", () => {
 
   it("sends no marker to a client without the asyncTasks capability", () => {
     expect(backgroundedBashToolCall(completed, new Set(["t"]), false)).toBe(completed);
+  });
+
+  const exit = { terminal_id: "t", exit_code: null, signal: null };
+
+  it("keeps the terminal of a command in the background running", () => {
+    const withExit = {
+      ...completed,
+      update: {
+        ...completed.update,
+        _meta: { claudeCode: { toolName: "Bash" }, terminal_exit: exit },
+      },
+    };
+    expect(withRunningTerminal(withExit, "t")).toEqual({
+      ...completed,
+      update: { ...completed.update, _meta: { claudeCode: { toolName: "Bash" } } },
+    });
+    expect(withRunningTerminal(withExit, "other")).toBe(withExit);
+  });
+
+  it("leaves out a `_meta` that held only the terminal's exit, which v2 would store as empty", () => {
+    const onlyExit = {
+      ...completed,
+      update: { ...completed.update, _meta: { terminal_exit: exit } },
+    };
+    expect(withRunningTerminal(onlyExit, "t")).toEqual(completed);
   });
 });

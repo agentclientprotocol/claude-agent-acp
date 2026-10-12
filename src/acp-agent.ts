@@ -56,7 +56,7 @@ import {
   WriteTextFileResponse,
   ToolCallContent,
 } from "@agentclientprotocol/sdk";
-import type { StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
+import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,
   AgentInfo,
@@ -65,6 +65,7 @@ import {
   FastModeState,
   getSessionMessages,
   getSubagentMessages,
+  HookCallback,
   listSessions,
   McpServerConfig,
   McpServerStatus,
@@ -75,6 +76,7 @@ import {
   Options,
   PermissionMode,
   PermissionResult,
+  PreToolUseHookInput,
   Query,
   query,
   SDKAssistantMessageError,
@@ -262,7 +264,7 @@ import {
   unregisterHookCallback,
 } from "./tools.js";
 import { previewPatchContent } from "./diff.js";
-import { backgroundedBashToolCall } from "./tool-calls/background.js";
+import { backgroundedBashToolCall, withRunningTerminal } from "./tool-calls/background.js";
 import { ChangedMetaFilter } from "./tool-calls/changed-meta-filter.js";
 import { ToolCallFieldTracker } from "./tool-calls/field-tracker.js";
 import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/client-capabilities.js";
@@ -688,15 +690,12 @@ type Turn = {
    *  consumer can match the replayed user message to this turn. It is also the
    *  id of the user message the turn reports as inserted. */
   promptUuid: string;
-  /** Where the turn reports how it progresses (see {@link TurnEvents}). */
+  /** Where the turn reports how its prompt is answered (see {@link TurnEvents}). */
   events: TurnEvents;
   /** Set once `events.inserted` has been reported. A clear-context restart
    *  activates the same turn again in the fresh session, which must not report
    *  it twice. */
   insertedReported?: boolean;
-  /** Whether the turn last reported that it awaits the user, so that
-   *  `syncAwaitingUser` reports only changes. */
-  awaitingUser?: boolean;
   /** Tools surfaced during this turn, awaiting completion or an explicit
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
@@ -887,7 +886,19 @@ type PendingReplay = {
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
+  /** Set by a cancel. While it is set, the consumer treats what arrives as the
+   *  work the cancel stopped: it drops main-thread `assistant` and `user`
+   *  messages (streamed text still goes out), skips results, and starts no
+   *  model cycle. Cleared when the next prompt's turn activates,
+   *  or when Claude Code starts a model request that serves none of
+   *  {@link Session.cancelledPrompts} (see the `status` case of the
+   *  consumer), such as its follow-up after a background command finished. */
   cancelled: boolean;
+  /** The prompts whose work the cancel stopped: the turns it settled as
+   *  cancelled, and their steers. Recorded when the cancel arrives, before the
+   *  orphan accounting, which can undercount a prompt that Claude Code had
+   *  already taken off its queue. */
+  cancelledPrompts?: Set<string>;
   /** FIFO of in-flight prompts. The head is the turn the SDK is currently
    *  processing; later entries are queued and will be echoed in order. */
   turnQueue?: Turn[];
@@ -959,6 +970,16 @@ export type Session = {
    *  cancel() routes orphan accounting to `orphanCommands` (exact, per-uuid)
    *  instead of `pendingOrphanResults` (count, coalescing-blind). */
   msgLifecycleV1?: boolean;
+  /** True once a `system`/init advertised the request_marker_lists_v1
+   *  capability: each `status: requesting` frame, which starts a model
+   *  request, then lists the prompts the request serves in
+   *  `user_message_uuids`, and leaves the field out for a request that serves
+   *  none, such as a cycle that Claude Code started on its own. */
+  requestMarkerListsV1?: boolean;
+  /** A main-thread model request started (`status: requesting`) since the
+   *  last result, so a model cycle runs. Read only with
+   *  {@link Session.requestMarkerListsV1}. */
+  modelRequestSinceResult?: boolean;
   /** Latched from `system`/init `terminal_slash_commands` (CLI 2.1.232+):
    *  names of advertised slash commands whose UX is bound to the CLI's own
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
@@ -1068,11 +1089,13 @@ export type Session = {
   /** Whether nested subagent text/thinking is forwarded to the ACP client.
    *  Enabled by either the ACP capability or the pre-existing SDK option. */
   forwardSubagentText: boolean;
-  /** Number of ACP permission/elicitation requests currently awaiting user
-   *  input. This is a counter rather than a boolean because parallel subagents
-   *  can ask concurrently; steering must remain non-interrupting until the last
-   *  request settles. */
-  pendingUserInputCount?: number;
+  /** The ACP permission and elicitation requests that await user input, each
+   *  with the subagent that asked (`agentID`, absent for the main
+   *  conversation and for a request that names no agent). Parallel subagents
+   *  can ask concurrently. Steering stays non-interrupting while any request
+   *  is open; the foreground work awaits the user while one that blocks it is
+   *  open (see {@link blocksForeground}). */
+  openUserInputs?: Set<{ agentID?: string }>;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
@@ -1190,6 +1213,14 @@ export type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
+      /** Whether the task runs in the background, so that the tool call that
+       *  spawned it does not wait on it (`task_started.is_backgrounded`, or a
+       *  later `task_updated` patch). Absent when Claude Code did not say. */
+      backgrounded?: boolean;
+      /** The subagent task whose agent launched this task
+       *  (`task_started.parent_task_id`), absent for one the main conversation
+       *  launched. */
+      parentTaskId?: string;
       /** Absent-from-level lifecycle, one field so the illegal
        *  armed-but-not-ended state is unrepresentable: undefined = live per
        *  the level signal; "ended" = a level omitted the task (holds stop
@@ -1206,6 +1237,13 @@ export type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** The display terminals of the commands that went to the background and
+   *  still run, by the id of the command's task: the Bash tool call whose
+   *  terminal it is, and the subagent tool call that ran it, if any. The
+   *  terminal exits when the task ends, not at the tool result (see
+   *  `withRunningTerminal`). Only for a client that renders terminals and is
+   *  not AIR, which shows the command through its async tasks. */
+  backgroundTerminals?: Map<string, { toolCallId: string; parentToolUseId?: string }>;
   /** The parent tool call of each subagent that a settle bookend removed from
    *  `liveBackgroundTasks`. The SDK can resume such a subagent under the same
    *  agent id without a new `task_started` (a running `task_updated` patch or
@@ -1227,8 +1265,8 @@ export type Session = {
   nativeSubagentTaskIdByToolUseId?: Map<string, string>;
   /** Captures the ACP session in which an Agent/Task tool call was made. This
    *  supplies the immediate parent for nested `task_started` notifications.
-   *  Their `parent_task_id` (SDK 0.3.292+) names the launching subagent too,
-   *  but is not read yet. */
+   *  Their `parent_task_id` (SDK 0.3.292+) names the launching subagent too;
+   *  only {@link blocksForeground} reads it so far. */
   nativeSubagentParentByToolUseId?: Map<string, string>;
   /** Session-owned lifecycle controller shared by the consumer, cancel, reset,
    *  and teardown paths. */
@@ -1359,6 +1397,12 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
   "observer",
   "observer-activity",
 ]);
+
+/** The foreground work of a session (see ForegroundEvents): a prompt's turn,
+ *  or a model cycle that Claude Code started on its own. At most one cycle
+ *  runs at a time, so a constant names it. */
+const AUTONOMOUS_CYCLE = "autonomous-cycle";
+type ForegroundOwner = Turn | typeof AUTONOMOUS_CYCLE;
 
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
@@ -2569,6 +2613,18 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
+  /** See the `foreground` constructor option. */
+  private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
+  /**
+   * The foreground work of each session while it runs, by the session id that
+   * the client knows. A clear-context restart replaces the Claude Code session
+   * behind that id and moves the running turn to it, so the work belongs to the
+   * id, not to a {@link Session}.
+   */
+  private readonly foregroundWork = new Map<
+    string,
+    { owner: ForegroundOwner; events: ForegroundEvents; awaitingUser: boolean }
+  >();
   /** The session index (docs/air-extensions.md, "Session index"). */
   private readonly sessionIndex = new sessionIndex.SessionIndexConnection({
     agent: this,
@@ -2577,8 +2633,22 @@ export class ClaudeAcpAgent {
     teardownSession: (sessionId) => this.teardownSession(sessionId),
   });
 
-  constructor(client: AcpClient, logger?: Logger, options: { v2?: boolean } = {}) {
+  constructor(
+    client: AcpClient,
+    logger?: Logger,
+    options: {
+      v2?: boolean;
+      /**
+       * Where the agent reports a session's foreground work (see
+       * {@link ForegroundEvents}), called each time work starts in the session
+       * `sessionId`. Without it, nothing reports the work: a v1 client has no
+       * session state, and learns that a turn ended from its prompt response.
+       */
+      foreground?: (sessionId: string) => ForegroundEvents;
+    } = {},
+  ) {
     this.v2 = options.v2 ?? false;
+    this.foregroundEvents = options.foreground;
     this.sessions = {};
     this.client = new ChangedMetaClient(client, () => this.toolCallCapabilities.air.client);
     this.logger = logger ?? console;
@@ -3455,13 +3525,7 @@ export class ClaudeAcpAgent {
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     let events!: TurnEvents;
     const outcome = new Promise<TurnOutcome>((resolve, reject) => {
-      events = {
-        inserted() {},
-        awaitingUser() {},
-        resumed() {},
-        ended: resolve,
-        failed: reject,
-      };
+      events = { inserted() {}, ended: resolve, failed: reject };
     });
     await this.startTurn(params, events);
     return outcome;
@@ -3557,10 +3621,12 @@ export class ClaudeAcpAgent {
         completeTurn = resolve;
       }),
       resolve: (outcome) => {
+        this.endForeground(params.sessionId, turn, { outcome });
         events.ended(outcome);
         completeTurn();
       },
       reject: (error) => {
+        this.endForeground(params.sessionId, turn, { error });
         events.failed(error);
         completeTurn();
       },
@@ -3951,7 +4017,7 @@ export class ClaudeAcpAgent {
     // Deliver into the running turn rather than queuing behind it as a fresh
     // prompt would.
     userMessage.priority =
-      (session.pendingUserInputCount ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
@@ -3964,6 +4030,8 @@ export class ClaudeAcpAgent {
     if (turnInFlight.deferredSettle !== undefined) {
       turnInFlight.steeredSettle = turnInFlight.deferredSettle;
       turnInFlight.deferredSettle = undefined;
+      // The held turn's work had ended at its result; the steer resumes it.
+      this.startForeground(sessionId, turnInFlight);
     }
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
@@ -4363,6 +4431,7 @@ export class ClaudeAcpAgent {
     const activateTurn = (turn: Turn) => {
       session.activeTurn = turn;
       session.cancelled = false;
+      session.cancelledPrompts = undefined;
       compaction.resume();
       if (turn.localCommand?.startsAtActivation) ensureLocalCommandMarkdown(turn);
       session.pendingOrphanResults = 0;
@@ -4397,7 +4466,7 @@ export class ClaudeAcpAgent {
       reportInserted(turn);
       // A request can already be open: Claude Code asks for a queued prompt
       // before the consumer reaches its echo.
-      this.syncAwaitingUser(session);
+      this.syncAwaitingUser(params.sessionId, session);
     };
 
     /** Report that Claude Code took the turn's prompt in, once. A turn can be
@@ -4407,6 +4476,7 @@ export class ClaudeAcpAgent {
       if (turn.insertedReported || turn.settled) return;
       turn.insertedReported = true;
       turn.events.inserted(turn.promptUuid);
+      this.startForeground(params.sessionId, turn);
     };
 
     /** Ensure there is an active turn before a user-turn result that carries no
@@ -4432,7 +4502,10 @@ export class ClaudeAcpAgent {
      *  a stamp naming an orphaned command consumes the result outright, and a
      *  stamp naming anything else positively refutes "this is a dead turn's
      *  result", so the dup-over-loss one-skip must not eat it. */
-    const ensureActiveTurn = async (resultUserMessageUuid?: string) => {
+    const ensureActiveTurn = async (
+      resultUserMessageUuid?: string,
+      resultUserMessageUuids?: readonly string[],
+    ) => {
       if (session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           return;
@@ -4458,8 +4531,8 @@ export class ClaudeAcpAgent {
       }
       // Orphan accounting runs BEFORE the head check: an orphan's echo-less
       // result can arrive with an EMPTY queue (the common post-cancel
-      // timeline — the active turn settled at the interrupt's idle and the
-      // user hasn't typed yet), and it must still be consumed here. Skipping
+      // timeline — the cancelled turn settled at its interrupted result and
+      // the user hasn't typed yet), and it must still be consumed here. Skipping
       // the bookkeeping when there is nothing to promote would leave a
       // phantom entry/count that swallows the next live echo-less result
       // (e.g. /compact) instead.
@@ -4527,6 +4600,14 @@ export class ClaudeAcpAgent {
           }
         }
       }
+      // A result that names a prompt a cancel stopped is that prompt's, even
+      // when the orphan accounting above lost track of it: the interrupt
+      // receipt leaves out a prompt that Claude Code had already taken off its
+      // queue. It must not settle the prompt sent after the cancel.
+      const stamps =
+        resultUserMessageUuids ??
+        (resultUserMessageUuid !== undefined ? [resultUserMessageUuid] : []);
+      if (stamps.some((uuid) => session.cancelledPrompts?.has(uuid))) return;
       const head = firstUnsettledQueuedTurn();
       if (!head) {
         return;
@@ -4635,21 +4716,58 @@ export class ClaudeAcpAgent {
 
     /** Registers a live background task (see `liveBackgroundTasks`). A
      *  subagent is also recorded on the active turn, so that turn holds until
-     *  the subagent settles (see `Turn.spawnedTaskIds`). */
+     *  the subagent settles (see `Turn.spawnedTaskIds`). Its requests may
+     *  already be open, and where it runs decides whether they block the
+     *  foreground work, so that is checked again. */
     const registerLiveTask = (
       taskId: string,
       parentToolUseId: string | undefined,
       isSubagent: boolean,
+      placement: { backgrounded?: boolean; parentTaskId?: string } = {},
     ) => {
-      session.liveBackgroundTasks.set(taskId, { parentToolUseId, isSubagent });
+      session.liveBackgroundTasks.set(taskId, {
+        parentToolUseId,
+        isSubagent,
+        ...(placement.backgrounded !== undefined ? { backgrounded: placement.backgrounded } : {}),
+        ...(placement.parentTaskId !== undefined ? { parentTaskId: placement.parentTaskId } : {}),
+      });
       if (parentToolUseId) forgetForegroundToolCall(session, parentToolUseId);
       session.resumableSubagents?.delete(taskId);
       if (isSubagent && session.activeTurn && !session.activeTurn.settled) {
         (session.activeTurn.spawnedTaskIds ??= new Set()).add(taskId);
       }
+      this.syncAwaitingUser(params.sessionId, session);
     };
 
-    const settleLiveTask = (taskId: string) => settleLiveBackgroundTask(session, taskId);
+    /** Ends the display terminal of a command that went to the background, once
+     *  its task ends (see `Session.backgroundTerminals`). Claude Code reports no
+     *  exit code for it, and `completed` does not mean 0: Claude Code accepts
+     *  some non-zero codes as a success, such as grep's 1. */
+    const endBackgroundTerminal = async (taskId: string) => {
+      const terminal = session.backgroundTerminals?.get(taskId);
+      if (!terminal) return;
+      session.backgroundTerminals!.delete(taskId);
+      await sendUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: terminal.toolCallId,
+          _meta: {
+            ...(terminal.parentToolUseId
+              ? { claudeCode: { parentToolUseId: terminal.parentToolUseId } }
+              : {}),
+            terminal_exit: { terminal_id: terminal.toolCallId, exit_code: null, signal: null },
+          },
+        },
+      });
+    };
+
+    /** Settles a task. Its request may still be open, and an agent without a
+     *  record no longer blocks the foreground work, so that is checked again. */
+    const settleLiveTask = (taskId: string) => {
+      settleLiveBackgroundTask(session, taskId);
+      this.syncAwaitingUser(params.sessionId, session);
+    };
 
     /** Registers a settled subagent again when the SDK resumes it without a
      *  new `task_started`. The active turn is the one that resumed it, so it
@@ -4658,7 +4776,8 @@ export class ClaudeAcpAgent {
     const resumeLiveTask = (taskId: string) => {
       if (session.liveBackgroundTasks.has(taskId)) return;
       const settled = session.resumableSubagents?.get(taskId);
-      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true);
+      // Claude Code always resumes a subagent in the background.
+      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true, { backgrounded: true });
     };
 
     /** Whether any background subagent this turn spawned is still live —
@@ -4716,6 +4835,8 @@ export class ClaudeAcpAgent {
         turnAwaitingSubagents(session.activeTurn)
       ) {
         session.activeTurn.deferredSettle = outcome;
+        // The hold delays v1's answer; the turn's work ended at its result.
+        this.endForeground(params.sessionId, session.activeTurn, { outcome });
       } else {
         await settleActive(outcome);
       }
@@ -4746,9 +4867,14 @@ export class ClaudeAcpAgent {
         const unfinished = [...(turn.foregroundToolCallIds ?? [])].filter(
           (id) => session.emittedToolCalls.has(id) && !backgroundTools.has(id),
         );
-        /** Closes a tool call as failed. Returns false when the turn ended meanwhile. */
-        const failToolCall = async (toolCallId: string, text: string): Promise<boolean> => {
-          // A late hook must not overwrite the failure we are about to send.
+        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+        /**
+         * Closes a tool call that the turn ended without a result for
+         * (`AcpToolCallRenderer.unfinished`). Returns false when the turn
+         * ended meanwhile.
+         */
+        const closeUnfinished = async (toolCallId: string, ran: boolean): Promise<boolean> => {
+          // A late hook must not overwrite the report we are about to send.
           unregisterHookCallback(toolCallId);
           session.emittedToolCalls.delete(toolCallId);
           delete session.toolUseCache[toolCallId];
@@ -4756,12 +4882,7 @@ export class ClaudeAcpAgent {
           session.dispatchedToolCalls?.delete(toolCallId);
           await sendUpdate({
             sessionId: params.sessionId,
-            update: {
-              sessionUpdate: "tool_call_update",
-              toolCallId,
-              status: "failed",
-              content: [{ type: "content", content: { type: "text", text } }],
-            },
+            update: renderer.unfinished({ toolCallId, ran }),
           });
           // Cancellation can arrive while we await the client update.
           if (turn.settled || session.activeTurn !== turn) return false;
@@ -4777,7 +4898,7 @@ export class ClaudeAcpAgent {
         const abandoned = unfinished.filter((id) => !session.dispatchedToolCalls?.has(id));
         const stuck = unfinished.filter((id) => session.dispatchedToolCalls?.has(id));
         for (const toolCallId of abandoned) {
-          if (!(await failToolCall(toolCallId, "Claude stopped this tool call before it ran."))) {
+          if (!(await closeUnfinished(toolCallId, false))) {
             return;
           }
         }
@@ -4788,12 +4909,7 @@ export class ClaudeAcpAgent {
           );
           // Fail every unfinished tool before reporting one error for the prompt.
           for (const toolCallId of stuck) {
-            if (
-              !(await failToolCall(
-                toolCallId,
-                "Claude ended the turn without returning a result for this tool.",
-              ))
-            ) {
+            if (!(await closeUnfinished(toolCallId, true))) {
               return;
             }
           }
@@ -4921,6 +5037,7 @@ export class ClaudeAcpAgent {
     /** Reject every in-flight turn — used when the stream dies. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
+      this.endAutonomousCycle(params.sessionId, { error });
       const turns = session.activeTurn
         ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
         : [...(session.turnQueue ?? [])];
@@ -5019,9 +5136,9 @@ export class ClaudeAcpAgent {
                 this.trackOrphanCommand(session, active.promptUuid, "zombie");
               }
             } else if (active.commandResultSeen) {
-              // Its result was already consumed (dropped at the cancelled
-              // guard); only the terminal frame is outstanding, which no-ops
-              // with no entry. Nothing to track.
+              // Its result was already consumed (at the cancelled guard);
+              // only the terminal frame is outstanding, which no-ops with no
+              // entry. Nothing to track.
             } else {
               // The wedged turn WAS dispatched (it's active), so track it
               // "started": its late result (if the SDK recovers) is skipped
@@ -5094,6 +5211,12 @@ export class ClaudeAcpAgent {
             session.cancelled ? "cancelled" : "failed",
             session.cancelled ? "stopped" : "failed",
             "at end of stream",
+          );
+          this.endAutonomousCycle(
+            params.sessionId,
+            session.cancelled
+              ? { outcome: { stopReason: "cancelled" } }
+              : { error: RequestError.internalError(undefined, SESSION_ENDED_MESSAGE) },
           );
           await settleActive(
             session.cancelled
@@ -5246,6 +5369,8 @@ export class ClaudeAcpAgent {
           continue;
         }
 
+        this.startAutonomousCycle(params.sessionId, session, message);
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -5256,6 +5381,9 @@ export class ClaudeAcpAgent {
                 // re-emits per turn and the capability can't be lost mid-CLI.
                 if (message.capabilities?.includes("msg_lifecycle_v1")) {
                   session.msgLifecycleV1 = true;
+                }
+                if (message.capabilities?.includes("request_marker_lists_v1")) {
+                  session.requestMarkerListsV1 = true;
                 }
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
@@ -5300,6 +5428,25 @@ export class ClaudeAcpAgent {
                 }
                 break;
               case "status": {
+                // A model request that serves none of the prompts a cancel
+                // stopped is new work, such as Claude Code's follow-up after a
+                // background command finished. It comes after the stopped
+                // work's result: Claude Code ends the interrupted turn first,
+                // then runs any prompt it had already taken off its queue (its
+                // request names it, so the cancel still drops it), then its own
+                // follow-ups, whose requests name no prompt.
+                if (
+                  message.status === "requesting" &&
+                  session.cancelled &&
+                  session.requestMarkerListsV1 &&
+                  !servesCancelledWork(session, message)
+                ) {
+                  session.cancelled = false;
+                  session.cancelledPrompts = undefined;
+                  // The stopped work's tail has drained, as at activation.
+                  compaction.resume();
+                }
+                if (message.status === "requesting") session.modelRequestSinceResult = true;
                 if (message.status === "compacting") {
                   await compaction.start(message.uuid);
                 } else if (message.compact_result === "success") {
@@ -5395,6 +5542,17 @@ export class ClaudeAcpAgent {
                   session.owedTrailingIdles = 0;
                 }
                 if (message.state === "idle") {
+                  // A model cycle that Claude Code started on its own normally
+                  // ends at its result. An idle that no earlier result owes
+                  // means that result will not come (the stream dropped
+                  // mid-cycle, as for a turn in issue #825), so the cycle ends
+                  // here. An owed idle belongs to an earlier result: it can lag
+                  // past the cycle's first output.
+                  if (session.owedTrailingIdles === 0) {
+                    this.endAutonomousCycle(params.sessionId, {
+                      outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
+                    });
+                  }
                   // A non-cancelled turn normally settled at its terminal
                   // `result` already (issue #773), and that result recorded an
                   // owed trailing idle — absorbed here via the decrement. We
@@ -5404,9 +5562,9 @@ export class ClaudeAcpAgent {
                   // the time it arrives the SDK may have echoed the NEXT turn
                   // and activated it — settling now would resolve that new
                   // turn prematurely with end_turn and ~zero usage, dropping
-                  // its real result. A cancelled turn relies on `idle`: its
-                  // `result` is dropped at the `session.cancelled` guard, so
-                  // it never settles at a result and must settle here.
+                  // its real result. A cancelled turn settles at its
+                  // interrupted result (at the `session.cancelled` guard); one
+                  // whose result never came settles here.
                   //
                   // An idle that is NOT owed while the active turn is still
                   // unsettled is the issue #825 signature: `idle` is the SDK's
@@ -5418,12 +5576,9 @@ export class ClaudeAcpAgent {
                   // the turn NOW so its session/prompt gets a terminal
                   // response, instead of leaving it hanging until the next
                   // prompt drains the wreckage.
-                  // A cancelled turn still consumed tokens: its dropped result
-                  // already fed the accumulator (the usage tally at the result
-                  // handler runs before the `session.cancelled` guard), so
-                  // report it — clients metering spend would otherwise lose
-                  // the interrupted turn's tokens entirely (issue #844). Zero
-                  // when the cancel pre-empted the result (wedge/force-cancel).
+                  // A cancelled turn reaches this with no result of its own,
+                  // so its usage is zero (wedge/force-cancel), or, for a held
+                  // turn, the usage its result recorded (issue #844).
                   if (session.cancelled && session.activeTurn && !session.activeTurn.settled) {
                     // A held turn's result passed long ago; this idle is the
                     // trailer of the followup cycle the cancel interrupted,
@@ -5474,8 +5629,11 @@ export class ClaudeAcpAgent {
                     // Via the subagent gate, not settleActive: a steered turn
                     // can also have spawned background subagents, which own it
                     // from here (settles now if none is live, holds otherwise).
+                    const outcome = session.activeTurn.steeredSettle;
                     const steered: Turn = session.activeTurn;
-                    steered.deferredSettle = steered.steeredSettle;
+                    steered.deferredSettle = outcome;
+                    // A hold delays v1's answer; the turn's work ends here.
+                    this.endForeground(params.sessionId, steered, { outcome });
                     leaveSteerLane(steered);
                     await settleDeferredIfDrained();
                   } else if (session.owedTrailingIdles > 0) {
@@ -5719,7 +5877,10 @@ export class ClaudeAcpAgent {
                 // turn: a turn only ever waits on its own subagents, and a
                 // spawn during a held-open drain window (an agent chain)
                 // extends that turn's hold.
-                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type);
+                registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type, {
+                  backgrounded: message.is_backgrounded,
+                  parentTaskId: message.parent_task_id,
+                });
                 await subagents.taskStarted(
                   {
                     taskId: message.task_id,
@@ -5768,6 +5929,7 @@ export class ClaudeAcpAgent {
                   // The subagent streams no more text under this parent.
                   streamedBlocksByParent.delete(message.tool_use_id);
                 }
+                await endBackgroundTerminal(message.task_id);
                 settleLiveTask(message.task_id);
                 break;
               case "task_updated":
@@ -5778,6 +5940,13 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 await asyncTasks.taskUpdated(message.task_id, message.patch);
+                // A task moved to the background no longer blocks the tool
+                // call that spawned it, nor its requests the foreground work.
+                if (message.patch.is_backgrounded !== undefined) {
+                  const task = session.liveBackgroundTasks.get(message.task_id);
+                  if (task) task.backgrounded = message.patch.is_backgrounded;
+                  this.syncAwaitingUser(params.sessionId, session);
+                }
                 // terminal-status task_updated patch and a (deduplicated)
                 // task_notification when a task settles, but only the patch is
                 // guaranteed per transition — prune on it too so the registry
@@ -5793,6 +5962,7 @@ export class ClaudeAcpAgent {
                     message.task_id,
                   )?.parentToolUseId;
                   if (parentToolUseId) streamedBlocksByParent.delete(parentToolUseId);
+                  await endBackgroundTerminal(message.task_id);
                   settleLiveTask(message.task_id);
                 } else if (
                   message.patch.status === "running" ||
@@ -6016,6 +6186,7 @@ export class ClaudeAcpAgent {
             }
             break;
           case "result": {
+            session.modelRequestSinceResult = false;
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -6057,7 +6228,7 @@ export class ClaudeAcpAgent {
               // the map in that case).
               if (!isAutonomousResult) {
                 recordResultForOrphanCommands();
-                await ensureActiveTurn(message.user_message_uuid);
+                await ensureActiveTurn(message.user_message_uuid, message.user_message_uuids);
                 // A result that names a steer consumed it (see
                 // Turn.steeredEchoes), so the steered work is done: retire
                 // its echo — the CLI may never have replayed it — and, with
@@ -6121,13 +6292,10 @@ export class ClaudeAcpAgent {
               // orphan skip) and the SDK follows it with a trailing
               // `session_state_changed: idle` — record the debt so the idle
               // handler absorbs that idle rather than reading it as a turn the
-              // SDK abandoned (issue #825). One exclusion: the cancelled ACTIVE
-              // turn's own result. It is dropped at the `session.cancelled`
-              // guard, and either the idle itself settles the turn (consuming
-              // the trailer) or the next echo's hand-off does (which records
-              // the debt there instead) — counting here too would double it.
-              // Results skipped while cancelled with NO active turn — orphaned
-              // queued turns the SDK still ran, or a force-cancelled turn's
+              // SDK abandoned (issue #825). That includes the result of a
+              // cancelled turn, which settles it at the `session.cancelled`
+              // guard below. Results skipped while cancelled with NO active
+              // turn — orphaned queued turns the SDK still ran, or a force-cancelled turn's
               // late result after the backstop settled it — get no such settle,
               // so their trailers must be counted here or they'd later be read
               // as the next healthy turn being abandoned and false-fail it.
@@ -6140,22 +6308,18 @@ export class ClaudeAcpAgent {
               // but a held turn settling AT a followup result unblocks the
               // client at exactly that point, making the race the common
               // case.
-              // The cancelled-ACTIVE-turn exclusion applies only to that
-              // turn's OWN result — a followup result arriving inside the
-              // cancel window still gets its own trailer and must be counted,
-              // or that idle would later false-fail the next prompt.
-              // A second exclusion: a steered turn's own results (see
+              // One exclusion: a steered turn's own results (see
               // Turn.steeredEchoes). One idle covers the whole interrupted +
               // steered sequence and that idle settles the turn, so counting
               // either result would leave a debt that swallows it. Autonomous
               // results inside a steered turn keep their own trailers, and so
               // does a result that named the steer: it took the turn out of the
-              // steer lane above and settles at the result, not the idle.
-              const owesTrailingIdle = isAutonomousResult || !isSteering(session.activeTurn);
-              if (
-                owesTrailingIdle &&
-                (isAutonomousResult || !session.cancelled || !session.activeTurn)
-              ) {
+              // steer lane above and settles at the result, not the idle. So
+              // does a cancelled steered turn's result, which settles it at the
+              // `session.cancelled` guard below.
+              const owesTrailingIdle =
+                isAutonomousResult || !isSteering(session.activeTurn) || session.cancelled;
+              if (owesTrailingIdle) {
                 session.owedTrailingIdles++;
               }
 
@@ -6261,12 +6425,58 @@ export class ClaudeAcpAgent {
                 });
               }
 
+              // A model cycle that Claude Code started on its own ends at its
+              // result, after its usage, also after a cancel. A turn that
+              // Claude Code takes in takes the cycle over, so a cycle that
+              // still runs owns this result, whatever its origin says. A
+              // placeholder result (`num_turns: 0`, see the autonomous lane
+              // below) comes before the shared followup runs, so it ends
+              // nothing. The diagnostic of an ExitPlanMode answer that
+              // interrupted the cycle ends it `cancelled`, as it ends a turn,
+              // unless a held turn continues the accepted plan in a fresh
+              // context: that turn takes the cycle over (see the autonomous
+              // lane below).
+              const exitPlanInterruption =
+                pendingExitPlanModeInterruption !== undefined &&
+                isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption);
+              const continuesPlan =
+                exitPlanInterruption &&
+                isHeldOpen(session.activeTurn) &&
+                pendingExitPlanContextReset?.toolUseId ===
+                  pendingExitPlanModeInterruption?.toolUseId;
+              if (!continuesPlan && !(isAutonomousResult && message.num_turns === 0)) {
+                this.endAutonomousCycle(
+                  params.sessionId,
+                  autonomousCycleEnd(
+                    message,
+                    resultModelUsage,
+                    session.cancelled || exitPlanInterruption || isAbortedResult(message),
+                  ),
+                );
+              }
+
               if (session.cancelled) {
                 session.pendingExitPlanModeInterruption = undefined;
                 session.pendingExitPlanContextReset = undefined;
                 if (!isAutonomousResult) {
                   await clearFailuresFromEarlierTurns();
                   stopReason = "cancelled";
+                }
+                // The cancelled turn ends at the result of the work the
+                // interrupt stopped: its own result, or for a turn held open
+                // for its subagents (see Turn.deferredSettle), its follow-up's
+                // aborted one. A follow-up result that is not aborted, such as
+                // a placeholder or one that ended before the interrupt landed,
+                // belongs to other work. Claude Code ends the stopped work
+                // first, then goes on with its queue, so the idle can come
+                // much later, after a follow-up. That idle, the next echo's
+                // hand-off, and the force-cancel backstop settle a turn whose
+                // result never comes.
+                const active = session.activeTurn;
+                const stoppedWork =
+                  !isAutonomousResult || (isHeldOpen(active) && isAbortedResult(message));
+                if (active && !active.settled && stoppedWork) {
+                  await settleActive(cancelledOutcome(session, active));
                 }
                 break;
               }
@@ -6309,8 +6519,11 @@ export class ClaudeAcpAgent {
                   ) {
                     // The fresh query has none of this one's background
                     // tasks, so the hold can never drain there: drop it, and
-                    // let the continuation's own result settle the turn.
+                    // let the continuation's own result settle the turn. The
+                    // continuation is the turn's work again, which takes
+                    // over the follow-up cycle that planned it.
                     (heldTurn as Turn).deferredSettle = undefined;
+                    this.startForeground(params.sessionId, heldTurn as Turn);
                     await this.exitPlan.restart(
                       params.sessionId,
                       session,
@@ -6650,9 +6863,10 @@ export class ClaudeAcpAgent {
               // subagent never holds the prompt hostage.
               //
               // is_error/auth already settled via failActive (activeTurn is null
-              // then, so both branches no-op); cancellation is left to the
-              // idle/abort path. settleActive is idempotent, so a duplicate
-              // idle is a no-op.
+              // then, so both branches no-op); a cancelled turn settles at
+              // the `session.cancelled` guard above, or on the idle/abort
+              // path when its result never comes. settleActive is idempotent,
+              // so a duplicate idle is a no-op.
               //
               // A result also closes this compaction lifecycle — before the
               // settle, so a `cancelled` terminal for an entity the runtime
@@ -6867,7 +7081,7 @@ export class ClaudeAcpAgent {
                 if (session.activeTurn !== queued) {
                   if (session.activeTurn) {
                     // Hand off the previous turn. If a cancel is pending for it
-                    // (its trailing idle hasn't arrived yet), settle it
+                    // (neither its result nor its idle has arrived), settle it
                     // "cancelled" per the ACP contract rather than "end_turn" —
                     // otherwise a cancel followed quickly by the next prompt
                     // would report the cancelled turn as a normal completion.
@@ -7134,6 +7348,7 @@ export class ClaudeAcpAgent {
 
             const acceptedPlanToolUseId = observeExitPlanToolResults(message, content, session);
             let backgroundedToolCalls: ReadonlySet<string> = new Set();
+            let runningTerminal: string | undefined;
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
               const backgroundBashTask = backgroundBashTaskFromToolResult(
@@ -7142,6 +7357,24 @@ export class ClaudeAcpAgent {
                 session.toolUseCache,
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
+              // The command's terminal runs until its task ends, unless the
+              // task has ended already (a fast command can end before the tool
+              // result comes).
+              const terminalId = backgroundBashTask?.toolCallId;
+              if (
+                terminalId &&
+                this.toolCallCapabilities.terminalOutput &&
+                !this.toolCallCapabilities.air.client &&
+                session.liveBackgroundTasks.has(backgroundBashTask.taskId)
+              ) {
+                runningTerminal = terminalId;
+                (session.backgroundTerminals ??= new Map()).set(backgroundBashTask.taskId, {
+                  toolCallId: terminalId,
+                  ...(message.parent_tool_use_id
+                    ? { parentToolUseId: message.parent_tool_use_id }
+                    : {}),
+                });
+              }
               await asyncTasks.toolResults(content);
               backgroundedToolCalls = backgroundedBashToolCallIds(
                 content,
@@ -7198,10 +7431,13 @@ export class ClaudeAcpAgent {
               // (e.g. a subagent image) carry the stamped parentToolUseId
               // meta and are excluded there.
               await sendUpdate(
-                backgroundedBashToolCall(
-                  acceptedPlanToolResult(notification, acceptedPlanToolUseId),
-                  backgroundedToolCalls,
-                  asyncTasks.enabled,
+                withRunningTerminal(
+                  backgroundedBashToolCall(
+                    acceptedPlanToolResult(notification, acceptedPlanToolUseId),
+                    backgroundedToolCalls,
+                    asyncTasks.enabled,
+                  ),
+                  runningTerminal,
                 ),
               );
             }
@@ -7453,6 +7689,14 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // Before anything awaits, so a model request that the consumer reads in
+    // the meantime is already judged against these prompts.
+    session.cancelledPrompts ??= new Set();
+    for (const turn of session.turnQueue ?? []) {
+      if (turn.settled) continue;
+      session.cancelledPrompts.add(turn.promptUuid);
+      for (const uuid of turn.steeredUuids ?? []) session.cancelledPrompts.add(uuid);
+    }
     for (const turn of session.turnQueue ?? []) turn.localCommandAbort?.abort();
     session.pendingExitPlanModeInterruption = undefined;
     session.pendingExitPlanContextReset = undefined;
@@ -7507,9 +7751,10 @@ export class ClaudeAcpAgent {
     // never decrements the count) to miss.
     const lifecycleLane = session.msgLifecycleV1 === true;
     // Settle queued turns that haven't started yet (no echo seen) right away —
-    // they have no in-flight SDK work to interrupt. The active turn is settled
-    // by the consumer when it observes the interrupt's trailing idle (or via the
-    // backstop below). Mirrors the old pendingMessages cancellation.
+    // they have no in-flight SDK work to interrupt. The consumer settles the
+    // active turn at its interrupted result, or at the idle when that never
+    // comes (or via the backstop below). Mirrors the old pendingMessages
+    // cancellation.
     const orphanedTurns: Turn[] = [];
     if (session.turnQueue) {
       for (const turn of session.turnQueue) {
@@ -7604,15 +7849,19 @@ export class ClaudeAcpAgent {
     // whose session sits idle gets no trailing idle (the interrupt emits
     // nothing; with no state events consumed yet, the same is assumed).
     // A held turn whose followup cycle is live (running, or blocked on a
-    // permission request) is left to that idle, like any live turn: the
-    // interrupt still flushes the cycle's output, which must reach the client
-    // before the turn ends cancelled. The captured outcome preserves usage and
-    // metadata (issue #844), while reporter state makes a late checkpoint
-    // response harmless.
+    // permission request) is left to that cycle's interrupted result, like any
+    // live turn, or to the idle when no result comes. The captured outcome
+    // preserves usage and metadata (issue #844), while reporter state makes a
+    // late checkpoint response harmless.
+    // Since CLI 2.1.270, Claude Code reports `running` for as long as
+    // background agents live, so the session state cannot tell a live
+    // followup from a hold. With request markers, a followup is live when one
+    // of its model requests started after the turn's result.
     {
       const active = session.activeTurn;
-      const followupLive =
-        session.lastSessionState === "running" || session.lastSessionState === "requires_action";
+      const followupLive = session.requestMarkerListsV1
+        ? session.modelRequestSinceResult === true
+        : session.lastSessionState === "running" || session.lastSessionState === "requires_action";
       if (
         active &&
         (active.settling || (isHeldOpen(active) && !followupLive)) &&
@@ -7655,7 +7904,7 @@ export class ClaudeAcpAgent {
     }
 
     // A steered active turn (see Turn.steeredEchoes) settles "cancelled" in the
-    // consumer at the interrupt's trailing idle, like any live turn. But the
+    // consumer at its interrupted result, or at the idle, like any live turn. But the
     // steer lane pays for its last result's trailer by settling on it, which
     // this cancel pre-empts, so count that trailer here or it arrives un-owed
     // against the next prompt and false-fails it (issue #825). Over-counting
@@ -7692,6 +7941,9 @@ export class ClaudeAcpAgent {
 
     // Before the interrupt: once it stops the running turn, Claude Code starts
     // the next queued message right away.
+    // A prompt or steer that arrived while this cancel awaited is abandoned
+    // too, after the record above was taken.
+    for (const uuid of abandoned) (session.cancelledPrompts ??= new Set()).add(uuid);
     this.dropQueuedMessages(params.sessionId, session.query, abandoned);
     const interrupt = session.query.interrupt();
     if (!options.awaitInterrupt) {
@@ -7822,6 +8074,9 @@ export class ClaudeAcpAgent {
     } catch (error) {
       this.logger.error(`Session ${sessionId}: cancellation failed during teardown`, error);
     }
+    // The turns end before this returns; so does a model cycle that Claude
+    // Code started on its own, which no turn waits for.
+    this.endAutonomousCycle(sessionId, { outcome: { stopReason: "cancelled" } });
     // cancel() arms the force-cancel floor and interrupts gracefully, but a
     // wedged consumer only wakes when `cancelController` aborts — closeQueryStream
     // below doesn't touch it. Since we're tearing the session down anyway, wake
@@ -8432,38 +8687,109 @@ export class ClaudeAcpAgent {
     return response;
   }
 
-  /** Mark a client request as blocking on user input for exactly the lifetime
-   *  of its promise. Steering consults this session-local count synchronously,
-   *  so a message arriving while any permission/elicitation card is open uses
-   *  non-interrupting SDK delivery. The active turn reports that it awaits the
-   *  user while any such request is open (see `syncAwaitingUser`). */
-  private async withPendingUserInput<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+  /** Mark a client request of the subagent `agentID` (absent for the main
+   *  conversation) as awaiting user input for exactly the lifetime of its
+   *  promise (see `Session.openUserInputs`). Steering consults the open
+   *  requests synchronously, so a message arriving while any permission or
+   *  elicitation card is open uses non-interrupting SDK delivery. */
+  private async withPendingUserInput<T>(
+    sessionId: string,
+    request: () => Promise<T>,
+    agentID?: string,
+  ): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
-    session.pendingUserInputCount = (session.pendingUserInputCount ?? 0) + 1;
-    this.syncAwaitingUser(session);
+    const input = agentID !== undefined ? { agentID } : {};
+    (session.openUserInputs ??= new Set()).add(input);
+    this.syncAwaitingUser(sessionId, session);
     try {
       return await request();
     } finally {
-      session.pendingUserInputCount = Math.max(0, (session.pendingUserInputCount ?? 1) - 1);
-      this.syncAwaitingUser(session);
+      session.openUserInputs.delete(input);
+      this.syncAwaitingUser(sessionId, session);
     }
   }
 
-  /** Report whether the session's active turn awaits the user: exactly while
-   *  a permission request or question is open in the session. A request does
-   *  not say which prompt it is for, and Claude Code can ask for a queued
-   *  prompt before the consumer activates it, so a request is not tied to the
-   *  turn that was active when it opened. Called when the count changes and
-   *  when a turn activates. */
-  private syncAwaitingUser(session: Session): void {
-    const turn = session.activeTurn;
-    if (!turn || turn.settled || !turn.insertedReported) return;
-    const waiting = (session.pendingUserInputCount ?? 0) > 0;
-    if (waiting === (turn.awaitingUser ?? false)) return;
-    turn.awaitingUser = waiting;
-    if (waiting) turn.events.awaitingUser();
-    else turn.events.resumed();
+  /** Report whether the session's foreground work awaits the user: exactly
+   *  while a permission request or question that blocks it is open (see
+   *  {@link blocksForeground}). A request does not say which prompt it is for,
+   *  and Claude Code can ask for a queued prompt before the consumer activates
+   *  it, so a request is not tied to the work that was running when it
+   *  opened. Called when a request opens or closes, when a turn activates, and
+   *  when a task registers or moves to the background. */
+  private syncAwaitingUser(sessionId: string, session: Session): void {
+    const work = this.foregroundWork.get(sessionId);
+    if (!work) return;
+    const waiting = [...(session.openUserInputs ?? [])].some((input) =>
+      blocksForeground(session, input.agentID),
+    );
+    if (waiting === work.awaitingUser) return;
+    work.awaitingUser = waiting;
+    if (waiting) work.events.awaitingUser();
+    else work.events.running();
+  }
+
+  /** Make `owner` the foreground work of the session `sessionId` (see
+   *  {@link ForegroundEvents}): it reports `running`, then waits at once if a
+   *  request is open. If work already runs, it goes on under `owner` and
+   *  reports nothing new: a turn takes over a cycle that Claude Code started on
+   *  its own, and only the owner's end ends the work. */
+  private startForeground(sessionId: string, owner: ForegroundOwner): void {
+    if (!this.foregroundEvents) return;
+    const current = this.foregroundWork.get(sessionId);
+    if (current) {
+      current.owner = owner;
+      return;
+    }
+    const events = this.foregroundEvents(sessionId);
+    this.foregroundWork.set(sessionId, { owner, events, awaitingUser: false });
+    events.running();
+    const session = this.sessions[sessionId];
+    if (session) this.syncAwaitingUser(sessionId, session);
+  }
+
+  /** End the foreground work of the session `sessionId` with `outcome`, or as
+   *  failed with `error`, if `owner` is that work. */
+  private endForeground(
+    sessionId: string,
+    owner: ForegroundOwner,
+    end: { outcome: TurnOutcome } | { error: unknown },
+  ): void {
+    const work = this.foregroundWork.get(sessionId);
+    if (work?.owner !== owner) return;
+    this.foregroundWork.delete(sessionId);
+    if ("outcome" in end) work.events.ended(end.outcome);
+    else work.events.failed(end.error);
+  }
+
+  /** Start a model cycle that Claude Code started on its own as the foreground
+   *  work (see {@link ForegroundEvents}) when `message` is its first output:
+   *  model output of the main conversation (not a subagent's) while no work
+   *  runs. That includes a turn that v1 holds for its background subagents,
+   *  whose work ended at its result, so its follow-up is a cycle. Output of
+   *  the work a cancel stopped starts nothing (see Session.cancelled). */
+  private startAutonomousCycle(sessionId: string, session: Session, message: SDKMessage): void {
+    if (!this.foregroundEvents || this.foregroundWork.has(sessionId) || session.cancelled) return;
+    if (message.type !== "assistant" && message.type !== "stream_event") return;
+    if (message.parent_tool_use_id !== null) return;
+    // A turn that Claude Code started is the foreground work already. Without
+    // lifecycle frames, a queued turn's output can come before its echo, so
+    // output while a turn is queued may be that turn's. With them, a turn that
+    // Claude Code has not started has no output yet.
+    const queued = (session.turnQueue ?? []).some(
+      (turn) => !turn.settled && turn !== session.activeTurn,
+    );
+    if (queued && !session.msgLifecycleV1) return;
+    this.startForeground(sessionId, AUTONOMOUS_CYCLE);
+  }
+
+  /** End the session's model cycle that Claude Code started on its own, if one
+   *  runs. */
+  private endAutonomousCycle(
+    sessionId: string,
+    end: { outcome: TurnOutcome } | { error: unknown },
+  ): void {
+    this.endForeground(sessionId, AUTONOMOUS_CYCLE, end);
   }
 
   /** Forward a permission request to the client, wiring the tool call's
@@ -8478,6 +8804,7 @@ export class ClaudeAcpAgent {
     signal: AbortSignal,
     parentToolUseId: string | undefined,
     ownerSessionId: string,
+    agentID: string | undefined,
     toolInput: unknown,
     previewContent?: ToolCallContent[],
   ): Promise<RequestPermissionResponse> {
@@ -8506,8 +8833,10 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(ownerSessionId, () =>
-        raceWithAbort(this.client.requestPermission(params, signal), signal),
+      return await this.withPendingUserInput(
+        ownerSessionId,
+        () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+        agentID,
       );
     } catch (error) {
       if (signal.aborted) {
@@ -8588,6 +8917,106 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /**
+   * The owner of a tool use that Claude Code reports outside the stream, in
+   * `canUseTool` or a hook, for the subagent `agentID` or the root session.
+   * `parentToolUseId` is the Agent/Task tool call that spawned the subagent,
+   * as the streamed subagent path stamps it in `_meta.claudeCode` (see
+   * `liveBackgroundTasks`). `toolCallSessionId` is the session of an eagerly
+   * emitted tool call and of its requests: the subagent's child session once
+   * it is announced, else the root session. In the rare SDK ordering where
+   * the callback beats the spawning Agent/Task frame, the root keeps it; the
+   * later frame announces the child with its correct nested lineage.
+   */
+  private toolUseOwner(
+    session: Session,
+    sessionId: string,
+    agentID: string | undefined,
+  ): { parentToolUseId?: string; toolCallSessionId: string } {
+    const parentToolUseId = agentID
+      ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
+      : undefined;
+    const child =
+      clientSupportsSubagents(this.clientCapabilities) && agentID
+        ? session.nativeSubagentsByTaskId?.get(agentID)
+        : undefined;
+    return {
+      ...(parentToolUseId ? { parentToolUseId } : {}),
+      toolCallSessionId: child?.announced ? child.sessionId : sessionId,
+    };
+  }
+
+  /**
+   * The PreToolUse hook of a v2 connection, for Edit and Write: the tool call
+   * shows the exact patch of the change before the tool runs.
+   *
+   * A v2 diff cannot hold the input's snippet, so without it an auto-approved
+   * Edit or Write would show its change only once it is done. Claude Code runs
+   * the tool only after the hook returns, so the file is as it was before the
+   * change, as for the approval patch of a permission request (which runs
+   * after this hook, and shows the same patch). The hook makes no permission
+   * decision, and a failure only leaves the preview out.
+   */
+  private fileChangePreviewHook(sessionId: string): HookCallback {
+    return async (input, toolUseID) => {
+      if (input.hook_event_name === "PreToolUse" && toolUseID) {
+        await this.previewFileChange(sessionId, input, toolUseID).catch((error) =>
+          this.logger.error(`Session ${sessionId}: failed to preview ${toolUseID}: ${error}`),
+        );
+      }
+      return { continue: true };
+    };
+  }
+
+  private async previewFileChange(
+    sessionId: string,
+    input: PreToolUseHookInput,
+    toolUseID: string,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
+    const content = await previewPatchContent(input.tool_name, toolInput, session.cwd, "v2");
+    if (!content) return;
+    const { parentToolUseId, toolCallSessionId } = this.toolUseOwner(
+      session,
+      sessionId,
+      input.agent_id,
+    );
+    // Hook callbacks bypass the stream, so the hook can come before the
+    // streamed tool_use, as `canUseTool` can: then the tool call goes out
+    // with the patch.
+    if (!session.emittedToolCalls.has(toolUseID)) {
+      await this.ensureToolCallEmitted(
+        sessionId,
+        input.tool_name,
+        toolUseID,
+        toolInput,
+        parentToolUseId,
+        undefined,
+        toolCallSessionId,
+        content,
+      );
+      return;
+    }
+    const update: SessionNotification["update"] = {
+      sessionUpdate: "tool_call_update",
+      toolCallId: toolUseID,
+      content,
+    };
+    if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
+    const fields = toolCallFieldsOf(session);
+    if (!fields.apply(update)) return;
+    // The streamed input must not replace the patch, as for an approval patch.
+    fields.pinContent(toolUseID, content);
+    // The stream's router sends it to the session that holds the tool call.
+    if (session.nativeSubagentDeliver) {
+      await session.nativeSubagentDeliver({ sessionId, update });
+    } else {
+      await this.client.sessionUpdate({ sessionId: toolCallSessionId, update });
+    }
+  }
+
   canUseTool(sessionId: string): CanUseTool {
     return async (
       toolName,
@@ -8616,25 +9045,11 @@ export class ClaudeAcpAgent {
         };
       }
 
-      // When the tool call originates inside a subagent, attribute the eagerly
-      // emitted tool_call (and the permission request itself) to the Agent/Task
-      // tool call that spawned the subagent, mirroring the streamed subagent
-      // path's `_meta.claudeCode.parentToolUseId` (see `liveBackgroundTasks`).
-      const parentToolUseId = agentID
-        ? session.liveBackgroundTasks.get(agentID)?.parentToolUseId
-        : undefined;
-      const permissionSessionId =
-        clientSupportsSubagents(this.clientCapabilities) && agentID
-          ? (() => {
-              const child = session.nativeSubagentsByTaskId?.get(agentID);
-              // A request must never target a child session before its
-              // subagent_spawned notification. In the rare SDK ordering where
-              // canUseTool beats the spawning Agent/Task frame, keep the
-              // permission on the root session; the later frame will announce
-              // the child with correct nested lineage.
-              return child?.announced ? child.sessionId : sessionId;
-            })()
-          : sessionId;
+      const { parentToolUseId, toolCallSessionId: permissionSessionId } = this.toolUseOwner(
+        session,
+        sessionId,
+        agentID,
+      );
       if (agentID && !parentToolUseId) {
         // The attribution rests on task_started.task_id === canUseTool's
         // agentID for subagent tasks (documented since SDK 0.3.292, which
@@ -8670,6 +9085,7 @@ export class ClaudeAcpAgent {
           toolInput,
           toolUseID,
           signal,
+          agentID,
         );
       }
 
@@ -8763,6 +9179,7 @@ export class ClaudeAcpAgent {
         signal,
         parentToolUseId,
         sessionId,
+        agentID,
         toolInput,
         previewContent,
       );
@@ -8872,6 +9289,7 @@ export class ClaudeAcpAgent {
     toolInput: Record<string, unknown>,
     toolUseID: string,
     signal: AbortSignal,
+    agentID: string | undefined,
   ): Promise<PermissionResult> {
     const questions = extractAskUserQuestions(toolInput);
     if (!questions) {
@@ -8886,8 +9304,10 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withPendingUserInput(sessionId, () =>
-        this.client.createElicitation(createRequest, signal),
+      response = await this.withPendingUserInput(
+        sessionId,
+        () => this.client.createElicitation(createRequest, signal),
+        agentID,
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -9715,32 +10135,26 @@ export class ClaudeAcpAgent {
     // into the query.
     const resolvedProvider = this.resolveProviderConfig();
     const providerEnv = createEnvForProvider(resolvedProvider);
-    const configuredSettings =
-      userProvidedOptions?.settings ??
-      (modelConfig
-        ? {
-            ...(modelConfig.modelOverrides && { modelOverrides: modelConfig.modelOverrides }),
-            ...(modelConfig.availableModels && { availableModels: modelConfig.availableModels }),
-          }
-        : undefined);
-    const configuredSettingsObject =
-      typeof configuredSettings === "string"
+    const providedSettings = userProvidedOptions?.settings;
+    const providedSettingsObject =
+      typeof providedSettings === "string"
         ? (JSON.parse(
-            await fs.readFile(path.resolve(params.cwd, configuredSettings), "utf8"),
+            await fs.readFile(path.resolve(params.cwd, providedSettings), "utf8"),
           ) as Settings)
-        : configuredSettings;
+        : providedSettings;
+    const configuredSettingsObject = modelConfig
+      ? { ...modelConfig, ...providedSettingsObject }
+      : providedSettingsObject;
     // Claude Code applies env from settings.json after the subprocess env. Put
     // an active ACP route in the programmatic settings tier too so user/project
     // settings cannot silently restore a different ANTHROPIC_BASE_URL.
-    let settings = configuredSettings;
-    if (resolvedProvider) {
-      const baseSettings = configuredSettingsObject;
-      settings = {
-        ...baseSettings,
-        apiKeyHelper: "",
-        env: { ...baseSettings?.env, ...providerEnv },
-      };
-    }
+    const settings = resolvedProvider
+      ? {
+          ...configuredSettingsObject,
+          apiKeyHelper: "",
+          env: { ...configuredSettingsObject?.env, ...providerEnv },
+        }
+      : configuredSettingsObject;
     const env = {
       ...process.env,
       ...userProvidedOptions?.env,
@@ -9810,6 +10224,17 @@ export class ClaudeAcpAgent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
+        // On v2, an Edit or Write shows its exact patch before it runs, also
+        // when no permission request shows it (`fileChangePreviewHook`): a v2
+        // diff cannot hold the input's snippet.
+        ...(this.v2
+          ? {
+              PreToolUse: [
+                ...(userProvidedOptions?.hooks?.PreToolUse || []),
+                { matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] },
+              ],
+            }
+          : {}),
         PostToolUse: [
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
@@ -10372,6 +10797,31 @@ function cancelledOutcome(session: Session, turn: Turn | null | undefined): Turn
   };
 }
 
+/** Whether the model request that `status` (a `status: requesting` frame)
+ *  starts may belong to the work a cancel stopped. It may while:
+ *  - a turn is unsettled: the stopped turn, whose result is still to come, or
+ *    a queued prompt, which the cancel abandons (one that arrived while the
+ *    cancel awaited is recorded only when the cancel sweeps the queue) or
+ *    whose echo ends the cancel right after its request anyway;
+ *  - the orphan accounting still expects the result of an abandoned prompt
+ *    that Claude Code may still run, which it can fold into its own
+ *    follow-up after that follow-up's first request;
+ *  - the request serves one of {@link Session.cancelledPrompts}, as an
+ *    abandoned prompt's request does even when the interrupt receipt left it
+ *    out of the orphan accounting. */
+function servesCancelledWork(session: Session, status: object): boolean {
+  const cancelled = session.cancelledPrompts;
+  if (!cancelled) return false;
+  if ((session.turnQueue ?? []).some((turn) => !turn.settled)) return true;
+  if ((session.pendingOrphanResults ?? 0) > 0 || (session.orphanCommands?.size ?? 0) > 0) {
+    return true;
+  }
+  const served = (status as { user_message_uuids?: unknown }).user_message_uuids;
+  return (
+    Array.isArray(served) && served.some((uuid) => typeof uuid === "string" && cancelled.has(uuid))
+  );
+}
+
 /** `_meta.quota` for a prompt response: what the turn spent, shaped like
  *  codex-acp's (snake_case container keys, camelCase counters) so a client
  *  reads one shape from either agent.
@@ -10384,15 +10834,95 @@ function cancelledOutcome(session: Session, turn: Turn | null | undefined): Turn
  *  so the rows can total more than `token_count`. They are the fuller picture,
  *  not a decomposition of it. */
 function turnQuotaMeta(session: Session) {
+  return quotaMeta(session.accumulatedUsage, session.accumulatedModelUsage);
+}
+
+/** `_meta.quota` for work that spent `usage` in its main agent loop and
+ *  `modelUsage` by model (see {@link turnQuotaMeta}). */
+function quotaMeta(usage: AccumulatedUsage, modelUsage: ModelTokenTally | undefined) {
   return {
     quota: {
-      token_count: quotaTokenCount(session.accumulatedUsage),
-      model_usage: Object.entries(session.accumulatedModelUsage ?? {}).map(([model, usage]) => ({
+      token_count: quotaTokenCount(usage),
+      model_usage: Object.entries(modelUsage ?? {}).map(([model, usage]) => ({
         model,
         token_count: quotaTokenCount(usage),
       })),
     },
   };
+}
+
+/** Whether a request that awaits the user for the subagent `agentID` (absent
+ *  for the main conversation) blocks the session's foreground work. The main
+ *  conversation's requests do. So do those of a subagent that runs in the
+ *  foreground of the main conversation, since the tool call that spawned it
+ *  waits on it, and so on up a chain of such subagents. A request of a
+ *  subagent in the background, or nested inside one, does not: the main
+ *  conversation goes on without it. Nor does one of an agent without a
+ *  record: a teammate, a settled subagent, or one that Claude Code left out
+ *  of its background tasks and the consumer pruned, which only happens to a
+ *  subagent nested in a background one. A subagent that the main
+ *  conversation waits on has a record by the time it asks, as its
+ *  `task_started` comes first; when the consumer reads the request first, the
+ *  `task_started` checks again. */
+function blocksForeground(session: Session, agentID: string | undefined): boolean {
+  const seen = new Set<string>();
+  for (let id = agentID; id !== undefined && !seen.has(id);) {
+    seen.add(id);
+    const task = session.liveBackgroundTasks.get(id);
+    if (!task) return false;
+    if (task.backgrounded) return false;
+    id = task.parentTaskId;
+  }
+  return true;
+}
+
+/** Whether Claude Code ended the work of `result` because an interrupt
+ *  stopped it, while the model streamed or while a tool ran. */
+function isAbortedResult(result: Extract<SDKMessage, { type: "result" }>): boolean {
+  return (
+    result.terminal_reason === "aborted_streaming" || result.terminal_reason === "aborted_tools"
+  );
+}
+
+/** How a model cycle that Claude Code started on its own ended, read from its
+ *  result as a turn's is: a refusal, the token limit, and the turn and budget
+ *  limits are their stop reasons, an error result fails the cycle, and a
+ *  cancel ends it `cancelled`. The usage and `_meta.quota` are the result's
+ *  own, `modelUsage` its increment by model, since autonomous results stay out
+ *  of the turn tally. */
+function autonomousCycleEnd(
+  result: Extract<SDKMessage, { type: "result" }>,
+  modelUsage: ModelTokenTally,
+  cancelled: boolean,
+): { outcome: TurnOutcome } | { error: unknown } {
+  // Typed non-null, but third-party backends have been observed omitting
+  // usage token fields (see snapshotFromUsage).
+  const tally: AccumulatedUsage = {
+    inputTokens: result.usage.input_tokens ?? 0,
+    outputTokens: result.usage.output_tokens ?? 0,
+    cachedReadTokens: result.usage.cache_read_input_tokens ?? 0,
+    cachedWriteTokens: result.usage.cache_creation_input_tokens ?? 0,
+  };
+  const ended = (stopReason: StopReason) => ({
+    outcome: {
+      stopReason,
+      usage: { ...tally, totalTokens: tallyTotal(tally) },
+      _meta: quotaMeta(tally, modelUsage),
+    },
+  });
+  if (cancelled) return ended("cancelled");
+  if (result.stop_reason === "refusal") return ended("refusal");
+  if (result.stop_reason === "max_tokens") return ended("max_tokens");
+  if (result.is_error) {
+    const text =
+      result.subtype === "success" ? result.result : result.errors.join(", ") || result.subtype;
+    return { error: RequestError.internalError(undefined, text) };
+  }
+  return ended(
+    result.subtype === "success" || result.subtype === "error_during_execution"
+      ? "end_turn"
+      : "max_turn_requests",
+  );
 }
 
 /** One `token_count` object. `cachedInputTokens` is cache reads, matching

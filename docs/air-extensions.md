@@ -17,6 +17,7 @@ It describes only this adapter.
 - [Claude tools and ACP fields](#claude-tools-and-acp-fields)
 - [Diff patch](#diff-patch)
 - [Plan file](#plan-file)
+- [Session hooks](#session-hooks)
 - [Permission presentation](#permission-presentation)
 - [Goal](#goal)
 - [Recommended config values](#recommended-config-values)
@@ -495,6 +496,21 @@ The plan text goes out as before in these cases:
 `rawInput` then is the SDK input with `plan`, and the input `planFilePath` when it is present.
 AIR then shows the in-memory `plan` text.
 A client that is not AIR always gets the whole SDK input, like upstream.
+
+## Session hooks
+
+The adapter accepts session hooks from any client, without a capability.
+AIR puts the hooks into `_meta.claudeCode.options.settings.hooks` of `session/new` and `session/load`:
+
+```json
+{ "claudeCode": { "options": { "settings": { "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "..." }] }] } } } }
+```
+
+- The settings go to the flag settings tier of that session only. Other sessions and the settings files do not change.
+- Claude Code runs the hooks of every settings tier, so the user, project and IDE hooks of one event all run. `src/tests/session-hooks.test.ts` checks this with the Claude Code binary.
+- `CLAUDE_MODEL_CONFIG` stays in effect (see [Model configuration](model-configuration.md#precedence)).
+- A `session/load` with different settings recreates the query, so it applies the new hooks.
+- Claude asks for no hook trust step.
 
 ## Permission presentation
 
