@@ -320,9 +320,17 @@ import {
   buildModelConfigOption,
   getAvailableModels,
   MODEL_CONFIG_ID,
+  narrowToGatewayModels,
   resolveModelPreference,
   type SessionModelState,
 } from "./session-model.js";
+import {
+  GatewayListingError,
+  listBedrockModels,
+  listGatewayModels,
+  PROVIDER_AUTH_TOKEN_PLACEHOLDER,
+  selectBedrockRegion,
+} from "./gateway-models.js";
 import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
@@ -1697,6 +1705,19 @@ type ProviderConfig = {
     projectId: string;
     region: string;
   };
+  /**
+   * Model ids an `anthropic` or `bedrock` gateway listed when it was set via
+   * `providers/set`; the model picker offers only these. Absent when the
+   * listing failed or the config came from elsewhere (gateway `authenticate`),
+   * so nothing is narrowed.
+   */
+  listedModels?: string[];
+  /**
+   * The cross-region prefix of the model ids a `bedrock` gateway
+   * listed (`eu` for `eu.anthropic.claude-sonnet-5`), passed to the CLI as
+   * `ANTHROPIC_BEDROCK_REGION_PREFIX` so it calls the models under that prefix.
+   */
+  bedrockRegionPrefix?: string;
 };
 
 export type { ToolUpdateMeta } from "./tool-calls/renderer.js";
@@ -2884,7 +2905,7 @@ export class ClaudeAcpAgent {
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    if (this.providerUpdate) await this.providerUpdate;
+    while (this.providerUpdate) await this.providerUpdate;
     const response = await this.createSession(params, {
       // Revisit these meta values once we support resume
       resume: (params._meta as NewSessionMeta | undefined)?.claudeCode?.options?.resume,
@@ -2959,7 +2980,7 @@ export class ClaudeAcpAgent {
    * later load or resume with the same settings reuses it.
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
-    if (this.providerUpdate) await this.providerUpdate;
+    while (this.providerUpdate) await this.providerUpdate;
     const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
@@ -2977,7 +2998,7 @@ export class ClaudeAcpAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-    if (this.providerUpdate) await this.providerUpdate;
+    while (this.providerUpdate) await this.providerUpdate;
     const result = await this.getOrCreateSession(params);
 
     this.afterSetupResponse(params.sessionId, params.mcpServers ?? []);
@@ -2986,7 +3007,7 @@ export class ClaudeAcpAgent {
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     const timing = new SessionTiming(this.logger, "load", params.sessionId);
-    if (this.providerUpdate) await this.providerUpdate;
+    while (this.providerUpdate) await this.providerUpdate;
     let result: NewSessionResponse;
     if (this.sessions[params.sessionId]) {
       const resumedSession = await readResumedSession(params.sessionId, this.logger);
@@ -3420,6 +3441,48 @@ export class ClaudeAcpAgent {
     return {};
   }
 
+  /**
+   * The model ids the gateway in `config` lists, read before `providers/set`
+   * returns so the sessions it recreates already offer only those, and for
+   * `bedrock` the region prefix picked from them. Setting the same gateway
+   * again reuses the previous listing. `vertex` gateways are not listed.
+   * Throws a {@link GatewayListingError} when the listing fails.
+   */
+  private async listProviderModels(
+    config: ProviderConfig,
+  ): Promise<Pick<ProviderConfig, "listedModels" | "bedrockRegionPrefix">> {
+    // Reuse needs the very same headers, so a rotated token lists again, and a
+    // failed listing then fails that `providers/set`. Deliberate: AIR keeps its
+    // proxy key for the IDE's lifetime and does not rotate it.
+    const current = this.providerConfig;
+    if (
+      current?.listedModels &&
+      current.apiType === config.apiType &&
+      current.baseUrl === config.baseUrl &&
+      sameHeaders(current.headers, config.headers)
+    ) {
+      return {
+        listedModels: current.listedModels,
+        bedrockRegionPrefix: current.bedrockRegionPrefix,
+      };
+    }
+    if (config.apiType === "anthropic") {
+      return { listedModels: await listGatewayModels(config.baseUrl, config.headers, this.logger) };
+    }
+    if (config.apiType === "bedrock") {
+      const modelIds = await listBedrockModels(config.baseUrl, config.headers, this.logger);
+      if (!modelIds) return {};
+      const region = selectBedrockRegion(modelIds);
+      if (region.modelIds.length < modelIds.length) {
+        this.logger.log(
+          `[providers/set] Bedrock models span several region prefixes; using ${region.regionPrefix} and dropping ${modelIds.length - region.modelIds.length} id(s) of other prefixes`,
+        );
+      }
+      return { listedModels: region.modelIds, bedrockRegionPrefix: region.regionPrefix };
+    }
+    return {};
+  }
+
   resolveProviderConfig(): ProviderConfig | null {
     return this.providerConfig ?? gatewayRequestToProviderConfig(this.gatewayAuthRequest);
   }
@@ -3455,7 +3518,10 @@ export class ClaudeAcpAgent {
     // provider routing set via `providers/set`. Neither touches the on-disk
     // credential store, so dropping these references is the whole logout for
     // those paths.
-    const hadRoutingOverride = this.resolveProviderConfig() !== null;
+    // A queued `providers/set` may still be listing and apply after this point,
+    // so a busy queue counts as an override to clear.
+    const hadRoutingOverride =
+      this.resolveProviderConfig() !== null || this.providerUpdate !== null;
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
     // Any probe already running read the pre-logout world; the bump makes its
@@ -3568,7 +3634,7 @@ export class ClaudeAcpAgent {
    * before this resolves.
    */
   async startTurn(params: PromptRequest, events: TurnEvents): Promise<void> {
-    if (this.providerUpdate) await this.providerUpdate;
+    while (this.providerUpdate) await this.providerUpdate;
     let session = this.sessions[params.sessionId];
     if (!session) {
       throw new Error("Session not found");
@@ -10697,7 +10763,7 @@ export class ClaudeAcpAgent {
       // configured. Managed `deniedModels` drops entries the CLI would refuse.
       const settingsAvailableModels = settingsManager.getSettings().availableModels;
       const settingsModelOverrides = settingsManager.getSettings().modelOverrides;
-      const allowedModels = Array.isArray(settingsAvailableModels)
+      const settingsAllowedModels = Array.isArray(settingsAvailableModels)
         ? applyAvailableModelsAllowlist(
             initializationResult.models,
             settingsAvailableModels,
@@ -10705,6 +10771,14 @@ export class ClaudeAcpAgent {
             settingsManager.getManagedDeniedModels(),
           )
         : initializationResult.models;
+      // Then keep only the models the `providers/set` gateway listed.
+      const allowedModels = resolvedProvider?.listedModels
+        ? narrowToGatewayModels(
+            settingsAllowedModels,
+            resolvedProvider.listedModels,
+            resolvedProvider.bedrockRegionPrefix,
+          )
+        : settingsAllowedModels;
 
       const models = await getAvailableModels(
         q,
@@ -10715,6 +10789,7 @@ export class ClaudeAcpAgent {
         creationOpts.resume !== undefined,
         sessionId,
         await resumedModelHint,
+        resolvedProvider?.listedModels !== undefined,
       );
       timing.phase("models");
 
@@ -10935,6 +11010,25 @@ export class ClaudeAcpAgent {
   private async enqueueProviderUpdate(config: ProviderConfig | undefined): Promise<void> {
     const previous = this.providerUpdate?.catch(() => undefined) ?? Promise.resolve();
     const update = previous.then(async () => {
+      // The listing runs in the queue, so `providers/set`, `providers/disable`
+      // and logout apply in the order they arrived. A failed listing fails this
+      // `providers/set` before the provider replaces the current one.
+      if (config) {
+        try {
+          Object.assign(config, await this.listProviderModels(config));
+        } catch (error) {
+          if (error instanceof GatewayListingError) {
+            throw RequestError.internalError(
+              { providerId: PROVIDER_ID, apiType: config.apiType, baseUrl: config.baseUrl },
+              `Model discovery for provider "${PROVIDER_ID}" failed: ${error.message}`,
+            );
+          }
+          throw error;
+        }
+        this.logger.log(
+          `[providers/set] listedModels=${config.listedModels?.length ?? "none"} bedrockRegionPrefix=${config.bedrockRegionPrefix ?? "none"}`,
+        );
+      }
       const sessions = Object.entries(this.sessions);
       const activeTurns = sessions.flatMap(([, session]) =>
         (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
@@ -11450,9 +11544,12 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
     return {
       ...resetRouting,
       CLAUDE_CODE_USE_BEDROCK: "1",
-      AWS_BEARER_TOKEN_BEDROCK: "acp-proxy", // Bypass local AWS credential checks
+      AWS_BEARER_TOKEN_BEDROCK: PROVIDER_AUTH_TOKEN_PLACEHOLDER, // Bypass local AWS credential checks
       ANTHROPIC_BEDROCK_BASE_URL: config.baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+      ...(config.bedrockRegionPrefix
+        ? { ANTHROPIC_BEDROCK_REGION_PREFIX: config.bedrockRegionPrefix }
+        : {}),
     };
   }
 
@@ -11479,8 +11576,13 @@ function createEnvForProvider(config: ProviderConfig | null): Record<string, str
     ...resetRouting,
     ANTHROPIC_BASE_URL: config.baseUrl,
     ANTHROPIC_CUSTOM_HEADERS: customHeaders,
-    ANTHROPIC_AUTH_TOKEN: "acp-proxy", // Bypass local Claude login checks
+    ANTHROPIC_AUTH_TOKEN: PROVIDER_AUTH_TOKEN_PLACEHOLDER, // Bypass local Claude login checks
   };
+}
+
+function sameHeaders(a: Record<string, string>, b: Record<string, string>): boolean {
+  const aKeys = Object.keys(a);
+  return aKeys.length === Object.keys(b).length && aKeys.every((key) => b[key] === a[key]);
 }
 
 /**
@@ -11687,10 +11789,14 @@ export function buildConfigOptions(
   fastMode?: FastModeOptionState,
   presentation?: ConfigOptionPresentation,
 ): SessionConfigOption[] {
-  const options: SessionConfigOption[] = [
-    SessionModeManager.configOption(modes),
-    buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
-  ];
+  const options: SessionConfigOption[] = [SessionModeManager.configOption(modes)];
+  // A gateway that lists none of the SDK's models leaves no model to offer, so
+  // there is no model option at all.
+  if (models.availableModels.length > 0) {
+    options.push(
+      buildModelConfigOption(models, modelInfos, presentation?.useRecommendedValue === true),
+    );
+  }
   const effort = buildEffortConfigOption(
     modelInfos,
     models.currentModelId,

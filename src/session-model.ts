@@ -1,6 +1,7 @@
 import type { SessionConfigOption } from "@agentclientprotocol/sdk";
 import type { ModelInfo, Query, Settings } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
+import { bedrockRegionPrefix } from "./gateway-models.js";
 
 export const MODEL_CONFIG_ID = "model";
 
@@ -262,9 +263,10 @@ function resolveSettingsModel(
 
 const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
 
-/** A model id without the spellings `deniedModels` ignores: provider
- *  prefixes, dates, version suffixes, `-fast` and context hints. */
-function normalizeDeniedModelId(value: string): string {
+/** A model id without the spellings that name the same model: provider
+ *  prefixes, dates, version suffixes, `-fast` and context hints. `deniedModels`
+ *  and gateway listings both match on it. */
+function normalizeModelId(value: string): string {
   let id = stripContextHints(value.trim().toLowerCase());
   const providerPrefix = id.lastIndexOf("anthropic.");
   if (providerPrefix !== -1) id = id.slice(providerPrefix + "anthropic.".length);
@@ -283,10 +285,10 @@ function normalizeDeniedModelId(value: string): string {
  * the enforcer; this only keeps the picker from offering a refused row.
  */
 export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
-  const id = normalizeDeniedModelId(modelId);
+  const id = normalizeModelId(modelId);
   if (!id) return false;
   return deniedModels.some((entry) => {
-    const denied = normalizeDeniedModelId(entry);
+    const denied = normalizeModelId(entry);
     if (!denied) return false;
     if (MODEL_FAMILY_ALIASES.has(denied)) return id === denied || id.includes(`-${denied}`);
     return id === denied || id.startsWith(`${denied}-`);
@@ -379,6 +381,48 @@ export function applyAvailableModelsAllowlist(
   return result;
 }
 
+/**
+ * Keep the SDK models the `providers/set` gateway listed (`listGatewayModels`,
+ * `listBedrockModels`). A row matches when its `resolvedModel` (or
+ * its `value` when the SDK gives none) names a listed model in any spelling:
+ * `claude-sonnet-5[1m]` matches a listed `claude-sonnet-5-20260101`, and
+ * `eu.anthropic.claude-sonnet-5` matches a listed `eu.anthropic.claude-sonnet-5-v1:0`.
+ *
+ * With a Bedrock `regionPrefix`, a row resolved to another cross-region prefix
+ * (`us.anthropic.claude-sonnet-5` under `eu`) is dropped even when the same
+ * model is listed under `eu`: the CLI would call it in the other region.
+ *
+ * A row the SDK gives no `resolvedModel` names its model only by an alias, so
+ * it is checked as far as the alias allows: `default` is kept, and a family
+ * alias such as `opus` is kept when the gateway lists a model of that family.
+ *
+ * When no row matches by its model (a `default` row kept only for lacking a
+ * `resolvedModel` does not count), the gateway serves none of the SDK's
+ * models, and nothing is left: the session offers no model.
+ */
+export function narrowToGatewayModels(
+  models: ModelInfo[],
+  listedModelIds: readonly string[],
+  regionPrefix?: string,
+): ModelInfo[] {
+  const listed = new Set(listedModelIds.map(normalizeModelId).filter(Boolean));
+  const narrowed = models.filter((model) => {
+    const modelId = model.resolvedModel ?? model.value;
+    const prefix = bedrockRegionPrefix(modelId);
+    if (regionPrefix !== undefined && prefix !== undefined && prefix !== regionPrefix) {
+      return false;
+    }
+    const id = normalizeModelId(modelId);
+    if (listed.has(id)) return true;
+    if (model.resolvedModel !== undefined) return false;
+    if (model.value === "default") return true;
+    return MODEL_FAMILY_ALIASES.has(id) && [...listed].some((entry) => entry.includes(`-${id}`));
+  });
+  return narrowed.some((model) => listed.has(normalizeModelId(model.resolvedModel ?? model.value)))
+    ? narrowed
+    : [];
+}
+
 /** Whether a rejected `setModel` was vetoed by a user-configured
  *  PreModelSwitch hook. The CLI's rejection message is the stable,
  *  distinguishable marker ("Model switch blocked by a PreModelSwitch hook:
@@ -397,7 +441,18 @@ export async function getAvailableModels(
   isResumedSession: boolean,
   sessionId: string,
   resumedModelHint?: string,
+  narrowedByGateway = false,
 ): Promise<SessionModelState> {
+  // A gateway that lists none of the SDK's models leaves none to offer
+  // (`narrowToGatewayModels`). The session stays on the model the SDK runs,
+  // and the gateway refuses its requests.
+  if (models.length === 0) {
+    return {
+      availableModels: [],
+      currentModelId: (isResumedSession && resumedModelHint) || sdkModels[0]?.value || "default",
+    };
+  }
+
   const settings = settingsManager.getSettings();
 
   let currentModel = models[0];
@@ -444,9 +499,34 @@ export async function getAvailableModels(
   //      be re-asserted to keep the reported model truthful.
   // Anything else (fuzzy match, allowlist-synthesized value, alias) gets a
   // setModel call so we don't drift from the user's intended pin.
+  // Case (a) does not hold when `narrowToGatewayModels` left the SDK on a
+  // model the gateway does not list: the dropped `default` row of a fresh or
+  // transcript-less session, or a resumed transcript model outside the list.
+  // Such a session switches to models[0].
   const sdkSawSameValue = sdkModels.some((m) => m.value === currentModel.value);
+  const sdkDefault = sdkModels.find((m) => m.value === "default");
+  const sdkDefaultDropped = sdkDefault !== undefined && !models.some((m) => m.value === "default");
+  let switchToListed = false;
+  if (resolvedFromInput === undefined) {
+    if (!isResumedSession || !resumedModelHint) {
+      switchToListed = sdkDefaultDropped;
+    } else if (
+      narrowedByGateway &&
+      (!models.some((m) => m.value === currentModel.value) ||
+        // A loose match can map the transcript's model onto a listed row of
+        // another version, which the CLI does not resume on.
+        (currentModel.resolvedModel !== undefined &&
+          normalizeModelId(currentModel.resolvedModel) !== normalizeModelId(resumedModelHint)))
+    ) {
+      currentModel = models[0];
+      switchToListed = true;
+    }
+  }
+  // When the switch fails, the SDK stays on the model it ran before it.
+  const modelBeforeSwitch = (): ModelInfo =>
+    switchToListed && sdkDefault !== undefined ? sdkDefault : models[0];
   const skipSetModel =
-    resolvedFromInput === undefined ||
+    (resolvedFromInput === undefined && !switchToListed) ||
     (!isResumedSession && currentModel.value === resolvedFromInput && sdkSawSameValue);
   if (!skipSetModel) {
     const setModelStartedAt = performance.now();
@@ -478,15 +558,19 @@ export async function getAvailableModels(
       // live model back on this path: getContextUsage isn't serviced on a
       // fresh session until the first prompt turn (issues #886/#880).
       if (!isResumedSession) {
-        if (!isPreModelSwitchHookBlock(error)) throw error;
+        // A switch onto a listed model is advisory too: the session stays on
+        // the model the SDK runs and reports it.
+        if (!switchToListed && !isPreModelSwitchHookBlock(error)) throw error;
         logger.error(
-          `Model pin "${currentModel.value}" was vetoed by a PreModelSwitch hook; staying on the default model:`,
+          `Model switch to "${currentModel.value}" failed or was vetoed by a PreModelSwitch hook; staying on the default model:`,
           error,
         );
-        currentModel = models[0];
+        currentModel = modelBeforeSwitch();
       } else {
         logger.error(`Failed to re-assert model "${currentModel.value}" on resume:`, error);
-        currentModel = resumedModelHint ? matchResumedModel(models, resumedModelHint) : models[0];
+        currentModel = resumedModelHint
+          ? matchResumedModel(models, resumedModelHint)
+          : modelBeforeSwitch();
       }
     }
   }
