@@ -4898,6 +4898,13 @@ export class ClaudeAcpAgent {
       }
     };
 
+    /** Whether the closing at the end of the work a cancel stopped takes a tool
+     *  call that the subagent started by the Agent call `parentToolUseId` made
+     *  (undefined for a call of the main conversation): not one of a running
+     *  background subagent, which the cancel may not have stopped. */
+    const closedAtCancel = (parentToolUseId: string | undefined): boolean =>
+      parentToolUseId === undefined || !runsInBackground(parentToolUseId);
+
     /** Closes the tool calls that the work a cancel stopped left open, as that
      *  work ends. Claude Code's interrupt ends each running tool of the main
      *  conversation with an error result, which `sendInterruptedToolResults`
@@ -4915,9 +4922,7 @@ export class ClaudeAcpAgent {
      *  Runs once per turn: a second call, from the other settling path, waits
      *  for the first (see `Turn.closingCancelledToolCalls`). */
     const closeCancelledToolCalls = (turn: Turn): Promise<void> =>
-      (turn.closingCancelledToolCalls ??= closeOpenToolCalls(
-        (parentToolUseId) => parentToolUseId === undefined || !runsInBackground(parentToolUseId),
-      ));
+      (turn.closingCancelledToolCalls ??= closeOpenToolCalls(closedAtCancel));
     session.closeCancelledToolCalls = closeCancelledToolCalls;
 
     /** Closes the tool calls of the subagent that the Agent call `agentToolUseId`
