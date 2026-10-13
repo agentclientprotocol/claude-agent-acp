@@ -157,13 +157,18 @@ function connectRouter(): v2.Stream {
 
 /**
  * A v2 client app that collects every `_auth/status_update`, session update,
- * elicitation, and permission request it receives, accepts every elicitation,
- * and answers permission requests with `answerPermission`.
+ * elicitation, and permission request it receives, answers elicitations with
+ * `answerElicitation` (it accepts them), and answers permission requests with
+ * `answerPermission`.
  */
 function v2Client({
   answerPermission = () => ({ outcome: { outcome: "cancelled" } }),
+  answerElicitation = () => ({ action: "accept" }),
 }: {
   answerPermission?: (request: v2.RequestPermissionRequest) => v2.RequestPermissionResponse;
+  answerElicitation?: (
+    request: v2.CreateElicitationRequest,
+  ) => v2.CreateElicitationResponse | Promise<v2.CreateElicitationResponse>;
 } = {}) {
   const authUpdates: AuthStatusUpdateNotification[] = [];
   const sessionUpdates: v2.UpdateSessionNotification[] = [];
@@ -186,7 +191,7 @@ function v2Client({
     })
     .onRequest(v2.methods.client.elicitation.create, ({ params }) => {
       elicitations.push(params);
-      return { action: "accept" };
+      return answerElicitation(params);
     })
     .onNotification(v2.methods.client.elicitation.complete, ({ params }) => {
       completedElicitations.push(params);
@@ -743,6 +748,69 @@ describe("ACP v2 prompts", () => {
       "user_message",
       "running",
       "requires_action",
+      "running",
+      "agent_message_chunk",
+      "idle end_turn",
+    ]);
+  });
+
+  it("does not report the next turn as waiting for a question that its client never settled", async () => {
+    // Claude Code's interrupt withdraws the question. The client holds it and
+    // ignores $/cancel_request, so only the agent can stop waiting for it.
+    const withdrawal = new AbortController();
+    sdk.interrupt = async () => withdrawal.abort();
+    const client = v2Client({ answerElicitation: () => new Promise<never>(() => {}) });
+    scriptTurns(
+      async function* (options) {
+        void options.canUseTool!(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Which package?",
+                header: "Package",
+                options: [
+                  { label: "core", description: "The core package" },
+                  { label: "cli", description: "The CLI" },
+                ],
+                multiSelect: false,
+              },
+            ],
+          },
+          {
+            signal: withdrawal.signal,
+            suggestions: [],
+            toolUseID: "toolu_question",
+            requestId: randomUUID(),
+          } as Parameters<NonNullable<Options["canUseTool"]>>[2],
+        ).catch(() => undefined);
+        // Claude Code does not wait for the callback of a request that it withdrew.
+        await new Promise((resolve) => withdrawal.signal.addEventListener("abort", resolve));
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      },
+      async function* (options) {
+        yield assistantText(options, "Hello again.");
+        yield result(options);
+        yield idleState(options);
+      },
+    );
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("ask") });
+      await vi.waitFor(() => expect(client.elicitations).toHaveLength(1));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("again") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    const trace = turnTrace(client.sessionUpdates);
+    expect(trace.slice(trace.lastIndexOf("user_message"))).toEqual([
+      "user_message",
       "running",
       "agent_message_chunk",
       "idle end_turn",

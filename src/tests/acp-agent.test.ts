@@ -4542,6 +4542,87 @@ describe("permission request cancellation", () => {
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
 
+  /** The requests to the client that are elicitations, and how each ends when its signal aborts. */
+  const elicitations = [
+    {
+      name: "an AskUserQuestion",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        agent.canUseTool("session-1")(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Pick a color",
+                header: "Color",
+                options: [{ label: "Blue", description: "Use blue" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          { signal, suggestions: [], toolUseID: "tool-1" } as any,
+        ),
+      // Like a permission request, it ends the tool use as aborted.
+      aborted: (outcome: Promise<unknown>) => expect(outcome).rejects.toThrow("Tool use aborted"),
+    },
+    {
+      name: "an MCP elicitation",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleMcpElicitation("session-1", { form: true, url: true })(
+          {
+            mode: "form",
+            message: "Choose",
+            requestedSchema: { type: "object", properties: {} },
+          },
+          { signal },
+        ),
+      aborted: (outcome: Promise<unknown>) =>
+        expect(outcome).resolves.toEqual({ action: "cancel" }),
+    },
+    {
+      name: "a refusal-fallback user dialog",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleUserDialog("session-1")(
+          {
+            dialogKind: "refusal_fallback_prompt",
+            payload: {
+              originalModel: "claude-fable-5",
+              fallbackModel: "claude-opus-4-8",
+              apiRefusalCategory: "cyber",
+            },
+          },
+          { signal },
+        ),
+      aborted: (outcome: Promise<unknown>) =>
+        expect(outcome).resolves.toEqual({ behavior: "cancelled" }),
+    },
+  ];
+
+  it.each(elicitations)(
+    "does not wait for $name when its client ignores cancellation",
+    async ({ start, aborted }) => {
+      // The client holds the elicitation and never answers $/cancel_request.
+      const createElicitation = vi.fn(() => new Promise<CreateElicitationResponse>(() => {}));
+      const mockClient = {
+        sessionUpdate: async () => {},
+        createElicitation,
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { elicitation: { form: {}, url: {} } });
+      const session = injectSession(agent, "session-1");
+      session.emittedToolCalls.add("tool-1");
+
+      const controller = new AbortController();
+      const pending = start(agent, controller.signal);
+      await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
+      // The client was asked to cancel the request, and ignores that.
+      expect(createElicitation.mock.calls[0]).toEqual([expect.anything(), controller.signal]);
+      controller.abort();
+
+      await aborted(pending);
+      expect(session.openUserInputs?.size ?? 0).toBe(0);
+    },
+  );
+
   it("observes a client rejection when the signal aborts during request creation", async () => {
     const controller = new AbortController();
     const clientOperation = Promise.reject(new Error("Request cancelled"));
@@ -6257,6 +6338,89 @@ describe("subagent permission attribution (issue #851)", () => {
 
     expect(updates[0].sessionId).toBe("child-session");
     expect((elicitations[0] as { sessionId?: string }).sessionId).toBe("child-session");
+  });
+
+  it("stops counting a child's question once Claude Code withdraws it, though its client never settles it (the subagents RFD)", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+        // A client that ignores $/cancel_request.
+        createElicitation: () => new Promise(() => {}),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, {
+      subagents: {},
+      elicitation: { form: {} },
+    } as ClientCapabilities);
+    const session = mockSessionState();
+    agent.sessions["session-1"] = session;
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "agent-42",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+          workState: "running",
+        },
+      ],
+    ]);
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "session-1",
+      session,
+      async (notification) => {
+        updates.push(notification);
+      },
+      { log: () => {} },
+    );
+    session.nativeSubagentRuntime = runtime;
+    const childStates = () =>
+      updates.flatMap(({ update }) =>
+        update.sessionUpdate === "subagent_update" && update.state ? [update.state.state] : [],
+      );
+    const withdrawal = new AbortController();
+    const asking = agent
+      .canUseTool("session-1")(
+        "AskUserQuestion",
+        {
+          questions: [
+            {
+              question: "Which mode?",
+              header: "Mode",
+              options: [{ label: "Fast", description: "Fast mode" }],
+              multiSelect: false,
+            },
+          ],
+        },
+        {
+          signal: withdrawal.signal,
+          suggestions: [],
+          toolUseID: "toolu_question",
+          agentID: "agent-42",
+        } as any,
+      )
+      .catch((error: Error) => error.message);
+    await vi.waitFor(() => expect(childStates()).toEqual(["requires_action"]));
+
+    withdrawal.abort();
+    await expect(asking).resolves.toBe("Tool use aborted");
+    // The child ends, and a SendMessage runs it again with no request open.
+    await runtime.finishTask("agent-42", "completed", async () => {});
+    await runtime.taskStarted({ taskId: "agent-42", toolUseId: "toolu_send" }, async () => {});
+
+    expect(childStates()).toEqual(["requires_action", "running", "idle", "running"]);
   });
 
   function taskStarted(taskId: string, toolUseId: string) {
@@ -22604,7 +22768,8 @@ describe("turn steering (_session/steering)", () => {
     ]);
   }
 
-  it.each([
+  /** Every request to the client that waits for the user, started with the signal that withdraws it. */
+  const userInputRequests = [
     {
       name: "a permission request",
       start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
@@ -22706,7 +22871,9 @@ describe("turn steering (_session/steering)", () => {
         ),
       response: { action: "accept", content: { choice: "retry_fallback" } },
     },
-  ])(
+  ];
+
+  it.each(userInputRequests)(
     "uses priority:'later' while $name is pending",
     async ({
       start,
@@ -22761,6 +22928,52 @@ describe("turn steering (_session/steering)", () => {
       resolveUserInput(response);
       await pending;
       expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0);
+    },
+  );
+
+  it.each(userInputRequests)(
+    "uses priority:'now' again once $name is withdrawn, though its client never settles it",
+    async ({ start }) => {
+      // A client that ignores $/cancel_request: its request never settles.
+      const userInputRequest = vi.fn(() => new Promise<never>(() => {}));
+      const input = new Pushable<any>();
+      const inputPush = vi.spyOn(input, "push");
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async () => {},
+          requestPermission: userInputRequest,
+          createElicitation: userInputRequest,
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      agent.sessions["test-session"] = mockSessionState({
+        input,
+        turnQueue: [
+          {
+            promptUuid: "running",
+            isLocalOnlyCommand: false,
+            settled: false,
+            resolve: () => {},
+            reject: () => {},
+          },
+        ],
+      });
+
+      const withdrawal = new AbortController();
+      // The tool use ends as aborted. That is not what this test checks.
+      const pending = start(agent, withdrawal.signal).catch(() => {});
+      await waitFor(() => userInputRequest.mock.calls.length === 1);
+      withdrawal.abort();
+      await vi.waitFor(() =>
+        expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0),
+      );
+      await pending;
+
+      await agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle this" }],
+      });
+      expect(inputPush.mock.calls[0][0].priority).toBe("now");
     },
   );
 

@@ -9121,6 +9121,21 @@ export class ClaudeAcpAgent {
     }
   }
 
+  /** Send the client an elicitation for a callback of Claude Code. When the
+   *  callback's `signal` aborts, the SDK sends `$/cancel_request` and keeps
+   *  waiting for the client's reply, which a client that ignores the cancel
+   *  never sends. So the call also rejects at once on the abort, as
+   *  {@link requestPermissionFromClient} does for a permission request. Left
+   *  open, the request would stay in `openUserInputs` (see
+   *  {@link withPendingUserInput}), which keeps steering non-interrupting, and
+   *  a child's `openRequests` would not drop. */
+  private elicitFromClient(
+    request: CreateElicitationRequest,
+    signal: AbortSignal,
+  ): Promise<CreateElicitationResponse> {
+    return raceWithAbort(this.client.createElicitation(request, signal), signal);
+  }
+
   /** Emit the `tool_call` a permission request references if it hasn't been sent
    *  yet, so the client has the tool call before being asked to approve it. The
    *  matching streamed tool_use chunk later refines it with a `tool_call_update`
@@ -9535,7 +9550,7 @@ export class ClaudeAcpAgent {
 
       try {
         const response = await this.withPendingUserInput(sessionId, () =>
-          this.client.createElicitation(createRequest, signal),
+          this.elicitFromClient(createRequest, signal),
         );
         if (signal.aborted) {
           return { action: "cancel" };
@@ -9584,7 +9599,7 @@ export class ClaudeAcpAgent {
       response = await this.withChildAwaitingUser(sessionId, requestSessionId, () =>
         this.withPendingUserInput(
           sessionId,
-          () => this.client.createElicitation(createRequest, signal),
+          () => this.elicitFromClient(createRequest, signal),
           agentID,
         ),
       );
@@ -9631,7 +9646,7 @@ export class ClaudeAcpAgent {
       let response: CreateElicitationResponse;
       try {
         response = await this.withPendingUserInput(sessionId, () =>
-          this.client.createElicitation(refusalFallbackToCreateRequest(prompt, sessionId), signal),
+          this.elicitFromClient(refusalFallbackToCreateRequest(prompt, sessionId), signal),
         );
       } catch (error) {
         // A cancellation we requested (signal aborted) is expected teardown;
