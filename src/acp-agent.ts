@@ -275,6 +275,7 @@ import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/c
 import {
   AcpToolCallRenderer,
   isFinalToolCallStatus,
+  type ToolCallUpdate,
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
@@ -867,7 +868,10 @@ export type Session = {
   /** Set by a cancel. While it is set, the consumer treats what arrives as the
    *  work the cancel stopped: it drops main-thread `assistant` and `user`
    *  messages (streamed text still goes out), skips results, and starts no
-   *  model cycle. Cleared when the next prompt's turn activates,
+   *  model cycle. Two things still go out: a tool result for a tool call that
+   *  the client holds open, until the client is told that the work ended, and,
+   *  as the turn settles, a report that closes each tool call left without a
+   *  result. Cleared when the next prompt's turn activates,
    *  or when Claude Code starts a model request that serves none of
    *  {@link Session.cancelledPrompts} (see the `status` case of the
    *  consumer), such as its follow-up after a background command finished. */
@@ -1127,6 +1131,13 @@ export type Session = {
    *  not here: Claude abandoned it before it ran. Pruned when the call ends;
    *  the oldest entries are dropped. */
   dispatchedToolCalls?: Set<string>;
+  /** For each open tool call that a subagent made: the Agent/Task call that
+   *  started that subagent. When a cancel ends such a call, the report names
+   *  that parent as the call's other updates do, so that every client form
+   *  routes it with them. It also tells the calls of a background subagent,
+   *  which a cancel leaves open while the subagent keeps running. Pruned when
+   *  the call ends; the oldest entries are dropped. */
+  toolCallParents?: Map<string, string>;
   /** The fields that the client holds for each open tool call, so that a
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
@@ -4204,6 +4215,22 @@ export class ClaudeAcpAgent {
       const eagerOwnerSessionId = toolCallId
         ? session.eagerToolCallSessions?.get(toolCallId)
         : undefined;
+      // Before routing, which can buffer or drop the update: a cancel still has
+      // to know the parent of a call that is open here. A later update can be
+      // the first to name it, for a call that a permission request emitted.
+      if (
+        toolCallId &&
+        update.sessionUpdate === "tool_call_update" &&
+        isFinalToolCallStatus(update.status)
+      ) {
+        session.toolCallParents?.delete(toolCallId);
+      } else if (
+        toolCallId &&
+        claudeMeta?.parentToolUseId &&
+        session.emittedToolCalls.has(toolCallId)
+      ) {
+        recordToolCallParent(session, toolCallId, claudeMeta.parentToolUseId);
+      }
       const routedNotification = await subagents.route(
         notification,
         sendUpdate,
@@ -4842,6 +4869,106 @@ export class ClaudeAcpAgent {
       }
     };
 
+    /** Sends `report`, which ends the tool call `toolCallId` without its result
+     *  (see `AcpToolCallRenderer.unfinished`), and forgets the call. Forgetting
+     *  comes first, so that a late hook or a second close cannot overwrite the
+     *  report. */
+    const closeToolCall = async (toolCallId: string, report: ToolCallUpdate) => {
+      unregisterHookCallback(toolCallId);
+      session.emittedToolCalls.delete(toolCallId);
+      delete session.toolUseCache[toolCallId];
+      session.toolCallFields?.delete(toolCallId);
+      session.dispatchedToolCalls?.delete(toolCallId);
+      session.toolCallParents?.delete(toolCallId);
+      await sendUpdate({ sessionId: params.sessionId, update: report });
+    };
+
+    /** Whether the subagent that the Agent call `agentToolUseId` started runs in
+     *  the background and has not ended. */
+    const runsInBackground = (agentToolUseId: string): boolean =>
+      [...session.liveBackgroundTasks.values()].some(
+        (task) =>
+          task.isSubagent &&
+          task.backgrounded === true &&
+          !task.endedPerLevel &&
+          task.parentToolUseId === agentToolUseId,
+      );
+
+    /** Closes the tool calls that the work a cancel stopped left open, as that
+     *  work ends. Claude Code's interrupt ends each running tool of the main
+     *  conversation with an error result, which `sendInterruptedToolResults`
+     *  delivers. What is still open here has no result to deliver:
+     *  - a tool of a subagent: Claude Code writes its interrupted result only to
+     *    the subagent's own transcript, not to the stream;
+     *  - a tool call that Claude abandoned before it ran;
+     *  - every tool call, when the stream gives no results at all, as when the
+     *    force-cancel backstop ends a wedged turn.
+     *  A foreground subagent ends with the work that waits on it. A background
+     *  subagent keeps its tool calls open until the SDK reports its end, which
+     *  Claude Code 2.1.293 does for the ones it stops, before the turn's result
+     *  (see `NativeSubagentRuntime.parentCancelled`).
+     *  Returns false when the turn ended meanwhile. */
+    const closeCancelledToolCalls = async (turn: Turn): Promise<boolean> => {
+      const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+      for (const toolCallId of [...session.emittedToolCalls]) {
+        const parentToolUseId = session.toolCallParents?.get(toolCallId);
+        if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
+        const report = renderer.unfinished({
+          toolCallId,
+          ran: session.dispatchedToolCalls?.has(toolCallId) === true,
+          cancelled: true,
+        });
+        // Named as the call's other updates are: the subagent runtime routes the
+        // report with them, to the child session, or to none that has ended.
+        if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
+        await closeToolCall(toolCallId, report);
+        if (turn.settled || session.activeTurn !== turn) return false;
+      }
+      return true;
+    };
+
+    /** Delivers the results that the work a cancel stopped sends for tool calls
+     *  that the client holds open. Claude Code's interrupt ends each running tool
+     *  of the main conversation with an error result, before the result that
+     *  ends the turn. The tool call gets that result like any other, so its
+     *  final status and `nonExecutionKind` reach the client. Nothing else of the
+     *  message is applied: the other effects of a tool result (async tasks, plan
+     *  state, the ExitPlanMode flow) belong to the stopped work, which stays
+     *  dropped. */
+    const sendInterruptedToolResults = async (message: Extract<SDKMessage, { type: "user" }>) => {
+      const content = message.message.content;
+      if (!Array.isArray(content)) return;
+      const results = content.filter(
+        (block) => block.type === "tool_result" && session.emittedToolCalls.has(block.tool_use_id),
+      );
+      if (results.length === 0) return;
+      const resultCount = content.filter((block) => block.type === "tool_result").length;
+      for (const notification of toAcpNotifications(
+        results,
+        "user",
+        params.sessionId,
+        session.toolUseCache,
+        routedNotificationClient,
+        this.logger,
+        {
+          clientCapabilities: this.clientCapabilities,
+          toolCallCapabilities: this.toolCallCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+          cwd: session.cwd,
+          taskState: session.taskState,
+          emittedToolCalls: session.emittedToolCalls,
+          toolCallFields: toolCallFieldsOf(session),
+          messageId: messageIdForGrouping(message),
+          // `tool_use_result` describes the one result of its message.
+          toolUseResult: results.length === resultCount ? message.tool_use_result : undefined,
+          toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
+          cancelled: true,
+        },
+      )) {
+        await sendUpdate(notification);
+      }
+    };
+
     /** At the actual turn boundary, preview its checkpoint, settle the active
      *  turn exactly once, disarm the force-cancel backstop, and drop it from
      *  the queue. Cancellation and provider failures skip checkpoint I/O. */
@@ -4874,16 +5001,7 @@ export class ClaudeAcpAgent {
          * ended meanwhile.
          */
         const closeUnfinished = async (toolCallId: string, ran: boolean): Promise<boolean> => {
-          // A late hook must not overwrite the report we are about to send.
-          unregisterHookCallback(toolCallId);
-          session.emittedToolCalls.delete(toolCallId);
-          delete session.toolUseCache[toolCallId];
-          session.toolCallFields?.delete(toolCallId);
-          session.dispatchedToolCalls?.delete(toolCallId);
-          await sendUpdate({
-            sessionId: params.sessionId,
-            update: renderer.unfinished({ toolCallId, ran }),
-          });
+          await closeToolCall(toolCallId, renderer.unfinished({ toolCallId, ran }));
           // Cancellation can arrive while we await the client update.
           if (turn.settled || session.activeTurn !== turn) return false;
           if (session.cancelled) {
@@ -4920,6 +5038,12 @@ export class ClaudeAcpAgent {
           );
           return;
         }
+      }
+      // The client is told that the work a cancel stopped ended (the prompt
+      // response on v1, `idle` on v2) only after every tool call that work
+      // opened has ended.
+      if (result.stopReason === "cancelled" && session.cancelled) {
+        if (!(await closeCancelledToolCalls(turn))) return;
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -7210,6 +7334,13 @@ export class ClaudeAcpAgent {
             }
 
             if (session.cancelled) {
+              // The work the cancel stopped ends its tools with error results.
+              // Until the client is told that the work ended, they close the
+              // tool calls it opened. Everything else that work sends is
+              // dropped, and so is everything after that report.
+              if (message.type === "user" && !this.workEndReported(params.sessionId, session)) {
+                await sendInterruptedToolResults(message);
+              }
               break;
             }
 
@@ -8991,6 +9122,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    if (parentToolUseId) recordToolCallParent(session, toolCallId, parentToolUseId);
     // SandboxNetworkAccess is a permission-only callback, not an executing
     // tool: the SDK does not send a tool_result for its synthetic id.
     if (
@@ -9018,6 +9150,7 @@ export class ClaudeAcpAgent {
       session.emittedToolCalls.delete(toolCallId);
       session.eagerToolCallSessions?.delete(toolCallId);
       session.toolCallFields?.delete(toolCallId);
+      session.toolCallParents?.delete(toolCallId);
       throw error;
     }
   }
@@ -11808,6 +11941,19 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+const MAX_TOOL_CALL_PARENTS = 1000;
+
+/** Records the Agent/Task call that started the subagent making `toolCallId`. */
+function recordToolCallParent(session: Session, toolCallId: string, parentToolUseId: string): void {
+  const parents = (session.toolCallParents ??= new Map());
+  parents.delete(toolCallId);
+  parents.set(toolCallId, parentToolUseId);
+  if (parents.size > MAX_TOOL_CALL_PARENTS) {
+    const oldest = parents.keys().next().value;
+    if (oldest !== undefined) parents.delete(oldest);
+  }
+}
+
 const MAX_DISPATCHED_TOOL_CALLS = 1000;
 
 /** Records a tool call that Claude Code sent to the tool runner. */
@@ -11940,6 +12086,10 @@ export function toAcpNotifications(
     // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
     // denied/interrupted tool_call_updates with why the tool never ran.
     toolResultMeta?: unknown;
+    // True when the content is a result of the work that a `session/cancel`
+    // stopped. An error result then ends a run that the cancel aborted,
+    // whichever kind the SDK stamped on it (see `resultStatus`).
+    cancelled?: boolean;
     // True when the content comes from the history of a loaded session.
     replay?: boolean;
   },
@@ -12156,6 +12306,7 @@ export function toAcpNotifications(
                 status: renderer.resultStatus(
                   "is_error" in chunk && chunk.is_error === true,
                   nonExecution,
+                  { cancelled: options?.cancelled },
                 ),
                 rawOutput: chunk.content,
               },
@@ -12191,6 +12342,7 @@ export function toAcpNotifications(
               status: renderer.resultStatus(
                 "is_error" in chunk && chunk.is_error === true,
                 nonExecution,
+                { cancelled: options?.cancelled },
               ),
               rawOutput: chunk.content,
             },
@@ -12246,6 +12398,7 @@ export function toAcpNotifications(
             .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
               structured: toolUseResult,
               nonExecution,
+              cancelled: options?.cancelled,
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {

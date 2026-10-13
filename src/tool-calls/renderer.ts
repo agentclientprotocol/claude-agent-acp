@@ -163,19 +163,28 @@ export class AcpToolCallRenderer {
 
   /**
    * The status of a tool result. Claude Code reports a run that it aborted in
-   * one of two ways: an error result whose `nonExecution` kind says so (a
-   * cancelled turn), or a command result that says `interrupted` (for example,
-   * a steering message landed just before the command started). Such a run is
-   * `cancelled` for a v2 client, which has that status. Every other client gets
-   * `failed` for the error, with the kind in `_meta.claudeCode.nonExecutionKind`,
-   * and `completed` for the command.
+   * one of three ways:
+   * - an error result whose `nonExecution` kind says so (`interrupted`,
+   *   `cancelled`);
+   * - a command result that says `interrupted` (for example, a steering
+   *   message landed just before the command started);
+   * - any error result of the work that a `session/cancel` stopped
+   *   (`run.cancelled`). The kind does not say so there: CLI 2.1.293 stamps a
+   *   command that the interrupt killed `user-rejected`, as if the user had
+   *   refused it.
+   *
+   * Such a run is `cancelled` for a v2 client, which has that status. Every
+   * other client gets `failed` for the error, with the kind in
+   * `_meta.claudeCode.nonExecutionKind`, and `completed` for the command.
    */
   resultStatus(
     isError: boolean,
     nonExecution: ToolResultMeta | undefined,
-    interrupted = false,
+    run: { interrupted?: boolean; cancelled?: boolean } = {},
   ): ToolCallStatus {
-    const aborted = interrupted || (isError && isAbortedToolResult(nonExecution));
+    const aborted =
+      run.interrupted === true ||
+      (isError && (run.cancelled === true || isAbortedToolResult(nonExecution)));
     if (this.capabilities.v2 && aborted) return V2_CANCELLED;
     return isError ? "failed" : "completed";
   }
@@ -421,7 +430,7 @@ export class AcpToolCallRenderer {
   result(
     toolUse: ToolUse,
     result: ResultBlock,
-    options: { structured?: unknown; nonExecution?: ToolResultMeta } = {},
+    options: { structured?: unknown; nonExecution?: ToolResultMeta; cancelled?: boolean } = {},
   ): ToolCallUpdate[] {
     const facts = this.resultFacts(toolUse, result, options.structured);
     const { _meta: resultMeta, ...fields } = this.fieldsOfResult(toolUse, result, facts);
@@ -472,11 +481,10 @@ export class AcpToolCallRenderer {
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      status: this.resultStatus(
-        result.is_error === true,
-        options.nonExecution,
-        facts.command?.interrupted === true,
-      ),
+      status: this.resultStatus(result.is_error === true, options.nonExecution, {
+        interrupted: facts.command?.interrupted === true,
+        cancelled: options.cancelled,
+      }),
       ...(rawOutput !== undefined ? { rawOutput } : {}),
       ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,
@@ -630,18 +638,23 @@ export class AcpToolCallRenderer {
    * reached a complete assistant message, for example because Claude switched
    * to a steering message), a v2 client gets `cancelled` and every other
    * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
-   * returned no result, it failed.
+   * returned no result, it failed, unless a `session/cancel` ended the turn
+   * (`cancelled`): the cancel stopped the run, so a v2 client gets `cancelled`
+   * for it too.
    */
-  unfinished(call: { toolCallId: string; ran: boolean }): ToolCallUpdate {
+  unfinished(call: { toolCallId: string; ran: boolean; cancelled?: boolean }): ToolCallUpdate {
+    const stopped = !call.ran || call.cancelled === true;
     return {
       sessionUpdate: "tool_call_update",
       toolCallId: call.toolCallId,
-      status: !call.ran && this.capabilities.v2 ? V2_CANCELLED : "failed",
+      status: stopped && this.capabilities.v2 ? V2_CANCELLED : "failed",
       content: [
         textContent(
-          call.ran
-            ? "Claude ended the turn without returning a result for this tool."
-            : "Claude stopped this tool call before it ran.",
+          !call.ran
+            ? "Claude stopped this tool call before it ran."
+            : call.cancelled
+              ? "The turn was cancelled before this tool call returned a result."
+              : "Claude ended the turn without returning a result for this tool.",
         ),
       ],
     };

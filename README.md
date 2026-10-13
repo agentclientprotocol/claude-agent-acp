@@ -53,7 +53,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   the turn waits on and, currently, background children too. Each stopped child reports `idle`
   with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
   withdrawn. The adapter ends no child at a cancel itself, so a child that keeps running keeps its
-  open requests. A child that still runs when Claude Code exits is `idle` with no stop reason.
+  open requests and its open tool calls. A tool call of a stopped child that Claude Code reports no
+  result for, such as the command it was running, ends in the child's session before the cancelled
+  prompt resolves. A child that still runs when Claude Code exits is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
 - A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
