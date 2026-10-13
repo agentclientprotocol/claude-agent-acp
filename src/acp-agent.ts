@@ -121,6 +121,7 @@ import {
   NativeSubagentRuntime,
   nativeSubagentState,
   resumedNativeSubagentId,
+  sendMessageResume,
   sendMessageResumePrompt,
 } from "./native-subagents.js";
 import {
@@ -5907,6 +5908,10 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                // In the RFD form, a resumed child runs under the call that
+                // resumed it, and the end of an earlier delegation ends
+                // nothing: the child and its live task belong to the new run.
+                if (subagents.isStaleEnd(message.task_id, message.tool_use_id)) break;
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(
@@ -7426,20 +7431,26 @@ export class ClaudeAcpAgent {
               );
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
-                resumeLiveTask(resumedAgentId);
-                await subagents.taskResumed(
+                const resume = sendMessageResume(
+                  session.toolUseCache,
                   resumedAgentId,
-                  sendUpdate,
-                  sendMessageResumePrompt(
-                    session.toolUseCache,
-                    resumedAgentId,
-                    Array.isArray(content)
-                      ? content.flatMap((block) =>
-                          block.type === "tool_result" ? [block.tool_use_id] : [],
-                        )
-                      : [],
-                  ),
+                  Array.isArray(content)
+                    ? content.flatMap((block) =>
+                        block.type === "tool_result" ? [block.tool_use_id] : [],
+                      )
+                    : [],
                 );
+                // In the RFD form the result can arrive after the run it
+                // started ended, and then resumes nothing.
+                if (!subagents.isEndedDelegation(resumedAgentId, resume?.toolUseId)) {
+                  resumeLiveTask(resumedAgentId);
+                  await subagents.sendMessageResumed(
+                    resumedAgentId,
+                    sendUpdate,
+                    resume?.text,
+                    resume?.toolUseId,
+                  );
+                }
               }
             }
 

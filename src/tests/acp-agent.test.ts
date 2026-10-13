@@ -6419,6 +6419,13 @@ describe("subagent permission attribution (issue #851)", () => {
       ).toEqual([]);
     });
 
+    const childText = (parentToolUseId: string, text: string) => ({
+      type: "stream_event",
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } },
+    });
     const taskNotification = (
       toolUseId: string,
       status: string,
@@ -6434,6 +6441,146 @@ describe("subagent permission attribution (issue #851)", () => {
       uuid: randomUUID(),
       session_id: "test-session",
       ...extra,
+    });
+
+    it("keeps the child's session for a SendMessage resume, which the SDK runs under the SendMessage id", async () => {
+      const updates = await run([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", {
+          to: "agent-42",
+          message: "Also check Windows",
+        }),
+        // The CLI starts the resumed agent again, under the SendMessage call.
+        {
+          ...taskStarted("agent-42", "toolu_send"),
+          subagent_type: "Explore",
+          prompt: "Also check Windows",
+        },
+        childText("toolu_send", "Checking Windows"),
+        // A late copy of the first delegation's end does not end the second.
+        taskNotification("toolu_parent", "completed"),
+        childText("toolu_send", "Still checking"),
+        taskNotification("toolu_send", "completed"),
+      ]);
+
+      const traffic = subagentTraffic(updates).map(({ sessionId, update }) => ({
+        sessionId,
+        update:
+          update.sessionUpdate === "subagent_update"
+            ? {
+                sessionUpdate: update.sessionUpdate,
+                sessionId: update.sessionId,
+                state: update.state,
+              }
+            : update,
+      }));
+      expect(traffic).toEqual([
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "agent-42",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "agent-42",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_send",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            content: [{ type: "text", text: "Also check Windows" }],
+          },
+        },
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+      ]);
+      // The resumed run's output reaches the same child session, and the
+      // child is idle only after all of it: the late end did not end it.
+      const order = updates.flatMap(({ sessionId, update }) =>
+        sessionId === "agent-42" && update.sessionUpdate === "agent_message_chunk"
+          ? ["output"]
+          : update.sessionUpdate === "subagent_update" && update.state?.state === "idle"
+            ? ["idle"]
+            : [],
+      );
+      expect(order).toEqual(["idle", "output", "output", "idle"]);
+    });
+
+    it("keeps the resumed run's live task when an earlier delegation's end arrives late", async () => {
+      const { agent } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" }),
+        { ...taskStarted("agent-42", "toolu_send"), subagent_type: "Explore", prompt: "Again" },
+        taskNotification("toolu_parent", "completed"),
+      ]);
+
+      // The child's permission requests are still attributed to its run.
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.get("agent-42")).toMatchObject({
+        parentToolUseId: "toolu_send",
+      });
+    });
+
+    it("ignores a SendMessage result that arrives after the run it started ended", async () => {
+      const { agent, updates } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+        taskNotification("toolu_parent", "completed"),
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" }),
+        { ...taskStarted("agent-42", "toolu_send"), subagent_type: "Explore", prompt: "Again" },
+        taskNotification("toolu_send", "failed"),
+        {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: { success: true, resumedAgentId: "agent-42" },
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Resumed" }],
+          },
+        },
+      ]);
+
+      expect(subagentTraffic(updates).at(-1)?.update).toMatchObject({
+        sessionUpdate: "subagent_update",
+        state: { state: "idle" },
+      });
+      expect(agent.sessions["test-session"]?.liveBackgroundTasks.has("agent-42")).toBe(false);
     });
 
     // agentclientprotocol/agent-client-protocol#2308: a cancel stops the

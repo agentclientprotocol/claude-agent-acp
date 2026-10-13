@@ -43,9 +43,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`, and `idle`
   when its work ends, with `end_turn` or `cancelled` when the SDK gives the reason. A failure is
-  `idle` with the `error` stop reason and the SDK's error text as its `error`.
-- The prompt of the Agent or Task call that launches the child is a `session_message` in the
-  child's transcript. The tool call stays a tool call of the session that made it.
+  `idle` with the `error` stop reason and the SDK's error text as its `error`. The child keeps its
+  session for every delegation to it.
+- The prompt of the Agent or Task call that launches the child, and the message of each
+  SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
+  call stays a tool call of the session that made it.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
   the turn waits on and, currently, background children too. Each stopped child reports `idle`
   with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
@@ -53,8 +55,6 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   open requests. A child that still runs when Claude Code exits is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
-- A SendMessage that resumes a child is not shown yet: the child stays `idle`, and only the
-  permission and question requests of the resumed run appear in its session.
 - A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
   children yet.
 
