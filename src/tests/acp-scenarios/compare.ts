@@ -19,6 +19,9 @@
  * - An `available_commands_update` also lists the `mcp` command of the
  *   adapter (see {@link ADAPTER_COMMANDS}), when origin/main did not list
  *   `mcp`. The adapter replaces the text of `/mcp` for every client.
+ * - A permission request for a shell command also offers "Yes, and switch to
+ *   auto mode" (see {@link ADAPTER_PERMISSION_OPTIONS}), as Claude Code's own
+ *   prompt does, when origin/main did not offer it.
  * - A `terminal_exit` has a `null` exit code where origin/main sent a code
  *   that the tool result does not say (see `CommandOutput.exitCode`): 1 for a
  *   failure that names no code or an interrupted command, 0 for a
@@ -41,6 +44,9 @@ export const AIR_ONLY_CLAUDE_CODE_KEYS = new Set(["title", "subagent", "skill", 
 
 /** The names of the commands that the adapter adds to `available_commands_update`. */
 export const ADAPTER_COMMANDS = new Set(["mcp"]);
+
+/** The permission options that the adapter adds to what origin/main offered. */
+export const ADAPTER_PERMISSION_OPTIONS = new Set(["switch-to-auto"]);
 
 /** The tool call fields that an update replaces as a whole. */
 const REPLACED_FIELDS = [
@@ -163,6 +169,23 @@ function withoutAdapterCommands(want: Json, got: Json): Json {
   };
 }
 
+/** A copy of `actual` without the adapter's permission options that `wanted` does not offer. */
+function withoutAdapterOptions(wanted: Recorded, actual: Recorded): Recorded {
+  const options = (record: Recorded) => ((record.payload as Json).options ?? []) as Json[];
+  const offered = new Set(options(wanted).map((option) => option.optionId));
+  return {
+    ...actual,
+    payload: {
+      ...(actual.payload as Json),
+      options: options(actual).filter(
+        (option) =>
+          offered.has(option.optionId) ||
+          !ADAPTER_PERMISSION_OPTIONS.has(option.optionId as string),
+      ),
+    },
+  };
+}
+
 /**
  * `wanted` with the unknown exit code of `actual`, when origin/main sent a code
  * in the `terminal_exit` of the same tool call.
@@ -238,6 +261,9 @@ export function compareWithBaseline(baseline: Recorded[], current: Recorded[]): 
   const matches = (wanted: Recorded, actual: Recorded | undefined): boolean => {
     if (!actual || actual.kind !== wanted.kind) return false;
     if (canonical(actual) === canonical(wanted)) return true;
+    if (wanted.kind === "requestPermission") {
+      return canonical(withoutAdapterOptions(wanted, actual)) === canonical(wanted);
+    }
     const want = updateOf(wanted);
     const got = updateOf(actual);
     if (!want || !got || want.sessionUpdate !== got.sessionUpdate) return false;

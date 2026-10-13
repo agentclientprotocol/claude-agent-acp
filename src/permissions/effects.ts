@@ -6,6 +6,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import type { DurablePermissionChangeSet } from "./normalization.js";
 import { PERMISSION_OPTION_ID } from "./options.js";
+import { displayedShellUpdates } from "./options/shell.js";
 
 export interface ClaudePermissionSelection {
   optionId: string;
@@ -175,6 +176,24 @@ function applyCommonSelection(
   }
 }
 
+/** A shell ask's "always" option applies only the updates its label shows; auto mode switches the session. */
+function applyShellSelection(
+  selection: ClaudePermissionSelection,
+  context: ClaudePermissionEffectContext,
+): PermissionResult {
+  switch (selection.optionId) {
+    case PERMISSION_OPTION_ID.allowWithUpdates: {
+      const displayed = context.durableChangeSet && displayedShellUpdates(context.durableChangeSet);
+      if (!displayed) throw new Error("Invalid durable permission selection");
+      return allow(context, displayed.updates, true);
+    }
+    case PERMISSION_OPTION_ID.switchToAuto:
+      return allow(context, [{ type: "setMode", mode: "auto", destination: "session" }], true);
+    default:
+      return applyCommonSelection(selection, context);
+  }
+}
+
 function applyGeneratedDurableSelection(
   selection: ClaudePermissionSelection,
   context: ClaudePermissionEffectContext,
@@ -202,9 +221,10 @@ export function applyClaudePermissionSelection(
       return applyCommonSelection(selection, context);
     case "ExitPlanMode":
       return applyExitPlanModeSelection(selection, context);
-    case "Read":
     case "Bash":
     case "PowerShell":
+      return applyShellSelection(selection, context);
+    case "Read":
     case "Glob":
     case "Grep":
     case "Edit":

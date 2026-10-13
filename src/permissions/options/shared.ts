@@ -13,6 +13,7 @@ export const PERMISSION_OPTION_ID = {
   exitPlanClearAuto: "exit-plan-clear-auto",
   exitPlanClearBypass: "exit-plan-clear-bypass",
   exitPlanClearAcceptEdits: "exit-plan-clear-accept-edits",
+  switchToAuto: "switch-to-auto",
   reject: "reject",
 } as const;
 
@@ -27,6 +28,8 @@ export interface PermissionOptionContext {
    *  approvable by a stray keystroke, so the decline option leads. */
   defaultToNo?: boolean;
   availableModes?: readonly string[];
+  /** The session's mode while the ask is open. */
+  currentMode?: string;
   /** The mode the session left when it entered plan mode. */
   prePlanMode?: string;
   contextUsedPercent?: number;
