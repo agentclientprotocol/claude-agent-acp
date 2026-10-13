@@ -11,6 +11,8 @@ export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
  * file, and AIR reads the plan from it.
  */
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
+/** The plan file holds the complete plan submitted for review. */
+export const AIR_PLAN_READY_KEY = "planReady";
 /**
  * The session index: a bounded, ordered `session/list` with row metadata, and
  * `_session/rename`, `_session/archive`, `_session/unarchive` and the list

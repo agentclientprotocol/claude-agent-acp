@@ -399,6 +399,7 @@ describe("the ACP tool call contract", () => {
           { content: "User has approved your plan.\n\n## Approved Plan:\n1. Do it" },
         );
         expect(call.rawInput).toEqual({ planFilePath });
+        expect(call._meta).toHaveProperty("jetbrains.air.planReady", true);
         expect(call.content).toEqual([]);
         expect(updates[0]).toMatchObject({
           status: "completed",
@@ -406,6 +407,32 @@ describe("the ACP tool call contract", () => {
           rawInput: { planFilePath },
         });
         expect(JSON.stringify([call, updates])).not.toContain("Do it");
+      });
+
+      it("marks a complete plan ready, but not its partial input or replay", () => {
+        const toolUse = {
+          id: "review",
+          name: "ExitPlanMode",
+          input: { plan: "1. Do it", planFilePath },
+        };
+        const renderer = AcpToolCallRenderer.for(planFileAir);
+        expect(renderer.toolCall(toolUse, { inputComplete: false })._meta).not.toHaveProperty(
+          "jetbrains.air.planReady",
+        );
+        expect(renderer.partialRefinement(toolUse, toolUse.input)._meta).not.toHaveProperty(
+          "jetbrains.air.planReady",
+        );
+        expect(renderer.refinement(toolUse)._meta).toHaveProperty("jetbrains.air.planReady", true);
+        expect(renderer.permissionToolCall(toolUse)._meta).toHaveProperty(
+          "jetbrains.air.planReady",
+          true,
+        );
+        expect(
+          AcpToolCallRenderer.for(planFileAir, true).refinement(toolUse)._meta,
+        ).not.toHaveProperty("jetbrains.air.planReady");
+        expect(AcpToolCallRenderer.for(terminalAir).refinement(toolUse)._meta).not.toHaveProperty(
+          "jetbrains.air.planReady",
+        );
       });
 
       it("clears the plan file for AIR in a call of its own when the plan is approved", () => {

@@ -499,6 +499,28 @@ While the adapter does not know the path, a report carries no `planFilePath` key
 The adapter never sends a blank path, because AIR reads a present non-file value as a retraction.
 Without `rawInputRendering`, a `planFile` client gets no copy of the plan in `content` either.
 
+### Ready for review
+
+The existing `planFile` capability also supports `_meta.jetbrains.air.planReady: true`.
+The complete ExitPlanMode tool call or refinement sends this boolean with the file path.
+The permission subject repeats it when the permission callback precedes the complete streamed report.
+The field tracker can omit a repeated signal.
+Partial input and history replay never send it.
+
+```json
+{
+  "rawInput": { "planFilePath": "/Users/me/.claude/plans/tidy-plan.md" },
+  "_meta": { "jetbrains": { "air": { "version": 1, "planReady": true } } }
+}
+```
+
+The file now holds the complete plan submitted for review.
+AIR reads it once, saves the text, and shows the full plan without simulated streaming.
+A revised plan uses a new tool call id, even when it uses the same file.
+The adapter keeps the file unchanged while this review waits for a decision.
+Older clients ignore the new metadata.
+Older adapters can omit it; clients can read the file at the approval request instead.
+
 ### Fallback
 
 The plan text goes out as before in these cases:

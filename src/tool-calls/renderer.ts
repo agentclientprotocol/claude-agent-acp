@@ -8,6 +8,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import {
   AIR_COMMAND_TITLE_KEY,
+  AIR_PLAN_READY_KEY,
   AIR_SKILL_KEY,
   AIR_SUBAGENT_KEY,
   withAirMeta,
@@ -220,7 +221,11 @@ export class AcpToolCallRenderer {
     const isMcp = toolUse.name.startsWith("mcp__");
     return {
       _meta: {
-        ...this.toolUseMeta(toolUse, options.cwd),
+        ...this.planReadyMeta(
+          this.toolUseMeta(toolUse, options.cwd),
+          facts,
+          options.inputComplete !== false,
+        ),
         ...(facts.command && this.capabilities.terminalOutput
           ? { terminal_info: { terminal_id: toolUse.id } }
           : {}),
@@ -247,7 +252,7 @@ export class AcpToolCallRenderer {
   refinement(toolUse: ToolUse, cwd?: string): ToolCallUpdate {
     const facts = this.facts(toolUse, cwd);
     return {
-      _meta: this.toolUseMeta(toolUse, cwd),
+      _meta: this.planReadyMeta(this.toolUseMeta(toolUse, cwd), facts),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput: this.rawInput(facts, toolUse.input),
@@ -323,7 +328,7 @@ export class AcpToolCallRenderer {
       ...(options.extraLocations?.length
         ? { locations: [...(facts.locations ?? []), ...options.extraLocations] }
         : {}),
-      ...(options.meta ? { _meta: options.meta } : {}),
+      _meta: this.planReadyMeta(options.meta, facts),
     };
   }
 
@@ -712,6 +717,16 @@ export class AcpToolCallRenderer {
       ...(facts.change ?? []),
       ...(!terminal && !this.capabilities.air.rawInputRendering ? (facts.display ?? []) : []),
     ];
+  }
+
+  /** Marks a complete file plan before the client presents its approval. */
+  private planReadyMeta(
+    meta: ToolUpdateMeta | undefined,
+    facts: ToolUseFacts,
+    inputComplete = true,
+  ): ToolUpdateMeta | undefined {
+    if (!inputComplete || this.replay || !facts.planFilePath) return meta;
+    return withAirMeta(meta, AIR_PLAN_READY_KEY, true) as ToolUpdateMeta;
   }
 
   /**
