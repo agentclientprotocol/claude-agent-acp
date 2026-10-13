@@ -42,7 +42,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 
 - `subagent_update` on the parent announces the child before any of its traffic, with the
   parent's `title` and `description` for it, and reports its work state: `running`,
-  `requires_action` while one of its requests is open, and `idle` when its work ends, with
+  `requires_action` while one of its requests is open (and `running` again when the last one ends,
+  unless a cancel withdrew it: the child is stopping then), and `idle` when its work ends, with
   `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the `error`
   stop reason and the SDK's error text as its `error`. The child keeps its session for every
   delegation to it.
@@ -52,11 +53,10 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
   the turn waits on and, currently, background children too. Each stopped child reports `idle`
   with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
-  withdrawn, which reports no `running` before that `idle`. The adapter ends no child at a cancel
-  itself, so a child that keeps running keeps its open requests and its open tool calls. A tool
-  call of a stopped child that Claude Code reports no result for, such as the command it was
-  running, ends in the child's session before the cancelled prompt resolves. A child that still
-  runs when Claude Code exits is `idle` with no stop reason.
+  withdrawn. The adapter ends no child at a cancel itself, so a child that keeps running keeps its
+  open requests and its open tool calls. A tool call of a stopped child that Claude Code reports no
+  result for, such as the command it was running, ends in the child's session before the cancelled
+  prompt resolves. A child that still runs when Claude Code exits is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
 - A replay restores each child under its live session id, from its own transcript: its prompt and
