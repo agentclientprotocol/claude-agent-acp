@@ -5535,6 +5535,54 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(requests[0].sessionId).toBe("child-session");
   });
 
+  it("reports a child as requires_action while its permission request is open (the subagents RFD)", async () => {
+    const { agent, updates, requests, session } = setup();
+    await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "agent-42",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+          workState: "running",
+        },
+      ],
+    ]);
+    session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      "session-1",
+      session,
+      async (notification) => {
+        updates.push(notification as SessionNotification);
+      },
+      { log: () => {} },
+    );
+
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "toolu_sub",
+      agentID: "agent-42",
+    } as any);
+
+    const states = updates.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate === "subagent_update" ? [[sessionId, update.state]] : [],
+    );
+    expect(states).toEqual([
+      ["session-1", { state: "requires_action" }],
+      ["session-1", { state: "running" }],
+    ]);
+    expect(requests[0].sessionId).toBe("agent-42");
+  });
+
   it("keeps a raced permission on the root until the child is announced", async () => {
     const { agent, updates, requests, session } = setup();
     await agent.initialize({
@@ -6688,7 +6736,10 @@ describe("subagent permission attribution (issue #851)", () => {
       expect(atResponse.at(-1)).toBe("prompt cancelled");
       // The background child keeps running, with its request still open.
       expect(atResponse).not.toContain("withdrawn @agent-bg");
-      expect(before("agent-bg ")).toEqual(['agent-bg {"state":"running"}']);
+      expect(before("agent-bg ")).toEqual([
+        'agent-bg {"state":"running"}',
+        'agent-bg {"state":"requires_action"}',
+      ]);
       // When the stream ends, its end has no reason the adapter saw.
       expect(log.filter((line) => line.startsWith("agent-bg ")).at(-1)).toBe(
         'agent-bg {"state":"idle"}',

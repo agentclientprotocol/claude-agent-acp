@@ -35,6 +35,8 @@ export type NativeSubagent = {
    * SDK's error text, which a later event of the same failure may carry.
    */
   missingError?: boolean;
+  /** The RFD form: the open permission and question requests of the child. */
+  openRequests?: number;
   /** The RFD form: the ids of the prompt messages in the child's transcript. */
   promptIds?: Set<string>;
   /** The RFD form: the calls that delegated to the child, whose runs ended. */
@@ -492,6 +494,32 @@ export class NativeSubagentRuntime {
     if (this.form === "air") await this.finishAll("cancelled", deliver);
   }
 
+  /**
+   * Runs `request`, a permission or question request of the session
+   * `sessionId`. In the RFD form, a child waiting on it is `requires_action`
+   * until its last open request ends.
+   */
+  async awaitingUser<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+    const child = this.form === "rfd" ? this.childOfSession(sessionId) : undefined;
+    if (!child?.announced) return request();
+    child.openRequests = (child.openRequests ?? 0) + 1;
+    if (child.openRequests === 1 && child.workState === "running") {
+      await this.reportState(child, { state: "requires_action" }).catch((error) =>
+        this.logger.log(`Failed to report that subagent ${child.sessionId} waits: ${error}`),
+      );
+    }
+    try {
+      return await request();
+    } finally {
+      child.openRequests = (child.openRequests ?? 1) - 1;
+      if (child.openRequests === 0 && child.workState === "requires_action") {
+        await this.reportState(child, { state: "running" }).catch((error) =>
+          this.logger.log(`Failed to report that subagent ${child.sessionId} runs: ${error}`),
+        );
+      }
+    }
+  }
+
   discardPending(parentToolUseId: string): void {
     this.takePending(parentToolUseId);
   }
@@ -518,7 +546,11 @@ export class NativeSubagentRuntime {
       this.childByParentToolUse.set(toolUseId, child);
       child.parentToolUseId = toolUseId;
     }
-    if (child.workState !== "running") await this.reportState(child, { state: "running" });
+    if (!isWorking(child)) {
+      await this.reportState(child, {
+        state: child.openRequests ? "requires_action" : "running",
+      });
+    }
     if (prompt && toolUseId) {
       await publishPrompt(
         child,
@@ -899,6 +931,11 @@ async function publishPrompt(
       content: [{ type: "text", text: prompt }],
     },
   });
+}
+
+/** The RFD form: whether the child's foreground work is in progress. */
+function isWorking(child: NativeSubagent): boolean {
+  return child.workState === "running" || child.workState === "requires_action";
 }
 
 /**

@@ -988,6 +988,29 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(runtime.isStaleEnd("worker-1", "launch-1")).toBe(false);
   });
 
+  it("resumes a child with an open request as requires_action", async () => {
+    const { runtime, published } = await runningWorker();
+    let answer!: () => void;
+    const request = runtime.awaitingUser(
+      "worker-1",
+      () => new Promise<void>((resolve) => (answer = resolve)),
+    );
+    await Promise.resolve();
+    // The work ends while the request is open; then a resume runs it again.
+    await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "send-1" }, async () => {});
+    answer();
+    await request;
+
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "requires_action" },
+      { state: "idle", stopReason: "end_turn" },
+      { state: "requires_action" },
+      { state: "running" },
+    ]);
+  });
+
   it("names the session that sent a resume's prompt, and no sender when it is unknown", async () => {
     const { runtime, published } = await runningWorker();
     // worker-1 launches worker-2, which the root then resumes.
@@ -1189,5 +1212,44 @@ describe("NativeSubagentRuntime in the RFD form", () => {
 
     await runtime.finishTask("worker-1", "disconnected", async () => {});
     expect(states(published).at(-1)).toEqual({ state: "unknown" });
+  });
+
+  it("reports a child as requires_action while its requests are open", async () => {
+    const { runtime, published } = await runningWorker();
+    const first = Promise.withResolvers<string>();
+    const second = Promise.withResolvers<string>();
+
+    const answers = Promise.all([
+      runtime.awaitingUser("worker-1", () => first.promise),
+      runtime.awaitingUser("worker-1", () => second.promise),
+    ]);
+    await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+    first.resolve("allow");
+    await first.promise;
+    expect(states(published).at(-1)).toEqual({ state: "requires_action" });
+    second.resolve("deny");
+    await expect(answers).resolves.toEqual(["allow", "deny"]);
+
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "requires_action" },
+      { state: "running" },
+    ]);
+    // The root session's own requests change no child.
+    await runtime.awaitingUser("root", async () => "allow");
+    expect(states(published)).toHaveLength(3);
+  });
+
+  it("does not report running again for a child that ended while it waited", async () => {
+    const { runtime, published } = await runningWorker();
+    const answer = Promise.withResolvers<string>();
+
+    const request = runtime.awaitingUser("worker-1", () => answer.promise);
+    await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+    await runtime.finishTask("worker-1", "completed", async () => {});
+    answer.resolve("allow");
+    await request;
+
+    expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
   });
 });

@@ -8759,6 +8759,21 @@ export class ClaudeAcpAgent {
     return response;
   }
 
+  /** Runs `request`, a request that `requestSessionId` sends for the session
+   *  `ownerSessionId`. When that is a subagent's child session, the child
+   *  reports that it awaits the user while the request is open (the RFD form,
+   *  see `NativeSubagentRuntime.awaitingUser`). */
+  private withChildAwaitingUser<T>(
+    ownerSessionId: string,
+    requestSessionId: string,
+    request: () => Promise<T>,
+  ): Promise<T> {
+    const runtime = this.sessions[ownerSessionId]?.nativeSubagentRuntime;
+    return runtime && requestSessionId !== ownerSessionId
+      ? runtime.awaitingUser(requestSessionId, request)
+      : request();
+  }
+
   /** Mark a client request of the subagent `agentID` (absent for the main
    *  conversation) as awaiting user input for exactly the lifetime of its
    *  promise (see `Session.openUserInputs`). Steering consults the open
@@ -8913,10 +8928,12 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(
-        ownerSessionId,
-        () => raceWithAbort(this.client.requestPermission(params, signal), signal),
-        agentID,
+      return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, () =>
+        this.withPendingUserInput(
+          ownerSessionId,
+          () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+          agentID,
+        ),
       );
     } catch (error) {
       if (signal.aborted) {
@@ -9384,10 +9401,12 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withPendingUserInput(
-        sessionId,
-        () => this.client.createElicitation(createRequest, signal),
-        agentID,
+      response = await this.withChildAwaitingUser(sessionId, requestSessionId, () =>
+        this.withPendingUserInput(
+          sessionId,
+          () => this.client.createElicitation(createRequest, signal),
+          agentID,
+        ),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
