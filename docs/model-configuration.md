@@ -40,6 +40,31 @@ CLAUDE_MODEL_CONFIG='{"modelOverrides":{"claude-opus-4-6":"us.anthropic.claude-o
 node dist/index.js
 ```
 
+## Custom model gateway (`ACP_GATEWAY_AUTH`)
+
+For deployments that route Claude Code's API traffic through a custom LLM gateway speaking the standard Anthropic protocol, where the credentials live outside the agent — typically `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` in the user's `~/.claude/settings.json`, with the gateway injecting the real credential upstream. There is no Anthropic subscription or API key on the machine, so every sign-in prompt a client offers cannot be completed.
+
+```jsonc
+// ~/.claude/settings.json — the single source of truth for routing and auth
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://gateway.internal.example",
+    "ANTHROPIC_AUTH_TOKEN": "<gateway token>",
+  },
+}
+```
+
+```bash
+ACP_GATEWAY_AUTH=1 node dist/index.js
+```
+
+**This is a status signal, not a routing switch.** The adapter does not rewrite the session environment in this mode: traffic flows exactly where `~/.claude/settings.json` (or the process environment) points it, which Claude Code reads natively. What the flag changes is the identity the agent reports to the ACP client — `kind: "gateway"`, "Custom model gateway" — instead of a "not logged in" verdict that would trigger sign-in prompts. The adapter also skips `claude auth status` entirely in this mode, and `auth/logout` reports keep the gateway identity (logout clears only the CLI credential store, which is not the credential in use).
+
+- Any non-empty value enables it, matching the `CLAUDE_CODE_USE_BEDROCK` truthiness convention; set `1`.
+- Do not combine with `CLAUDE_CODE_USE_BEDROCK`/`CLAUDE_CODE_USE_VERTEX`: those switch the wire protocol away from the Anthropic API format a gateway speaks. If both are set, the CLI follows the Bedrock/Vertex switches while the agent reports the gateway identity.
+- A client-managed route (`providers/set`) wins over the flag: it bakes routing into the session env and zeroes `ACP_GATEWAY_AUTH` there.
+- **Not Claude Code's `CLAUDE_CODE_USE_GATEWAY`.** Claude Code itself has an undocumented env var of that name; its error strings describe a _Cloud gateway_ sign-in flow with a credential hand-off file and instructions to `unset CLAUDE_CODE_USE_GATEWAY`. This adapter flag is deliberately named differently and is a pure status signal: it never routes traffic, never spawns sign-in, and never touches the CLI credential store.
+
 ## Precedence
 
 An ACP caller can provide `settings` via `_meta.claudeCode.options.settings` in `session/new` or `session/load`, as an object or a path to a settings file. The adapter merges `CLAUDE_MODEL_CONFIG` into those settings, so a caller that only adds hooks keeps the model settings. When both set the same key, the caller wins; the merge is shallow, so a caller's `modelOverrides` replaces the env var's map.

@@ -80,6 +80,9 @@ describe("authorization", () => {
     vi.useRealTimers();
 
     delete process.env.CLAUDE_CODE_EXECUTABLE;
+    // The gateway-mode tests stub env vars; a leak would silently disable the
+    // account publish in later tests (publishSessionAccountIdentity's guard).
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.resetAllMocks();
   });
@@ -223,6 +226,57 @@ describe("authorization", () => {
           }),
         }),
       }),
+    );
+  });
+
+  it("leaves session env and settings untouched in gateway mode", async () => {
+    // STATUS-ONLY: the env var must not turn into a provider override. The
+    // user's real base URL and token come from their settings.json / process
+    // env and pass through untouched — an "acp-proxy" placeholder here would
+    // clobber the credential the gateway actually honors.
+    vi.stubEnv("ACP_GATEWAY_AUTH", "1");
+    vi.stubEnv("ANTHROPIC_AUTH_TOKEN", "user-token");
+    vi.stubEnv("ANTHROPIC_BASE_URL", "https://gw.example.com");
+
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    const options = mockQuery.mock.calls[0][0].options;
+    // No provider override resolved: no programmatic settings/env rewrite.
+    expect(options.settings).toBeUndefined();
+    expect(options.env.ANTHROPIC_AUTH_TOKEN).toBe("user-token");
+    expect(options.env.ANTHROPIC_BASE_URL).toBe("https://gw.example.com");
+    expect(options.env.ACP_GATEWAY_AUTH).toBe("1");
+  });
+
+  it("does not change the auth methods list in gateway mode", async () => {
+    // Parity with CLAUDE_CODE_USE_BEDROCK/VERTEX: the env var changes the
+    // pushed identity, never the advertised sign-in methods.
+    vi.stubEnv("ACP_GATEWAY_AUTH", "1");
+
+    const [agent] = await createAgentMock();
+
+    const withoutCapabilities = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+    });
+    expect(withoutCapabilities.authMethods).not.toContainEqual(
+      expect.objectContaining({ id: "gateway" }),
+    );
+
+    const withTerminal = await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        auth: { terminal: true },
+      } as any,
+    });
+    expect(withTerminal.authMethods).toContainEqual(
+      expect.objectContaining({ id: "claude-ai-login" }),
+    );
+    expect(withTerminal.authMethods).toContainEqual(
+      expect.objectContaining({ id: "console-login" }),
     );
   });
 

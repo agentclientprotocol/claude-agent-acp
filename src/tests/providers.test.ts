@@ -45,6 +45,9 @@ describe("providers", () => {
   afterEach(() => {
     vi.runAllTimers();
     vi.useRealTimers();
+    // The gateway-mode tests stub env vars; a leak would flip later tests
+    // into gateway mode or zero their routing expectations.
+    vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.resetAllMocks();
   });
@@ -506,6 +509,47 @@ describe("providers", () => {
         }),
       }),
     );
+  });
+
+  it("zeroes the gateway routing flag when an ACP provider override is active", async () => {
+    // The deployment-level env var must not fight a client-configured route:
+    // once `providers/set` bakes routing into the session env, the flag is off.
+    vi.stubEnv("ACP_GATEWAY_AUTH", "1");
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://client.example",
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          env: expect.objectContaining({
+            ACP_GATEWAY_AUTH: "0",
+            ANTHROPIC_BASE_URL: "https://client.example",
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("lists native anthropic routing with the gateway env var set", async () => {
+    // STATUS-ONLY: the env var never becomes a provider config, so the list
+    // keeps reporting the routing the process env describes.
+    vi.stubEnv("ACP_GATEWAY_AUTH", "1");
+    vi.stubEnv("ANTHROPIC_BASE_URL", "https://gw.example.com");
+
+    const [agent] = await createAgentMock();
+
+    const response = await agent.unstable_listProviders({});
+    expect(response.providers[0].current).toEqual({
+      apiType: "anthropic",
+      baseUrl: "https://gw.example.com",
+    });
   });
 
   it("clears provider config on logout", async () => {
