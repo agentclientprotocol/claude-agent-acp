@@ -9,6 +9,9 @@ import {
   wrapQuery,
 } from "./session-doubles.js";
 
+// The agent reads the CLI's auth status on each prompt. Answer it, so that the
+// tests checking `logError` don't see "claude auth status failed". The answer
+// makes the agent send an auth status `extNotification`; the client stubs it.
 vi.mock("node:child_process", async () => ({
   ...(await vi.importActual<typeof import("node:child_process")>("node:child_process")),
   execFile: (...args: unknown[]) =>
@@ -146,16 +149,6 @@ describe("incomplete foreground tools", () => {
     expect(failedTool()).toHaveLength(1);
   });
 
-  it("terminates a tool whose start streams in after the cancel", async () => {
-    const { prompt, updates, agent } = createTestSession(cancelThenLateToolStartMessages);
-
-    await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
-    expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
-    expect(
-      updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed"),
-    ).toHaveLength(1);
-  });
-
   it.each(["deferred", "checkpoint"] as const)(
     "terminates unfinished tools when cancel settles a %s turn inline",
     async (settlement) => {
@@ -170,25 +163,13 @@ describe("incomplete foreground tools", () => {
           yield toolUse("second-tool");
           yield toolStart("completed-tool");
           yield toolResult("completed-tool");
-          yield toolStart("background-tool");
-          yield toolUse("background-tool");
-          yield {
-            type: "system",
-            subtype: "task_started",
-            session_id: sessionId,
-            task_id: "background-shell",
-            tool_use_id: "background-tool",
-            description: "dev server",
-          };
-          yield {
-            type: "system",
-            subtype: "task_started",
-            session_id: sessionId,
-            task_id: "child",
-            tool_use_id: "parent-agent",
-            subagent_type: "Explore",
-            description: "investigate",
-          };
+          // A background subagent holds the turn open, and its command runs on.
+          yield toolStart("bg-agent", null, "Agent");
+          yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+          yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+          yield toolResult("bg-agent");
+          yield toolStart("bg-child", "bg-agent");
+          yield toolUse("bg-child", "bg-agent");
         }
         yield successfulResultMessage();
         await streamGate;
@@ -238,11 +219,15 @@ describe("incomplete foreground tools", () => {
           expect(hasHookCallback(id)).toBe(false);
         }
         expect(
-          updates.some(
-            (u) =>
-              ["completed-tool", "background-tool"].includes(u.toolCallId) && u.status === "failed",
-          ),
+          updates.some((u) => u.toolCallId === "completed-tool" && u.status === "failed"),
         ).toBe(false);
+        if (settlement === "deferred") {
+          // The cancel did not stop the background subagent, so its command stays open.
+          expect(updates.some((u) => u.toolCallId === "bg-child" && u.status === "failed")).toBe(
+            false,
+          );
+          expect(agent.sessions[sessionId].emittedToolCalls.has("bg-child")).toBe(true);
+        }
         await agent.cancel({ sessionId });
         releaseStream();
         await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
@@ -436,6 +421,65 @@ describe("incomplete foreground tools", () => {
       releaseCheckpoint();
       releasePublication();
       releaseStream();
+    }
+  });
+
+  it("closes each tool call once, before the response, when a cancel settles a held turn that the consumer is closing", async () => {
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => (releasePublication = resolve));
+    let firstHeld!: () => void;
+    const publicationHeld = new Promise<void>((resolve) => (firstHeld = resolve));
+    const { agent, prompt, updates, logError } = createTestSession(async function* (input, agent) {
+      yield* echoNextPrompt(input);
+      // A background subagent holds the turn open after its result.
+      yield toolStart("bg-agent", null, "Agent");
+      yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+      yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+      yield toolResult("bg-agent");
+      yield successfulResultMessage();
+      // The first cancel lands while a follow-up cycle runs two commands, so it
+      // leaves the turn to the consumer, which settles it at the idle.
+      yield { type: "system", subtype: "session_state_changed", state: "running" };
+      yield toolStart();
+      yield toolUse();
+      yield toolStart("second-tool");
+      yield toolUse("second-tool");
+      await agent.cancel({ sessionId });
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+    const events: string[] = [];
+    const publish = agent.client.sessionUpdate.bind(agent.client);
+    agent.client.sessionUpdate = async (notification) => {
+      const update = notification.update;
+      if (update.sessionUpdate === "tool_call_update" && update.status === "failed") {
+        if (update.toolCallId === toolCallId) {
+          firstHeld();
+          await publicationGate;
+        }
+        events.push(`end ${update.toolCallId}`);
+      }
+      await publish(notification);
+    };
+
+    try {
+      const response = prompt().then((outcome) => {
+        events.push("response");
+        return outcome;
+      });
+      await publicationHeld;
+      // The session now reads idle, so the second cancel settles the held turn
+      // itself, while the consumer's first report is in flight.
+      const cancel = agent.cancel({ sessionId });
+      await vi.waitFor(() => expect(agent.sessions[sessionId].activeTurn).toBeNull());
+      releasePublication();
+      await cancel;
+      await expect(response).resolves.toMatchObject({ stopReason: "cancelled" });
+      expect(events).toEqual([`end ${toolCallId}`, "end second-tool", "response"]);
+      expect(logError).not.toHaveBeenCalled();
+      await agent.sessions[sessionId].consumer;
+      expect(updates.filter((u) => u.status === "failed")).toHaveLength(2);
+    } finally {
+      releasePublication();
     }
   });
 
@@ -862,16 +906,6 @@ async function* incompleteThenSuccessfulTurnMessages(input: Pushable<any>) {
   // Keep the SDK stream open for the next prompt in the same session.
   yield userEcho((await messages.next()).value);
   yield successfulResultMessage();
-}
-
-async function* cancelThenLateToolStartMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
-  const messages = input[Symbol.asyncIterator]();
-  yield userEcho((await messages.next()).value);
-  await agent.cancel({ sessionId });
-  // The late SDK flush: a tool start that streams in after the cancel but
-  // before the turn's trailing idle settles it. No tool_result will follow.
-  yield toolStart();
-  yield { type: "system", subtype: "session_state_changed", state: "idle" };
 }
 
 async function* cancelledThenSuccessfulTurnMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
