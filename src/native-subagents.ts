@@ -535,8 +535,9 @@ export class NativeSubagentRuntime {
    * Code's interrupt withdrew it as it stopped the child, and the SDK's events
    * report the child `idle` next. The end of the request then reports no
    * `running`, which would show a child that is being stopped as working.
-   * Without a cancel, a hook or the classifier answered the request in the
-   * user's place and the child runs on, so the end reports `running`.
+   * Without a cancel, something else answered the request in the user's place,
+   * such as a `PermissionRequest` hook, and the child runs on, so the end
+   * reports `running`.
    */
   async awaitingUser<T>(
     sessionId: string,

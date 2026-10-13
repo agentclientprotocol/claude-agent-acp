@@ -1489,7 +1489,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       const request = withdrawable(runtime, withdrawal);
       await vi.waitFor(() => expect(states(published)).toHaveLength(2));
 
-      // A hook or the classifier answered the request in the user's place.
+      // A hook answered the request in the user's place.
       withdrawal.abort();
       await expect(request).resolves.toBe("Tool use aborted");
 
