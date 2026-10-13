@@ -3877,6 +3877,35 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("ends the terminal of a command that gets no result, for a client that renders terminals", () => {
+    const terminalExit = (name: string, capabilities?: ToolCallCapabilities) =>
+      new AcpToolCallRenderer(capabilities).terminalExit({
+        id: "toolu_bash",
+        name,
+        input: { command: "make" },
+      });
+    const zed = ToolCallCapabilities.from({ _meta: { terminal_output: true } });
+    const airWithTerminal = ToolCallCapabilities.from({
+      _meta: { ...AIR_CLIENT._meta, terminal_output: true },
+    });
+    const exit = (exitCode: number | null) => ({
+      terminal_exit: { terminal_id: "toolu_bash", exit_code: exitCode, signal: null },
+    });
+
+    // The command ended without a result, so no exit code is known.
+    expect(terminalExit("Bash", zed)).toEqual(exit(null));
+    expect(terminalExit("PowerShell", zed)).toEqual(exit(null));
+    // A v2 client renders terminals without declaring them.
+    expect(terminalExit("Bash", ToolCallCapabilities.from({}, { v2: true }))).toEqual(exit(null));
+    // AIR always gets a number, and reads 1 for a command that did not succeed.
+    expect(terminalExit("Bash", airWithTerminal)).toEqual(exit(1));
+    // No terminal was started for these tool calls.
+    expect(terminalExit("Bash")).toBeUndefined();
+    expect(terminalExit("Bash", ToolCallCapabilities.from(AIR_CLIENT))).toBeUndefined();
+    expect(terminalExit("Read", zed)).toBeUndefined();
+    expect(terminalExit("mcp__server__tool", zed)).toBeUndefined();
+  });
+
   it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
     // TodoWrite renders as a plan, so only the permission flow emits its tool call.
     const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };

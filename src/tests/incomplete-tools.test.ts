@@ -524,6 +524,95 @@ describe("incomplete foreground tools", () => {
   });
 });
 
+describe("the display terminal of a command that ends without a result", () => {
+  const TERMINAL_CLIENT = { _meta: { terminal_output: true } };
+  const AIR_TERMINAL_CLIENT = {
+    _meta: { terminal_output: true, jetbrains: { air: { version: 1, capabilities: [] } } },
+  };
+  /** The reports that end the tool call `id`. */
+  const endsOf = (updates: any[], id = toolCallId) =>
+    updates.filter(
+      (u) => u.toolCallId === id && ["completed", "failed", "cancelled"].includes(u.status),
+    );
+
+  /** Runs the cancelled turn of `interruptedSubagentMessages` for a client with `capabilities`. */
+  async function cancelledSubagentCommand(capabilities: Record<string, unknown>) {
+    const session = createTestSession(interruptedSubagentMessages);
+    await session.agent.initialize({ protocolVersion: 1, clientCapabilities: capabilities });
+    await expect(session.prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+    return endsOf(session.updates, "child-tool");
+  }
+
+  it("ends the terminal of a command that a cancel closes", async () => {
+    const [end, ...more] = await cancelledSubagentCommand(TERMINAL_CLIENT);
+
+    expect(more).toEqual([]);
+    // The report that ends the call ends its terminal too, and still names the subagent.
+    expect(end).toMatchObject({
+      status: "failed",
+      _meta: {
+        terminal_exit: { terminal_id: "child-tool", exit_code: null, signal: null },
+        claudeCode: { parentToolUseId: "parent-agent" },
+      },
+    });
+  });
+
+  it("gives an AIR client the number that it reads for a command that did not succeed", async () => {
+    const [end] = await cancelledSubagentCommand(AIR_TERMINAL_CLIENT);
+
+    expect(end._meta.terminal_exit).toEqual({
+      terminal_id: "child-tool",
+      exit_code: 1,
+      signal: null,
+    });
+  });
+
+  it("sends no terminal exit to a client that renders no terminals", async () => {
+    const [end] = await cancelledSubagentCommand({});
+
+    expect(end._meta?.terminal_exit).toBeUndefined();
+  });
+
+  it("sends no terminal exit for a tool that is not a command", async () => {
+    const session = createTestSession(interruptedSubagentReadMessages);
+    await session.agent.initialize({ protocolVersion: 1, clientCapabilities: TERMINAL_CLIENT });
+
+    await expect(session.prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    const [end] = endsOf(session.updates, "child-tool");
+    expect(end.status).toBe("failed");
+    expect(end._meta.terminal_exit).toBeUndefined();
+  });
+
+  it("ends the terminal of a command that ran, but got no result by the end of the turn", async () => {
+    const session = createTestSession((input) => unfinishedToolMessages(input, "result"));
+    await session.agent.initialize({ protocolVersion: 1, clientCapabilities: TERMINAL_CLIENT });
+
+    await expect(session.prompt()).rejects.toMatchObject({
+      data: { errorKind: "incomplete_tool_call" },
+    });
+
+    const [end] = endsOf(session.updates);
+    expect(end.content[0].content.text).toContain("without returning a result");
+    expect(end._meta.terminal_exit).toEqual({
+      terminal_id: toolCallId,
+      exit_code: null,
+      signal: null,
+    });
+  });
+
+  it("ends the terminal of a command that Claude abandoned before it ran", async () => {
+    const session = createTestSession(abandonedToolMessages);
+    await session.agent.initialize({ protocolVersion: 1, clientCapabilities: TERMINAL_CLIENT });
+
+    await expect(session.prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    const [end] = endsOf(session.updates);
+    expect(end.content[0].content.text).toBe("Claude stopped this tool call before it ran.");
+    expect(end._meta.terminal_exit).toMatchObject({ terminal_id: toolCallId });
+  });
+});
+
 describe("tool calls of a cancelled turn", () => {
   /** The reports that end the tool call `id`. */
   const ends = (updates: any[], id = toolCallId) =>
@@ -1022,6 +1111,25 @@ async function* interruptedSubagentMessages(input: Pushable<any>, agent: ClaudeA
   yield taskStopped("bash-task", "child-tool");
   yield interruptedResult("parent-agent");
   yield taskStopped("agent-1", "parent-agent");
+  yield interruptNote;
+  yield abortedResult();
+}
+
+/** Like `interruptedSubagentMessages`, but the subagent reads a file, not runs a command. */
+async function* interruptedSubagentReadMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield toolStart("parent-agent", null, "Agent");
+  yield toolUse("parent-agent", null, "Agent", {
+    description: "Read a file",
+    subagent_type: "general-purpose",
+    prompt: "Read it",
+  });
+  yield taskStarted("agent-1", "parent-agent", "general-purpose");
+  yield toolStart("child-tool", "parent-agent", "Read");
+  yield toolUse("child-tool", "parent-agent", "Read", { file_path: "/test/file.txt" });
+  await agent.cancel({ sessionId });
+  yield taskStopped("agent-1", "parent-agent");
+  yield interruptedResult("parent-agent");
   yield interruptNote;
   yield abortedResult();
 }

@@ -1640,6 +1640,71 @@ describe("ACP v2 prompts", () => {
       expect(childEnd).toBeLessThan(idle);
     });
 
+    it("ends the terminal of a stopped subagent's command with the tool call", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      const subagentTask = (
+        options: Options,
+        subtype: string,
+        fields: Record<string, unknown>,
+      ) => ({
+        type: "system",
+        subtype,
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+        ...fields,
+      });
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent", "Agent", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield subagentTask(options, "task_started", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield toolUseMessage(options, "toolu_child", "Bash", { command: "make" }, "toolu_agent");
+        await interrupted.promise;
+        // Claude Code sends no result for the subagent's command.
+        yield subagentTask(options, "task_notification", {
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+        });
+        yield toolResultMessage(options, "toolu_agent", { is_error: true }, "user-rejected");
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelWhileRunning("toolu_child");
+
+      // The command's terminal shows in the child's session, and its exit comes
+      // with the tool call's end, before the root reports idle. The exit code is
+      // unknown, so the exit carries none.
+      const terminalAt = (predicate: (update: Seen["update"]) => boolean) =>
+        updates.findIndex(
+          ({ sessionId, update }) =>
+            sessionId === "agent-1" &&
+            update.sessionUpdate === "terminal_update" &&
+            predicate(update),
+        );
+      const exit = terminalAt((update) => update.exitStatus !== undefined);
+      expect(terminalAt((update) => update.exitStatus === undefined)).toBeGreaterThanOrEqual(0);
+      expect(updates[exit]).toMatchObject({
+        update: { terminalId: "toolu_child", exitStatus: {} },
+      });
+      expect(exit).toBeGreaterThan(terminalAt((update) => update.exitStatus === undefined));
+      expect(exit).toBeLessThan(idleAt(root, updates));
+      expect(updates[lastStatusAt(updates, "toolu_child")]).toMatchObject({
+        sessionId: "agent-1",
+        update: { status: "cancelled" },
+      });
+    });
+
     it("ends a tool call that finished as the cancel landed as completed, not cancelled", async () => {
       const interrupted = Promise.withResolvers<void>();
       sdk.interrupt = async () => interrupted.resolve();

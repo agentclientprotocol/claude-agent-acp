@@ -4854,8 +4854,14 @@ export class ClaudeAcpAgent {
     /** Sends `report`, which ends the tool call `toolCallId` without its result
      *  (see `AcpToolCallRenderer.unfinished`), and forgets the call. Forgetting
      *  comes first, so that a late hook or a second close cannot overwrite the
-     *  report. */
+     *  report. A command has a display terminal on a client that renders them,
+     *  and no result will end it, so the report ends it too. */
     const closeToolCall = async (toolCallId: string, report: ToolCallUpdate) => {
+      // Read before the cache entry goes: it names the tool.
+      const toolUse = session.toolUseCache[toolCallId];
+      const terminalExit =
+        toolUse && new AcpToolCallRenderer(this.toolCallCapabilities).terminalExit(toolUse);
+      if (terminalExit) report._meta = { ...report._meta, ...terminalExit };
       unregisterHookCallback(toolCallId);
       session.emittedToolCalls.delete(toolCallId);
       delete session.toolUseCache[toolCallId];

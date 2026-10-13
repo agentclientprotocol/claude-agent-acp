@@ -163,6 +163,14 @@ export class AcpToolCallRenderer {
   }
 
   /**
+   * Whether a tool call with these facts gets a display terminal: a command, for a client
+   * that renders terminals.
+   */
+  private hasTerminal(facts: ToolUseFacts): boolean {
+    return facts.command === true && this.capabilities.terminalOutput;
+  }
+
+  /**
    * The status of a tool result. Claude Code reports a run that it aborted in
    * one of three ways:
    * - an error result whose `nonExecution` kind says so (`interrupted`,
@@ -231,9 +239,7 @@ export class AcpToolCallRenderer {
     return {
       _meta: {
         ...this.toolUseMeta(toolUse, options.cwd),
-        ...(facts.command && this.capabilities.terminalOutput
-          ? { terminal_info: { terminal_id: toolUse.id } }
-          : {}),
+        ...(this.hasTerminal(facts) ? { terminal_info: { terminal_id: toolUse.id } } : {}),
         // Only AIR gets the MCP flag. The upstream adapter does not send it.
         ...(isMcp && this.capabilities.air.client ? { is_mcp_tool_call: true } : {}),
       } satisfies ToolUpdateMeta,
@@ -641,7 +647,7 @@ export class AcpToolCallRenderer {
    * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
    * returned no result, it failed, unless a `session/cancel` ended the turn
    * (`cancelled`): the cancel stopped the run, so a v2 client gets `cancelled`
-   * for it too.
+   * for it too. The report does not end the call's terminal: see {@link terminalExit}.
    */
   unfinished(call: { toolCallId: string; ran: boolean; cancelled?: boolean }): ToolCallUpdate {
     const stopped = !call.ran || call.cancelled === true;
@@ -658,6 +664,24 @@ export class AcpToolCallRenderer {
               : "Claude ended the turn without returning a result for this tool.",
         ),
       ],
+    };
+  }
+
+  /**
+   * The `_meta` that ends the display terminal of a command whose tool call gets no result, to
+   * add to the report from {@link unfinished}. Undefined when the tool call has no terminal
+   * (see {@link toolCall}). The exit code is unknown, since the command ended without a result:
+   * null, or 1 for AIR, which always gets a number and reads 1 for a command that did not
+   * succeed.
+   */
+  terminalExit(toolUse: ToolUse): Pick<ToolUpdateMeta, "terminal_exit"> | undefined {
+    if (!this.hasTerminal(this.facts(toolUse))) return undefined;
+    return {
+      terminal_exit: {
+        terminal_id: toolUse.id,
+        exit_code: this.capabilities.air.client ? 1 : null,
+        signal: null,
+      },
     };
   }
 
@@ -720,7 +744,7 @@ export class AcpToolCallRenderer {
    * does not render `rawInput` itself, and never next to a terminal.
    */
   toolUseContent(toolCallId: string, facts: ToolUseFacts): ToolCallContent[] {
-    const terminal = facts.command === true && this.capabilities.terminalOutput;
+    const terminal = this.hasTerminal(facts);
     return [
       ...(terminal ? [{ type: "terminal" as const, terminalId: toolCallId }] : []),
       ...(facts.change ?? []),
