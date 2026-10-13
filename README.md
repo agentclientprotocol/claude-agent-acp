@@ -62,6 +62,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   each SendMessage message are `session_message`s, and its end is an `idle` before the response.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
+- After a load or resume, with or without replay, a SendMessage that resumes an agent from before
+  it runs that agent in its session from before. Before the agent's traffic, each of its ancestors
+  that the client was not told about in this connection is announced, parent before child and
+  with no work state, as the RFD requires. An agent whose launch the session's history does not
+  record stays unexposed.
 - A client cannot prompt, cancel, or otherwise change a child yet.
 
 An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents

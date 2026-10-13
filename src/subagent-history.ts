@@ -1,10 +1,12 @@
 import {
   getSessionInfo,
+  getSessionMessages,
   getSubagentMessages,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { isNativeSubagentControlTool, type HistoricalSubagent } from "./native-subagents.js";
 import { findTranscript } from "./resumed-session.js";
 
 /** What the metadata file of a subagent says about it. */
@@ -82,6 +84,96 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
   // characters. The session info reads it back from the transcript.
   const dir = (await getSessionInfo(sessionId).catch(() => undefined))?.cwd;
   return dir ? { agents, dir } : { agents };
+}
+
+/**
+ * The agent `agentId` and its ancestors, root first, from the subagent history
+ * of the session `sessionId`. The runtime restores an agent from it when Claude
+ * Code resumes one that ran before the session was loaded or resumed.
+ *
+ * The metadata file of an agent names the call that launched it, but not the
+ * agent that made the call. So the parent of a launch is the session whose
+ * transcript has the call, as in the replay: the session's own transcript, or
+ * an agent's. The list is empty when the agent or one of its ancestors has no
+ * metadata, or no transcript has its launch.
+ */
+export async function subagentLineage(
+  sessionId: string,
+  agentId: string,
+  logger: { error(...args: unknown[]): void },
+): Promise<HistoricalSubagent[]> {
+  const history = await subagentHistory(sessionId);
+  const launchOf = new Map<string, { launchId: string; record: SubagentRecord }>();
+  for (const [launchId, record] of history.agents) {
+    launchOf.set(record.agentId, { launchId, record });
+  }
+  if (!launchOf.has(agentId)) return [];
+
+  // Without the project directory, as the replay reads it (`readResumedSession`).
+  const rootLaunches = new Set(
+    launchIdsIn(
+      await getSessionMessages(sessionId).catch((error: unknown) => {
+        logger.error(`Failed to read the transcript of session ${sessionId}:`, error);
+        return [];
+      }),
+    ),
+  );
+  const agentLaunches = new Map<string, Set<string>>();
+  /** The agent whose transcript has the launch `launchId`, `null` for the root's. */
+  const launcherOf = async (launchId: string): Promise<string | null | undefined> => {
+    if (rootLaunches.has(launchId)) return null;
+    for (const candidate of launchOf.keys()) {
+      let launches = agentLaunches.get(candidate);
+      if (!launches) {
+        launches = new Set(
+          launchIdsIn(await readSubagentMessages(sessionId, candidate, history, logger)),
+        );
+        agentLaunches.set(candidate, launches);
+      }
+      if (launches.has(launchId)) return candidate;
+    }
+    return undefined;
+  };
+
+  const lineage: HistoricalSubagent[] = [];
+  let current: string | null = agentId;
+  while (current !== null) {
+    const launch = launchOf.get(current);
+    // A cycle, or an ancestor without metadata.
+    if (!launch || lineage.some((entry) => entry.agentId === current)) return [];
+    const launcher = await launcherOf(launch.launchId);
+    if (launcher === undefined) return [];
+    lineage.unshift({
+      agentId: current,
+      launchId: launch.launchId,
+      ...(launcher !== null ? { parentAgentId: launcher } : {}),
+      ...(launch.record.name ? { name: launch.record.name } : {}),
+      ...(launch.record.agentType ? { agentType: launch.record.agentType } : {}),
+      ...(launch.record.description ? { description: launch.record.description } : {}),
+    });
+    current = launcher;
+  }
+  return lineage;
+}
+
+/** The ids of the Agent and Task calls that launched subagents in `content`. */
+export function subagentLaunchIds(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((block) =>
+    typeof block === "object" &&
+    block !== null &&
+    block.type === "tool_use" &&
+    typeof block.id === "string" &&
+    isNativeSubagentControlTool(block.name)
+      ? [block.id as string]
+      : [],
+  );
+}
+
+function launchIdsIn(messages: readonly SessionMessage[]): string[] {
+  return messages.flatMap((message) =>
+    subagentLaunchIds((message as { message?: { content?: unknown } }).message?.content),
+  );
 }
 
 /**

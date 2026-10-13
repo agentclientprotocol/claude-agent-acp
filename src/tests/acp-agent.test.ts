@@ -6971,6 +6971,150 @@ describe("subagent permission attribution (issue #851)", () => {
       });
     });
 
+    it("restores an agent from before a resume from the session's history, when SendMessage resumes it", async () => {
+      // The session's history on disk: the root launched agent-7 with toolu_old.
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-restore-"));
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      try {
+        const directory = path.join(configDir, "projects", "-tmp-proj");
+        await mkdir(path.join(directory, "test-session", "subagents"), { recursive: true });
+        const record = (uuid: string, parentUuid: string | null, extra: object) =>
+          JSON.stringify({
+            sessionId: "test-session",
+            cwd: "/tmp/proj",
+            version: "2.0.0",
+            userType: "external",
+            isSidechain: false,
+            timestamp: "2026-10-13T00:00:00.000Z",
+            uuid,
+            parentUuid,
+            ...extra,
+          });
+        await writeFile(
+          path.join(directory, "test-session.jsonl"),
+          [
+            record("u1", null, { type: "user", message: { role: "user", content: "Go" } }),
+            record("a1", "u1", {
+              type: "assistant",
+              message: {
+                id: "m-a1",
+                role: "assistant",
+                model: "claude-opus-5",
+                content: [
+                  { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
+                ],
+              },
+            }),
+          ].join("\n") + "\n",
+        );
+        // The SDK reads no transcript for a session id that is not a UUID, as
+        // the test session's is, so it answers with the transcript above.
+        vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+        vi.mocked(getSessionMessages).mockResolvedValueOnce([
+          {
+            type: "assistant",
+            uuid: "a1",
+            session_id: "test-session",
+            parent_tool_use_id: null,
+            message: {
+              role: "assistant",
+              content: [
+                { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
+              ],
+            },
+          },
+        ] as Awaited<ReturnType<typeof getSessionMessages>>);
+        await writeFile(
+          path.join(directory, "test-session", "subagents", "agent-agent-7.meta.json"),
+          JSON.stringify({
+            agentType: "Explore",
+            description: "Echo a word",
+            name: "echoer",
+            toolUseId: "toolu_old",
+          }),
+        );
+
+        const updates = await run([
+          rootToolUse("toolu_send", "SendMessage", { to: "agent-7", message: "Say PING" }),
+          { ...taskStarted("agent-7", "toolu_send"), subagent_type: "Explore", prompt: "Say PING" },
+          {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            tool_use_result: { success: true, resumedAgentId: "agent-7" },
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Resuming" }],
+            },
+          },
+          // The resumed run's messages carry the id of the call that launched it.
+          childText("toolu_old", "PING"),
+          taskNotification("toolu_send", "completed", { task_id: "agent-7" }),
+          // The harness's own Agent call, which launched nothing here.
+          {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [{ type: "tool_result", tool_use_id: "toolu_parent", content: "done" }],
+            },
+          },
+        ]);
+
+        expect(
+          updates.flatMap(({ sessionId, update }) =>
+            sessionId === "agent-7" || update.sessionUpdate === "subagent_update"
+              ? [{ sessionId, update }]
+              : [],
+          ),
+        ).toEqual([
+          {
+            sessionId: "test-session",
+            update: {
+              sessionUpdate: "subagent_update",
+              sessionId: "agent-7",
+              title: "echoer (Explore)",
+              description: "Echo a word",
+              state: { state: "running" },
+            },
+          },
+          {
+            sessionId: "agent-7",
+            update: {
+              sessionUpdate: "session_message",
+              messageId: "toolu_send",
+              senderSessionId: "test-session",
+              recipientSessionId: "agent-7",
+              content: [{ type: "text", text: "Say PING" }],
+            },
+          },
+          {
+            sessionId: "agent-7",
+            update: expect.objectContaining({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "PING" },
+            }),
+          },
+          {
+            sessionId: "test-session",
+            update: {
+              sessionUpdate: "subagent_update",
+              sessionId: "agent-7",
+              state: { state: "idle", stopReason: "end_turn" },
+            },
+          },
+        ]);
+      } finally {
+        if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+        await rm(configDir, { recursive: true, force: true });
+      }
+    });
+
     it("ignores a SendMessage result that arrives after the run it started ended", async () => {
       const { agent, updates } = await runAgent([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },

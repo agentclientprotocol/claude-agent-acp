@@ -183,7 +183,12 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { readSubagentMessages, subagentHistory } from "./subagent-history.js";
+import {
+  readSubagentMessages,
+  subagentHistory,
+  subagentLaunchIds,
+  subagentLineage,
+} from "./subagent-history.js";
 import {
   type ReplayChild,
   RfdSubagentReplay,
@@ -1781,20 +1786,6 @@ function sessionListOffset(cursor: string | null | undefined): number {
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
-}
-
-/** The ids of the Agent and Task tool uses in the content of a message. */
-function subagentLaunchIds(content: unknown): string[] {
-  if (!Array.isArray(content)) return [];
-  return content.flatMap((block) =>
-    typeof block === "object" &&
-    block !== null &&
-    block.type === "tool_use" &&
-    typeof block.id === "string" &&
-    isNativeSubagentControlTool(block.name)
-      ? [block.id as string]
-      : [],
-  );
 }
 
 function stripSubagentTextAndThinking(content: unknown): unknown {
@@ -4157,6 +4148,7 @@ export class ClaudeAcpAgent {
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
+      (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get

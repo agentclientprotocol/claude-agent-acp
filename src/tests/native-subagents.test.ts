@@ -3,6 +3,7 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   announceNativeSubagent,
   finishNativeSubagent,
+  type HistoricalSubagent,
   NativeSubagent,
   NativeSubagentRuntime,
   NativeSubagentSession,
@@ -1040,6 +1041,195 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       ["send-worker", "worker-1"],
       ["send-unknown", undefined],
     ]);
+  });
+
+  describe("an agent from before a load or resume", () => {
+    const echoer: HistoricalSubagent = {
+      agentId: "echoer-1",
+      launchId: "launch-1",
+      name: "echoer",
+      agentType: "Explore",
+      description: "Echo a word",
+    };
+    const coordinator: HistoricalSubagent = {
+      agentId: "coordinator-1",
+      launchId: "launch-c",
+      name: "coordinator",
+      agentType: "general-purpose",
+      description: "Coordinate",
+    };
+    const nestedEchoer: HistoricalSubagent = { ...echoer, parentAgentId: "coordinator-1" };
+
+    /** A runtime that knows no child, with the session history's lineage of each agent. */
+    function reloaded(lineages: Record<string, readonly HistoricalSubagent[]>) {
+      const published: AcpSessionNotification[] = [];
+      const log = vi.fn();
+      const lineage = vi.fn(async (agentId: string) => lineages[agentId] ?? []);
+      const runtime = new NativeSubagentRuntime(
+        "rfd",
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log },
+        lineage,
+      );
+      return { runtime, published, lineage, log };
+    }
+    const announcements = (published: AcpSessionNotification[]) =>
+      published.flatMap(({ sessionId, update }) =>
+        update.sessionUpdate === "subagent_update" && update.title
+          ? [`${sessionId} -> ${update.sessionId} ${JSON.stringify(update.state ?? null)}`]
+          : [],
+      );
+
+    it("restores the agent that a SendMessage call resumes under its id, and routes its run to it", async () => {
+      const { runtime, published } = reloaded({ "echoer-1": [echoer] });
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await runtime.taskStarted(
+        { taskId: "echoer-1", toolUseId: "send-1", subagentType: "Explore", prompt: "Say PING" },
+        async () => {},
+      );
+      // Claude Code sends the resumed run's messages under the call that
+      // launched the agent.
+      await expect(runtime.route(output("launch-1"), async () => {})).resolves.toMatchObject({
+        sessionId: "echoer-1",
+      });
+      await runtime.finishTask("echoer-1", "completed", async () => {}, "send-1");
+
+      expect(published).toEqual([
+        {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "echoer-1",
+            title: "echoer (Explore)",
+            description: "Echo a word",
+            state: { state: "running" },
+          },
+        },
+        {
+          sessionId: "echoer-1",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "send-1",
+            senderSessionId: "root",
+            recipientSessionId: "echoer-1",
+            content: [{ type: "text", text: "Say PING" }],
+          },
+        },
+        {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: "echoer-1",
+            state: { state: "idle", stopReason: "end_turn" },
+          },
+        },
+      ]);
+    });
+
+    it("announces the agent's ancestors first, parent before child, with no work state", async () => {
+      const { runtime, published } = reloaded({ "echoer-1": [coordinator, nestedEchoer] });
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await runtime.taskStarted(
+        { taskId: "echoer-1", toolUseId: "send-1", prompt: "Say PING" },
+        async () => {},
+      );
+
+      expect(announcements(published)).toEqual([
+        "root -> coordinator-1 null",
+        'coordinator-1 -> echoer-1 {"state":"running"}',
+      ]);
+      expect(published[0]?.update).toEqual({
+        sessionUpdate: "subagent_update",
+        sessionId: "coordinator-1",
+        title: "coordinator (general-purpose)",
+        description: "Coordinate",
+      });
+    });
+
+    it("announces an ancestor once, for each agent under it that resumes", async () => {
+      const sibling: HistoricalSubagent = {
+        agentId: "sibling-1",
+        launchId: "launch-s",
+        name: "sibling",
+        parentAgentId: "coordinator-1",
+      };
+      const { runtime, published } = reloaded({
+        "echoer-1": [coordinator, nestedEchoer],
+        "sibling-1": [coordinator, sibling],
+      });
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await runtime.taskStarted({ taskId: "echoer-1", toolUseId: "send-1" }, async () => {});
+      await runtime.route(sendMessage("send-2"), async () => {});
+      await runtime.taskStarted({ taskId: "sibling-1", toolUseId: "send-2" }, async () => {});
+
+      expect(announcements(published)).toEqual([
+        "root -> coordinator-1 null",
+        'coordinator-1 -> echoer-1 {"state":"running"}',
+        'coordinator-1 -> sibling-1 {"state":"running"}',
+      ]);
+    });
+
+    it("delivers the output that waited for the agent once it is restored", async () => {
+      const { runtime } = reloaded({ "echoer-1": [echoer] });
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await expect(runtime.route(output("launch-1"), async () => {})).resolves.toBeNull();
+
+      const delivered: AcpSessionNotification[] = [];
+      await runtime.taskStarted({ taskId: "echoer-1", toolUseId: "send-1" }, async (update) => {
+        delivered.push(update);
+      });
+
+      expect(delivered).toEqual([output("launch-1")]);
+    });
+
+    it("restores the agent at the SendMessage result when no task_started came", async () => {
+      const { runtime, published } = reloaded({ "echoer-1": [echoer] });
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await runtime.sendMessageResumed("echoer-1", async () => {}, "Say PING", "send-1");
+
+      expect(
+        published.map(({ sessionId, update }) => `${sessionId} ${update.sessionUpdate}`),
+      ).toEqual(["root subagent_update", "echoer-1 session_message"]);
+    });
+
+    it("keeps an agent that the history cannot place, or not read, unexposed", async () => {
+      const { runtime, published, lineage, log } = reloaded({});
+      lineage.mockRejectedValueOnce(new Error("EACCES"));
+      for (const [taskId, toolUseId] of [
+        ["unreadable-1", "send-1"],
+        ["lost-1", "send-2"],
+      ] as const) {
+        await runtime.route(sendMessage(toolUseId), async () => {});
+        await runtime.taskStarted(
+          { taskId, toolUseId, subagentType: "Explore", prompt: "Hi" },
+          async () => {},
+        );
+        await expect(runtime.route(output(toolUseId), async () => {})).resolves.toBeNull();
+        await runtime.finishTask(taskId, "completed", async () => {}, toolUseId);
+      }
+
+      expect(lineage.mock.calls).toEqual([["unreadable-1"], ["lost-1"]]);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining("EACCES"));
+      expect(published).toEqual([]);
+    });
+
+    it("reads no history for a new launch, or for a child it knows", async () => {
+      const { runtime, lineage } = reloaded({});
+      await runtime.route(launch("launch-1", { description: "Fix the build" }), async () => {});
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        async () => {},
+      );
+      await runtime.finishTask("worker-1", "completed", async () => {}, "launch-1");
+      await runtime.route(sendMessage("send-1"), async () => {});
+      await runtime.taskStarted({ taskId: "worker-1", toolUseId: "send-1" }, async () => {});
+
+      expect(lineage).not.toHaveBeenCalled();
+    });
   });
 
   it("keeps a nested child that ends before its parent is known unexposed", async () => {

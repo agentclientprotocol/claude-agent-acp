@@ -86,6 +86,25 @@ type SubagentIdentity = {
   subagentType?: string;
 };
 
+/** An agent of the session's subagent history, as the runtime restores it. */
+export type HistoricalSubagent = {
+  agentId: string;
+  /** The Agent or Task call that launched it. */
+  launchId: string;
+  /** The agent that made that call. None means the root session. */
+  parentAgentId?: string;
+  name?: string;
+  agentType?: string;
+  description?: string;
+};
+
+/**
+ * The agent `agentId` and its ancestors, root first, from the session's
+ * subagent history; empty when the history cannot place it (see
+ * `subagentLineage`).
+ */
+export type SubagentLineage = (agentId: string) => Promise<readonly HistoricalSubagent[]>;
+
 const MAX_PENDING_PARENTS = 64;
 const MAX_PENDING_UPDATES = 256;
 const MAX_PENDING_UPDATES_PER_PARENT = 32;
@@ -120,13 +139,17 @@ export class NativeSubagentRuntime {
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
 
-  /** `form` is undefined for a client without native subagent sessions. */
+  /**
+   * `form` is undefined for a client without native subagent sessions. The RFD
+   * form restores an agent from before a load or resume with `lineage`.
+   */
   constructor(
     form: SubagentForm | undefined,
     private readonly rootSessionId: string,
     private readonly session: NativeSubagentSession,
     private readonly publish: Publish,
     private readonly logger: Logger,
+    private readonly lineage?: SubagentLineage,
   ) {
     this.form = form;
     this.enabled = form !== undefined;
@@ -249,7 +272,11 @@ export class NativeSubagentRuntime {
 
   async taskStarted(task: TaskStarted, deliver: Publish): Promise<void> {
     if (!this.enabled) return;
-    const known = this.form === "rfd" ? this.children.get(task.taskId) : undefined;
+    const known =
+      this.form === "rfd"
+        ? (this.children.get(task.taskId) ??
+          (await this.restore(task.taskId, task.toolUseId ?? undefined, deliver)))
+        : undefined;
     if (known) {
       // A child keeps its session for every delegation to it. The SDK starts
       // a resumed agent again under the id of the call that resumed it.
@@ -358,7 +385,7 @@ export class NativeSubagentRuntime {
     toolUseId?: string,
   ): Promise<void> {
     if (this.form !== "rfd") return this.taskResumed(taskId, deliver, prompt);
-    const child = this.children.get(taskId);
+    const child = this.children.get(taskId) ?? (await this.restore(taskId, toolUseId, deliver));
     if (!child) return;
     const finishing = this.taskFinishPromises.get(taskId);
     if (finishing) await finishing.catch(() => {});
@@ -522,6 +549,71 @@ export class NativeSubagentRuntime {
 
   discardPending(parentToolUseId: string): void {
     this.takePending(parentToolUseId);
+  }
+
+  /**
+   * The RFD form: restores the agent `agentId` when the SendMessage call
+   * `toolUseId` resumes it and the runtime does not know it, because it ran
+   * before the session was loaded or resumed. A new launch is no resume: its
+   * call is an Agent or Task call.
+   *
+   * The agent keeps its session id from before, its agent id. The session's
+   * subagent history (see {@link SubagentLineage}) gives the call that
+   * launched it and its ancestors. The launch call is its delegation again:
+   * Claude Code sends the resumed run's messages under that call's id. Before the agent's traffic, the RFD requires its complete
+   * ancestor chain, parent before child. So each ancestor that the client was
+   * not told about in this connection is announced, with no work state since
+   * nothing says that it runs; then the agent, as running. The RFD forbids
+   * guessing a parent, so an agent that the history cannot place stays
+   * unexposed, as before.
+   */
+  private async restore(
+    agentId: string,
+    toolUseId: string | undefined,
+    deliver: Publish,
+  ): Promise<NativeSubagent | undefined> {
+    if (!this.lineage || !toolUseId || !this.senderByToolUse.has(toolUseId)) return undefined;
+    const lineage = await this.lineage(agentId).catch((error: unknown) => {
+      this.logger.log(
+        `Session ${this.rootSessionId}: failed to read the history of subagent ${agentId}: ${error}`,
+      );
+      return [];
+    });
+    for (const entry of lineage) {
+      let child = this.children.get(entry.agentId);
+      if (!child) {
+        child = {
+          sessionId: entry.agentId,
+          parentSessionId: entry.parentAgentId
+            ? (this.children.get(entry.parentAgentId)?.sessionId ?? entry.parentAgentId)
+            : this.rootSessionId,
+          parentToolUseId: entry.launchId,
+          name: subagentDisplayName(entry.name, entry.description, entry.agentType, entry.agentId),
+          task: subagentDescription(undefined, entry.description),
+          ...rfdLabels(entry.name, entry.agentType, entry.description),
+        };
+        this.children.set(entry.agentId, child);
+        this.taskByToolUse.set(entry.launchId, entry.agentId);
+        this.childByParentToolUse.set(entry.launchId, child);
+      }
+      if (child.announced) continue;
+      if (entry.agentId === agentId) {
+        await this.announce(child);
+      } else {
+        await this.publish({
+          sessionId: child.parentSessionId,
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: child.sessionId,
+            ...(child.title ? { title: child.title } : {}),
+            ...(child.description ? { description: child.description } : {}),
+          },
+        });
+        child.announced = true;
+      }
+      for (const pending of this.takePending(entry.launchId)) await deliver(pending);
+    }
+    return this.children.get(agentId);
   }
 
   /**
