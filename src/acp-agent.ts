@@ -7062,11 +7062,14 @@ export class ClaudeAcpAgent {
                 }
               }
             }
+            // The stream sees a tool_use first, so the tool's PostToolUse hook
+            // is registered here, and publishes through this client: a
+            // subagent's hook update must reach the child session too.
             for (const notification of streamEventToAcpNotifications(
               message,
               params.sessionId,
               session.toolUseCache,
-              this.client,
+              routedNotificationClient,
               this.logger,
               {
                 clientCapabilities: this.clientCapabilities,

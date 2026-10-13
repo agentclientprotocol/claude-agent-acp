@@ -23,6 +23,7 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import {
+  createPostToolUseHook,
   markdownEscape,
   toolInfoFromToolUse,
   toDisplayPath,
@@ -5581,6 +5582,111 @@ describe("subagent permission attribution (issue #851)", () => {
       ["session-1", { state: "running" }],
     ]);
     expect(requests[0].sessionId).toBe("agent-42");
+  });
+
+  it("sends the PostToolUse hook update of a child's Edit to the child session", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+    const input = { file_path: "/repo/x.ts", old_string: "a", new_string: "b" };
+    const ranEdit = Promise.withResolvers<void>();
+    const hooked = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (prompts) =>
+      (async function* () {
+        const { value: prompt } = await prompts[Symbol.asyncIterator]().next();
+        yield userEcho(prompt);
+        yield rootToolUse("toolu_parent", "Agent", { subagent_type: "Explore", prompt: "Fix x" });
+        yield { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" };
+        // Claude Code streams the child's tool_use before its complete message.
+        yield {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_parent",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: "toolu_sub_edit", name: "Edit", input: {} },
+          },
+        };
+        yield {
+          ...rootToolUse("toolu_sub_edit", "Edit", input),
+          parent_tool_use_id: "toolu_parent",
+        };
+        yield {
+          type: "user",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          parent_tool_use_id: "toolu_parent",
+          message: {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_sub_edit",
+                content: "The file was edited.",
+              },
+            ],
+          },
+        };
+        ranEdit.resolve();
+        await hooked.promise;
+        yield successResult();
+      })(),
+    );
+    const turn = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await ranEdit.promise;
+    await vi.waitFor(() =>
+      expect(
+        updates.some(
+          ({ update }) =>
+            update.sessionUpdate === "tool_call_update" &&
+            update.toolCallId === "toolu_sub_edit" &&
+            update.status === "completed",
+        ),
+      ).toBe(true),
+    );
+    await createPostToolUseHook()(
+      {
+        hook_event_name: "PostToolUse",
+        tool_name: "Edit",
+        tool_input: input,
+        tool_response: {
+          filePath: "/repo/x.ts",
+          oldString: "a",
+          newString: "b",
+          originalFile: "a\n",
+          structuredPatch: [
+            { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ["-a", "+b"] },
+          ],
+          userModified: false,
+          replaceAll: false,
+        },
+      } as any,
+      "toolu_sub_edit",
+      { signal: new AbortController().signal },
+    );
+    hooked.resolve();
+    await turn;
+
+    const editReports = updates.filter(
+      ({ update }) =>
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+        update.toolCallId === "toolu_sub_edit",
+    );
+    // The hook's report carries the final diff.
+    expect(editReports.some(({ update }) => "content" in update && update.content)).toBe(true);
+    expect(new Set(editReports.map(({ sessionId }) => sessionId))).toEqual(new Set(["agent-42"]));
   });
 
   it("keeps a raced permission on the root until the child is announced", async () => {
