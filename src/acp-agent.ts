@@ -2947,13 +2947,29 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /**
+   * Copies the session's transcript into a new session, then starts that
+   * session, so the client can prompt it as soon as the response arrives, as
+   * the schema requires of a fork. It starts like a resumed session: from the
+   * copied transcript, with the model and the permission mode it records. A
+   * later load or resume with the same settings reuses it.
+   */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    return forkSession(params, {
+    const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+    const { modes, configOptions } = await this.getOrCreateSession({
+      sessionId,
+      cwd: params.cwd,
+      mcpServers: params.mcpServers,
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    });
+    this.afterSetupResponse(sessionId, params.mcpServers ?? []);
+    return { sessionId, modes, configOptions };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {

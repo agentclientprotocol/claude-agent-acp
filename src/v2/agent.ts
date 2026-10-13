@@ -21,7 +21,7 @@ import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
 import { v2Foreground, v2Prompt } from "./prompt.js";
 import {
-  v1ForkSessionRequests,
+  v1ForkSessionRequest,
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
@@ -93,12 +93,12 @@ export function v2AgentApp(
       };
     })
     .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
-      const requests = v1ForkSessionRequests(params);
-      const { sessionId } = await agent.unstable_forkSession(requests.fork);
+      // The agent starts the forked session, so the client can prompt it.
+      const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
       return {
-        sessionId,
-        ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
-        ...(await setupCommands(agent, sessionId, logger)),
+        sessionId: response.sessionId,
+        ...v2ResumeSessionResponse(response),
+        ...(await setupCommands(agent, response.sessionId, logger)),
       };
     })
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {

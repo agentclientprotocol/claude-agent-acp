@@ -60,28 +60,12 @@ export function v1RestoreSessionRequest(
 }
 
 /**
- * The v1 requests that a v2 `session/fork` means.
- *
- * The agent's v1 fork copies the transcript into a new session and returns
- * only its id; a v1 client then resumes or loads it. A v2 fork returns the new
- * session with its config options, like `session/new`, so the client can
- * prompt it. The v2 surface therefore forks, then resumes the fork without
- * replay, with the request's `cwd`, `additionalDirectories`, and
- * `mcpServers`. The request's `_meta` goes to the fork alone.
+ * The v1 request of a v2 `session/fork`. In both versions the agent's fork
+ * returns a session that the client can prompt, with its config options.
  */
-export function v1ForkSessionRequests(params: v2.ForkSessionRequest): {
-  fork: ForkSessionRequest;
-  resume: (sessionId: string) => ResumeSessionRequest;
-} {
-  const { mcpServers, _meta, ...request } = params;
-  const session = {
-    ...request,
-    ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
-  };
-  return {
-    fork: { ...session, ...(_meta != null ? { _meta } : {}) },
-    resume: (sessionId) => ({ ...session, sessionId }),
-  };
+export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
+  const { mcpServers, ...request } = params;
+  return { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */

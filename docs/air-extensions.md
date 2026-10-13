@@ -1541,6 +1541,8 @@ It adds this object to the `session/fork` request:
   When only one stored message has the fingerprint, the adapter uses that message.
 - When no message matches, the request fails with `invalidParams`.
 - The fork keeps the history up to that message.
+- With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
+  A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
 
 ## Presentation hints
 

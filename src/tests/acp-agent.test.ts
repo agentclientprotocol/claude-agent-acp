@@ -10540,9 +10540,114 @@ describe("session/fork", () => {
     vi.mocked(importSessionToStore).mockClear();
   });
 
+  const modes = { currentModeId: "plan", availableModes: [] };
+
+  /** An agent whose sessions start without Claude Code: each one gets a
+   *  scripted query that runs `turn` for every prompt. */
+  function forkingAgent(turn: (prompt: any) => any[] = () => []) {
+    const updates: SessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      { sessionUpdate: async (n: SessionNotification) => updates.push(n) } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    const createSession = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async (params: any, options: any) => {
+        const sessionId = options.resume as string;
+        const input = new Pushable<any>();
+        async function* answer() {
+          for await (const prompt of input) yield* turn(prompt);
+        }
+        agent.sessions[sessionId] = mockSessionState(
+          {
+            // The commands go to the client after the response.
+            query: Object.assign(wrapQuery(answer()), { supportedCommands: async () => [] }),
+            input,
+            modes,
+            sessionFingerprint: computeSessionFingerprint(params),
+          },
+          agent,
+          sessionId,
+        );
+        return { sessionId, modes, configOptions: [] };
+      });
+    return { agent, updates, createSession };
+  }
+
+  it("starts the forked session, so the client can prompt it at once", async () => {
+    const { agent, updates, createSession } = forkingAgent((prompt) => [
+      userEcho(prompt),
+      {
+        type: "assistant",
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: "fork-id",
+        message: {
+          id: "msg_fork",
+          role: "assistant",
+          model: "claude-sonnet-4-20250514",
+          content: [{ type: "text", text: "Forked answer" }],
+          usage: {},
+        },
+      },
+      successfulResultMessage({ session_id: "fork-id" }),
+      { type: "system", subtype: "session_state_changed", state: "idle", session_id: "fork-id" },
+    ]);
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    const response = await agent.unstable_forkSession({
+      sessionId: "source-id",
+      cwd: "/workspace",
+      mcpServers: [],
+    });
+
+    // It starts like a resumed session, from the copied transcript.
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/workspace", mcpServers: [] }),
+      expect.objectContaining({ resume: "fork-id" }),
+    );
+    expect(response).toEqual({ sessionId: "fork-id", modes, configOptions: [] });
+    await expect(
+      agent.prompt({ sessionId: "fork-id", prompt: [{ type: "text", text: "go on" }] }),
+    ).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(updates).toContainEqual(
+      expect.objectContaining({
+        sessionId: "fork-id",
+        update: expect.objectContaining({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Forked answer" },
+        }),
+      }),
+    );
+  });
+
+  it("reuses the forked session for a later resume or load with the same settings", async () => {
+    const { agent, createSession } = forkingAgent();
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+    const settings = { cwd: "/workspace", mcpServers: [] };
+    await agent.unstable_forkSession({ sessionId: "source-id", ...settings });
+    const forked = agent.sessions["fork-id"];
+
+    await agent.resumeSession({ sessionId: "fork-id", ...settings });
+    vi.mocked(getSessionMessages).mockResolvedValueOnce([]);
+    await agent.loadSession({ sessionId: "fork-id", ...settings });
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(agent.sessions["fork-id"]).toBe(forked);
+  });
+
+  it("fails when the forked session cannot start", async () => {
+    const { agent, createSession } = forkingAgent();
+    createSession.mockRejectedValueOnce(new Error("Claude Code did not start"));
+    vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
+
+    await expect(
+      agent.unstable_forkSession({ sessionId: "source-id", cwd: "/workspace", mcpServers: [] }),
+    ).rejects.toThrow("Claude Code did not start");
+  });
+
   it("forks the latest turn in the requested workspace", async () => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent, createSession } = forkingAgent();
     vi.mocked(forkSession).mockResolvedValueOnce({ sessionId: "fork-id" });
 
     const response = await agent.unstable_forkSession({
@@ -10554,11 +10659,14 @@ describe("session/fork", () => {
 
     expect(response.sessionId).toBe("fork-id");
     expect(forkSession).toHaveBeenCalledWith("source-id", { dir: "/workspace" });
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({ cwd: "/workspace", additionalDirectories: ["/workspace/extra"] }),
+      expect.objectContaining({ resume: "fork-id" }),
+    );
   });
 
   it("forks at an AIR message id through the current SDK", async () => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent } = forkingAgent();
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
       {
         type: "assistant",
@@ -10614,8 +10722,7 @@ describe("session/fork", () => {
       messageOccurrence: 2,
     },
   ])("forks at an inactive persisted branch by $resolution", async (forkPoint) => {
-    const client = { sessionUpdate: async () => {} } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+    const { agent } = forkingAgent();
     const targetText = "Answer from the branch that is no longer active.";
     const targetFingerprint = `sha256:${createHash("sha256").update(targetText).digest("hex")}`;
     vi.mocked(getSessionMessages).mockResolvedValueOnce([
