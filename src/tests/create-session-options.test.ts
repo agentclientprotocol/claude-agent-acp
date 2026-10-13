@@ -173,6 +173,18 @@ describe("createSession options merging", () => {
     });
   });
 
+  it("registers the PreToolUse hook of the change previews only on a v2 connection", async () => {
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    // A v1 client gets the input's diff, so Claude Code waits on no hook.
+    expect(capturedOptions!.hooks?.PreToolUse).toBeUndefined();
+
+    const v2Agent = new ClaudeAcpAgent(createMockClient(), undefined, { v2: true });
+    await v2Agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    expect(capturedOptions!.hooks?.PreToolUse).toEqual([
+      { matcher: "Edit|Write", hooks: [expect.any(Function)] },
+    ]);
+  });
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: process.cwd(),
@@ -455,6 +467,56 @@ describe("createSession options merging", () => {
       });
     });
 
+    it("appends AIR custom instructions to the claude_code preset", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: "Follow the project rules." },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+        append: "Follow the project rules.",
+      });
+    });
+
+    it("ignores malformed AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          jetbrains: {
+            air: { customInstructions: 42 },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toEqual({
+        type: "preset",
+        preset: "claude_code",
+      });
+    });
+
+    it("gives the legacy system prompt precedence over AIR custom instructions", async () => {
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: {
+          systemPrompt: "legacy prompt",
+          jetbrains: {
+            air: { customInstructions: "AIR instructions" },
+          },
+        },
+      });
+
+      expect(capturedOptions!.systemPrompt).toBe("legacy prompt");
+    });
+
     it("replaces the preset when a string is provided", async () => {
       await agent.newSession({
         cwd: process.cwd(),
@@ -594,9 +656,71 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toBeUndefined();
     });
 
-    it("ignores env var when _meta provides settings", async () => {
+    it("keeps model settings when session settings add hooks", async () => {
       process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+      const hooks = { PostToolUse: [{ hooks: [{ type: "command", command: "echo ready" }] }] };
+
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+        hooks,
+      });
+      // The CLI adds these hooks to the ones in the user and project settings.
+      expect(capturedOptions!.settingSources).toEqual(["user", "project", "local"]);
+    });
+
+    it("applies session hooks on session/load with model settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const hooks = { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] };
+
+      await agent.loadSession({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.resume).toBe(sessionId);
+      expect(capturedOptions!.settings).toEqual({ availableModels: ["opus"], hooks });
+    });
+
+    it("merges model settings with a session settings file", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-settings-"));
+      const settingsFile = path.join(settingsDir, "settings.json");
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [] } }));
+
+      try {
+        await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          _meta: { claudeCode: { options: { settings: settingsFile } } },
+        });
+
+        expect(capturedOptions!.settings).toEqual({
+          availableModels: ["opus"],
+          hooks: { Stop: [] },
+        });
+      } finally {
+        fs.rmSync(settingsDir, { recursive: true });
+      }
+    });
+
+    it("prefers session settings when both sources set the same field", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
       });
 
       await agent.newSession({
@@ -614,10 +738,10 @@ describe("createSession options merging", () => {
         },
       });
 
-      // _meta settings take precedence; env var is ignored entirely
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        availableModels: ["opus"],
       });
     });
 

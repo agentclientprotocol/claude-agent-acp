@@ -42,12 +42,12 @@ node dist/index.js
 
 ## Precedence
 
-When an ACP caller provides `settings` via `_meta.claudeCode.options.settings` in the `sessions/create` request, `CLAUDE_MODEL_CONFIG` is ignored entirely. The env var is a deployment-level fallback for cases where the caller does not configure model settings itself.
+An ACP caller can provide `settings` via `_meta.claudeCode.options.settings` in `session/new` or `session/load`, as an object or a path to a settings file. The adapter merges `CLAUDE_MODEL_CONFIG` into those settings, so a caller that only adds hooks keeps the model settings. When both set the same key, the caller wins; the merge is shallow, so a caller's `modelOverrides` replaces the env var's map.
 
-| Source                                       | Priority                                              |
-| -------------------------------------------- | ----------------------------------------------------- |
-| `_meta.claudeCode.options.settings` (caller) | Highest — used if present                             |
-| `CLAUDE_MODEL_CONFIG` (env var)              | Fallback — used only when caller provides no settings |
+| Source                                       | Priority                                       |
+| -------------------------------------------- | ---------------------------------------------- |
+| `_meta.claudeCode.options.settings` (caller) | Highest — wins for each key it sets            |
+| `CLAUDE_MODEL_CONFIG` (env var)              | Used for the keys that the caller does not set |
 
 ## Format details
 

@@ -98,7 +98,10 @@ type QueryOptions = {
     input: Record<string, unknown>,
     extra: Record<string, unknown>,
   ) => Promise<unknown>;
-  hooks?: Record<string, { hooks: ((input: any, id: string, opts: any) => Promise<unknown>)[] }[]>;
+  hooks?: Record<
+    string,
+    { matcher?: string; hooks: ((input: any, id: string, opts: any) => Promise<unknown>)[] }[]
+  >;
 };
 
 /** What a scenario script reads and calls. */
@@ -107,6 +110,8 @@ export interface ScriptContext {
   /** The session id that the agent passed to the SDK. */
   sessionId: string;
   options: QueryOptions;
+  /** The uuid of the prompt the current turn answers, as the agent sent it. */
+  promptUuid?: string;
   /** Calls `canUseTool` like Claude Code does before it runs a tool. */
   canUseTool(
     toolName: string,
@@ -114,8 +119,13 @@ export interface ScriptContext {
     toolUseID: string,
     extra?: Record<string, unknown>,
   ): Promise<unknown>;
-  /** Calls every hook callback that the agent registered for the event. */
+  /**
+   * Calls the hook callbacks that the agent registered for the event, whose
+   * `matcher`, like Claude Code's, matches the `tool_name` of the input.
+   */
   hook(event: string, input: Record<string, unknown>, toolUseID?: string): Promise<void>;
+  /** Calls the PreToolUse hooks of a tool use, which run before it runs. */
+  preToolUse(toolUseID: string, toolName: string, input: unknown): Promise<void>;
   /** Calls the PostToolUse hooks of a tool use. */
   postToolUse(
     toolUseID: string,
@@ -192,6 +202,13 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       }),
     async hook(event, input, toolUseID) {
       for (const matcher of options.hooks?.[event] ?? []) {
+        if (
+          matcher.matcher &&
+          typeof input.tool_name === "string" &&
+          !new RegExp(`^(?:${matcher.matcher})$`).test(input.tool_name)
+        ) {
+          continue;
+        }
         for (const callback of matcher.hooks) {
           await callback(
             { hook_event_name: event, session_id: sessionId, cwd: script.cwd, ...input },
@@ -200,6 +217,13 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
           );
         }
       }
+    },
+    preToolUse(toolUseID, toolName, input) {
+      return ctx.hook(
+        "PreToolUse",
+        { tool_name: toolName, tool_input: input, tool_use_id: toolUseID },
+        toolUseID,
+      );
     },
     postToolUse(toolUseID, toolName, input, response) {
       return ctx.hook(
@@ -215,6 +239,7 @@ export function mockedQuery(args: { prompt: AsyncIterable<any>; options: QueryOp
       const next = await iterator.next();
       if (next.done) return;
       const user = next.value;
+      ctx.promptUuid = user.uuid;
       yield {
         type: "user",
         message: user.message,
@@ -430,8 +455,8 @@ export interface ScenarioRunV2 {
   normalized: WireRecorded[];
   /**
    * `passes` when every prompt turn ended with a stop reason other than
-   * `_error`, or else why the scenario stopped: the error of a rejected
-   * request, or the notice of a turn that failed.
+   * `error`, or else why the scenario stopped: the error of a rejected
+   * request, or of a turn that failed.
    */
   status: string;
 }
@@ -459,9 +484,10 @@ export async function runScenarioV2(
   const methodsOfClientRequests = new Map<string | number, string>();
   let recording = true;
   let sessionId: string | undefined;
-  // The stop reasons of the session's idle state updates, and its notices.
+  // The stop reasons of the session's idle state updates, and the error
+  // messages of the failed ones.
   const idles: unknown[] = [];
-  const notices: string[] = [];
+  const failures: string[] = [];
 
   const each = (message: v2.AnyWireMessage) =>
     (Array.isArray(message) ? message : [message]) as Record<string, any>[];
@@ -495,12 +521,14 @@ export async function runScenarioV2(
         sessionUpdate: string;
         state?: string;
         stopReason?: unknown;
-        title?: string;
+        error?: { message?: string } | null;
       };
       if (update.sessionUpdate === "state_update" && update.state === "idle") {
         idles.push(update.stopReason);
+        if (update.stopReason === "error") {
+          failures.push(update.error?.message ?? "the turn failed");
+        }
       }
-      if (update.sessionUpdate === "notice" && update.title) notices.push(update.title);
     })
     .onRequest(v2.methods.client.session.requestPermission, ({ params }) =>
       permissionAnswer(scenario, params.options),
@@ -556,8 +584,8 @@ export async function runScenarioV2(
             stop("the turn reported no idle state");
             return;
           }
-          if (idles[idlesBefore] === "_error") {
-            stop(notices.at(-1) ?? "the turn failed");
+          if (idles[idlesBefore] === "error") {
+            stop(failures.at(-1) ?? "the turn failed");
             return;
           }
           await settle();
@@ -954,6 +982,8 @@ export async function* toolCall(
 ) {
   const parent = outcome.parent ?? null;
   yield* assistantTurn(`msg_${tool.id}`, [{ type: "tool_use", ...tool }], parent);
+  // Claude Code runs the PreToolUse hooks before it asks for permission.
+  await ctx.preToolUse(tool.id, tool.name, tool.input);
   if (outcome.ask) {
     await ctx.canUseTool(
       tool.name,

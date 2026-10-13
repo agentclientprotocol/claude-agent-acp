@@ -1,34 +1,35 @@
 /**
  * `--hide-claude-auth`: this integration must never bill a claude.ai
- * subscription. The flag hides the claude.ai login method from `initialize`
- * and makes the agent behave like a logged-out CLI whenever a subscription
- * would pay for a turn. `acp-agent.ts` decides *when* the guard applies (flag
- * on, no provider override) and calls in here for the *what*.
+ * subscription. Under the flag the agent hides the claude.ai login method from
+ * `initialize`, and refuses with `authRequired` every session and every turn
+ * that a subscription would pay for. `acp-agent.ts` decides when the guard
+ * applies (flag on, no provider override); this module decides what it refuses.
  *
- * The account the CLI reports at `initialize` is the source of truth. The SDK
- * memoizes it, so it is a constant for the life of a query, and two layers
- * keep it honest:
+ * The guard judges the `AccountInfo` that the SDK caches at `initialize`. That
+ * cache never changes during the life of a query, but the CLI itself picks up
+ * a login or logout made elsewhere. So the cached account can go stale: a
+ * session started on an API key keeps passing the guard after the user swaps
+ * the key for a claude.ai login, and the subscription pays.
  *
- * 1. Session creation refuses an account that holds no credential this
- *    integration accepts. A logged-out session never exists, so the client's
- *    sign-in always leads to a new session with a fresh `initialize`. The
- *    per-turn guard repeats the check on the same cached account, which costs
- *    microseconds and covers a session created under a provider override that
- *    `providers/disable` later removed.
- * 2. A sign-out during the session ends the query. The next turn recreates it,
- *    so the next `initialize` reports the real account and layer 1 judges it.
- *    The recreation resumes the stored conversation. When the CLI never wrote
- *    one, because the first turn was the one that signed out, the recreation
- *    starts a fresh query under the same session id instead.
+ * `authStatus` cannot fix this: it only reports to the client, and the guard
+ * does not read it. The agent therefore recreates the query whenever the
+ * account may have changed, and the new `initialize` gives the guard a current
+ * account. Two signals trigger it:
  *
- * A file-based credential replaced by a subscription between two turns is seen
- * by the CLI probe the agent fires at the START of every user prompt. That read
- * is never awaited, so it usually lands mid-turn; all it does there is mark the
- * session. The guard consumes the mark at the turn boundary — the next prompt
- * recreates the query and layer 1 judges the account the new `initialize`
- * reports — so a probe never interrupts a running turn. A swap that happens
- * after the last probe stays unseen until the next prompt reads the store
- * again. Closing that window would cost a blocking read per turn.
+ * - A turn fails with `auth_required`, which means a sign-out. The query is
+ *   closed at once and recreated on the next turn.
+ * - The `claude auth status` check that runs at the start of every prompt (the
+ *   same check that feeds `authStatus`) reports a different kind of identity
+ *   than the session started with. The session is flagged and recreated at the
+ *   next turn boundary, so a running turn is never interrupted.
+ *
+ * The recreation resumes the conversation, or starts a new one under the same
+ * session id when the CLI never saved it. Session creation also refuses an
+ * account with no credential this integration accepts. So a signed-out session
+ * never exists, and a sign-in always leads to a fresh `initialize`.
+ *
+ * The check is not awaited, so a credential swapped after it ran stays unseen
+ * until the next prompt. Awaiting it would add a CLI run to every turn.
  */
 
 import { RequestError } from "@agentclientprotocol/sdk";

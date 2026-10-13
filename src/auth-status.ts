@@ -103,6 +103,13 @@ const NOT_LOGGED_IN: AuthStatus = {
   label: "Not logged in",
 };
 
+const API_KEY_SOURCE_DETAILS = new Map([
+  ["apiKeyHelper", "API key helper"],
+  ["env", "env"],
+  ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+  ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"],
+]);
+
 /** Display names for the non-firstParty backends, where auth lives outside the
  *  agent (AWS credentials, gcloud ADC, …). */
 const EXTERNAL_PROVIDER_LABELS: Record<string, string> = {
@@ -162,7 +169,10 @@ export function accountInfoHasIdentitySignal(account: AccountInfo | undefined): 
 /** Session-time mapping from the SDK's `AccountInfo`, the richest source when
  *  it is populated. Returns `undefined` when the account carries no identity
  *  signal, so callers keep the status they already know. */
-export function fromAccountInfo(account: AccountInfo | undefined): AuthStatus | undefined {
+export function fromAccountInfo(
+  account: AccountInfo | undefined,
+  apiKeyHelper?: string,
+): AuthStatus | undefined {
   if (!account || !accountInfoHasIdentitySignal(account)) {
     return undefined;
   }
@@ -172,13 +182,14 @@ export function fromAccountInfo(account: AccountInfo | undefined): AuthStatus | 
     apiKeySource: account.apiKeySource,
     email: account.email,
     organization: account.organization,
+    apiKeyHelper,
   });
 }
 
 /** Pre-session mapping from `claude auth status --json` stdout. Returns
  *  `undefined` when the output is not the expected JSON object, so callers can
  *  report "not known" instead of guessing. */
-export function fromCliStatus(stdout: string): AuthStatus | undefined {
+export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -205,6 +216,7 @@ export function fromCliStatus(stdout: string): AuthStatus | undefined {
     apiKeySource: status.apiKeySource,
     email: status.email,
     organization: status.orgName,
+    apiKeyHelper,
   });
 }
 
@@ -224,6 +236,7 @@ function mapAuthFields(fields: {
   apiKeySource?: string;
   email?: string;
   organization?: string;
+  apiKeyHelper?: string;
 }): AuthStatus {
   const { apiProvider, subscriptionType, apiKeySource, email, organization } = fields;
 
@@ -237,11 +250,19 @@ function mapAuthFields(fields: {
     };
   }
   if (apiKeySource) {
+    if (
+      apiKeySource === "apiKeyHelper" &&
+      typeof fields.apiKeyHelper === "string" &&
+      /\bcentral\b/i.test(fields.apiKeyHelper) &&
+      /\bproxy\s+start\b/i.test(fields.apiKeyHelper)
+    ) {
+      return { kind: "gateway", label: "JetBrains Air Gateway" };
+    }
+    const detail = API_KEY_SOURCE_DETAILS.get(apiKeySource);
     return {
       kind: "api_key",
       label: "Anthropic API key",
-      // The source ("apiKeyHelper", "env", …) is the specifics line.
-      detail: apiKeySource,
+      ...(detail ? { detail } : {}),
     };
   }
   if (subscriptionType) {

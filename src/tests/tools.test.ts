@@ -3788,6 +3788,120 @@ describe("tool_result_meta non-execution stamping", () => {
     });
   });
 
+  it("reports an aborted run as cancelled to a v2 client, and as failed to every other client", () => {
+    const status = (kind: string, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [deniedResult] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolResultMeta: [{ id: "toolu_bash", non_execution_kind: kind }],
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status("interrupted", v2)).toMatchObject({
+      status: "cancelled",
+      _meta: { claudeCode: { nonExecutionKind: "interrupted" } },
+    });
+    expect(status("cancelled", v2)).toMatchObject({ status: "cancelled" });
+    // A refused tool did not run because of a decision: it failed.
+    for (const kind of ["user-rejected", "permission-rule", "automode-blocked"]) {
+      expect(status(kind, v2)).toMatchObject({ status: "failed" });
+    }
+    // v1 has no cancelled status.
+    expect(status("interrupted")).toMatchObject({ status: "failed" });
+    expect(status("interrupted", ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  it("reports an interrupted command as cancelled to a v2 client, and as completed to every other client", () => {
+    const status = (interrupted: boolean, toolCallCapabilities?: ToolCallCapabilities) =>
+      toAcpNotifications(
+        [{ type: "tool_result", tool_use_id: "toolu_bash", content: "partial" }] as any,
+        "user",
+        "test-session",
+        { toolu_bash: bashToolUse },
+        mockClient,
+        mockLogger,
+        {
+          toolUseResult: { stdout: "partial", stderr: "", interrupted, isImage: false },
+          ...(toolCallCapabilities ? { toolCallCapabilities } : {}),
+        },
+      ).at(-1)?.update;
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(status(true, v2)).toMatchObject({ status: "cancelled" });
+    expect(status(false, v2)).toMatchObject({ status: "completed" });
+    // v1 has no cancelled status.
+    expect(status(true)).toMatchObject({ status: "completed" });
+    expect(status(true, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "completed",
+    });
+  });
+
+  it("closes a tool call that Claude dropped before it ran as cancelled on v2, and as failed elsewhere", () => {
+    const unfinished = (ran: boolean, capabilities?: ToolCallCapabilities) =>
+      new AcpToolCallRenderer(capabilities).unfinished({ toolCallId: "toolu_bash", ran });
+    const v2 = ToolCallCapabilities.from({}, { v2: true });
+
+    expect(unfinished(false, v2)).toEqual({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "toolu_bash",
+      status: "cancelled",
+      content: [
+        {
+          type: "content",
+          content: { type: "text", text: "Claude stopped this tool call before it ran." },
+        },
+      ],
+    });
+    // A tool that ran but returned no result failed, also on v2.
+    expect(unfinished(true, v2)).toMatchObject({
+      status: "failed",
+      content: [
+        {
+          content: { text: "Claude ended the turn without returning a result for this tool." },
+        },
+      ],
+    });
+    // v1 has no cancelled status.
+    expect(unfinished(false)).toMatchObject({ status: "failed" });
+    expect(unfinished(false, ToolCallCapabilities.from(AIR_CLIENT))).toMatchObject({
+      status: "failed",
+    });
+  });
+
+  it("reports an aborted run of a tool call that only a permission request surfaced as cancelled on v2", () => {
+    // TodoWrite renders as a plan, so only the permission flow emits its tool call.
+    const todoWrite = { type: "tool_use" as const, id: "toolu_todo", name: "TodoWrite", input: {} };
+    const notifications = toAcpNotifications(
+      [
+        { type: "tool_result", tool_use_id: "toolu_todo", content: "stopped", is_error: true },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_todo: todoWrite },
+      mockClient,
+      mockLogger,
+      {
+        toolResultMeta: [{ id: "toolu_todo", non_execution_kind: "interrupted" }],
+        emittedToolCalls: new Set(["toolu_todo"]),
+        toolCallCapabilities: ToolCallCapabilities.from({}, { v2: true }),
+      },
+    );
+
+    expect(notifications[0]?.update).toMatchObject({
+      toolCallId: "toolu_todo",
+      status: "cancelled",
+    });
+  });
+
   it("attributes entries by tool_use_id, so only the flagged result in a batch is stamped", () => {
     const toolUseCache: ToolUseCache = {
       toolu_bash: bashToolUse,
@@ -4550,5 +4664,104 @@ describe("NotebookEdit", () => {
     expect(notifications[0].update).toMatchObject({ status: "completed" });
     expect(notifications[0].update).not.toHaveProperty("content");
     expect(notifications[0].update).not.toHaveProperty("rawOutput");
+  });
+});
+
+// A plan that the user approves through ExitPlanMode becomes the session's
+// markdown plan for a client that supports plan operations.
+describe("toAcpNotifications - the plan of an approved ExitPlanMode", () => {
+  const mockClient = {} as AcpClient;
+  const mockLogger: Logger = { log: () => {}, error: () => {} };
+
+  /** The plan updates for the result of an ExitPlanMode call with `input`. */
+  function planUpdates(
+    result: Record<string, unknown> = {},
+    options: Parameters<typeof toAcpNotifications>[6] = {},
+    input: Record<string, unknown> = { plan: "Implement it", planFilePath: "/plans/p.md" },
+  ) {
+    return toAcpNotifications(
+      [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_plan",
+          content: "User has approved your plan. You can now start coding.",
+          ...result,
+        },
+      ] as any,
+      "user",
+      "test-session",
+      { toolu_plan: { type: "tool_use", id: "toolu_plan", name: "ExitPlanMode", input } },
+      mockClient,
+      mockLogger,
+      { clientCapabilities: { plan: {} }, ...options },
+    )
+      .filter(({ update }) => update.sessionUpdate === "plan_update")
+      .map(({ update }) => update);
+  }
+
+  const markdownPlan = (content: string) => ({
+    sessionUpdate: "plan_update",
+    plan: { type: "markdown", planId: "plan-mode", content },
+  });
+
+  it("shows the plan of the structured result, which includes the user's edits", () => {
+    const toolUseResult = { plan: "Implement it carefully", isAgent: false, planWasEdited: true };
+    expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it carefully")]);
+  });
+
+  it("shows the plan of the input, trimmed, when there is no structured result, as on replay", () => {
+    expect(planUpdates({}, {}, { plan: "\nImplement it\n" })).toEqual([
+      markdownPlan("Implement it"),
+    ]);
+  });
+
+  it("shows the plan of the input when the structured result has none", () => {
+    const toolUseResult = { plan: null, isAgent: false };
+    expect(planUpdates({}, { toolUseResult })).toEqual([markdownPlan("Implement it")]);
+  });
+
+  it("shows the plan after the tool call's result", () => {
+    const toolUseResult = { plan: "Implement it", isAgent: false };
+    const kinds = toAcpNotifications(
+      [{ type: "tool_result", tool_use_id: "toolu_plan", content: "Approved." }] as any,
+      "user",
+      "test-session",
+      {
+        toolu_plan: {
+          type: "tool_use",
+          id: "toolu_plan",
+          name: "ExitPlanMode",
+          input: { plan: "Implement it" },
+        },
+      },
+      mockClient,
+      mockLogger,
+      { clientCapabilities: { plan: {} }, toolUseResult },
+    ).map(({ update }) => update.sessionUpdate);
+    expect(kinds).toEqual(["tool_call_update", "plan_update"]);
+  });
+
+  it("shows nothing to a client without plan operations", () => {
+    expect(planUpdates({}, { clientCapabilities: {} })).toEqual([]);
+  });
+
+  it("shows nothing for a plan the user rejected", () => {
+    expect(planUpdates({ is_error: true, content: "The user chose to keep planning." })).toEqual(
+      [],
+    );
+  });
+
+  it("shows nothing for a subagent's plan", () => {
+    expect(planUpdates({}, { parentToolUseId: "toolu_agent" })).toEqual([]);
+    expect(planUpdates({}, { toolUseResult: { plan: "Implement it", isAgent: true } })).toEqual([]);
+  });
+
+  it("shows nothing for a plan that waits for its team lead", () => {
+    const toolUseResult = { plan: "Implement it", isAgent: false, awaitingLeaderApproval: true };
+    expect(planUpdates({}, { toolUseResult })).toEqual([]);
+  });
+
+  it("shows nothing for an empty plan", () => {
+    expect(planUpdates({}, {}, { plan: "  " })).toEqual([]);
   });
 });

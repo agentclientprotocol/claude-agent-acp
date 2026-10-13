@@ -1,10 +1,11 @@
 /**
- * A prompt turn as the adapter understands it, independent of the ACP version.
+ * A prompt turn and the foreground work of a session, as the adapter
+ * understands them, independent of the ACP version.
  *
- * The agent reports each turn through {@link TurnEvents}, and each ACP version
- * maps the events to its own messages. ACP v1 answers `session/prompt` when the
- * turn ends or fails. ACP v2 answers it when the prompt is inserted, and
- * reports the rest as session state.
+ * The agent reports how each prompt is answered through {@link TurnEvents}:
+ * ACP v1 answers `session/prompt` when the turn ends or fails, and ACP v2 when
+ * the prompt is inserted. ACP v2 also reports the session's work as state,
+ * which the agent reports through {@link ForegroundEvents}.
  *
  * The agent calls these synchronously while it updates its own state, so a
  * handler must not throw, nor call back into the agent before it returns.
@@ -24,28 +25,50 @@ export interface TurnEvents {
    */
   inserted(messageId: string): void;
   /**
-   * The turn waits for the user: a permission request or a question is open in
-   * the session. Requests do not say which prompt they are for, so this
-   * includes one opened before the turn was inserted. Only reported after
-   * {@link inserted}.
-   */
-  awaitingUser(): void;
-  /**
-   * The turn works again: no request is open any more. A turn that ends or
-   * fails while it waits reports that instead.
-   */
-  resumed(): void;
-  /**
    * The turn ended. A queued turn that is cancelled before it is inserted
    * ends too, without {@link inserted}; Claude Code may still run its prompt.
    */
   ended(outcome: TurnOutcome): void;
   /**
-   * The turn failed. Without {@link inserted} before, Claude Code was not seen
-   * taking the prompt in. `title`, when the agent has one, describes the
-   * failure for the user in plain text, such as "API Error: 529 Overloaded".
+   * The turn failed with `error`, the JSON-RPC error that v1 answers the
+   * prompt with. Without {@link inserted} before, Claude Code was not seen
+   * taking the prompt in.
    */
-  failed(error: unknown, title?: string): void;
+  failed(error: unknown): void;
+}
+
+/**
+ * The foreground work of a session: what a client would wait for before it
+ * sends the next prompt. One piece of work runs at a time, and the next starts
+ * with {@link running}. The work is either:
+ *
+ * - A prompt's turn, from {@link TurnEvents.inserted} until its result, or
+ *   until it fails or is cancelled. A turn that v1 holds open for the
+ *   background subagents it spawned (`Turn.deferredSettle`) ends its work at
+ *   its result all the same: the hold only delays v1's answer.
+ * - A model cycle that Claude Code starts on its own while no work runs: for
+ *   example, its follow-up after a background command or subagent finished,
+ *   or its answer to a message from another session. It runs until its result.
+ *
+ * A prompt that Claude Code takes in while a cycle runs takes the cycle over:
+ * the cycle reports nothing more, and the turn reports from there.
+ */
+export interface ForegroundEvents {
+  /** The work started, or works again after it waited for the user. */
+  running(): void;
+  /**
+   * The work waits for the user: a permission request or a question is open in
+   * the session. Requests do not say which work they are for, so this includes
+   * one opened before the work started.
+   */
+  awaitingUser(): void;
+  /** The work ended. */
+  ended(outcome: TurnOutcome): void;
+  /**
+   * The work failed with `error`, the JSON-RPC error that v1 answers the
+   * prompt with.
+   */
+  failed(error: unknown): void;
 }
 
 /** Why a turn ended. Every ACP version has these reasons. */

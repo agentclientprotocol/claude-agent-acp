@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, Mock, vi, afterEach, beforeEach } from "vitest";
 import type { AccountInfo } from "@anthropic-ai/claude-agent-sdk";
 import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
@@ -45,7 +48,13 @@ vi.mock("node:child_process", async () => {
 });
 
 describe("authorization", () => {
-  beforeEach(() => {
+  let configDir: string;
+  let originalConfigDir: string | undefined;
+
+  beforeEach(async () => {
+    originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    configDir = await mkdtemp(path.join(os.tmpdir(), "authorization-test-"));
+    process.env.CLAUDE_CONFIG_DIR = configDir;
     vi.useFakeTimers();
     // Skip native-binary resolution; the exec itself is stubbed.
     process.env.CLAUDE_CODE_EXECUTABLE = "claude";
@@ -74,7 +83,7 @@ describe("authorization", () => {
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     //await all pending events like
     vi.runAllTimers();
     vi.useRealTimers();
@@ -82,6 +91,9 @@ describe("authorization", () => {
     delete process.env.CLAUDE_CODE_EXECUTABLE;
     vi.unstubAllGlobals();
     vi.resetAllMocks();
+    if (originalConfigDir === undefined) delete realProcess.env.CLAUDE_CONFIG_DIR;
+    else realProcess.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+    await rm(configDir, { recursive: true, force: true });
   });
 
   /** Third element: the `extNotification` spy, so a test can read the
@@ -1124,7 +1136,7 @@ describe("authorization", () => {
         // account by itself — no CLI probe is needed for the post-login state.
         expect(authStatusUpdates(extNotification)).toEqual([
           { kind: "api_key", label: "Anthropic API key", detail: "ANTHROPIC_API_KEY" },
-          { kind: "api_key", label: "Anthropic API key", detail: "apiKeyHelper" },
+          { kind: "api_key", label: "Anthropic API key", detail: "API key helper" },
         ]);
       });
 

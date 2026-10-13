@@ -45,12 +45,20 @@ export class Pushable<T> implements AsyncIterable<T> {
   }
 }
 
-// Helper to convert Node.js streams to Web Streams
+// Helper to convert Node.js streams to Web Streams. A byte stream gets each
+// chunk without a copy, so the caller must not change a chunk until its write
+// resolves.
 export function nodeToWebWritable(nodeStream: Writable): WritableStream<Uint8Array> {
   return new WritableStream<Uint8Array>({
     write(chunk) {
       return new Promise<void>((resolve, reject) => {
-        nodeStream.write(Buffer.from(chunk), (err) => {
+        // A Uint8Array is written as it is: Node wraps it in a Buffer view
+        // without a copy. The ACP encoder hands each message a fresh array,
+        // so nothing changes the bytes while the write is pending. An
+        // object-mode stream would get the array itself, so it keeps
+        // getting a Buffer copy, as before.
+        const data = nodeStream.writableObjectMode ? Buffer.from(chunk) : chunk;
+        nodeStream.write(data, (err) => {
           if (err) {
             reject(err);
           } else {
@@ -83,6 +91,58 @@ export function unreachable(value: never, logger: Logger = console) {
   }
   logger.error(`Unexpected case: ${valueAsString}`);
 }
+
+/**
+ * Yields to the event loop when the current macrotask has run for too long.
+ *
+ * An await of an already-resolved promise continues in a microtask, so a loop
+ * that drains a backlog of buffered messages never lets timers or I/O run:
+ * incoming requests, `session/cancel` among them, wait until the backlog is
+ * gone. A loop calls {@link maybeYield} once per item. Within the budget it
+ * returns undefined and the loop goes on at once. Past the budget it returns a
+ * promise that resolves in the check phase of the event loop, after pending
+ * I/O has run.
+ *
+ * The budget is measured from the first call since the event loop last
+ * reached its check phase, so a loop that already waits on real I/O never
+ * yields, and all loops that share one instance share one budget per
+ * event-loop iteration.
+ *
+ * A test that fakes `setImmediate` and drives such a loop for longer than the
+ * budget must advance the fake timers, or the loop waits for them.
+ */
+export class EventLoopYielder {
+  /** Whether a check-phase marker is pending. While it is, the event loop has
+   *  not reached its check phase since {@link sliceStart}. */
+  private markerPending = false;
+  private sliceStart = 0;
+
+  constructor(
+    private readonly budgetMs: number,
+    private readonly now: () => number = () => performance.now(),
+  ) {}
+
+  maybeYield(): Promise<void> | undefined {
+    const time = this.now();
+    if (!this.markerPending) {
+      this.markerPending = true;
+      this.sliceStart = time;
+      setImmediate(() => {
+        this.markerPending = false;
+      });
+      return undefined;
+    }
+    if (time - this.sliceStart < this.budgetMs) return undefined;
+    return new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+/** The longest stretch, in milliseconds, that a message loop keeps the event
+ *  loop before it yields. */
+const MESSAGE_LOOP_BUDGET_MS = 8;
+
+/** The yielder shared by the loops that forward messages to the client. */
+export const messageLoopYielder = new EventLoopYielder(MESSAGE_LOOP_BUDGET_MS);
 
 export function sleep(time: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, time));
