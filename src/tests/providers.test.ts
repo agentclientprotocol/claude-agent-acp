@@ -203,6 +203,31 @@ describe("providers", () => {
     );
   });
 
+  it("maps an Authorization Bearer header to ANTHROPIC_AUTH_TOKEN, other headers pass through", async () => {
+    const [agent, mockQuery] = await createAgentMock();
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await agent.unstable_setProvider({
+      providerId: "main",
+      apiType: "anthropic",
+      baseUrl: "https://gateway.example",
+      headers: { authorization: "Bearer sk-provider-token", "x-api-key": "test" },
+    });
+
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.objectContaining({
+        options: expect.objectContaining({
+          env: expect.objectContaining({
+            ANTHROPIC_AUTH_TOKEN: "sk-provider-token",
+            ANTHROPIC_BASE_URL: "https://gateway.example",
+            ANTHROPIC_CUSTOM_HEADERS: "x-api-key: test",
+          }),
+        }),
+      }),
+    );
+  });
+
   it("keeps native session creation unchanged when the providers API is unused", async () => {
     const [agent, mockQuery] = await createAgentMock();
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
