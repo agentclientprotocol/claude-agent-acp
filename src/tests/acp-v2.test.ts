@@ -1657,6 +1657,107 @@ describe("ACP v2 prompts", () => {
       expect(updates[at]).toMatchObject({ update: { status: "completed" } });
       expect(at).toBeLessThan(idleAt(root, updates));
     });
+
+    it("ends the tool call of a background subagent as cancelled when the SDK reports it stopped while the root is idle", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      const subagentTask = (
+        options: Options,
+        subtype: string,
+        fields: Record<string, unknown>,
+      ) => ({
+        type: "system",
+        subtype,
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+        ...fields,
+      });
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent", "Agent", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+          run_in_background: true,
+        });
+        yield subagentTask(options, "task_started", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+          is_backgrounded: true,
+        });
+        // Claude Code answers a background Agent call when the subagent launches.
+        yield toolResultMessage(options, "toolu_agent", {});
+        yield toolUseMessage(options, "toolu_child", "Bash", { command: "make" }, "toolu_agent");
+        yield result(options);
+        yield idleState(options);
+        await interrupted.promise;
+        // The interrupt stops the subagent while nothing else runs. Claude Code
+        // sends the interrupted result of its command after that.
+        yield subagentTask(options, "task_updated", { patch: { status: "killed" } });
+        yield subagentTask(options, "task_notification", {
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+        });
+        yield {
+          ...toolResultMessage(options, "toolu_child", { is_error: true }, "user-rejected"),
+          parent_tool_use_id: "toolu_agent",
+        };
+        yield idleState(options);
+      });
+
+      const client = v2Client();
+      let root = "";
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        ({ sessionId: root } = await agent.request(v2.methods.agent.session.new, { cwd }));
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: root,
+          prompt: text("go"),
+        });
+        await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: root });
+        await vi.waitFor(() =>
+          expect(
+            client
+              .updates("tool_call_update")
+              .filter((update) => update.toolCallId === "toolu_child")
+              .map((update) => update.status),
+          ).toContain("cancelled"),
+        );
+        await client.authUpdate(1);
+      });
+
+      const updates = client.sessionUpdates as unknown as Seen[];
+      // The child reported idle first, and then its command ended in its session.
+      const childIdle = updates.findIndex(
+        ({ sessionId, update }) =>
+          sessionId === "agent-1" &&
+          update.sessionUpdate === "state_update" &&
+          update.state === "idle" &&
+          update.stopReason === "cancelled",
+      );
+      expect(childIdle).toBeGreaterThanOrEqual(0);
+      expect(updates[lastStatusAt(updates, "toolu_child")]).toMatchObject({
+        sessionId: "agent-1",
+        update: { status: "cancelled" },
+      });
+      expect(lastStatusAt(updates, "toolu_child")).toBeGreaterThan(childIdle);
+      // Claude Code's result for the command was dropped, so only one report ended it.
+      expect(
+        updates.filter(
+          ({ update }) => update.toolCallId === "toolu_child" && update.status === "cancelled",
+        ),
+      ).toHaveLength(1);
+      // The cancel found no work to end: the root reported nothing after its idle.
+      expect(turnTrace(updates.filter(({ sessionId }) => sessionId === root) as never)).toEqual([
+        "user_message",
+        "running",
+        "idle end_turn",
+      ]);
+    });
   });
 
   it("reports a tool call that Claude dropped before it ran as cancelled", async () => {

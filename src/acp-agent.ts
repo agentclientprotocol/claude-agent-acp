@@ -4876,6 +4876,28 @@ export class ClaudeAcpAgent {
           task.parentToolUseId === agentToolUseId,
       );
 
+    /** Ends the open tool calls that `include` accepts, with the report of a call
+     *  that a cancel stopped and sent no result for. `include` gets the Agent/Task
+     *  call of the subagent that made the tool call, if a subagent did. */
+    const closeOpenToolCalls = async (
+      include: (parentToolUseId: string | undefined) => boolean,
+    ): Promise<void> => {
+      const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+      for (const toolCallId of [...session.emittedToolCalls]) {
+        const parentToolUseId = session.toolCallParents?.get(toolCallId);
+        if (!include(parentToolUseId)) continue;
+        const report = renderer.unfinished({
+          toolCallId,
+          ran: session.dispatchedToolCalls?.has(toolCallId) === true,
+          cancelled: true,
+        });
+        // Named as the call's other updates are: the subagent runtime routes the
+        // report with them, to the child session, or to none that has ended.
+        if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
+        await closeToolCall(toolCallId, report);
+      }
+    };
+
     /** Closes the tool calls that the work a cancel stopped left open, as that
      *  work ends. Claude Code's interrupt ends each running tool of the main
      *  conversation with an error result, which `sendInterruptedToolResults`
@@ -4888,27 +4910,34 @@ export class ClaudeAcpAgent {
      *  A foreground subagent ends with the work that waits on it. A background
      *  subagent keeps its tool calls open until the SDK reports its end, which
      *  Claude Code 2.1.293 does for the ones it stops, before the turn's result
-     *  (see `NativeSubagentRuntime.parentCancelled`).
+     *  (see `NativeSubagentRuntime.parentCancelled`). When the SDK reports it
+     *  only after the work ended, `closeStoppedSubagentToolCalls` closes them.
      *  Runs once per turn: a second call, from the other settling path, waits
      *  for the first (see `Turn.closingCancelledToolCalls`). */
     const closeCancelledToolCalls = (turn: Turn): Promise<void> =>
-      (turn.closingCancelledToolCalls ??= (async () => {
-        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
-        for (const toolCallId of [...session.emittedToolCalls]) {
-          const parentToolUseId = session.toolCallParents?.get(toolCallId);
-          if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
-          const report = renderer.unfinished({
-            toolCallId,
-            ran: session.dispatchedToolCalls?.has(toolCallId) === true,
-            cancelled: true,
-          });
-          // Named as the call's other updates are: the subagent runtime routes the
-          // report with them, to the child session, or to none that has ended.
-          if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
-          await closeToolCall(toolCallId, report);
-        }
-      })());
+      (turn.closingCancelledToolCalls ??= closeOpenToolCalls(
+        (parentToolUseId) => parentToolUseId === undefined || !runsInBackground(parentToolUseId),
+      ));
     session.closeCancelledToolCalls = closeCancelledToolCalls;
+
+    /** Closes the tool calls of the subagent that the Agent call `agentToolUseId`
+     *  started, once the SDK reports the subagent stopped, if a cancel stopped it
+     *  after the work that waited on it ended. Nothing else ends them then.
+     *  Example: the cancel settles a turn that v1 holds for a background
+     *  subagent, so `closeCancelledToolCalls` leaves the subagent's command
+     *  open, since the subagent runs. Claude Code's interrupt then stops the
+     *  subagent. Claude Code 2.1.296 sends the command's interrupted result
+     *  after that, but the result is dropped like all output after the work's
+     *  end (see the `session.cancelled` check of the user/assistant case).
+     *  While the work still runs, the calls of a stopped subagent get Claude
+     *  Code's result, or `closeCancelledToolCalls` at the work's end. */
+    const closeStoppedSubagentToolCalls = async (
+      agentToolUseId: string | null | undefined,
+    ): Promise<void> => {
+      if (!agentToolUseId || !session.cancelled) return;
+      if (!this.workEndReported(params.sessionId, session)) return;
+      await closeOpenToolCalls((parentToolUseId) => parentToolUseId === agentToolUseId);
+    };
 
     /** Delivers the results that the work a cancel stopped sends for tool calls
      *  that the client holds open. Claude Code's interrupt ends each running tool
@@ -6044,6 +6073,9 @@ export class ClaudeAcpAgent {
                   droppedStreams.delete(message.tool_use_id);
                 }
                 await endBackgroundTerminal(message.task_id);
+                if (message.status === "stopped") {
+                  await closeStoppedSubagentToolCalls(message.tool_use_id);
+                }
                 settleLiveTask(message.task_id);
                 break;
               case "task_updated":
@@ -6086,6 +6118,9 @@ export class ClaudeAcpAgent {
                     droppedStreams.delete(parentToolUseId);
                   }
                   await endBackgroundTerminal(message.task_id);
+                  if (message.patch.status === "killed") {
+                    await closeStoppedSubagentToolCalls(parentToolUseId);
+                  }
                   settleLiveTask(message.task_id);
                 } else if (
                   message.patch.status === "running" ||

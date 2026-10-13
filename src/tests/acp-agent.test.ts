@@ -7383,6 +7383,124 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
+    it("closes a background child's tool call in its session when the SDK reports the stop after the cancelled response", async () => {
+      const log: string[] = [];
+      const updates: AcpSessionNotification[] = [];
+      const logError = vi.fn();
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+            if (update.update.sessionUpdate === "subagent_update") {
+              log.push(`${update.update.sessionId} ${JSON.stringify(update.update.state)}`);
+            }
+            if (update.update.sessionUpdate === "tool_call_update" && update.update.status) {
+              log.push(
+                `tool @${update.sessionId} ${update.update.toolCallId} ${update.update.status}`,
+              );
+            }
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: logError },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const responded = Promise.withResolvers<void>();
+      injectGeneratorSession(agent, (input) =>
+        (async function* () {
+          const { value } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(value);
+          yield rootToolUse("toolu_agent", "Agent", {
+            description: "Run a slow command",
+            subagent_type: "general-purpose",
+            prompt: "Run it",
+            run_in_background: true,
+          });
+          yield {
+            ...taskStarted("agent-42", "toolu_agent"),
+            subagent_type: "general-purpose",
+            is_backgrounded: true,
+          };
+          // Claude Code answers a background Agent call when the subagent launches.
+          yield {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_agent",
+                  content: "Async agent launched",
+                },
+              ],
+            },
+          };
+          yield {
+            ...rootToolUse("toolu_child", "Bash", { command: "make" }),
+            parent_tool_use_id: "toolu_agent",
+          };
+          // The turn's result comes while the subagent runs, so v1 holds the turn
+          // for it. The cancel settles the held turn, which leaves the subagent's
+          // command open, since the subagent runs.
+          yield successResult();
+          await agent.cancel({ sessionId: "test-session" });
+          await responded.promise;
+          // Claude Code's interrupt stops the subagent only now, and sends the
+          // command's interrupted result after that.
+          yield taskUpdated({ status: "killed" });
+          yield taskNotification("toolu_agent", "stopped", { summary: "stopped" });
+          yield {
+            type: "user",
+            parent_tool_use_id: "toolu_agent",
+            uuid: randomUUID(),
+            session_id: "test-session",
+            tool_result_meta: [{ id: "toolu_child", non_execution_kind: "user-rejected" }],
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_child",
+                  is_error: true,
+                  content: "The user doesn't want to proceed with this tool use.",
+                },
+              ],
+            },
+          };
+        })(),
+      );
+
+      await expect(
+        agent
+          .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] })
+          .then((response) => {
+            log.push(`prompt ${response.stopReason}`);
+            responded.resolve();
+            return response;
+          }),
+      ).resolves.toMatchObject({ stopReason: "cancelled" });
+      await agent.sessions["test-session"]?.consumer;
+
+      // The command ends in the child's session, after the child reported idle.
+      expect(log).toEqual([
+        'agent-42 {"state":"running"}',
+        "tool @test-session toolu_agent completed",
+        "prompt cancelled",
+        'agent-42 {"state":"idle","stopReason":"cancelled"}',
+        "tool @agent-42 toolu_child failed",
+      ]);
+      expect(agent.sessions["test-session"]?.emittedToolCalls.size).toBe(0);
+      expect(logError).not.toHaveBeenCalled();
+      for (const payload of updates) {
+        expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+      }
+    });
+
     it("adds the SDK's error to a failure that a notification reported first", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
@@ -7521,6 +7639,74 @@ describe("subagent permission attribution (issue #851)", () => {
           update.status,
       ),
     ).toBe(false);
+  });
+
+  it("releases a background child's tool call without a report when the SDK reports the stop after the cancel (AIR)", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const logs: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: (message: string) => logs.push(message), error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_NATIVE_SUBAGENTS });
+    const responded = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) =>
+      (async function* () {
+        const { value } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(value);
+        yield rootToolUse("toolu_agent", "Agent", { description: "Explore", prompt: "Look" });
+        yield {
+          ...taskStarted("agent-42", "toolu_agent"),
+          subagent_type: "Explore",
+          is_backgrounded: true,
+        };
+        yield {
+          ...rootToolUse("toolu_child", "Bash", { command: "make" }),
+          parent_tool_use_id: "toolu_agent",
+        };
+        yield successResult();
+        await agent.cancel({ sessionId: "test-session" });
+        await responded.promise;
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_agent",
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+      })(),
+    );
+
+    await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] })
+      .finally(() => responded.resolve());
+    await agent.sessions["test-session"]?.consumer;
+
+    // AIR's draft ended the child at the cancel, so the closing report for its
+    // command is dropped with every later update of the child.
+    const childEnded = updates.findIndex(
+      ({ update }) =>
+        update.sessionUpdate === "subagent_state_update" &&
+        update.subagentSessionId === "agent-42" &&
+        update.state === "cancelled",
+    );
+    expect(childEnded).toBeGreaterThanOrEqual(0);
+    expect(
+      updates.slice(childEnded + 1).filter(({ sessionId }) => sessionId === "agent-42"),
+    ).toEqual([]);
+    expect(logs).toContain(
+      "Session test-session: ignoring late update for terminal subagent agent-42",
+    );
+    // The call is not kept open here, though.
+    expect(agent.sessions["test-session"]?.emittedToolCalls.size).toBe(0);
   });
 
   it("buffers child output until spawn and drops duplicates and late updates", async () => {

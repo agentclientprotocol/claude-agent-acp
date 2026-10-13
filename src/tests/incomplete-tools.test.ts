@@ -685,6 +685,114 @@ describe("tool calls of a cancelled turn", () => {
   });
 });
 
+describe("tool calls of a background subagent that a cancel stops", () => {
+  /** The reports that end the tool call `id`. */
+  const ends = (updates: any[], id: string) =>
+    updates.filter(
+      (u) => u.toolCallId === id && ["completed", "failed", "cancelled"].includes(u.status),
+    );
+  const textOf = (update: any): string =>
+    (update.content ?? []).map((item: any) => item.content?.text).join("");
+
+  /**
+   * Runs the fixture until two background subagents each run a command, and
+   * the cancel (if any) came. `settlement` is what the cancel finds: a turn
+   * that v1 holds open for the subagents, which the cancel settles at once, or
+   * no turn, because it ended earlier. Then the SDK reports how the first
+   * subagent ended (`reports`). Returns the updates that its reports caused.
+   */
+  async function endFirstSubagent(
+    settlement: "held turn" | "no turn",
+    options: { cancel?: boolean; reports?: SubagentEndReports } = {},
+  ) {
+    const { cancel = true, reports = "both" } = options;
+    const reported = Promise.withResolvers<void>();
+    const session = createTestSession((input) =>
+      backgroundSubagentsEndMessages(input, settlement, reported.promise, reports),
+    );
+    const { agent, updates } = session;
+    const first = session.prompt();
+    await vi.waitFor(() => {
+      const state = agent.sessions[sessionId];
+      expect(state.emittedToolCalls.has("bg-child-2")).toBe(true);
+      if (settlement === "held turn") expect(state.activeTurn?.deferredSettle).toBeDefined();
+    });
+    if (cancel) await agent.cancel({ sessionId });
+    if (settlement === "held turn" && cancel) {
+      await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    }
+    const before = updates.length;
+    reported.resolve();
+    await agent.sessions[sessionId].consumer;
+    return { ...session, before, afterReports: updates.slice(before) };
+  }
+
+  it.each([
+    ["held turn", "both"],
+    ["no turn", "both"],
+    // Each report alone ends the subagent, and the SDK can send either.
+    ["no turn", "update only"],
+    ["no turn", "notification only"],
+  ] as const)(
+    "closes the command of a subagent that the SDK reports stopped after the cancel (%s, %s)",
+    async (settlement, reports) => {
+      const { updates, agent, logError, before, afterReports } = await endFirstSubagent(
+        settlement,
+        { reports },
+      );
+
+      // The cancel left the command open, since its subagent ran. The SDK then
+      // stopped the subagent, and Claude Code's result for the command came after
+      // the work's end, which is dropped like all output after it.
+      expect(ends(updates.slice(0, before), "bg-child-1")).toEqual([]);
+      const [end, ...more] = ends(afterReports, "bg-child-1");
+      expect(more).toEqual([]);
+      expect(end).toMatchObject({
+        status: "failed",
+        _meta: { claudeCode: { parentToolUseId: "bg-agent-1" } },
+      });
+      expect(textOf(end)).toBe("The turn was cancelled before this tool call returned a result.");
+      expect(logError).not.toHaveBeenCalled();
+      // The other subagent runs on, and so does its command.
+      expect(ends(updates, "bg-child-2")).toEqual([]);
+      expect([...agent.sessions[sessionId].emittedToolCalls]).toEqual(["bg-child-2"]);
+      expect([...(agent.sessions[sessionId].toolCallParents ?? [])]).toEqual([
+        ["bg-child-2", "bg-agent-2"],
+      ]);
+    },
+  );
+
+  it("leaves the command of a subagent that completed after the cancel as it is", async () => {
+    const { afterReports } = await endFirstSubagent("no turn", { reports: "completed" });
+
+    // The subagent was not stopped, so nothing says that its command was cancelled.
+    expect(ends(afterReports, "bg-child-1")).toEqual([]);
+  });
+
+  it("leaves a subagent that stopped without a cancel to Claude Code's result", async () => {
+    const { updates, logError } = await endFirstSubagent("no turn", { cancel: false });
+
+    // For example, the model stops the subagent. Its command gets Claude Code's
+    // own result, and no report is made up for it first.
+    const [end, ...more] = ends(updates, "bg-child-1");
+    expect(more).toEqual([]);
+    expect(textOf(end)).toContain("doesn't want to proceed with this tool use");
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("leaves the command of a subagent that stopped before the work's end to Claude Code's result", async () => {
+    const { prompt, updates, logError } = createTestSession(stoppedMidTurnSubagentMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    // The turn still runs, so the result of the command reaches the client.
+    const [end, ...more] = ends(updates, "bg-child-1");
+    expect(more).toEqual([]);
+    expect(textOf(end)).toContain("doesn't want to proceed with this tool use");
+    expect(logError).not.toHaveBeenCalled();
+  });
+});
+
 function toolStart(id = toolCallId, parent: string | null = null, name = "Bash") {
   return {
     type: "stream_event",
@@ -1062,6 +1170,71 @@ async function* backgroundSubagentMessages(input: Pushable<any>, agent: ClaudeAc
   // background one ended.
   yield taskStopped("agent-fg", "fg-agent");
   yield interruptedResult("fg-agent");
+  yield interruptNote;
+  yield abortedResult();
+}
+
+/** The reports with which the SDK ends a subagent: a patch and a notification, or one of them. */
+type SubagentEndReports = "both" | "update only" | "notification only" | "completed";
+
+/**
+ * Two background subagents each run a command. With a "held turn", the turn's
+ * result came while they run, so v1 holds the turn for them; with "no turn",
+ * it ended before they started. After `reported`, the SDK reports how the first
+ * subagent ended, and Claude Code's result for its command.
+ */
+async function* backgroundSubagentsEndMessages(
+  input: Pushable<any>,
+  settlement: "held turn" | "no turn",
+  reported: Promise<void>,
+  reports: SubagentEndReports,
+) {
+  yield* echoNextPrompt(input);
+  if (settlement === "no turn") yield successfulResultMessage();
+  for (const n of [1, 2]) {
+    yield toolStart(`bg-agent-${n}`, null, "Agent");
+    yield toolUse(`bg-agent-${n}`, null, "Agent", { description: "Work", prompt: "Work" });
+    yield taskStarted(`agent-bg-${n}`, `bg-agent-${n}`, "general-purpose", true);
+    yield toolResult(`bg-agent-${n}`);
+    yield toolStart(`bg-child-${n}`, `bg-agent-${n}`);
+    yield toolUse(`bg-child-${n}`, `bg-agent-${n}`);
+  }
+  if (settlement === "held turn") yield successfulResultMessage();
+  await reported;
+  const done = { type: "system", session_id: sessionId, task_id: "agent-bg-1" };
+  if (reports === "completed") {
+    yield { ...done, subtype: "task_updated", patch: { status: "completed" } };
+    yield {
+      ...done,
+      subtype: "task_notification",
+      tool_use_id: "bg-agent-1",
+      status: "completed",
+      summary: "done",
+      output_file: "",
+    };
+  } else {
+    if (reports !== "notification only") {
+      yield { ...done, subtype: "task_updated", patch: { status: "killed" } };
+    }
+    if (reports !== "update only") yield taskStopped("agent-bg-1", "bg-agent-1");
+    // Claude Code's result for the command comes after the stop.
+    yield interruptedResult("bg-child-1", "bg-agent-1");
+  }
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/** A background subagent stops while the cancelled turn still runs, and Claude Code sends the result of its command. */
+async function* stoppedMidTurnSubagentMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield toolStart("bg-agent-1", null, "Agent");
+  yield toolUse("bg-agent-1", null, "Agent", { description: "Work", prompt: "Work" });
+  yield taskStarted("agent-bg-1", "bg-agent-1", "general-purpose", true);
+  yield toolResult("bg-agent-1");
+  yield toolStart("bg-child-1", "bg-agent-1");
+  yield toolUse("bg-child-1", "bg-agent-1");
+  await agent.cancel({ sessionId });
+  yield taskStopped("agent-bg-1", "bg-agent-1");
+  yield interruptedResult("bg-child-1", "bg-agent-1");
   yield interruptNote;
   yield abortedResult();
 }
