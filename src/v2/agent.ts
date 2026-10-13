@@ -152,9 +152,13 @@ async function setupCommands(
 class V2ClientConnection implements AcpClient {
   /**
    * The sessions whose history replays, each with the messages that the
-   * replay has cleared so far.
+   * replay has cleared so far. A subagent that a replay announces replays
+   * with it.
    */
   private readonly replays = new Map<string, Set<string>>();
+
+  /** The session whose replay announced each replaying subagent. */
+  private readonly replayRoots = new Map<string, string>();
 
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
@@ -181,6 +185,11 @@ class V2ClientConnection implements AcpClient {
       return await restore();
     } finally {
       this.replays.delete(sessionId);
+      for (const [child, root] of this.replayRoots) {
+        if (root !== sessionId) continue;
+        this.replays.delete(child);
+        this.replayRoots.delete(child);
+      }
     }
   }
 
@@ -207,6 +216,19 @@ class V2ClientConnection implements AcpClient {
   }
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+    // A subagent that a replay announces replays too, so its messages are
+    // cleared before their first replayed chunk, as the parent's are.
+    if (
+      update.sessionUpdate === "subagent_update" &&
+      this.replays.has(notification.sessionId) &&
+      !this.replays.has(update.sessionId)
+    ) {
+      this.replays.set(update.sessionId, new Set());
+      this.replayRoots.set(
+        update.sessionId,
+        this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
+      );
+    }
     const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
       const clear = this.replayClear(notification.sessionId, v2Update);
       return clear ? [clear, v2Update] : [v2Update];

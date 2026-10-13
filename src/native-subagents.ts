@@ -3,7 +3,7 @@ import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 
 /** The work state of a child, as the RFD's `subagent_update.state` carries it. */
-type WorkState = NonNullable<
+export type WorkState = NonNullable<
   Extract<SessionNotification["update"], { sessionUpdate: "subagent_update" }>["state"]
 >;
 
@@ -950,7 +950,7 @@ function isWorking(child: NativeSubagent): boolean {
  * stream ended, is idle with no stop reason: its work ended, but the adapter
  * did not see a cancellation or a failure, which the RFD forbids claiming.
  */
-function rfdEndState(state: SubagentState, end: TaskEnd | undefined): WorkState {
+export function rfdEndState(state: SubagentState, end: TaskEnd | undefined): WorkState {
   if (end?.unexplained || end?.reason === "worker_restart") return { state: "idle" };
   switch (state) {
     case "completed":
@@ -976,7 +976,7 @@ function rfdEndState(state: SubagentState, end: TaskEnd | undefined): WorkState 
  * name, with its role after it when both are known, else the role. The
  * description is the task's short description, never the prompt.
  */
-function rfdLabels(
+export function rfdLabels(
   name: unknown,
   role: unknown,
   description: unknown,

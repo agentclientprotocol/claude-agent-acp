@@ -3699,6 +3699,267 @@ describe("subagent transcript replay", () => {
     }
   });
 
+  describe("for a client on the subagents RFD", () => {
+    const sessionId = "22222222-2222-4222-8222-222222222222";
+    const lines = (records: object[]) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+    const base = {
+      sessionId,
+      cwd: "/tmp/proj",
+      version: "2.0.0",
+      userType: "external",
+      isSidechain: false,
+      timestamp: "2026-09-24T00:00:00.000Z",
+    };
+    const user = (uuid: string, content: unknown, extra: object = {}) => ({
+      ...base,
+      type: "user",
+      uuid,
+      message: { role: "user", content },
+      ...extra,
+    });
+    const assistant = (uuid: string, content: unknown[], extra: object = {}) => ({
+      ...base,
+      type: "assistant",
+      uuid,
+      message: { id: `m-${uuid}`, role: "assistant", model: "claude-opus-5", content },
+      ...extra,
+    });
+    const toolUse = (id: string, name: string, input: object) => ({
+      type: "tool_use",
+      id,
+      name,
+      input,
+    });
+    const toolResult = (id: string, content: string) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content,
+    });
+
+    /**
+     * Writes the session's transcripts, replays them to a client on the RFD
+     * form, and returns each update as `<session> <kind> <detail>`.
+     */
+    async function replayRfd(
+      root: object[],
+      children: Record<string, { meta: object; records: object[] }>,
+      capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
+    ): Promise<string[]> {
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      try {
+        const directory = path.join(configDir, "projects", "-tmp-proj");
+        await mkdir(path.join(directory, sessionId, "subagents"), { recursive: true });
+        let parentUuid: string | null = null;
+        const chain = (records: object[]) =>
+          records.map((record) => {
+            const linked = { ...record, parentUuid };
+            parentUuid = (record as { uuid: string }).uuid;
+            return linked;
+          });
+        await writeFile(path.join(directory, `${sessionId}.jsonl`), lines(chain(root)));
+        for (const [agentId, { meta, records }] of Object.entries(children)) {
+          parentUuid = null;
+          const sidechain = records.map((record) => ({ ...record, isSidechain: true, agentId }));
+          await writeFile(
+            path.join(directory, sessionId, "subagents", `agent-${agentId}.jsonl`),
+            lines(chain(sidechain)),
+          );
+          await writeFile(
+            path.join(directory, sessionId, "subagents", `agent-${agentId}.meta.json`),
+            JSON.stringify(meta),
+          );
+        }
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: SessionNotification) =>
+              updates.push(update as AcpSessionNotification),
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await initializeClient(agent, capabilities);
+        vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+        await (
+          agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+        ).replaySessionHistory(sessionId);
+        return updates.flatMap(({ sessionId: target, update }) => {
+          const on = target === sessionId ? "root" : target;
+          const u = update as any;
+          switch (update.sessionUpdate) {
+            case "subagent_update":
+              return [`${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}`];
+            case "session_message":
+              return [
+                `${on} session_message ${u.messageId} from=${u.senderSessionId ?? "-"} ${u.content[0].text}`,
+              ];
+            case "tool_call":
+              return [`${on} tool_call ${u.toolCallId}`];
+            case "notice":
+              return [`${on} notice ${u.title}: ${u.description}`];
+            case "user_message_chunk":
+            case "agent_message_chunk":
+              return [`${on} ${update.sessionUpdate} ${u.content.text}`];
+            default:
+              return [];
+          }
+        });
+      } finally {
+        if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+        await rm(configDir, { recursive: true, force: true });
+      }
+    }
+
+    it("replays each child under its live session id, with its incoming messages, before the response", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Explore it"),
+          assistant("a1", [
+            toolUse("toolu_agent", "Agent", {
+              name: "scout",
+              subagent_type: "Explore",
+              description: "Explore the code",
+              prompt: "Look around",
+            }),
+            // A launch without a metadata file has no known id.
+            toolUse("toolu_lost", "Agent", { description: "Lost", prompt: "No file" }),
+          ]),
+          user("u2", [toolResult("toolu_agent", "Found it."), toolResult("toolu_lost", "Gone.")]),
+          assistant("a2", [
+            toolUse("toolu_send", "SendMessage", { to: "scout", message: "Check the tests too" }),
+          ]),
+          user("u3", [toolResult("toolu_send", "Message sent.")]),
+          user(
+            "u4",
+            "<task-notification>\n<task-id>abc123</task-id>\n<tool-use-id>toolu_send</tool-use-id>\n<status>completed</status>\n</task-notification>",
+            { origin: { kind: "task-notification" } },
+          ),
+          assistant("a3", [{ type: "text", text: "Done." }]),
+        ],
+        {
+          abc123: {
+            meta: {
+              agentType: "Explore",
+              name: "scout",
+              description: "Explore the code",
+              toolUseId: "toolu_agent",
+              requestShape: "foreground",
+            },
+            records: [
+              user("c1", "Look around"),
+              assistant("c2", [
+                { type: "text", text: "Child report." },
+                toolUse("toolu_nested", "Agent", {
+                  name: "helper",
+                  subagent_type: "general-purpose",
+                  description: "Read the spec",
+                  prompt: "Read spec.md",
+                }),
+              ]),
+              user("c3", [toolResult("toolu_nested", "The spec says X.")]),
+              // Harness text that the live child session does not show.
+              user("c4", "[Request interrupted by user for tool use]"),
+              user(
+                "c5",
+                "The coordinator sent a message while you were working:\nCheck the tests too\n\nAddress this before completing your current task.",
+                { isMeta: true, origin: { kind: "coordinator" } },
+              ),
+              assistant("c6", [{ type: "text", text: "Tests pass." }]),
+            ],
+          },
+          def456: {
+            meta: {
+              agentType: "general-purpose",
+              name: "helper",
+              description: "Read the spec",
+              toolUseId: "toolu_nested",
+              requestShape: "foreground",
+            },
+            records: [user("g1", "Read spec.md"), assistant("g2", [{ type: "text", text: "X." }])],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Explore it",
+        "root tool_call toolu_agent",
+        "root tool_call toolu_lost",
+        // The child is announced under its agent id, right after its launch.
+        'root subagent_update abc123 {"state":"running"}',
+        "abc123 session_message toolu_agent from=" + sessionId + " Look around",
+        "abc123 agent_message_chunk Child report.",
+        "abc123 tool_call toolu_nested",
+        // A nested child is announced on the child that launched it.
+        'abc123 subagent_update def456 {"state":"running"}',
+        "def456 session_message toolu_nested from=abc123 Read spec.md",
+        "def456 agent_message_chunk X.",
+        // The delivered message has the id, text, and sender of its SendMessage call.
+        "abc123 session_message toolu_send from=" + sessionId + " Check the tests too",
+        "abc123 agent_message_chunk Tests pass.",
+        "root tool_call toolu_send",
+        "root agent_message_chunk Done.",
+        // Every end comes before the response.
+        'abc123 subagent_update def456 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
+        "root notice Some subagent history is not available: The history of 1 subagent of this session could not be restored.",
+      ]);
+    });
+
+    it("ends a child that the user stopped as cancelled, and one without a known end as idle", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Run them"),
+          assistant("a1", [
+            toolUse("toolu_stopped", "Agent", { prompt: "Sleep", run_in_background: true }),
+            toolUse("toolu_open", "Agent", { prompt: "Wait", run_in_background: true }),
+          ]),
+          // A background launch answers at once: its result is not the end.
+          user("u2", [
+            toolResult("toolu_stopped", "Async agent launched successfully."),
+            toolResult("toolu_open", "Async agent launched successfully."),
+          ]),
+        ],
+        {
+          stopped1: {
+            meta: { toolUseId: "toolu_stopped", requestShape: "background", stoppedByUser: true },
+            records: [user("s1", "Sleep")],
+          },
+          open1: {
+            meta: { toolUseId: "toolu_open", requestShape: "background" },
+            records: [user("o1", "Wait")],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("idle"))).toEqual([
+        'root subagent_update open1 {"state":"idle"}',
+        'root subagent_update stopped1 {"state":"idle","stopReason":"cancelled"}',
+      ]);
+    });
+
+    it("leaves out a subagent message that the session transcript stores inline", async () => {
+      // The SDK returns such a message with its parent_tool_use_id.
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: SessionNotification) =>
+            updates.push(update as AcpSessionNotification),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+      vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
+      await (
+        agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+      ).replaySessionHistory("s1");
+
+      // Neither its text nor its tool call reaches the root.
+      expect(updates).toEqual([]);
+    });
+  });
+
   it("replays an unattributed sidechain as a deterministic disconnected child", async () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([

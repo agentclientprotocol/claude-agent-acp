@@ -65,7 +65,6 @@ import {
   FastModeState,
   filterEscalatingDefaultMode,
   getSessionMessages,
-  getSubagentMessages,
   HookCallback,
   listSessions,
   McpServerConfig,
@@ -184,7 +183,12 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { subagentHistory } from "./subagent-history.js";
+import { readSubagentMessages, subagentHistory } from "./subagent-history.js";
+import {
+  type ReplayChild,
+  RfdSubagentReplay,
+  replaySubagentTerminalState,
+} from "./subagent-replay.js";
 import {
   readResumedSession,
   readResumedTail,
@@ -1772,28 +1776,6 @@ function subagentLaunchIds(content: unknown): string[] {
       ? [block.id as string]
       : [],
   );
-}
-
-function replaySubagentTerminalState(
-  block: Record<string, unknown>,
-): "completed" | "failed" | "cancelled" {
-  if (block.is_error !== true) return "completed";
-  const text = replayContentText(block.content).toLowerCase();
-  return /\b(?:cancelled|canceled|interrupted|stopped|killed)\b/.test(text)
-    ? "cancelled"
-    : "failed";
-}
-
-function replayContentText(value: unknown, seen = new Set<unknown>()): string {
-  if (typeof value === "string") return value;
-  if (typeof value !== "object" || value === null || seen.has(value)) return "";
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => replayContentText(item, seen)).join(" ");
-  const record = value as Record<string, unknown>;
-  return [record.text, record.content, record.message]
-    .map((item) => replayContentText(item, seen))
-    .filter(Boolean)
-    .join(" ");
 }
 
 function stripSubagentTextAndThinking(content: unknown): unknown {
@@ -8346,10 +8328,11 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    // Only AIR's draft replays child sessions so far. A client on the RFD gets
-    // no children on replay, which the RFD allows (it SHOULD replay them), until
-    // the replay keeps the children's live session ids.
-    const nativeReplayEnabled = subagentForm(this.clientCapabilities) === "air";
+    // AIR's draft replays each child under a replay id. A client on the RFD
+    // form gets each child under the session id it had live (see
+    // `RfdSubagentReplay`).
+    const form = subagentForm(this.clientCapabilities);
+    const nativeReplayEnabled = form === "air";
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
@@ -8483,8 +8466,24 @@ export class ClaudeAcpAgent {
     const subagents =
       nativeReplayEnabled && replayChildren.size > 0
         ? await subagentHistory(sessionId)
-        : { ids: new Map<string, string>() };
+        : { agents: new Map() };
     const replayedSubagents = new Set<string>();
+    const rfdHistory =
+      form === "rfd" &&
+      messages.some(
+        (message) =>
+          subagentLaunchIds((message as { message?: { content?: unknown } }).message?.content)
+            .length > 0,
+      )
+        ? await subagentHistory(sessionId)
+        : { agents: new Map() };
+    const rfdReplay =
+      form === "rfd"
+        ? new RfdSubagentReplay(rfdHistory, (notification) =>
+            this.client.sessionUpdate(asSdkSessionNotification(notification)),
+          )
+        : undefined;
+    rfdReplay?.scan(messages, sessionId);
 
     // History persists no task_started frame, so a background task gets its
     // spawn from the notification of its stop, with the tool call that
@@ -8511,6 +8510,7 @@ export class ClaudeAcpAgent {
     const restoreTaskNotification = async (
       notification: PersistedTaskNotification,
     ): Promise<void> => {
+      if (rfdReplay?.taskNotification(notification.task_id, notification.status)) return;
       const toolUseId = notification.tool_use_id;
       if (!toolUseId) return;
       const child = replayChildren.get(toolUseId);
@@ -8535,7 +8535,8 @@ export class ClaudeAcpAgent {
       await replayAsyncTasks.taskNotification(notification);
     };
 
-    const replayMessage = async (message: SessionMessage): Promise<void> => {
+    /** Replays `message`, from the transcript of `child` when it is set (the RFD form). */
+    const replayMessage = async (message: SessionMessage, child?: ReplayChild): Promise<void> => {
       // A long history is sent in order, but with event-loop turns in between,
       // so other sessions and incoming requests are not starved meanwhile.
       const pause = messageLoopYielder.maybeYield();
@@ -8543,6 +8544,9 @@ export class ClaudeAcpAgent {
       if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
+      // In the RFD form a child's history comes from its own transcript, so a
+      // subagent message that the session transcript stores inline is skipped.
+      if (rfdReplay && !child && parentToolUseIdOf(message)) return;
       if (
         message.type === "user" &&
         message.parent_tool_use_id === null &&
@@ -8594,13 +8598,15 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
-      const replayTargetSessionId =
-        nativeReplayEnabled && parentToolUseId
+      const replayTargetSessionId = child
+        ? child.sessionId
+        : nativeReplayEnabled && parentToolUseId
           ? await announceReplayChild(parentToolUseId)
           : sessionId;
       if (
         message.type === "assistant" &&
         parentToolUseId &&
+        !child &&
         !nativeReplayEnabled &&
         !forwardSubagentText
       ) {
@@ -8615,6 +8621,9 @@ export class ClaudeAcpAgent {
         }
         // Live, the prompt loop skips this record and the SDK frame reports the stop.
         content = isTaskNotificationRecord(message) ? null : stripLocalCommandMetadata(content);
+        if (content !== null && child && rfdReplay) {
+          content = await rfdReplay.childContent(child, message, content);
+        }
         if (content === null) return;
       } else if (Array.isArray(content)) {
         for (const block of content) {
@@ -8704,28 +8713,42 @@ export class ClaudeAcpAgent {
       if (nativeReplayEnabled && message.type === "assistant") {
         for (const toolUseId of subagentLaunchIds(content)) {
           await announceReplayChild(toolUseId);
-          const agentId = subagents.ids.get(toolUseId);
+          const agentId = subagents.agents.get(toolUseId)?.agentId;
           if (!agentId || replayedSubagents.has(agentId)) continue;
           replayedSubagents.add(agentId);
-          let childMessages: SessionMessage[] = [];
-          try {
-            // With the project directory, the SDK skips its search of every project.
-            // A session opened from another directory falls back to that search.
-            if (subagents.dir) {
-              childMessages = await getSubagentMessages(sessionId, agentId, { dir: subagents.dir });
-            }
-            if (childMessages.length === 0) {
-              childMessages = await getSubagentMessages(sessionId, agentId);
-            }
-          } catch (error) {
-            this.logger.error(`Failed to read the history of subagent ${agentId}:`, error);
-          }
+          const childMessages = await readSubagentMessages(
+            sessionId,
+            agentId,
+            subagents,
+            this.logger,
+          );
           registerLaunches(childMessages);
           for (const childMessage of childMessages) await replayMessage(childMessage);
         }
       }
+      // The RFD form announces a child right after its launch, then sends its
+      // own transcript to it.
+      if (rfdReplay && message.type === "assistant") {
+        for (const toolUseId of subagentLaunchIds(content)) {
+          const launched = rfdReplay.childOfLaunch(toolUseId);
+          if (!launched || launched.announced) continue;
+          await rfdReplay.announce(launched);
+          const childMessages = await readSubagentMessages(
+            sessionId,
+            launched.sessionId,
+            rfdHistory,
+            this.logger,
+          );
+          rfdReplay.scan(childMessages, launched.sessionId);
+          for (const childMessage of childMessages) await replayMessage(childMessage, launched);
+          await rfdReplay.childReplayed(launched, childMessages);
+        }
+      }
     };
     for (const message of messages) await replayMessage(message);
+    if (rfdReplay && !pending?.stopped) {
+      await rfdReplay.finish(clientSupportsNotices(this.clientCapabilities), sessionId);
+    }
 
     if (nativeReplayEnabled && !pending?.stopped) {
       // Claude history persists sidechain messages and Agent/Task tool uses,

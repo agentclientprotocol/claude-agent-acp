@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -864,6 +864,93 @@ describe("ACP v2 prompts", () => {
     expect(client.updates("tool_call_update")).toContainEqual(
       expect.objectContaining({ toolCallId: "toolu_w", title: "Write a.ts", content: [] }),
     );
+  });
+
+  it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // Claude Code keeps the subagent's history in its own transcript, beside
+      // the session's, with a metadata file that names its launch.
+      const project = path.join(tempDir, "claude", "projects", "-project");
+      const subagents = path.join(project, sessionId, "subagents");
+      await mkdir(subagents, { recursive: true });
+      const entry = (uuid: string, parentUuid: string | null, message: unknown, sidechain = true) =>
+        JSON.stringify({
+          type: (message as { role: string }).role,
+          uuid,
+          parentUuid,
+          sessionId,
+          cwd,
+          version: "2.0.0",
+          isSidechain: sidechain,
+          ...(sidechain ? { agentId: "abc123" } : {}),
+          userType: "external",
+          timestamp: "2026-09-24T00:00:00.000Z",
+          message,
+        });
+      await writeFile(
+        path.join(project, `${sessionId}.jsonl`),
+        entry("r1", null, { role: "user", content: "Explore it" }, false) + "\n",
+      );
+      await writeFile(
+        path.join(subagents, "agent-abc123.jsonl"),
+        [
+          entry("c1", null, { role: "user", content: "Look around" }),
+          entry("c2", "c1", {
+            id: "msg_child",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [{ type: "text", text: "Child report." }],
+          }),
+        ].join("\n") + "\n",
+      );
+      await writeFile(
+        path.join(subagents, "agent-abc123.meta.json"),
+        JSON.stringify({ agentType: "Explore", name: "scout", toolUseId: "toolu_agent" }),
+      );
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_agent",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent",
+              name: "Agent",
+              input: { name: "scout", subagent_type: "Explore", prompt: "Look around" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "Found it." }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
+      sessionId === "abc123" ? [update] : [],
+    );
+    expect(child).toEqual([
+      { sessionUpdate: "state_update", state: "running" },
+      expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
+      // The client may still hold the child's message, so the replay clears it.
+      { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
+      expect.objectContaining({
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg_child",
+        content: text("Child report.")[0],
+      }),
+      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+    ]);
   });
 
   it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {

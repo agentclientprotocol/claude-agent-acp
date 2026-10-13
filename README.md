@@ -56,8 +56,11 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   open requests. A child that still runs when Claude Code exits is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
-- A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
-  children yet.
+- A replay restores each child under its live session id, from its own transcript: its prompt and
+  each SendMessage message are `session_message`s, and its end is an `idle` before the response.
+  A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
+  parent, and a notice, for a client that takes notices, says that subagent history is missing.
+- A client cannot prompt, cancel, or otherwise change a child yet.
 
 An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
