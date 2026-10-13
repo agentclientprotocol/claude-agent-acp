@@ -9085,13 +9085,6 @@ export class ClaudeAcpAgent {
     return this.foregroundEvents ? !this.foregroundWork.has(sessionId) : !session.activeTurn;
   }
 
-  /** Whether a model cycle that Claude Code started on its own is the session's
-   *  foreground work. Only a client that gets the session's work reported (v2)
-   *  has any; a turn that took a cycle over owns the work from then on. */
-  private runsAutonomousCycle(sessionId: string): boolean {
-    return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
-  }
-
   /** End the session's model cycle that Claude Code started on its own, if one
    *  runs. */
   private endAutonomousCycle(
@@ -9099,6 +9092,13 @@ export class ClaudeAcpAgent {
     end: { outcome: TurnOutcome } | { error: unknown },
   ): void {
     this.endForeground(sessionId, AUTONOMOUS_CYCLE, end);
+  }
+
+  /** Whether a model cycle that Claude Code started on its own is the session's
+   *  foreground work. Only a client that gets the session's work reported (v2)
+   *  has any; a turn that took a cycle over owns the work from then on. */
+  private runsAutonomousCycle(sessionId: string): boolean {
+    return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }
 
   /** Forward a permission request to the client, wiring the tool call's
