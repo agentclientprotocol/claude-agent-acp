@@ -26,6 +26,7 @@ import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
+import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
 import { v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
@@ -3197,6 +3198,107 @@ describe("ACP v2 session translation", () => {
     terminals.forget("closed");
     expect(commanded("closed")).toEqual([]);
     expect(commanded("open")).toHaveLength(1);
+  });
+
+  describe("the _meta that the client stores for a tool call", () => {
+    const report = (_meta?: Record<string, unknown>, fields: Record<string, unknown> = {}) => ({
+      toolCallId: "t",
+      ...fields,
+      ...(_meta ? { _meta } : {}),
+    });
+
+    it("gives the tool's name as name, once, and leaves it out of _meta", () => {
+      const meta = new V2ToolCallMeta();
+      expect(meta.apply("s", report({ claudeCode: { toolName: "memory_recall" } }), true)).toEqual({
+        toolCallId: "t",
+        name: "memory_recall",
+      });
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Bash" } }), false)).toEqual({
+        toolCallId: "t",
+      });
+      // A report's own name wins.
+      expect(
+        meta.apply("s", report({ claudeCode: { toolName: "Bash" } }, { name: "Read" }), true),
+      ).toEqual({ toolCallId: "t", name: "Read" });
+    });
+
+    it("sends the earlier claudeCode keys again with a key that changes", () => {
+      const meta = new V2ToolCallMeta();
+      const denial = { toolResponse: { decisionReasonType: "rule" } };
+      expect(meta.apply("s", report({ claudeCode: denial }), true)).toEqual(
+        report({ claudeCode: denial }),
+      );
+      expect(
+        meta.apply("s", report({ claudeCode: { nonExecutionKind: "permission-rule" } }), false),
+      ).toEqual(report({ claudeCode: { ...denial, nonExecutionKind: "permission-rule" } }));
+    });
+
+    it("replaces a claudeCode key whole, and other _meta keys whole", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply(
+        "s",
+        report({ claudeCode: { toolResponse: { elapsedTimeSeconds: 1 } }, flag: { a: 1 } }),
+        true,
+      );
+      expect(
+        meta.apply("s", report({ claudeCode: { toolResponse: { status: "ok" } } }), false),
+      ).toEqual(report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { a: 1 } }));
+      expect(meta.apply("s", report({ flag: { b: 2 } }), false)).toEqual(
+        report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { b: 2 } }),
+      );
+    });
+
+    it("sends no _meta on a report that changes nothing", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(
+        meta.apply(
+          "s",
+          report(
+            { claudeCode: { toolName: "Bash", parentToolUseId: "p" } },
+            { status: "completed" },
+          ),
+          false,
+        ),
+      ).toEqual({ toolCallId: "t", status: "completed" });
+    });
+
+    it("gives a permission request's subject the whole _meta, also when it changes nothing", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(meta.subject("s", report({ claudeCode: { toolName: "Bash" } }))).toEqual(
+        report({ claudeCode: { parentToolUseId: "p" } }),
+      );
+      // Its own keys are stored, since the subject updates the tool call.
+      meta.subject("s", report({ claudeCode: { mcpServer: { name: "docs" } } }));
+      expect(meta.apply("s", report({ claudeCode: { nonExecutionKind: "x" } }), false)).toEqual(
+        report({
+          claudeCode: { parentToolUseId: "p", mcpServer: { name: "docs" }, nonExecutionKind: "x" },
+        }),
+      );
+    });
+
+    it("keeps the tool calls of each session apart, and forgets a closed session's", () => {
+      const meta = new V2ToolCallMeta();
+      const started = { claudeCode: { parentToolUseId: "p" } };
+      meta.apply("closed", report(started), true);
+      meta.apply("open", report(started), true);
+      meta.forget("closed");
+      const failed = report({ claudeCode: { nonExecutionKind: "x" } });
+      expect(meta.apply("closed", failed, false)._meta).toEqual(failed._meta);
+      expect(meta.apply("open", failed, false)._meta).toEqual({
+        claudeCode: { parentToolUseId: "p", nonExecutionKind: "x" },
+      });
+    });
+
+    it("forgets what an earlier tool call with the same id stored, when one starts", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Read" } }), true)).toEqual({
+        toolCallId: "t",
+        name: "Read",
+      });
+    });
   });
 
   it("fails on a permission request without the title that v2 requires", () => {

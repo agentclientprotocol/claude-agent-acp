@@ -44,11 +44,13 @@ export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. Also carried as the
        standard ACP `name` field on the initial `tool_call`. A progress beat
-       for AIR leaves it out when the adapter does not know the tool. */
+       for AIR leaves it out when the adapter does not know the tool. A v2
+       client gets it as `name` alone (see `V2ToolCallMeta`). */
     toolName?: string;
-    /* The structured output provided by Claude Code. For an AIR client, a
-       PostToolUse update carries only the `status` and `isAsync` markers of
-       the tool_response: the tool output itself is in the tool-call content. */
+    /* The structured output provided by Claude Code. For an AIR or a v2
+       client, a PostToolUse update carries only the `status` and `isAsync`
+       markers of the tool_response: the tool output itself is in the
+       tool-call content. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
        Agent/Task call that spawned the subagent. Mirrors the SDK's
@@ -148,6 +150,15 @@ export class AcpToolCallRenderer {
     replay = false,
   ): AcpToolCallRenderer {
     return new AcpToolCallRenderer(ClientCapabilities.from(capabilities), replay);
+  }
+
+  /**
+   * Whether the client keeps a tool call's `_meta` across reports: AIR merges
+   * its keys, and v2 stores it. Such a client gets no `toolResponse` text that
+   * the tool call's content already shows, which it would otherwise keep.
+   */
+  private get keepsMeta(): boolean {
+    return this.capabilities.air.client || this.capabilities.v2;
   }
 
   /**
@@ -506,7 +517,8 @@ export class AcpToolCallRenderer {
   /**
    * The report of a PostToolUse hook: the final change of an edit tool, and
    * the `status` and `isAsync` markers of the `tool_response`. The rest of the
-   * `tool_response` repeats output that the content already carries.
+   * `tool_response` repeats output that the content already carries, such as
+   * the whole text of a written file.
    */
   async hookResult(
     toolUse: Pick<ToolUse, "id" | "name">,
@@ -517,7 +529,7 @@ export class AcpToolCallRenderer {
     const change = reporter.hookResult
       ? await reporter.hookResult(toolResponse, { cwd, capabilities: this.capabilities })
       : {};
-    if (!this.capabilities.air.client) {
+    if (!this.keepsMeta) {
       // The upstream shape: the whole tool_response, on every hook.
       return {
         _meta: { claudeCode: { toolResponse, toolName: toolUse.name } } satisfies ToolUpdateMeta,
@@ -587,9 +599,10 @@ export class AcpToolCallRenderer {
     message?: string;
   }): ToolCallUpdate {
     const reason = denial.decisionReason ?? denial.message;
-    // AIR gets the SDK message only when it differs from the reason, which
-    // the content shows. Every other client gets the upstream toolResponse.
-    const extraMessage = !this.capabilities.air.client
+    // AIR and v2 get the SDK message only when it differs from the reason,
+    // which the content shows. Every other client gets the upstream
+    // toolResponse.
+    const extraMessage = !this.keepsMeta
       ? { decisionReason: denial.decisionReason, message: denial.message }
       : denial.decisionReason !== undefined &&
           denial.message !== undefined &&

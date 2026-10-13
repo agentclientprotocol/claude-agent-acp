@@ -32,6 +32,7 @@ import {
 } from "./session.js";
 import { v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
+import { V2ToolCallMeta } from "./tool-call-meta.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -104,6 +105,7 @@ export function v2AgentApp(
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
       client.terminals.forget(params.sessionId);
+      client.toolCallMeta.forget(params.sessionId);
       return response;
     })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -156,6 +158,9 @@ class V2ClientConnection implements AcpClient {
 
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
+
+  /** The `_meta` that the client stores for each tool call. */
+  readonly toolCallMeta = new V2ToolCallMeta();
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -217,7 +222,8 @@ class V2ClientConnection implements AcpClient {
 
   /**
    * The v2 updates of a v1 update: for a tool call report, the updates of its
-   * terminal first, then the report itself (see {@link V2Terminals}).
+   * terminal first (see {@link V2Terminals}), then the report itself, with the
+   * `_meta` that the client stores (see {@link V2ToolCallMeta}).
    */
   private v2Updates(
     sessionId: string,
@@ -228,7 +234,9 @@ class V2ClientConnection implements AcpClient {
       return v2Update ? [v2Update] : [];
     }
     const { terminal, report } = this.terminals.split(sessionId, update);
-    const reportUpdate = report && v2SessionUpdate(report);
+    if (!report) return terminal;
+    const starts = report.sessionUpdate === "tool_call";
+    const reportUpdate = v2SessionUpdate(this.toolCallMeta.apply(sessionId, report, starts));
     return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
   }
 
@@ -252,9 +260,11 @@ class V2ClientConnection implements AcpClient {
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The subject is an update of the tool call, with its stored `_meta`.
+    const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
-      v2PermissionRequest(params),
+      v2PermissionRequest({ ...params, toolCall }),
       { cancellationSignal: signal },
     );
     return v1PermissionResponse(response);
