@@ -7964,13 +7964,17 @@ describe("stop reason propagation", () => {
         },
       },
     });
-    expect(updates).toContainEqual({
-      sessionId: "test-session",
-      update: {
-        sessionUpdate: "session_info_update",
-        _meta: { jetbrains: { air: { version: 1, goal: null } } },
-      },
-    });
+    // The turn settles at its `result`, and the cleared goal arrives after it,
+    // so prompt() can resolve before the consumer has published `goal: null`.
+    await vi.waitFor(() =>
+      expect(updates).toContainEqual({
+        sessionId: "test-session",
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { jetbrains: { air: { version: 1, goal: null } } },
+        },
+      }),
+    );
     expect(updates.some((notification) => notification.update?._meta?.claudeCode?.goal)).toBe(
       false,
     );
