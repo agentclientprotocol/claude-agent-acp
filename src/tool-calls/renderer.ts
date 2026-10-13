@@ -19,6 +19,7 @@ import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from
 import type { ToolResultContext, ToolResultFacts, ToolUse, ToolUseFacts } from "./facts.js";
 import { reporterFor } from "./reporters/index.js";
 import { resolveSkillPath } from "./reporters/interaction.js";
+import { shellDescription } from "./reporters/bash.js";
 import { grepPath } from "./reporters/search.js";
 
 export type ToolCallUpdate = SessionNotification["update"];
@@ -726,9 +727,8 @@ export class AcpToolCallRenderer {
         ? (toolUse.input as Record<string, unknown>)
         : {};
     const description =
-      (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
-      typeof input.description === "string"
-        ? input.description
+      toolUse.name === "Bash" || toolUse.name === "PowerShell"
+        ? shellDescription(input)
         : undefined;
     const skillName =
       toolUse.name === "Skill" && typeof input.skill === "string" ? input.skill : undefined;
