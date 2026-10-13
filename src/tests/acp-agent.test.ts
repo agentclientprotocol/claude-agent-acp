@@ -18891,7 +18891,9 @@ describe("output after a cancel", () => {
       content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }],
     },
   });
-  const writeInput = { file_path: "/tmp/proj/notes.md", content: "done\n" };
+  // No test writes the file. A path under /tmp would read to CodeQL as a
+  // file created in the temp directory.
+  const writeInput = { file_path: "/workspace/proj/notes.md", content: "done\n" };
   /** Claude Code's permission check for the Write call `id`, as it calls it. */
   const askToWrite = (agent: ClaudeAcpAgent, id: string) =>
     agent.canUseTool("test-session")("Write", writeInput, {
@@ -18911,7 +18913,7 @@ describe("output after a cancel", () => {
         tool_use_id: id,
         session_id: "test-session",
         transcript_path: "",
-        cwd: "/tmp/proj",
+        cwd: "/workspace/proj",
       } as any,
       id,
       { signal: new AbortController().signal },
