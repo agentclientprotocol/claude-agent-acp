@@ -59,6 +59,10 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
 - A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
   children yet.
 
+An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents
+are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
+after the parent's copy.
+
 JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
 which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
 [AIR extensions](docs/air-extensions.md#native-subagent-sessions).
@@ -66,6 +70,19 @@ which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilit
 Without either signal, Agent and Task stay ordinary tool calls and child interactions stay on the
 root session. Clients that use the historical `_meta["subagent-transcript"]` capability or the
 `forwardSubagentText` session option retain the flattened child transcript.
+
+### Experimental ACP v2
+
+Started with `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2=1`, the adapter also serves the
+[draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview): a client that asks for
+protocol version 2 or later in `initialize` gets v2, and every other client gets v1, as before.
+The draft can still change, and this surface changes with it.
+
+On v2 the adapter serves the session baseline (`session/new`, `session/list`, `session/resume`
+with replay, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,
+`session/fork`, additional directories, config options (the mode is one), plans, notices,
+compaction, display terminals for commands, permission requests, elicitation, providers, auth, and
+[subagents](#subagent-sessions). Steering and the AIR extensions are v1 only for now.
 
 ## Contribution Policy
 

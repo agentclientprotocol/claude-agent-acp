@@ -27,7 +27,7 @@ import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
-import { v2SessionUpdate } from "../v2/session-update.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
 
@@ -2586,6 +2586,85 @@ describe("ACP v2 requests that subagents make", () => {
     });
   }
 
+  it("reports a subagent as a child session, with its work state also on the child's stream", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_agent",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent-1",
+              name: "Agent",
+              input: { description: "Explore the project", prompt: "Look around" },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield taskStarted(options, "agent-1", { prompt: "Look around" });
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "failed", error: "The model is overloaded" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptToIdle(v2Client());
+
+    const root = client.sessionUpdates.find(
+      ({ update }) => update.sessionUpdate === "user_message",
+    )!.sessionId;
+    const traffic = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+      const on = sessionId === root ? "root" : sessionId;
+      if (update.sessionUpdate === "subagent_update") {
+        const state = update.state as { state: string; stopReason?: string } | undefined;
+        return [
+          `${on} subagent_update ${update.sessionId} ${state?.state} ${state?.stopReason ?? ""}`,
+        ];
+      }
+      if (sessionId === root) return [];
+      if (update.sessionUpdate === "state_update") {
+        const { state, stopReason } = update as { state: string; stopReason?: string };
+        return [`${on} state_update ${state} ${stopReason ?? ""}`];
+      }
+      return [`${on} ${update.sessionUpdate}`];
+    });
+    // The announcement comes first, and each state reaches the parent, then
+    // the child.
+    expect(traffic).toEqual([
+      "root subagent_update agent-1 running ",
+      "agent-1 state_update running ",
+      "agent-1 session_message",
+      "root subagent_update agent-1 idle error",
+      "agent-1 state_update idle error",
+    ]);
+    expect(
+      client.sessionUpdates.filter(
+        ({ sessionId, update }) =>
+          sessionId === "agent-1" && update.sessionUpdate === "state_update",
+      )[1].update,
+    ).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: { code: -32603, message: "The model is overloaded" },
+    });
+  });
+
   it("keeps the turn running while a background subagent's request is open", async () => {
     turnWithRequest([["agent-1", { is_backgrounded: true }]], "agent-1");
     const client = await promptToIdle(v2Client());
@@ -2977,6 +3056,63 @@ describe("ACP v2 session translation", () => {
         state: "failed",
       }),
     ).toThrow("does not translate subagent_state_update session updates yet");
+  });
+
+  it("passes the subagent updates through, which v1 and v2 share", () => {
+    const announcement = {
+      sessionUpdate: "subagent_update" as const,
+      sessionId: "agent-1",
+      title: "Explore",
+      description: "Look around",
+      state: { state: "running" as const },
+    };
+    expect(v2SessionUpdate(announcement)).toEqual(announcement);
+    const message = {
+      sessionUpdate: "session_message" as const,
+      messageId: "toolu_agent",
+      senderSessionId: "root",
+      recipientSessionId: "agent-1",
+      content: text("Look around"),
+    };
+    expect(v2SessionUpdate(message)).toEqual(message);
+    const chunk = {
+      sessionUpdate: "session_message_chunk" as const,
+      messageId: "m",
+      content: text("Look")[0],
+    };
+    expect(v2SessionUpdate(chunk)).toEqual(chunk);
+  });
+
+  it("reports a subagent's work state on the child's stream as well", () => {
+    const failed = {
+      state: "idle" as const,
+      stopReason: "error" as const,
+      error: { code: -32603, message: "Overloaded" },
+    };
+    expect(
+      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", state: failed }),
+    ).toEqual({ sessionId: "agent-1", update: { sessionUpdate: "state_update", ...failed } });
+    // An update of the association that reports no state has no copy.
+    expect(
+      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", title: "X" }),
+    ).toBeUndefined();
+  });
+
+  it("fails on a subagent state that the subagents RFD does not define", () => {
+    expect(() =>
+      v2SessionUpdate({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-1",
+        state: { state: "_paused" },
+      }),
+    ).toThrow("does not translate the subagent state _paused");
+    expect(() =>
+      v2SessionUpdate({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-1",
+        state: { state: "idle", stopReason: "_timeout" },
+      }),
+    ).toThrow("the subagent state idle with the stop reason _timeout");
   });
 
   it("sends compaction updates as they are, which v1 and v2 share", () => {

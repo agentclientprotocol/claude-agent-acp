@@ -8321,8 +8321,13 @@ export class ClaudeAcpAgent {
     const session = replayState();
     // A replay rebuilds the client view, so its plan goes out again.
     if (session?.taskState) forgetPublishedTaskPlan(session.taskState);
+    // A subagent's text replays onto the root only for a client that gets it
+    // there live: one without native subagent sessions that asked for the
+    // flattened transcript. With native sessions the text goes to the child
+    // session, which AIR's replay restores and the RFD form leaves out for now.
     const forwardSubagentText =
-      session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
+      !clientSupportsSubagents(this.clientCapabilities) &&
+      (session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities));
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =

@@ -30,7 +30,7 @@ import {
   v2NewSessionResponse,
   v2ResumeSessionResponse,
 } from "./session.js";
-import { v2SessionUpdate } from "./session-update.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
 import { V2ToolCallMeta } from "./tool-call-meta.js";
 
@@ -211,13 +211,17 @@ class V2ClientConnection implements AcpClient {
       const clear = this.replayClear(notification.sessionId, v2Update);
       return clear ? [clear, v2Update] : [v2Update];
     });
+    // A subagent's work state also goes to the child's own stream, after the
+    // parent's copy.
+    const childState = v2ChildStateUpdate(update);
     // Every update goes to the connection before any is awaited, so an update
     // that another call sends meanwhile cannot come between them.
-    await Promise.all(
-      updates.map((v2Update) =>
+    await Promise.all([
+      ...updates.map((v2Update) =>
         this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
       ),
-    );
+      ...(childState ? [this.ctx.notify(v2.methods.client.session.update, childState)] : []),
+    ]);
   }
 
   /**

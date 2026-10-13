@@ -36,6 +36,11 @@ export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRe
       // plans, and `plan_removed`; v1 asks for the `plan` marker. With it, the
       // agent shows an approved ExitPlanMode plan as a markdown plan.
       plan: {},
+      // Subagent updates are part of v2's baseline session model (the subagents
+      // RFD), so every v2 client takes them; v1 asks for the `subagents`
+      // capability. With it, the agent reports each Agent or Task subagent as a
+      // child session.
+      subagents: {},
       // v1 marks terminal auth support with a boolean, v2 with an object.
       auth: {
         terminal: capabilities?.auth?.terminal != null,
