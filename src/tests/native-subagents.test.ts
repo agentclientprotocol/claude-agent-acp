@@ -68,8 +68,8 @@ describe("NativeSubagentRuntime lifecycle", () => {
       await release.promise;
     });
 
-    const first = announceNativeSubagent(value, publish);
-    const second = announceNativeSubagent(value, publish);
+    const first = announceNativeSubagent(value, publish, "air");
+    const second = announceNativeSubagent(value, publish, "air");
 
     await Promise.resolve();
     expect(publish).toHaveBeenCalledTimes(1);
@@ -101,7 +101,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   });
 
   it("falls back to one ordinary failed tool call when no child ever starts", async () => {
-    const runtime = new NativeSubagentRuntime(true, "root", {}, async () => {}, { log: () => {} });
+    const runtime = new NativeSubagentRuntime("air", "root", {}, async () => {}, { log: () => {} });
 
     await expect(
       runtime.route(control("tool_call", "pending"), async () => {}),
@@ -124,7 +124,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   });
 
   it("creates a schema-valid non-native failed tool call without a cached initial call", async () => {
-    const runtime = new NativeSubagentRuntime(true, "root", {}, async () => {}, { log: () => {} });
+    const runtime = new NativeSubagentRuntime("air", "root", {}, async () => {}, { log: () => {} });
 
     const fallback = await runtime.route(
       {
@@ -166,7 +166,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
     const session = sessionWith(outer);
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       session,
       async (notification) => {
@@ -211,7 +211,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
     const published: AcpSessionNotification[] = [];
     const delivered: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       {},
       async (notification) => {
@@ -258,7 +258,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   it("creates a distinct ACP lifecycle when the SDK restarts the same task id", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       {},
       async (notification) => {
@@ -332,7 +332,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   it("announces resumed subagent generation immediately when SendMessage restarts the task (#1158)", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       {},
       async (notification) => {
@@ -393,7 +393,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
   it("announces a resumed nested subagent under a live ancestor when its parent has finished", async () => {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
-      true,
+      "air",
       "root",
       {},
       async (notification) => {
@@ -439,7 +439,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
     ): Promise<Record<string, unknown>> {
       const published: AcpSessionNotification[] = [];
       const runtime = new NativeSubagentRuntime(
-        true,
+        "air",
         "root",
         {},
         async (notification) => {
@@ -507,7 +507,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
       const published: AcpSessionNotification[] = [];
       const logged: string[] = [];
       const runtime = new NativeSubagentRuntime(
-        true,
+        "air",
         "root",
         {},
         async (notification) => {
@@ -625,7 +625,7 @@ describe("NativeSubagentRuntime lifecycle", () => {
     it("keeps the work of a child tool call in the generation that started it", async () => {
       const published: AcpSessionNotification[] = [];
       const runtime = new NativeSubagentRuntime(
-        true,
+        "air",
         "root",
         {},
         async (notification) => {
@@ -727,5 +727,295 @@ describe("NativeSubagentRuntime lifecycle", () => {
       ]);
       expect(logged).toEqual(["Session root: ignoring late update for terminal subagent worker-1"]);
     });
+  });
+});
+
+/**
+ * The subagents RFD (agentclientprotocol/agent-client-protocol#1992, as
+ * revised), for a client that declares `subagents` and is not AIR.
+ */
+describe("NativeSubagentRuntime in the RFD form", () => {
+  const launch = (
+    toolCallId: string,
+    input: Record<string, unknown>,
+    parentToolUseId?: string,
+  ): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Agent",
+        status: "pending",
+        rawInput: input,
+        _meta: {
+          claudeCode: { toolName: "Agent", ...(parentToolUseId ? { parentToolUseId } : {}) },
+        },
+      },
+    }) as AcpSessionNotification;
+  const output = (parentToolUseId: string): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "working" },
+        _meta: { claudeCode: { parentToolUseId } },
+      },
+    }) as AcpSessionNotification;
+  /** A runtime whose child `worker-1` was launched by `launch-1` and runs. */
+  async function runningWorker(input: Record<string, unknown> = {}) {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    const control = await runtime.route(
+      launch("launch-1", { description: "Fix the build", prompt: "Make it pass", ...input }),
+      async () => {},
+    );
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+    return { runtime, published, control };
+  }
+  const states = (published: AcpSessionNotification[]) =>
+    published.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" && update.state ? [update.state] : [],
+    );
+
+  it("keeps the Agent tool call as a tool call of the session that made it", async () => {
+    const { runtime, control } = await runningWorker();
+
+    expect(control).toMatchObject({ sessionId: "root", update: { toolCallId: "launch-1" } });
+    // A nested launch is a tool call of the child that made it.
+    await expect(
+      runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {}),
+    ).resolves.toMatchObject({ sessionId: "worker-1", update: { toolCallId: "launch-2" } });
+  });
+
+  it("announces the child with the parent's labels, then sends it the prompt", async () => {
+    const { published } = await runningWorker({ name: "builder" });
+
+    expect(published).toEqual([
+      {
+        sessionId: "root",
+        update: {
+          sessionUpdate: "subagent_update",
+          sessionId: "worker-1",
+          title: "builder (Explore)",
+          description: "Fix the build",
+          state: { state: "running" },
+        },
+      },
+      {
+        sessionId: "worker-1",
+        update: {
+          sessionUpdate: "session_message",
+          messageId: "launch-1",
+          senderSessionId: "root",
+          recipientSessionId: "worker-1",
+          content: [{ type: "text", text: "Make it pass" }],
+        },
+      },
+    ]);
+  });
+
+  it("titles a child without a name by its role", async () => {
+    const { published } = await runningWorker();
+
+    expect(published[0]?.update).toMatchObject({ title: "Explore", description: "Fix the build" });
+  });
+
+  it("does not show a resume yet: the idle child keeps its one session", async () => {
+    const { runtime, published } = await runningWorker();
+    await runtime.finishTask("worker-1", "completed", async () => {});
+
+    // An idle child is reusable, so its updates still go to it.
+    await expect(runtime.route(output("launch-1"), async () => {})).resolves.toMatchObject({
+      sessionId: "worker-1",
+    });
+    // The SDK runs a resumed agent again under the id of the call that
+    // resumed it. The child stays idle, and no second session opens.
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "send-1", subagentType: "Explore", prompt: "Again" },
+      async () => {},
+    );
+    await runtime.taskResumed("worker-1", async () => {}, "Again");
+    await expect(runtime.route(output("send-1"), async () => {})).resolves.toBeNull();
+
+    expect(states(published)).toEqual([
+      { state: "running" },
+      { state: "idle", stopReason: "end_turn" },
+    ]);
+    expect(
+      published.some(({ update }) => "sessionId" in update && update.sessionId !== "worker-1"),
+    ).toBe(false);
+  });
+
+  it("keeps a nested child that ends before its parent is known unexposed", async () => {
+    const { runtime, published } = await runningWorker();
+    // worker-2's spawning frame has not arrived, so its parent is unknown.
+    await runtime.taskStarted(
+      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+      async () => {},
+    );
+    await expect(runtime.route(output("launch-2"), async () => {})).resolves.toBeNull();
+    // A resume signal does not give the unexposed child another call.
+    await runtime.taskStarted({ taskId: "worker-2", toolUseId: "send-9" }, async () => {});
+    await runtime.finishTask("worker-2", "completed", async () => {});
+    // The frame arrives late: it is the tool call of worker-1 that made it.
+    await expect(
+      runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {}),
+    ).resolves.toMatchObject({ sessionId: "worker-1" });
+
+    expect(
+      published.some(
+        ({ update }) =>
+          (update.sessionUpdate === "subagent_update" && update.sessionId === "worker-2") ||
+          (update.sessionUpdate === "session_message" && update.recipientSessionId === "worker-2"),
+      ),
+    ).toBe(false);
+    expect(published.some(({ sessionId }) => sessionId === "worker-2")).toBe(false);
+  });
+
+  describe("a nested child whose own parent is not announced yet", () => {
+    /** A runtime, the updates it sends in order, and the deliver function of
+     *  the agent, which routes a buffered update again (as `sendUpdate` does). */
+    function setup() {
+      const sent: AcpSessionNotification[] = [];
+      const runtime: NativeSubagentRuntime = new NativeSubagentRuntime(
+        "rfd",
+        "root",
+        {},
+        async (notification) => {
+          sent.push(notification);
+        },
+        { log: () => {} },
+      );
+      const deliver = async (notification: AcpSessionNotification): Promise<void> => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) sent.push(routed);
+      };
+      return { runtime, sent, deliver };
+    }
+    /** The announcements, as [parent, child], and the sessions that got
+     *  traffic before each was announced. */
+    function check(sent: AcpSessionNotification[]) {
+      const announced = new Set(["root"]);
+      const early: string[] = [];
+      const announcements: [string, string][] = [];
+      for (const { sessionId, update } of sent) {
+        if (!announced.has(sessionId)) early.push(sessionId);
+        if (update.sessionUpdate === "subagent_update" && !announced.has(update.sessionId)) {
+          announced.add(update.sessionId);
+          announcements.push([sessionId, update.sessionId]);
+        }
+      }
+      return { announcements, early };
+    }
+
+    it("announces it after that parent, when the parent's task started before its launch frame", async () => {
+      const { runtime, sent, deliver } = setup();
+      // worker-1 is known, but its launch frame has not come: not announced.
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-2", { description: "Dig" }, "launch-1"));
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", { description: "Fix the build" }));
+
+      expect(check(sent)).toEqual({
+        announcements: [
+          ["root", "worker-1"],
+          ["worker-1", "worker-2"],
+        ],
+        early: [],
+      });
+    });
+
+    it("never announces it under the root, when its parent is not known yet", async () => {
+      const { runtime, sent, deliver } = setup();
+      await deliver(launch("launch-2", { description: "Dig" }, "launch-1"));
+      await runtime.taskStarted(
+        { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(launch("launch-1", { description: "Fix the build" }));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+
+      expect(check(sent)).toEqual({
+        announcements: [
+          ["root", "worker-1"],
+          ["worker-1", "worker-2"],
+        ],
+        early: [],
+      });
+    });
+  });
+
+  it("keeps the role in the title when a late frame names the child", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+    await runtime.route(launch("launch-1", { name: "builder" }), async () => {});
+
+    expect(published[0]?.update).toMatchObject({ title: "builder (Explore)" });
+  });
+
+  it("reports nothing when the parent is cancelled, until the SDK ends the child", async () => {
+    const { runtime, published } = await runningWorker();
+
+    await runtime.parentCancelled(async () => {});
+    expect(states(published)).toEqual([{ state: "running" }]);
+    await runtime.finishTask("worker-1", "killed", async () => {});
+    expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "cancelled" });
+  });
+
+  it("ends the children that still run with the stream as idle, with no reason it did not see", async () => {
+    // After a cancel, a child that still runs is a background child that
+    // outlived it: the stream's end is no evidence that it was cancelled.
+    const cancelled = await runningWorker();
+    await cancelled.runtime.finishAll("cancelled", async () => {});
+    expect(states(cancelled.published).at(-1)).toEqual({ state: "idle" });
+
+    const failed = await runningWorker();
+    await failed.runtime.finishAll("failed", async () => {});
+    expect(states(failed.published).at(-1)).toEqual({ state: "idle" });
+    // A later error event does not turn that end into a failure.
+    await failed.runtime.finishTask("worker-1", "failed", async () => {}, undefined, {
+      error: "boom",
+    });
+    expect(states(failed.published)).toHaveLength(2);
+  });
+
+  it("reports a child that can no longer be observed as unknown", async () => {
+    const { runtime, published } = await runningWorker();
+
+    await runtime.finishTask("worker-1", "disconnected", async () => {});
+    expect(states(published).at(-1)).toEqual({ state: "unknown" });
   });
 });

@@ -37,14 +37,34 @@ npm install @agentclientprotocol/claude-agent-acp@preview
 
 ### Subagent sessions
 
-Subagents are exposed only after bilateral capability negotiation. Until the released ACP SDKs
-preserve the draft `clientCapabilities.subagents` field, a supporting client may advertise
-`nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`; the adapter mirrors the capability
-in its initialize response. The canonical field remains supported and takes precedence once it is
-available. Without either client signal, Agent/Task lifecycle keeps its legacy ordinary ACP
-tool-call representation and child interactions stay on the root session. Clients that use the
-historical `_meta["subagent-transcript"]` capability or `forwardSubagentText` session option retain
-the flattened child transcript behavior. See [AIR extensions](docs/air-extensions.md#native-subagent-sessions).
+A client that declares `clientCapabilities.subagents`, other than JetBrains AIR, gets each Agent or
+Task subagent as its own child session, following the [subagents RFD](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/rfds/subagents.mdx):
+
+- `subagent_update` on the parent announces the child before any of its traffic, with the
+  parent's `title` and `description` for it, and reports its work state: `running`, and `idle`
+  when its work ends, with `end_turn` or `cancelled` when the SDK gives the reason. A failure is
+  `idle` with the `error` stop reason and the SDK's error text as its `error`.
+- The prompt of the Agent or Task call that launches the child is a `session_message` in the
+  child's transcript. The tool call stays a tool call of the session that made it.
+- `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
+  the turn waits on and, currently, background children too. Each stopped child reports `idle`
+  with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
+  withdrawn. The adapter ends no child at a cancel itself, so a child that keeps running keeps its
+  open requests. A child that still runs when Claude Code exits is `idle` with no stop reason.
+- A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
+  guessing its parent.
+- A SendMessage that resumes a child is not shown yet: the child stays `idle`, and only the
+  permission and question requests of the resumed run appear in its session.
+- A client cannot prompt, cancel, or otherwise change a child yet, and a replay does not restore
+  children yet.
+
+JetBrains AIR keeps the earlier draft of the RFD (`subagent_spawned`, `subagent_state_update`),
+which it enables with `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`. See
+[AIR extensions](docs/air-extensions.md#native-subagent-sessions).
+
+Without either signal, Agent and Task stay ordinary tool calls and child interactions stay on the
+root session. Clients that use the historical `_meta["subagent-transcript"]` capability or the
+`forwardSubagentText` session option retain the flattened child transcript.
 
 ## Contribution Policy
 

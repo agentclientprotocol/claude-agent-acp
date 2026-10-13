@@ -111,6 +111,7 @@ import {
   asSdkSessionNotification,
   clientSupportsSubagents,
   SubagentAwareSessionCapabilities,
+  subagentForm,
   type SubagentState,
 } from "./acp-subagents.js";
 import {
@@ -2804,6 +2805,8 @@ export class ClaudeAcpAgent {
       }
     }
 
+    // The subagents RFD has only the client capability. AIR's draft also had
+    // this agent capability, which AIR gets (`docs/air-extensions.md`).
     const sessionCapabilities: SubagentAwareSessionCapabilities = {
       additionalDirectories: {},
       close: {},
@@ -2811,7 +2814,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
-      subagents: {},
+      ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
     return {
@@ -4147,7 +4150,7 @@ export class ClaudeAcpAgent {
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
     const subagents = (session.nativeSubagentRuntime ??= new NativeSubagentRuntime(
-      clientSupportsSubagents(this.clientCapabilities),
+      subagentForm(this.clientCapabilities),
       params.sessionId,
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
@@ -5911,6 +5914,7 @@ export class ClaudeAcpAgent {
                   message.status,
                   sendUpdate,
                   message.tool_use_id,
+                  { reason: message.reason },
                 );
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
@@ -5953,7 +5957,13 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
+                  await subagents.finishTask(
+                    message.task_id,
+                    message.patch.status,
+                    sendUpdate,
+                    undefined,
+                    { error: message.patch.status === "failed" ? message.patch.error : undefined },
+                  );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
                   )?.parentToolUseId;
@@ -7495,13 +7505,18 @@ export class ClaudeAcpAgent {
             if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
               break;
             }
-            const subagentParentToolUseId = message.parent_tool_use_id
-              ? [...session.liveBackgroundTasks.values()].some(
-                  (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
-                )
+            // The beat is in the subagent whose Agent call is
+            // `parent_tool_use_id`, unless it reports on that Agent call
+            // itself: the Agent call's own heartbeat falls back to its id, and
+            // a tool call is never its own parent.
+            const subagentParentToolUseId =
+              message.parent_tool_use_id &&
+              message.parent_tool_use_id !== toolCallId &&
+              [...session.liveBackgroundTasks.values()].some(
+                (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
+              )
                 ? message.parent_tool_use_id
-                : undefined
-              : undefined;
+                : undefined;
             // `tool_name` names the tool that reports the beat. When the beat
             // falls back to the parent call, AIR gets the name of that call,
             // or no name. Every other client gets `tool_name`, like upstream.
@@ -7746,9 +7761,18 @@ export class ClaudeAcpAgent {
     // their compaction is running. Close it before ANY cancelled prompt
     // resolves, not just the active-turn idle/backstop paths.
     await session.contextCompaction?.interrupt();
+    // A cancel drops the state of each tool call (the session that a
+    // permission request emitted it in, the fields the client holds, the hook
+    // callbacks), even when publishing fails. AIR's draft ends every child
+    // here, so a later update of an ended child's tool call is then dropped
+    // instead of reaching that child's session. The RFD form keeps the state:
+    // a background subagent can keep running after a cancel
+    // (agentclientprotocol/agent-client-protocol#2308), and its tool call that
+    // a permission request emitted on the root before the child was announced
+    // must stay on the root, which the RFD requires. Each tool call drops its
+    // own state when it ends.
     try {
-      await session.nativeSubagentRuntime?.finishAll(
-        "cancelled",
+      await session.nativeSubagentRuntime?.parentCancelled(
         session.nativeSubagentDeliver ??
           (async (notification) =>
             this.client.sessionUpdate(asSdkSessionNotification(notification))),
@@ -7759,9 +7783,11 @@ export class ClaudeAcpAgent {
         error,
       );
     } finally {
-      session.eagerToolCallSessions?.clear();
-      session.toolCallFields?.clear();
-      clearHookCallbacks(params.sessionId);
+      if (session.nativeSubagentRuntime?.form !== "rfd") {
+        session.eagerToolCallSessions?.clear();
+        session.toolCallFields?.clear();
+        clearHookCallbacks(params.sessionId);
+      }
     }
     // The user messages this cancel abandons while Claude Code may still have
     // them queued: they are dropped from its queue before the interrupt.
@@ -8301,7 +8327,10 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    // Only AIR's draft replays child sessions so far. A client on the RFD gets
+    // no children on replay, which the RFD allows (it SHOULD replay them), until
+    // the replay keeps the children's live session ids.
+    const nativeReplayEnabled = subagentForm(this.clientCapabilities) === "air";
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
