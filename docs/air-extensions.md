@@ -206,6 +206,20 @@ The adapter keeps them where they are.
 | `quota`                 | `PromptResponse._meta.quota`                                                                                                              | Token usage of the turn, also split by model.                                      |
 | `authStatus`            | `initialize` response `agentCapabilities._meta.authStatus`                                                                                | The agent pushes `_auth/status_update`. The object carries no payload.             |
 
+## Auth source display
+
+The connection-scoped `_auth/status_update` continues to report agent-owned authentication, not client-owned `providers/set` routing. When the active key source is `apiKeyHelper`, the adapter reads the effective helper command through SDK `resolveSettings` / the session's `SettingsManager`, including programmatic settings overrides.
+
+A command containing the whole word `central` and the word sequence `proxy start` is displayed as:
+
+```json
+{ "authStatus": { "kind": "gateway", "label": "JetBrains Air Gateway" } }
+```
+
+Matching is case-insensitive and accepts multiple whitespace characters between `proxy` and `start`. The command's flags, URL, host and route are not checked. This is a weak display heuristic, not proof of configuration provenance, account ownership or entitlement. Inactive helpers and external cloud backends retain their existing classification. No helper command, key, headers, private route or inferred account is included in this payload.
+
+Other active helpers use `label: "Anthropic API key"` and `detail: "API key helper"`; unknown key-source identifiers are not exposed as display text. CLI and SDK reads share this presentation, retain stale-probe protection, and suppress unchanged notifications.
+
 ## Zed conventions
 
 The adapter keeps these Zed and upstream conventions unchanged for every client.
@@ -1186,8 +1200,9 @@ This section covers only the AIR bridge.
 - The canonical client field is `clientCapabilities.subagents: {}`.
 - Released ACP SDKs can strip that draft field.
   AIR can instead declare `nativeSubagentSessions` in `_meta.jetbrains.air.capabilities`.
-- Either signal enables native subagent sessions. The canonical field takes precedence when it is available.
-- The agent advertises `nativeSubagentSessions` to AIR, and `agentCapabilities.sessionCapabilities.subagents` to every client.
+- Either signal enables native subagent sessions, and AIR gets this earlier draft of the RFD whichever it declares.
+- The agent advertises `nativeSubagentSessions` and `agentCapabilities.sessionCapabilities.subagents` to AIR.
+- A client that is not AIR and declares `clientCapabilities.subagents` gets the revised RFD instead (`subagent_update`, `session_message`), see the README.
 - With native sessions, the adapter sends `subagent_spawned` and `subagent_state_update`.
   The child output goes to the child session. The Agent or Task tool call is not the subagent card.
 - `subagent_spawned` can carry an optional `prompt`: the exact prompt of the child session.
@@ -1541,6 +1556,8 @@ It adds this object to the `session/fork` request:
   When only one stored message has the fingerprint, the adapter uses that message.
 - When no message matches, the request fails with `invalidParams`.
 - The fork keeps the history up to that message.
+- With or without this object, the forked session runs once the response arrives, so the client can prompt it without `session/load` or `session/resume`.
+  A later load replays its history into it, and a later resume returns it. A load or resume with other settings (`cwd`, MCP servers, additional directories, or the session options in `_meta`) restarts it, as for any loaded session.
 
 ## Presentation hints
 

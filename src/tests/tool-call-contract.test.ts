@@ -179,6 +179,36 @@ describe("the ACP tool call contract", () => {
     expect(both.call.title).toBe('grep "a" /p');
   });
 
+  it("reads the Grep -l and -c flags like output_mode", () => {
+    expect(report(air, "Grep", { pattern: "a", "-c": true }).call.title).toBe('grep -c "a"');
+    expect(report(air, "Grep", { pattern: "a", "-l": "true" }).call.title).toBe('grep -l "a"');
+    const both = report(air, "Grep", { pattern: "a", "-c": true, output_mode: "content" });
+    expect(both.call.title).toBe('grep "a"');
+  });
+
+  it("reads the Bash command_description alias like description", () => {
+    const { call } = report(terminalAir, "Bash", {
+      command: "ls",
+      command_description: "List files",
+    });
+    expect(call).toMatchObject({
+      title: "ls",
+      _meta: { jetbrains: { air: { commandTitle: "List files" } } },
+    });
+
+    const plain = report(plainAir, "Bash", { command: "ls", command_description: "List files" });
+    expect(plain.call.content).toEqual([
+      { type: "content", content: { type: "text", text: "List files" } },
+    ]);
+
+    const both = report(terminalAir, "Bash", {
+      command: "ls",
+      description: "Canonical",
+      command_description: "Alias",
+    });
+    expect(both.call._meta).toMatchObject({ jetbrains: { air: { commandTitle: "Canonical" } } });
+  });
+
   it("keeps the Read error text for AIR", () => {
     const { updates } = report(
       terminalAir,

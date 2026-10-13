@@ -5,7 +5,7 @@
  * schema, so a malformed v2 message fails the test.
  */
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,7 +26,8 @@ import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
-import { v2SessionUpdate } from "../v2/session-update.js";
+import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
 import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
 
@@ -590,6 +591,62 @@ function result(options: Options, overrides: Record<string, unknown> = {}) {
   };
 }
 
+/** A complete assistant message that calls the tool `name`, for the main conversation or a subagent. */
+function toolUseMessage(
+  options: Options,
+  id: string,
+  name: string,
+  input: Record<string, unknown>,
+  parent: string | null = null,
+) {
+  return {
+    type: "assistant",
+    message: {
+      id: `msg_${id}`,
+      type: "message",
+      role: "assistant",
+      model: "claude-sonnet-4-6",
+      content: [{ type: "tool_use", id, name, input }],
+      stop_reason: "tool_use",
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+    parent_tool_use_id: parent,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+/** The result of a tool call, with the SDK's `tool_result_meta` sidecar when it stamps one. */
+function toolResultMessage(
+  options: Options,
+  id: string,
+  fields: Record<string, unknown>,
+  nonExecutionKind?: string,
+) {
+  return {
+    type: "user",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content: "result", ...fields }],
+    },
+    ...(nonExecutionKind
+      ? { tool_result_meta: [{ id, non_execution_kind: nonExecutionKind }] }
+      : {}),
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: options.sessionId,
+  };
+}
+
+/** How a result ends work that an interrupt stopped while a tool ran. */
+const ABORTED_TOOLS = {
+  subtype: "error_during_execution",
+  is_error: true,
+  stop_reason: null,
+  terminal_reason: "aborted_tools",
+};
+
 /** The turn of a session as the client saw it: messages, states, and notices. */
 function turnTrace(updates: v2.UpdateSessionNotification[]): string[] {
   return updates.flatMap(({ update }) => {
@@ -863,6 +920,139 @@ describe("ACP v2 prompts", () => {
     expect(client.updates("tool_call_update")).toContainEqual(
       expect.objectContaining({ toolCallId: "toolu_w", title: "Write a.ts", content: [] }),
     );
+  });
+
+  it("replays a subagent's history to its own session, and clears each replayed message there first", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // Claude Code keeps the subagent's history in its own transcript, beside
+      // the session's, with a metadata file that names its launch.
+      const project = path.join(tempDir, "claude", "projects", "-project");
+      const subagents = path.join(project, sessionId, "subagents");
+      await mkdir(subagents, { recursive: true });
+      const entry = (uuid: string, parentUuid: string | null, message: unknown, sidechain = true) =>
+        JSON.stringify({
+          type: (message as { role: string }).role,
+          uuid,
+          parentUuid,
+          sessionId,
+          cwd,
+          version: "2.0.0",
+          isSidechain: sidechain,
+          ...(sidechain ? { agentId: "abc123" } : {}),
+          userType: "external",
+          timestamp: "2026-09-24T00:00:00.000Z",
+          message,
+        });
+      await writeFile(
+        path.join(project, `${sessionId}.jsonl`),
+        entry("r1", null, { role: "user", content: "Explore it" }, false) + "\n",
+      );
+      await writeFile(
+        path.join(subagents, "agent-abc123.jsonl"),
+        [
+          entry("c1", null, { role: "user", content: "Look around" }),
+          entry("c2", "c1", {
+            id: "msg_child",
+            role: "assistant",
+            model: "claude-haiku-4-5",
+            content: [{ type: "text", text: "Child report." }],
+          }),
+        ].join("\n") + "\n",
+      );
+      await writeFile(
+        path.join(subagents, "agent-abc123.meta.json"),
+        JSON.stringify({ agentType: "Explore", name: "scout", toolUseId: "toolu_agent" }),
+      );
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_agent",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent",
+              name: "Agent",
+              input: { name: "scout", subagent_type: "Explore", prompt: "Look around" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_agent", content: "Found it." }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
+      sessionId === "abc123" ? [update] : [],
+    );
+    expect(child).toEqual([
+      { sessionUpdate: "state_update", state: "running" },
+      expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
+      // The client may still hold the child's message, so the replay clears it.
+      { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
+      expect.objectContaining({
+        sessionUpdate: "agent_message_chunk",
+        messageId: "msg_child",
+        content: text("Child report.")[0],
+      }),
+      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+    ]);
+  });
+
+  it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_plan",
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_plan",
+              name: "ExitPlanMode",
+              // The transcript keeps the plan that Claude Code adds to the input.
+              input: { plan: "# Plan\n1. Do it", planFilePath: "/plans/p.md" },
+            },
+          ],
+        }),
+        transcriptEntry("user", randomUUID(), {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_plan",
+              content: "User has approved your plan. You can now start coding.",
+            },
+          ],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("plan_update")).toEqual([
+      {
+        sessionUpdate: "plan_update",
+        plan: { type: "markdown", planId: "plan-mode", content: "# Plan\n1. Do it" },
+      },
+    ]);
   });
 
   it("reports Claude Code's warnings as live notices", async () => {
@@ -1342,6 +1532,133 @@ describe("ACP v2 prompts", () => {
     expect(statuses.at(-1)).toBe("cancelled");
   });
 
+  describe("the tool calls that a cancel stops", () => {
+    type Seen = { sessionId: string; update: Record<string, any> };
+
+    /**
+     * Runs a turn that the client cancels once `toolCallId` has an update, and
+     * returns what the client got, and the id of the session. The turn ends
+     * with the idle of that session: a subagent's child session has an idle of
+     * its own, which comes before it.
+     */
+    async function cancelWhileRunning(toolCallId: string) {
+      const client = v2Client();
+      let root = "";
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        ({ sessionId: root } = await agent.request(v2.methods.agent.session.new, { cwd }));
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: root,
+          prompt: text("go"),
+        });
+        await vi.waitFor(() =>
+          expect(client.updates("tool_call_update").some((u) => u.toolCallId === toolCallId)).toBe(
+            true,
+          ),
+        );
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: root });
+        await vi.waitFor(() =>
+          expect(
+            turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === root)),
+          ).toContain("idle cancelled"),
+        );
+        await client.authUpdate(1);
+      });
+      return { root, updates: client.sessionUpdates as unknown as Seen[] };
+    }
+    const idleAt = (root: string, updates: Seen[]) =>
+      updates.findIndex(
+        ({ sessionId, update }) =>
+          sessionId === root && update.sessionUpdate === "state_update" && update.state === "idle",
+      );
+    const lastStatusAt = (updates: Seen[], id: string) =>
+      updates.findLastIndex(({ update }) => update.toolCallId === id && update.status);
+
+    it("ends a stopped tool call and its subagent's as cancelled, before it reports idle cancelled", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      const subagentTask = (
+        options: Options,
+        subtype: string,
+        fields: Record<string, unknown>,
+      ) => ({
+        type: "system",
+        subtype,
+        task_id: "agent-1",
+        tool_use_id: "toolu_agent",
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+        ...fields,
+      });
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_agent", "Agent", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield subagentTask(options, "task_started", {
+          description: "Run a slow command",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield toolUseMessage(options, "toolu_child", "Bash", { command: "make" }, "toolu_agent");
+        await interrupted.promise;
+        // Claude Code stops the subagent, then gives the Agent call a result, in
+        // the stream. It stamps the result `user-rejected`, the kind of a tool
+        // that the user refused, which is `failed`, though the cancel stopped
+        // this one. The subagent's command gets none.
+        yield subagentTask(options, "task_notification", {
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+        });
+        yield toolResultMessage(options, "toolu_agent", { is_error: true }, "user-rejected");
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelWhileRunning("toolu_child");
+
+      // The Agent call ends in the session that made it, with Claude Code's
+      // result and the kind that it stamped. The subagent's command ends in the
+      // child's session, whose own idle came first.
+      const idle = idleAt(root, updates);
+      const agentEnd = lastStatusAt(updates, "toolu_agent");
+      expect(updates[agentEnd]).toMatchObject({
+        sessionId: root,
+        update: {
+          status: "cancelled",
+          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
+        },
+      });
+      const childEnd = lastStatusAt(updates, "toolu_child");
+      expect(updates[childEnd]).toMatchObject({
+        sessionId: "agent-1",
+        update: { status: "cancelled" },
+      });
+      expect(agentEnd).toBeLessThan(idle);
+      expect(childEnd).toBeLessThan(idle);
+    });
+
+    it("ends a tool call that finished as the cancel landed as completed, not cancelled", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield toolUseMessage(options, "toolu_bash", "Bash", { command: "make" });
+        await interrupted.promise;
+        yield toolResultMessage(options, "toolu_bash", {});
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelWhileRunning("toolu_bash");
+
+      const at = lastStatusAt(updates, "toolu_bash");
+      expect(updates[at]).toMatchObject({ update: { status: "completed" } });
+      expect(at).toBeLessThan(idleAt(root, updates));
+    });
+  });
+
   it("reports a tool call that Claude dropped before it ran as cancelled", async () => {
     scriptTurns(async function* (options) {
       // Claude starts a tool_use, but no complete assistant message holds it,
@@ -1622,6 +1939,39 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
       usage: { inputTokens: 7, outputTokens: 4, totalTokens: 11 },
       _meta: { quota: { token_count: { inputTokens: 7, outputTokens: 4, totalTokens: 11 } } },
     });
+  });
+
+  it("ends the tool call that a cancelled cycle runs with Claude Code's result, before idle cancelled", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      // Claude Code's follow-up runs a command.
+      yield toolUseMessage(options, "toolu_cycle", "Bash", { command: "make" });
+      await interrupted.promise;
+      yield toolResultMessage(options, "toolu_cycle", { is_error: true }, "user-rejected");
+      yield followupResult(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(client.updates("tool_call_update").some((u) => u.toolCallId === "toolu_cycle")).toBe(
+          true,
+        ),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    const updates = client.sessionUpdates.map(({ update }) => update) as Array<Record<string, any>>;
+    const at = updates.findLastIndex((u) => u.toolCallId === "toolu_cycle" && u.status);
+    expect(updates[at]).toMatchObject({ status: "cancelled" });
+    const cycleIdle = updates.findLastIndex(
+      (u) => u.sessionUpdate === "state_update" && u.state === "idle",
+    );
+    expect(updates[cycleIdle]).toMatchObject({ stopReason: "cancelled" });
+    expect(at).toBeLessThan(cycleIdle);
   });
 
   it("ends a cycle that the client cancels with idle cancelled", async () => {
@@ -2539,6 +2889,85 @@ describe("ACP v2 requests that subagents make", () => {
     });
   }
 
+  it("reports a subagent as a child session, with its work state also on the child's stream", async () => {
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_agent",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent-1",
+              name: "Agent",
+              input: { description: "Explore the project", prompt: "Look around" },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield taskStarted(options, "agent-1", { prompt: "Look around" });
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "failed", error: "The model is overloaded" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = await promptToIdle(v2Client());
+
+    const root = client.sessionUpdates.find(
+      ({ update }) => update.sessionUpdate === "user_message",
+    )!.sessionId;
+    const traffic = client.sessionUpdates.flatMap(({ sessionId, update }) => {
+      const on = sessionId === root ? "root" : sessionId;
+      if (update.sessionUpdate === "subagent_update") {
+        const state = update.state as { state: string; stopReason?: string } | undefined;
+        return [
+          `${on} subagent_update ${update.sessionId} ${state?.state} ${state?.stopReason ?? ""}`,
+        ];
+      }
+      if (sessionId === root) return [];
+      if (update.sessionUpdate === "state_update") {
+        const { state, stopReason } = update as { state: string; stopReason?: string };
+        return [`${on} state_update ${state} ${stopReason ?? ""}`];
+      }
+      return [`${on} ${update.sessionUpdate}`];
+    });
+    // The announcement comes first, and each state reaches the parent, then
+    // the child.
+    expect(traffic).toEqual([
+      "root subagent_update agent-1 running ",
+      "agent-1 state_update running ",
+      "agent-1 session_message",
+      "root subagent_update agent-1 idle error",
+      "agent-1 state_update idle error",
+    ]);
+    expect(
+      client.sessionUpdates.filter(
+        ({ sessionId, update }) =>
+          sessionId === "agent-1" && update.sessionUpdate === "state_update",
+      )[1].update,
+    ).toEqual({
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: { code: -32603, message: "The model is overloaded" },
+    });
+  });
+
   it("keeps the turn running while a background subagent's request is open", async () => {
     turnWithRequest([["agent-1", { is_backgrounded: true }]], "agent-1");
     const client = await promptToIdle(v2Client());
@@ -2932,6 +3361,63 @@ describe("ACP v2 session translation", () => {
     ).toThrow("does not translate subagent_state_update session updates yet");
   });
 
+  it("passes the subagent updates through, which v1 and v2 share", () => {
+    const announcement = {
+      sessionUpdate: "subagent_update" as const,
+      sessionId: "agent-1",
+      title: "Explore",
+      description: "Look around",
+      state: { state: "running" as const },
+    };
+    expect(v2SessionUpdate(announcement)).toEqual(announcement);
+    const message = {
+      sessionUpdate: "session_message" as const,
+      messageId: "toolu_agent",
+      senderSessionId: "root",
+      recipientSessionId: "agent-1",
+      content: text("Look around"),
+    };
+    expect(v2SessionUpdate(message)).toEqual(message);
+    const chunk = {
+      sessionUpdate: "session_message_chunk" as const,
+      messageId: "m",
+      content: text("Look")[0],
+    };
+    expect(v2SessionUpdate(chunk)).toEqual(chunk);
+  });
+
+  it("reports a subagent's work state on the child's stream as well", () => {
+    const failed = {
+      state: "idle" as const,
+      stopReason: "error" as const,
+      error: { code: -32603, message: "Overloaded" },
+    };
+    expect(
+      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", state: failed }),
+    ).toEqual({ sessionId: "agent-1", update: { sessionUpdate: "state_update", ...failed } });
+    // An update of the association that reports no state has no copy.
+    expect(
+      v2ChildStateUpdate({ sessionUpdate: "subagent_update", sessionId: "agent-1", title: "X" }),
+    ).toBeUndefined();
+  });
+
+  it("fails on a subagent state that the subagents RFD does not define", () => {
+    expect(() =>
+      v2SessionUpdate({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-1",
+        state: { state: "_paused" },
+      }),
+    ).toThrow("does not translate the subagent state _paused");
+    expect(() =>
+      v2SessionUpdate({
+        sessionUpdate: "subagent_update",
+        sessionId: "agent-1",
+        state: { state: "idle", stopReason: "_timeout" },
+      }),
+    ).toThrow("the subagent state idle with the stop reason _timeout");
+  });
+
   it("sends compaction updates as they are, which v1 and v2 share", () => {
     const update = {
       sessionUpdate: "compaction_update" as const,
@@ -2956,6 +3442,16 @@ describe("ACP v2 session translation", () => {
       plan: { type: "items", planId: "plan", entries },
       _meta: meta,
     });
+  });
+
+  it("passes the agent's plan operations through, which have v2's shape", () => {
+    const update = {
+      sessionUpdate: "plan_update" as const,
+      plan: { type: "markdown" as const, planId: "plan-mode", content: "# Plan" },
+    };
+    expect(v2SessionUpdate(update)).toEqual(update);
+    const removed = { sessionUpdate: "plan_removed" as const, planId: "plan-mode" };
+    expect(v2SessionUpdate(removed)).toEqual(removed);
   });
 
   it("reports a new tool call with an upserting tool_call_update", () => {
@@ -3141,6 +3637,107 @@ describe("ACP v2 session translation", () => {
     terminals.forget("closed");
     expect(commanded("closed")).toEqual([]);
     expect(commanded("open")).toHaveLength(1);
+  });
+
+  describe("the _meta that the client stores for a tool call", () => {
+    const report = (_meta?: Record<string, unknown>, fields: Record<string, unknown> = {}) => ({
+      toolCallId: "t",
+      ...fields,
+      ...(_meta ? { _meta } : {}),
+    });
+
+    it("gives the tool's name as name, once, and leaves it out of _meta", () => {
+      const meta = new V2ToolCallMeta();
+      expect(meta.apply("s", report({ claudeCode: { toolName: "memory_recall" } }), true)).toEqual({
+        toolCallId: "t",
+        name: "memory_recall",
+      });
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Bash" } }), false)).toEqual({
+        toolCallId: "t",
+      });
+      // A report's own name wins.
+      expect(
+        meta.apply("s", report({ claudeCode: { toolName: "Bash" } }, { name: "Read" }), true),
+      ).toEqual({ toolCallId: "t", name: "Read" });
+    });
+
+    it("sends the earlier claudeCode keys again with a key that changes", () => {
+      const meta = new V2ToolCallMeta();
+      const denial = { toolResponse: { decisionReasonType: "rule" } };
+      expect(meta.apply("s", report({ claudeCode: denial }), true)).toEqual(
+        report({ claudeCode: denial }),
+      );
+      expect(
+        meta.apply("s", report({ claudeCode: { nonExecutionKind: "permission-rule" } }), false),
+      ).toEqual(report({ claudeCode: { ...denial, nonExecutionKind: "permission-rule" } }));
+    });
+
+    it("replaces a claudeCode key whole, and other _meta keys whole", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply(
+        "s",
+        report({ claudeCode: { toolResponse: { elapsedTimeSeconds: 1 } }, flag: { a: 1 } }),
+        true,
+      );
+      expect(
+        meta.apply("s", report({ claudeCode: { toolResponse: { status: "ok" } } }), false),
+      ).toEqual(report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { a: 1 } }));
+      expect(meta.apply("s", report({ flag: { b: 2 } }), false)).toEqual(
+        report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { b: 2 } }),
+      );
+    });
+
+    it("sends no _meta on a report that changes nothing", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(
+        meta.apply(
+          "s",
+          report(
+            { claudeCode: { toolName: "Bash", parentToolUseId: "p" } },
+            { status: "completed" },
+          ),
+          false,
+        ),
+      ).toEqual({ toolCallId: "t", status: "completed" });
+    });
+
+    it("gives a permission request's subject the whole _meta, also when it changes nothing", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(meta.subject("s", report({ claudeCode: { toolName: "Bash" } }))).toEqual(
+        report({ claudeCode: { parentToolUseId: "p" } }),
+      );
+      // Its own keys are stored, since the subject updates the tool call.
+      meta.subject("s", report({ claudeCode: { mcpServer: { name: "docs" } } }));
+      expect(meta.apply("s", report({ claudeCode: { nonExecutionKind: "x" } }), false)).toEqual(
+        report({
+          claudeCode: { parentToolUseId: "p", mcpServer: { name: "docs" }, nonExecutionKind: "x" },
+        }),
+      );
+    });
+
+    it("keeps the tool calls of each session apart, and forgets a closed session's", () => {
+      const meta = new V2ToolCallMeta();
+      const started = { claudeCode: { parentToolUseId: "p" } };
+      meta.apply("closed", report(started), true);
+      meta.apply("open", report(started), true);
+      meta.forget("closed");
+      const failed = report({ claudeCode: { nonExecutionKind: "x" } });
+      expect(meta.apply("closed", failed, false)._meta).toEqual(failed._meta);
+      expect(meta.apply("open", failed, false)._meta).toEqual({
+        claudeCode: { parentToolUseId: "p", nonExecutionKind: "x" },
+      });
+    });
+
+    it("forgets what an earlier tool call with the same id stored, when one starts", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Read" } }), true)).toEqual({
+        toolCallId: "t",
+        name: "Read",
+      });
+    });
   });
 
   it("fails on a permission request without the title that v2 requires", () => {

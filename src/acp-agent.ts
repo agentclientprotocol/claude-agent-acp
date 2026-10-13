@@ -63,8 +63,8 @@ import {
   CanUseTool,
   FastModeDisabledReason,
   FastModeState,
+  filterEscalatingDefaultMode,
   getSessionMessages,
-  getSubagentMessages,
   HookCallback,
   listSessions,
   McpServerConfig,
@@ -79,6 +79,7 @@ import {
   PreToolUseHookInput,
   Query,
   query,
+  resolveSettings,
   SDKAssistantMessageError,
   SDKActiveGoalMessage,
   SDKMessage,
@@ -109,6 +110,7 @@ import {
   asSdkSessionNotification,
   clientSupportsSubagents,
   SubagentAwareSessionCapabilities,
+  subagentForm,
   type SubagentState,
 } from "./acp-subagents.js";
 import {
@@ -118,6 +120,7 @@ import {
   NativeSubagentRuntime,
   nativeSubagentState,
   resumedNativeSubagentId,
+  sendMessageResume,
   sendMessageResumePrompt,
 } from "./native-subagents.js";
 import {
@@ -180,7 +183,17 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
-import { subagentHistory } from "./subagent-history.js";
+import {
+  readSubagentMessages,
+  subagentHistory,
+  subagentLaunchIds,
+  subagentLineage,
+} from "./subagent-history.js";
+import {
+  type ReplayChild,
+  RfdSubagentReplay,
+  replaySubagentTerminalState,
+} from "./subagent-replay.js";
 import {
   readResumedSession,
   readResumedTail,
@@ -271,6 +284,7 @@ import { ClientCapabilities as ToolCallClientCapabilities } from "./tool-calls/c
 import {
   AcpToolCallRenderer,
   isFinalToolCallStatus,
+  type ToolCallUpdate,
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
 import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
@@ -284,9 +298,11 @@ import {
 } from "./utils.js";
 import {
   acceptedPlanToolResult,
+  approvedPlan,
   ExitPlanCoordinator,
   isExitPlanInterruptionResult,
   observeExitPlanToolResults,
+  planModeUpdate,
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
@@ -700,6 +716,11 @@ type Turn = {
    *  background handoff. Intersect with emittedToolCalls at settlement so
    *  tool_result counts even when a presentation hook is still pending. */
   foregroundToolCallIds?: Set<string>;
+  /** Closes the tool calls this turn left open when a cancel ended it. Both
+   *  the consumer and `cancelTurns` can settle a cancelled turn; they share
+   *  this one closing, so each call gets one report and both wait for all of
+   *  them before reporting the cancel. */
+  closingCancelledToolCalls?: Promise<void>;
   /** Local-only slash commands (e.g. `/clear`) return a result without an echo,
    *  so the consumer can't promote them via the replay; it falls back to
    *  promoting the queue head when the result arrives. */
@@ -889,7 +910,10 @@ export type Session = {
   /** Set by a cancel. While it is set, the consumer treats what arrives as the
    *  work the cancel stopped: it drops main-thread `assistant` and `user`
    *  messages (streamed text still goes out), skips results, and starts no
-   *  model cycle. Cleared when the next prompt's turn activates,
+   *  model cycle. Two things still go out: a tool result for a tool call that
+   *  the client holds open, until the client is told that the work ended, and,
+   *  as the turn settles, a report that closes each tool call left without a
+   *  result. Cleared when the next prompt's turn activates,
    *  or when Claude Code starts a model request that serves none of
    *  {@link Session.cancelledPrompts} (see the `status` case of the
    *  consumer), such as its follow-up after a background command finished. */
@@ -1152,6 +1176,13 @@ export type Session = {
    *  not here: Claude abandoned it before it ran. Pruned when the call ends;
    *  the oldest entries are dropped. */
   dispatchedToolCalls?: Set<string>;
+  /** For each open tool call that a subagent made: the Agent/Task call that
+   *  started that subagent. When a cancel ends such a call, the report names
+   *  that parent as the call's other updates do, so that every client form
+   *  routes it with them. It also tells the calls of a background subagent,
+   *  which a cancel leaves open while the subagent keeps running. Pruned when
+   *  the call ends; the oldest entries are dropped. */
+  toolCallParents?: Map<string, string>;
   /** The fields that the client holds for each open tool call, so that a
    *  `tool_call_update` resends only the fields that changed. Created lazily
    *  by {@link toolCallFieldsOf}. */
@@ -1273,6 +1304,9 @@ export type Session = {
   nativeSubagentRuntime?: NativeSubagentRuntime;
   /** Child-aware delivery closure paired with {@link nativeSubagentRuntime}. */
   nativeSubagentDeliver?: (notification: AcpSessionNotification) => Promise<void>;
+  /** The consumer's `closeCancelledToolCalls`, for `cancelTurns`, which settles
+   *  a held or settling turn itself. */
+  closeCancelledToolCalls?: (turn: Turn) => Promise<void>;
   /** Session-owned async task controller. Prompt cancellation intentionally
    *  does not finish it because background work may outlive a prompt. */
   asyncTaskRuntime?: AsyncTaskRuntime;
@@ -1783,42 +1817,6 @@ function sessionListOffset(cursor: string | null | undefined): number {
 function parentToolUseIdOf(message: { parent_tool_use_id?: unknown }): string | null {
   if (!("parent_tool_use_id" in message)) return null;
   return typeof message.parent_tool_use_id === "string" ? message.parent_tool_use_id : null;
-}
-
-/** The ids of the Agent and Task tool uses in the content of a message. */
-function subagentLaunchIds(content: unknown): string[] {
-  if (!Array.isArray(content)) return [];
-  return content.flatMap((block) =>
-    typeof block === "object" &&
-    block !== null &&
-    block.type === "tool_use" &&
-    typeof block.id === "string" &&
-    isNativeSubagentControlTool(block.name)
-      ? [block.id as string]
-      : [],
-  );
-}
-
-function replaySubagentTerminalState(
-  block: Record<string, unknown>,
-): "completed" | "failed" | "cancelled" {
-  if (block.is_error !== true) return "completed";
-  const text = replayContentText(block.content).toLowerCase();
-  return /\b(?:cancelled|canceled|interrupted|stopped|killed)\b/.test(text)
-    ? "cancelled"
-    : "failed";
-}
-
-function replayContentText(value: unknown, seen = new Set<unknown>()): string {
-  if (typeof value === "string") return value;
-  if (typeof value !== "object" || value === null || seen.has(value)) return "";
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((item) => replayContentText(item, seen)).join(" ");
-  const record = value as Record<string, unknown>;
-  return [record.text, record.content, record.message]
-    .map((item) => replayContentText(item, seen))
-    .filter(Boolean)
-    .join(" ");
 }
 
 function stripSubagentTextAndThinking(content: unknown): unknown {
@@ -2587,6 +2585,12 @@ export class ClaudeAcpAgent {
   /** Last auth identity reported to the client, connection-scoped like
    *  `authenticate`/`logout`. Undefined means "not determined yet". */
   currentAuthStatus?: AuthStatus;
+  private authStatusSettings?: {
+    manager: SettingsManager;
+    override?: Settings;
+    env?: Options["env"];
+  };
+  private authStatusHelper?: string;
   /** In-flight `claude auth status --json` probe, shared by every caller so
    *  a concurrent `initialize` and start-of-prompt read never spawn two CLI
    *  processes. */
@@ -2663,6 +2667,7 @@ export class ClaudeAcpAgent {
       },
       applyFastMode: (session, enabled) => this.applyFastMode(session, enabled),
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
+      supportsPlanOperations: () => this.clientCapabilities?.plan != null,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
@@ -2824,6 +2829,8 @@ export class ClaudeAcpAgent {
       }
     }
 
+    // The subagents RFD has only the client capability. AIR's draft also had
+    // this agent capability, which AIR gets (`docs/air-extensions.md`).
     const sessionCapabilities: SubagentAwareSessionCapabilities = {
       additionalDirectories: {},
       close: {},
@@ -2831,7 +2838,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
-      subagents: {},
+      ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
     return {
@@ -2975,13 +2982,29 @@ export class ClaudeAcpAgent {
     };
   }
 
+  /**
+   * Copies the session's transcript into a new session, then starts that
+   * session, so the client can prompt it as soon as the response arrives, as
+   * the schema requires of a fork. It starts like a resumed session: from the
+   * copied transcript, with the model and the permission mode it records. A
+   * later load or resume with the same settings reuses it.
+   */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     if (this.providerUpdate) await this.providerUpdate;
-    return forkSession(params, {
+    const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+    const { modes, configOptions } = await this.getOrCreateSession({
+      sessionId,
+      cwd: params.cwd,
+      mcpServers: params.mcpServers,
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    });
+    this.afterSetupResponse(sessionId, params.mcpServers ?? []);
+    return { sessionId, modes, configOptions };
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -3164,7 +3187,31 @@ export class ClaudeAcpAgent {
    * under an apiKeyHelper) means "nothing to add", not "logged out" — keep
    * what the CLI probe already established instead of overwriting it.
    */
-  private publishSessionAccountIdentity(account: AccountInfo | undefined): void {
+  private useAuthStatusSettings(
+    manager: SettingsManager,
+    settingsOverride?: Settings,
+    launchEnv?: Options["env"],
+  ): void {
+    const helper = manager.getApiKeyHelper(settingsOverride);
+    const changed =
+      manager.getCwd() !== (this.authStatusSettings?.manager.getCwd() ?? process.cwd()) ||
+      helper !== this.authStatusHelper ||
+      JSON.stringify(launchEnv) !== JSON.stringify(this.authStatusSettings?.env);
+    this.authStatusSettings = { manager, override: settingsOverride, env: launchEnv };
+    this.authStatusHelper = helper;
+    if (changed) {
+      // The epoch bump discards any probe that read the old context, and the
+      // session account may carry no identity signal (an apiKeyHelper), so
+      // only a probe in the new context can classify it.
+      this.authEpoch += 1;
+      void this.probeCliAuthStatus({ fresh: true });
+    }
+  }
+
+  private publishSessionAccountIdentity(
+    account: AccountInfo | undefined,
+    apiKeyHelper?: string,
+  ): void {
     if (this.providerConfig) {
       if (!this.loggedOverriddenAccount) {
         this.loggedOverriddenAccount = true;
@@ -3177,7 +3224,7 @@ export class ClaudeAcpAgent {
     if (this.gatewayAuthRequest) {
       return;
     }
-    const fromSession = fromAccountInfo(account);
+    const fromSession = fromAccountInfo(account, apiKeyHelper);
     if (fromSession) {
       this.setAuthStatus(fromSession);
     } else if (!this.loggedUninformativeAccount) {
@@ -3211,6 +3258,8 @@ export class ClaudeAcpAgent {
     // auth-affecting event describes a world that no longer exists. Remember
     // which one this read belongs to and drop the answer if it moved on.
     const epoch = this.authEpoch;
+    const context = this.authStatusSettings;
+    const apiKeyHelper = context?.manager.getApiKeyHelper(context.override);
     // ACP gateway auth bypasses the CLI credential store entirely, so the
     // probe would report an identity that is not the one being used. A mere
     // client provider override (`providers/set`) does NOT skip the probe: it
@@ -3222,8 +3271,12 @@ export class ClaudeAcpAgent {
     let stdout: string;
     try {
       const cliPath = await claudeCliPath();
-      ({ stdout } = await execFileAsync(cliPath, ["auth", "status", "--json"], {
+      const args = ["auth", "status", "--json"];
+      if (context?.override) args.push("--settings", JSON.stringify(context.override));
+      ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
+        cwd: context?.manager.getCwd() ?? process.cwd(),
+        env: context?.env ? { ...process.env, ...context.env } : process.env,
       }));
     } catch (error) {
       const failed = error as { stdout?: unknown; killed?: boolean; signal?: unknown } | null;
@@ -3250,7 +3303,15 @@ export class ClaudeAcpAgent {
       }
       stdout = failed.stdout;
     }
-    const status = fromCliStatus(stdout);
+    let status = fromCliStatus(stdout, apiKeyHelper);
+    if (!context && status?.kind === "api_key" && status.detail === "API key helper") {
+      try {
+        const resolved = await resolveSettings({ cwd: process.cwd() });
+        status = fromCliStatus(stdout, filterEscalatingDefaultMode(resolved).apiKeyHelper);
+      } catch {
+        this.logger.error("Could not resolve auth source settings");
+      }
+    }
     if (!status) {
       this.logger.error("claude auth status returned unparseable output");
       return undefined;
@@ -3551,6 +3612,11 @@ export class ClaudeAcpAgent {
     // that finds the new credential must not be the one the refusal skipped.
     // The guard itself consumes the result only at the next turn boundary (see
     // `markSessionsWhoseAccountKindChanged`).
+    this.useAuthStatusSettings(
+      session.settingsManager,
+      session.effortSettingsOverride,
+      (session.creationParams?._meta as NewSessionMeta | undefined)?.claudeCode?.options?.env,
+    );
     void this.probeCliAuthStatus();
     const signOutRespawn = this.respawnSignedOutSession(params.sessionId, session);
     if (signOutRespawn) session = await signOutRespawn;
@@ -3854,7 +3920,11 @@ export class ClaudeAcpAgent {
       logger: this.logger,
       // The guard reads the account anyway; reuse that read to keep the
       // reported identity current, refusal or not.
-      onAccount: (account) => this.publishSessionAccountIdentity(account),
+      onAccount: (account) =>
+        this.publishSessionAccountIdentity(
+          account,
+          session.settingsManager.getApiKeyHelper(session.effortSettingsOverride),
+        ),
     });
   }
 
@@ -4155,11 +4225,12 @@ export class ClaudeAcpAgent {
      *  stamps from `parent_tool_use_id`, and never reach the top-level feed
      *  as the turn's answer. */
     const subagents = (session.nativeSubagentRuntime ??= new NativeSubagentRuntime(
-      clientSupportsSubagents(this.clientCapabilities),
+      subagentForm(this.clientCapabilities),
       params.sessionId,
       session,
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
+      (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
@@ -4208,6 +4279,22 @@ export class ClaudeAcpAgent {
       const eagerOwnerSessionId = toolCallId
         ? session.eagerToolCallSessions?.get(toolCallId)
         : undefined;
+      // Before routing, which can buffer or drop the update: a cancel still has
+      // to know the parent of a call that is open here. A later update can be
+      // the first to name it, for a call that a permission request emitted.
+      if (
+        toolCallId &&
+        update.sessionUpdate === "tool_call_update" &&
+        isFinalToolCallStatus(update.status)
+      ) {
+        session.toolCallParents?.delete(toolCallId);
+      } else if (
+        toolCallId &&
+        claudeMeta?.parentToolUseId &&
+        session.emittedToolCalls.has(toolCallId)
+      ) {
+        recordToolCallParent(session, toolCallId, claudeMeta.parentToolUseId);
+      }
       const routedNotification = await subagents.route(
         notification,
         sendUpdate,
@@ -4846,6 +4933,107 @@ export class ClaudeAcpAgent {
       }
     };
 
+    /** Sends `report`, which ends the tool call `toolCallId` without its result
+     *  (see `AcpToolCallRenderer.unfinished`), and forgets the call. Forgetting
+     *  comes first, so that a late hook or a second close cannot overwrite the
+     *  report. */
+    const closeToolCall = async (toolCallId: string, report: ToolCallUpdate) => {
+      unregisterHookCallback(toolCallId);
+      session.emittedToolCalls.delete(toolCallId);
+      delete session.toolUseCache[toolCallId];
+      session.toolCallFields?.delete(toolCallId);
+      session.dispatchedToolCalls?.delete(toolCallId);
+      session.toolCallParents?.delete(toolCallId);
+      await sendUpdate({ sessionId: params.sessionId, update: report });
+    };
+
+    /** Whether the subagent that the Agent call `agentToolUseId` started runs in
+     *  the background and has not ended. */
+    const runsInBackground = (agentToolUseId: string): boolean =>
+      [...session.liveBackgroundTasks.values()].some(
+        (task) =>
+          task.isSubagent &&
+          task.backgrounded === true &&
+          !task.endedPerLevel &&
+          task.parentToolUseId === agentToolUseId,
+      );
+
+    /** Closes the tool calls that the work a cancel stopped left open, as that
+     *  work ends. Claude Code's interrupt ends each running tool of the main
+     *  conversation with an error result, which `sendInterruptedToolResults`
+     *  delivers. What is still open here has no result to deliver:
+     *  - a tool of a subagent: Claude Code writes its interrupted result only to
+     *    the subagent's own transcript, not to the stream;
+     *  - a tool call that Claude abandoned before it ran;
+     *  - every tool call, when the stream gives no results at all, as when the
+     *    force-cancel backstop ends a wedged turn.
+     *  A foreground subagent ends with the work that waits on it. A background
+     *  subagent keeps its tool calls open until the SDK reports its end, which
+     *  Claude Code 2.1.293 does for the ones it stops, before the turn's result
+     *  (see `NativeSubagentRuntime.parentCancelled`).
+     *  Runs once per turn: a second call, from the other settling path, waits
+     *  for the first (see `Turn.closingCancelledToolCalls`). */
+    const closeCancelledToolCalls = (turn: Turn): Promise<void> =>
+      (turn.closingCancelledToolCalls ??= (async () => {
+        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+        for (const toolCallId of [...session.emittedToolCalls]) {
+          const parentToolUseId = session.toolCallParents?.get(toolCallId);
+          if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
+          const report = renderer.unfinished({
+            toolCallId,
+            ran: session.dispatchedToolCalls?.has(toolCallId) === true,
+            cancelled: true,
+          });
+          // Named as the call's other updates are: the subagent runtime routes the
+          // report with them, to the child session, or to none that has ended.
+          if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
+          await closeToolCall(toolCallId, report);
+        }
+      })());
+    session.closeCancelledToolCalls = closeCancelledToolCalls;
+
+    /** Delivers the results that the work a cancel stopped sends for tool calls
+     *  that the client holds open. Claude Code's interrupt ends each running tool
+     *  of the main conversation with an error result, before the result that
+     *  ends the turn. The tool call gets that result like any other, so its
+     *  final status and `nonExecutionKind` reach the client. Nothing else of the
+     *  message is applied: the other effects of a tool result (async tasks, plan
+     *  state, the ExitPlanMode flow) belong to the stopped work, which stays
+     *  dropped. */
+    const sendInterruptedToolResults = async (message: Extract<SDKMessage, { type: "user" }>) => {
+      const content = message.message.content;
+      if (!Array.isArray(content)) return;
+      const results = content.filter(
+        (block) => block.type === "tool_result" && session.emittedToolCalls.has(block.tool_use_id),
+      );
+      if (results.length === 0) return;
+      const resultCount = content.filter((block) => block.type === "tool_result").length;
+      for (const notification of toAcpNotifications(
+        results,
+        "user",
+        params.sessionId,
+        session.toolUseCache,
+        routedNotificationClient,
+        this.logger,
+        {
+          clientCapabilities: this.clientCapabilities,
+          toolCallCapabilities: this.toolCallCapabilities,
+          parentToolUseId: message.parent_tool_use_id,
+          cwd: session.cwd,
+          taskState: session.taskState,
+          emittedToolCalls: session.emittedToolCalls,
+          toolCallFields: toolCallFieldsOf(session),
+          messageId: messageIdForGrouping(message),
+          // `tool_use_result` describes the one result of its message.
+          toolUseResult: results.length === resultCount ? message.tool_use_result : undefined,
+          toolResultMeta: (message as { tool_result_meta?: unknown }).tool_result_meta,
+          cancelled: true,
+        },
+      )) {
+        await sendUpdate(notification);
+      }
+    };
+
     /** At the actual turn boundary, preview its checkpoint, settle the active
      *  turn exactly once, disarm the force-cancel backstop, and drop it from
      *  the queue. Cancellation and provider failures skip checkpoint I/O. */
@@ -4878,16 +5066,7 @@ export class ClaudeAcpAgent {
          * ended meanwhile.
          */
         const closeUnfinished = async (toolCallId: string, ran: boolean): Promise<boolean> => {
-          // A late hook must not overwrite the report we are about to send.
-          unregisterHookCallback(toolCallId);
-          session.emittedToolCalls.delete(toolCallId);
-          delete session.toolUseCache[toolCallId];
-          session.toolCallFields?.delete(toolCallId);
-          session.dispatchedToolCalls?.delete(toolCallId);
-          await sendUpdate({
-            sessionId: params.sessionId,
-            update: renderer.unfinished({ toolCallId, ran }),
-          });
+          await closeToolCall(toolCallId, renderer.unfinished({ toolCallId, ran }));
           // Cancellation can arrive while we await the client update.
           if (turn.settled || session.activeTurn !== turn) return false;
           if (session.cancelled) {
@@ -4924,6 +5103,14 @@ export class ClaudeAcpAgent {
           );
           return;
         }
+      }
+      // The client is told that the work a cancel stopped ended (the prompt
+      // response on v1, `idle` on v2) only after every tool call that work
+      // opened has ended.
+      if (result.stopReason === "cancelled" && session.cancelled) {
+        await closeCancelledToolCalls(turn);
+        // `cancelTurns` can settle the turn while the reports are in flight.
+        if (turn.settled || session.activeTurn !== turn) return;
       }
       turn.settling = true;
       turn.settlingOutcome = result;
@@ -5913,6 +6100,10 @@ export class ClaudeAcpAgent {
                   );
                   break;
                 }
+                // In the RFD form, a resumed child runs under the call that
+                // resumed it, and the end of an earlier delegation ends
+                // nothing: the child and its live task belong to the new run.
+                if (subagents.isStaleEnd(message.task_id, message.tool_use_id)) break;
                 // The task settled — no further tool calls can originate
                 // from it, so its registry entry can be dropped.
                 await subagents.finishTask(
@@ -5920,6 +6111,7 @@ export class ClaudeAcpAgent {
                   message.status,
                   sendUpdate,
                   message.tool_use_id,
+                  { reason: message.reason },
                 );
                 await asyncTasks.taskNotification({
                   task_id: message.task_id,
@@ -5962,7 +6154,13 @@ export class ClaudeAcpAgent {
                   message.patch.status === "failed" ||
                   message.patch.status === "killed"
                 ) {
-                  await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);
+                  await subagents.finishTask(
+                    message.task_id,
+                    message.patch.status,
+                    sendUpdate,
+                    undefined,
+                    { error: message.patch.status === "failed" ? message.patch.error : undefined },
+                  );
                   const parentToolUseId = session.liveBackgroundTasks.get(
                     message.task_id,
                   )?.parentToolUseId;
@@ -7056,11 +7254,14 @@ export class ClaudeAcpAgent {
                 }
               }
             }
+            // The stream sees a tool_use first, so the tool's PostToolUse hook
+            // is registered here, and publishes through this client: a
+            // subagent's hook update must reach the child session too.
             for (const notification of streamEventToAcpNotifications(
               message,
               params.sessionId,
               session.toolUseCache,
-              this.client,
+              routedNotificationClient,
               this.logger,
               {
                 clientCapabilities: this.clientCapabilities,
@@ -7201,6 +7402,13 @@ export class ClaudeAcpAgent {
             }
 
             if (session.cancelled) {
+              // The work the cancel stopped ends its tools with error results.
+              // Until the client is told that the work ended, they close the
+              // tool calls it opened. Everything else that work sends is
+              // dropped, and so is everything after that report.
+              if (message.type === "user" && !this.workEndReported(params.sessionId, session)) {
+                await sendInterruptedToolResults(message);
+              }
               break;
             }
 
@@ -7425,20 +7633,26 @@ export class ClaudeAcpAgent {
               );
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
-                resumeLiveTask(resumedAgentId);
-                await subagents.taskResumed(
+                const resume = sendMessageResume(
+                  session.toolUseCache,
                   resumedAgentId,
-                  sendUpdate,
-                  sendMessageResumePrompt(
-                    session.toolUseCache,
-                    resumedAgentId,
-                    Array.isArray(content)
-                      ? content.flatMap((block) =>
-                          block.type === "tool_result" ? [block.tool_use_id] : [],
-                        )
-                      : [],
-                  ),
+                  Array.isArray(content)
+                    ? content.flatMap((block) =>
+                        block.type === "tool_result" ? [block.tool_use_id] : [],
+                      )
+                    : [],
                 );
+                // In the RFD form the result can arrive after the run it
+                // started ended, and then resumes nothing.
+                if (!subagents.isEndedDelegation(resumedAgentId, resume?.toolUseId)) {
+                  resumeLiveTask(resumedAgentId);
+                  await subagents.sendMessageResumed(
+                    resumedAgentId,
+                    sendUpdate,
+                    resume?.text,
+                    resume?.toolUseId,
+                  );
+                }
               }
             }
 
@@ -7504,13 +7718,18 @@ export class ClaudeAcpAgent {
             if (toolCallId === null || !session.emittedToolCalls.has(toolCallId)) {
               break;
             }
-            const subagentParentToolUseId = message.parent_tool_use_id
-              ? [...session.liveBackgroundTasks.values()].some(
-                  (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
-                )
+            // The beat is in the subagent whose Agent call is
+            // `parent_tool_use_id`, unless it reports on that Agent call
+            // itself: the Agent call's own heartbeat falls back to its id, and
+            // a tool call is never its own parent.
+            const subagentParentToolUseId =
+              message.parent_tool_use_id &&
+              message.parent_tool_use_id !== toolCallId &&
+              [...session.liveBackgroundTasks.values()].some(
+                (task) => task.isSubagent && task.parentToolUseId === message.parent_tool_use_id,
+              )
                 ? message.parent_tool_use_id
-                : undefined
-              : undefined;
+                : undefined;
             // `tool_name` names the tool that reports the beat. When the beat
             // falls back to the parent call, AIR gets the name of that call,
             // or no name. Every other client gets `tool_name`, like upstream.
@@ -7755,9 +7974,18 @@ export class ClaudeAcpAgent {
     // their compaction is running. Close it before ANY cancelled prompt
     // resolves, not just the active-turn idle/backstop paths.
     await session.contextCompaction?.interrupt();
+    // A cancel drops the state of each tool call (the session that a
+    // permission request emitted it in, the fields the client holds, the hook
+    // callbacks), even when publishing fails. AIR's draft ends every child
+    // here, so a later update of an ended child's tool call is then dropped
+    // instead of reaching that child's session. The RFD form keeps the state:
+    // a background subagent can keep running after a cancel
+    // (agentclientprotocol/agent-client-protocol#2308), and its tool call that
+    // a permission request emitted on the root before the child was announced
+    // must stay on the root, which the RFD requires. Each tool call drops its
+    // own state when it ends.
     try {
-      await session.nativeSubagentRuntime?.finishAll(
-        "cancelled",
+      await session.nativeSubagentRuntime?.parentCancelled(
         session.nativeSubagentDeliver ??
           (async (notification) =>
             this.client.sessionUpdate(asSdkSessionNotification(notification))),
@@ -7768,9 +7996,11 @@ export class ClaudeAcpAgent {
         error,
       );
     } finally {
-      session.eagerToolCallSessions?.clear();
-      session.toolCallFields?.clear();
-      clearHookCallbacks(params.sessionId);
+      if (session.nativeSubagentRuntime?.form !== "rfd") {
+        session.eagerToolCallSessions?.clear();
+        session.toolCallFields?.clear();
+        clearHookCallbacks(params.sessionId);
+      }
     }
     // The user messages this cancel abandons while Claude Code may still have
     // them queued: they are dropped from its queue before the interrupt.
@@ -7893,7 +8123,8 @@ export class ClaudeAcpAgent {
     // permission request) is left to that cycle's interrupted result, like any
     // live turn, or to the idle when no result comes. The captured outcome
     // preserves usage and metadata (issue #844), while reporter state makes a
-    // late checkpoint response harmless.
+    // late checkpoint response harmless. The turn's open tool calls close
+    // before its response, as in the consumer's settle.
     // Since CLI 2.1.270, Claude Code reports `running` for as long as
     // background agents live, so the session state cannot tell a live
     // followup from a hold. With request markers, a followup is live when one
@@ -7908,7 +8139,10 @@ export class ClaudeAcpAgent {
         (active.settling || (isHeldOpen(active) && !followupLive)) &&
         (active.deferredSettle ?? active.settlingOutcome)
       ) {
+        const closingToolCalls = session.closeCancelledToolCalls?.(active);
         session.fileChangeReporter?.finish(active.fileChangeReport, "cancelled");
+        // Settled before the reports are awaited, so that the consumer, which
+        // keeps running meanwhile, cannot settle the turn a second time.
         active.settled = true;
         // Mirror settleActive's invariants (it is consumer-scoped and
         // unreachable from here): disarm the backstop — none should be
@@ -7940,7 +8174,16 @@ export class ClaudeAcpAgent {
         if (session.lastSessionState !== "idle") {
           session.owedTrailingIdles++;
         }
-        active.resolve(cancelledOutcome(session, active));
+        try {
+          await closingToolCalls;
+        } catch (error) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to publish cancelled tool state`,
+            error,
+          );
+        } finally {
+          active.resolve(cancelledOutcome(session, active));
+        }
       }
     }
 
@@ -8290,8 +8533,13 @@ export class ClaudeAcpAgent {
     const session = replayState();
     // A replay rebuilds the client view, so its plan goes out again.
     if (session?.taskState) forgetPublishedTaskPlan(session.taskState);
+    // A subagent's text replays onto the root only for a client that gets it
+    // there live: one without native subagent sessions that asked for the
+    // flattened transcript. With native sessions the text goes to the child
+    // session, which AIR's replay restores and the RFD form leaves out for now.
     const forwardSubagentText =
-      session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities);
+      !clientSupportsSubagents(this.clientCapabilities) &&
+      (session?.forwardSubagentText ?? supportsSubagentTranscript(this.clientCapabilities));
     const supportsTypedFailures = supportsAirSessionFailures(this.clientCapabilities);
     const activeUsageLimit = supportsTypedFailures ? activeUsageLimitMessage(messages) : undefined;
     const sessionFailures =
@@ -8310,7 +8558,11 @@ export class ClaudeAcpAgent {
           })
         : undefined;
     let replayTurnId: string | undefined;
-    const nativeReplayEnabled = clientSupportsSubagents(this.clientCapabilities);
+    // AIR's draft replays each child under a replay id. A client on the RFD
+    // form gets each child under the session id it had live (see
+    // `RfdSubagentReplay`).
+    const form = subagentForm(this.clientCapabilities);
+    const nativeReplayEnabled = form === "air";
     const replayCompactionUpdates = clientSupportsCompactionUpdates(this.clientCapabilities);
     const replayTerminalStates = new Map<string, "completed" | "failed" | "cancelled">();
     const replayChildren = new Map<
@@ -8444,8 +8696,24 @@ export class ClaudeAcpAgent {
     const subagents =
       nativeReplayEnabled && replayChildren.size > 0
         ? await subagentHistory(sessionId)
-        : { ids: new Map<string, string>() };
+        : { agents: new Map() };
     const replayedSubagents = new Set<string>();
+    const rfdHistory =
+      form === "rfd" &&
+      messages.some(
+        (message) =>
+          subagentLaunchIds((message as { message?: { content?: unknown } }).message?.content)
+            .length > 0,
+      )
+        ? await subagentHistory(sessionId)
+        : { agents: new Map() };
+    const rfdReplay =
+      form === "rfd"
+        ? new RfdSubagentReplay(rfdHistory, (notification) =>
+            this.client.sessionUpdate(asSdkSessionNotification(notification)),
+          )
+        : undefined;
+    rfdReplay?.scan(messages, sessionId);
 
     // History persists no task_started frame, so a background task gets its
     // spawn from the notification of its stop, with the tool call that
@@ -8472,6 +8740,7 @@ export class ClaudeAcpAgent {
     const restoreTaskNotification = async (
       notification: PersistedTaskNotification,
     ): Promise<void> => {
+      if (rfdReplay?.taskNotification(notification.task_id, notification.status)) return;
       const toolUseId = notification.tool_use_id;
       if (!toolUseId) return;
       const child = replayChildren.get(toolUseId);
@@ -8496,7 +8765,8 @@ export class ClaudeAcpAgent {
       await replayAsyncTasks.taskNotification(notification);
     };
 
-    const replayMessage = async (message: SessionMessage): Promise<void> => {
+    /** Replays `message`, from the transcript of `child` when it is set (the RFD form). */
+    const replayMessage = async (message: SessionMessage, child?: ReplayChild): Promise<void> => {
       // A long history is sent in order, but with event-loop turns in between,
       // so other sessions and incoming requests are not starved meanwhile.
       const pause = messageLoopYielder.maybeYield();
@@ -8504,6 +8774,9 @@ export class ClaudeAcpAgent {
       if (pending?.stopped || isReplayHiddenMetaMessage(message)) {
         return;
       }
+      // In the RFD form a child's history comes from its own transcript, so a
+      // subagent message that the session transcript stores inline is skipped.
+      if (rfdReplay && !child && parentToolUseIdOf(message)) return;
       if (
         message.type === "user" &&
         message.parent_tool_use_id === null &&
@@ -8555,13 +8828,15 @@ export class ClaudeAcpAgent {
       // @ts-expect-error - untyped in SDK but we handle all of these
       let content: unknown = message.message.content;
       const parentToolUseId = parentToolUseIdOf(message);
-      const replayTargetSessionId =
-        nativeReplayEnabled && parentToolUseId
+      const replayTargetSessionId = child
+        ? child.sessionId
+        : nativeReplayEnabled && parentToolUseId
           ? await announceReplayChild(parentToolUseId)
           : sessionId;
       if (
         message.type === "assistant" &&
         parentToolUseId &&
+        !child &&
         !nativeReplayEnabled &&
         !forwardSubagentText
       ) {
@@ -8576,6 +8851,9 @@ export class ClaudeAcpAgent {
         }
         // Live, the prompt loop skips this record and the SDK frame reports the stop.
         content = isTaskNotificationRecord(message) ? null : stripLocalCommandMetadata(content);
+        if (content !== null && child && rfdReplay) {
+          content = await rfdReplay.childContent(child, message, content);
+        }
         if (content === null) return;
       } else if (Array.isArray(content)) {
         for (const block of content) {
@@ -8665,28 +8943,42 @@ export class ClaudeAcpAgent {
       if (nativeReplayEnabled && message.type === "assistant") {
         for (const toolUseId of subagentLaunchIds(content)) {
           await announceReplayChild(toolUseId);
-          const agentId = subagents.ids.get(toolUseId);
+          const agentId = subagents.agents.get(toolUseId)?.agentId;
           if (!agentId || replayedSubagents.has(agentId)) continue;
           replayedSubagents.add(agentId);
-          let childMessages: SessionMessage[] = [];
-          try {
-            // With the project directory, the SDK skips its search of every project.
-            // A session opened from another directory falls back to that search.
-            if (subagents.dir) {
-              childMessages = await getSubagentMessages(sessionId, agentId, { dir: subagents.dir });
-            }
-            if (childMessages.length === 0) {
-              childMessages = await getSubagentMessages(sessionId, agentId);
-            }
-          } catch (error) {
-            this.logger.error(`Failed to read the history of subagent ${agentId}:`, error);
-          }
+          const childMessages = await readSubagentMessages(
+            sessionId,
+            agentId,
+            subagents,
+            this.logger,
+          );
           registerLaunches(childMessages);
           for (const childMessage of childMessages) await replayMessage(childMessage);
         }
       }
+      // The RFD form announces a child right after its launch, then sends its
+      // own transcript to it.
+      if (rfdReplay && message.type === "assistant") {
+        for (const toolUseId of subagentLaunchIds(content)) {
+          const launched = rfdReplay.childOfLaunch(toolUseId);
+          if (!launched || launched.announced) continue;
+          await rfdReplay.announce(launched);
+          const childMessages = await readSubagentMessages(
+            sessionId,
+            launched.sessionId,
+            rfdHistory,
+            this.logger,
+          );
+          rfdReplay.scan(childMessages, launched.sessionId);
+          for (const childMessage of childMessages) await replayMessage(childMessage, launched);
+          await rfdReplay.childReplayed(launched, childMessages);
+        }
+      }
     };
     for (const message of messages) await replayMessage(message);
+    if (rfdReplay && !pending?.stopped) {
+      await rfdReplay.finish(clientSupportsNotices(this.clientCapabilities), sessionId);
+    }
 
     if (nativeReplayEnabled && !pending?.stopped) {
       // Claude history persists sidechain messages and Agent/Task tool uses,
@@ -8726,6 +9018,21 @@ export class ClaudeAcpAgent {
   async writeTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
     const response = await this.client.writeTextFile(params);
     return response;
+  }
+
+  /** Runs `request`, a request that `requestSessionId` sends for the session
+   *  `ownerSessionId`. When that is a subagent's child session, the child
+   *  reports that it awaits the user while the request is open (the RFD form,
+   *  see `NativeSubagentRuntime.awaitingUser`). */
+  private withChildAwaitingUser<T>(
+    ownerSessionId: string,
+    requestSessionId: string,
+    request: () => Promise<T>,
+  ): Promise<T> {
+    const runtime = this.sessions[ownerSessionId]?.nativeSubagentRuntime;
+    return runtime && requestSessionId !== ownerSessionId
+      ? runtime.awaitingUser(requestSessionId, request)
+      : request();
   }
 
   /** Mark a client request of the subagent `agentID` (absent for the main
@@ -8882,10 +9189,12 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withPendingUserInput(
-        ownerSessionId,
-        () => raceWithAbort(this.client.requestPermission(params, signal), signal),
-        agentID,
+      return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, () =>
+        this.withPendingUserInput(
+          ownerSessionId,
+          () => raceWithAbort(this.client.requestPermission(params, signal), signal),
+          agentID,
+        ),
       );
     } catch (error) {
       if (signal.aborted) {
@@ -8935,6 +9244,7 @@ export class ClaudeAcpAgent {
       return;
     }
     session.emittedToolCalls.add(toolCallId);
+    if (parentToolUseId) recordToolCallParent(session, toolCallId, parentToolUseId);
     // SandboxNetworkAccess is a permission-only callback, not an executing
     // tool: the SDK does not send a tool_result for its synthetic id.
     if (
@@ -8962,6 +9272,7 @@ export class ClaudeAcpAgent {
       session.emittedToolCalls.delete(toolCallId);
       session.eagerToolCallSessions?.delete(toolCallId);
       session.toolCallFields?.delete(toolCallId);
+      session.toolCallParents?.delete(toolCallId);
       throw error;
     }
   }
@@ -9353,10 +9664,12 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withPendingUserInput(
-        sessionId,
-        () => this.client.createElicitation(createRequest, signal),
-        agentID,
+      response = await this.withChildAwaitingUser(sessionId, requestSessionId, () =>
+        this.withPendingUserInput(
+          sessionId,
+          () => this.client.createElicitation(createRequest, signal),
+          agentID,
+        ),
       );
     } catch (error) {
       // A cancellation we requested (signal aborted) settles as an aborted tool
@@ -10403,6 +10716,8 @@ export class ClaudeAcpAgent {
       prompt: input,
       options,
     });
+    this.useAuthStatusSettings(settingsManager, configuredSettingsObject, userProvidedOptions?.env);
+    const authSettingsEpoch = this.authEpoch;
     timing.phase("prepare-query");
 
     // `query()` spawns the CLI at once. Any throw between here and the
@@ -10428,7 +10743,12 @@ export class ClaudeAcpAgent {
       // Publish the identity BEFORE the guard can refuse this session. A
       // refusal is exactly when the client most needs to know which account it
       // was refused for.
-      this.publishSessionAccountIdentity(initializationResult.account);
+      if (authSettingsEpoch === this.authEpoch) {
+        this.publishSessionAccountIdentity(
+          initializationResult.account,
+          settingsManager.getApiKeyHelper(configuredSettingsObject),
+        );
+      }
 
       // Shared with the per-turn guard, so "warn once" spans the whole session.
       const claudeSubscriptionGuard: ClaudeSubscriptionGuardState = {};
@@ -10671,7 +10991,10 @@ export class ClaudeAcpAgent {
         sessionFailureState:
           creationOpts.replayState?.sessionFailureState ?? createSessionFailureState(),
         claudeSubscriptionGuard,
-        accountKind: fromAccountInfo(initializationResult.account)?.kind,
+        accountKind: fromAccountInfo(
+          initializationResult.account,
+          settingsManager.getApiKeyHelper(configuredSettingsObject),
+        )?.kind,
         fileChangeReporter,
       };
       timing.phase("register");
@@ -11761,6 +12084,19 @@ function shouldEmitToolCall(toolName: string): boolean {
   return toolName !== "TodoWrite" && !isTaskTool(toolName);
 }
 
+const MAX_TOOL_CALL_PARENTS = 1000;
+
+/** Records the Agent/Task call that started the subagent making `toolCallId`. */
+function recordToolCallParent(session: Session, toolCallId: string, parentToolUseId: string): void {
+  const parents = (session.toolCallParents ??= new Map());
+  parents.delete(toolCallId);
+  parents.set(toolCallId, parentToolUseId);
+  if (parents.size > MAX_TOOL_CALL_PARENTS) {
+    const oldest = parents.keys().next().value;
+    if (oldest !== undefined) parents.delete(oldest);
+  }
+}
+
 const MAX_DISPATCHED_TOOL_CALLS = 1000;
 
 /** Records a tool call that Claude Code sent to the tool runner. */
@@ -11893,6 +12229,10 @@ export function toAcpNotifications(
     // untyped in sdk.d.ts) and validated by `parseToolResultMeta`. Stamps
     // denied/interrupted tool_call_updates with why the tool never ran.
     toolResultMeta?: unknown;
+    // True when the content is a result of the work that a `session/cancel`
+    // stopped. An error result then ends a run that the cancel aborted,
+    // whichever kind the SDK stamped on it (see `resultStatus`).
+    cancelled?: boolean;
     // True when the content comes from the history of a loaded session.
     replay?: boolean;
   },
@@ -11938,6 +12278,8 @@ export function toAcpNotifications(
     let update: SessionNotification["update"] | null = null;
     // The tool call that this chunk finishes, if it is a tool result.
     let finishedToolCallId: string | undefined;
+    // The plan that this chunk approves, if it is an ExitPlanMode result.
+    let approvedPlanUpdate: SessionNotification["update"] | undefined;
     switch (chunk.type) {
       case "text":
       case "text_delta": {
@@ -12107,6 +12449,7 @@ export function toAcpNotifications(
                 status: renderer.resultStatus(
                   "is_error" in chunk && chunk.is_error === true,
                   nonExecution,
+                  { cancelled: options?.cancelled },
                 ),
                 rawOutput: chunk.content,
               },
@@ -12142,6 +12485,7 @@ export function toAcpNotifications(
               status: renderer.resultStatus(
                 "is_error" in chunk && chunk.is_error === true,
                 nonExecution,
+                { cancelled: options?.cancelled },
               ),
               rawOutput: chunk.content,
             },
@@ -12197,6 +12541,7 @@ export function toAcpNotifications(
             .result(toolUse, chunk as Parameters<AcpToolCallRenderer["result"]>[1], {
               structured: toolUseResult,
               nonExecution,
+              cancelled: options?.cancelled,
             })
             .reverse();
           for (const outputUpdate of rest.reverse()) {
@@ -12204,6 +12549,20 @@ export function toAcpNotifications(
               stampParentToolUseId(outputUpdate, options.parentToolUseId);
             }
             output.push({ sessionId, update: outputUpdate });
+          }
+          // An approved plan of the main conversation becomes the session's
+          // markdown plan, after the tool call's result. An approval that
+          // clears the context ends the tool with an error result instead, and
+          // the restart into the fresh context publishes that plan (see
+          // ExitPlanCoordinator.restart).
+          if (
+            toolUse.name === "ExitPlanMode" &&
+            options?.clientCapabilities?.plan &&
+            !options.parentToolUseId &&
+            !("is_error" in chunk && chunk.is_error)
+          ) {
+            const plan = approvedPlan(toolUse.input, toolUseResult);
+            if (plan) approvedPlanUpdate = planModeUpdate(plan);
           }
           update = finalUpdate;
         }
@@ -12247,6 +12606,7 @@ export function toAcpNotifications(
         output.push({ sessionId, update });
       }
     }
+    if (approvedPlanUpdate) output.push({ sessionId, update: approvedPlanUpdate });
     if (finishedToolCallId !== undefined) {
       // The PostToolUse hook can still send the final diff, so the fields
       // stay tracked until its callback leaves the registry.

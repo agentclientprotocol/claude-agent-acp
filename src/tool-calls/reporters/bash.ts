@@ -3,15 +3,29 @@ import type { BetaBashCodeExecutionResultBlock } from "@anthropic-ai/sdk/resourc
 import { structuredResult, textContent, toAcpContentUpdate } from "../content.js";
 import type { ToolReporter, ToolResultContext, ToolResultFacts, ToolUseFacts } from "../facts.js";
 
+/**
+ * Reads a Bash or PowerShell input's description the way the CLI validates it.
+ * Since CLI 2.1.295 the CLI accepts `command_description` for `description`.
+ * The streamed tool use keeps the original key. The canonical key wins when
+ * both spellings are present.
+ */
+export function shellDescription(input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const raw = input as Record<string, unknown>;
+  if (typeof raw.description === "string") return raw.description;
+  return typeof raw.command_description === "string" ? raw.command_description : undefined;
+}
+
 /** Bash and PowerShell: a command whose output goes to the terminal channel. */
 export class BashReporter implements ToolReporter {
   toolUse(input: unknown): ToolUseFacts {
     const bash = input as BashInput | undefined;
+    const description = shellDescription(input);
     return {
       title: bash?.command ? bash.command : "Terminal",
       kind: "execute",
       command: true,
-      ...(bash?.description ? { display: [textContent(bash.description)] } : {}),
+      ...(description ? { display: [textContent(description)] } : {}),
     };
   }
 
