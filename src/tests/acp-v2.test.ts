@@ -2715,6 +2715,131 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     ]);
   });
 
+  it("shows nothing of a tool that a prompt the cancel abandoned asks to run, and denies it (#1061)", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    const echo = (options: Options, prompt: { uuid?: string; message: unknown }) => ({
+      type: "user",
+      message: prompt.message,
+      parent_tool_use_id: null,
+      uuid: prompt.uuid,
+      session_id: options.sessionId,
+      isReplay: true,
+    });
+    const input = { file_path: path.join(cwd, "notes.md"), content: "done\n" };
+    let decision: unknown;
+    sdk.run = async function* (prompts, options) {
+      const iter = prompts[Symbol.asyncIterator]();
+      const { value: first } = await iter.next();
+      yield markersInit(options);
+      yield requesting(options, first.uuid!);
+      yield echo(options, first);
+      yield assistantText(options, "Starting the build.", "msg_first");
+      const { value: second } = await iter.next();
+      await interrupted.promise;
+      yield result(options, { ...ABORTED, user_message_uuids: [first.uuid] });
+      // Claude Code had already taken the second prompt, so it still runs it,
+      // and its answer writes a file.
+      yield requesting(options, second.uuid!);
+      yield echo(options, second);
+      yield stream(options, {
+        type: "message_start",
+        message: { id: "msg_second", role: "assistant", content: [], usage: {} },
+      });
+      yield stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_late", name: "Write", input: {} },
+      });
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_second",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [{ type: "tool_use", id: "toolu_late", name: "Write", input }],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      // Claude Code runs the PreToolUse hooks, then asks for the permission.
+      for (const matcher of options.hooks?.PreToolUse ?? []) {
+        for (const hook of matcher.hooks) {
+          await hook(
+            {
+              hook_event_name: "PreToolUse",
+              session_id: options.sessionId!,
+              cwd,
+              tool_name: "Write",
+              tool_input: input,
+              tool_use_id: "toolu_late",
+            } as never,
+            "toolu_late",
+            { signal: new AbortController().signal },
+          );
+        }
+      }
+      decision = await options.canUseTool!("Write", input, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_late",
+      } as never);
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_late",
+              content: "The user cancelled this prompt.",
+              is_error: true,
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options, { user_message_uuids: [second.uuid] });
+      yield idleState(options);
+      while (!(await iter.next()).done);
+    };
+    const client = await promptAndWait(1, async (agent, sessionId, client) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+        ]),
+      );
+      const queued = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("and write it down"),
+      });
+      await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.turnQueue).toHaveLength(2));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await expect(queued).rejects.toMatchObject({ code: -32800 });
+      await vi.waitFor(() => expect(decision).toBeDefined());
+    });
+
+    expect(decision).toEqual({ behavior: "deny", message: "The user cancelled this prompt." });
+    // Neither a tool call, which would never end, nor a patch, nor a request.
+    expect(client.sessionUpdates.filter(({ update }) => "toolCallId" in update)).toEqual([]);
+    expect(client.permissionRequests).toEqual([]);
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
+
   it("reports what the interrupt flushes of a cycle that Claude Code started before idle cancelled", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();

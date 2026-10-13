@@ -63,6 +63,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   getSubagentMessages,
+  type HookCallback,
   importSessionToStore,
   listSessions,
   PermissionUpdate,
@@ -18823,23 +18824,98 @@ describe("output after a cancel", () => {
     ];
   }
 
-  /** An agent on a session that `makeGenerator` scripts, and the text of every
-   *  agent message chunk its client receives. */
+  /** An agent on a session that `makeGenerator` scripts, the text of every
+   *  agent message chunk its client receives, every update, and every
+   *  permission request, which the client allows once. */
   function setup(makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>) {
     const texts: string[] = [];
+    const updates: SessionNotification["update"][] = [];
+    const permissionRequests: RequestPermissionRequest[] = [];
     const agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async ({ update }: SessionNotification) => {
+          updates.push(update);
           if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
             texts.push(update.content.text);
           }
+        },
+        requestPermission: async (params: RequestPermissionRequest) => {
+          permissionRequests.push(params);
+          const option =
+            params.options.find(({ kind }) => kind === "allow_once") ?? params.options[0]!;
+          return { outcome: { outcome: "selected", optionId: option.optionId } };
         },
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
     injectGeneratorSession(agent, makeGenerator);
-    return { agent, texts };
+    return { agent, texts, updates, permissionRequests };
   }
+
+  /** How Claude Code starts to stream an assistant message that runs the tool
+   *  `id`, up to the tool use's start. */
+  const toolUseStart = (id: string, name: string) => [
+    messageStart(),
+    streamEvent({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id, name, input: {} },
+    }),
+  ];
+  /** The whole assistant message that runs the tool `id`, which ends its stream. */
+  function toolUseMessage(id: string, name: string, input: Record<string, unknown>) {
+    const message = assistant("");
+    return [
+      {
+        ...message,
+        message: { ...message.message, content: [{ type: "tool_use", id, name, input }] },
+      },
+      streamEvent({ type: "content_block_stop", index: 0 }),
+      streamEvent({ type: "message_stop" }),
+    ];
+  }
+  /** How Claude Code sends an assistant message that runs the tool `id`: it
+   *  streams the tool use's start, then sends the whole message. */
+  const toolUse = (id: string, name: string, input: Record<string, unknown>) => [
+    ...toolUseStart(id, name),
+    ...toolUseMessage(id, name, input),
+  ];
+  /** The result of the tool `id`. */
+  const toolResult = (id: string, content: string, isError = false) => ({
+    type: "user",
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }],
+    },
+  });
+  const writeInput = { file_path: "/tmp/proj/notes.md", content: "done\n" };
+  /** Claude Code's permission check for the Write call `id`, as it calls it. */
+  const askToWrite = (agent: ClaudeAcpAgent, id: string) =>
+    agent.canUseTool("test-session")("Write", writeInput, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: id,
+    } as any);
+  /** The v2 PreToolUse preview hook for the Write call `id`, as Claude Code calls it. */
+  const previewWrite = (agent: ClaudeAcpAgent, id: string) =>
+    (
+      agent as unknown as { fileChangePreviewHook(sessionId: string): HookCallback }
+    ).fileChangePreviewHook("test-session")(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: writeInput,
+        tool_use_id: id,
+        session_id: "test-session",
+        transcript_path: "",
+        cwd: "/tmp/proj",
+      } as any,
+      id,
+      { signal: new AbortController().signal },
+    );
 
   /** Sends the prompt `text` and waits until its turn is active. Returns the
    *  prompt and the session's consumer, which ends with the scripted stream. */
@@ -18977,6 +19053,185 @@ describe("output after a cancel", () => {
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     await consumer;
     expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it.each([
+    ["before the consumer reaches it", "before", true],
+    ["after its streamed start, before its message", "between", true],
+    ["after its message", "after", true],
+    ["before its message, for a tool use that did not stream", "before", false],
+  ] as const)(
+    "shows nothing of a tool that a prompt the cancel abandoned asks to run, and denies it, when Claude Code asks %s (#1061)",
+    async (_when, order, streamed) => {
+      const cancelled = Promise.withResolvers<void>();
+      let asked: Promise<unknown> | undefined;
+      let previewed: Promise<unknown> | undefined;
+      const { agent, texts, updates, permissionRequests } = setup((input) =>
+        (async function* () {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: first } = await iter.next();
+          yield* startTurn(first);
+          yield* answer("Starting the build.");
+          const { value: second } = await iter.next();
+          yield lifecycleFrame(second.uuid, "queued");
+          await cancelled.promise;
+          yield abortedResult(first.uuid);
+          yield lifecycleFrame(first.uuid, "cancelled");
+          // Claude Code had already taken the second prompt, so it still runs
+          // it, and its answer writes a file. It calls the preview hook and
+          // asks for the permission on its control channel, which can run
+          // ahead of the consumer.
+          yield lifecycleFrame(second.uuid, "started");
+          yield requesting(second.uuid);
+          yield userEcho(second);
+          const ask = () => {
+            previewed = previewWrite(agent, "toolu_late");
+            asked = askToWrite(agent, "toolu_late");
+          };
+          if (order === "before") ask();
+          if (streamed) yield* toolUseStart("toolu_late", "Write");
+          if (order === "between") {
+            // Claude Code can run a tool whose input is complete before it
+            // sends the whole message.
+            ask();
+            await Promise.all([previewed, asked]);
+          }
+          yield* streamed
+            ? toolUseMessage("toolu_late", "Write", writeInput)
+            : [toolUseMessage("toolu_late", "Write", writeInput)[0]];
+          if (order === "after") ask();
+          await Promise.all([previewed, asked]);
+          yield toolResult("toolu_late", "The user cancelled this prompt.", true);
+          yield stampedResult(second.uuid);
+          yield lifecycleFrame(second.uuid, "completed");
+          yield idle;
+          yield requesting();
+          yield* followup();
+        })(),
+      );
+      const { prompt: first, consumer } = await promptActive(agent, "build it");
+      const second = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and write it down" }],
+      });
+      await vi.waitFor(() =>
+        expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+      );
+      vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+        still_queued: [],
+      });
+
+      await agent.cancel({ sessionId: "test-session" });
+      cancelled.resolve();
+
+      await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+      await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+      await consumer;
+      await expect(asked).resolves.toEqual({
+        behavior: "deny",
+        message: "The user cancelled this prompt.",
+      });
+      // Neither a tool call, which would never end, nor a request.
+      expect(updates.filter((update) => "toolCallId" in update)).toEqual([]);
+      expect(permissionRequests).toEqual([]);
+      expect(agent.sessions["test-session"]!.emittedToolCalls.size).toBe(0);
+      expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    },
+  );
+
+  it("stops waiting for a tool use that the stream does not show, when Claude Code withdraws the request or the wait runs out", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const asked = Promise.withResolvers<void>();
+    const { agent, permissionRequests } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // The window stays open while the requests below wait.
+        await asked.promise;
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    // SandboxNetworkAccess asks under an id that no tool use in the stream has.
+    const ask = (id: string, signal: AbortSignal) =>
+      agent.canUseTool("test-session")("SandboxNetworkAccess", { host: "example.com" }, {
+        signal,
+        suggestions: [],
+        toolUseID: id,
+      } as any);
+    // A withdrawn request stops waiting at once, whether it was withdrawn
+    // before it asked or while it waits.
+    agent.toolUseWaitMs = 60_000;
+    await expect(ask("network-1", AbortSignal.abort())).rejects.toThrow("Tool use aborted");
+    const withdrawn = new AbortController();
+    const withdrawnAsk = ask("network-2", withdrawn.signal);
+    withdrawn.abort();
+    await expect(withdrawnAsk).rejects.toThrow("Tool use aborted");
+    // Once the wait runs out, the request goes out as it would without a cancel.
+    agent.toolUseWaitMs = 20;
+    await expect(ask("network-3", new AbortController().signal)).resolves.toMatchObject({
+      behavior: "allow",
+    });
+    expect(permissionRequests.map(({ toolCall }) => toolCall.toolCallId)).toEqual(["network-3"]);
+    asked.resolve();
+    await consumer;
+  });
+
+  it("asks for the next prompt's tool once the consumer reaches it, when Claude Code asks while the window still looks open", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const asking = Promise.withResolvers<void>();
+    const { agent, updates, permissionRequests } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        const { value: next } = await iter.next();
+        // Claude Code asks to run the next prompt's tool before the consumer
+        // has reached the prompt's echo, which closes the window.
+        await asking.promise;
+        yield* startTurn(next);
+        yield* toolUse("toolu_next", "Write", writeInput);
+        yield toolResult("toolu_next", "Wrote the file.");
+        yield stampedResult(next.uuid);
+        yield lifecycleFrame(next.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    const next = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "write it down" }],
+    });
+    expect(agent.sessions["test-session"]!.cancelled).toBe(true);
+    const asked = askToWrite(agent, "toolu_next");
+    asking.resolve();
+
+    await expect(asked).resolves.toMatchObject({ behavior: "allow" });
+    expect(permissionRequests.map(({ toolCall }) => toolCall.toolCallId)).toEqual(["toolu_next"]);
+    await expect(next).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(
+      updates.some(
+        (update) => update.sessionUpdate === "tool_call" && update.toolCallId === "toolu_next",
+      ),
+    ).toBe(true);
   });
 
   it("does not let the next prompt take the result of a prompt the cancel abandoned", async () => {

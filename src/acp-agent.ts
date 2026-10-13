@@ -412,6 +412,11 @@ const STRUCTURED_USAGE_TIMEOUT_MS = 5_000;
  *  The teardown wakes the consumer itself, so they end within a few ticks
  *  unless the consumer is wedged. */
 const TEARDOWN_TURN_END_TIMEOUT_MS = 5_000;
+/** How long `canUseTool` or a hook waits, while a cancel's window may be
+ *  open, for the consumer to reach a tool use in the stream. Claude Code
+ *  streams the tool use before it asks, so the consumer is usually there
+ *  within a few ticks. */
+const TOOL_USE_WAIT_MS = 2_000;
 /** The number of settled subagents whose parent tool call a session keeps for
  *  a later resume (see `resumableSubagents`). */
 const MAX_RESUMABLE_SUBAGENTS = 256;
@@ -1145,6 +1150,16 @@ export type Session = {
    *  not here: Claude abandoned it before it ran. Pruned when the call ends;
    *  the oldest entries are dropped. */
   dispatchedToolCalls?: Set<string>;
+  /** The tool uses that the consumer reached in the stream, each with whether
+   *  it dropped it as output of the work a cancel stopped (`true`, see
+   *  `dropsStoppedWorkOutput`). The first sight of a tool use decides: its
+   *  streamed start, or its complete message. `canUseTool` and the v2 preview
+   *  hook read it (see `isStoppedWorkToolUse`). The oldest entries are
+   *  dropped. */
+  reachedToolUses?: Map<string, boolean>;
+  /** What waits for the consumer to reach each tool use (see
+   *  `isStoppedWorkToolUse`). */
+  toolUseWaiters?: Map<string, Set<() => void>>;
   /** For each open tool call that a subagent made: the Agent/Task call that
    *  started that subagent. When a cancel ends such a call, the report names
    *  that parent as the call's other updates do, so that every client form
@@ -2580,6 +2595,9 @@ export class ClaudeAcpAgent {
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
   forceCancelGraceMs: number = DEFAULT_FORCE_CANCEL_GRACE_MS;
+  /** How long `canUseTool` or a hook waits for the consumer to reach a tool
+   *  use (see `isStoppedWorkToolUse`). Mutable so tests can shrink it. */
+  toolUseWaitMs: number = TOOL_USE_WAIT_MS;
   /**
    * The connection serves ACP v2 (`src/v2/`). The agent still speaks v1
    * types, except for the tool call content that v2 needs and v1 cannot
@@ -7131,7 +7149,14 @@ export class ClaudeAcpAgent {
             // prefix of the text, so the text would be sent again (see
             // unstreamedRemainder).
             const streamKey = message.parent_tool_use_id ?? "";
-            if (session.cancelled && this.workEndReported(params.sessionId, session)) {
+            const stoppedWorkOutput = this.dropsStoppedWorkOutput(params.sessionId, session);
+            if (
+              message.event.type === "content_block_start" &&
+              isToolUseBlock(message.event.content_block)
+            ) {
+              recordReachedToolUse(session, message.event.content_block.id, stoppedWorkOutput);
+            }
+            if (stoppedWorkOutput) {
               if (message.parent_tool_use_id === null || forwardsSubagentText()) {
                 droppedStreams.add(streamKey);
               }
@@ -7210,8 +7235,17 @@ export class ClaudeAcpAgent {
           }
           case "user":
           case "assistant": {
-            if (message.type === "assistant")
+            if (message.type === "assistant") {
               recordDispatchedToolUses(session, message.message.content);
+              // A tool use that did not stream is reached here first.
+              const content = message.message.content;
+              const stoppedWorkOutput = this.dropsStoppedWorkOutput(params.sessionId, session);
+              for (const block of Array.isArray(content) ? content : []) {
+                if (isToolUseBlock(block)) {
+                  recordReachedToolUse(session, block.id, stoppedWorkOutput);
+                }
+              }
+            }
             // Record the ACP messageId -> SDK uuid mapping for this message
             // (including replays). The consolidated message carries both ids, so
             // this is where we learn the uuid the SDK's rewind/resume APIs key on
@@ -9056,6 +9090,68 @@ export class ClaudeAcpAgent {
     return this.foregroundEvents ? !this.foregroundWork.has(sessionId) : !session.activeTurn;
   }
 
+  /** Whether the consumer drops what it reaches now as output of the work a
+   *  cancel stopped: the client has been told that the work ended, and the
+   *  window after the cancel is still open (see Session.cancelled). */
+  private dropsStoppedWorkOutput(sessionId: string, session: Session): boolean {
+    return session.cancelled && this.workEndReported(sessionId, session);
+  }
+
+  /**
+   * Whether the tool use `toolUseId`, which reaches `canUseTool` or a hook, is
+   * output of the work a cancel stopped that the consumer dropped (see
+   * `dropsStoppedWorkOutput`). Example: Claude Code runs a prompt that the
+   * cancel abandoned, and it asks to run a command. The consumer drops the
+   * tool use and its result, so a tool call shown for it would never end, and
+   * the client would keep it open (issue #1061).
+   *
+   * Claude Code calls `canUseTool` and hooks on its control channel, after it
+   * streamed the tool use, and the consumer can lag behind. So the session can
+   * still look cancelled while the consumer has the next prompt's echo, which
+   * ends the window, still ahead of the tool use. While a cancel's window may
+   * be open, this waits until the consumer reaches the tool use, for at most
+   * {@link toolUseWaitMs} or until `signal` aborts: the stream never shows
+   * some tool uses, such as SandboxNetworkAccess's. Without a cancel nothing
+   * is dropped, so it answers at once. It returns a promise only when it
+   * waits, so a permission request without a cancel goes out as soon as
+   * before.
+   */
+  private isStoppedWorkToolUse(
+    session: Session,
+    toolUseId: string,
+    signal?: AbortSignal,
+  ): boolean | Promise<boolean> {
+    const reached = session.reachedToolUses?.get(toolUseId);
+    if (reached !== undefined) return reached;
+    if (!session.cancelled || signal?.aborted) return false;
+    return this.reachedInStream(session, toolUseId, signal);
+  }
+
+  /** Waits until the consumer reaches the tool use `toolUseId` (see
+   *  `isStoppedWorkToolUse`), then says whether it dropped it. */
+  private async reachedInStream(
+    session: Session,
+    toolUseId: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    await new Promise<void>((resolve) => {
+      const waiters = (session.toolUseWaiters ??= new Map());
+      let waiting = waiters.get(toolUseId);
+      if (!waiting) waiters.set(toolUseId, (waiting = new Set()));
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        waiting.delete(done);
+        if (waiting.size === 0 && waiters.get(toolUseId) === waiting) waiters.delete(toolUseId);
+        resolve();
+      };
+      const timer = setTimeout(done, this.toolUseWaitMs);
+      signal?.addEventListener("abort", done, { once: true });
+      waiting.add(done);
+    });
+    return session.reachedToolUses?.get(toolUseId) ?? false;
+  }
+
   /** End the session's model cycle that Claude Code started on its own, if one
    *  runs. */
   private endAutonomousCycle(
@@ -9235,9 +9331,9 @@ export class ClaudeAcpAgent {
    * decision, and a failure only leaves the preview out.
    */
   private fileChangePreviewHook(sessionId: string): HookCallback {
-    return async (input, toolUseID) => {
+    return async (input, toolUseID, { signal }) => {
       if (input.hook_event_name === "PreToolUse" && toolUseID) {
-        await this.previewFileChange(sessionId, input, toolUseID).catch((error) =>
+        await this.previewFileChange(sessionId, input, toolUseID, signal).catch((error) =>
           this.logger.error(`Session ${sessionId}: failed to preview ${toolUseID}: ${error}`),
         );
       }
@@ -9249,9 +9345,13 @@ export class ClaudeAcpAgent {
     sessionId: string,
     input: PreToolUseHookInput,
     toolUseID: string,
+    signal: AbortSignal,
   ): Promise<void> {
     const session = this.sessions[sessionId];
     if (!session) return;
+    // As in `canUseTool`: the work a cancel stopped shows nothing.
+    const stopped = this.isStoppedWorkToolUse(session, toolUseID, signal);
+    if (stopped instanceof Promise ? await stopped : stopped) return;
     const toolInput = (input.tool_input ?? {}) as Record<string, unknown>;
     const content = await previewPatchContent(input.tool_name, toolInput, session.cwd, "v2");
     if (!content) return;
@@ -9320,6 +9420,16 @@ export class ClaudeAcpAgent {
           behavior: "deny",
           message: "Session not found",
         };
+      }
+      // The work a cancel stopped shows the client nothing after it was told
+      // that the work ended: neither a tool call nor a request. Its tool does
+      // not run.
+      const stopped = this.isStoppedWorkToolUse(session, toolUseID, signal);
+      if (stopped instanceof Promise ? await stopped : stopped) {
+        this.logger.log(
+          `Session ${sessionId}: denied ${toolName} ${toolUseID}, which the cancelled work asked for`,
+        );
+        return { behavior: "deny", message: "The user cancelled this prompt." };
       }
 
       const { parentToolUseId, toolCallSessionId: permissionSessionId } = this.toolUseOwner(
@@ -12010,15 +12120,37 @@ function recordDispatchedToolCall(session: Session, toolCallId: string): void {
 function recordDispatchedToolUses(session: Session, content: unknown): void {
   if (!Array.isArray(content)) return;
   for (const block of content) {
-    if (
-      (block?.type === "tool_use" ||
-        block?.type === "server_tool_use" ||
-        block?.type === "mcp_tool_use") &&
-      typeof block.id === "string"
-    ) {
-      recordDispatchedToolCall(session, block.id);
-    }
+    if (isToolUseBlock(block)) recordDispatchedToolCall(session, block.id);
   }
+}
+
+function isToolUseBlock(block: unknown): block is { type: string; id: string } {
+  const { type, id } = (block ?? {}) as { type?: unknown; id?: unknown };
+  return (
+    (type === "tool_use" || type === "server_tool_use" || type === "mcp_tool_use") &&
+    typeof id === "string"
+  );
+}
+
+const MAX_REACHED_TOOL_USES = 1000;
+
+/**
+ * Records that the consumer reached the tool use `toolUseId`, and whether it
+ * dropped it as output of the work a cancel stopped, then wakes what waits for
+ * it (see `isStoppedWorkToolUse`). The first record of a tool use stays.
+ */
+function recordReachedToolUse(session: Session, toolUseId: string, dropped: boolean): void {
+  const reached = (session.reachedToolUses ??= new Map());
+  if (reached.has(toolUseId)) return;
+  reached.set(toolUseId, dropped);
+  if (reached.size > MAX_REACHED_TOOL_USES) {
+    const oldest = reached.keys().next().value;
+    if (oldest !== undefined) reached.delete(oldest);
+  }
+  const waiters = session.toolUseWaiters?.get(toolUseId);
+  if (!waiters) return;
+  session.toolUseWaiters?.delete(toolUseId);
+  for (const wake of waiters) wake();
 }
 
 /** Streamed and permission-surfaced tools can precede the SDK's user echo. */
