@@ -1974,6 +1974,287 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     expect(at).toBeLessThan(cycleIdle);
   });
 
+  describe("the tool calls that a cancelled cycle leaves open", () => {
+    type Seen = { sessionId: string; update: Record<string, any> };
+
+    /**
+     * Sends the prompt "hi", cancels once the tool call `toolCallId` has an
+     * update, which the script's cycle runs, and returns what the client got
+     * once the root session reported its second idle.
+     */
+    async function cancelCycle(toolCallId: string) {
+      const client = v2Client();
+      let root = "";
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        ({ sessionId: root } = await agent.request(v2.methods.agent.session.new, { cwd }));
+        await agent.request(v2.methods.agent.session.prompt, {
+          sessionId: root,
+          prompt: text("hi"),
+        });
+        await vi.waitFor(() =>
+          expect(
+            client.updates("tool_call_update").some((update) => update.toolCallId === toolCallId),
+          ).toBe(true),
+        );
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId: root });
+        await vi.waitFor(() =>
+          expect(
+            turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === root)).filter(
+              (state) => state.startsWith("idle"),
+            ),
+          ).toHaveLength(2),
+        );
+        await client.authUpdate(1);
+      });
+      return { root, updates: client.sessionUpdates as unknown as Seen[] };
+    }
+    const lastStatusAt = (updates: Seen[], id: string) =>
+      updates.findLastIndex(({ update }) => update.toolCallId === id && update.status);
+    const lastIdleAt = (updates: Seen[], sessionId: string) =>
+      updates.findLastIndex(
+        ({ sessionId: id, update }) =>
+          id === sessionId && update.sessionUpdate === "state_update" && update.state === "idle",
+      );
+    const statusesOf = (updates: Seen[], id: string) =>
+      updates.filter(({ update }) => update.toolCallId === id && update.status);
+    /** A system frame about the task of a subagent that the Agent call `toolUseId` started. */
+    const taskFrame = (
+      options: Options,
+      subtype: string,
+      taskId: string,
+      toolUseId: string,
+      fields: Record<string, unknown> = {},
+    ) => ({
+      type: "system",
+      subtype,
+      task_id: taskId,
+      tool_use_id: toolUseId,
+      uuid: randomUUID(),
+      session_id: options.sessionId,
+      ...fields,
+    });
+    const agentCall = (options: Options, id: string, fields: Record<string, unknown> = {}) =>
+      toolUseMessage(options, id, "Agent", {
+        description: "Run it",
+        subagent_type: "general-purpose",
+        prompt: "Run it",
+        ...fields,
+      });
+
+    it("ends the command of a foreground subagent that the cycle runs, which Claude Code sends no result for, before idle cancelled", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield assistantText(options, "Started the build in the background.");
+        yield result(options);
+        yield idleState(options);
+        // Claude Code's follow-up runs a subagent, which runs a command.
+        yield agentCall(options, "toolu_agent");
+        yield taskFrame(options, "task_started", "agent-1", "toolu_agent", {
+          description: "Run it",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield toolUseMessage(options, "toolu_child", "Bash", { command: "make" }, "toolu_agent");
+        await interrupted.promise;
+        // The interrupt stops the subagent, and Claude Code answers the Agent
+        // call, but not the subagent's command.
+        yield taskFrame(options, "task_notification", "agent-1", "toolu_agent", {
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+        });
+        yield toolResultMessage(options, "toolu_agent", { is_error: true }, "user-rejected");
+        yield followupResult(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelCycle("toolu_child");
+
+      // Claude Code's result ends the Agent call. The command ends in the
+      // child's session, after the child's idle and before the cycle's.
+      expect(updates[lastStatusAt(updates, "toolu_agent")]).toMatchObject({
+        sessionId: root,
+        update: {
+          status: "cancelled",
+          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
+        },
+      });
+      const end = lastStatusAt(updates, "toolu_child");
+      expect(updates[end]).toMatchObject({ sessionId: "agent-1", update: { status: "cancelled" } });
+      expect(statusesOf(updates, "toolu_child").map(({ update }) => update.status)).toEqual([
+        "pending",
+        "cancelled",
+      ]);
+      expect(end).toBeGreaterThan(lastIdleAt(updates, "agent-1"));
+      expect(updates[lastIdleAt(updates, root)]).toMatchObject({
+        update: { stopReason: "cancelled" },
+      });
+      expect(end).toBeLessThan(lastIdleAt(updates, root));
+    });
+
+    it("ends a tool call that Claude abandoned in the cycle before idle cancelled", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield assistantText(options, "Started the build in the background.");
+        yield result(options);
+        yield idleState(options);
+        // Claude Code's follow-up starts a command, but no complete message holds it.
+        yield stream(options, {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_dropped", name: "Bash", input: {} },
+        });
+        await interrupted.promise;
+        yield followupResult(options, ABORTED);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelCycle("toolu_dropped");
+
+      const end = lastStatusAt(updates, "toolu_dropped");
+      expect(updates[end]).toMatchObject({ update: { status: "cancelled" } });
+      expect(JSON.stringify(updates[end].update.content)).toContain(
+        "Claude stopped this tool call before it ran.",
+      );
+      expect(end).toBeLessThan(lastIdleAt(updates, root));
+    });
+
+    it("ends the tool calls of a cycle that the cancel ends at the idle, when no result comes", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield assistantText(options, "Started the build in the background.");
+        yield result(options);
+        yield idleState(options);
+        yield stream(options, {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "toolu_dropped", name: "Bash", input: {} },
+        });
+        await interrupted.promise;
+        // The interrupt ends the cycle with an idle, and no result.
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelCycle("toolu_dropped");
+
+      const end = lastStatusAt(updates, "toolu_dropped");
+      expect(updates[end]).toMatchObject({ update: { status: "cancelled" } });
+      expect(updates[lastIdleAt(updates, root)]).toMatchObject({
+        update: { stopReason: "cancelled" },
+      });
+      expect(end).toBeLessThan(lastIdleAt(updates, root));
+    });
+
+    it("leaves the tool call of a cycle that the SDK aborted without a cancel to Claude Code's result", async () => {
+      const aborted = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        yield assistantText(options, "Started the build in the background.");
+        yield result(options);
+        yield idleState(options);
+        yield toolUseMessage(options, "toolu_cycle", "Bash", { command: "make" });
+        // For example, a steering message aborts the cycle. Nobody cancelled it,
+        // so Claude Code's result for the command is still to be delivered.
+        yield followupResult(options, ABORTED_TOOLS);
+        yield idleState(options);
+        aborted.resolve();
+        yield toolResultMessage(options, "toolu_cycle", { is_error: true }, "interrupted");
+      });
+      const client = v2Client();
+      await client.app.connectWith(connectRouter(), async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+        await aborted.promise;
+        await vi.waitFor(() =>
+          expect(
+            client
+              .updates("tool_call_update")
+              .filter((update) => update.toolCallId === "toolu_cycle" && update.status)
+              .map((update) => update.status),
+          ).toEqual(["pending", "cancelled"]),
+        );
+        await client.authUpdate(1);
+      });
+
+      // The end is Claude Code's, with the kind that it stamped, not this closing's.
+      expect(
+        client
+          .updates("tool_call_update")
+          .findLast((update) => update.toolCallId === "toolu_cycle" && update.status),
+      ).toMatchObject({ _meta: { claudeCode: { nonExecutionKind: "interrupted" } } });
+    });
+
+    it("closes the calls of a held turn's follow-up before idle cancelled, and leaves a running background subagent's open", async () => {
+      const interrupted = Promise.withResolvers<void>();
+      sdk.interrupt = async () => interrupted.resolve();
+      scriptTurns(async function* (options) {
+        yield markersInit(options);
+        // The turn starts two background subagents, and ends while they run, so
+        // v1 holds its answer for them. Its work ended at the result.
+        for (const n of [1, 2]) {
+          yield agentCall(options, `toolu_bg_${n}`, { run_in_background: true });
+          yield taskFrame(options, "task_started", `agent-bg-${n}`, `toolu_bg_${n}`, {
+            description: "Run it",
+            subagent_type: "general-purpose",
+            prompt: "Run it",
+            is_backgrounded: true,
+          });
+        }
+        yield toolUseMessage(
+          options,
+          "toolu_bg_child",
+          "Bash",
+          { command: "sleep 99" },
+          "toolu_bg_2",
+        );
+        yield assistantText(options, "Running two subagents in the background.");
+        yield result(options);
+        yield idleState(options);
+        // The first subagent finishes, and Claude Code's follow-up runs another
+        // subagent in the foreground, which runs a command.
+        yield taskFrame(options, "task_notification", "agent-bg-1", "toolu_bg_1", {
+          status: "completed",
+          output_file: "",
+          summary: "done",
+        });
+        yield requesting(options);
+        yield agentCall(options, "toolu_agent");
+        yield taskFrame(options, "task_started", "agent-1", "toolu_agent", {
+          description: "Run it",
+          subagent_type: "general-purpose",
+          prompt: "Run it",
+        });
+        yield toolUseMessage(options, "toolu_child", "Bash", { command: "make" }, "toolu_agent");
+        await interrupted.promise;
+        yield taskFrame(options, "task_notification", "agent-1", "toolu_agent", {
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+        });
+        yield toolResultMessage(options, "toolu_agent", { is_error: true }, "user-rejected");
+        yield followupResult(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const { root, updates } = await cancelCycle("toolu_child");
+
+      // The follow-up is a cycle that v2 reports: its calls end before its idle,
+      // not at the settle of the held turn, which comes after. Each ends once.
+      const end = lastStatusAt(updates, "toolu_child");
+      expect(updates[end]).toMatchObject({ sessionId: "agent-1", update: { status: "cancelled" } });
+      expect(statusesOf(updates, "toolu_child")).toHaveLength(2);
+      expect(end).toBeLessThan(lastIdleAt(updates, root));
+      // The other background subagent was not stopped, so its command runs on.
+      expect(statusesOf(updates, "toolu_bg_child").map(({ update }) => update.status)).toEqual([
+        "pending",
+      ]);
+    });
+  });
+
   it("ends a cycle that the client cancels with idle cancelled", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();

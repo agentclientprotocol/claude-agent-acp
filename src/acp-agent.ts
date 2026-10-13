@@ -4876,6 +4876,35 @@ export class ClaudeAcpAgent {
           task.parentToolUseId === agentToolUseId,
       );
 
+    /** Ends the open tool calls that `include` accepts, with the report of a call
+     *  that a cancel stopped and sent no result for. `include` gets the Agent/Task
+     *  call of the subagent that made the tool call, if a subagent did. */
+    const closeOpenToolCalls = async (
+      include: (parentToolUseId: string | undefined) => boolean,
+    ): Promise<void> => {
+      const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
+      for (const toolCallId of [...session.emittedToolCalls]) {
+        const parentToolUseId = session.toolCallParents?.get(toolCallId);
+        if (!include(parentToolUseId)) continue;
+        const report = renderer.unfinished({
+          toolCallId,
+          ran: session.dispatchedToolCalls?.has(toolCallId) === true,
+          cancelled: true,
+        });
+        // Named as the call's other updates are: the subagent runtime routes the
+        // report with them, to the child session, or to none that has ended.
+        if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
+        await closeToolCall(toolCallId, report);
+      }
+    };
+
+    /** Whether the closing at the end of the work a cancel stopped takes a tool
+     *  call that the subagent started by the Agent call `parentToolUseId` made
+     *  (undefined for a call of the main conversation): not one of a running
+     *  background subagent, which the cancel may not have stopped. */
+    const closedAtCancel = (parentToolUseId: string | undefined): boolean =>
+      parentToolUseId === undefined || !runsInBackground(parentToolUseId);
+
     /** Closes the tool calls that the work a cancel stopped left open, as that
      *  work ends. Claude Code's interrupt ends each running tool of the main
      *  conversation with an error result, which `sendInterruptedToolResults`
@@ -4892,22 +4921,7 @@ export class ClaudeAcpAgent {
      *  Runs once per turn: a second call, from the other settling path, waits
      *  for the first (see `Turn.closingCancelledToolCalls`). */
     const closeCancelledToolCalls = (turn: Turn): Promise<void> =>
-      (turn.closingCancelledToolCalls ??= (async () => {
-        const renderer = new AcpToolCallRenderer(this.toolCallCapabilities);
-        for (const toolCallId of [...session.emittedToolCalls]) {
-          const parentToolUseId = session.toolCallParents?.get(toolCallId);
-          if (parentToolUseId !== undefined && runsInBackground(parentToolUseId)) continue;
-          const report = renderer.unfinished({
-            toolCallId,
-            ran: session.dispatchedToolCalls?.has(toolCallId) === true,
-            cancelled: true,
-          });
-          // Named as the call's other updates are: the subagent runtime routes the
-          // report with them, to the child session, or to none that has ended.
-          if (parentToolUseId !== undefined) stampParentToolUseId(report, parentToolUseId);
-          await closeToolCall(toolCallId, report);
-        }
-      })());
+      (turn.closingCancelledToolCalls ??= closeOpenToolCalls(closedAtCancel));
     session.closeCancelledToolCalls = closeCancelledToolCalls;
 
     /** Delivers the results that the work a cancel stopped sends for tool calls
@@ -4950,6 +4964,19 @@ export class ClaudeAcpAgent {
       )) {
         await sendUpdate(notification);
       }
+    };
+
+    /** A cancel stopped the model cycle that Claude Code started on its own, and
+     *  its end is about to be reported: closes the tool calls that it left open
+     *  first. A cycle is foreground work that no turn settles, so
+     *  `closeCancelledToolCalls` does not run for it. Claude Code's interrupt
+     *  gives the tools of the main conversation results, which
+     *  `sendInterruptedToolResults` delivers while the cycle runs. What is still
+     *  open has none, such as the command of a foreground subagent. A turn that
+     *  took the cycle over closes its own calls, when it settles. */
+    const closeCancelledCycleToolCalls = async (): Promise<void> => {
+      if (!session.cancelled || !this.runsAutonomousCycle(params.sessionId)) return;
+      await closeOpenToolCalls(closedAtCancel);
     };
 
     /** At the actual turn boundary, preview its checkpoint, settle the active
@@ -5658,6 +5685,7 @@ export class ClaudeAcpAgent {
                   // here. An owed idle belongs to an earlier result: it can lag
                   // past the cycle's first output.
                   if (session.owedTrailingIdles === 0) {
+                    await closeCancelledCycleToolCalls();
                     this.endAutonomousCycle(params.sessionId, {
                       outcome: { stopReason: session.cancelled ? "cancelled" : "end_turn" },
                     });
@@ -6568,6 +6596,7 @@ export class ClaudeAcpAgent {
                 pendingExitPlanContextReset?.toolUseId ===
                   pendingExitPlanModeInterruption?.toolUseId;
               if (!continuesPlan && !(isAutonomousResult && message.num_turns === 0)) {
+                await closeCancelledCycleToolCalls();
                 this.endAutonomousCycle(
                   params.sessionId,
                   autonomousCycleEnd(
@@ -9054,6 +9083,13 @@ export class ClaudeAcpAgent {
    *  prompt, so no turn is active. */
   private workEndReported(sessionId: string, session: Session): boolean {
     return this.foregroundEvents ? !this.foregroundWork.has(sessionId) : !session.activeTurn;
+  }
+
+  /** Whether a model cycle that Claude Code started on its own is the session's
+   *  foreground work. Only a client that gets the session's work reported (v2)
+   *  has any; a turn that took a cycle over owns the work from then on. */
+  private runsAutonomousCycle(sessionId: string): boolean {
+    return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }
 
   /** End the session's model cycle that Claude Code started on its own, if one

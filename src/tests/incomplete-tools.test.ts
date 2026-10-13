@@ -632,6 +632,19 @@ describe("tool calls of a cancelled turn", () => {
     expect(textOf(ends(updates)[0])).toBe("Claude stopped this tool call before it ran.");
   });
 
+  it("does not close the tool calls of a cycle that Claude Code started on its own, which v1 does not report", async () => {
+    const { prompt, updates, agent } = createTestSession(cancelledCycleMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    await agent.sessions[sessionId].consumer;
+
+    // v1 sends no state for such a cycle, so no prompt response or idle follows
+    // the cycle's end, and its output after the cancel is dropped. v2 closes the
+    // tool calls that the cycle left open as it reports the cycle's end.
+    expect(ends(updates, "cycle-tool")).toEqual([]);
+    expect(agent.sessions[sessionId].emittedToolCalls.has("cycle-tool")).toBe(true);
+  });
+
   it("drops Claude Code's result for a tool call once the cancelled turn has ended", async () => {
     const responded = Promise.withResolvers<void>();
     const { prompt, updates, agent, logError } = createTestSession((input, agent) =>
@@ -1081,6 +1094,19 @@ async function* startAfterCancelMessages(input: Pushable<any>, agent: ClaudeAcpA
   yield* echoNextPrompt(input);
   await agent.cancel({ sessionId });
   yield toolStart();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/** After the turn ended, Claude Code's own follow-up starts a command, and the cancel stops it. */
+async function* cancelledCycleMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  yield toolStart("cycle-tool");
+  yield toolUse("cycle-tool");
+  await agent.cancel({ sessionId });
+  yield interruptedResult("cycle-tool");
+  yield { ...abortedResult(), origin: { kind: "task-notification" } };
   yield { type: "system", subtype: "session_state_changed", state: "idle" };
 }
 
