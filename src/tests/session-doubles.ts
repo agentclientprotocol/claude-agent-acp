@@ -68,7 +68,7 @@ export function mockSessionState(
       dispose: vi.fn(),
       getSettings: () => ({}),
       getApiKeyHelper: () => undefined,
-      getCwd: () => "/test",
+      getCwd: () => process.cwd(),
     },
     accumulatedUsage: {
       inputTokens: 0,
