@@ -3162,6 +3162,71 @@ describe("ACP v2 requests that subagents make", () => {
       "running",
     ]);
   });
+
+  it("reports no running before idle cancelled for a child's request that a cancel withdraws", async () => {
+    // Claude Code's interrupt withdraws the request, which the client holds and
+    // would not settle, then it stops the child.
+    const withdrawal = new AbortController();
+    sdk.interrupt = async () => withdrawal.abort();
+    const client = v2Client({
+      answerPermission: () =>
+        new Promise<never>(() => {}) as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(async function* (options) {
+      yield toolUseMessage(options, "toolu_agent-1", "Agent", {
+        description: "Explore the project",
+        prompt: "Look around",
+        subagent_type: "Explore",
+      });
+      yield taskStarted(options, "agent-1", { is_backgrounded: false });
+      await options.canUseTool!("Bash", { command: "ls" }, {
+        signal: withdrawal.signal,
+        suggestions: [],
+        toolUseID: "toolu_ls",
+        agentID: "agent-1",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]).catch(() => undefined);
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "killed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+    let root = "";
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      ({ sessionId: root } = await agent.request(v2.methods.agent.session.new, { cwd }));
+      await agent.request(v2.methods.agent.session.prompt, { sessionId: root, prompt: text("go") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId: root });
+      await vi.waitFor(() =>
+        expect(
+          turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === root)),
+        ).toContain("idle cancelled"),
+      );
+      await client.authUpdate(1);
+    });
+
+    expect(client.permissionRequests[0].sessionId).toBe("agent-1");
+    // The child's own stream, and the parent's copy of its states.
+    expect(
+      turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === "agent-1")),
+    ).toEqual(["running", "requires_action", "idle cancelled"]);
+    expect(
+      client.sessionUpdates.flatMap(({ sessionId, update }) => {
+        if (sessionId !== root || update.sessionUpdate !== "subagent_update" || !update.state) {
+          return [];
+        }
+        const { state, stopReason } = update.state as { state: string; stopReason?: string };
+        return [stopReason ? `${state} ${stopReason}` : state];
+      }),
+    ).toEqual(["running", "requires_action", "idle cancelled"]);
+  });
 });
 
 // A Bash call that sends its command to the background returns at once, while

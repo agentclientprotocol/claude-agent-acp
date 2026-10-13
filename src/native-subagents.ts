@@ -138,6 +138,8 @@ export class NativeSubagentRuntime {
   private readonly generationByTaskId = new Map<string, number>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
+  /** The RFD form: how many times the parent was cancelled (see {@link awaitingUser}). */
+  private parentCancels = 0;
 
   /**
    * `form` is undefined for a client without native subagent sessions. The RFD
@@ -515,20 +517,35 @@ export class NativeSubagentRuntime {
    * foreground children that the turn waits on and, currently, background
    * children too, and the SDK's task events report each as cancelled. A child
    * that keeps running keeps its open requests
-   * (agentclientprotocol/agent-client-protocol#2308).
+   * (agentclientprotocol/agent-client-protocol#2308). The RFD form only counts
+   * the cancel, for {@link awaitingUser}.
    */
   async parentCancelled(deliver: Publish): Promise<void> {
     if (this.form === "air") await this.finishAll("cancelled", deliver);
+    else this.parentCancels++;
   }
 
   /**
    * Runs `request`, a permission or question request of the session
    * `sessionId`. In the RFD form, a child waiting on it is `requires_action`
-   * until its last open request ends.
+   * until its last open request ends, and then `running` again.
+   *
+   * `signal` aborts when Claude Code withdraws the request, which is not an
+   * answer. If the parent was cancelled while the request was open, Claude
+   * Code's interrupt withdrew it as it stopped the child, and the SDK's events
+   * report the child `idle` next. The end of the request then reports no
+   * `running`, which would show a child that is being stopped as working.
+   * Without a cancel, a hook or the classifier answered the request in the
+   * user's place and the child runs on, so the end reports `running`.
    */
-  async awaitingUser<T>(sessionId: string, request: () => Promise<T>): Promise<T> {
+  async awaitingUser<T>(
+    sessionId: string,
+    request: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const child = this.form === "rfd" ? this.childOfSession(sessionId) : undefined;
     if (!child?.announced) return request();
+    const cancelsAtOpen = this.parentCancels;
     child.openRequests = (child.openRequests ?? 0) + 1;
     if (child.openRequests === 1 && child.workState === "running") {
       await this.reportState(child, { state: "requires_action" }).catch((error) =>
@@ -539,7 +556,9 @@ export class NativeSubagentRuntime {
       return await request();
     } finally {
       child.openRequests = (child.openRequests ?? 1) - 1;
-      if (child.openRequests === 0 && child.workState === "requires_action") {
+      // Withdrawn after a cancel that came while the request was open.
+      const stopped = signal?.aborted === true && this.parentCancels !== cancelsAtOpen;
+      if (child.openRequests === 0 && child.workState === "requires_action" && !stopped) {
         await this.reportState(child, { state: "running" }).catch((error) =>
           this.logger.log(`Failed to report that subagent ${child.sessionId} runs: ${error}`),
         );

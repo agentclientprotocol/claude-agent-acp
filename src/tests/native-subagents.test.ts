@@ -1442,4 +1442,132 @@ describe("NativeSubagentRuntime in the RFD form", () => {
 
     expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
   });
+
+  describe("a request that Claude Code withdraws", () => {
+    /**
+     * A request of `worker-1` that fails once `withdrawal` aborts, as the
+     * agent's requests do. It resolves with how it ended.
+     */
+    const withdrawable = (runtime: NativeSubagentRuntime, withdrawal: AbortController) =>
+      runtime
+        .awaitingUser(
+          "worker-1",
+          () =>
+            new Promise<string>((_answer, reject) => {
+              const fail = () => reject(new Error("Tool use aborted"));
+              if (withdrawal.signal.aborted) fail();
+              else withdrawal.signal.addEventListener("abort", fail);
+            }),
+          withdrawal.signal,
+        )
+        .catch((error: Error) => error.message);
+
+    it("does not report running for a request that a cancel withdraws, and leaves the child's end to the SDK", async () => {
+      const { runtime, published } = await runningWorker();
+      const withdrawal = new AbortController();
+      const request = withdrawable(runtime, withdrawal);
+      await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+
+      // Claude Code's interrupt withdraws the request of the child it stops,
+      // then the SDK reports that it killed the child.
+      await runtime.parentCancelled(async () => {});
+      withdrawal.abort();
+      await expect(request).resolves.toBe("Tool use aborted");
+      expect(states(published)).toEqual([{ state: "running" }, { state: "requires_action" }]);
+
+      await runtime.finishTask("worker-1", "killed", async () => {});
+      expect(states(published)).toEqual([
+        { state: "running" },
+        { state: "requires_action" },
+        { state: "idle", stopReason: "cancelled" },
+      ]);
+    });
+
+    it("reports running for a request that Claude Code withdraws without a cancel, since the child goes on", async () => {
+      const { runtime, published } = await runningWorker();
+      const withdrawal = new AbortController();
+      const request = withdrawable(runtime, withdrawal);
+      await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+
+      // A hook or the classifier answered the request in the user's place.
+      withdrawal.abort();
+      await expect(request).resolves.toBe("Tool use aborted");
+
+      expect(states(published)).toEqual([
+        { state: "running" },
+        { state: "requires_action" },
+        { state: "running" },
+      ]);
+    });
+
+    it("keeps the open request of a child that outlives a cancel, and reports running once the user answers it", async () => {
+      const { runtime, published } = await runningWorker();
+      const answer = Promise.withResolvers<string>();
+      const request = runtime.awaitingUser("worker-1", () => answer.promise);
+      await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+
+      await runtime.parentCancelled(async () => {});
+      expect(states(published)).toEqual([{ state: "running" }, { state: "requires_action" }]);
+
+      // The cancel did not resolve the request: the user can still answer it.
+      answer.resolve("allow");
+      await request;
+      expect(states(published)).toEqual([
+        { state: "running" },
+        { state: "requires_action" },
+        { state: "running" },
+      ]);
+    });
+
+    it("does not count a cancel that came before the request opened", async () => {
+      const { runtime, published } = await runningWorker();
+      await runtime.parentCancelled(async () => {});
+      const withdrawal = new AbortController();
+      const request = withdrawable(runtime, withdrawal);
+      await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+
+      withdrawal.abort();
+      await request;
+
+      expect(states(published).at(-1)).toEqual({ state: "running" });
+    });
+
+    it.each([
+      { first: "withdrawn", last: "answered", running: true },
+      { first: "answered", last: "withdrawn", running: false },
+      { first: "withdrawn", last: "withdrawn", running: false },
+    ])(
+      "lets the last of two requests decide: $first, then $last",
+      async ({ first, last, running }) => {
+        const { runtime, published } = await runningWorker();
+        const withdrawals = [new AbortController(), new AbortController()];
+        const answers = [Promise.withResolvers<string>(), Promise.withResolvers<string>()];
+        const requests = withdrawals.map((withdrawal, index) =>
+          runtime
+            .awaitingUser("worker-1", () => answers[index].promise, withdrawal.signal)
+            .catch((error: Error) => error.message),
+        );
+        await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+        await runtime.parentCancelled(async () => {});
+
+        const end = async (index: number, how: string) => {
+          if (how === "answered") {
+            answers[index].resolve("allow");
+          } else {
+            withdrawals[index].abort();
+            answers[index].reject(new Error("Tool use aborted"));
+          }
+          await requests[index];
+        };
+        await end(0, first);
+        // Only the last request to end reports.
+        expect(states(published)).toHaveLength(2);
+        await end(1, last);
+
+        expect(states(published).at(-1)).toEqual({
+          state: running ? "running" : "requires_action",
+        });
+      },
+    );
+  });
 });

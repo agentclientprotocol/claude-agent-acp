@@ -5845,6 +5845,116 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(requests[0].sessionId).toBe("agent-42");
   });
 
+  describe("a child's permission request that Claude Code withdraws (the subagents RFD)", () => {
+    /**
+     * An agent for an RFD client, whose child `agent-42` runs and has asked for
+     * permission. The client holds the request and ignores `$/cancel_request`.
+     * `withdrawal` is the request's signal, which Claude Code aborts when it
+     * withdraws the request.
+     */
+    async function childWaitingForPermission() {
+      const updates: AcpSessionNotification[] = [];
+      const withdrawal = new AbortController();
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+          requestPermission: () => new Promise(() => {}),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+      const query = wrapQuery((async function* () {})());
+      const session = mockSessionState({ query, input: new Pushable() });
+      agent.sessions["session-1"] = session;
+      session.liveBackgroundTasks.set("agent-42", {
+        parentToolUseId: "toolu_parent",
+        isSubagent: true,
+      });
+      session.nativeSubagentsByTaskId = new Map([
+        [
+          "agent-42",
+          {
+            sessionId: "agent-42",
+            parentSessionId: "session-1",
+            parentToolUseId: "toolu_parent",
+            name: "Explore",
+            task: "Investigate",
+            announced: true,
+            workState: "running",
+          },
+        ],
+      ]);
+      const runtime = new NativeSubagentRuntime(
+        "rfd",
+        "session-1",
+        session,
+        async (notification) => {
+          updates.push(notification);
+        },
+        { log: () => {} },
+      );
+      session.nativeSubagentRuntime = runtime;
+      const asking = agent
+        .canUseTool("session-1")("Bash", { command: "ls" }, {
+          signal: withdrawal.signal,
+          suggestions: [],
+          toolUseID: "toolu_sub",
+          agentID: "agent-42",
+        } as any)
+        .catch((error: Error) => error.message);
+      /** The states that the child reported, such as `idle cancelled`. */
+      const childStates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate === "subagent_update" && update.state
+            ? [
+                [update.state.state, (update.state as { stopReason?: string }).stopReason]
+                  .filter(Boolean)
+                  .join(" "),
+              ]
+            : [],
+        );
+      await vi.waitFor(() => expect(childStates()).toEqual(["requires_action"]));
+      return { agent, query, runtime, withdrawal, asking, childStates };
+    }
+
+    it("reports no running when a cancel withdraws it, and leaves the child's end to the SDK", async () => {
+      const { agent, query, runtime, withdrawal, asking, childStates } =
+        await childWaitingForPermission();
+      // Claude Code's interrupt withdraws the request of the child that it stops.
+      query.interrupt.mockImplementation(async () => withdrawal.abort());
+
+      await agent.cancel({ sessionId: "session-1" });
+      await expect(asking).resolves.toBe("Tool use aborted");
+      expect(childStates()).toEqual(["requires_action"]);
+
+      await runtime.finishTask("agent-42", "killed", async () => {});
+      expect(childStates()).toEqual(["requires_action", "idle cancelled"]);
+    });
+
+    it("reports no running when a session/close withdraws it", async () => {
+      const { agent, query, withdrawal, asking, childStates } = await childWaitingForPermission();
+      // The SDK's cleanup of a closed query aborts every request that is open.
+      query.close.mockImplementation(() => withdrawal.abort());
+
+      await agent.closeSession({ sessionId: "session-1" });
+      await expect(asking).resolves.toBe("Tool use aborted");
+
+      expect(childStates()).toEqual(["requires_action"]);
+    });
+
+    it("reports running when Claude Code withdraws it on its own, since the child goes on", async () => {
+      const { withdrawal, asking, childStates } = await childWaitingForPermission();
+
+      // A hook answered the request in the user's place.
+      withdrawal.abort();
+      await expect(asking).resolves.toBe("Tool use aborted");
+
+      expect(childStates()).toEqual(["requires_action", "running"]);
+    });
+  });
+
   it("sends the PostToolUse hook update of a child's Edit to the child session", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(

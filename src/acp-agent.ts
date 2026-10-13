@@ -8940,15 +8940,17 @@ export class ClaudeAcpAgent {
   /** Runs `request`, a request that `requestSessionId` sends for the session
    *  `ownerSessionId`. When that is a subagent's child session, the child
    *  reports that it awaits the user while the request is open (the RFD form,
-   *  see `NativeSubagentRuntime.awaitingUser`). */
+   *  see `NativeSubagentRuntime.awaitingUser`). `signal` aborts when Claude
+   *  Code withdraws the request. */
   private withChildAwaitingUser<T>(
     ownerSessionId: string,
     requestSessionId: string,
+    signal: AbortSignal,
     request: () => Promise<T>,
   ): Promise<T> {
     const runtime = this.sessions[ownerSessionId]?.nativeSubagentRuntime;
     return runtime && requestSessionId !== ownerSessionId
-      ? runtime.awaitingUser(requestSessionId, request)
+      ? runtime.awaitingUser(requestSessionId, request, signal)
       : request();
   }
 
@@ -9106,7 +9108,7 @@ export class ClaudeAcpAgent {
     // The request goes to a subagent's child session for a tool call of that
     // subagent, but it blocks the turn of the owner session.
     try {
-      return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, () =>
+      return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, signal, () =>
         this.withPendingUserInput(
           ownerSessionId,
           () => raceWithAbort(this.client.requestPermission(params, signal), signal),
@@ -9581,7 +9583,7 @@ export class ClaudeAcpAgent {
     );
     let response;
     try {
-      response = await this.withChildAwaitingUser(sessionId, requestSessionId, () =>
+      response = await this.withChildAwaitingUser(sessionId, requestSessionId, signal, () =>
         this.withPendingUserInput(
           sessionId,
           () => this.client.createElicitation(createRequest, signal),
