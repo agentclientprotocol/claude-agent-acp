@@ -496,6 +496,51 @@ describe("incomplete foreground tools", () => {
     expect(agent.sessions[sessionId].toolUseCache).toEqual({});
   });
 
+  it("closes a tool_use that Claude abandoned in a cycle that Claude Code started, and leaves the rest", async () => {
+    const { prompt, updates, logError, agent } = createTestSession(abandonedCycleToolMessages);
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    await agent.sessions[sessionId].consumer;
+
+    const ends = (id: string) =>
+      updates.filter(
+        (u) => u.toolCallId === id && ["completed", "failed", "cancelled"].includes(u.status),
+      );
+    // The cycle's end closes the call it abandoned, as a turn's end would.
+    const [end, ...more] = ends(toolCallId);
+    expect(more).toEqual([]);
+    expect(end.status).toBe("failed");
+    expect(end.content[0].content.text).toBe("Claude stopped this tool call before it ran.");
+    // The call that ran has its result, once. The background subagent runs on,
+    // and still streams its command's tool_use, so that stays open.
+    expect(ends("ran-tool").map((u) => u.status)).toEqual(["completed"]);
+    expect(ends("bg-child")).toEqual([]);
+    expect([...agent.sessions[sessionId].emittedToolCalls]).toEqual(["bg-child"]);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("closes a tool_use that a cycle left when it ends at an idle with no result", async () => {
+    const { prompt, updates, logError, agent } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield successfulResultMessage();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      // Claude Code's follow-up starts a tool_use, and the stream drops before
+      // the cycle's result.
+      yield toolStart();
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    await agent.sessions[sessionId].consumer;
+
+    const ends = updates.filter((u) => u.toolCallId === toolCallId && u.status === "failed");
+    expect(ends.map((u) => u.content[0].content.text)).toEqual([
+      "Claude stopped this tool call before it ran.",
+    ]);
+    expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+    expect(logError).not.toHaveBeenCalled();
+  });
+
   it("closes an abandoned tool_use and still fails the turn for an unfinished tool", async () => {
     const { prompt, updates } = createTestSession(abandonedAndUnfinishedToolMessages);
 
@@ -1544,6 +1589,29 @@ async function* abandonedToolMessages(input: Pushable<any>) {
   yield toolStart();
   yield assistantText("Here is the answer.");
   yield successfulResultMessage();
+}
+
+/**
+ * After the turn ended, Claude Code's own follow-up runs a command, starts a
+ * background subagent, which is streaming a tool_use as the follow-up ends,
+ * and starts a tool_use that no complete message ever holds.
+ */
+async function* abandonedCycleToolMessages(input: Pushable<any>) {
+  yield* echoNextPrompt(input);
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  yield toolStart("ran-tool");
+  yield toolUse("ran-tool");
+  yield toolResult("ran-tool");
+  yield toolStart("bg-agent", null, "Agent");
+  yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+  yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+  yield toolResult("bg-agent");
+  yield toolStart("bg-child", "bg-agent");
+  yield toolStart();
+  yield assistantText("The build passed.");
+  yield successfulResultMessage({ origin: { kind: "task-notification" } });
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
 }
 
 async function* abandonedAndUnfinishedToolMessages(input: Pushable<any>) {

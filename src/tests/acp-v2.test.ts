@@ -2175,6 +2175,44 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
     });
   });
 
+  it("closes a tool call that Claude dropped before it ran in a cycle as cancelled, before the cycle's idle", async () => {
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      // Claude Code's follow-up starts a tool_use, but no complete assistant
+      // message holds it, so it never runs.
+      yield stream(options, {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: "toolu_dropped", name: "Bash", input: {} },
+      });
+      yield assistantText(options, "The build passed.", "msg_followup");
+      yield followupResult(options);
+      yield idleState(options);
+    });
+    const client = await promptAndWait(2);
+
+    const dropped = client.sessionUpdates.flatMap(({ update }) =>
+      update.sessionUpdate === "tool_call_update" &&
+      update.toolCallId === "toolu_dropped" &&
+      update.status
+        ? [update.status]
+        : update.sessionUpdate === "state_update"
+          ? [`state ${update.state}`]
+          : [],
+    );
+    expect(dropped).toEqual([
+      "state running",
+      "state idle",
+      "state running",
+      "pending",
+      "cancelled",
+      "state idle",
+    ]);
+    expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
+  });
+
   it("ends the tool call that a cancelled cycle runs with Claude Code's result, before idle cancelled", async () => {
     const interrupted = Promise.withResolvers<void>();
     sdk.interrupt = async () => interrupted.resolve();
