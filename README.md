@@ -51,10 +51,14 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
   call stays a tool call of the session that made it.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
-  the turn waits on and, currently, background children too. Each stopped child reports `idle`
-  with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
-  withdrawn. The adapter ends no child at a cancel itself, so a child that keeps running keeps its
-  open requests and its open tool calls. A tool call of a stopped child that Claude Code reports no
+  the turn waits on. Background children keep running, as the RFD prefers; a client stops one with
+  its own `cancel`. Each stopped child reports `idle` with `cancelled` from Claude Code's own
+  events, and its open requests are withdrawn. The adapter ends no child at a cancel itself, so a
+  child that keeps running keeps its open requests and its open tool calls. To spare background
+  children, the adapter declares the SDK option `perTaskStopAffordance`, which a client can turn
+  off in `_meta.claudeCode.options`. That option spares background workflows too, which a client
+  cannot stop, so the adapter stops them after the interrupt, as Claude Code did without it.
+  Background commands keep running after a cancel either way. A tool call of a stopped child that Claude Code reports no
   result for, such as the command it was running, ends in the child's session before the cancelled
   prompt resolves. When Claude Code stops a background child after that, or while no prompt runs,
   the tool call ends right after the child reports `idle`. A child that still runs when Claude Code

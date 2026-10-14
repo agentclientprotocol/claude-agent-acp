@@ -7214,6 +7214,97 @@ describe("subagent permission attribution (issue #851)", () => {
       });
     });
 
+    describe("session/cancel on the parent session", () => {
+      /**
+       * Runs a turn that starts a background workflow, a background command
+       * and a background subagent, then cancels it. With
+       * `perTaskStopAffordance` declared, Claude Code's interrupt spares all
+       * three. Returns the query.
+       */
+      async function cancelWithBackgroundWork(stopsWorkflowsOnCancel: boolean) {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { subagents: {} } as ClientCapabilities,
+        });
+        const interrupted = Promise.withResolvers<void>();
+        injectGeneratorSession(
+          agent,
+          async function* (input: Pushable<any>) {
+            const { value } = await input[Symbol.asyncIterator]().next();
+            yield userEcho(value);
+            yield rootToolUse("toolu_workflow", "Workflow");
+            // As seen live: a workflow's task_started has no is_backgrounded.
+            yield {
+              ...taskStarted("workflow-1", "toolu_workflow"),
+              task_type: "local_workflow",
+            };
+            yield rootToolUse("toolu_shell", "Bash");
+            yield {
+              ...taskStarted("shell-1", "toolu_shell"),
+              task_type: "local_bash",
+              is_backgrounded: true,
+            };
+            yield rootToolUse("toolu_agent", "Agent");
+            yield {
+              ...taskStarted("agent-42", "toolu_agent"),
+              task_type: "local_agent",
+              subagent_type: "Explore",
+              is_backgrounded: true,
+            };
+            await interrupted.promise;
+            yield {
+              ...successResult(),
+              subtype: "error_during_execution",
+              is_error: true,
+              terminal_reason: "aborted_tools",
+            };
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          },
+          { stopsWorkflowsOnCancel },
+        );
+        const query = agent.sessions["test-session"]!.query;
+        vi.mocked(query.interrupt).mockImplementation(async () => {
+          interrupted.resolve();
+          return undefined;
+        });
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "go" }],
+        });
+        await vi.waitFor(() =>
+          expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-42")).toBe(true),
+        );
+
+        await agent.cancel({ sessionId: "test-session" });
+
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        return query;
+      }
+
+      it("stops the background workflows that the interrupt spares, after it", async () => {
+        const query = await cancelWithBackgroundWork(true);
+
+        // Not the command or the subagent: the interrupt never stopped
+        // background commands, and the client stops a subagent with its
+        // child's `cancel`.
+        expect(query.stopTask).toHaveBeenCalledExactlyOnceWith("workflow-1");
+        expect(vi.mocked(query.interrupt).mock.invocationCallOrder[0]).toBeLessThan(
+          vi.mocked(query.stopTask).mock.invocationCallOrder[0],
+        );
+      });
+
+      it("stops no workflow when the interrupt does not spare them", async () => {
+        const query = await cancelWithBackgroundWork(false);
+
+        expect(query.interrupt).toHaveBeenCalled();
+        expect(query.stopTask).not.toHaveBeenCalled();
+      });
+    });
+
     it("reports a child that the SDK stopped as cancelled", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },

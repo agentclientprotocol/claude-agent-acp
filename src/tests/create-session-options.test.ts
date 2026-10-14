@@ -457,6 +457,85 @@ describe("createSession options merging", () => {
     });
   });
 
+  describe("per-task stop affordance", () => {
+    function sessionFor(sessionId: string) {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
+    }
+
+    // Declared, Claude Code's interrupt spares background subagents, which a
+    // client on the subagents RFD form stops one at a time with its child's
+    // `cancel`. It spares background workflows too, which that client cannot
+    // stop, so the session's cancel stops them.
+    it("declares it for a client on the subagents RFD form", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(true);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(true);
+    });
+
+    it("stops workflows on a cancel only when declared and the client cannot stop them", async () => {
+      const { sessionId: plain } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(sessionFor(plain).stopsWorkflowsOnCancel).toBe(false);
+
+      // A caller's own declaration counts.
+      const { sessionId: declared } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(declared).stopsWorkflowsOnCancel).toBe(true);
+
+      // AIR stops a workflow itself, as an async task.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+        } as ClientCapabilities,
+      });
+      const { sessionId: air } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(air).stopsWorkflowsOnCancel).toBe(false);
+    });
+
+    it("does not declare it for a client that cannot cancel one subagent", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+
+      // AIR's draft grants a child no `cancel`.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          subagents: {},
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+        } as ClientCapabilities,
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+    });
+
+    it("lets a caller's perTaskStopAffordance win", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: false } } },
+      });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(false);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(false);
+    });
+  });
+
   describe("systemPrompt via _meta", () => {
     it("defaults to the claude_code preset when not provided", async () => {
       await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
