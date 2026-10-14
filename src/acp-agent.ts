@@ -1422,6 +1422,16 @@ const AUTONOMOUS_RESULT_ORIGINS: ReadonlySet<SDKMessageOrigin["kind"]> = new Set
 const AUTONOMOUS_CYCLE = "autonomous-cycle";
 type ForegroundOwner = Turn | typeof AUTONOMOUS_CYCLE;
 
+/** The events of a connection that reports no foreground work: v1, whose
+ *  client has no session state. The agent still tracks the work, which
+ *  decides what the window after a cancel drops (see `workEndReported`). */
+const UNREPORTED_FOREGROUND: ForegroundEvents = {
+  running: () => {},
+  awaitingUser: () => {},
+  ended: () => {},
+  failed: () => {},
+};
+
 /** Whether this turn's terminal result arrived but its settlement is being
  *  held for background subagents it spawned (see Turn.deferredSettle). The
  *  single spelling of the hold predicate, shared by the consumer's settle
@@ -2608,7 +2618,8 @@ export class ClaudeAcpAgent {
   private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
   /**
    * The foreground work of each session while it runs, by the session id that
-   * the client knows. A clear-context restart replaces the Claude Code session
+   * the client knows, on every connection: only the `foreground` option
+   * reports it. A clear-context restart replaces the Claude Code session
    * behind that id and moves the running turn to it, so the work belongs to the
    * id, not to a {@link Session}.
    */
@@ -2632,8 +2643,9 @@ export class ClaudeAcpAgent {
       /**
        * Where the agent reports a session's foreground work (see
        * {@link ForegroundEvents}), called each time work starts in the session
-       * `sessionId`. Without it, nothing reports the work: a v1 client has no
-       * session state, and learns that a turn ended from its prompt response.
+       * `sessionId`. Without it, nothing reports the work, which the agent
+       * still tracks: a v1 client has no session state, and learns that a turn
+       * ended from its prompt response.
        */
       foreground?: (sessionId: string) => ForegroundEvents;
     } = {},
@@ -5017,10 +5029,17 @@ export class ClaudeAcpAgent {
      *  gives the tools of the main conversation results, which
      *  `sendInterruptedToolResults` delivers while the cycle runs. What is still
      *  open has none, such as the command of a foreground subagent. A turn that
-     *  took the cycle over closes its own calls, when it settles. */
+     *  took the cycle over closes its own calls, when it settles.
+     *  The follow-up of a turn that v1 holds for its background subagents is a
+     *  cycle too, and the cancel ends the held turn as well, possibly in
+     *  `cancelTurns` while these reports are in flight. So the cycle's calls
+     *  close with the held turn's closing, which each settle of the turn waits
+     *  for, and the response never comes before them. */
     const closeCancelledCycleToolCalls = async (): Promise<void> => {
       if (!session.cancelled || !this.runsAutonomousCycle(params.sessionId)) return;
-      await closeOpenToolCalls(closedAtCancel);
+      const held = session.activeTurn;
+      if (held && !held.settled) await closeCancelledToolCalls(held);
+      else await closeOpenToolCalls(closedAtCancel);
     };
 
     /** At the actual turn boundary, preview its checkpoint, settle the active
@@ -9097,13 +9116,12 @@ export class ClaudeAcpAgent {
    *  reports nothing new: a turn takes over a cycle that Claude Code started on
    *  its own, and only the owner's end ends the work. */
   private startForeground(sessionId: string, owner: ForegroundOwner): void {
-    if (!this.foregroundEvents) return;
     const current = this.foregroundWork.get(sessionId);
     if (current) {
       current.owner = owner;
       return;
     }
-    const events = this.foregroundEvents(sessionId);
+    const events = this.foregroundEvents?.(sessionId) ?? UNREPORTED_FOREGROUND;
     this.foregroundWork.set(sessionId, { owner, events, awaitingUser: false });
     events.running();
     const session = this.sessions[sessionId];
@@ -9131,7 +9149,7 @@ export class ClaudeAcpAgent {
    *  whose work ended at its result, so its follow-up is a cycle. Output of
    *  the work a cancel stopped starts nothing (see Session.cancelled). */
   private startAutonomousCycle(sessionId: string, session: Session, message: SDKMessage): void {
-    if (!this.foregroundEvents || this.foregroundWork.has(sessionId) || session.cancelled) return;
+    if (this.foregroundWork.has(sessionId) || session.cancelled) return;
     if (message.type !== "assistant" && message.type !== "stream_event") return;
     if (message.parent_tool_use_id !== null) return;
     // A turn that Claude Code started is the foreground work already. Without
@@ -9148,9 +9166,13 @@ export class ClaudeAcpAgent {
   /** Whether the client has been told that the session's work ended: on v2 by
    *  an idle state, so no foreground work is open, including a cycle that
    *  Claude Code started on its own; on v1 by the response to the turn's
-   *  prompt, so no turn is active. */
+   *  prompt, so no turn is active. v1 reports nothing for a cycle, so its end
+   *  is its result or idle: until then, Claude Code's results for the cycle's
+   *  tool calls still reach the client after a cancel. */
   private workEndReported(sessionId: string, session: Session): boolean {
-    return this.foregroundEvents ? !this.foregroundWork.has(sessionId) : !session.activeTurn;
+    return this.foregroundEvents
+      ? !this.foregroundWork.has(sessionId)
+      : !session.activeTurn && !this.runsAutonomousCycle(sessionId);
   }
 
   /** Whether the consumer drops what it reaches now as output of the work a
@@ -9225,8 +9247,7 @@ export class ClaudeAcpAgent {
   }
 
   /** Whether a model cycle that Claude Code started on its own is the session's
-   *  foreground work. Only a client that gets the session's work reported (v2)
-   *  has any; a turn that took a cycle over owns the work from then on. */
+   *  foreground work. A turn that took a cycle over owns the work from then on. */
   private runsAutonomousCycle(sessionId: string): boolean {
     return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }

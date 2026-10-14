@@ -721,17 +721,62 @@ describe("tool calls of a cancelled turn", () => {
     expect(textOf(ends(updates)[0])).toBe("Claude stopped this tool call before it ran.");
   });
 
-  it("does not close the tool calls of a cycle that Claude Code started on its own, which v1 does not report", async () => {
-    const { prompt, updates, agent } = createTestSession(cancelledCycleMessages);
+  describe("of a cycle that Claude Code started on its own, which v1 does not report", () => {
+    it("delivers Claude Code's interrupted result for the cycle's command", async () => {
+      const { prompt, updates, agent, logError } = createTestSession(cancelledCycleMessages);
 
-    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
-    await agent.sessions[sessionId].consumer;
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      await agent.sessions[sessionId].consumer;
 
-    // v1 sends no state for such a cycle, so no prompt response or idle follows
-    // the cycle's end, and its output after the cancel is dropped. v2 closes the
-    // tool calls that the cycle left open as it reports the cycle's end.
-    expect(ends(updates, "cycle-tool")).toEqual([]);
-    expect(agent.sessions[sessionId].emittedToolCalls.has("cycle-tool")).toBe(true);
+      // v1 reports nothing for the cycle, so it ends at its result: until then,
+      // Claude Code's result for its command still reaches the client.
+      const [end, ...more] = ends(updates, "cycle-tool");
+      expect(more).toEqual([]);
+      expect(end).toMatchObject({
+        status: "failed",
+        _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
+      });
+      expect(textOf(end)).toContain("doesn't want to proceed with this tool use");
+      expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+      expect(logError).not.toHaveBeenCalled();
+    });
+
+    it("delivers the result of its Agent call, and closes the command of the subagent, which Claude Code reports no result for", async () => {
+      const { prompt, updates, agent, logError } = createTestSession(cancelledCycleAgentMessages);
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      await agent.sessions[sessionId].consumer;
+
+      const [agentEnd, ...moreAgentEnds] = ends(updates, "cycle-agent");
+      expect(moreAgentEnds).toEqual([]);
+      expect(textOf(agentEnd)).toContain("doesn't want to proceed with this tool use");
+      const [childEnd, ...moreChildEnds] = ends(updates, "cycle-child");
+      expect(moreChildEnds).toEqual([]);
+      expect(childEnd).toMatchObject({
+        status: "failed",
+        _meta: { claudeCode: { parentToolUseId: "cycle-agent" } },
+      });
+      expect(textOf(childEnd)).toBe(
+        "The turn was cancelled before this tool call returned a result.",
+      );
+      expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+      expect(logError).not.toHaveBeenCalled();
+    });
+
+    it("closes a call that gets no result at the idle that ends the cycle, and drops what comes after", async () => {
+      const { prompt, updates, agent, logError } = createTestSession(cycleEndedByIdleMessages);
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      await agent.sessions[sessionId].consumer;
+
+      // Claude Code's result comes only after the idle that ended the cycle, so
+      // the call was closed at the idle, and the late result is dropped.
+      const [end, ...more] = ends(updates, "cycle-tool");
+      expect(more).toEqual([]);
+      expect(textOf(end)).toBe("The turn was cancelled before this tool call returned a result.");
+      expect(agent.sessions[sessionId].emittedToolCalls.size).toBe(0);
+      expect(logError).not.toHaveBeenCalled();
+    });
   });
 
   it("drops Claude Code's result for a tool call once the cancelled turn has ended", async () => {
@@ -1301,7 +1346,8 @@ type SubagentEndReports = "both" | "update only" | "notification only" | "comple
 /**
  * Two background subagents each run a command. With a "held turn", the turn's
  * result came while they run, so v1 holds the turn for them; with "no turn",
- * it ended before they started. After `reported`, the SDK reports how the first
+ * Claude Code's own follow-up started them after the turn ended, and that
+ * follow-up ended too. After `reported`, the SDK reports how the first
  * subagent ended, and Claude Code's result for its command.
  */
 async function* backgroundSubagentsEndMessages(
@@ -1311,7 +1357,10 @@ async function* backgroundSubagentsEndMessages(
   reports: SubagentEndReports,
 ) {
   yield* echoNextPrompt(input);
-  if (settlement === "no turn") yield successfulResultMessage();
+  if (settlement === "no turn") {
+    yield successfulResultMessage();
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  }
   for (const n of [1, 2]) {
     yield toolStart(`bg-agent-${n}`, null, "Agent");
     yield toolUse(`bg-agent-${n}`, null, "Agent", { description: "Work", prompt: "Work" });
@@ -1321,6 +1370,10 @@ async function* backgroundSubagentsEndMessages(
     yield toolUse(`bg-child-${n}`, `bg-agent-${n}`);
   }
   if (settlement === "held turn") yield successfulResultMessage();
+  else {
+    yield successfulResultMessage({ origin: { kind: "task-notification" } });
+    yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  }
   await reported;
   const done = { type: "system", session_id: sessionId, task_id: "agent-bg-1" };
   if (reports === "completed") {
@@ -1389,6 +1442,41 @@ async function* cancelledCycleMessages(input: Pushable<any>, agent: ClaudeAcpAge
   yield interruptedResult("cycle-tool");
   yield { ...abortedResult(), origin: { kind: "task-notification" } };
   yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/**
+ * After the turn ended, Claude Code's own follow-up runs a foreground subagent
+ * that runs a command, and the cancel stops both. As seen live: the SDK reports
+ * the subagent stopped, and Claude Code sends the Agent call's interrupted
+ * result, but none for the subagent's command.
+ */
+async function* cancelledCycleAgentMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  yield toolStart("cycle-agent", null, "Agent");
+  yield toolUse("cycle-agent", null, "Agent", { description: "Work", prompt: "Work" });
+  yield taskStarted("agent-fg", "cycle-agent", "general-purpose");
+  yield toolStart("cycle-child", "cycle-agent");
+  yield toolUse("cycle-child", "cycle-agent");
+  await agent.cancel({ sessionId });
+  yield taskStopped("agent-fg", "cycle-agent");
+  yield interruptedResult("cycle-agent");
+  yield interruptNote;
+  yield { ...abortedResult(), origin: { kind: "task-notification" } };
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/** A cancelled follow-up ends at an idle with no result, and Claude Code's result for its command comes after. */
+async function* cycleEndedByIdleMessages(input: Pushable<any>, agent: ClaudeAcpAgent) {
+  yield* echoNextPrompt(input);
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  yield toolStart("cycle-tool");
+  yield toolUse("cycle-tool");
+  await agent.cancel({ sessionId });
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  yield interruptedResult("cycle-tool");
 }
 
 /** The result of the turn comes before Claude Code's result for the tool. */
