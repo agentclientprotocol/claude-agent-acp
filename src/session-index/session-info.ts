@@ -38,6 +38,7 @@ export function sessionInfoOf(
     lastPromptAt: iso(facts.lastPromptAt),
     model: facts.model,
     forkedFrom: facts.forkedFrom,
+    agentWorktree: row.agentWorktree,
     state: activity?.state,
     lastTurnEndedAt: activity?.lastTurnEndedAt,
     cost: cost === undefined ? undefined : { amount: cost, currency: "USD" },

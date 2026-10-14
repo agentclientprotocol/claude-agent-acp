@@ -24,6 +24,7 @@ import {
   AIR_SESSION_INDEX_CAPABILITY,
   AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
   AIR_SESSION_RENAME_CAPABILITY,
+  AIR_SESSION_WORKTREES_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
@@ -143,8 +144,8 @@ export class SessionIndexConnection {
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
-   *  itself, archive, rename and the list subscription, all only to a client
-   *  that declared `sessionIndex`. */
+   *  itself, archive, rename, the list subscription and the `agentWorktree`
+   *  row field, all only to a client that declared `sessionIndex`. */
   capabilities(): string[] {
     return this.service
       ? [
@@ -152,6 +153,7 @@ export class SessionIndexConnection {
           AIR_SESSION_ARCHIVE_CAPABILITY,
           AIR_SESSION_RENAME_CAPABILITY,
           AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
+          AIR_SESSION_WORKTREES_CAPABILITY,
         ]
       : [];
   }

@@ -53,7 +53,7 @@ import {
   type TranscriptFacts,
 } from "./transcript-scan.js";
 import { DirListings, statFiles } from "./dir-listing.js";
-import { worktreeCounterparts } from "./worktrees.js";
+import { isInLinkedWorktree, worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
@@ -125,6 +125,10 @@ export type IndexRow = {
   facts: TranscriptFacts;
   mtimeMs: number;
   archived: boolean;
+  /** The session runs in a linked git worktree that Claude Code made for
+   *  it: its transcript says so (`facts.agentWorktree`) and `cwd` lies in
+   *  a linked worktree. See {@link markAgentWorktrees}. */
+  agentWorktree?: true;
 };
 
 /** A keyset position: the order key and the session id of the last row. */
@@ -247,6 +251,22 @@ function toRow({ candidate, metadata }: Resolved, cwd: string): IndexRow {
     facts: metadata.facts,
     mtimeMs: candidate.mtimeMs,
   };
+}
+
+/**
+ * Sets `agentWorktree` on the rows whose transcript says Claude Code made
+ * their worktree and whose cwd lies in a linked worktree now. Only those rows
+ * are checked; the check is not cached, so a removed worktree shows at once.
+ */
+async function markAgentWorktrees(rows: IndexRow[]): Promise<IndexRow[]> {
+  await Promise.all(
+    rows.map(async (row) => {
+      if (row.facts.agentWorktree === true && (await isInLinkedWorktree(row.cwd))) {
+        row.agentWorktree = true;
+      }
+    }),
+  );
+  return rows;
 }
 
 function isAfter(row: { orderAtMs: number; sessionId: string }, cursor: ListCursor): boolean {
@@ -721,7 +741,7 @@ export class SessionIndex {
       if (previous && previous.mtimeMs >= item.candidate.mtimeMs) continue;
       newest.set(id, { row: toRow(item, cwd), mtimeMs: item.candidate.mtimeMs });
     }
-    return { rows: [...newest.values()].map(({ row }) => row), unknown };
+    return { rows: await markAgentWorktrees([...newest.values()].map(({ row }) => row)), unknown };
   }
 
   /**
@@ -831,7 +851,7 @@ export class SessionIndex {
       );
       await settlePending();
     }
-    return rows();
+    return markAgentWorktrees(rows());
   }
 
   /** Whether the cached metadata of `candidate`, still current, places it

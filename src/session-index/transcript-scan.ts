@@ -51,6 +51,11 @@ export type TranscriptFacts = {
   /** The session this one was forked from: the `forkedFrom.sessionId` that
    *  the SDK and CLI fork write on every copied record. */
   forkedFrom?: string;
+  /** What the last `worktree-state` record says: true when its
+   *  `worktreeSession` is set and not `enteredExisting` (Claude Code made the
+   *  worktree and the session is in it), false when it says otherwise.
+   *  Undefined when no such record was read. See {@link agentWorktreeOf}. */
+  agentWorktree?: boolean;
   /** Whether the head or the tail holds a user or an assistant message. A
    *  transcript without one is a metadata-only stub. */
   hasMessages: boolean;
@@ -67,7 +72,7 @@ export type HeadTail = {
 };
 
 /** Facts that an earlier scan may have found before the tail window. */
-const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt"] as const;
+const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "agentWorktree"] as const;
 
 /** What an earlier scan of the same file found, at `size`. */
 export type PreviousScan = { size: number } & Pick<
@@ -152,6 +157,12 @@ export async function scanTranscriptFile(
       }
     }
   }
+  // No worktree record in the tail (or before it, by an earlier scan): the
+  // one `claude --worktree` writes at the start may still be in the head.
+  if (facts.agentWorktree === undefined) {
+    const agentWorktree = agentWorktreeOf(read.head);
+    if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
+  }
   if (facts.lastPromptAt !== undefined || size <= CHUNK_SIZE) {
     facts.promptSearched = true;
   } else if (grownWithinTail && (previous.lastPromptAt !== undefined || previous.promptSearched)) {
@@ -199,6 +210,11 @@ export async function scanTranscriptFile(
         ...wider,
         ...(facts.model !== undefined && { model: facts.model }),
         ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
+        // The wider tail holds the narrow one, so a record it has is the
+        // latest; else the narrow scan's (inherited or from the head) stands.
+        ...((wider.agentWorktree ?? facts.agentWorktree) !== undefined && {
+          agentWorktree: wider.agentWorktree ?? facts.agentWorktree,
+        }),
         // A turn end the wider tail lacks may lie before it: the
         // narrow scan inherited it from an earlier scan of this file.
         lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
@@ -234,6 +250,39 @@ export function relocatedCwd(tail: string): string | undefined {
     if (entry?.type === "relocated" && typeof entry.relocatedCwd === "string") {
       return entry.relocatedCwd;
     }
+  }
+  return undefined;
+}
+
+const WORKTREE_STATE_MARKER = '"worktree-state"';
+
+/**
+ * Whether the last `worktree-state` record of `text` says the session is in
+ * a worktree that Claude Code made for it, as AIR's native Claude provider
+ * reads it: a set `worktreeSession` without `enteredExisting: true`. A
+ * record with `worktreeSession: null` means the session left the worktree.
+ * Undefined when `text` holds no such record.
+ *
+ * The CLI writes the record when it enters or leaves a worktree (for
+ * `claude --worktree`, at the start of the session, so in the head), and
+ * writes it again with the other session metadata at the end of the
+ * transcript (on exit and as the transcript grows), so the tail usually
+ * holds the latest one. Only the head and the tail are read: a session that
+ * entered a worktree midway through a long transcript, with no metadata
+ * written after it yet, is not seen until the CLI writes the metadata again.
+ */
+export function agentWorktreeOf(text: string): boolean | undefined {
+  if (!text.includes(WORKTREE_STATE_MARKER)) return undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes(WORKTREE_STATE_MARKER)) continue;
+    const entry = parseLine(line);
+    if (entry?.type !== "worktree-state" || !("worktreeSession" in entry)) continue;
+    const session = entry.worktreeSession;
+    if (session === null) return false;
+    if (!session || typeof session !== "object" || Array.isArray(session)) continue;
+    return (session as { enteredExisting?: unknown }).enteredExisting !== true;
   }
   return undefined;
 }
@@ -344,6 +393,10 @@ export function scanTranscript(
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
   const forkedFrom = FORKED_FROM_PATTERN.exec(head)?.[1];
   if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
+  // The tail only: scanTranscriptFile falls back to the head after it
+  // inherits what an earlier scan found before the tail.
+  const agentWorktree = agentWorktreeOf(tail);
+  if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
 
   const lines = tail.split("\n");
   let turnEndFound = false;
