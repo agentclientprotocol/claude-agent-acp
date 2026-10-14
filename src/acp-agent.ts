@@ -3895,40 +3895,52 @@ export class ClaudeAcpAgent {
     // husk that reached this by another route still releases its resources.
     this.closeQueryStream(session);
     try {
-      // `resume` names the Claude session, which shares the ACP session id, so
-      // the new query continues the same conversation under the same id.
-      await this.createSession(creationParams, {
-        resume: sessionId,
+      // The very first turn may be the one that signed out, so the CLI may
+      // never have written the conversation.
+      await this.recreateLiveSession(creationParams, sessionId, {
         permissionMode: session.modes.currentModeId as PermissionMode,
       });
     } catch (error) {
-      if (error instanceof RequestError && error.code === RequestError.resourceNotFound().code) {
-        // The CLI never wrote this conversation, because the very first turn
-        // was the one that signed out. Resuming it fails for ever, so start a
-        // fresh query under the same ACP session id: an empty history is a far
-        // better answer than a session the client can never use again.
-        this.logger.log(
-          `session ${sessionId} was never persisted; starting a fresh query under the same id`,
-        );
-        try {
-          await this.createSession(creationParams, {
-            reuseSessionId: sessionId,
-            permissionMode: session.modes.currentModeId as PermissionMode,
-          });
-          return;
-        } catch (fallbackError) {
-          if (!this.sessions[sessionId]) {
-            this.sessions[sessionId] = session;
-          }
-          throw fallbackError;
-        }
-      }
       // Keep the husk addressable: the client answers the refusal with its own
       // auth flow and then retries this session.
       if (!this.sessions[sessionId]) {
         this.sessions[sessionId] = session;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Starts a new query for the session `sessionId`, which ran on this
+   * connection and whose query is gone: it resumes the stored conversation.
+   * `resume` names the Claude session, which shares the ACP session id, so the
+   * new query continues the same conversation under the same id. Claude Code
+   * writes the conversation at the first prompt, so resuming a session that was
+   * never prompted fails with `resourceNotFound`, and keeps failing. Such a
+   * session starts a fresh query under the same id instead: it has no history
+   * to lose, and the client keeps a session it can use.
+   */
+  private async recreateLiveSession(
+    params: NewSessionRequest,
+    sessionId: string,
+    options: {
+      permissionMode?: PermissionMode;
+      resumedModelHint?: string | Promise<string | undefined>;
+    },
+  ): Promise<NewSessionResponse> {
+    try {
+      return await this.createSession(params, { resume: sessionId, ...options });
+    } catch (error) {
+      if (!(error instanceof RequestError && error.code === RequestError.resourceNotFound().code)) {
+        throw error;
+      }
+      this.logger.log(
+        `session ${sessionId} was never persisted; starting a fresh query under the same id`,
+      );
+      return await this.createSession(params, {
+        reuseSessionId: sessionId,
+        permissionMode: options.permissionMode,
+      });
     }
   }
 
@@ -10548,19 +10560,22 @@ export class ClaudeAcpAgent {
       await this.teardownSession(params.sessionId);
     }
 
-    const response = await this.createSession(
-      {
-        cwd: params.cwd,
-        mcpServers: params.mcpServers ?? [],
-        additionalDirectories: params.additionalDirectories,
-        _meta: params._meta,
-      },
-      {
-        resume: params.sessionId,
-        permissionMode: livePermissionMode,
-        ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
-      },
-    );
+    const sessionParams = {
+      cwd: params.cwd,
+      mcpServers: params.mcpServers ?? [],
+      additionalDirectories: params.additionalDirectories,
+      _meta: params._meta,
+    };
+    const creation = {
+      permissionMode: livePermissionMode,
+      ...(resumedSession ? { resumedModelHint: resumedSession.model } : {}),
+    };
+    // A live session may never have been prompted, so it may have no stored
+    // conversation to resume (see `recreateLiveSession`). For a session that
+    // is not loaded here, a missing conversation means an unknown session.
+    const response = existingSession
+      ? await this.recreateLiveSession(sessionParams, params.sessionId, creation)
+      : await this.createSession(sessionParams, { resume: params.sessionId, ...creation });
 
     return {
       sessionId: response.sessionId,

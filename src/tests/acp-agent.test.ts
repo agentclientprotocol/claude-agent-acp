@@ -13,6 +13,7 @@ import {
   PromptResponse,
   ReadTextFileRequest,
   ReadTextFileResponse,
+  RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -13436,6 +13437,66 @@ describe("getOrCreateSession param change detection", () => {
       expect.objectContaining({ cwd: "/new" }),
       expect.objectContaining({ resume: "s1" }),
     );
+  });
+
+  // Claude Code writes the conversation at the first prompt, so a live session
+  // that was never prompted has nothing to resume.
+  it("starts a fresh query under the same id for a live session that was never prompted", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/project" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValueOnce(RequestError.resourceNotFound("s1"))
+      .mockResolvedValueOnce({ sessionId: "s1", modes: undefined, configOptions: [] });
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        additionalDirectories: ["/project/extra"],
+      }),
+    ).resolves.toMatchObject({ configOptions: [] });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(2);
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      expect.objectContaining({ resume: "s1" }),
+    );
+    // The live session keeps its mode.
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      { reuseSessionId: "s1", permissionMode: "default" },
+    );
+  });
+
+  it("still fails a resume of an unknown session that has no stored conversation", async () => {
+    const agent = createMockAgent();
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(RequestError.resourceNotFound("s1"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/project", mcpServers: [] }),
+    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start a fresh query when the resume of a live session fails otherwise", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/old" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(new Error("CLI failed to start"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+    ).rejects.toThrow("CLI failed to start");
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
   });
 
   it("tears down existing session when mcpServers change", async () => {
