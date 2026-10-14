@@ -384,6 +384,28 @@ function sdkDeleteError(sessionId: string): Error {
 }
 
 /**
+ * `session/delete` of a client that is neither AIR nor a `sessionIndex` client:
+ * the SDK delete of the session's transcript. A session without one succeeds,
+ * as ACP asks ("Deleting an already-deleted session, or a session that never
+ * existed, SHOULD succeed silently"): an id that is not a session id, a
+ * session deleted before, or a session this connection ran but never prompted,
+ * since Claude Code writes the transcript at the first prompt. Other failures
+ * still fail the request.
+ */
+export async function deleteSessionIfStored(
+  sessionId: string,
+  deleteSession: (sessionId: string) => Promise<void> = sdkDeleteSession,
+): Promise<void> {
+  if (!isSessionId(sessionId)) return;
+  try {
+    await deleteSession(sessionId);
+  } catch (error) {
+    if (isSdkNotFound(error)) return;
+    throw error;
+  }
+}
+
+/**
  * `session/delete` of an AIR client without `sessionIndex`, which uses delete
  * to mark a session done: archives it instead, so the transcript survives. A
  * session without a transcript fails as the SDK delete did.

@@ -16,7 +16,6 @@ import {
   type ListSessionsRequest,
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk";
-import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
@@ -41,6 +40,7 @@ import {
 } from "./list-subscriptions.js";
 import {
   archiveInsteadOfDelete,
+  deleteSessionIfStored,
   archiveTo,
   renameTo,
   parseRenameSessionRequest,
@@ -336,7 +336,8 @@ export class SessionIndexConnection {
    * - Another AIR client uses delete to mark a session done, and may reopen
    *   it later: the adapter archives it instead (as `_session/archive` does,
    *   after the CLI closed), so the transcript survives.
-   * - Every other client: the SDK delete, as before.
+   * - Every other client: the SDK delete. A session without a transcript
+   *   succeeds (see {@link deleteSessionIfStored}).
    */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     const loaded = this.host.agent.sessions[params.sessionId] !== undefined;
@@ -350,7 +351,7 @@ export class SessionIndexConnection {
     } else if (this.host.isAirClient()) {
       await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
     } else {
-      await sdkDeleteSession(params.sessionId);
+      await deleteSessionIfStored(params.sessionId);
     }
     return {};
   }

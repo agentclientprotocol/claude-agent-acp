@@ -1423,7 +1423,8 @@ It is idempotent, and an unknown id also returns `{}`.
 - a `sessionIndex` client: deletes every transcript of the session (empty ones too) and every `<sessionId>/` directory, also one left without a transcript by an earlier failed delete. Anything left behind fails the request. A session that runs here is closed first. As with the CLI, the session is deleted also when another Claude Code process has it open. An unknown session is `-32002`.
 - an AIR client without `sessionIndex`: archives the session instead of deleting it (the title records of [Archive](#archive)), because AIR uses delete for "Done" and can reopen the session. A session that runs here is closed first. The list hides archived sessions from such a client too: those whose custom title, as the SDK list reports it, is archived. A session without a transcript fails with the error of the SDK delete, as before.
   A `sessionIndex` client sees such a session as archived (`archived: true`), as AIR's native Claude path does.
-- any other client: the SDK delete, as before.
+- any other client: the SDK delete. A session without a transcript (unknown, deleted before, or
+  never prompted) succeeds, as ACP asks.
 
 `session/close` of a session that is not loaded returns `{}` for every client.
 
