@@ -4912,6 +4912,18 @@ export class ClaudeAcpAgent {
           task.parentToolUseId === agentToolUseId,
       );
 
+    /** Whether output of the conversation `parentToolUseId` (null for the main
+     *  one) is a background subagent's that still runs. A cancel does not stop
+     *  such a subagent's work (agentclientprotocol/agent-client-protocol#2308):
+     *  the closing at the cancel leaves its tool calls open for their results
+     *  (`closedAtCancel`), and the window after the cancel lets its output
+     *  through (see the `session.cancelled` checks of the stream and the
+     *  user/assistant cases). Claude Code currently stops background subagents
+     *  at an interrupt, so this decides only the output that comes before the
+     *  SDK reports a subagent's end. */
+    const isRunningBackgroundSubagentOutput = (parentToolUseId: string | null): boolean =>
+      parentToolUseId !== null && runsInBackground(parentToolUseId);
+
     /** Ends the open tool calls that `include` accepts, with the report of a call
      *  that a cancel stopped and sent no result for. `include` gets the Agent/Task
      *  call of the subagent that made the tool call, if a subagent did. */
@@ -7217,7 +7229,8 @@ export class ClaudeAcpAgent {
             // `cancelled` check in the user/assistant case). Otherwise the
             // answer to a prompt the cancel abandoned, which Claude Code had
             // already taken off its queue, would stream to the client after the
-            // cancel was reported.
+            // cancel was reported. A background subagent that still runs is not
+            // work the cancel stopped (see isRunningBackgroundSubagentOutput).
             //
             // Where the consolidated message delivers the text (the same
             // condition as in the user/assistant case), a stream that loses a
@@ -7229,7 +7242,9 @@ export class ClaudeAcpAgent {
             // prefix of the text, so the text would be sent again (see
             // unstreamedRemainder).
             const streamKey = message.parent_tool_use_id ?? "";
-            const stoppedWorkOutput = this.dropsStoppedWorkOutput(params.sessionId, session);
+            const stoppedWorkOutput =
+              this.dropsStoppedWorkOutput(params.sessionId, session) &&
+              !isRunningBackgroundSubagentOutput(message.parent_tool_use_id);
             if (
               message.event.type === "content_block_start" &&
               isToolUseBlock(message.event.content_block)
@@ -7319,7 +7334,9 @@ export class ClaudeAcpAgent {
               recordDispatchedToolUses(session, message.message.content);
               // A tool use that did not stream is reached here first.
               const content = message.message.content;
-              const stoppedWorkOutput = this.dropsStoppedWorkOutput(params.sessionId, session);
+              const stoppedWorkOutput =
+                this.dropsStoppedWorkOutput(params.sessionId, session) &&
+                !isRunningBackgroundSubagentOutput(message.parent_tool_use_id);
               for (const block of Array.isArray(content) ? content : []) {
                 if (isToolUseBlock(block)) {
                   recordReachedToolUse(session, block.id, stoppedWorkOutput);
@@ -7432,11 +7449,15 @@ export class ClaudeAcpAgent {
               }
             }
 
-            if (session.cancelled) {
+            if (
+              session.cancelled &&
+              !isRunningBackgroundSubagentOutput(message.parent_tool_use_id)
+            ) {
               // The work the cancel stopped ends its tools with error results.
               // Until the client is told that the work ended, they close the
               // tool calls it opened. Everything else that work sends is
-              // dropped, and so is everything after that report.
+              // dropped, and so is everything after that report. A background
+              // subagent that still runs is not that work: its messages go on.
               if (message.type === "user" && !this.workEndReported(params.sessionId, session)) {
                 await sendInterruptedToolResults(message);
               }

@@ -909,11 +909,93 @@ describe("tool calls of a background subagent that a cancel stops", () => {
     },
   );
 
-  it("leaves the command of a subagent that completed after the cancel as it is", async () => {
-    const { afterReports } = await endFirstSubagent("no turn", { reports: "completed" });
+  it.each(["held turn", "no turn"] as const)(
+    "delivers the result of a command of a subagent that the cancel did not stop, which then completes (%s)",
+    async (settlement) => {
+      const { afterReports, agent, logError } = await endFirstSubagent(settlement, {
+        reports: "completed",
+      });
 
-    // The subagent was not stopped, so nothing says that its command was cancelled.
-    expect(ends(afterReports, "bg-child-1")).toEqual([]);
+      // The cancel did not stop the subagent: its command's own result reaches
+      // the client, though the cancel was reported, and nothing is made up.
+      const [end, ...more] = ends(afterReports, "bg-child-1");
+      expect(more).toEqual([]);
+      expect(end).toMatchObject({
+        status: "completed",
+        _meta: { claudeCode: { parentToolUseId: "bg-agent-1" } },
+      });
+      expect(agent.sessions[sessionId].emittedToolCalls.has("bg-child-1")).toBe(false);
+      expect(logError).not.toHaveBeenCalled();
+    },
+  );
+
+  it("delivers what a subagent that the cancel did not stop does after the cancel was reported", async () => {
+    const { afterReports, agent } = await endFirstSubagent("held turn", {
+      reports: "new work",
+    });
+
+    // It starts and runs another command: the streamed start, the complete
+    // message, and the result all reach the client.
+    expect(
+      afterReports.filter((u) => u.toolCallId === "bg-child-3").map((u) => u.sessionUpdate),
+    ).toEqual(expect.arrayContaining(["tool_call", "tool_call_update"]));
+    expect(ends(afterReports, "bg-child-3").map((u) => u.status)).toEqual(["completed"]);
+    expect(agent.sessions[sessionId].emittedToolCalls.has("bg-child-3")).toBe(false);
+  });
+
+  it("lets a subagent that the cancel did not stop ask for permissions after the cancel was reported", async () => {
+    const decisions: unknown[] = [];
+    const reported = Promise.withResolvers<void>();
+    const { agent, prompt, updates } = createTestSession(async function* (input, agent) {
+      yield* echoNextPrompt(input);
+      yield toolStart("bg-agent", null, "Agent");
+      yield toolUse("bg-agent", null, "Agent", { description: "Work", prompt: "Work" });
+      yield taskStarted("agent-bg", "bg-agent", "general-purpose", true);
+      yield toolResult("bg-agent");
+      // v1 holds the turn for the subagent.
+      yield successfulResultMessage();
+      await reported.promise;
+      const ask = (id: string) =>
+        agent.canUseTool(sessionId)("Bash", { command: "ls" }, {
+          toolUseID: id,
+          agentID: "agent-bg",
+          signal: new AbortController().signal,
+          suggestions: [],
+        } as any);
+      // A tool use that streams first, and one that only its complete message holds.
+      yield toolStart("bg-streamed", "bg-agent");
+      decisions.push(await ask("bg-streamed"));
+      yield toolUse("bg-whole", "bg-agent");
+      decisions.push(await ask("bg-whole"));
+      yield { type: "system", subtype: "session_state_changed", state: "idle" };
+    });
+    const first = prompt();
+    await vi.waitFor(() =>
+      expect(agent.sessions[sessionId].activeTurn?.deferredSettle).toBeDefined(),
+    );
+    await agent.cancel({ sessionId });
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+    reported.resolve();
+    await agent.sessions[sessionId].consumer;
+
+    // #1334 denies only the tools of the work that the cancel stopped.
+    expect(decisions).toEqual([
+      expect.objectContaining({ behavior: "allow" }),
+      expect.objectContaining({ behavior: "allow" }),
+    ]);
+    expect(updates.filter((u) => u.sessionUpdate === "tool_call").map((u) => u.toolCallId)).toEqual(
+      expect.arrayContaining(["bg-streamed", "bg-whole"]),
+    );
+  });
+
+  it("still drops what a stopped subagent sends after its stop was reported", async () => {
+    const { afterReports } = await endFirstSubagent("held turn");
+
+    // The SDK reported the subagent killed first, so its command's late result
+    // is the stopped work's, and the made-up report closed the call instead.
+    expect(ends(afterReports, "bg-child-1").map(textOf)).toEqual([
+      "The turn was cancelled before this tool call returned a result.",
+    ]);
   });
 
   it("leaves a subagent that stopped without a cancel to Claude Code's result", async () => {
@@ -1341,7 +1423,7 @@ async function* backgroundSubagentMessages(input: Pushable<any>, agent: ClaudeAc
 }
 
 /** The reports with which the SDK ends a subagent: a patch and a notification, or one of them. */
-type SubagentEndReports = "both" | "update only" | "notification only" | "completed";
+type SubagentEndReports = "both" | "update only" | "notification only" | "completed" | "new work";
 
 /**
  * Two background subagents each run a command. With a "held turn", the turn's
@@ -1376,7 +1458,14 @@ async function* backgroundSubagentsEndMessages(
   }
   await reported;
   const done = { type: "system", session_id: sessionId, task_id: "agent-bg-1" };
-  if (reports === "completed") {
+  if (reports === "new work") {
+    // The subagent runs on, and starts more work.
+    yield toolStart("bg-child-3", "bg-agent-1");
+    yield toolUse("bg-child-3", "bg-agent-1");
+    yield toolResult("bg-child-3", "bg-agent-1");
+  } else if (reports === "completed") {
+    // The command ends with its own result, and then the subagent completes.
+    yield toolResult("bg-child-1", "bg-agent-1");
     yield { ...done, subtype: "task_updated", patch: { status: "completed" } };
     yield {
       ...done,
