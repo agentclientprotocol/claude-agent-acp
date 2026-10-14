@@ -881,6 +881,16 @@ type PendingReplay = {
   stopped: boolean;
 };
 
+/** A permission or elicitation request that awaits user input. */
+type OpenUserInput = {
+  /** The subagent that asked: absent for the main conversation and for a
+   *  request that names no agent. */
+  agentID?: string;
+  /** Set by a cancel that comes while the request is open (see
+   *  `withPendingUserInput`). */
+  cancelled?: boolean;
+};
+
 export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
@@ -1087,13 +1097,11 @@ export type Session = {
   /** Whether nested subagent text/thinking is forwarded to the ACP client.
    *  Enabled by either the ACP capability or the pre-existing SDK option. */
   forwardSubagentText: boolean;
-  /** The ACP permission and elicitation requests that await user input, each
-   *  with the subagent that asked (`agentID`, absent for the main
-   *  conversation and for a request that names no agent). Parallel subagents
-   *  can ask concurrently. Steering stays non-interrupting while any request
-   *  is open; the foreground work awaits the user while one that blocks it is
-   *  open (see {@link blocksForeground}). */
-  openUserInputs?: Set<{ agentID?: string }>;
+  /** The ACP permission and elicitation requests that await user input.
+   *  Parallel subagents can ask concurrently. Steering stays non-interrupting
+   *  while any request is open; the foreground work awaits the user while one
+   *  that blocks it is open (see {@link blocksForeground}). */
+  openUserInputs?: Set<OpenUserInput>;
   /** Context window size of the session's current model, carried across
    *  prompts so mid-stream usage_update notifications report a correct `size`
    *  before the turn's first result message arrives. Seeded synchronously at
@@ -7980,6 +7988,9 @@ export class ClaudeAcpAgent {
       return;
     }
     session.cancelled = true;
+    // The interrupt below makes Claude Code withdraw the requests that are open
+    // now (see `withPendingUserInput`).
+    for (const input of session.openUserInputs ?? []) input.cancelled = true;
     // Before anything awaits, so a model request that the consumer reads in
     // the meantime is already judged against these prompts.
     session.cancelledPrompts ??= new Set();
@@ -9072,22 +9083,33 @@ export class ClaudeAcpAgent {
    *  conversation) as awaiting user input for exactly the lifetime of its
    *  promise (see `Session.openUserInputs`). Steering consults the open
    *  requests synchronously, so a message arriving while any permission or
-   *  elicitation card is open uses non-interrupting SDK delivery. */
+   *  elicitation card is open uses non-interrupting SDK delivery.
+   *
+   *  `signal` aborts when Claude Code withdraws the request, which is not an
+   *  answer. Example: the user cancels while a permission request is open.
+   *  Claude Code's interrupt withdraws it as it stops the work, and the work
+   *  ends `idle cancelled` right after. The end of the request then reports
+   *  no `running`: the client would see `requires_action`, `running`, `idle
+   *  cancelled`. A withdrawal without a cancel means that something else
+   *  answered the request in the user's place, such as a `PermissionRequest`
+   *  hook, and the work goes on, so the end reports `running`. */
   private async withPendingUserInput<T>(
     sessionId: string,
+    signal: AbortSignal,
     request: () => Promise<T>,
     agentID?: string,
   ): Promise<T> {
     const session = this.sessions[sessionId];
     if (!session) return request();
-    const input = agentID !== undefined ? { agentID } : {};
+    const input: OpenUserInput = agentID !== undefined ? { agentID } : {};
     (session.openUserInputs ??= new Set()).add(input);
     this.syncAwaitingUser(sessionId, session);
     try {
       return await request();
     } finally {
       session.openUserInputs.delete(input);
-      this.syncAwaitingUser(sessionId, session);
+      const withdrawnByCancel = signal.aborted && input.cancelled === true;
+      this.syncAwaitingUser(sessionId, session, withdrawnByCancel);
     }
   }
 
@@ -9097,8 +9119,13 @@ export class ClaudeAcpAgent {
    *  and Claude Code can ask for a queued prompt before the consumer activates
    *  it, so a request is not tied to the work that was running when it
    *  opened. Called when a request opens or closes, when a turn activates, and
-   *  when a task registers or moves to the background. */
-  private syncAwaitingUser(sessionId: string, session: Session): void {
+   *  when a task registers or moves to the background.
+   *
+   *  When the last request ends, the work reports `running` again, unless a
+   *  cancel withdrew that request (`withdrawnByCancel`, see
+   *  {@link withPendingUserInput}): the work is being stopped, and reports its
+   *  end next. */
+  private syncAwaitingUser(sessionId: string, session: Session, withdrawnByCancel = false): void {
     const work = this.foregroundWork.get(sessionId);
     if (!work) return;
     const waiting = [...(session.openUserInputs ?? [])].some((input) =>
@@ -9107,7 +9134,7 @@ export class ClaudeAcpAgent {
     if (waiting === work.awaitingUser) return;
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
-    else work.events.running();
+    else if (!withdrawnByCancel) work.events.running();
   }
 
   /** Make `owner` the foreground work of the session `sessionId` (see
@@ -9296,6 +9323,7 @@ export class ClaudeAcpAgent {
       return await this.withChildAwaitingUser(ownerSessionId, params.sessionId, signal, () =>
         this.withPendingUserInput(
           ownerSessionId,
+          signal,
           () => raceWithAbort(this.client.requestPermission(params, signal), signal),
           agentID,
         ),
@@ -9750,7 +9778,7 @@ export class ClaudeAcpAgent {
       }
 
       try {
-        const response = await this.withPendingUserInput(sessionId, () =>
+        const response = await this.withPendingUserInput(sessionId, signal, () =>
           this.elicitFromClient(createRequest, signal),
         );
         if (signal.aborted) {
@@ -9800,6 +9828,7 @@ export class ClaudeAcpAgent {
       response = await this.withChildAwaitingUser(sessionId, requestSessionId, signal, () =>
         this.withPendingUserInput(
           sessionId,
+          signal,
           () => this.elicitFromClient(createRequest, signal),
           agentID,
         ),
@@ -9846,7 +9875,7 @@ export class ClaudeAcpAgent {
       }
       let response: CreateElicitationResponse;
       try {
-        response = await this.withPendingUserInput(sessionId, () =>
+        response = await this.withPendingUserInput(sessionId, signal, () =>
           this.elicitFromClient(refusalFallbackToCreateRequest(prompt, sessionId), signal),
         );
       } catch (error) {

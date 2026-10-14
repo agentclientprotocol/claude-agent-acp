@@ -48,6 +48,8 @@ const sdk = vi.hoisted(() => ({
   ): AsyncGenerator<Record<string, unknown>> {},
   /** Claude Code receives an interrupt, as `cancel()` sends one. */
   interrupt: async (): Promise<void> => {},
+  /** The query is closed, as `session/close` closes it. */
+  close: (): void => {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
   mcpAuthenticate: async (
     _serverName: string,
@@ -87,6 +89,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
+        close: () => sdk.close(),
       });
       return Object.assign(messages, controls);
     },
@@ -3493,10 +3496,10 @@ describe("ACP v2 requests that subagents make", () => {
   });
 
   /** Asks for permission for a Bash call of the subagent `agentID`, and
-   *  resolves once the client answers. */
-  const askFor = (options: Options, agentID: string) =>
+   *  resolves once the client answers, or Claude Code aborts `signal`. */
+  const askFor = (options: Options, agentID: string, signal = new AbortController().signal) =>
     options.canUseTool!("Bash", { command: "ls" }, {
-      signal: new AbortController().signal,
+      signal,
       suggestions: [],
       toolUseID: `toolu_ls_${agentID}`,
       agentID,
@@ -3803,7 +3806,7 @@ describe("ACP v2 requests that subagents make", () => {
     ]);
   });
 
-  it("reports no running before idle cancelled for a child's request that a cancel withdraws", async () => {
+  it("reports no running before idle cancelled for a child's request that a cancel withdraws, and for the turn that waits on it", async () => {
     // Claude Code's interrupt withdraws the request, which the client holds and
     // would not settle, then it stops the child.
     const withdrawal = new AbortController();
@@ -3857,6 +3860,13 @@ describe("ACP v2 requests that subagents make", () => {
     expect(
       turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === "agent-1")),
     ).toEqual(["running", "requires_action", "idle cancelled"]);
+    // The turn waits on the foreground child, so its request holds the root too.
+    expect(turnTrace(client.sessionUpdates.filter(({ sessionId }) => sessionId === root))).toEqual([
+      "user_message",
+      "running",
+      "requires_action",
+      "idle cancelled",
+    ]);
     expect(
       client.sessionUpdates.flatMap(({ sessionId, update }) => {
         if (sessionId !== root || update.sessionUpdate !== "subagent_update" || !update.state) {
@@ -3866,6 +3876,465 @@ describe("ACP v2 requests that subagents make", () => {
         return [stopReason ? `${state} ${stopReason}` : state];
       }),
     ).toEqual(["running", "requires_action", "idle cancelled"]);
+  });
+
+  it("reports nothing for a background subagent's request that a cancel withdraws", async () => {
+    const withdrawal = new AbortController();
+    sdk.interrupt = async () => withdrawal.abort();
+    const client = v2Client({
+      answerPermission: () =>
+        new Promise<never>(() => {}) as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(async function* (options) {
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      yield assistantText(options, "Exploring.");
+      await askFor(options, "agent-1", withdrawal.signal);
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(1));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+      await client.authUpdate(1);
+    });
+
+    // The request does not hold the turn, so the cancel changes nothing of the
+    // turn's states but its end.
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
+
+  it("reports no running for a turn's request that a cancel withdraws along with a background subagent's", async () => {
+    const withdrawal = new AbortController();
+    sdk.interrupt = async () => withdrawal.abort();
+    const client = v2Client({
+      answerPermission: () =>
+        new Promise<never>(() => {}) as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(async function* (options) {
+      yield taskStarted(options, "agent-1", { is_backgrounded: true });
+      yield assistantText(options, "Exploring.");
+      await Promise.all([
+        // The turn's own request, and the subagent's.
+        options.canUseTool!("Bash", { command: "make" }, {
+          signal: withdrawal.signal,
+          suggestions: [],
+          toolUseID: "toolu_make",
+          requestId: randomUUID(),
+        } as Parameters<NonNullable<Options["canUseTool"]>>[2]).catch(() => undefined),
+        askFor(options, "agent-1", withdrawal.signal),
+      ]);
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() => expect(client.permissionRequests).toHaveLength(2));
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "requires_action",
+      "idle cancelled",
+    ]);
+  });
+});
+
+// Claude Code's interrupt withdraws each request that is open: the SDK aborts
+// the signal of the request's callback. A client that holds the request does
+// not settle it, so the withdrawal alone ends it. The work is being stopped
+// then and reports idle next, so it reports no running before that. A
+// withdrawal without a cancel is something else answering the request, such as
+// a `PermissionRequest` hook, and the work goes on.
+describe("ACP v2 requests that a cancel withdraws", () => {
+  /** What Claude Code asks of the user, with the signal that it aborts to withdraw the request. */
+  type Ask = (options: Options, signal: AbortSignal) => Promise<unknown>;
+
+  const askPermission =
+    (toolUseID = "toolu_ls"): Ask =>
+    (options, signal) =>
+      options.canUseTool!("Bash", { command: "ls" }, {
+        signal,
+        suggestions: [],
+        toolUseID,
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2]);
+  const askQuestion: Ask = (options, signal) =>
+    options.canUseTool!(
+      "AskUserQuestion",
+      {
+        questions: [
+          {
+            question: "Which package?",
+            header: "Package",
+            options: [
+              { label: "core", description: "The core package" },
+              { label: "cli", description: "The CLI" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      {
+        signal,
+        suggestions: [],
+        toolUseID: "toolu_question",
+        requestId: randomUUID(),
+      } as Parameters<NonNullable<Options["canUseTool"]>>[2],
+    );
+  const askElicitation: Ask = (options, signal) =>
+    options.onElicitation!(
+      {
+        serverName: "linear",
+        message: "Which team?",
+        mode: "form",
+        requestedSchema: { type: "object", properties: { team: { type: "string" } } },
+      },
+      { signal } as Parameters<NonNullable<Options["onElicitation"]>>[1],
+    );
+  const askRefusalFallback: Ask = (options, signal) =>
+    options.onUserDialog!(
+      {
+        dialogKind: "refusal_fallback_prompt",
+        payload: { originalModel: "claude-fable-5", fallbackModel: "claude-opus-4-8" },
+      },
+      { signal } as Parameters<NonNullable<Options["onUserDialog"]>>[1],
+    );
+  /** Every kind of request that holds the work, with the tool use it is for, if any. */
+  const ASKS: Array<[string, Ask, string | undefined]> = [
+    ["a permission request", askPermission(), "toolu_ls"],
+    ["a question", askQuestion, "toolu_question"],
+    ["an MCP server's elicitation", askElicitation, undefined],
+    ["the refusal fallback's consent prompt", askRefusalFallback, undefined],
+  ];
+
+  const hold = () => new Promise<never>(() => {});
+  /** A client that holds each request it gets, as one does that ignores `$/cancel_request`. */
+  const holdingClient = () =>
+    v2Client({
+      answerPermission: hold as unknown as () => v2.RequestPermissionResponse,
+      answerElicitation: hold,
+    });
+  const allowOnce: v2.RequestPermissionResponse = {
+    outcome: { outcome: "selected", optionId: "allow-once" },
+  };
+  const toolCallOf = (request: v2.RequestPermissionRequest) =>
+    (request.subject as { toolCall?: { toolCallId?: string } }).toolCall?.toolCallId;
+
+  /** Resolves once the turn waits for the user. */
+  const awaitsUser = (client: ReturnType<typeof v2Client>) =>
+    vi.waitFor(() => expect(turnTrace(client.sessionUpdates).at(-1)).toBe("requires_action"));
+
+  /**
+   * Sends the prompt "go", runs `during`, and returns what the client saw of
+   * the turn once it is idle.
+   */
+  async function runTurn(
+    client: ReturnType<typeof v2Client>,
+    during: (agent: v2.ClientContext, sessionId: string) => Promise<unknown> = async () => {},
+  ): Promise<string[]> {
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await during(agent, sessionId);
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).some((state) => state.startsWith("idle"))).toBe(
+          true,
+        ),
+      );
+      await client.authUpdate(1);
+    });
+    return turnTrace(client.sessionUpdates);
+  }
+
+  it.each(ASKS)(
+    "reports no running before idle cancelled for %s that a cancel withdraws",
+    async (_, ask) => {
+      const withdrawal = new AbortController();
+      sdk.interrupt = async () => withdrawal.abort();
+      scriptTurns(async function* (options) {
+        await ask(options, withdrawal.signal).catch(() => undefined);
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+      const client = holdingClient();
+
+      const trace = await runTurn(client, async (agent, sessionId) => {
+        await awaitsUser(client);
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      });
+
+      expect(trace).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+    },
+  );
+
+  it.each(ASKS)(
+    "reports no running before idle cancelled for %s that a session/close withdraws",
+    async (_, ask) => {
+      const withdrawal = new AbortController();
+      // The SDK's cleanup of a closed query aborts every request that is open.
+      sdk.close = () => withdrawal.abort();
+      const closed = Promise.withResolvers<void>();
+      scriptTurns(async function* (options) {
+        await ask(options, withdrawal.signal).catch(() => undefined);
+        // Claude Code sends nothing more once the session is closed.
+        await closed.promise;
+        yield idleState(options);
+      });
+      const client = holdingClient();
+
+      let atClose: string[] = [];
+      await runTurn(client, async (agent, sessionId) => {
+        await awaitsUser(client);
+        await agent.request(v2.methods.agent.session.close, { sessionId });
+        atClose = turnTrace(client.sessionUpdates);
+      });
+      closed.resolve();
+
+      expect(atClose).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+    },
+  );
+
+  it.each(ASKS)(
+    "reports running when Claude Code withdraws %s without a cancel, since the work goes on",
+    async (_, ask, toolUseId) => {
+      const withdrawal = new AbortController();
+      const client = holdingClient();
+      scriptTurns(async function* (options) {
+        const asking = ask(options, withdrawal.signal).catch(() => undefined);
+        await awaitsUser(client);
+        // A hook answers the request in the user's place.
+        withdrawal.abort();
+        await asking;
+        if (toolUseId) yield toolResultMessage(options, toolUseId, {});
+        yield assistantText(options, "Done.");
+        yield result(options);
+        yield idleState(options);
+      });
+
+      expect(await runTurn(client)).toEqual([
+        "user_message",
+        "running",
+        "requires_action",
+        "running",
+        "agent_message_chunk",
+        "idle end_turn",
+      ]);
+    },
+  );
+
+  it("reports running when the user answers the request after the cancel", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+    const client = v2Client({
+      answerPermission: () => answer.promise as unknown as v2.RequestPermissionResponse,
+    });
+    scriptTurns(async function* (options) {
+      // Claude Code does not withdraw the request.
+      const asking = askPermission()(options, new AbortController().signal);
+      await interrupted.promise;
+      answer.resolve(allowOnce);
+      await asking;
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+
+    const trace = await runTurn(client, async (agent, sessionId) => {
+      await awaitsUser(client);
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(trace).toEqual([
+      "user_message",
+      "running",
+      "requires_action",
+      "running",
+      "idle cancelled",
+    ]);
+  });
+
+  it("reports running when Claude Code withdraws a request that opened after the cancel", async () => {
+    // The cancel came before the request opened, so it did not stop that
+    // request's work: a prompt that Claude Code took up after the cancel can ask
+    // before the agent has seen its echo.
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    const withdrawal = new AbortController();
+    const client = holdingClient();
+    scriptTurns(async function* (options) {
+      await interrupted.promise;
+      yield toolUseMessage(options, "toolu_ls", "Bash", { command: "ls" });
+      const asking = askPermission()(options, withdrawal.signal).catch(() => undefined);
+      await awaitsUser(client);
+      withdrawal.abort();
+      await asking;
+      yield result(options, ABORTED_TOOLS);
+      yield idleState(options);
+    });
+
+    const trace = await runTurn(client, async (agent, sessionId) => {
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+    });
+
+    expect(trace).toEqual([
+      "user_message",
+      "running",
+      "requires_action",
+      "running",
+      "idle cancelled",
+    ]);
+  });
+
+  describe("two requests that are open together", () => {
+    // The work reports once, when the last of them ends, by how that one ended.
+    const wait = (client: ReturnType<typeof v2Client>) =>
+      vi.waitFor(() => expect(client.permissionRequests).toHaveLength(2));
+
+    it("reports no running when a cancel withdraws both", async () => {
+      const withdrawal = new AbortController();
+      sdk.interrupt = async () => withdrawal.abort();
+      const client = holdingClient();
+      scriptTurns(async function* (options) {
+        await Promise.all(
+          [askPermission("toolu_a"), askPermission("toolu_b")].map((ask) =>
+            ask(options, withdrawal.signal).catch(() => undefined),
+          ),
+        );
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const trace = await runTurn(client, async (agent, sessionId) => {
+        await wait(client);
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      });
+
+      expect(trace).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+    });
+
+    it("reports running when the user answers the one that the cancel did not withdraw", async () => {
+      const withdrawal = new AbortController();
+      sdk.interrupt = async () => withdrawal.abort();
+      const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const client = v2Client({
+        answerPermission: (request) =>
+          (toolCallOf(request) === "toolu_b"
+            ? answer.promise
+            : hold()) as unknown as v2.RequestPermissionResponse,
+      });
+      scriptTurns(async function* (options) {
+        const a = askPermission("toolu_a")(options, withdrawal.signal).catch(() => undefined);
+        const b = askPermission("toolu_b")(options, new AbortController().signal);
+        // The cancel withdraws the first, which ends while the second is open.
+        await a;
+        answer.resolve(allowOnce);
+        await b;
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const trace = await runTurn(client, async (agent, sessionId) => {
+        await wait(client);
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      });
+
+      expect(trace).toEqual([
+        "user_message",
+        "running",
+        "requires_action",
+        "running",
+        "idle cancelled",
+      ]);
+    });
+
+    it("reports no running when a cancel withdraws the one that ends last, after the user answered the other", async () => {
+      const withdrawal = new AbortController();
+      sdk.interrupt = async () => withdrawal.abort();
+      const answer = Promise.withResolvers<v2.RequestPermissionResponse>();
+      const client = v2Client({
+        answerPermission: (request) =>
+          (toolCallOf(request) === "toolu_b"
+            ? answer.promise
+            : hold()) as unknown as v2.RequestPermissionResponse,
+      });
+      scriptTurns(async function* (options) {
+        const a = askPermission("toolu_a")(options, withdrawal.signal).catch(() => undefined);
+        const b = askPermission("toolu_b")(options, new AbortController().signal);
+        await b;
+        await a;
+        yield result(options, ABORTED_TOOLS);
+        yield idleState(options);
+      });
+
+      const trace = await runTurn(client, async (agent, sessionId) => {
+        await wait(client);
+        // The first is still open, so the answer changes nothing.
+        answer.resolve(allowOnce);
+        await vi.waitFor(() => expect(agents[0].sessions[sessionId]?.openUserInputs?.size).toBe(1));
+        await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      });
+
+      expect(trace).toEqual(["user_message", "running", "requires_action", "idle cancelled"]);
+    });
+  });
+
+  it("reports no running before idle cancelled for a request of a cycle that Claude Code started, which a cancel withdraws", async () => {
+    const withdrawal = new AbortController();
+    sdk.interrupt = async () => withdrawal.abort();
+    const client = holdingClient();
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Started the build in the background.");
+      yield result(options);
+      yield idleState(options);
+      // The build finished, and Claude Code wakes the model to report it.
+      yield assistantText(options, "The build failed.", "msg_followup");
+      await askQuestion(options, withdrawal.signal).catch(() => undefined);
+      yield result(options, {
+        origin: { kind: "task-notification" },
+        ...ABORTED_TOOLS,
+      });
+      yield idleState(options);
+    });
+
+    const trace = await runTurn(client, async (agent, sessionId) => {
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toEqual([
+          "user_message",
+          "running",
+          "agent_message_chunk",
+          "idle end_turn",
+          "running",
+          "agent_message_chunk",
+          "requires_action",
+        ]),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle cancelled"));
+    });
+
+    expect(trace.slice(4)).toEqual([
+      "running",
+      "agent_message_chunk",
+      "requires_action",
+      "idle cancelled",
+    ]);
   });
 });
 
