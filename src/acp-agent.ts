@@ -1244,6 +1244,9 @@ export type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
+      /** The task's kind (`task_started.task_type`), such as `local_bash` or
+       *  `local_workflow`. Absent when Claude Code did not say. */
+      taskType?: string;
       /** Whether the task runs in the background, so that the tool call that
        *  spawned it does not wait on it (`task_started.is_backgrounded`, or a
        *  later `task_updated` patch). Absent when Claude Code did not say. */
@@ -1268,6 +1271,16 @@ export type Session = {
       endedPerLevel?: "ended" | "sweep-armed";
     }
   >;
+  /** Whether `session/cancel` also stops the session's background workflows
+   *  (see `stopBackgroundWorkflows`). Claude Code's interrupt kills background
+   *  subagents and workflows, unless the query declares
+   *  `perTaskStopAffordance`: then it spares both, and the client is expected
+   *  to stop each one itself. A client that can cancel one subagent gets the
+   *  declaration, but it has no control for a workflow unless it is AIR with
+   *  `asyncTasks` (`_session/async_task/stop`). So for such a client the
+   *  adapter stops the workflows after the interrupt, as the interrupt did
+   *  before. */
+  stopsWorkflowsOnCancel?: boolean;
   /** The display terminals of the commands that went to the background and
    *  still run, by the id of the command's task: the Bash tool call whose
    *  terminal it is, and the subagent tool call that ran it, if any. The
@@ -4836,11 +4849,12 @@ export class ClaudeAcpAgent {
       taskId: string,
       parentToolUseId: string | undefined,
       isSubagent: boolean,
-      placement: { backgrounded?: boolean; parentTaskId?: string } = {},
+      placement: { backgrounded?: boolean; parentTaskId?: string; taskType?: string } = {},
     ) => {
       session.liveBackgroundTasks.set(taskId, {
         parentToolUseId,
         isSubagent,
+        ...(placement.taskType !== undefined ? { taskType: placement.taskType } : {}),
         ...(placement.backgrounded !== undefined ? { backgrounded: placement.backgrounded } : {}),
         ...(placement.parentTaskId !== undefined ? { parentTaskId: placement.parentTaskId } : {}),
       });
@@ -6182,6 +6196,7 @@ export class ClaudeAcpAgent {
                 registerLiveTask(message.task_id, message.tool_use_id, !!message.subagent_type, {
                   backgrounded: message.is_backgrounded,
                   parentTaskId: message.parent_task_id,
+                  taskType: message.task_type,
                 });
                 await subagents.taskStarted(
                   {
@@ -8074,7 +8089,52 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    if (!this.sessions[params.sessionId] && (await this.cancelChildSession(params.sessionId))) {
+      return;
+    }
     await this.cancelTurns(params, { awaitInterrupt: true });
+  }
+
+  /**
+   * Cancels the current work of the subagent child session `sessionId`, which
+   * its `cancel` capability permits on the subagents RFD form, without
+   * cancelling its parent (see `NativeSubagentRuntime.cancelChild`). Returns
+   * false when no session has such a child.
+   */
+  private async cancelChildSession(sessionId: string): Promise<boolean> {
+    for (const [rootSessionId, session] of Object.entries(this.sessions)) {
+      const cancelled = await session.nativeSubagentRuntime?.cancelChild(sessionId, (taskId) =>
+        session.query.stopTask(taskId).catch((error: unknown) => {
+          this.logger.error(
+            `Session ${rootSessionId}: failed to stop the task ${taskId} of subagent session ${sessionId}`,
+            error,
+          );
+        }),
+      );
+      if (cancelled) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Stops each background workflow of the session that still runs, after the
+   * interrupt of a `session/cancel` spared it (see
+   * `Session.stopsWorkflowsOnCancel`). Claude Code reports each one
+   * `stopped`, along with the commands inside it, and starts no model cycle
+   * for it, as when the interrupt killed it. Every background workflow is
+   * stopped, whoever launched it, because the interrupt killed them all.
+   */
+  private stopBackgroundWorkflows(sessionId: string, session: Session): void {
+    if (!session.stopsWorkflowsOnCancel) return;
+    for (const [taskId, task] of session.liveBackgroundTasks) {
+      if (task.taskType !== "local_workflow") continue;
+      session.query.stopTask(taskId).catch((error: unknown) => {
+        this.logger.error(
+          `Session ${sessionId}: failed to stop the background workflow ${taskId}`,
+          error,
+        );
+      });
+    }
   }
 
   /** Cancel the session's turns and interrupt the SDK query. With
@@ -8382,6 +8442,7 @@ export class ClaudeAcpAgent {
       Promise.resolve(interrupt).catch(() => {});
       return;
     }
+    this.stopBackgroundWorkflows(params.sessionId, session);
     const receipt = await interrupt;
     // On CLIs advertising `interrupt_receipt_v1`, the receipt's `still_queued`
     // lists exactly which queued messages survive the interrupt and will still
@@ -10805,6 +10866,17 @@ export class ClaudeAcpAgent {
       systemPrompt,
       settingSources: ["user", "project", "local"],
       ...(thinking !== undefined && { thinking }),
+      // A client on the subagents RFD form can stop one subagent with
+      // `session/cancel` on its child session (see
+      // `NativeSubagentRuntime.cancelChild`). Declaring that makes Claude
+      // Code's interrupt spare background subagents, so they keep running
+      // after a parent cancel, as the RFD prescribes
+      // (agentclientprotocol/agent-client-protocol#2308). Without it, the
+      // interrupt kills them. It spares background workflows too, which
+      // `stopBackgroundWorkflows` stops instead. Background commands survive an
+      // interrupt either way. Before `userProvidedOptions`, so a client's own
+      // `perTaskStopAffordance` wins.
+      ...(subagentForm(this.clientCapabilities) === "rfd" ? { perTaskStopAffordance: true } : {}),
       ...userProvidedOptions,
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids
@@ -11256,6 +11328,9 @@ export class ClaudeAcpAgent {
         emittedToolCalls: new Set(),
         eagerToolCallSessions: new Map(),
         liveBackgroundTasks: new Map(),
+        stopsWorkflowsOnCancel:
+          options.perTaskStopAffordance === true &&
+          !clientSupportsAsyncTasks(this.clientCapabilities),
         nativeSubagentsByTaskId: new Map(),
         nativeSubagentTaskIdByToolUseId: new Map(),
         nativeSubagentParentByToolUseId: new Map(),

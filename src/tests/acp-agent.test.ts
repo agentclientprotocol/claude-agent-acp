@@ -7043,6 +7043,7 @@ describe("subagent permission attribution (issue #851)", () => {
             sessionId: "agent-42",
             title: "Explore",
             description: "Investigate",
+            capabilities: { cancel: {} },
             state: { state: "running" },
           },
         },
@@ -7081,6 +7082,226 @@ describe("subagent permission attribution (issue #851)", () => {
           stopReason: "error",
           error: { code: -32603, message: "Context too small" },
         },
+      });
+    });
+
+    describe("session/cancel on a child session", () => {
+      /**
+       * Runs a turn whose child agent-42 runs until `stopped`, then ends as
+       * Claude Code ends a child that `stopTask` stopped, for a client with
+       * `capabilities`. Returns the agent, its updates, and the prompt.
+       */
+      async function childRuns(capabilities: ClientCapabilities = { subagents: {} }) {
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: AcpSessionNotification) => {
+              updates.push(update);
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: capabilities });
+        const stopped = Promise.withResolvers<void>();
+        injectGeneratorSession(agent, async function* (input: Pushable<any>) {
+          const { value } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(value);
+          yield rootToolUse("toolu_parent", "Agent");
+          yield {
+            ...taskStarted("agent-42", "toolu_parent"),
+            subagent_type: "Explore",
+            prompt: "Go",
+          };
+          await stopped.promise;
+          // As seen live: the child's end, then the Agent call's interrupted
+          // result, and the parent's turn goes on.
+          yield taskUpdated({ status: "killed" });
+          yield taskNotification("toolu_parent", "stopped");
+          yield {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_parent",
+                  is_error: true,
+                  content: "[Request interrupted by user for tool use]",
+                },
+              ],
+            },
+          };
+          yield successResult();
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        } as never);
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "go" }],
+        });
+        await vi.waitFor(() =>
+          expect(
+            agent.sessions["test-session"]?.nativeSubagentsByTaskId?.get("agent-42")?.announced,
+          ).toBe(true),
+        );
+        return { agent, updates, prompt, stop: () => stopped.resolve() };
+      }
+
+      it("stops the child's task, and not its parent's work, then reports the child idle cancelled", async () => {
+        const { agent, updates, prompt, stop } = await childRuns();
+
+        await agent.cancel({ sessionId: "agent-42" });
+
+        const query = agent.sessions["test-session"]!.query;
+        expect(query.stopTask).toHaveBeenCalledExactlyOnceWith("agent-42");
+        expect(query.interrupt).not.toHaveBeenCalled();
+        expect(agent.sessions["test-session"]!.cancelled).toBeFalsy();
+        // Accepting the stop is no evidence: the SDK's events report the end.
+        expect(updates.at(-1)?.update).not.toMatchObject({ state: { state: "idle" } });
+        stop();
+        await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(
+          subagentTraffic(updates).flatMap(({ update }) =>
+            update.sessionUpdate === "subagent_update" ? [update] : [],
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            sessionId: "agent-42",
+            capabilities: { cancel: {} },
+            state: { state: "running" },
+          }),
+          {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "cancelled" },
+          },
+        ]);
+        for (const payload of updates) {
+          expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+        }
+      });
+
+      it("logs a stop that Claude Code refuses, and changes nothing", async () => {
+        const { agent, prompt, stop } = await childRuns();
+        const query = agent.sessions["test-session"]!.query;
+        vi.mocked(query.stopTask).mockRejectedValueOnce(new Error("No such task"));
+
+        await expect(agent.cancel({ sessionId: "agent-42" })).resolves.toBeUndefined();
+
+        expect(query.interrupt).not.toHaveBeenCalled();
+        stop();
+        await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+      });
+
+      it("changes nothing for a session id that is no session or child, or for AIR", async () => {
+        for (const capabilities of [
+          { subagents: {} },
+          AIR_NATIVE_SUBAGENTS,
+        ] as ClientCapabilities[]) {
+          const { agent, prompt, stop } = await childRuns(capabilities);
+          const target = capabilities === AIR_NATIVE_SUBAGENTS ? "agent-42" : "unknown-session";
+
+          await agent.cancel({ sessionId: target });
+
+          const query = agent.sessions["test-session"]!.query;
+          expect(query.stopTask).not.toHaveBeenCalled();
+          expect(query.interrupt).not.toHaveBeenCalled();
+          stop();
+          await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+        }
+      });
+    });
+
+    describe("session/cancel on the parent session", () => {
+      /**
+       * Runs a turn that starts a background workflow, a background command
+       * and a background subagent, then cancels it. With
+       * `perTaskStopAffordance` declared, Claude Code's interrupt spares all
+       * three. Returns the query.
+       */
+      async function cancelWithBackgroundWork(stopsWorkflowsOnCancel: boolean) {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { subagents: {} } as ClientCapabilities,
+        });
+        const interrupted = Promise.withResolvers<void>();
+        injectGeneratorSession(
+          agent,
+          async function* (input: Pushable<any>) {
+            const { value } = await input[Symbol.asyncIterator]().next();
+            yield userEcho(value);
+            yield rootToolUse("toolu_workflow", "Workflow");
+            // As seen live: a workflow's task_started has no is_backgrounded.
+            yield {
+              ...taskStarted("workflow-1", "toolu_workflow"),
+              task_type: "local_workflow",
+            };
+            yield rootToolUse("toolu_shell", "Bash");
+            yield {
+              ...taskStarted("shell-1", "toolu_shell"),
+              task_type: "local_bash",
+              is_backgrounded: true,
+            };
+            yield rootToolUse("toolu_agent", "Agent");
+            yield {
+              ...taskStarted("agent-42", "toolu_agent"),
+              task_type: "local_agent",
+              subagent_type: "Explore",
+              is_backgrounded: true,
+            };
+            await interrupted.promise;
+            yield {
+              ...successResult(),
+              subtype: "error_during_execution",
+              is_error: true,
+              terminal_reason: "aborted_tools",
+            };
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          },
+          { stopsWorkflowsOnCancel },
+        );
+        const query = agent.sessions["test-session"]!.query;
+        vi.mocked(query.interrupt).mockImplementation(async () => {
+          interrupted.resolve();
+          return undefined;
+        });
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "go" }],
+        });
+        await vi.waitFor(() =>
+          expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-42")).toBe(true),
+        );
+
+        await agent.cancel({ sessionId: "test-session" });
+
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        return query;
+      }
+
+      it("stops the background workflows that the interrupt spares, after it", async () => {
+        const query = await cancelWithBackgroundWork(true);
+
+        // Not the command or the subagent: the interrupt never stopped
+        // background commands, and the client stops a subagent with its
+        // child's `cancel`.
+        expect(query.stopTask).toHaveBeenCalledExactlyOnceWith("workflow-1");
+        expect(vi.mocked(query.interrupt).mock.invocationCallOrder[0]).toBeLessThan(
+          vi.mocked(query.stopTask).mock.invocationCallOrder[0],
+        );
+      });
+
+      it("stops no workflow when the interrupt does not spare them", async () => {
+        const query = await cancelWithBackgroundWork(false);
+
+        expect(query.interrupt).toHaveBeenCalled();
+        expect(query.stopTask).not.toHaveBeenCalled();
       });
     });
 
@@ -7354,6 +7575,7 @@ describe("subagent permission attribution (issue #851)", () => {
               sessionId: "agent-7",
               title: "echoer (Explore)",
               description: "Echo a word",
+              capabilities: { cancel: {} },
               state: { state: "running" },
             },
           },

@@ -51,10 +51,14 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
   call stays a tool call of the session that made it.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
-  the turn waits on and, currently, background children too. Each stopped child reports `idle`
-  with `cancelled` from Claude Code's own events, and the open requests of the foreground ones are
-  withdrawn. The adapter ends no child at a cancel itself, so a child that keeps running keeps its
-  open requests and its open tool calls. A tool call of a stopped child that Claude Code reports no
+  the turn waits on. Background children keep running, as the RFD prefers; a client stops one with
+  its own `cancel`. Each stopped child reports `idle` with `cancelled` from Claude Code's own
+  events, and its open requests are withdrawn. The adapter ends no child at a cancel itself, so a
+  child that keeps running keeps its open requests and its open tool calls. To spare background
+  children, the adapter declares the SDK option `perTaskStopAffordance`, which a client can turn
+  off in `_meta.claudeCode.options`. That option spares background workflows too, which a client
+  cannot stop, so the adapter stops them after the interrupt, as Claude Code did without it.
+  Background commands keep running after a cancel either way. A tool call of a stopped child that Claude Code reports no
   result for, such as the command it was running, ends in the child's session before the cancelled
   prompt resolves. When Claude Code stops a background child after that, or while no prompt runs,
   the tool call ends right after the child reports `idle`. A child that still runs when Claude Code
@@ -70,7 +74,12 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   that the client was not told about in this connection is announced, parent before child and
   with no work state, as the RFD requires. An agent whose launch the session's history does not
   record stays unexposed.
-- A client cannot prompt, cancel, or otherwise change a child yet.
+- Each running child is announced with the `cancel` capability. `session/cancel` with the child's
+  session id stops that child's current work, through the SDK's `Query.stopTask`, and not its
+  parent's: Claude Code also stops the foreground children it waits on, and the parent's turn goes
+  on. Each stopped child reports `idle` with `cancelled` from Claude Code's own events, and its
+  requests that the stop withdraws report no `running` first. A replayed child, which no longer
+  runs, gets no capabilities. A client cannot prompt or otherwise change a child.
 
 An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right
