@@ -8008,7 +8008,31 @@ export class ClaudeAcpAgent {
   }
 
   async cancel(params: CancelNotification): Promise<void> {
+    if (!this.sessions[params.sessionId] && (await this.cancelChildSession(params.sessionId))) {
+      return;
+    }
     await this.cancelTurns(params, { awaitInterrupt: true });
+  }
+
+  /**
+   * Cancels the current work of the subagent child session `sessionId`, which
+   * its `cancel` capability permits on the subagents RFD form, without
+   * cancelling its parent (see `NativeSubagentRuntime.cancelChild`). Returns
+   * false when no session has such a child.
+   */
+  private async cancelChildSession(sessionId: string): Promise<boolean> {
+    for (const [rootSessionId, session] of Object.entries(this.sessions)) {
+      const cancelled = await session.nativeSubagentRuntime?.cancelChild(sessionId, (taskId) =>
+        session.query.stopTask(taskId).catch((error: unknown) => {
+          this.logger.error(
+            `Session ${rootSessionId}: failed to stop the task ${taskId} of subagent session ${sessionId}`,
+            error,
+          );
+        }),
+      );
+      if (cancelled) return true;
+    }
+    return false;
   }
 
   /** Cancel the session's turns and interrupt the SDK query. With

@@ -37,6 +37,9 @@ export type NativeSubagent = {
   missingError?: boolean;
   /** The RFD form: the open permission and question requests of the child. */
   openRequests?: number;
+  /** The RFD form: how many times the client cancelled the child (see
+   *  `NativeSubagentRuntime.cancelChild`). */
+  cancels?: number;
   /** The RFD form: the ids of the prompt messages in the child's transcript. */
   promptIds?: Set<string>;
   /** The RFD form: the calls that delegated to the child, whose runs ended. */
@@ -526,18 +529,41 @@ export class NativeSubagentRuntime {
   }
 
   /**
+   * The RFD form: the client sent `session/cancel` for the child session
+   * `sessionId`, which the child's `cancel` capability permits (see
+   * `announceNativeSubagent`). `stop` stops the child's task, as
+   * `Query.stopTask` does: Claude Code stops the child's current work and the
+   * foreground subagents that it waits on, and the parent's work goes on. The
+   * SDK's task events report each stopped child `idle` with `cancelled` (see
+   * {@link finishTask}). Accepting the stop is no evidence that the child
+   * stopped, so nothing is reported here, and a child whose work already ended
+   * keeps its outcome. Returns false when `sessionId` is not a child session
+   * of this runtime. AIR's draft grants no `cancel`.
+   */
+  async cancelChild(sessionId: string, stop: (taskId: string) => Promise<void>): Promise<boolean> {
+    if (this.form !== "rfd") return false;
+    for (const [taskId, child] of this.children) {
+      if (child.sessionId !== sessionId || !child.announced) continue;
+      child.cancels = (child.cancels ?? 0) + 1;
+      await stop(taskId);
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Runs `request`, a permission or question request of the session
    * `sessionId`. In the RFD form, a child waiting on it is `requires_action`
    * until its last open request ends, and then `running` again.
    *
    * `signal` aborts when Claude Code withdraws the request, which is not an
-   * answer. If the parent was cancelled while the request was open, Claude
-   * Code's interrupt withdrew it as it stopped the child, and the SDK's events
-   * report the child `idle` next. The end of the request then reports no
-   * `running`, which would show a child that is being stopped as working.
-   * Without a cancel, something else answered the request in the user's place,
-   * such as a `PermissionRequest` hook, and the child runs on, so the end
-   * reports `running`.
+   * answer. If the root session, the child, or an ancestor of the child was
+   * cancelled while the request was open, Claude Code withdrew it as it
+   * stopped the child, and the SDK's events report the child `idle` next. The
+   * end of the request then reports no `running`, which would show a child
+   * that is being stopped as working. Without a cancel, something else
+   * answered the request in the user's place, such as a `PermissionRequest`
+   * hook, and the child runs on, so the end reports `running`.
    */
   async awaitingUser<T>(
     sessionId: string,
@@ -546,7 +572,7 @@ export class NativeSubagentRuntime {
   ): Promise<T> {
     const child = this.form === "rfd" ? this.childOfSession(sessionId) : undefined;
     if (!child?.announced) return request();
-    const cancelsAtOpen = this.parentCancels;
+    const cancelsAtOpen = this.cancelsAbove(child);
     child.openRequests = (child.openRequests ?? 0) + 1;
     if (child.openRequests === 1 && child.workState === "running") {
       await this.reportState(child, { state: "requires_action" }).catch((error) =>
@@ -558,7 +584,7 @@ export class NativeSubagentRuntime {
     } finally {
       child.openRequests = (child.openRequests ?? 1) - 1;
       // Withdrawn after a cancel that came while the request was open.
-      const stopped = signal?.aborted === true && this.parentCancels !== cancelsAtOpen;
+      const stopped = signal?.aborted === true && this.cancelsAbove(child) !== cancelsAtOpen;
       if (child.openRequests === 0 && child.workState === "requires_action" && !stopped) {
         await this.reportState(child, { state: "running" }).catch((error) =>
           this.logger.log(`Failed to report that subagent ${child.sessionId} runs: ${error}`),
@@ -796,6 +822,24 @@ export class NativeSubagentRuntime {
     }
   }
 
+  /**
+   * The RFD form: how many cancels the client sent for `child`, its
+   * ancestors, and the root session. Each cancel stops the foreground work
+   * under it, and the counts only grow, so a changed sum shows that a cancel
+   * that reaches the child came.
+   */
+  private cancelsAbove(child: NativeSubagent): number {
+    let cancels = this.parentCancels;
+    const seen = new Set<NativeSubagent>();
+    let next: NativeSubagent | undefined = child;
+    while (next && !seen.has(next)) {
+      seen.add(next);
+      cancels += next.cancels ?? 0;
+      next = this.childOfSession(next.parentSessionId);
+    }
+    return cancels;
+  }
+
   /** The child generation with the ACP session `sessionId`, if one exists. */
   private childOfSession(sessionId: string): NativeSubagent | undefined {
     if (sessionId === this.rootSessionId) return undefined;
@@ -929,8 +973,10 @@ export class NativeSubagentRuntime {
 /**
  * Announces the child on its parent, once, before any update of the child.
  * The RFD form announces it as running and then sends the prompt as the
- * first message of the child. The child gets no capabilities, so the client
- * may not cancel or otherwise change it.
+ * first message of the child. It grants the child `cancel`: the client may
+ * stop the child's current work with `session/cancel` (see
+ * `NativeSubagentRuntime.cancelChild`), and nothing else. AIR's draft grants
+ * no capabilities.
  */
 export async function announceNativeSubagent(
   child: NativeSubagent,
@@ -949,6 +995,7 @@ export async function announceNativeSubagent(
           sessionId: child.sessionId,
           ...(child.title ? { title: child.title } : {}),
           ...(child.description ? { description: child.description } : {}),
+          capabilities: { cancel: {} },
           state: { state: "running" },
         },
       });

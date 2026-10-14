@@ -70,7 +70,12 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   that the client was not told about in this connection is announced, parent before child and
   with no work state, as the RFD requires. An agent whose launch the session's history does not
   record stays unexposed.
-- A client cannot prompt, cancel, or otherwise change a child yet.
+- Each running child is announced with the `cancel` capability. `session/cancel` with the child's
+  session id stops that child's current work, through the SDK's `Query.stopTask`, and not its
+  parent's: Claude Code also stops the foreground children it waits on, and the parent's turn goes
+  on. Each stopped child reports `idle` with `cancelled` from Claude Code's own events, and its
+  requests that the stop withdraws report no `running` first. A replayed child, which no longer
+  runs, gets no capabilities. A client cannot prompt or otherwise change a child.
 
 An [ACP v2](#experimental-acp-v2) client gets the same without declaring anything, since subagents
 are part of v2's baseline. Each child also reports its work state as its own `state_update`, right

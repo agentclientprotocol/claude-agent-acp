@@ -48,6 +48,8 @@ const sdk = vi.hoisted(() => ({
   ): AsyncGenerator<Record<string, unknown>> {},
   /** Claude Code receives an interrupt, as `cancel()` sends one. */
   interrupt: async (): Promise<void> => {},
+  /** Claude Code stops one task, as `cancel()` does for a child session. */
+  stopTask: async (_taskId: string): Promise<void> => {},
   /** The query is closed, as `session/close` closes it. */
   close: (): void => {},
   mcpServerStatus: async (): Promise<Array<{ name: string; status: string }>> => [],
@@ -89,6 +91,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         mcpServerStatus: () => sdk.mcpServerStatus(),
         mcpAuthenticate: (serverName: string) => sdk.mcpAuthenticate(serverName),
         interrupt: () => sdk.interrupt(),
+        stopTask: (taskId: string) => sdk.stopTask(taskId),
         close: () => sdk.close(),
       });
       return Object.assign(messages, controls);
@@ -3647,6 +3650,115 @@ describe("ACP v2 requests that subagents make", () => {
       stopReason: "error",
       error: { code: -32603, message: "The model is overloaded" },
     });
+  });
+
+  it("stops a child's task when the client cancels the child session, and reports the child idle cancelled on both streams", async () => {
+    const stopped = Promise.withResolvers<string>();
+    sdk.stopTask = async (taskId) => stopped.resolve(taskId);
+    let interrupted = false;
+    sdk.interrupt = async () => {
+      interrupted = true;
+    };
+    scriptTurns(async function* (options) {
+      yield {
+        type: "assistant",
+        message: {
+          id: "msg_agent",
+          type: "message",
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_agent-1",
+              name: "Agent",
+              input: { description: "Explore the project", prompt: "Look around" },
+            },
+          ],
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 2 },
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield taskStarted(options, "agent-1", { prompt: "Look around" });
+      await stopped.promise;
+      // As seen live: the child's end, then the Agent call's interrupted
+      // result, and the turn goes on.
+      yield {
+        type: "system",
+        subtype: "task_updated",
+        task_id: "agent-1",
+        patch: { status: "killed" },
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield {
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_agent-1",
+              is_error: true,
+              content: "[Request interrupted by user for tool use]",
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        uuid: randomUUID(),
+        session_id: options.sessionId,
+      };
+      yield assistantText(options, "The subagent was stopped.");
+      yield result(options);
+      yield idleState(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() =>
+        expect(
+          client.sessionUpdates.some(({ update }) => update.sessionUpdate === "subagent_update"),
+        ).toBe(true),
+      );
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId: "agent-1" });
+      await expect(stopped.promise).resolves.toBe("agent-1");
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+      await client.authUpdate(1);
+    });
+
+    expect(interrupted).toBe(false);
+    const subagentUpdates = client.sessionUpdates.flatMap(({ update }) =>
+      update.sessionUpdate === "subagent_update" ? [update] : [],
+    );
+    expect(subagentUpdates[0]).toMatchObject({
+      sessionId: "agent-1",
+      capabilities: { cancel: {} },
+      state: { state: "running" },
+    });
+    expect(subagentUpdates.at(-1)).toEqual({
+      sessionUpdate: "subagent_update",
+      sessionId: "agent-1",
+      state: { state: "idle", stopReason: "cancelled" },
+    });
+    expect(
+      client.sessionUpdates
+        .filter(
+          ({ sessionId, update }) =>
+            sessionId === "agent-1" && update.sessionUpdate === "state_update",
+        )
+        .map(({ update }) => update),
+    ).toEqual([
+      { sessionUpdate: "state_update", state: "running" },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "cancelled" },
+    ]);
+    // The turn goes on, and ends as Claude Code ends it.
+    expect(turnTrace(client.sessionUpdates).at(-1)).toBe("idle end_turn");
   });
 
   it("keeps the turn running while a background subagent's request is open", async () => {

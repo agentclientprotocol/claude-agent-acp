@@ -842,6 +842,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           sessionId: "worker-1",
           title: "builder (Explore)",
           description: "Fix the build",
+          capabilities: { cancel: {} },
           state: { state: "running" },
         },
       },
@@ -1106,6 +1107,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
             sessionId: "echoer-1",
             title: "echoer (Explore)",
             description: "Echo a word",
+            capabilities: { cancel: {} },
             state: { state: "running" },
           },
         },
@@ -1443,15 +1445,54 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(states(published).at(-1)).toEqual({ state: "idle", stopReason: "end_turn" });
   });
 
+  describe("a cancel of one child by the client", () => {
+    it("stops the child's task, and leaves its end to the SDK", async () => {
+      const { runtime, published } = await runningWorker();
+      const stop = vi.fn(async (_taskId: string) => {});
+
+      await expect(runtime.cancelChild("worker-1", stop)).resolves.toBe(true);
+
+      expect(stop).toHaveBeenCalledExactlyOnceWith("worker-1");
+      // Accepting the stop is no evidence that the child stopped.
+      expect(states(published)).toEqual([{ state: "running" }]);
+      await runtime.finishTask("worker-1", "killed", async () => {});
+      expect(states(published)).toEqual([
+        { state: "running" },
+        { state: "idle", stopReason: "cancelled" },
+      ]);
+    });
+
+    it("stops nothing for a session that is no child, or for AIR, which grants no cancel", async () => {
+      const { runtime } = await runningWorker();
+      const stop = vi.fn(async (_taskId: string) => {});
+      const air = new NativeSubagentRuntime("air", "root", {}, async () => {}, { log: () => {} });
+      await air.route(control("tool_call"), async () => {});
+      await air.taskStarted(
+        { taskId: "child-1", toolUseId: "agent-tool", subagentType: "Explore" },
+        async () => {},
+      );
+
+      await expect(runtime.cancelChild("root", stop)).resolves.toBe(false);
+      await expect(runtime.cancelChild("other-1", stop)).resolves.toBe(false);
+      await expect(air.cancelChild("child-1", stop)).resolves.toBe(false);
+      expect(stop).not.toHaveBeenCalled();
+    });
+  });
+
   describe("a request that Claude Code withdraws", () => {
     /**
-     * A request of `worker-1` that fails once `withdrawal` aborts, as the
-     * agent's requests do. It resolves with how it ended.
+     * A request of `sessionId` (`worker-1` by default) that fails once
+     * `withdrawal` aborts, as the agent's requests do. It resolves with how
+     * it ended.
      */
-    const withdrawable = (runtime: NativeSubagentRuntime, withdrawal: AbortController) =>
+    const withdrawable = (
+      runtime: NativeSubagentRuntime,
+      withdrawal: AbortController,
+      sessionId = "worker-1",
+    ) =>
       runtime
         .awaitingUser(
-          "worker-1",
+          sessionId,
           () =>
             new Promise<string>((_answer, reject) => {
               const fail = () => reject(new Error("Tool use aborted"));
@@ -1481,6 +1522,45 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         { state: "requires_action" },
         { state: "idle", stopReason: "cancelled" },
       ]);
+    });
+
+    it("does not report running for a request that the client's cancel of the child withdraws", async () => {
+      const { runtime, published } = await runningWorker();
+      const withdrawal = new AbortController();
+      const request = withdrawable(runtime, withdrawal);
+      await vi.waitFor(() => expect(states(published)).toHaveLength(2));
+
+      await runtime.cancelChild("worker-1", async () => withdrawal.abort());
+      await expect(request).resolves.toBe("Tool use aborted");
+
+      expect(states(published)).toEqual([{ state: "running" }, { state: "requires_action" }]);
+    });
+
+    it("does not report running for a request of a foreground subagent that the cancel of its parent stops", async () => {
+      const { runtime, published } = await runningWorker();
+      // worker-1 runs a foreground subagent, which asks.
+      await runtime.route(launch("launch-2", { description: "Dig" }, "launch-1"), async () => {});
+      await runtime.taskStarted(
+        { taskId: "digger-1", toolUseId: "launch-2", subagentType: "Explore" },
+        async () => {},
+      );
+      const withdrawal = new AbortController();
+      const request = withdrawable(runtime, withdrawal, "digger-1");
+      await vi.waitFor(() =>
+        expect(published.at(-1)?.update).toMatchObject({
+          sessionId: "digger-1",
+          state: { state: "requires_action" },
+        }),
+      );
+
+      // Claude Code also stops the subagent that worker-1 waits on.
+      await runtime.cancelChild("worker-1", async () => withdrawal.abort());
+      await expect(request).resolves.toBe("Tool use aborted");
+
+      expect(published.at(-1)?.update).toMatchObject({
+        sessionId: "digger-1",
+        state: { state: "requires_action" },
+      });
     });
 
     it("reports running for a request that Claude Code withdraws without a cancel, since the child goes on", async () => {
