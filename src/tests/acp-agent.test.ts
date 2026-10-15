@@ -13,6 +13,7 @@ import {
   PromptResponse,
   ReadTextFileRequest,
   ReadTextFileResponse,
+  RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -13269,6 +13270,14 @@ describe("session/delete", () => {
     return agent.sessions[sessionId]!;
   }
 
+  // Session ids are UUIDs: the SDK delete rejects any other id.
+  const SESSION_1 = "6f0c5f0e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
+  const SESSION_2 = "7a1d6e1f-2b3c-4d4e-9f0a-1b2c3d4e5f60";
+
+  /** The error the SDK delete throws for a session without a transcript. */
+  const sdkNotFound = (sessionId: string) =>
+    new Error(`Session ${sessionId} not found in any project directory`);
+
   beforeEach(() => {
     vi.mocked(deleteSession).mockReset();
     vi.mocked(deleteSession).mockResolvedValue(undefined);
@@ -13276,45 +13285,70 @@ describe("session/delete", () => {
 
   it("tears down the active session and deletes it from disk", async () => {
     const agent = createMockAgent();
-    const session = injectSession(agent, "session-1");
+    const session = injectSession(agent, SESSION_1);
 
-    const result = await agent.deleteSession({ sessionId: "session-1" });
+    const result = await agent.deleteSession({ sessionId: SESSION_1 });
 
     expect(result).toEqual({});
-    expect(agent.sessions["session-1"]).toBeUndefined();
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
     expect(session.query.interrupt).toHaveBeenCalled();
     expect(session.settingsManager.dispose).toHaveBeenCalled();
     expect(session.abortController.signal.aborted).toBe(true);
-    expect(deleteSession).toHaveBeenCalledWith("session-1");
+    expect(deleteSession).toHaveBeenCalledWith(SESSION_1);
   });
 
   it("deletes a session from disk that is not currently active", async () => {
     const agent = createMockAgent();
 
-    const result = await agent.deleteSession({ sessionId: "not-active" });
+    const result = await agent.deleteSession({ sessionId: SESSION_1 });
 
     expect(result).toEqual({});
-    expect(deleteSession).toHaveBeenCalledWith("not-active");
+    expect(deleteSession).toHaveBeenCalledWith(SESSION_1);
   });
 
-  it("propagates errors from the SDK delete call", async () => {
+  it("deletes an active session that was never prompted, which has no transcript", async () => {
     const agent = createMockAgent();
-    vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Session not found on disk"));
+    injectSession(agent, SESSION_1);
+    vi.mocked(deleteSession).mockRejectedValueOnce(sdkNotFound(SESSION_1));
 
-    await expect(agent.deleteSession({ sessionId: "missing" })).rejects.toThrow(
-      "Session not found on disk",
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).resolves.toEqual({});
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
+  });
+
+  // ACP: "Deleting an already-deleted session, or a session that never
+  // existed, SHOULD succeed silently."
+  it("succeeds for a session that does not exist", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(sdkNotFound(SESSION_1));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).resolves.toEqual({});
+  });
+
+  it("succeeds for an id that is not a session id, without asking the SDK", async () => {
+    const agent = createMockAgent();
+
+    await expect(agent.deleteSession({ sessionId: "tck-never-created" })).resolves.toEqual({});
+    expect(deleteSession).not.toHaveBeenCalled();
+  });
+
+  it("propagates other errors from the SDK delete call", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).rejects.toThrow(
+      "EACCES: permission denied",
     );
   });
 
   it("does not affect other sessions when deleting one", async () => {
     const agent = createMockAgent();
-    injectSession(agent, "session-a");
-    injectSession(agent, "session-b");
+    injectSession(agent, SESSION_1);
+    injectSession(agent, SESSION_2);
 
-    await agent.deleteSession({ sessionId: "session-a" });
+    await agent.deleteSession({ sessionId: SESSION_1 });
 
-    expect(agent.sessions["session-a"]).toBeUndefined();
-    expect(agent.sessions["session-b"]).toBeDefined();
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
+    expect(agent.sessions[SESSION_2]).toBeDefined();
   });
 });
 
@@ -13436,6 +13470,66 @@ describe("getOrCreateSession param change detection", () => {
       expect.objectContaining({ cwd: "/new" }),
       expect.objectContaining({ resume: "s1" }),
     );
+  });
+
+  // Claude Code writes the conversation at the first prompt, so a live session
+  // that was never prompted has nothing to resume.
+  it("starts a fresh query under the same id for a live session that was never prompted", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/project" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValueOnce(RequestError.resourceNotFound("s1"))
+      .mockResolvedValueOnce({ sessionId: "s1", modes: undefined, configOptions: [] });
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        additionalDirectories: ["/project/extra"],
+      }),
+    ).resolves.toMatchObject({ configOptions: [] });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(2);
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      expect.objectContaining({ resume: "s1" }),
+    );
+    // The live session keeps its mode.
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      { reuseSessionId: "s1", permissionMode: "default" },
+    );
+  });
+
+  it("still fails a resume of an unknown session that has no stored conversation", async () => {
+    const agent = createMockAgent();
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(RequestError.resourceNotFound("s1"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/project", mcpServers: [] }),
+    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start a fresh query when the resume of a live session fails otherwise", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/old" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(new Error("CLI failed to start"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+    ).rejects.toThrow("CLI failed to start");
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
   });
 
   it("tears down existing session when mcpServers change", async () => {

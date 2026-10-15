@@ -34,6 +34,12 @@ export const AIR_SESSION_RENAME_CAPABILITY = "sessionRename";
  * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
  */
 export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
+/**
+ * Session index rows carry `agentWorktree: true` when the session runs in a
+ * linked git worktree that Claude Code made for it. Advertised exactly when
+ * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
+ */
+export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
