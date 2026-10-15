@@ -323,6 +323,25 @@ describe("createSession options merging", () => {
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
   });
 
+  it("asks the SDK for a predicted follow-up prompt per turn", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(true);
+  });
+
+  it("lets a caller turn the predicted follow-up prompt off", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { claudeCode: { options: { promptSuggestions: false } } },
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(false);
+  });
+
   it("defaults tools to claude_code preset when not provided", async () => {
     await agent.newSession({
       cwd: process.cwd(),

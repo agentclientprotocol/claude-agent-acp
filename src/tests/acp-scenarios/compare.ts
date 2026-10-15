@@ -33,6 +33,7 @@ import type { Recorded } from "./harness.js";
 export const AIR_ONLY_META_KEYS = new Set([
   "jetbrains",
   "goal",
+  "promptSuggestions",
   "contextCompaction",
   "kind",
   "permission",

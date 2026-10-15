@@ -103,6 +103,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import { promptSuggestionsMeta, promptSuggestionText } from "./prompt-suggestions.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
@@ -940,6 +941,15 @@ export type Session = {
   /** Last goal snapshot sent to the ACP client, used to roll back an
    *  optimistic `/goal` update when the command itself fails. */
   lastPublishedGoal?: GoalSnapshot | null;
+  /** Last follow-up prompt sent to the ACP client (`null` after a clear), so an
+   *  unchanged prediction is not re-notified. Undefined until the first push. */
+  lastPublishedPromptSuggestion?: string | null;
+  /** Whether an arriving `prompt_suggestion` still answers the turn the user is
+   *  waiting on: set at a turn's result, cleared when the next prompt arrives.
+   *  A prediction the user outran — the next prompt was sent before the
+   *  prediction was read off the stream — follows a turn that is already
+   *  answered, so it is dropped instead of published mid-turn. */
+  promptSuggestionExpected?: boolean;
   /** Count of result messages the consumer should treat as orphans and skip
    *  (not promote/attribute to the current head). When cancel() settles+removes
    *  a queued turn, that turn's user message was already pushed to the SDK, so
@@ -3741,6 +3751,18 @@ export class ClaudeAcpAgent {
 
     session.titles.onPrompt(params.prompt);
 
+    // The prompt the previous turn predicted is spent: the user either sent it
+    // or sent something else. Clearing it here keeps a turn that predicts
+    // nothing (the CLI predicts none in plan mode, after an API error, or at
+    // the usage limit) from leaving the stale prediction in the composer. A
+    // session that holds no prediction needs no clear, and the prompt path
+    // then keeps the ordering it has without this feature.
+    if (session.lastPublishedPromptSuggestion != null) {
+      await this.publishPromptSuggestion(params.sessionId, null);
+    } else {
+      session.promptSuggestionExpected = false;
+    }
+
     // Each prompt is a Turn that the persistent consumer settles once the
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
     // turn, pushes the user message onto the streaming input, and makes sure
@@ -4001,6 +4023,31 @@ export class ClaudeAcpAgent {
       update: {
         sessionUpdate: "session_info_update",
         _meta: withAirMeta(undefined, AIR_GOAL_KEY, goal),
+      },
+    });
+  }
+
+  /**
+   * Publishes the follow-up prompt the CLI predicted for the next turn, or
+   * `null` to clear the one the client holds. Only AIR renders it, so only AIR
+   * gets the key; see `docs/air-extensions.md`.
+   */
+  private async publishPromptSuggestion(sessionId: string, text: string | null): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    // A clear ends the window the turn's result opened: whatever prediction is
+    // still in flight answers a turn the user has already moved past.
+    if (text === null) session.promptSuggestionExpected = false;
+    // A session that never published one holds nothing, so a clear before the
+    // first prediction is already true on the client and goes nowhere.
+    if ((session.lastPublishedPromptSuggestion ?? null) === text) return;
+    if (!this.toolCallCapabilities.air.client) return;
+    session.lastPublishedPromptSuggestion = text;
+    await this.client.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: promptSuggestionsMeta(text),
       },
     });
   }
@@ -6537,6 +6584,9 @@ export class ClaudeAcpAgent {
             break;
           case "result": {
             session.modelRequestSinceResult = false;
+            // The CLI predicts the next prompt right after this result, so a
+            // `prompt_suggestion` from here on belongs to the turn just ended.
+            session.promptSuggestionExpected = true;
             // The result ends the model turn. A background task that still
             // waits for its tool call id gets its spawn now, without the id.
             await asyncTasks.releaseHeld();
@@ -7952,11 +8002,25 @@ export class ClaudeAcpAgent {
             // cached title no longer describes the session: drop it and
             // re-evaluate at the next turn-end.
             session.titles.reset();
+            // The follow-up prompt was predicted from the transcript the reset
+            // dropped, so it no longer follows from anything.
+            await this.publishPromptSuggestion(params.sessionId, null);
             break;
           }
           case "tool_use_summary":
-          case "prompt_suggestion":
             break;
+          case "prompt_suggestion": {
+            // The CLI predicts the next prompt after the turn's `result`. AIR
+            // shows it as gray text in an empty composer; Tab fills the
+            // composer, and nothing is sent until the user sends it.
+            if (!session.promptSuggestionExpected) break;
+            session.promptSuggestionExpected = false;
+            await this.publishPromptSuggestion(
+              params.sessionId,
+              promptSuggestionText(message.suggestion),
+            );
+            break;
+          }
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {
               await sessionFailures.clear((failure) => failure.kind === "auth_required");
@@ -10892,6 +10956,13 @@ export class ClaudeAcpAgent {
       // interrupt either way. Before `userProvidedOptions`, so a client's own
       // `perTaskStopAffordance` wins.
       ...(subagentForm(this.clientCapabilities) === "rfd" ? { perTaskStopAffordance: true } : {}),
+      // One predicted follow-up prompt per turn, published as
+      // `session_info_update._meta.promptSuggestions`. It rides the turn's own
+      // prompt cache, and the user can turn it off in settings.json
+      // (`promptSuggestionEnabled`) or with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false.
+      // Before `userProvidedOptions`, so a client that passes
+      // `promptSuggestions: false` keeps it off.
+      promptSuggestions: true,
       ...userProvidedOptions,
       // Claude Code uses the same checkpoint store for /rewind. Enable it only
       // for clients that negotiated per-turn file-change reports; this avoids

@@ -20,6 +20,7 @@ It describes only this adapter.
 - [Session hooks](#session-hooks)
 - [Permission presentation](#permission-presentation)
 - [Goal](#goal)
+- [Predicted follow-up prompt](#predicted-follow-up-prompt)
 - [Recommended config values](#recommended-config-values)
 - [Async tasks](#async-tasks)
 - [Agent file-change report](#agent-file-change-report)
@@ -205,6 +206,7 @@ The adapter keeps them where they are.
 | `steering`              | `initialize` response `_meta.steering = {supported: true}`                                                                                | The agent accepts `_session/steering` for a running turn.                          |
 | `quota`                 | `PromptResponse._meta.quota`                                                                                                              | Token usage of the turn, also split by model.                                      |
 | `authStatus`            | `initialize` response `agentCapabilities._meta.authStatus`                                                                                | The agent pushes `_auth/status_update`. The object carries no payload.             |
+| `promptSuggestions`     | `session_info_update._meta.promptSuggestions = {suggestions: [{text}]}`, AIR only                                                         | The prompt the agent predicts for the next turn. An empty list clears it.          |
 
 ## Auth source display
 
@@ -814,6 +816,37 @@ It publishes `goal: null` for `/goal clear`.
 While that command is pending, the adapter ignores late updates for the previous goal.
 A matching runtime `active_goal` stays authoritative and adds the iteration, reason, and timestamp.
 A failed command restores the previous state.
+
+## Predicted follow-up prompt
+
+After a turn, the Claude Code CLI can predict the prompt the user is likely to send next.
+The adapter asks for it with the SDK option `promptSuggestions: true` and forwards the one prediction of the turn.
+
+ACP has no field for a composer prefill, so the prediction travels outside the AIR namespace:
+
+```json
+{
+  "sessionUpdate": "session_info_update",
+  "_meta": { "promptSuggestions": { "suggestions": [{ "text": "Run the tests" }] } }
+}
+```
+
+The key names no vendor, so another client can read it.
+The adapter sends it only to an AIR client; see the [compatibility rule](#compatibility-rule).
+
+AIR shows the first non-blank `suggestions[].text` as gray text in an empty composer.
+Tab fills the composer with it and sends nothing.
+
+`suggestions: []` clears the prediction the client holds. The adapter clears it:
+
+- when the next `session/prompt` arrives, because that turn's prediction is spent;
+- on a `conversation_reset`, because the prediction was drawn from the transcript the reset dropped.
+
+A prediction the next prompt outran — the user sent it before the adapter read the prediction off the SDK stream — is dropped instead of published.
+
+The CLI predicts nothing on the first turn of a session, after an API error, in plan mode, and at the account's usage limit, so many turns end with no prediction.
+A client must treat a turn without one as normal.
+A caller can turn the whole feature off with `_meta.claudeCode.options.promptSuggestions: false` on `session/new`; a user can turn it off in Claude Code settings or with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`.
 
 ## Recommended config values
 
