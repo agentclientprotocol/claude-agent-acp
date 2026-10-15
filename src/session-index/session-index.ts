@@ -706,11 +706,14 @@ export class SessionIndex {
    * alone gives, read from it at once, and the ids of the sessions it gives
    * no answer for: a transcript of it has nothing cached at its stat, no cwd
    * known, or is continued in another session (whether the successor hides
-   * it depends on the successor now). Reads no transcript.
+   * it depends on the successor now). Reads no transcript. The rows carry
+   * `agentWorktree` ({@link markAgentWorktrees}, which reads git files)
+   * unless `mark` is false, for a caller that uses only their ids.
    */
   async cachedRowsOf(
     paths: readonly string[],
     candidates: readonly TranscriptCandidate[],
+    { mark = true }: { mark?: boolean } = {},
   ): Promise<{ rows: IndexRow[]; unknown: Set<string> }> {
     const unknown = new Set<string>();
     const resolved: { item: Resolved; cwd: string }[] = [];
@@ -741,7 +744,8 @@ export class SessionIndex {
       if (previous && previous.mtimeMs >= item.candidate.mtimeMs) continue;
       newest.set(id, { row: toRow(item, cwd), mtimeMs: item.candidate.mtimeMs });
     }
-    return { rows: await markAgentWorktrees([...newest.values()].map(({ row }) => row)), unknown };
+    const rows = [...newest.values()].map(({ row }) => row);
+    return { rows: mark ? await markAgentWorktrees(rows) : rows, unknown };
   }
 
   /**

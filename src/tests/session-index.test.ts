@@ -618,6 +618,52 @@ describe("session/list of a sessionIndex client", () => {
     ]);
   });
 
+  it("marks a session that made its worktree mid-session, and not after a malformed record", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const other = path.join(workspace, "other");
+    await linkWorktrees(repo, made, other);
+    // Started in the main checkout, then EnterWorktree made a worktree: the
+    // CLI moved the transcript there, so the row's cwd is the worktree.
+    const movedId = randomUUID();
+    const moved = await writeTranscript({
+      sessionId: movedId,
+      cwd: repo,
+      dirName: encodeProjectPath(made),
+      lastMessageAt: base,
+      trailer: [
+        worktreeState(movedId, { path: made }),
+        { type: "relocated", sessionId: movedId, relocatedCwd: made },
+      ],
+    });
+    // The latest record has no worktreeSession object: it decides, so the
+    // older marked one does not count.
+    const malformedId = randomUUID();
+    const malformed = await writeTranscript({
+      sessionId: malformedId,
+      cwd: other,
+      lastMessageAt: base - 1000,
+      trailer: [
+        worktreeState(malformedId, { path: other }),
+        { type: "worktree-state", worktreeSession: "other", sessionId: malformedId },
+      ],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+      [malformed.id, other, undefined],
+    ]);
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+    ]);
+  });
+
   it("recovers the cwd of a session whose head has none", async () => {
     // A first prompt beyond 64 KB pushes the first cwd out of the head; the
     // tail cwd is a subdirectory of the project.
@@ -2742,13 +2788,17 @@ describe("tail growth", () => {
     // messages push it out of the tail.
     const messages = Array.from({ length: 20 }, (_, i) => big(id, at + i, 10_000)).join("\n");
     const inHead = path.join(workspace, `${id}.jsonl`);
-    await fs.writeFile(inHead, `${record({ path: "/wt" })}\n${messages}\n`);
-    let { size } = await fs.stat(inHead);
-    expect((await scanTranscriptFile(inHead, size)).agentWorktree).toBe(true);
+    const headContent = `${record({ path: "/wt" })}\n${messages}\n`;
+    await fs.writeFile(inHead, headContent);
+    expect((await scanTranscriptFile(inHead, Buffer.byteLength(headContent))).agentWorktree).toBe(
+      true,
+    );
     // A later record in the tail wins over the head.
-    await fs.appendFile(inHead, `${record(null)}\n`);
-    ({ size } = await fs.stat(inHead));
-    expect((await scanTranscriptFile(inHead, size)).agentWorktree).toBe(false);
+    const nullRecord = `${record(null)}\n`;
+    await fs.appendFile(inHead, nullRecord);
+    expect(
+      (await scanTranscriptFile(inHead, Buffer.byteLength(headContent + nullRecord))).agentWorktree,
+    ).toBe(false);
     // The record an earlier scan found stands when the file grew within the
     // tail and the new tail lost it, not the older one of the head.
     const grown = path.join(workspace, `${randomUUID()}.jsonl`);
@@ -2768,6 +2818,22 @@ describe("tail growth", () => {
       },
     );
     expect(second.agentWorktree).toBe(false);
+  });
+
+  it("takes the worktree record of a wider tail over the head's", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    const messages = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => big(id, at + from + i, 10_000)).join("\n");
+    // No prompt, so the tail grows; the null record lies beyond the 64 KB
+    // tail and the 64 KB head, within the 256 KB window.
+    const file = path.join(workspace, `${id}.jsonl`);
+    const content = `${record({ path: "/wt" })}\n${messages(0, 10)}\n${record(null)}\n${messages(100, 10)}\n`;
+    await fs.writeFile(file, content);
+    const facts = await scanTranscriptFile(file, Buffer.byteLength(content));
+    expect(facts.agentWorktree).toBe(false);
   });
 
   it("does not search a transcript of the same size again", async () => {

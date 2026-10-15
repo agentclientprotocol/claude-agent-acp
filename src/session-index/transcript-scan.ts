@@ -259,9 +259,12 @@ const WORKTREE_STATE_MARKER = '"worktree-state"';
 /**
  * Whether the last `worktree-state` record of `text` says the session is in
  * a worktree that Claude Code made for it, as AIR's native Claude provider
- * reads it: a set `worktreeSession` without `enteredExisting: true`. A
- * record with `worktreeSession: null` means the session left the worktree.
- * Undefined when `text` holds no such record.
+ * reads it: a `worktreeSession` that is an object without
+ * `enteredExisting: true`. The last line that parses as a `worktree-state`
+ * record decides; any other `worktreeSession` (`null`, which the CLI writes
+ * when the session leaves the worktree, missing, or no object) means false.
+ * Only lines that are not JSON (such as the cut first line of a window) are
+ * skipped. Undefined when `text` holds no such record.
  *
  * The CLI writes the record when it enters or leaves a worktree (for
  * `claude --worktree`, at the start of the session, so in the head), and
@@ -278,10 +281,11 @@ export function agentWorktreeOf(text: string): boolean | undefined {
     const line = lines[i]!;
     if (!line.includes(WORKTREE_STATE_MARKER)) continue;
     const entry = parseLine(line);
-    if (entry?.type !== "worktree-state" || !("worktreeSession" in entry)) continue;
+    // Only a line that is no JSON record is skipped: the latest record that
+    // parses decides, even when its `worktreeSession` is missing or no object.
+    if (entry?.type !== "worktree-state") continue;
     const session = entry.worktreeSession;
-    if (session === null) return false;
-    if (!session || typeof session !== "object" || Array.isArray(session)) continue;
+    if (!session || typeof session !== "object" || Array.isArray(session)) return false;
     return (session as { enteredExisting?: unknown }).enteredExisting !== true;
   }
   return undefined;
