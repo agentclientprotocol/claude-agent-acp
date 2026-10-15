@@ -568,16 +568,28 @@ function supportsRemoteControl(query: Query): query is RemoteControlQuery {
 }
 
 const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
-const REMOTE_CONTROL_COMMAND_ALIASES = new Set(["remote-control", "rc"]);
 
-/** Parses `/remote-control [name]` (or `/rc`) from a single-text prompt. */
-function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): { name?: string } | null {
+type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
+
+/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
+ *  prompt. Connecting is idempotent, so the command never needs to know whether
+ *  Remote Control is already on. */
+function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
   const [first] = prompt;
   if (prompt.length !== 1 || first?.type !== "text") return null;
-  const match = /^\/(\S+)(?:\s+([\s\S]*))?$/.exec(first.text.trim());
-  if (!match || !REMOTE_CONTROL_COMMAND_ALIASES.has(match[1])) return null;
-  const name = match[2]?.trim();
-  return name ? { name } : {};
+  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
+  if (!match) return null;
+  const argument = match[1]?.trim();
+  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
+  return argument ? { action: "connect", name: argument } : { action: "connect" };
+}
+
+/** Whether Claude Code itself offers a slash command of this name. The adapter
+ *  only stands in for the command when it does not, so a command or skill of
+ *  the user's own is never shadowed. */
+async function claudeCodeAdvertisesCommand(query: Query, name: string): Promise<boolean> {
+  const commands = await query.supportedCommands();
+  return commands.some((command) => command.name === name);
 }
 
 /** Wait for a polling interval, resolving false when the session is aborted. */
@@ -1111,9 +1123,6 @@ export type Session = {
    *  user's intent so it persists across model switches; the Fast mode config
    *  option is only surfaced while the selected model supports it. */
   fastModeEnabled: boolean;
-  /** Whether `/remote-control` last connected this session, so running the
-   *  command again disconnects instead of reconnecting. */
-  remoteControlActive?: boolean;
   /** The non-default effort the user picked through the ACP picker this
    *  session. A pin lives at the SDK's flag layer, which overrides the CLI's
    *  persisted effort (including the per-model `modelSettings` entries), so it
@@ -3759,16 +3768,24 @@ export class ClaudeAcpAgent {
     }
 
     const remoteControlCommand = parseRemoteControlCommand(params.prompt);
-    if (remoteControlCommand && supportsRemoteControl(session.query)) {
+    if (
+      remoteControlCommand &&
+      supportsRemoteControl(session.query) &&
+      !(await claudeCodeAdvertisesCommand(session.query, REMOTE_CONTROL_COMMAND_NAME))
+    ) {
+      // The reply bypasses the turn queue, so it would land inside the output of
+      // a turn that is still running, and v2 would report no `running` state
+      // around it. Refuse instead of interleaving.
+      if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        );
+      }
       // Answered by the adapter without a model turn; v2 clients treat an
       // `ended` without a prior `inserted` as a refused prompt.
       events.inserted(randomUUID());
-      await this.toggleRemoteControl(
-        params.sessionId,
-        session,
-        session.query,
-        remoteControlCommand.name,
-      );
+      await this.runRemoteControlCommand(params.sessionId, session.query, remoteControlCommand);
       events.ended({ stopReason: "end_turn" });
       return;
     }
@@ -3852,19 +3869,16 @@ export class ClaudeAcpAgent {
     );
   }
 
-  /** Starts Remote Control, or stops it when this session already has it on.
-   *  A failed request leaves the tracked state alone so the next run retries. */
-  private async toggleRemoteControl(
+  /** Connects Remote Control (again, if it is already on) or disconnects it. */
+  private async runRemoteControlCommand(
     sessionId: string,
-    session: Session,
     query: RemoteControlQuery,
-    name: string | undefined,
+    command: RemoteControlCommand,
   ): Promise<void> {
     let text: string;
-    if (session.remoteControlActive) {
+    if (command.action === "disconnect") {
       try {
         await query.enableRemoteControl(false);
-        session.remoteControlActive = false;
         text = "Remote Control is off. Run /remote-control to reconnect.";
       } catch (error) {
         this.logger.error(`Failed to disable Remote Control: ${error}`);
@@ -3872,10 +3886,9 @@ export class ClaudeAcpAgent {
       }
     } else {
       try {
-        const result = await query.enableRemoteControl(true, name);
-        session.remoteControlActive = true;
+        const result = await query.enableRemoteControl(true, command.name);
         text = result.session_url
-          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control again to disconnect.`
+          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control off to disconnect.`
           : "Remote Control is active, but Claude Code did not return a session URL.";
       } catch (error) {
         this.logger.error(`Failed to enable Remote Control: ${error}`);
@@ -12419,8 +12432,8 @@ function getAvailableSlashCommands(
           {
             name: REMOTE_CONTROL_COMMAND_NAME,
             description:
-              "Continue this session from claude.ai/code or the Claude mobile app; run again to disconnect (optional name)",
-            input: { hint: "[session name]" },
+              "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
+            input: { hint: "[session name | off]" },
           },
         ]
       : [];
