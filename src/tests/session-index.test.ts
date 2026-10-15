@@ -21,6 +21,8 @@ import type { SessionInfo } from "@agentclientprotocol/sdk";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
+  archiveTo,
+  renameTo,
   SessionIndexService,
   writeCustomTitleSidecar,
 } from "../session-index/service.js";
@@ -168,11 +170,52 @@ async function indexAgent() {
   return created;
 }
 
+/** The transcripts the session index of `agent` has read so far. */
+const transcriptsRead = (agent: ClaudeAcpAgent): number =>
+  (agent as any).sessionIndex.service.index.transcriptsRead;
+
 /** The `custom-title` and `agent-name` records that title a session. */
 const titleRecords = (sessionId: string, title: string) => [
   { type: "custom-title", customTitle: title, sessionId },
   { type: "agent-name", agentName: title, sessionId },
 ];
+
+/** A `worktree-state` record, as the CLI writes it when a session enters
+ *  (`worktree` set) or leaves (null) a worktree. */
+const worktreeState = (
+  sessionId: string,
+  worktree: { path: string; enteredExisting?: boolean } | null,
+) => ({
+  type: "worktree-state",
+  worktreeSession: worktree && {
+    originalCwd: "/repo",
+    worktreePath: worktree.path,
+    worktreeName: path.basename(worktree.path),
+    worktreeBranch: `worktree-${path.basename(worktree.path)}`,
+    originalBranch: "main",
+    originalHeadCommit: "0123456789abcdef0123456789abcdef01234567",
+    sessionId,
+    ...(worktree.enteredExisting !== undefined && { enteredExisting: worktree.enteredExisting }),
+  },
+  sessionId,
+});
+
+/** A repository at `repo` with linked worktrees at `linked`, as git lays
+ *  them out. */
+async function linkWorktrees(repo: string, ...linked: string[]): Promise<void> {
+  await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+  for (const worktree of linked) {
+    const meta = path.join(repo, ".git", "worktrees", path.basename(worktree));
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(worktree, { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(worktree, ".git")}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    await fs.writeFile(path.join(worktree, ".git"), `gitdir: ${meta}\n`);
+  }
+}
+
+const agentWorktreeOfRow = (row: SessionInfo | undefined) =>
+  (row?._meta as any)?.jetbrains?.air?.agentWorktree;
 
 /** The last `count` records of a transcript. */
 async function lastRecords(file: string, count = 2): Promise<unknown[]> {
@@ -217,6 +260,7 @@ describe("sessionIndex negotiation", () => {
     "sessionArchive",
     "sessionRename",
     "sessionListSubscribe",
+    "sessionWorktrees",
   ];
   const baseline = [
     "sessionFailure",
@@ -335,11 +379,11 @@ describe("session/list of a sessionIndex client", () => {
     const { agent } = await indexAgent();
     const page = await agent.listSessions({ cwd: workspace, _meta: listMeta({ limit: 5 }) });
     expect(page.sessions).toHaveLength(5);
-    expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(16);
+    const read = transcriptsRead(agent);
+    expect(read).toBeLessThanOrEqual(16);
     // A second list reads nothing again.
-    vi.mocked(getSessionInfo).mockClear();
     await agent.listSessions({ cwd: workspace, _meta: listMeta({ limit: 5 }) });
-    expect(getSessionInfo).not.toHaveBeenCalled();
+    expect(transcriptsRead(agent)).toBe(read);
   });
 
   it("lists unarchived sessions by default, archived ones only, or all in one order", async () => {
@@ -508,6 +552,116 @@ describe("session/list of a sessionIndex client", () => {
     await expect(
       agent.listSessions({ cwd: repo, cursor: first.nextCursor, _meta: listMeta({ limit: 1 }) }),
     ).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it("marks the rows of sessions in a worktree Claude Code made (agentWorktree)", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const entered = path.join(workspace, "entered");
+    const user = path.join(workspace, "user");
+    const left = path.join(workspace, "left");
+    await linkWorktrees(repo, made, entered, user, left);
+    const madeId = randomUUID();
+    const enteredId = randomUUID();
+    const leftId = randomUUID();
+    const mainId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      lastMessageAt: base,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inEntered = await writeTranscript({
+      sessionId: enteredId,
+      cwd: entered,
+      lastMessageAt: base - 1000,
+      trailer: [worktreeState(enteredId, { path: entered, enteredExisting: true })],
+    });
+    // A worktree the user made: no record.
+    const inUser = await writeTranscript({ cwd: user, lastMessageAt: base - 2000 });
+    // Left the worktree: the later null record wins.
+    const inLeft = await writeTranscript({
+      sessionId: leftId,
+      cwd: left,
+      lastMessageAt: base - 3000,
+      trailer: [worktreeState(leftId, { path: left }), worktreeState(leftId, null)],
+    });
+    // The main checkout, with a record that says otherwise: not in a linked
+    // worktree, so no field.
+    const inMain = await writeTranscript({
+      sessionId: mainId,
+      cwd: repo,
+      lastMessageAt: base - 4000,
+      trailer: [worktreeState(mainId, { path: made })],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, made, true],
+      [inEntered.id, entered, undefined],
+      [inUser.id, user, undefined],
+      [inLeft.id, left, undefined],
+      [inMain.id, repo, undefined],
+    ]);
+    // The field is omitted, not false.
+    for (const row of page.sessions.slice(1)) {
+      expect((row._meta as any)?.jetbrains?.air ?? {}).not.toHaveProperty("agentWorktree");
+    }
+    // The worktree's own list carries it too.
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, true],
+    ]);
+  });
+
+  it("marks a session that made its worktree mid-session, and not after a malformed record", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const other = path.join(workspace, "other");
+    await linkWorktrees(repo, made, other);
+    // Started in the main checkout, then EnterWorktree made a worktree: the
+    // CLI moved the transcript there, so the row's cwd is the worktree.
+    const movedId = randomUUID();
+    const moved = await writeTranscript({
+      sessionId: movedId,
+      cwd: repo,
+      dirName: encodeProjectPath(made),
+      lastMessageAt: base,
+      trailer: [
+        worktreeState(movedId, { path: made }),
+        { type: "relocated", sessionId: movedId, relocatedCwd: made },
+      ],
+    });
+    // The latest record has no worktreeSession object: it decides, so the
+    // older marked one does not count.
+    const malformedId = randomUUID();
+    const malformed = await writeTranscript({
+      sessionId: malformedId,
+      cwd: other,
+      lastMessageAt: base - 1000,
+      trailer: [
+        worktreeState(malformedId, { path: other }),
+        { type: "worktree-state", worktreeSession: "other", sessionId: malformedId },
+      ],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+      [malformed.id, other, undefined],
+    ]);
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+    ]);
   });
 
   it("recovers the cwd of a session whose head has none", async () => {
@@ -1402,6 +1556,39 @@ describe("_session/list/subscribe", () => {
     await agent.dispose();
   });
 
+  it("marks the change rows of sessions in a worktree Claude Code made", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const user = path.join(workspace, "user");
+    await linkWorktrees(repo, made, user);
+    // The worktrees' project directories exist before the subscription.
+    await writeTranscript({ cwd: made });
+    await writeTranscript({ cwd: user });
+    const { rowsOf, agent } = await subscribedAgent(repo);
+    const madeId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inUser = await writeTranscript({ cwd: user });
+    expect(await waitFor(() => rowsOf(inMade.id).length > 0 && rowsOf(inUser.id).length > 0)).toBe(
+      true,
+    );
+    expect(agentWorktreeOfRow(rowsOf(inMade.id).at(-1))).toBe(true);
+    expect(agentWorktreeOfRow(rowsOf(inUser.id).at(-1))).toBeUndefined();
+    // The session leaves the worktree: the row changes and loses the field.
+    await fs.appendFile(inMade.file, JSON.stringify(worktreeState(madeId, null)) + "\n");
+    expect(
+      await waitFor(
+        () =>
+          rowsOf(inMade.id).length > 1 &&
+          agentWorktreeOfRow(rowsOf(inMade.id).at(-1)) === undefined,
+      ),
+    ).toBe(true);
+    await agent.dispose();
+  });
+
   /** A subscription manager over a real index whose first read of rows is slow. */
   function slowFirstRows(
     delayMs: number,
@@ -1624,13 +1811,12 @@ describe("_session/list/subscribe", () => {
     // Past the events of these writes, which a new watch may still get.
     await new Promise((resolve) => setTimeout(resolve, 1000));
     const { subscriptions, sent, rowsRead, service } = slowFirstRows(0, { rescanMs: 300 });
-    vi.mocked(getSessionInfo).mockClear();
     await subscriptions.subscribe(workspace);
     // Past the rescan after the watchers opened, and a few periodic ones.
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(rowsRead).toEqual([]);
     expect(sent).toEqual([]);
-    expect(vi.mocked(getSessionInfo)).not.toHaveBeenCalled();
+    expect(service.index.transcriptsRead).toBe(0);
     const files = await service.index.enumerateFiles([workspace]);
     expect(files).toHaveLength(12);
     expect(files.filter((file) => service.index.isRead(file))).toEqual([]);
@@ -2567,12 +2753,11 @@ describe("cwd recovery in a directory without any cwd", () => {
       await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base - 3600_000 - i });
     }
     const { agent } = await indexAgent();
-    vi.mocked(getSessionInfo).mockClear();
     await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
-    expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(16 + 64);
-    vi.mocked(getSessionInfo).mockClear();
+    const read = transcriptsRead(agent);
+    expect(read).toBeLessThanOrEqual(16 + 64);
     await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
-    expect(getSessionInfo).not.toHaveBeenCalled();
+    expect(transcriptsRead(agent)).toBe(read);
   });
 });
 
@@ -2592,6 +2777,63 @@ describe("tail growth", () => {
     await fs.writeFile(file, `${big(id, at - 1000, 10)}\n${big(id, at, 2_000_000)}\n`);
     const { size } = await fs.stat(file);
     expect((await scanTranscriptFile(file, size)).lastMessageAt).toBe(at);
+  });
+
+  it("reads the worktree record of the tail, else of an earlier scan, else of the head", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    // `claude --worktree` writes the record at the start; 200 KB of
+    // messages push it out of the tail.
+    const messages = Array.from({ length: 20 }, (_, i) => big(id, at + i, 10_000)).join("\n");
+    const inHead = path.join(workspace, `${id}.jsonl`);
+    const headContent = `${record({ path: "/wt" })}\n${messages}\n`;
+    await fs.writeFile(inHead, headContent);
+    expect((await scanTranscriptFile(inHead, Buffer.byteLength(headContent))).agentWorktree).toBe(
+      true,
+    );
+    // A later record in the tail wins over the head.
+    const nullRecord = `${record(null)}\n`;
+    await fs.appendFile(inHead, nullRecord);
+    expect(
+      (await scanTranscriptFile(inHead, Buffer.byteLength(headContent + nullRecord))).agentWorktree,
+    ).toBe(false);
+    // The record an earlier scan found stands when the file grew within the
+    // tail and the new tail lost it, not the older one of the head.
+    const grown = path.join(workspace, `${randomUUID()}.jsonl`);
+    const before = `${record({ path: "/wt" })}\n${messages}\n${record(null)}\n${big(id, at + 50, 10_000)}\n`;
+    await fs.writeFile(grown, before);
+    const first = await scanTranscriptFile(grown, Buffer.byteLength(before));
+    expect(first.agentWorktree).toBe(false);
+    const appended = `${big(id, at + 100, 60_000)}\n`;
+    await fs.appendFile(grown, appended);
+    const second = await scanTranscriptFile(
+      grown,
+      Buffer.byteLength(before + appended),
+      undefined,
+      {
+        ...first,
+        size: Buffer.byteLength(before),
+      },
+    );
+    expect(second.agentWorktree).toBe(false);
+  });
+
+  it("takes the worktree record of a wider tail over the head's", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    const messages = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => big(id, at + from + i, 10_000)).join("\n");
+    // No prompt, so the tail grows; the null record lies beyond the 64 KB
+    // tail and the 64 KB head, within the 256 KB window.
+    const file = path.join(workspace, `${id}.jsonl`);
+    const content = `${record({ path: "/wt" })}\n${messages(0, 10)}\n${record(null)}\n${messages(100, 10)}\n`;
+    await fs.writeFile(file, content);
+    const facts = await scanTranscriptFile(file, Buffer.byteLength(content));
+    expect(facts.agentWorktree).toBe(false);
   });
 
   it("does not search a transcript of the same size again", async () => {
@@ -2676,14 +2918,6 @@ describe("list metadata of the listed copy", () => {
     const { agent } = await indexAgent();
     const page = await agent.listSessions({});
     expect(page.sessions.map((s) => s.title)).toEqual(["Listed copy"]);
-  });
-
-  it("keeps a row whose copy the SDK does not find", async () => {
-    const session = await writeTranscript({});
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
-    const { agent } = await indexAgent();
-    const page = await agent.listSessions({ cwd: workspace });
-    expect(page.sessions.map((s) => [s.sessionId, s.title])).toEqual([[session.id, "Fix it"]]);
   });
 });
 
@@ -2790,8 +3024,6 @@ describe("title of a listed copy that starts with a slash command", () => {
         .map((entry) => JSON.stringify(entry))
         .join("\n") + "\n",
     );
-    // The SDK does not find this copy: the title comes from the file.
-    vi.mocked(getSessionInfo).mockResolvedValueOnce(undefined);
     const { agent } = await indexAgent();
     const page = await agent.listSessions({ cwd: workspace });
     expect(page.sessions.map((s) => s.title)).toEqual([
@@ -3565,7 +3797,6 @@ describe("session index cost", () => {
     const base = Date.parse("2026-08-01T00:00:00Z");
     for (let i = 0; i < 120; i++) await writeTranscript({ lastMessageAt: base - i * 60_000 });
     const { agent } = await indexAgent();
-    vi.mocked(getSessionInfo).mockClear();
     let cursor: string | undefined;
     let rows = 0;
     do {
@@ -3579,7 +3810,7 @@ describe("session index cost", () => {
     } while (cursor);
     expect(rows).toBe(120);
     // Pages after a cursor skip the transcripts cached before it.
-    expect(vi.mocked(getSessionInfo).mock.calls.length).toBeLessThanOrEqual(120);
+    expect(transcriptsRead(agent)).toBeLessThanOrEqual(120);
   });
 
   it("reads only the changed transcript for a subscription", async () => {
@@ -3594,12 +3825,11 @@ describe("session index cost", () => {
     });
     await service.subscribeList(workspace);
     await settle();
-    vi.mocked(getSessionInfo).mockClear();
+    const read = service.index.transcriptsRead;
     await fs.appendFile(sessions[3]!.file, promptRecord(sessions[3]!.id, "Next") + "\n");
     expect(await waitFor(() => changes.length > 0)).toBe(true);
-    // At most the changed one (it may have been read already, for its
-    // creation just before subscribe).
-    for (const [id] of vi.mocked(getSessionInfo).mock.calls) expect(id).toBe(sessions[3]!.id);
+    // At most the changed one.
+    expect(service.index.transcriptsRead - read).toBeLessThanOrEqual(1);
     service.dispose();
   });
 });
@@ -4101,5 +4331,254 @@ describe("archive of a long session", () => {
     }
     await agent.archiveSession({ sessionId: session.id });
     expect(lastPromptAt(await list("archived"))).toBe(new Date(at - 1000).toISOString());
+  });
+});
+
+describe("list subscriptions after this connection's own title changes", () => {
+  it("push a rename, archive, unarchive and delete at once, without the watcher", async () => {
+    const session = await writeTranscript({ prompt: "Old title" });
+    const changes: ListChanges[] = [];
+    const service = new SessionIndexService({
+      notifyListChanges: async (change) => {
+        changes.push(change);
+      },
+      // The watcher's events and rescans would come only after the test.
+      listSubscriptionTiming: {
+        debounceMs: 60_000,
+        maxWaitMs: 60_000,
+        rescanMs: 60_000,
+        minSessionIntervalMs: 0,
+      },
+      logError: () => {},
+    });
+    await service.subscribeList(workspace);
+    // Past the rescan that follows the opening of the watchers.
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    changes.length = 0;
+    const last = () =>
+      changes.flatMap((change) => change.sessions.filter((s) => s.sessionId === session.id)).at(-1);
+    const soon = (check: () => boolean) => waitFor(check, 500);
+
+    await service.retitle(session.id, renameTo("New title"), { sidecar: "always" });
+    expect(await soon(() => last()?.title === "New title")).toBe(true);
+    await service.retitle(session.id, archiveTo(true), { sidecar: "existing" });
+    expect(await soon(() => airRow(last()!).archived === true)).toBe(true);
+    await service.retitle(session.id, archiveTo(false), { sidecar: "existing" });
+    expect(await soon(() => airRow(last()!).archived === false)).toBe(true);
+    expect(last()!.title).toBe("New title");
+    // A rename to the title it has changes nothing, and sends nothing.
+    const sent = changes.length;
+    await service.retitle(session.id, renameTo("New title"), { sidecar: "always" });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(changes).toHaveLength(sent);
+
+    await service.delete(session.id, false);
+    expect(await soon(() => changes.some((change) => change.removed.includes(session.id)))).toBe(
+      true,
+    );
+    service.dispose();
+  });
+
+  it("push a rename made by another process through the watcher", async () => {
+    const session = await writeTranscript({ prompt: "Old title" });
+    const changes: ListChanges[] = [];
+    const service = new SessionIndexService({
+      notifyListChanges: async (change) => {
+        changes.push(change);
+      },
+      logError: () => {},
+    });
+    await service.subscribeList(workspace);
+    await settle();
+    await fs.appendFile(
+      session.file,
+      titleRecords(session.id, "Renamed elsewhere")
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+    await writeCustomTitleSidecar(session.file, "Renamed elsewhere");
+    expect(
+      await waitFor(() =>
+        changes.some((change) =>
+          change.sessions.some(
+            (s) => s.sessionId === session.id && s.title === "Renamed elsewhere",
+          ),
+        ),
+      ),
+    ).toBe(true);
+    service.dispose();
+  });
+});
+
+describe("the pages of one list", () => {
+  const base = Date.parse("2026-07-01T00:00:00Z");
+  const projectDir = () => path.join(configDir, "projects", encodeProjectPath(workspace));
+
+  /** Transcripts one minute apart, newest first, in directories that
+   *  changed long enough ago for their listings to be kept. */
+  async function project(count: number) {
+    const sessions: { id: string; file: string }[] = [];
+    for (let i = 0; i < count; i++) {
+      sessions.push(await writeTranscript({ lastMessageAt: base - i * 60_000 }));
+    }
+    const past = (Date.now() - 60_000) / 1000;
+    await fs.utimes(projectDir(), past, past);
+    await fs.utimes(path.dirname(projectDir()), past, past);
+    return sessions;
+  }
+
+  async function drain(
+    agent: ClaudeAcpAgent,
+    limit: number,
+    between?: (page: number) => Promise<void>,
+  ) {
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await agent.listSessions({ cwd: workspace, cursor, _meta: listMeta({ limit }) });
+      pages.push(page.sessions.map((s) => s.sessionId));
+      cursor = page.nextCursor ?? undefined;
+      if (cursor) await between?.(pages.length);
+    } while (cursor);
+    return pages;
+  }
+
+  const enumerations = (agent: ClaudeAcpAgent) =>
+    vi.spyOn((agent as any).sessionIndex.service.index, "enumerate");
+
+  it("enumerates the transcripts once for all its pages", async () => {
+    const sessions = await project(45);
+    const { agent } = await indexAgent();
+    const enumerate = enumerations(agent);
+    const pages = await drain(agent, 10);
+    expect(pages.flat()).toEqual(sessions.map(({ id }) => id));
+    expect(enumerate).toHaveBeenCalledTimes(1);
+    // A new list enumerates again, and pages as before.
+    expect(await drain(agent, 10)).toEqual(pages);
+    expect(enumerate).toHaveBeenCalledTimes(2);
+  });
+
+  it("is as fresh after a cursor as a new enumeration", async () => {
+    const sessions = await project(30);
+    const { agent } = await indexAgent();
+    const enumerate = enumerations(agent);
+    const deleted = sessions[25]!;
+    const prompted = sessions[22]!;
+    const answered = sessions[28]!;
+    const pages = await drain(agent, 10, async (page) => {
+      if (page !== 1) return;
+      // Neither adds nor removes a transcript: the enumeration is reused.
+      await fs.truncate(deleted.file, 0);
+      await fs.appendFile(prompted.file, promptRecord(prompted.id, "Again") + "\n");
+      await fs.appendFile(answered.file, assistantRecord(answered.id, "end_turn") + "\n");
+    });
+    expect(enumerate).toHaveBeenCalledTimes(1);
+    const listed = pages.flat();
+    // Emptied: gone. Prompted: moved before the cursor, out of later pages.
+    expect(listed).not.toContain(deleted.id);
+    expect(listed).not.toContain(prompted.id);
+    // Answered without a prompt: in its place, with its new turn end.
+    expect(listed.indexOf(answered.id)).toBe(listed.indexOf(sessions[27]!.id) + 1);
+    const fresh = await agent.listSessions({ cwd: workspace, _meta: listMeta({ limit: 50 }) });
+    expect(fresh.sessions[0]!.sessionId).toBe(prompted.id);
+    expect(fresh.sessions.map((s) => s.sessionId).filter((id) => id !== prompted.id)).toEqual(
+      listed,
+    );
+  });
+
+  it("reads every copy of a session that a later page reaches", async () => {
+    const sessions = await project(30);
+    // A session with a copy among the second page and an older one in
+    // another project, which gets a new prompt after the first page.
+    const id = randomUUID();
+    await writeTranscript({ sessionId: id, lastMessageAt: base - 14.5 * 60_000 });
+    const older = await writeTranscript({
+      sessionId: id,
+      cwd: path.join(workspace, "other"),
+      lastMessageAt: base - 90 * 60_000,
+    });
+    const past = (Date.now() - 60_000) / 1000;
+    await fs.utimes(projectDir(), past, past);
+    await fs.utimes(path.dirname(older.file), past, past);
+    await fs.utimes(path.dirname(projectDir()), past, past);
+    const { agent } = await indexAgent();
+    const enumerate = enumerations(agent);
+    const pages: string[][] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await agent.listSessions({ cursor, _meta: listMeta({ limit: 10 }) });
+      pages.push(page.sessions.map((s) => s.sessionId));
+      cursor = page.nextCursor ?? undefined;
+      if (pages.length === 1) {
+        await fs.appendFile(older.file, promptRecord(id, "Resumed") + "\n");
+      }
+    } while (cursor);
+    expect(enumerate).toHaveBeenCalledTimes(1);
+    // Its newest copy now comes before the first page's cursor.
+    expect(pages.flat()).toEqual(sessions.map((session) => session.id));
+    const fresh = await agent.listSessions({ _meta: listMeta({ limit: 1 }) });
+    expect(fresh.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+      [id, path.join(workspace, "other")],
+    ]);
+  });
+
+  it("enumerates again once a transcript is added or removed", async () => {
+    const sessions = await project(30);
+    const { agent } = await indexAgent();
+    const enumerate = enumerations(agent);
+    let added: { id: string } | undefined;
+    const pages = await drain(agent, 10, async (page) => {
+      if (page === 1) {
+        // An older session copied in: listed in its place.
+        added = await writeTranscript({ lastMessageAt: base - 25.5 * 60_000 });
+      } else if (page === 2) {
+        await fs.rm(sessions[29]!.file);
+      }
+    });
+    expect(enumerate).toHaveBeenCalledTimes(3);
+    const listed = pages.flat();
+    expect(listed.indexOf(added!.id)).toBe(listed.indexOf(sessions[25]!.id) + 1);
+    expect(listed).not.toContain(sessions[29]!.id);
+    expect(listed).toHaveLength(30);
+  });
+});
+
+describe("titles by the SDK's rule", () => {
+  it("finds a custom title whose record starts before the tail window", async () => {
+    const id = randomUUID();
+    // Past the head window.
+    let filler = assistantRecord(id, null);
+    while (filler.length < 70_000) filler += "\n" + assistantRecord(id, null);
+    // The cut line of the last 64 KB, which the SDK still searches.
+    const title = JSON.stringify({
+      type: "custom-title",
+      padding: "p".repeat(10_000),
+      customTitle: "Across the boundary",
+      sessionId: id,
+    });
+    // About 60 KB after it: the window starts within its padding.
+    let tail = assistantRecord(id, null);
+    while (tail.length < 60_000) tail += "\n" + assistantRecord(id, null);
+    const session = await writeTranscript({
+      sessionId: id,
+      prompt: "First prompt",
+      trailer: [],
+    });
+    await fs.appendFile(session.file, `${filler}\n${title}\n${tail}\n`);
+    const bytes = await fs.readFile(session.file);
+    const window = bytes.length - 64 * 1024;
+    const start = bytes.indexOf(title);
+    expect(start).toBeLessThan(window);
+    expect(start + title.indexOf('"customTitle"')).toBeGreaterThan(window);
+    expect(start).toBeGreaterThan(64 * 1024);
+    const sdk = await vi
+      .importActual<typeof import("@anthropic-ai/claude-agent-sdk")>(
+        "@anthropic-ai/claude-agent-sdk",
+      )
+      .then((module) => module.getSessionInfo(id, { dir: workspace }));
+    expect(sdk!.summary).toBe("Across the boundary");
+    const { agent } = await indexAgent();
+    const page = await agent.listSessions({ cwd: workspace });
+    expect(page.sessions.map((s) => s.title)).toEqual(["Across the boundary"]);
   });
 });

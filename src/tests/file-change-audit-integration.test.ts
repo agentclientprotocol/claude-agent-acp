@@ -11,7 +11,13 @@ import {
 import type { Pushable } from "../utils.js";
 
 type Scenario =
-  "reported" | "providerError" | "localOnly" | "waitForCancel" | "waitForCheckpointCancel";
+  | "reported"
+  | "providerError"
+  | "localOnly"
+  | "waitForCancel"
+  | "waitForCheckpointCancel"
+  | "subagentEdit"
+  | "subagentEditError";
 let scenario: Scenario = "reported";
 let observedOptions: Options | undefined;
 let replayMessages: unknown[] = [];
@@ -47,7 +53,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
         }
         return Promise.resolve({
           canRewind: true,
-          filesChanged: ["src/changed.ts"],
+          filesChanged:
+            scenario === "subagentEdit" || scenario === "subagentEditError"
+              ? ["README.md"]
+              : ["src/changed.ts"],
           insertions: 4,
           deletions: 1,
         });
@@ -170,6 +179,48 @@ async function* runTurn(input: Pushable<SDKUserMessage>, interrupted: Promise<vo
       errors: ["Provider failed"],
     };
     return;
+  }
+
+  if (scenario === "subagentEdit" || scenario === "subagentEditError") {
+    const parentToolUseId = "toolu_agent_1";
+    const editToolUseId = "toolu_subagent_edit";
+    yield {
+      ...assistantMessage("Editing"),
+      parent_tool_use_id: parentToolUseId,
+      message: {
+        ...assistantMessage("Editing").message,
+        stop_reason: "tool_use",
+        content: [
+          {
+            type: "tool_use" as const,
+            id: editToolUseId,
+            name: "Edit",
+            input: {
+              file_path: path.join(process.cwd(), "GEMINI.md"),
+              old_string: "a",
+              new_string: "b",
+            },
+          },
+        ],
+      },
+    };
+    yield {
+      type: "user" as const,
+      parent_tool_use_id: parentToolUseId,
+      uuid: randomUUID(),
+      session_id: "sdk-session",
+      message: {
+        role: "user" as const,
+        content: [
+          {
+            type: "tool_result" as const,
+            tool_use_id: editToolUseId,
+            content: scenario === "subagentEditError" ? "Edit failed" : "Edited",
+            is_error: scenario === "subagentEditError",
+          },
+        ],
+      },
+    };
   }
 
   yield assistantMessage("Visible answer");
@@ -348,6 +399,48 @@ describe("native file-change report integration", () => {
     );
 
     resolveCheckpointPreview();
+    await agent.dispose();
+  });
+
+  /** A subagent's successful file-tool edit is added to the checkpoint paths. */
+  it("reports files that only a subagent edited alongside the checkpoint paths", async () => {
+    scenario = "subagentEdit";
+    const updates: SessionNotification[] = [];
+    const { agent, sessionId } = await createAgent(updates);
+
+    await agent.prompt(prompt(sessionId, "request-subagent", "Delegate an edit"));
+
+    expect(reports(updates)).toEqual([
+      {
+        version: 1,
+        requestId: "request-subagent",
+        status: "reported",
+        paths: [path.join(process.cwd(), "README.md"), path.join(process.cwd(), "GEMINI.md")],
+        declaredComplete: false,
+        truncated: false,
+      },
+    ]);
+    await agent.dispose();
+  });
+
+  /** A subagent edit whose tool result is an error did not change the file. */
+  it("does not report a subagent edit that failed", async () => {
+    scenario = "subagentEditError";
+    const updates: SessionNotification[] = [];
+    const { agent, sessionId } = await createAgent(updates);
+
+    await agent.prompt(prompt(sessionId, "request-subagent-error", "Delegate an edit"));
+
+    expect(reports(updates)).toEqual([
+      {
+        version: 1,
+        requestId: "request-subagent-error",
+        status: "reported",
+        paths: [path.join(process.cwd(), "README.md")],
+        declaredComplete: false,
+        truncated: false,
+      },
+    ]);
     await agent.dispose();
   });
 });

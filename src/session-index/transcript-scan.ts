@@ -51,15 +51,28 @@ export type TranscriptFacts = {
   /** The session this one was forked from: the `forkedFrom.sessionId` that
    *  the SDK and CLI fork write on every copied record. */
   forkedFrom?: string;
+  /** What the last `worktree-state` record says: true when its
+   *  `worktreeSession` is set and not `enteredExisting` (Claude Code made the
+   *  worktree and the session is in it), false when it says otherwise.
+   *  Undefined when no such record was read. See {@link agentWorktreeOf}. */
+  agentWorktree?: boolean;
   /** Whether the head or the tail holds a user or an assistant message. A
    *  transcript without one is a metadata-only stub. */
   hasMessages: boolean;
 };
 
-export type HeadTail = { head: string; tail: string };
+export type HeadTail = {
+  head: string;
+  /** The last 64 KB from their first whole line on; the whole file when it
+   *  fits in the head. */
+  tail: string;
+  /** The last 64 KB as the SDK searches them, with the cut line before
+   *  `tail`; absent when that is `tail`. */
+  sdkTail?: string;
+};
 
 /** Facts that an earlier scan may have found before the tail window. */
-const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt"] as const;
+const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "agentWorktree"] as const;
 
 /** What an earlier scan of the same file found, at `size`. */
 export type PreviousScan = { size: number } & Pick<
@@ -69,14 +82,18 @@ export type PreviousScan = { size: number } & Pick<
 
 /** The last `window` bytes of a file of `size` bytes, without the first,
  *  cut line. The whole file when it fits. */
-async function readTail(handle: fs.FileHandle, size: number, window: number): Promise<string> {
+async function readTail(
+  handle: fs.FileHandle,
+  size: number,
+  window: number,
+): Promise<{ raw: string; tail: string }> {
   const length = Math.min(window, size);
   const buffer = Buffer.allocUnsafe(length);
   const { bytesRead } = await handle.read(buffer, 0, length, size - length);
   const raw = buffer.toString("utf8", 0, bytesRead);
-  if (length === size) return raw;
+  if (length === size) return { raw, tail: raw };
   const newline = raw.indexOf("\n");
-  return newline >= 0 ? raw.slice(newline + 1) : "";
+  return { raw, tail: newline >= 0 ? raw.slice(newline + 1) : "" };
 }
 
 /** The first and the last 64 KB of the first `size` bytes of `filePath`:
@@ -98,7 +115,8 @@ export async function readHeadTailOf(handle: fs.FileHandle, size: number): Promi
   const first = await handle.read(buffer, 0, Math.min(CHUNK_SIZE, size), 0);
   const head = buffer.toString("utf8", 0, first.bytesRead);
   if (size <= CHUNK_SIZE) return { head, tail: head };
-  return { head, tail: await readTail(handle, size, CHUNK_SIZE) };
+  const { raw, tail } = await readTail(handle, size, CHUNK_SIZE);
+  return raw === tail ? { head, tail } : { head, tail, sdkTail: raw };
 }
 
 /**
@@ -138,6 +156,12 @@ export async function scanTranscriptFile(
         (facts as Record<string, unknown>)[key] = previous[key];
       }
     }
+  }
+  // No worktree record in the tail (or before it, by an earlier scan): the
+  // one `claude --worktree` writes at the start may still be in the head.
+  if (facts.agentWorktree === undefined) {
+    const agentWorktree = agentWorktreeOf(read.head);
+    if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
   }
   if (facts.lastPromptAt !== undefined || size <= CHUNK_SIZE) {
     facts.promptSearched = true;
@@ -186,6 +210,11 @@ export async function scanTranscriptFile(
         ...wider,
         ...(facts.model !== undefined && { model: facts.model }),
         ...(facts.tailCwd !== undefined && { tailCwd: facts.tailCwd }),
+        // The wider tail holds the narrow one, so a record it has is the
+        // latest; else the narrow scan's (inherited or from the head) stands.
+        ...((wider.agentWorktree ?? facts.agentWorktree) !== undefined && {
+          agentWorktree: wider.agentWorktree ?? facts.agentWorktree,
+        }),
         // A turn end the wider tail lacks may lie before it: the
         // narrow scan inherited it from an earlier scan of this file.
         lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
@@ -221,6 +250,43 @@ export function relocatedCwd(tail: string): string | undefined {
     if (entry?.type === "relocated" && typeof entry.relocatedCwd === "string") {
       return entry.relocatedCwd;
     }
+  }
+  return undefined;
+}
+
+const WORKTREE_STATE_MARKER = '"worktree-state"';
+
+/**
+ * Whether the last `worktree-state` record of `text` says the session is in
+ * a worktree that Claude Code made for it, as AIR's native Claude provider
+ * reads it: a `worktreeSession` that is an object without
+ * `enteredExisting: true`. The last line that parses as a `worktree-state`
+ * record decides; any other `worktreeSession` (`null`, which the CLI writes
+ * when the session leaves the worktree, missing, or no object) means false.
+ * Only lines that are not JSON (such as the cut first line of a window) are
+ * skipped. Undefined when `text` holds no such record.
+ *
+ * The CLI writes the record when it enters or leaves a worktree (for
+ * `claude --worktree`, at the start of the session, so in the head), and
+ * writes it again with the other session metadata at the end of the
+ * transcript (on exit and as the transcript grows), so the tail usually
+ * holds the latest one. Only the head and the tail are read: a session that
+ * entered a worktree midway through a long transcript, with no metadata
+ * written after it yet, is not seen until the CLI writes the metadata again.
+ */
+export function agentWorktreeOf(text: string): boolean | undefined {
+  if (!text.includes(WORKTREE_STATE_MARKER)) return undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    if (!line.includes(WORKTREE_STATE_MARKER)) continue;
+    const entry = parseLine(line);
+    // Only a line that is no JSON record is skipped: the latest record that
+    // parses decides, even when its `worktreeSession` is missing or no object.
+    if (entry?.type !== "worktree-state") continue;
+    const session = entry.worktreeSession;
+    if (!session || typeof session !== "object" || Array.isArray(session)) return false;
+    return (session as { enteredExisting?: unknown }).enteredExisting !== true;
   }
   return undefined;
 }
@@ -331,6 +397,10 @@ export function scanTranscript(
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
   const forkedFrom = FORKED_FROM_PATTERN.exec(head)?.[1];
   if (forkedFrom !== undefined) facts.forkedFrom = forkedFrom;
+  // The tail only: scanTranscriptFile falls back to the head after it
+  // inherits what an earlier scan found before the tail.
+  const agentWorktree = agentWorktreeOf(tail);
+  if (agentWorktree !== undefined) facts.agentWorktree = agentWorktree;
 
   const lines = tail.split("\n");
   let turnEndFound = false;
@@ -464,8 +534,8 @@ export function isSidechainTranscript(head: string): boolean {
 }
 
 /** The last `customTitle` of the tail, as the SDK reads it. */
-export function tailCustomTitle(tail: string): string | undefined {
-  return lastField(tail, "customTitle");
+export function tailCustomTitle({ tail, sdkTail }: HeadTail): string | undefined {
+  return lastField(sdkTail ?? tail, "customTitle");
 }
 
 /** The last non-blank top-level `agentName` of the records of `text`, the
@@ -500,11 +570,15 @@ export type SdkTitles = {
 /**
  * The titles the SDK gives a transcript, from its own head and tail, in the
  * SDK's order: custom title (tail, the sidecar, head), AI title, then
- * {@link generatedTitle}. For a transcript that the SDK `getSessionInfo`
- * does not read (another copy of the session comes first in its search).
- * The sidecar title counts only when the tail has no custom title.
+ * {@link generatedTitle}: what the SDK `getSessionInfo` reports for this
+ * file, without its lookup of the file. The sidecar title counts only when
+ * the tail has no custom title.
  */
-export function sdkTitles({ head, tail }: HeadTail, sidecarTitle?: string): SdkTitles {
+export function sdkTitles(
+  { head, tail: wholeLines, sdkTail }: HeadTail,
+  sidecarTitle?: string,
+): SdkTitles {
+  const tail = sdkTail ?? wholeLines;
   const customTitle =
     lastField(tail, "customTitle") ??
     sidecarTitle ??

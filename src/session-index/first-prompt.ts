@@ -1,7 +1,8 @@
 /**
  * The first prompt of a transcript, extracted the way the SDK does for a
  * session title (its `rf`, `ti` and `jP` in `@anthropic-ai/claude-agent-sdk`).
- * Used when the SDK `getSessionInfo` read another copy of the session.
+ * Part of the SDK's title rule that the session index applies itself (see
+ * `sdkTitles`).
  *
  * - Only main-chain user records count: no tool result, meta or compact
  *   summary record.

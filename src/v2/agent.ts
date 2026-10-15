@@ -19,9 +19,9 @@ import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v1InitializeRequest, v2InitializeResponse } from "./initialize.js";
 import { v1PermissionResponse, v2PermissionRequest } from "./permission.js";
-import { v2Prompt } from "./prompt.js";
+import { v2Foreground, v2Prompt } from "./prompt.js";
 import {
-  v1ForkSessionRequests,
+  v1ForkSessionRequest,
   v1NewSessionRequest,
   v1RestoreSessionRequest,
   v1SetSessionConfigOptionRequest,
@@ -30,8 +30,9 @@ import {
   v2NewSessionResponse,
   v2ResumeSessionResponse,
 } from "./session.js";
-import { v2SessionUpdate } from "./session-update.js";
+import { v2ChildStateUpdate, v2SessionUpdate } from "./session-update.js";
 import { V2Terminals } from "./terminal.js";
+import { V2ToolCallMeta } from "./tool-call-meta.js";
 
 /**
  * The ACP v2 surface, for one connection.
@@ -52,7 +53,13 @@ export function v2AgentApp(
     .agent({ name: "claude-code-acp" })
     .onConnect((connection) => {
       client = new V2ClientConnection(connection.client, logger ?? console);
-      agent = new ClaudeAcpAgent(client, logger, { v2: true });
+      agent = new ClaudeAcpAgent(client, logger, {
+        v2: true,
+        foreground: (sessionId) =>
+          v2Foreground((update) => {
+            void client.send({ sessionId, update });
+          }),
+      });
       onAgent(agent);
     })
     .onRequest(v2.methods.agent.initialize, async ({ params }) =>
@@ -87,17 +94,18 @@ export function v2AgentApp(
       };
     })
     .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
-      const requests = v1ForkSessionRequests(params);
-      const { sessionId } = await agent.unstable_forkSession(requests.fork);
+      // The agent starts the forked session, so the client can prompt it.
+      const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
       return {
-        sessionId,
-        ...v2ResumeSessionResponse(await agent.resumeSession(requests.resume(sessionId))),
-        ...(await setupCommands(agent, sessionId, logger)),
+        sessionId: response.sessionId,
+        ...v2ResumeSessionResponse(response),
+        ...(await setupCommands(agent, response.sessionId, logger)),
       };
     })
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
       client.terminals.forget(params.sessionId);
+      client.toolCallMeta.forget(params.sessionId);
       return response;
     })
     .onRequest(v2.methods.agent.session.delete, ({ params }) => agent.deleteSession(params))
@@ -144,12 +152,19 @@ async function setupCommands(
 class V2ClientConnection implements AcpClient {
   /**
    * The sessions whose history replays, each with the messages that the
-   * replay has cleared so far.
+   * replay has cleared so far. A subagent that a replay announces replays
+   * with it.
    */
   private readonly replays = new Map<string, Set<string>>();
 
+  /** The session whose replay announced each replaying subagent. */
+  private readonly replayRoots = new Map<string, string>();
+
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
+
+  /** The `_meta` that the client stores for each tool call. */
+  readonly toolCallMeta = new V2ToolCallMeta();
 
   constructor(
     private readonly ctx: v2.AgentContext,
@@ -170,6 +185,11 @@ class V2ClientConnection implements AcpClient {
       return await restore();
     } finally {
       this.replays.delete(sessionId);
+      for (const [child, root] of this.replayRoots) {
+        if (root !== sessionId) continue;
+        this.replays.delete(child);
+        this.replayRoots.delete(child);
+      }
     }
   }
 
@@ -196,22 +216,40 @@ class V2ClientConnection implements AcpClient {
   }
 
   async sessionUpdate({ update, ...notification }: AcpSessionNotification): Promise<void> {
+    // A subagent that a replay announces replays too, so its messages are
+    // cleared before their first replayed chunk, as the parent's are.
+    if (
+      update.sessionUpdate === "subagent_update" &&
+      this.replays.has(notification.sessionId) &&
+      !this.replays.has(update.sessionId)
+    ) {
+      this.replays.set(update.sessionId, new Set());
+      this.replayRoots.set(
+        update.sessionId,
+        this.replayRoots.get(notification.sessionId) ?? notification.sessionId,
+      );
+    }
     const updates = this.v2Updates(notification.sessionId, update).flatMap((v2Update) => {
       const clear = this.replayClear(notification.sessionId, v2Update);
       return clear ? [clear, v2Update] : [v2Update];
     });
+    // A subagent's work state also goes to the child's own stream, after the
+    // parent's copy.
+    const childState = v2ChildStateUpdate(update);
     // Every update goes to the connection before any is awaited, so an update
     // that another call sends meanwhile cannot come between them.
-    await Promise.all(
-      updates.map((v2Update) =>
+    await Promise.all([
+      ...updates.map((v2Update) =>
         this.ctx.notify(v2.methods.client.session.update, { ...notification, update: v2Update }),
       ),
-    );
+      ...(childState ? [this.ctx.notify(v2.methods.client.session.update, childState)] : []),
+    ]);
   }
 
   /**
    * The v2 updates of a v1 update: for a tool call report, the updates of its
-   * terminal first, then the report itself (see {@link V2Terminals}).
+   * terminal first (see {@link V2Terminals}), then the report itself, with the
+   * `_meta` that the client stores (see {@link V2ToolCallMeta}).
    */
   private v2Updates(
     sessionId: string,
@@ -222,7 +260,9 @@ class V2ClientConnection implements AcpClient {
       return v2Update ? [v2Update] : [];
     }
     const { terminal, report } = this.terminals.split(sessionId, update);
-    const reportUpdate = report && v2SessionUpdate(report);
+    if (!report) return terminal;
+    const starts = report.sessionUpdate === "tool_call";
+    const reportUpdate = v2SessionUpdate(this.toolCallMeta.apply(sessionId, report, starts));
     return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
   }
 
@@ -246,9 +286,11 @@ class V2ClientConnection implements AcpClient {
     params: AcpPermissionRequest,
     signal?: AbortSignal,
   ): Promise<RequestPermissionResponse> {
+    // The subject is an update of the tool call, with its stored `_meta`.
+    const toolCall = this.toolCallMeta.subject(params.sessionId, params.toolCall);
     const response = await this.ctx.request(
       v2.methods.client.session.requestPermission,
-      v2PermissionRequest(params),
+      v2PermissionRequest({ ...params, toolCall }),
       { cancellationSignal: signal },
     );
     return v1PermissionResponse(response);

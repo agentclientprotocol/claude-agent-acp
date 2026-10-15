@@ -16,7 +16,6 @@ import {
   type ListSessionsRequest,
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk";
-import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {
@@ -24,6 +23,7 @@ import {
   AIR_SESSION_INDEX_CAPABILITY,
   AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
   AIR_SESSION_RENAME_CAPABILITY,
+  AIR_SESSION_WORKTREES_CAPABILITY,
   clientSupportsAirCapability,
   withAirMeta,
 } from "../air-extension.js";
@@ -41,6 +41,7 @@ import {
 } from "./list-subscriptions.js";
 import {
   archiveInsteadOfDelete,
+  deleteSessionIfStored,
   archiveTo,
   renameTo,
   parseRenameSessionRequest,
@@ -143,8 +144,8 @@ export class SessionIndexConnection {
   }
 
   /** The AIR capabilities the agent advertises for the index: the index
-   *  itself, archive, rename and the list subscription, all only to a client
-   *  that declared `sessionIndex`. */
+   *  itself, archive, rename, the list subscription and the `agentWorktree`
+   *  row field, all only to a client that declared `sessionIndex`. */
   capabilities(): string[] {
     return this.service
       ? [
@@ -152,6 +153,7 @@ export class SessionIndexConnection {
           AIR_SESSION_ARCHIVE_CAPABILITY,
           AIR_SESSION_RENAME_CAPABILITY,
           AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
+          AIR_SESSION_WORKTREES_CAPABILITY,
         ]
       : [];
   }
@@ -336,7 +338,8 @@ export class SessionIndexConnection {
    * - Another AIR client uses delete to mark a session done, and may reopen
    *   it later: the adapter archives it instead (as `_session/archive` does,
    *   after the CLI closed), so the transcript survives.
-   * - Every other client: the SDK delete, as before.
+   * - Every other client: the SDK delete. A session without a transcript
+   *   succeeds (see {@link deleteSessionIfStored}).
    */
   async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
     const loaded = this.host.agent.sessions[params.sessionId] !== undefined;
@@ -350,19 +353,7 @@ export class SessionIndexConnection {
     } else if (this.host.isAirClient()) {
       await archiveInsteadOfDelete(params.sessionId, this.airArchiver());
     } else {
-      try {
-        await sdkDeleteSession(params.sessionId);
-      } catch (error) {
-        // Missing transcripts are already deleted; unrelated SDK failures must propagate.
-        const message = error instanceof Error ? error.message : String(error);
-        if (
-          message !== `Invalid sessionId: ${params.sessionId}` &&
-          message !== `Session ${params.sessionId} not found in any project directory` &&
-          !message.startsWith(`Session ${params.sessionId} not found in project directory for `)
-        ) {
-          throw error;
-        }
-      }
+      await deleteSessionIfStored(params.sessionId);
     }
     return {};
   }

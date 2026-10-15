@@ -42,3 +42,33 @@ export function backgroundedBashToolCall(
     },
   };
 }
+
+/**
+ * Keeps the display terminal of a command that went to the background running:
+ * drops `terminal_exit` from the tool result update of `toolCallId`.
+ *
+ * The Bash call returns as soon as the command detaches, so that exit would
+ * mark the terminal as ended while the command still runs. The consumer sends
+ * the exit when the command's task ends (see `Session.backgroundTerminals`).
+ */
+export function withRunningTerminal(
+  notification: SessionNotification,
+  toolCallId: string | undefined,
+): SessionNotification {
+  const update = notification.update;
+  if (
+    toolCallId === undefined ||
+    update.sessionUpdate !== "tool_call_update" ||
+    update.toolCallId !== toolCallId ||
+    !update._meta ||
+    !("terminal_exit" in update._meta)
+  ) {
+    return notification;
+  }
+  const meta = { ...update._meta };
+  delete meta.terminal_exit;
+  const next: typeof update = { ...update, _meta: meta };
+  // An empty `_meta` would clear what a v2 client stores for the tool call.
+  if (Object.keys(meta).length === 0) delete next._meta;
+  return { ...notification, update: next };
+}

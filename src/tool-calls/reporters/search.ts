@@ -26,8 +26,9 @@ export class GrepReporter implements ToolReporter {
     if (grep?.["-A"] !== undefined) label += ` -A ${grep["-A"]}`;
     if (grep?.["-B"] !== undefined) label += ` -B ${grep["-B"]}`;
     if (grep?.["-C"] !== undefined) label += ` -C ${grep["-C"]}`;
-    if (grep?.output_mode === "files_with_matches") label += " -l";
-    else if (grep?.output_mode === "count") label += " -c";
+    const outputMode = grepOutputMode(input);
+    if (outputMode === "files_with_matches") label += " -l";
+    else if (outputMode === "count") label += " -c";
     if (grep?.head_limit !== undefined) label += ` | head -${grep.head_limit}`;
     if (grep?.glob) label += ` --include="${grep.glob}"`;
     if (grep?.type) label += ` --type=${grep.type}`;
@@ -37,6 +38,20 @@ export class GrepReporter implements ToolReporter {
     if (path) label += ` ${path}`;
     return { title: label, kind: "search" };
   }
+}
+
+/**
+ * Reads a Grep input's output mode the way the CLI validates it. Since CLI
+ * 2.1.295 the CLI reads a `-l` or `-c` flag (`true` or `"true"`) as
+ * `output_mode: "files_with_matches"` or `"count"` when `output_mode` is unset.
+ */
+function grepOutputMode(input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const raw = input as Record<string, unknown>;
+  if (typeof raw.output_mode === "string") return raw.output_mode;
+  if (raw["-l"] === true || raw["-l"] === "true") return "files_with_matches";
+  if (raw["-c"] === true || raw["-c"] === "true") return "count";
+  return undefined;
 }
 
 /**

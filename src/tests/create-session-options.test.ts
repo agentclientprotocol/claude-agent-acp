@@ -173,6 +173,18 @@ describe("createSession options merging", () => {
     });
   });
 
+  it("registers the PreToolUse hook of the change previews only on a v2 connection", async () => {
+    await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    // A v1 client gets the input's diff, so Claude Code waits on no hook.
+    expect(capturedOptions!.hooks?.PreToolUse).toBeUndefined();
+
+    const v2Agent = new ClaudeAcpAgent(createMockClient(), undefined, { v2: true });
+    await v2Agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    expect(capturedOptions!.hooks?.PreToolUse).toEqual([
+      { matcher: "Edit|Write", hooks: [expect.any(Function)] },
+    ]);
+  });
+
   it("merges user-provided disallowedTools with ACP internal list", async () => {
     await agent.newSession({
       cwd: process.cwd(),
@@ -311,6 +323,25 @@ describe("createSession options merging", () => {
     expect(capturedOptions?.env?.HOME).toBe("/custom/home");
   });
 
+  it("asks the SDK for a predicted follow-up prompt per turn", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(true);
+  });
+
+  it("lets a caller turn the predicted follow-up prompt off", async () => {
+    await agent.newSession({
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { claudeCode: { options: { promptSuggestions: false } } },
+    });
+
+    expect(capturedOptions!.promptSuggestions).toBe(false);
+  });
+
   it("defaults tools to claude_code preset when not provided", async () => {
     await agent.newSession({
       cwd: process.cwd(),
@@ -442,6 +473,85 @@ describe("createSession options merging", () => {
       });
 
       expect(capturedOptions!.forwardSubagentText).toBe(true);
+    });
+  });
+
+  describe("per-task stop affordance", () => {
+    function sessionFor(sessionId: string) {
+      return (agent as unknown as { sessions: Record<string, any> }).sessions[sessionId];
+    }
+
+    // Declared, Claude Code's interrupt spares background subagents, which a
+    // client on the subagents RFD form stops one at a time with its child's
+    // `cancel`. It spares background workflows too, which that client cannot
+    // stop, so the session's cancel stops them.
+    it("declares it for a client on the subagents RFD form", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(true);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(true);
+    });
+
+    it("stops workflows on a cancel only when declared and the client cannot stop them", async () => {
+      const { sessionId: plain } = await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(sessionFor(plain).stopsWorkflowsOnCancel).toBe(false);
+
+      // A caller's own declaration counts.
+      const { sessionId: declared } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(declared).stopsWorkflowsOnCancel).toBe(true);
+
+      // AIR stops a workflow itself, as an async task.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+        } as ClientCapabilities,
+      });
+      const { sessionId: air } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: true } } },
+      });
+      expect(sessionFor(air).stopsWorkflowsOnCancel).toBe(false);
+    });
+
+    it("does not declare it for a client that cannot cancel one subagent", async () => {
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+
+      // AIR's draft grants a child no `cancel`.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          subagents: {},
+          _meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
+        } as ClientCapabilities,
+      });
+      await agent.newSession({ cwd: process.cwd(), mcpServers: [] });
+      expect(capturedOptions!.perTaskStopAffordance).toBeUndefined();
+    });
+
+    it("lets a caller's perTaskStopAffordance win", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const { sessionId } = await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { perTaskStopAffordance: false } } },
+      });
+
+      expect(capturedOptions!.perTaskStopAffordance).toBe(false);
+      expect(sessionFor(sessionId).stopsWorkflowsOnCancel).toBe(false);
     });
   });
 
@@ -644,9 +754,71 @@ describe("createSession options merging", () => {
       expect(capturedOptions!.settings).toBeUndefined();
     });
 
-    it("ignores env var when _meta provides settings", async () => {
+    it("keeps model settings when session settings add hooks", async () => {
       process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
         modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+      });
+      const hooks = { PostToolUse: [{ hooks: [{ type: "command", command: "echo ready" }] }] };
+
+      await agent.newSession({
+        cwd: process.cwd(),
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.settings).toEqual({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
+        hooks,
+      });
+      // The CLI adds these hooks to the ones in the user and project settings.
+      expect(capturedOptions!.settingSources).toEqual(["user", "project", "local"]);
+    });
+
+    it("applies session hooks on session/load with model settings", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const cwd = process.cwd();
+      const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+      const hooks = { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] };
+
+      await agent.loadSession({
+        sessionId,
+        cwd,
+        mcpServers: [],
+        _meta: { claudeCode: { options: { settings: { hooks } } } },
+      });
+
+      expect(capturedOptions!.resume).toBe(sessionId);
+      expect(capturedOptions!.settings).toEqual({ availableModels: ["opus"], hooks });
+    });
+
+    it("merges model settings with a session settings file", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: ["opus"] });
+      const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-acp-settings-"));
+      const settingsFile = path.join(settingsDir, "settings.json");
+      fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [] } }));
+
+      try {
+        await agent.newSession({
+          cwd: process.cwd(),
+          mcpServers: [],
+          _meta: { claudeCode: { options: { settings: settingsFile } } },
+        });
+
+        expect(capturedOptions!.settings).toEqual({
+          availableModels: ["opus"],
+          hooks: { Stop: [] },
+        });
+      } finally {
+        fs.rmSync(settingsDir, { recursive: true });
+      }
+    });
+
+    it("prefers session settings when both sources set the same field", async () => {
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({
+        modelOverrides: { "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1" },
+        availableModels: ["opus"],
       });
 
       await agent.newSession({
@@ -664,10 +836,10 @@ describe("createSession options merging", () => {
         },
       });
 
-      // _meta settings take precedence; env var is ignored entirely
       expect(capturedOptions!.settings).toEqual({
         model: "claude-sonnet-4-6",
         modelOverrides: { "claude-opus-4-6": "meta-value" },
+        availableModels: ["opus"],
       });
     });
 

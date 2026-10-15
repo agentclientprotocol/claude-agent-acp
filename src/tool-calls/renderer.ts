@@ -8,6 +8,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import {
   AIR_COMMAND_TITLE_KEY,
+  AIR_MCP_KEY,
   AIR_SKILL_KEY,
   AIR_SUBAGENT_KEY,
   withAirMeta,
@@ -19,6 +20,7 @@ import { resultText, textContent, toAcpContentUpdate, toolResponseMarkers } from
 import type { ToolResultContext, ToolResultFacts, ToolUse, ToolUseFacts } from "./facts.js";
 import { reporterFor } from "./reporters/index.js";
 import { resolveSkillPath } from "./reporters/interaction.js";
+import { shellDescription } from "./reporters/bash.js";
 import { grepPath } from "./reporters/search.js";
 
 export type ToolCallUpdate = SessionNotification["update"];
@@ -44,11 +46,13 @@ export type ToolUpdateMeta = {
   claudeCode?: {
     /* The name of the tool that was used in Claude Code. Also carried as the
        standard ACP `name` field on the initial `tool_call`. A progress beat
-       for AIR leaves it out when the adapter does not know the tool. */
+       for AIR leaves it out when the adapter does not know the tool. A v2
+       client gets it as `name` alone (see `V2ToolCallMeta`). */
     toolName?: string;
-    /* The structured output provided by Claude Code. For an AIR client, a
-       PostToolUse update carries only the `status` and `isAsync` markers of
-       the tool_response: the tool output itself is in the tool-call content. */
+    /* The structured output provided by Claude Code. For an AIR or a v2
+       client, a PostToolUse update carries only the `status` and `isAsync`
+       markers of the tool_response: the tool output itself is in the
+       tool-call content. */
     toolResponse?: unknown;
     /* For a tool call made inside a subagent: the tool_use id of the
        Agent/Task call that spawned the subagent. Mirrors the SDK's
@@ -79,6 +83,9 @@ export type ToolUpdateMeta = {
       /* For Skill tool calls: the skill name, and the absolute path of its
          SKILL.md when it could be located on disk. */
       skill?: { name: string; path?: string };
+      /* For MCP tool calls: the normalized server name and the tool name, so
+         a client need not parse the `mcp__<server>__<tool>` title. */
+      mcp?: { server: string; tool: string };
       [key: string]: unknown;
     };
   };
@@ -151,14 +158,48 @@ export class AcpToolCallRenderer {
   }
 
   /**
-   * The status of a tool result. `nonExecution` is why Claude Code stamped an
-   * error result instead of the tool's output. A run that was aborted is
-   * `cancelled` for a v2 client, which has that status; every other client
-   * gets `failed`, with the kind in `_meta.claudeCode.nonExecutionKind`.
+   * Whether the client keeps a tool call's `_meta` across reports: AIR merges
+   * its keys, and v2 stores it. Such a client gets no `toolResponse` text that
+   * the tool call's content already shows, which it would otherwise keep.
    */
-  resultStatus(isError: boolean, nonExecution: ToolResultMeta | undefined): ToolCallStatus {
-    if (!isError) return "completed";
-    return this.capabilities.v2 && isAbortedToolResult(nonExecution) ? V2_CANCELLED : "failed";
+  private get keepsMeta(): boolean {
+    return this.capabilities.air.client || this.capabilities.v2;
+  }
+
+  /**
+   * Whether a tool call with these facts gets a display terminal: a command, for a client
+   * that renders terminals.
+   */
+  private hasTerminal(facts: ToolUseFacts): boolean {
+    return facts.command === true && this.capabilities.terminalOutput;
+  }
+
+  /**
+   * The status of a tool result. Claude Code reports a run that it aborted in
+   * one of three ways:
+   * - an error result whose `nonExecution` kind says so (`interrupted`,
+   *   `cancelled`);
+   * - a command result that says `interrupted` (for example, a steering
+   *   message landed just before the command started);
+   * - any error result of the work that a `session/cancel` stopped
+   *   (`run.cancelled`). The kind does not say so there: CLI 2.1.293 stamps a
+   *   command that the interrupt killed `user-rejected`, as if the user had
+   *   refused it.
+   *
+   * Such a run is `cancelled` for a v2 client, which has that status. Every
+   * other client gets `failed` for the error, with the kind in
+   * `_meta.claudeCode.nonExecutionKind`, and `completed` for the command.
+   */
+  resultStatus(
+    isError: boolean,
+    nonExecution: ToolResultMeta | undefined,
+    run: { interrupted?: boolean; cancelled?: boolean } = {},
+  ): ToolCallStatus {
+    const aborted =
+      run.interrupted === true ||
+      (isError && (run.cancelled === true || isAbortedToolResult(nonExecution)));
+    if (this.capabilities.v2 && aborted) return V2_CANCELLED;
+    return isError ? "failed" : "completed";
   }
 
   /** The facts of a tool use. */
@@ -202,9 +243,7 @@ export class AcpToolCallRenderer {
     return {
       _meta: {
         ...this.toolUseMeta(toolUse, options.cwd),
-        ...(facts.command && this.capabilities.terminalOutput
-          ? { terminal_info: { terminal_id: toolUse.id } }
-          : {}),
+        ...(this.hasTerminal(facts) ? { terminal_info: { terminal_id: toolUse.id } } : {}),
         // Only AIR gets the MCP flag. The upstream adapter does not send it.
         ...(isMcp && this.capabilities.air.client ? { is_mcp_tool_call: true } : {}),
       } satisfies ToolUpdateMeta,
@@ -332,7 +371,14 @@ export class AcpToolCallRenderer {
 
   /** The result fields of a tool result, before the status and the tool name. */
   resultFields(toolUse: ToolUse, result: ResultBlock, structured?: unknown): RenderedResult {
-    const facts = this.resultFacts(toolUse, result, structured);
+    return this.fieldsOfResult(toolUse, result, this.resultFacts(toolUse, result, structured));
+  }
+
+  private fieldsOfResult(
+    toolUse: ToolUse,
+    result: ResultBlock,
+    facts: ToolResultFacts,
+  ): RenderedResult {
     const { command, ...fields } = facts;
     if (!command) return fields;
     // The terminal was announced under the tool_use id (see `toolCall`), so the
@@ -395,9 +441,10 @@ export class AcpToolCallRenderer {
   result(
     toolUse: ToolUse,
     result: ResultBlock,
-    options: { structured?: unknown; nonExecution?: ToolResultMeta } = {},
+    options: { structured?: unknown; nonExecution?: ToolResultMeta; cancelled?: boolean } = {},
   ): ToolCallUpdate[] {
-    const { _meta: resultMeta, ...fields } = this.resultFields(toolUse, result, options.structured);
+    const facts = this.resultFacts(toolUse, result, options.structured);
+    const { _meta: resultMeta, ...fields } = this.fieldsOfResult(toolUse, result, facts);
     // AIR shows a read or a search that names a path as the list of viewed
     // files. That view does not show the text of the result, so it stays out.
     const viewedFiles =
@@ -445,7 +492,10 @@ export class AcpToolCallRenderer {
       } satisfies ToolUpdateMeta,
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
-      status: this.resultStatus(result.is_error === true, options.nonExecution),
+      status: this.resultStatus(result.is_error === true, options.nonExecution, {
+        interrupted: facts.command?.interrupted === true,
+        cancelled: options.cancelled,
+      }),
       ...(rawOutput !== undefined ? { rawOutput } : {}),
       ...(planFilePath ? { rawInput: planFileInput(toolUse.input, planFilePath) } : {}),
       ...fields,
@@ -486,7 +536,8 @@ export class AcpToolCallRenderer {
   /**
    * The report of a PostToolUse hook: the final change of an edit tool, and
    * the `status` and `isAsync` markers of the `tool_response`. The rest of the
-   * `tool_response` repeats output that the content already carries.
+   * `tool_response` repeats output that the content already carries, such as
+   * the whole text of a written file.
    */
   async hookResult(
     toolUse: Pick<ToolUse, "id" | "name">,
@@ -497,7 +548,7 @@ export class AcpToolCallRenderer {
     const change = reporter.hookResult
       ? await reporter.hookResult(toolResponse, { cwd, capabilities: this.capabilities })
       : {};
-    if (!this.capabilities.air.client) {
+    if (!this.keepsMeta) {
       // The upstream shape: the whole tool_response, on every hook.
       return {
         _meta: { claudeCode: { toolResponse, toolName: toolUse.name } } satisfies ToolUpdateMeta,
@@ -567,9 +618,10 @@ export class AcpToolCallRenderer {
     message?: string;
   }): ToolCallUpdate {
     const reason = denial.decisionReason ?? denial.message;
-    // AIR gets the SDK message only when it differs from the reason, which
-    // the content shows. Every other client gets the upstream toolResponse.
-    const extraMessage = !this.capabilities.air.client
+    // AIR and v2 get the SDK message only when it differs from the reason,
+    // which the content shows. Every other client gets the upstream
+    // toolResponse.
+    const extraMessage = !this.keepsMeta
       ? { decisionReason: denial.decisionReason, message: denial.message }
       : denial.decisionReason !== undefined &&
           denial.message !== undefined &&
@@ -588,6 +640,52 @@ export class AcpToolCallRenderer {
           toolResponse: { decisionReasonType: denial.decisionReasonType, ...extraMessage },
         },
       } satisfies ToolUpdateMeta,
+    };
+  }
+
+  /**
+   * The report that closes a tool call when the turn ends without its result.
+   * If Claude dropped it before it ran (`ran` is false: its tool_use never
+   * reached a complete assistant message, for example because Claude switched
+   * to a steering message), a v2 client gets `cancelled` and every other
+   * client `failed`, since v1 has no `cancelled`. If Claude Code ran it but
+   * returned no result, it failed, unless a `session/cancel` ended the turn
+   * (`cancelled`): the cancel stopped the run, so a v2 client gets `cancelled`
+   * for it too. The report does not end the call's terminal: see {@link terminalExit}.
+   */
+  unfinished(call: { toolCallId: string; ran: boolean; cancelled?: boolean }): ToolCallUpdate {
+    const stopped = !call.ran || call.cancelled === true;
+    return {
+      sessionUpdate: "tool_call_update",
+      toolCallId: call.toolCallId,
+      status: stopped && this.capabilities.v2 ? V2_CANCELLED : "failed",
+      content: [
+        textContent(
+          !call.ran
+            ? "Claude stopped this tool call before it ran."
+            : call.cancelled
+              ? "The turn was cancelled before this tool call returned a result."
+              : "Claude ended the turn without returning a result for this tool.",
+        ),
+      ],
+    };
+  }
+
+  /**
+   * The `_meta` that ends the display terminal of a command whose tool call gets no result, to
+   * add to the report from {@link unfinished}. Undefined when the tool call has no terminal
+   * (see {@link toolCall}). The exit code is unknown, since the command ended without a result:
+   * null, or 1 for AIR, which always gets a number and reads 1 for a command that did not
+   * succeed.
+   */
+  terminalExit(toolUse: ToolUse): Pick<ToolUpdateMeta, "terminal_exit"> | undefined {
+    if (!this.hasTerminal(this.facts(toolUse))) return undefined;
+    return {
+      terminal_exit: {
+        terminal_id: toolUse.id,
+        exit_code: this.capabilities.air.client ? 1 : null,
+        signal: null,
+      },
     };
   }
 
@@ -650,7 +748,7 @@ export class AcpToolCallRenderer {
    * does not render `rawInput` itself, and never next to a terminal.
    */
   toolUseContent(toolCallId: string, facts: ToolUseFacts): ToolCallContent[] {
-    const terminal = facts.command === true && this.capabilities.terminalOutput;
+    const terminal = this.hasTerminal(facts);
     return [
       ...(terminal ? [{ type: "terminal" as const, terminalId: toolCallId }] : []),
       ...(facts.change ?? []),
@@ -670,9 +768,8 @@ export class AcpToolCallRenderer {
         ? (toolUse.input as Record<string, unknown>)
         : {};
     const description =
-      (toolUse.name === "Bash" || toolUse.name === "PowerShell") &&
-      typeof input.description === "string"
-        ? input.description
+      toolUse.name === "Bash" || toolUse.name === "PowerShell"
+        ? shellDescription(input)
         : undefined;
     const skillName =
       toolUse.name === "Skill" && typeof input.skill === "string" ? input.skill : undefined;
@@ -688,8 +785,26 @@ export class AcpToolCallRenderer {
         ...(skillPath ? { path: skillPath } : {}),
       });
     }
+    const mcp = mcpToolName(toolUse.name);
+    if (mcp) meta = withAirMeta(meta, AIR_MCP_KEY, mcp);
     return meta as ToolUpdateMeta;
   }
+}
+
+/**
+ * Splits `mcp__<server>__<tool>` the way Claude Code does: the server is the
+ * segment up to the next `__`, the tool is the whole rest. `server` is the
+ * normalized name, not the config key.
+ */
+export function mcpToolName(name: string): { server: string; tool: string } | undefined {
+  const prefix = "mcp__";
+  if (!name.startsWith(prefix)) return undefined;
+  const rest = name.slice(prefix.length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0) return undefined;
+  const tool = rest.slice(separator + 2);
+  if (!tool) return undefined;
+  return { server: rest.slice(0, separator), tool };
 }
 
 /** The input with the path of the plan file in place of the plan text. */
