@@ -240,6 +240,7 @@ import {
   type FileChangeReportTurnState,
   type FileChangeReportUnavailableReason,
   type NativeFileChangeReporter,
+  recordSubagentFileEdits,
   supportsAgentFileChangeReport,
 } from "./file-change-audit.js";
 import {
@@ -733,6 +734,9 @@ type Turn = {
    *  turn. The state is turn-owned so a late control response can never be
    *  rebound to a newer prompt. */
   fileChangeReport?: FileChangeReportTurnState;
+  /** Files that subagents of this turn edited with a file tool, collected only
+   *  when a report was requested (see {@link recordSubagentFileEdits}). */
+  editedPaths?: Set<string>;
   /** Set once the deferred has been resolved/rejected, so the consumer never
    *  settles a turn twice (idle + handoff + stream-end can all race). */
   settled: boolean;
@@ -7770,6 +7774,12 @@ export class ClaudeAcpAgent {
             let runningTerminal: string | undefined;
             if (message.type === "user") {
               rememberResolvedToolNames(session, content);
+              recordSubagentFileEdits(
+                session.activeTurn,
+                message.parent_tool_use_id,
+                content,
+                session.toolUseCache,
+              );
               const backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
                 message.tool_use_result,
