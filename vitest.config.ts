@@ -14,6 +14,8 @@ export default defineConfig({
     // tests off the machine's real CLI and Claude config, and stops a run
     // from outliving its test (it wrote into temp config dirs being deleted).
     env: usesRealCli ? {} : { CLAUDE_CODE_EXECUTABLE: "/usr/bin/false" },
+    // Real-CLI runs may want a real gateway listing.
+    setupFiles: usesRealCli ? [] : ["src/tests/setup-no-network.ts"],
     include: [
       "src/**/*.{test,spec}.{js,mjs,cjs,ts,mts,cts,jsx,tsx}",
       // Release tooling lives in scripts/ rather than src/ so it stays outside tsc's

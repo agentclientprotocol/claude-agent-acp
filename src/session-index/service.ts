@@ -16,10 +16,7 @@ import {
   type ListSessionsRequest,
   type ListSessionsResponse,
 } from "@agentclientprotocol/sdk";
-import {
-  deleteSession as sdkDeleteSession,
-  getSessionInfo as sdkGetSessionInfo,
-} from "@anthropic-ai/claude-agent-sdk";
+import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
 import type { OwnSessionState } from "./activity.js";
@@ -34,6 +31,7 @@ import {
   ListSubscriptions,
   type ListChanges,
   type ListSubscribeResponse,
+  type ListSubscriptionDeps,
 } from "./list-subscriptions.js";
 import { LiveSessionRegistry } from "./live-registry.js";
 import {
@@ -59,7 +57,6 @@ import {
   readSidecarTitle,
   SessionIndex,
   type ArchivedFilter,
-  type GetSessionInfo,
   type ListCursor,
 } from "./session-index.js";
 import { sessionInfoOf } from "./session-info.js";
@@ -294,7 +291,7 @@ async function copyTitle(filePath: string, sessionId: string): Promise<string | 
   const { size } = await fs.stat(filePath);
   const headTail = await readHeadTail(filePath, size);
   const sidecar =
-    tailCustomTitle(headTail.tail) === undefined
+    tailCustomTitle(headTail) === undefined
       ? await readSidecarTitle(filePath, sessionId)
       : undefined;
   const { title, archived } = effectiveTitle(
@@ -387,6 +384,28 @@ function sdkDeleteError(sessionId: string): Error {
 }
 
 /**
+ * `session/delete` of a client that is neither AIR nor a `sessionIndex` client:
+ * the SDK delete of the session's transcript. A session without one succeeds,
+ * as ACP asks ("Deleting an already-deleted session, or a session that never
+ * existed, SHOULD succeed silently"): an id that is not a session id, a
+ * session deleted before, or a session this connection ran but never prompted,
+ * since Claude Code writes the transcript at the first prompt. Other failures
+ * still fail the request.
+ */
+export async function deleteSessionIfStored(
+  sessionId: string,
+  deleteSession: (sessionId: string) => Promise<void> = sdkDeleteSession,
+): Promise<void> {
+  if (!isSessionId(sessionId)) return;
+  try {
+    await deleteSession(sessionId);
+  } catch (error) {
+    if (isSdkNotFound(error)) return;
+    throw error;
+  }
+}
+
+/**
  * `session/delete` of an AIR client without `sessionIndex`, which uses delete
  * to mark a session done: archives it instead, so the transcript survives. A
  * session without a transcript fails as the SDK delete did.
@@ -426,7 +445,6 @@ export type RetitleOptions = {
 };
 
 export type SessionIndexDeps = {
-  getSessionInfo?: GetSessionInfo;
   deleteSession?: (sessionId: string) => Promise<void>;
   registry?: LiveSessionRegistry;
   now?: () => number;
@@ -434,6 +452,11 @@ export type SessionIndexDeps = {
   ownSessionState?: (sessionId: string) => OwnSessionState | undefined;
   /** Sends `_session/list/changes`. */
   notifyListChanges?: (changes: ListChanges) => Promise<void>;
+  /** The timing of the list subscriptions, for tests. */
+  listSubscriptionTiming?: Pick<
+    ListSubscriptionDeps,
+    "debounceMs" | "maxWaitMs" | "rescanMs" | "minSessionIntervalMs"
+  >;
   logError: (message: string, error: unknown) => void;
 };
 
@@ -449,7 +472,7 @@ export class SessionIndexService {
   private readonly deleteSession: (sessionId: string) => Promise<void>;
 
   constructor(private readonly deps: SessionIndexDeps) {
-    this.index = new SessionIndex(deps.getSessionInfo ?? sdkGetSessionInfo);
+    this.index = new SessionIndex();
     this.registry = deps.registry ?? new LiveSessionRegistry();
     this.now = deps.now ?? Date.now;
     this.deleteSession = deps.deleteSession ?? ((id) => sdkDeleteSession(id));
@@ -588,6 +611,9 @@ export class SessionIndexService {
         stored = await this.titleCopies(sessionId, transcripts, change, options.sidecar);
       }
       return stored;
+    }).finally(() => {
+      // Whatever was written, also by a change that failed part way.
+      this.subscriptions?.sessionWritten(sessionId);
     });
   }
 
@@ -666,6 +692,7 @@ export class SessionIndexService {
         }
       } finally {
         this.index.invalidate(all);
+        this.subscriptions?.sessionWritten(sessionId);
       }
     });
   }
@@ -682,6 +709,7 @@ export class SessionIndexService {
       own: (sessionId) => this.deps.ownSessionState?.(sessionId),
       notify: (changes) => this.deps.notifyListChanges?.(changes) ?? Promise.resolve(),
       logError: this.deps.logError,
+      ...this.deps.listSubscriptionTiming,
     });
     return this.subscriptions.subscribe(cwd);
   }

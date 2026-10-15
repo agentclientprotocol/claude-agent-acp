@@ -225,6 +225,41 @@ describe("session lifecycle serialization", () => {
     }
   });
 
+  it.each(["close", "dispose"] as const)(
+    "does not recreate a session after %s during provider model discovery",
+    async (operation) => {
+      const f = fixture();
+      f.install("s1");
+      const listing = gate();
+      const started = gate();
+      vi.spyOn(f.agent as any, "listProviderModels").mockImplementation(async () => {
+        started.release();
+        await listing.promise;
+        return {};
+      });
+      try {
+        const update = f.agent.unstable_setProvider({
+          providerId: "main",
+          apiType: "anthropic",
+          baseUrl: "https://gateway.example/v1",
+        });
+        await started.promise;
+        const cleanup =
+          operation === "close" ? f.agent.closeSession({ sessionId: "s1" }) : f.agent.dispose();
+        if (operation === "close") await cleanup;
+        listing.release();
+        await Promise.all([update, cleanup]);
+        expect(f.create).not.toHaveBeenCalled();
+        expect(f.agent.sessions).toEqual({});
+        expect(f.queries[0].close).toHaveBeenCalledTimes(1);
+      } finally {
+        listing.release();
+        f.creation.release();
+        await f.agent.dispose();
+      }
+    },
+  );
+
   it("cancels a turn before waiting for its blocked provider update", async () => {
     const f = fixture();
     const session = f.install("s1");

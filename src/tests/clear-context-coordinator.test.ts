@@ -1,3 +1,4 @@
+import type { SessionNotification } from "@agentclientprotocol/sdk";
 import { describe, expect, it, vi } from "vitest";
 import {
   ClearContextCoordinatorHost,
@@ -331,6 +332,7 @@ describe("ExitPlanCoordinator", () => {
     const host = {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
+      supportsPlanOperations: () => true,
       destroyReplacement,
       settleCancelledTurn,
       settleFailedTurn: vi.fn(),
@@ -375,6 +377,7 @@ describe("ExitPlanCoordinator", () => {
     const host = {
       ...baseHost,
       sessionUpdate: vi.fn(async () => {}),
+      supportsPlanOperations: () => true,
       destroyReplacement: vi.fn(),
       settleCancelledTurn: vi.fn(),
       settleFailedTurn,
@@ -383,12 +386,60 @@ describe("ExitPlanCoordinator", () => {
 
     await coordinator.restart("public-session", oldSession, reset);
 
+    // The plan was never carried out, so it does not become the session's plan.
+    expect(host.sessionUpdate).not.toHaveBeenCalled();
     expect(settleFailedTurn).toHaveBeenCalledWith(oldSession, turn, error);
     expect(turn.carriedUsage).toBeUndefined();
     expect(turn.carriedModelUsage).toBeUndefined();
     expect(oldSession.pendingExitPlanContextReset).toBeUndefined();
     expect(oldSession.activeTurn).toBeNull();
     expect(oldSession.turnQueue).toEqual([]);
+  });
+
+  it.each([
+    ["publishes the approved plan after the session state, before the fresh context runs", true],
+    ["publishes no plan to a client without plan operations", false],
+  ])("%s", async (_, supportsPlanOperations) => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const reset = { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" as const };
+    const oldSession = testSession({ activeTurn: turn, turnQueue: [turn] });
+    const freshSession = testSession();
+    const order: string[] = [];
+    const host = {
+      ...testHost(oldSession, freshSession),
+      sessionUpdate: vi.fn(async ({ update }: SessionNotification) => {
+        order.push(
+          update.sessionUpdate === "plan_update"
+            ? `plan_update ${JSON.stringify(update.plan)}`
+            : update.sessionUpdate,
+        );
+      }),
+      supportsPlanOperations: () => supportsPlanOperations,
+      destroyReplacement: vi.fn(),
+      settleCancelledTurn: vi.fn(),
+      settleFailedTurn: vi.fn(),
+    };
+    vi.mocked(freshSession.input.push).mockImplementation(() => {
+      order.push("continuation");
+    });
+    const coordinator = new ExitPlanCoordinator<TestSession, ClearContextTurn>(host);
+
+    await coordinator.restart("public-session", oldSession, reset);
+
+    expect(order).toEqual([
+      "current_mode_update",
+      "config_option_update",
+      ...(supportsPlanOperations
+        ? [
+            "plan_update " +
+              JSON.stringify({ type: "markdown", planId: "plan-mode", content: "Ship it" }),
+          ]
+        : []),
+      "continuation",
+    ]);
   });
 });
 
