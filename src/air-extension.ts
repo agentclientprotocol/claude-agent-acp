@@ -45,6 +45,7 @@ export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
 export const AIR_SUBAGENT_KEY = "subagent";
 export const AIR_SKILL_KEY = "skill";
+export const AIR_MCP_KEY = "mcp";
 export const AIR_CONTEXT_COMPACTION_KEY = "contextCompaction";
 export const AIR_GOAL_KEY = "goal";
 export const AIR_KIND_KEY = "kind";

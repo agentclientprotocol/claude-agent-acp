@@ -8,6 +8,7 @@ import type {
 } from "@agentclientprotocol/sdk";
 import {
   AIR_COMMAND_TITLE_KEY,
+  AIR_MCP_KEY,
   AIR_SKILL_KEY,
   AIR_SUBAGENT_KEY,
   withAirMeta,
@@ -82,6 +83,9 @@ export type ToolUpdateMeta = {
       /* For Skill tool calls: the skill name, and the absolute path of its
          SKILL.md when it could be located on disk. */
       skill?: { name: string; path?: string };
+      /* For MCP tool calls: the normalized server name and the tool name, so
+         a client need not parse the `mcp__<server>__<tool>` title. */
+      mcp?: { server: string; tool: string };
       [key: string]: unknown;
     };
   };
@@ -781,8 +785,26 @@ export class AcpToolCallRenderer {
         ...(skillPath ? { path: skillPath } : {}),
       });
     }
+    const mcp = mcpToolName(toolUse.name);
+    if (mcp) meta = withAirMeta(meta, AIR_MCP_KEY, mcp);
     return meta as ToolUpdateMeta;
   }
+}
+
+/**
+ * Splits `mcp__<server>__<tool>` the way Claude Code does: the server is the
+ * segment up to the next `__`, the tool is the whole rest. `server` is the
+ * normalized name, not the config key.
+ */
+export function mcpToolName(name: string): { server: string; tool: string } | undefined {
+  const prefix = "mcp__";
+  if (!name.startsWith(prefix)) return undefined;
+  const rest = name.slice(prefix.length);
+  const separator = rest.indexOf("__");
+  if (separator <= 0) return undefined;
+  const tool = rest.slice(separator + 2);
+  if (!tool) return undefined;
+  return { server: rest.slice(0, separator), tool };
 }
 
 /** The input with the path of the plan file in place of the plan text. */
