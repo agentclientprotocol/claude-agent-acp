@@ -116,6 +116,18 @@ export async function worktreeCounterparts(cwd: string): Promise<string[]> {
 }
 
 /**
+ * Whether `cwd` lies in a linked worktree: its git dir is
+ * `<common-dir>/worktrees/<name>`. False in the main worktree, in a
+ * submodule and outside a repository.
+ */
+export async function isInLinkedWorktree(cwd: string): Promise<boolean> {
+  const gitDir = await findGitDir(cwd);
+  if (!gitDir) return false;
+  const commonDir = await commonDirOf(gitDir);
+  return path.resolve(path.dirname(gitDir)) === path.resolve(commonDir, "worktrees");
+}
+
+/**
  * Every existing worktree of the repository that contains `cwd`: the main
  * worktree and the linked ones. Empty outside a repository.
  */

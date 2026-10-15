@@ -54,7 +54,11 @@ export interface TurnEvents {
  * the cycle reports nothing more, and the turn reports from there.
  */
 export interface ForegroundEvents {
-  /** The work started, or works again after it waited for the user. */
+  /**
+   * The work started, or works again after it waited for the user. Not after
+   * a wait that a cancel ended: Claude Code's interrupt withdrew the last
+   * request, so the work is being stopped, and {@link ended} follows at once.
+   */
   running(): void;
   /**
    * The work waits for the user: a permission request or a question is open in

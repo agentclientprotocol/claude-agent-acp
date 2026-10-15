@@ -73,7 +73,8 @@ export function v2Prompt(
  *
  * - Started: `running`. For a prompt's turn, right after its `user_message`.
  * - Waiting on a permission request or a question: `requires_action`, and
- *   `running` once none is open.
+ *   `running` once none is open, unless a cancel withdrew the last one: the
+ *   work is being stopped then, and its `idle` follows.
  * - Ended: `idle` with the stop reason, usage, and `_meta` of the work.
  * - Failed: `idle` with the `error` stop reason and the JSON-RPC error that v1
  *   answers the prompt with, so a client can show its message and handle its

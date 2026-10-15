@@ -13,6 +13,7 @@ import {
   PromptResponse,
   ReadTextFileRequest,
   ReadTextFileResponse,
+  RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification,
@@ -63,6 +64,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   getSubagentMessages,
+  type HookCallback,
   importSessionToStore,
   listSessions,
   PermissionUpdate,
@@ -4542,6 +4544,87 @@ describe("permission request cancellation", () => {
     await expect(pending).rejects.toThrow("Tool use aborted");
   });
 
+  /** The requests to the client that are elicitations, and how each ends when its signal aborts. */
+  const elicitations = [
+    {
+      name: "an AskUserQuestion",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        agent.canUseTool("session-1")(
+          "AskUserQuestion",
+          {
+            questions: [
+              {
+                question: "Pick a color",
+                header: "Color",
+                options: [{ label: "Blue", description: "Use blue" }],
+                multiSelect: false,
+              },
+            ],
+          },
+          { signal, suggestions: [], toolUseID: "tool-1" } as any,
+        ),
+      // Like a permission request, it ends the tool use as aborted.
+      aborted: (outcome: Promise<unknown>) => expect(outcome).rejects.toThrow("Tool use aborted"),
+    },
+    {
+      name: "an MCP elicitation",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleMcpElicitation("session-1", { form: true, url: true })(
+          {
+            mode: "form",
+            message: "Choose",
+            requestedSchema: { type: "object", properties: {} },
+          },
+          { signal },
+        ),
+      aborted: (outcome: Promise<unknown>) =>
+        expect(outcome).resolves.toEqual({ action: "cancel" }),
+    },
+    {
+      name: "a refusal-fallback user dialog",
+      start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
+        (agent as any).handleUserDialog("session-1")(
+          {
+            dialogKind: "refusal_fallback_prompt",
+            payload: {
+              originalModel: "claude-fable-5",
+              fallbackModel: "claude-opus-4-8",
+              apiRefusalCategory: "cyber",
+            },
+          },
+          { signal },
+        ),
+      aborted: (outcome: Promise<unknown>) =>
+        expect(outcome).resolves.toEqual({ behavior: "cancelled" }),
+    },
+  ];
+
+  it.each(elicitations)(
+    "does not wait for $name when its client ignores cancellation",
+    async ({ start, aborted }) => {
+      // The client holds the elicitation and never answers $/cancel_request.
+      const createElicitation = vi.fn(() => new Promise<CreateElicitationResponse>(() => {}));
+      const mockClient = {
+        sessionUpdate: async () => {},
+        createElicitation,
+      } as unknown as AcpClient;
+      const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+      await initializeClient(agent, { elicitation: { form: {}, url: {} } });
+      const session = injectSession(agent, "session-1");
+      session.emittedToolCalls.add("tool-1");
+
+      const controller = new AbortController();
+      const pending = start(agent, controller.signal);
+      await vi.waitFor(() => expect(createElicitation).toHaveBeenCalledOnce());
+      // The client was asked to cancel the request, and ignores that.
+      expect(createElicitation.mock.calls[0]).toEqual([expect.anything(), controller.signal]);
+      controller.abort();
+
+      await aborted(pending);
+      expect(session.openUserInputs?.size ?? 0).toBe(0);
+    },
+  );
+
   it("observes a client rejection when the signal aborts during request creation", async () => {
     const controller = new AbortController();
     const clientOperation = Promise.reject(new Error("Request cancelled"));
@@ -5845,6 +5928,116 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(requests[0].sessionId).toBe("agent-42");
   });
 
+  describe("a child's permission request that Claude Code withdraws (the subagents RFD)", () => {
+    /**
+     * An agent for an RFD client, whose child `agent-42` runs and has asked for
+     * permission. The client holds the request and ignores `$/cancel_request`.
+     * `withdrawal` is the request's signal, which Claude Code aborts when it
+     * withdraws the request.
+     */
+    async function childWaitingForPermission() {
+      const updates: AcpSessionNotification[] = [];
+      const withdrawal = new AbortController();
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+          requestPermission: () => new Promise(() => {}),
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await initializeClient(agent, { subagents: {} } as ClientCapabilities);
+      const query = wrapQuery((async function* () {})());
+      const session = mockSessionState({ query, input: new Pushable() });
+      agent.sessions["session-1"] = session;
+      session.liveBackgroundTasks.set("agent-42", {
+        parentToolUseId: "toolu_parent",
+        isSubagent: true,
+      });
+      session.nativeSubagentsByTaskId = new Map([
+        [
+          "agent-42",
+          {
+            sessionId: "agent-42",
+            parentSessionId: "session-1",
+            parentToolUseId: "toolu_parent",
+            name: "Explore",
+            task: "Investigate",
+            announced: true,
+            workState: "running",
+          },
+        ],
+      ]);
+      const runtime = new NativeSubagentRuntime(
+        "rfd",
+        "session-1",
+        session,
+        async (notification) => {
+          updates.push(notification);
+        },
+        { log: () => {} },
+      );
+      session.nativeSubagentRuntime = runtime;
+      const asking = agent
+        .canUseTool("session-1")("Bash", { command: "ls" }, {
+          signal: withdrawal.signal,
+          suggestions: [],
+          toolUseID: "toolu_sub",
+          agentID: "agent-42",
+        } as any)
+        .catch((error: Error) => error.message);
+      /** The states that the child reported, such as `idle cancelled`. */
+      const childStates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate === "subagent_update" && update.state
+            ? [
+                [update.state.state, (update.state as { stopReason?: string }).stopReason]
+                  .filter(Boolean)
+                  .join(" "),
+              ]
+            : [],
+        );
+      await vi.waitFor(() => expect(childStates()).toEqual(["requires_action"]));
+      return { agent, query, runtime, withdrawal, asking, childStates };
+    }
+
+    it("reports no running when a cancel withdraws it, and leaves the child's end to the SDK", async () => {
+      const { agent, query, runtime, withdrawal, asking, childStates } =
+        await childWaitingForPermission();
+      // Claude Code's interrupt withdraws the request of the child that it stops.
+      query.interrupt.mockImplementation(async () => withdrawal.abort());
+
+      await agent.cancel({ sessionId: "session-1" });
+      await expect(asking).resolves.toBe("Tool use aborted");
+      expect(childStates()).toEqual(["requires_action"]);
+
+      await runtime.finishTask("agent-42", "killed", async () => {});
+      expect(childStates()).toEqual(["requires_action", "idle cancelled"]);
+    });
+
+    it("reports no running when a session/close withdraws it", async () => {
+      const { agent, query, withdrawal, asking, childStates } = await childWaitingForPermission();
+      // The SDK's cleanup of a closed query aborts every request that is open.
+      query.close.mockImplementation(() => withdrawal.abort());
+
+      await agent.closeSession({ sessionId: "session-1" });
+      await expect(asking).resolves.toBe("Tool use aborted");
+
+      expect(childStates()).toEqual(["requires_action"]);
+    });
+
+    it("reports running when Claude Code withdraws it on its own, since the child goes on", async () => {
+      const { withdrawal, asking, childStates } = await childWaitingForPermission();
+
+      // A hook answered the request in the user's place.
+      withdrawal.abort();
+      await expect(asking).resolves.toBe("Tool use aborted");
+
+      expect(childStates()).toEqual(["requires_action", "running"]);
+    });
+  });
+
   it("sends the PostToolUse hook update of a child's Edit to the child session", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -6257,6 +6450,89 @@ describe("subagent permission attribution (issue #851)", () => {
 
     expect(updates[0].sessionId).toBe("child-session");
     expect((elicitations[0] as { sessionId?: string }).sessionId).toBe("child-session");
+  });
+
+  it("stops counting a child's question once Claude Code withdraws it, though its client never settles it (the subagents RFD)", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (notification: AcpSessionNotification) => {
+          updates.push(notification);
+        },
+        // A client that ignores $/cancel_request.
+        createElicitation: () => new Promise(() => {}),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, {
+      subagents: {},
+      elicitation: { form: {} },
+    } as ClientCapabilities);
+    const session = mockSessionState();
+    agent.sessions["session-1"] = session;
+    session.liveBackgroundTasks.set("agent-42", {
+      parentToolUseId: "toolu_parent",
+      isSubagent: true,
+    });
+    session.nativeSubagentsByTaskId = new Map([
+      [
+        "agent-42",
+        {
+          sessionId: "agent-42",
+          parentSessionId: "session-1",
+          parentToolUseId: "toolu_parent",
+          name: "Explore",
+          task: "Investigate",
+          announced: true,
+          workState: "running",
+        },
+      ],
+    ]);
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "session-1",
+      session,
+      async (notification) => {
+        updates.push(notification);
+      },
+      { log: () => {} },
+    );
+    session.nativeSubagentRuntime = runtime;
+    const childStates = () =>
+      updates.flatMap(({ update }) =>
+        update.sessionUpdate === "subagent_update" && update.state ? [update.state.state] : [],
+      );
+    const withdrawal = new AbortController();
+    const asking = agent
+      .canUseTool("session-1")(
+        "AskUserQuestion",
+        {
+          questions: [
+            {
+              question: "Which mode?",
+              header: "Mode",
+              options: [{ label: "Fast", description: "Fast mode" }],
+              multiSelect: false,
+            },
+          ],
+        },
+        {
+          signal: withdrawal.signal,
+          suggestions: [],
+          toolUseID: "toolu_question",
+          agentID: "agent-42",
+        } as any,
+      )
+      .catch((error: Error) => error.message);
+    await vi.waitFor(() => expect(childStates()).toEqual(["requires_action"]));
+
+    withdrawal.abort();
+    await expect(asking).resolves.toBe("Tool use aborted");
+    // The child ends, and a SendMessage runs it again with no request open.
+    await runtime.finishTask("agent-42", "completed", async () => {});
+    await runtime.taskStarted({ taskId: "agent-42", toolUseId: "toolu_send" }, async () => {});
+
+    expect(childStates()).toEqual(["requires_action", "running", "idle", "running"]);
   });
 
   function taskStarted(taskId: string, toolUseId: string) {
@@ -6768,6 +7044,7 @@ describe("subagent permission attribution (issue #851)", () => {
             sessionId: "agent-42",
             title: "Explore",
             description: "Investigate",
+            capabilities: { cancel: {} },
             state: { state: "running" },
           },
         },
@@ -6806,6 +7083,226 @@ describe("subagent permission attribution (issue #851)", () => {
           stopReason: "error",
           error: { code: -32603, message: "Context too small" },
         },
+      });
+    });
+
+    describe("session/cancel on a child session", () => {
+      /**
+       * Runs a turn whose child agent-42 runs until `stopped`, then ends as
+       * Claude Code ends a child that `stopTask` stopped, for a client with
+       * `capabilities`. Returns the agent, its updates, and the prompt.
+       */
+      async function childRuns(capabilities: ClientCapabilities = { subagents: {} }) {
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: AcpSessionNotification) => {
+              updates.push(update);
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({ protocolVersion: 1, clientCapabilities: capabilities });
+        const stopped = Promise.withResolvers<void>();
+        injectGeneratorSession(agent, async function* (input: Pushable<any>) {
+          const { value } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(value);
+          yield rootToolUse("toolu_parent", "Agent");
+          yield {
+            ...taskStarted("agent-42", "toolu_parent"),
+            subagent_type: "Explore",
+            prompt: "Go",
+          };
+          await stopped.promise;
+          // As seen live: the child's end, then the Agent call's interrupted
+          // result, and the parent's turn goes on.
+          yield taskUpdated({ status: "killed" });
+          yield taskNotification("toolu_parent", "stopped");
+          yield {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_parent",
+                  is_error: true,
+                  content: "[Request interrupted by user for tool use]",
+                },
+              ],
+            },
+          };
+          yield successResult();
+          yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        } as never);
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "go" }],
+        });
+        await vi.waitFor(() =>
+          expect(
+            agent.sessions["test-session"]?.nativeSubagentsByTaskId?.get("agent-42")?.announced,
+          ).toBe(true),
+        );
+        return { agent, updates, prompt, stop: () => stopped.resolve() };
+      }
+
+      it("stops the child's task, and not its parent's work, then reports the child idle cancelled", async () => {
+        const { agent, updates, prompt, stop } = await childRuns();
+
+        await agent.cancel({ sessionId: "agent-42" });
+
+        const query = agent.sessions["test-session"]!.query;
+        expect(query.stopTask).toHaveBeenCalledExactlyOnceWith("agent-42");
+        expect(query.interrupt).not.toHaveBeenCalled();
+        expect(agent.sessions["test-session"]!.cancelled).toBeFalsy();
+        // Accepting the stop is no evidence: the SDK's events report the end.
+        expect(updates.at(-1)?.update).not.toMatchObject({ state: { state: "idle" } });
+        stop();
+        await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(
+          subagentTraffic(updates).flatMap(({ update }) =>
+            update.sessionUpdate === "subagent_update" ? [update] : [],
+          ),
+        ).toEqual([
+          expect.objectContaining({
+            sessionId: "agent-42",
+            capabilities: { cancel: {} },
+            state: { state: "running" },
+          }),
+          {
+            sessionUpdate: "subagent_update",
+            sessionId: "agent-42",
+            state: { state: "idle", stopReason: "cancelled" },
+          },
+        ]);
+        for (const payload of updates) {
+          expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+        }
+      });
+
+      it("logs a stop that Claude Code refuses, and changes nothing", async () => {
+        const { agent, prompt, stop } = await childRuns();
+        const query = agent.sessions["test-session"]!.query;
+        vi.mocked(query.stopTask).mockRejectedValueOnce(new Error("No such task"));
+
+        await expect(agent.cancel({ sessionId: "agent-42" })).resolves.toBeUndefined();
+
+        expect(query.interrupt).not.toHaveBeenCalled();
+        stop();
+        await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+      });
+
+      it("changes nothing for a session id that is no session or child, or for AIR", async () => {
+        for (const capabilities of [
+          { subagents: {} },
+          AIR_NATIVE_SUBAGENTS,
+        ] as ClientCapabilities[]) {
+          const { agent, prompt, stop } = await childRuns(capabilities);
+          const target = capabilities === AIR_NATIVE_SUBAGENTS ? "agent-42" : "unknown-session";
+
+          await agent.cancel({ sessionId: target });
+
+          const query = agent.sessions["test-session"]!.query;
+          expect(query.stopTask).not.toHaveBeenCalled();
+          expect(query.interrupt).not.toHaveBeenCalled();
+          stop();
+          await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+        }
+      });
+    });
+
+    describe("session/cancel on the parent session", () => {
+      /**
+       * Runs a turn that starts a background workflow, a background command
+       * and a background subagent, then cancels it. With
+       * `perTaskStopAffordance` declared, Claude Code's interrupt spares all
+       * three. Returns the query.
+       */
+      async function cancelWithBackgroundWork(stopsWorkflowsOnCancel: boolean) {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: { subagents: {} } as ClientCapabilities,
+        });
+        const interrupted = Promise.withResolvers<void>();
+        injectGeneratorSession(
+          agent,
+          async function* (input: Pushable<any>) {
+            const { value } = await input[Symbol.asyncIterator]().next();
+            yield userEcho(value);
+            yield rootToolUse("toolu_workflow", "Workflow");
+            // As seen live: a workflow's task_started has no is_backgrounded.
+            yield {
+              ...taskStarted("workflow-1", "toolu_workflow"),
+              task_type: "local_workflow",
+            };
+            yield rootToolUse("toolu_shell", "Bash");
+            yield {
+              ...taskStarted("shell-1", "toolu_shell"),
+              task_type: "local_bash",
+              is_backgrounded: true,
+            };
+            yield rootToolUse("toolu_agent", "Agent");
+            yield {
+              ...taskStarted("agent-42", "toolu_agent"),
+              task_type: "local_agent",
+              subagent_type: "Explore",
+              is_backgrounded: true,
+            };
+            await interrupted.promise;
+            yield {
+              ...successResult(),
+              subtype: "error_during_execution",
+              is_error: true,
+              terminal_reason: "aborted_tools",
+            };
+            yield { type: "system", subtype: "session_state_changed", state: "idle" };
+          },
+          { stopsWorkflowsOnCancel },
+        );
+        const query = agent.sessions["test-session"]!.query;
+        vi.mocked(query.interrupt).mockImplementation(async () => {
+          interrupted.resolve();
+          return undefined;
+        });
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "go" }],
+        });
+        await vi.waitFor(() =>
+          expect(agent.sessions["test-session"]!.liveBackgroundTasks.has("agent-42")).toBe(true),
+        );
+
+        await agent.cancel({ sessionId: "test-session" });
+
+        await expect(prompt).resolves.toMatchObject({ stopReason: "cancelled" });
+        return query;
+      }
+
+      it("stops the background workflows that the interrupt spares, after it", async () => {
+        const query = await cancelWithBackgroundWork(true);
+
+        // Not the command or the subagent: the interrupt never stopped
+        // background commands, and the client stops a subagent with its
+        // child's `cancel`.
+        expect(query.stopTask).toHaveBeenCalledExactlyOnceWith("workflow-1");
+        expect(vi.mocked(query.interrupt).mock.invocationCallOrder[0]).toBeLessThan(
+          vi.mocked(query.stopTask).mock.invocationCallOrder[0],
+        );
+      });
+
+      it("stops no workflow when the interrupt does not spare them", async () => {
+        const query = await cancelWithBackgroundWork(false);
+
+        expect(query.interrupt).toHaveBeenCalled();
+        expect(query.stopTask).not.toHaveBeenCalled();
       });
     });
 
@@ -7079,6 +7576,7 @@ describe("subagent permission attribution (issue #851)", () => {
               sessionId: "agent-7",
               title: "echoer (Explore)",
               description: "Echo a word",
+              capabilities: { cancel: {} },
               state: { state: "running" },
             },
           },
@@ -7383,6 +7881,124 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
+    it("closes a background child's tool call in its session when the SDK reports the stop after the cancelled response", async () => {
+      const log: string[] = [];
+      const updates: AcpSessionNotification[] = [];
+      const logError = vi.fn();
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (update: AcpSessionNotification) => {
+            updates.push(update);
+            if (update.update.sessionUpdate === "subagent_update") {
+              log.push(`${update.update.sessionId} ${JSON.stringify(update.update.state)}`);
+            }
+            if (update.update.sessionUpdate === "tool_call_update" && update.update.status) {
+              log.push(
+                `tool @${update.sessionId} ${update.update.toolCallId} ${update.update.status}`,
+              );
+            }
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: logError },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: { subagents: {} } as ClientCapabilities,
+      });
+      const responded = Promise.withResolvers<void>();
+      injectGeneratorSession(agent, (input) =>
+        (async function* () {
+          const { value } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(value);
+          yield rootToolUse("toolu_agent", "Agent", {
+            description: "Run a slow command",
+            subagent_type: "general-purpose",
+            prompt: "Run it",
+            run_in_background: true,
+          });
+          yield {
+            ...taskStarted("agent-42", "toolu_agent"),
+            subagent_type: "general-purpose",
+            is_backgrounded: true,
+          };
+          // Claude Code answers a background Agent call when the subagent launches.
+          yield {
+            type: "user",
+            parent_tool_use_id: null,
+            uuid: randomUUID(),
+            session_id: "test-session",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_agent",
+                  content: "Async agent launched",
+                },
+              ],
+            },
+          };
+          yield {
+            ...rootToolUse("toolu_child", "Bash", { command: "make" }),
+            parent_tool_use_id: "toolu_agent",
+          };
+          // The turn's result comes while the subagent runs, so v1 holds the turn
+          // for it. The cancel settles the held turn, which leaves the subagent's
+          // command open, since the subagent runs.
+          yield successResult();
+          await agent.cancel({ sessionId: "test-session" });
+          await responded.promise;
+          // Claude Code's interrupt stops the subagent only now, and sends the
+          // command's interrupted result after that.
+          yield taskUpdated({ status: "killed" });
+          yield taskNotification("toolu_agent", "stopped", { summary: "stopped" });
+          yield {
+            type: "user",
+            parent_tool_use_id: "toolu_agent",
+            uuid: randomUUID(),
+            session_id: "test-session",
+            tool_result_meta: [{ id: "toolu_child", non_execution_kind: "user-rejected" }],
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "toolu_child",
+                  is_error: true,
+                  content: "The user doesn't want to proceed with this tool use.",
+                },
+              ],
+            },
+          };
+        })(),
+      );
+
+      await expect(
+        agent
+          .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] })
+          .then((response) => {
+            log.push(`prompt ${response.stopReason}`);
+            responded.resolve();
+            return response;
+          }),
+      ).resolves.toMatchObject({ stopReason: "cancelled" });
+      await agent.sessions["test-session"]?.consumer;
+
+      // The command ends in the child's session, after the child reported idle.
+      expect(log).toEqual([
+        'agent-42 {"state":"running"}',
+        "tool @test-session toolu_agent completed",
+        "prompt cancelled",
+        'agent-42 {"state":"idle","stopReason":"cancelled"}',
+        "tool @agent-42 toolu_child failed",
+      ]);
+      expect(agent.sessions["test-session"]?.emittedToolCalls.size).toBe(0);
+      expect(logError).not.toHaveBeenCalled();
+      for (const payload of updates) {
+        expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
+      }
+    });
+
     it("adds the SDK's error to a failure that a notification reported first", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
@@ -7521,6 +8137,74 @@ describe("subagent permission attribution (issue #851)", () => {
           update.status,
       ),
     ).toBe(false);
+  });
+
+  it("releases a background child's tool call without a report when the SDK reports the stop after the cancel (AIR)", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const logs: string[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: AcpSessionNotification) => {
+          updates.push(update);
+        },
+      } as unknown as AcpClient,
+      { log: (message: string) => logs.push(message), error: () => {} },
+    );
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: AIR_NATIVE_SUBAGENTS });
+    const responded = Promise.withResolvers<void>();
+    injectGeneratorSession(agent, (input) =>
+      (async function* () {
+        const { value } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(value);
+        yield rootToolUse("toolu_agent", "Agent", { description: "Explore", prompt: "Look" });
+        yield {
+          ...taskStarted("agent-42", "toolu_agent"),
+          subagent_type: "Explore",
+          is_backgrounded: true,
+        };
+        yield {
+          ...rootToolUse("toolu_child", "Bash", { command: "make" }),
+          parent_tool_use_id: "toolu_agent",
+        };
+        yield successResult();
+        await agent.cancel({ sessionId: "test-session" });
+        await responded.promise;
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-42",
+          tool_use_id: "toolu_agent",
+          status: "stopped",
+          output_file: "",
+          summary: "stopped",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        };
+      })(),
+    );
+
+    await agent
+      .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] })
+      .finally(() => responded.resolve());
+    await agent.sessions["test-session"]?.consumer;
+
+    // AIR's draft ended the child at the cancel, so the closing report for its
+    // command is dropped with every later update of the child.
+    const childEnded = updates.findIndex(
+      ({ update }) =>
+        update.sessionUpdate === "subagent_state_update" &&
+        update.subagentSessionId === "agent-42" &&
+        update.state === "cancelled",
+    );
+    expect(childEnded).toBeGreaterThanOrEqual(0);
+    expect(
+      updates.slice(childEnded + 1).filter(({ sessionId }) => sessionId === "agent-42"),
+    ).toEqual([]);
+    expect(logs).toContain(
+      "Session test-session: ignoring late update for terminal subagent agent-42",
+    );
+    // The call is not kept open here, though.
+    expect(agent.sessions["test-session"]?.emittedToolCalls.size).toBe(0);
   });
 
   it("buffers child output until spawn and drops duplicates and late updates", async () => {
@@ -12586,6 +13270,14 @@ describe("session/delete", () => {
     return agent.sessions[sessionId]!;
   }
 
+  // Session ids are UUIDs: the SDK delete rejects any other id.
+  const SESSION_1 = "6f0c5f0e-1a2b-4c3d-8e9f-0a1b2c3d4e5f";
+  const SESSION_2 = "7a1d6e1f-2b3c-4d4e-9f0a-1b2c3d4e5f60";
+
+  /** The error the SDK delete throws for a session without a transcript. */
+  const sdkNotFound = (sessionId: string) =>
+    new Error(`Session ${sessionId} not found in any project directory`);
+
   beforeEach(() => {
     vi.mocked(deleteSession).mockReset();
     vi.mocked(deleteSession).mockResolvedValue(undefined);
@@ -12593,45 +13285,70 @@ describe("session/delete", () => {
 
   it("tears down the active session and deletes it from disk", async () => {
     const agent = createMockAgent();
-    const session = injectSession(agent, "session-1");
+    const session = injectSession(agent, SESSION_1);
 
-    const result = await agent.deleteSession({ sessionId: "session-1" });
+    const result = await agent.deleteSession({ sessionId: SESSION_1 });
 
     expect(result).toEqual({});
-    expect(agent.sessions["session-1"]).toBeUndefined();
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
     expect(session.query.interrupt).toHaveBeenCalled();
     expect(session.settingsManager.dispose).toHaveBeenCalled();
     expect(session.abortController.signal.aborted).toBe(true);
-    expect(deleteSession).toHaveBeenCalledWith("session-1");
+    expect(deleteSession).toHaveBeenCalledWith(SESSION_1);
   });
 
   it("deletes a session from disk that is not currently active", async () => {
     const agent = createMockAgent();
 
-    const result = await agent.deleteSession({ sessionId: "not-active" });
+    const result = await agent.deleteSession({ sessionId: SESSION_1 });
 
     expect(result).toEqual({});
-    expect(deleteSession).toHaveBeenCalledWith("not-active");
+    expect(deleteSession).toHaveBeenCalledWith(SESSION_1);
   });
 
-  it("propagates errors from the SDK delete call", async () => {
+  it("deletes an active session that was never prompted, which has no transcript", async () => {
     const agent = createMockAgent();
-    vi.mocked(deleteSession).mockRejectedValueOnce(new Error("Session not found on disk"));
+    injectSession(agent, SESSION_1);
+    vi.mocked(deleteSession).mockRejectedValueOnce(sdkNotFound(SESSION_1));
 
-    await expect(agent.deleteSession({ sessionId: "missing" })).rejects.toThrow(
-      "Session not found on disk",
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).resolves.toEqual({});
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
+  });
+
+  // ACP: "Deleting an already-deleted session, or a session that never
+  // existed, SHOULD succeed silently."
+  it("succeeds for a session that does not exist", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(sdkNotFound(SESSION_1));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).resolves.toEqual({});
+  });
+
+  it("succeeds for an id that is not a session id, without asking the SDK", async () => {
+    const agent = createMockAgent();
+
+    await expect(agent.deleteSession({ sessionId: "tck-never-created" })).resolves.toEqual({});
+    expect(deleteSession).not.toHaveBeenCalled();
+  });
+
+  it("propagates other errors from the SDK delete call", async () => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).rejects.toThrow(
+      "EACCES: permission denied",
     );
   });
 
   it("does not affect other sessions when deleting one", async () => {
     const agent = createMockAgent();
-    injectSession(agent, "session-a");
-    injectSession(agent, "session-b");
+    injectSession(agent, SESSION_1);
+    injectSession(agent, SESSION_2);
 
-    await agent.deleteSession({ sessionId: "session-a" });
+    await agent.deleteSession({ sessionId: SESSION_1 });
 
-    expect(agent.sessions["session-a"]).toBeUndefined();
-    expect(agent.sessions["session-b"]).toBeDefined();
+    expect(agent.sessions[SESSION_1]).toBeUndefined();
+    expect(agent.sessions[SESSION_2]).toBeDefined();
   });
 });
 
@@ -12753,6 +13470,66 @@ describe("getOrCreateSession param change detection", () => {
       expect.objectContaining({ cwd: "/new" }),
       expect.objectContaining({ resume: "s1" }),
     );
+  });
+
+  // Claude Code writes the conversation at the first prompt, so a live session
+  // that was never prompted has nothing to resume.
+  it("starts a fresh query under the same id for a live session that was never prompted", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/project" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValueOnce(RequestError.resourceNotFound("s1"))
+      .mockResolvedValueOnce({ sessionId: "s1", modes: undefined, configOptions: [] });
+
+    await expect(
+      agent.resumeSession({
+        sessionId: "s1",
+        cwd: "/project",
+        mcpServers: [],
+        additionalDirectories: ["/project/extra"],
+      }),
+    ).resolves.toMatchObject({ configOptions: [] });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(2);
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      expect.objectContaining({ resume: "s1" }),
+    );
+    // The live session keeps its mode.
+    expect(createSessionSpy).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ additionalDirectories: ["/project/extra"] }),
+      { reuseSessionId: "s1", permissionMode: "default" },
+    );
+  });
+
+  it("still fails a resume of an unknown session that has no stored conversation", async () => {
+    const agent = createMockAgent();
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(RequestError.resourceNotFound("s1"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/project", mcpServers: [] }),
+    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start a fresh query when the resume of a live session fails otherwise", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "s1", { cwd: "/old" });
+    const createSessionSpy = vi
+      .spyOn(agent as any, "createSession")
+      .mockRejectedValue(new Error("CLI failed to start"));
+
+    await expect(
+      agent.resumeSession({ sessionId: "s1", cwd: "/new", mcpServers: [] }),
+    ).rejects.toThrow("CLI failed to start");
+
+    expect(createSessionSpy).toHaveBeenCalledTimes(1);
   });
 
   it("tears down existing session when mcpServers change", async () => {
@@ -18823,23 +19600,100 @@ describe("output after a cancel", () => {
     ];
   }
 
-  /** An agent on a session that `makeGenerator` scripts, and the text of every
-   *  agent message chunk its client receives. */
+  /** An agent on a session that `makeGenerator` scripts, the text of every
+   *  agent message chunk its client receives, every update, and every
+   *  permission request, which the client allows once. */
   function setup(makeGenerator: (input: Pushable<any>) => AsyncGenerator<any>) {
     const texts: string[] = [];
+    const updates: SessionNotification["update"][] = [];
+    const permissionRequests: RequestPermissionRequest[] = [];
     const agent = new ClaudeAcpAgent(
       {
         sessionUpdate: async ({ update }: SessionNotification) => {
+          updates.push(update);
           if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
             texts.push(update.content.text);
           }
+        },
+        requestPermission: async (params: RequestPermissionRequest) => {
+          permissionRequests.push(params);
+          const option =
+            params.options.find(({ kind }) => kind === "allow_once") ?? params.options[0]!;
+          return { outcome: { outcome: "selected", optionId: option.optionId } };
         },
       } as unknown as AcpClient,
       { log: () => {}, error: () => {} },
     );
     injectGeneratorSession(agent, makeGenerator);
-    return { agent, texts };
+    return { agent, texts, updates, permissionRequests };
   }
+
+  /** How Claude Code starts to stream an assistant message that runs the tool
+   *  `id`, up to the tool use's start. */
+  const toolUseStart = (id: string, name: string) => [
+    messageStart(),
+    streamEvent({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id, name, input: {} },
+    }),
+  ];
+  /** The whole assistant message that runs the tool `id`, which ends its stream. */
+  function toolUseMessage(id: string, name: string, input: Record<string, unknown>) {
+    const message = assistant("");
+    return [
+      {
+        ...message,
+        message: { ...message.message, content: [{ type: "tool_use", id, name, input }] },
+      },
+      streamEvent({ type: "content_block_stop", index: 0 }),
+      streamEvent({ type: "message_stop" }),
+    ];
+  }
+  /** How Claude Code sends an assistant message that runs the tool `id`: it
+   *  streams the tool use's start, then sends the whole message. */
+  const toolUse = (id: string, name: string, input: Record<string, unknown>) => [
+    ...toolUseStart(id, name),
+    ...toolUseMessage(id, name, input),
+  ];
+  /** The result of the tool `id`. */
+  const toolResult = (id: string, content: string, isError = false) => ({
+    type: "user",
+    parent_tool_use_id: null,
+    uuid: randomUUID(),
+    session_id: "test-session",
+    message: {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: id, content, is_error: isError }],
+    },
+  });
+  // No test writes the file. A path under /tmp would read to CodeQL as a
+  // file created in the temp directory.
+  const writeInput = { file_path: "/workspace/proj/notes.md", content: "done\n" };
+  /** Claude Code's permission check for the Write call `id`, as it calls it. */
+  const askToWrite = (agent: ClaudeAcpAgent, id: string) =>
+    agent.canUseTool("test-session")("Write", writeInput, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: id,
+    } as any);
+  /** The v2 PreToolUse preview hook for the Write call `id`, as Claude Code calls it. */
+  const previewWrite = (agent: ClaudeAcpAgent, id: string) =>
+    (
+      agent as unknown as { fileChangePreviewHook(sessionId: string): HookCallback }
+    ).fileChangePreviewHook("test-session")(
+      {
+        hook_event_name: "PreToolUse",
+        tool_name: "Write",
+        tool_input: writeInput,
+        tool_use_id: id,
+        session_id: "test-session",
+        transcript_path: "",
+        cwd: "/workspace/proj",
+      } as any,
+      id,
+      { signal: new AbortController().signal },
+    );
 
   /** Sends the prompt `text` and waits until its turn is active. Returns the
    *  prompt and the session's consumer, which ends with the scripted stream. */
@@ -18977,6 +19831,185 @@ describe("output after a cancel", () => {
     await expect(second).resolves.toEqual({ stopReason: "cancelled" });
     await consumer;
     expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+  });
+
+  it.each([
+    ["before the consumer reaches it", "before", true],
+    ["after its streamed start, before its message", "between", true],
+    ["after its message", "after", true],
+    ["before its message, for a tool use that did not stream", "before", false],
+  ] as const)(
+    "shows nothing of a tool that a prompt the cancel abandoned asks to run, and denies it, when Claude Code asks %s (#1061)",
+    async (_when, order, streamed) => {
+      const cancelled = Promise.withResolvers<void>();
+      let asked: Promise<unknown> | undefined;
+      let previewed: Promise<unknown> | undefined;
+      const { agent, texts, updates, permissionRequests } = setup((input) =>
+        (async function* () {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: first } = await iter.next();
+          yield* startTurn(first);
+          yield* answer("Starting the build.");
+          const { value: second } = await iter.next();
+          yield lifecycleFrame(second.uuid, "queued");
+          await cancelled.promise;
+          yield abortedResult(first.uuid);
+          yield lifecycleFrame(first.uuid, "cancelled");
+          // Claude Code had already taken the second prompt, so it still runs
+          // it, and its answer writes a file. It calls the preview hook and
+          // asks for the permission on its control channel, which can run
+          // ahead of the consumer.
+          yield lifecycleFrame(second.uuid, "started");
+          yield requesting(second.uuid);
+          yield userEcho(second);
+          const ask = () => {
+            previewed = previewWrite(agent, "toolu_late");
+            asked = askToWrite(agent, "toolu_late");
+          };
+          if (order === "before") ask();
+          if (streamed) yield* toolUseStart("toolu_late", "Write");
+          if (order === "between") {
+            // Claude Code can run a tool whose input is complete before it
+            // sends the whole message.
+            ask();
+            await Promise.all([previewed, asked]);
+          }
+          yield* streamed
+            ? toolUseMessage("toolu_late", "Write", writeInput)
+            : [toolUseMessage("toolu_late", "Write", writeInput)[0]];
+          if (order === "after") ask();
+          await Promise.all([previewed, asked]);
+          yield toolResult("toolu_late", "The user cancelled this prompt.", true);
+          yield stampedResult(second.uuid);
+          yield lifecycleFrame(second.uuid, "completed");
+          yield idle;
+          yield requesting();
+          yield* followup();
+        })(),
+      );
+      const { prompt: first, consumer } = await promptActive(agent, "build it");
+      const second = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and write it down" }],
+      });
+      await vi.waitFor(() =>
+        expect(agent.sessions["test-session"]?.turnQueue?.length).toBeGreaterThanOrEqual(2),
+      );
+      vi.mocked(agent.sessions["test-session"]!.query.interrupt).mockResolvedValue({
+        still_queued: [],
+      });
+
+      await agent.cancel({ sessionId: "test-session" });
+      cancelled.resolve();
+
+      await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+      await expect(second).resolves.toEqual({ stopReason: "cancelled" });
+      await consumer;
+      await expect(asked).resolves.toEqual({
+        behavior: "deny",
+        message: "The user cancelled this prompt.",
+      });
+      // Neither a tool call, which would never end, nor a request.
+      expect(updates.filter((update) => "toolCallId" in update)).toEqual([]);
+      expect(permissionRequests).toEqual([]);
+      expect(agent.sessions["test-session"]!.emittedToolCalls.size).toBe(0);
+      expect(texts).toEqual(["Starting the build.", "The build", " passed."]);
+    },
+  );
+
+  it("stops waiting for a tool use that the stream does not show, when Claude Code withdraws the request or the wait runs out", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const asked = Promise.withResolvers<void>();
+    const { agent, permissionRequests } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        // The window stays open while the requests below wait.
+        await asked.promise;
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    // SandboxNetworkAccess asks under an id that no tool use in the stream has.
+    const ask = (id: string, signal: AbortSignal) =>
+      agent.canUseTool("test-session")("SandboxNetworkAccess", { host: "example.com" }, {
+        signal,
+        suggestions: [],
+        toolUseID: id,
+      } as any);
+    // A withdrawn request stops waiting at once, whether it was withdrawn
+    // before it asked or while it waits.
+    agent.toolUseWaitMs = 60_000;
+    await expect(ask("network-1", AbortSignal.abort())).rejects.toThrow("Tool use aborted");
+    const withdrawn = new AbortController();
+    const withdrawnAsk = ask("network-2", withdrawn.signal);
+    withdrawn.abort();
+    await expect(withdrawnAsk).rejects.toThrow("Tool use aborted");
+    // Once the wait runs out, the request goes out as it would without a cancel.
+    agent.toolUseWaitMs = 20;
+    await expect(ask("network-3", new AbortController().signal)).resolves.toMatchObject({
+      behavior: "allow",
+    });
+    expect(permissionRequests.map(({ toolCall }) => toolCall.toolCallId)).toEqual(["network-3"]);
+    asked.resolve();
+    await consumer;
+  });
+
+  it("asks for the next prompt's tool once the consumer reaches it, when Claude Code asks while the window still looks open", async () => {
+    const cancelled = Promise.withResolvers<void>();
+    const asking = Promise.withResolvers<void>();
+    const { agent, updates, permissionRequests } = setup((input) =>
+      (async function* () {
+        const iter = input[Symbol.asyncIterator]();
+        const { value: first } = await iter.next();
+        yield* startTurn(first);
+        yield* answer("Starting the build.");
+        await cancelled.promise;
+        yield abortedResult(first.uuid);
+        yield lifecycleFrame(first.uuid, "cancelled");
+        const { value: next } = await iter.next();
+        // Claude Code asks to run the next prompt's tool before the consumer
+        // has reached the prompt's echo, which closes the window.
+        await asking.promise;
+        yield* startTurn(next);
+        yield* toolUse("toolu_next", "Write", writeInput);
+        yield toolResult("toolu_next", "Wrote the file.");
+        yield stampedResult(next.uuid);
+        yield lifecycleFrame(next.uuid, "completed");
+        yield idle;
+      })(),
+    );
+    const { prompt: first, consumer } = await promptActive(agent, "build it");
+    await agent.cancel({ sessionId: "test-session" });
+    cancelled.resolve();
+    await expect(first).resolves.toMatchObject({ stopReason: "cancelled" });
+
+    const next = agent.prompt({
+      sessionId: "test-session",
+      prompt: [{ type: "text", text: "write it down" }],
+    });
+    expect(agent.sessions["test-session"]!.cancelled).toBe(true);
+    const asked = askToWrite(agent, "toolu_next");
+    asking.resolve();
+
+    await expect(asked).resolves.toMatchObject({ behavior: "allow" });
+    expect(permissionRequests.map(({ toolCall }) => toolCall.toolCallId)).toEqual(["toolu_next"]);
+    await expect(next).resolves.toMatchObject({ stopReason: "end_turn" });
+    await consumer;
+    expect(
+      updates.some(
+        (update) => update.sessionUpdate === "tool_call" && update.toolCallId === "toolu_next",
+      ),
+    ).toBe(true);
   });
 
   it("does not let the next prompt take the result of a prompt the cancel abandoned", async () => {
@@ -22604,7 +23637,8 @@ describe("turn steering (_session/steering)", () => {
     ]);
   }
 
-  it.each([
+  /** Every request to the client that waits for the user, started with the signal that withdraws it. */
+  const userInputRequests = [
     {
       name: "a permission request",
       start: (agent: ClaudeAcpAgent, signal: AbortSignal) =>
@@ -22706,7 +23740,9 @@ describe("turn steering (_session/steering)", () => {
         ),
       response: { action: "accept", content: { choice: "retry_fallback" } },
     },
-  ])(
+  ];
+
+  it.each(userInputRequests)(
     "uses priority:'later' while $name is pending",
     async ({
       start,
@@ -22761,6 +23797,52 @@ describe("turn steering (_session/steering)", () => {
       resolveUserInput(response);
       await pending;
       expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0);
+    },
+  );
+
+  it.each(userInputRequests)(
+    "uses priority:'now' again once $name is withdrawn, though its client never settles it",
+    async ({ start }) => {
+      // A client that ignores $/cancel_request: its request never settles.
+      const userInputRequest = vi.fn(() => new Promise<never>(() => {}));
+      const input = new Pushable<any>();
+      const inputPush = vi.spyOn(input, "push");
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async () => {},
+          requestPermission: userInputRequest,
+          createElicitation: userInputRequest,
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      agent.sessions["test-session"] = mockSessionState({
+        input,
+        turnQueue: [
+          {
+            promptUuid: "running",
+            isLocalOnlyCommand: false,
+            settled: false,
+            resolve: () => {},
+            reject: () => {},
+          },
+        ],
+      });
+
+      const withdrawal = new AbortController();
+      // The tool use ends as aborted. That is not what this test checks.
+      const pending = start(agent, withdrawal.signal).catch(() => {});
+      await waitFor(() => userInputRequest.mock.calls.length === 1);
+      withdrawal.abort();
+      await vi.waitFor(() =>
+        expect(agent.sessions["test-session"].openUserInputs?.size ?? 0).toBe(0),
+      );
+      await pending;
+
+      await agent.steer({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "also handle this" }],
+      });
+      expect(inputPush.mock.calls[0][0].priority).toBe("now");
     },
   );
 

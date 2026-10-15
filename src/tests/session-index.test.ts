@@ -180,6 +180,43 @@ const titleRecords = (sessionId: string, title: string) => [
   { type: "agent-name", agentName: title, sessionId },
 ];
 
+/** A `worktree-state` record, as the CLI writes it when a session enters
+ *  (`worktree` set) or leaves (null) a worktree. */
+const worktreeState = (
+  sessionId: string,
+  worktree: { path: string; enteredExisting?: boolean } | null,
+) => ({
+  type: "worktree-state",
+  worktreeSession: worktree && {
+    originalCwd: "/repo",
+    worktreePath: worktree.path,
+    worktreeName: path.basename(worktree.path),
+    worktreeBranch: `worktree-${path.basename(worktree.path)}`,
+    originalBranch: "main",
+    originalHeadCommit: "0123456789abcdef0123456789abcdef01234567",
+    sessionId,
+    ...(worktree.enteredExisting !== undefined && { enteredExisting: worktree.enteredExisting }),
+  },
+  sessionId,
+});
+
+/** A repository at `repo` with linked worktrees at `linked`, as git lays
+ *  them out. */
+async function linkWorktrees(repo: string, ...linked: string[]): Promise<void> {
+  await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+  for (const worktree of linked) {
+    const meta = path.join(repo, ".git", "worktrees", path.basename(worktree));
+    await fs.mkdir(meta, { recursive: true });
+    await fs.mkdir(worktree, { recursive: true });
+    await fs.writeFile(path.join(meta, "gitdir"), `${path.join(worktree, ".git")}\n`);
+    await fs.writeFile(path.join(meta, "commondir"), "../..\n");
+    await fs.writeFile(path.join(worktree, ".git"), `gitdir: ${meta}\n`);
+  }
+}
+
+const agentWorktreeOfRow = (row: SessionInfo | undefined) =>
+  (row?._meta as any)?.jetbrains?.air?.agentWorktree;
+
 /** The last `count` records of a transcript. */
 async function lastRecords(file: string, count = 2): Promise<unknown[]> {
   const lines = (await fs.readFile(file, "utf8")).trim().split("\n");
@@ -223,6 +260,7 @@ describe("sessionIndex negotiation", () => {
     "sessionArchive",
     "sessionRename",
     "sessionListSubscribe",
+    "sessionWorktrees",
   ];
   const baseline = [
     "sessionFailure",
@@ -514,6 +552,116 @@ describe("session/list of a sessionIndex client", () => {
     await expect(
       agent.listSessions({ cwd: repo, cursor: first.nextCursor, _meta: listMeta({ limit: 1 }) }),
     ).rejects.toMatchObject({ code: -32602 });
+  });
+
+  it("marks the rows of sessions in a worktree Claude Code made (agentWorktree)", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const entered = path.join(workspace, "entered");
+    const user = path.join(workspace, "user");
+    const left = path.join(workspace, "left");
+    await linkWorktrees(repo, made, entered, user, left);
+    const madeId = randomUUID();
+    const enteredId = randomUUID();
+    const leftId = randomUUID();
+    const mainId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      lastMessageAt: base,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inEntered = await writeTranscript({
+      sessionId: enteredId,
+      cwd: entered,
+      lastMessageAt: base - 1000,
+      trailer: [worktreeState(enteredId, { path: entered, enteredExisting: true })],
+    });
+    // A worktree the user made: no record.
+    const inUser = await writeTranscript({ cwd: user, lastMessageAt: base - 2000 });
+    // Left the worktree: the later null record wins.
+    const inLeft = await writeTranscript({
+      sessionId: leftId,
+      cwd: left,
+      lastMessageAt: base - 3000,
+      trailer: [worktreeState(leftId, { path: left }), worktreeState(leftId, null)],
+    });
+    // The main checkout, with a record that says otherwise: not in a linked
+    // worktree, so no field.
+    const inMain = await writeTranscript({
+      sessionId: mainId,
+      cwd: repo,
+      lastMessageAt: base - 4000,
+      trailer: [worktreeState(mainId, { path: made })],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, made, true],
+      [inEntered.id, entered, undefined],
+      [inUser.id, user, undefined],
+      [inLeft.id, left, undefined],
+      [inMain.id, repo, undefined],
+    ]);
+    // The field is omitted, not false.
+    for (const row of page.sessions.slice(1)) {
+      expect((row._meta as any)?.jetbrains?.air ?? {}).not.toHaveProperty("agentWorktree");
+    }
+    // The worktree's own list carries it too.
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, agentWorktreeOfRow(s)])).toEqual([
+      [inMade.id, true],
+    ]);
+  });
+
+  it("marks a session that made its worktree mid-session, and not after a malformed record", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const other = path.join(workspace, "other");
+    await linkWorktrees(repo, made, other);
+    // Started in the main checkout, then EnterWorktree made a worktree: the
+    // CLI moved the transcript there, so the row's cwd is the worktree.
+    const movedId = randomUUID();
+    const moved = await writeTranscript({
+      sessionId: movedId,
+      cwd: repo,
+      dirName: encodeProjectPath(made),
+      lastMessageAt: base,
+      trailer: [
+        worktreeState(movedId, { path: made }),
+        { type: "relocated", sessionId: movedId, relocatedCwd: made },
+      ],
+    });
+    // The latest record has no worktreeSession object: it decides, so the
+    // older marked one does not count.
+    const malformedId = randomUUID();
+    const malformed = await writeTranscript({
+      sessionId: malformedId,
+      cwd: other,
+      lastMessageAt: base - 1000,
+      trailer: [
+        worktreeState(malformedId, { path: other }),
+        { type: "worktree-state", worktreeSession: "other", sessionId: malformedId },
+      ],
+    });
+    const { agent } = await indexAgent();
+
+    const page = await agent.listSessions({
+      cwd: repo,
+      _meta: listMeta({ includeWorktrees: true }),
+    });
+    expect(page.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+      [malformed.id, other, undefined],
+    ]);
+    const own = await agent.listSessions({ cwd: made });
+    expect(own.sessions.map((s) => [s.sessionId, s.cwd, agentWorktreeOfRow(s)])).toEqual([
+      [moved.id, made, true],
+    ]);
   });
 
   it("recovers the cwd of a session whose head has none", async () => {
@@ -1405,6 +1553,39 @@ describe("_session/list/subscribe", () => {
     expect(changes().flatMap((c) => c.sessions.map((s) => s.sessionId))).not.toContain(
       elsewhere.id,
     );
+    await agent.dispose();
+  });
+
+  it("marks the change rows of sessions in a worktree Claude Code made", async () => {
+    const repo = path.join(workspace, "repo");
+    const made = path.join(workspace, "made");
+    const user = path.join(workspace, "user");
+    await linkWorktrees(repo, made, user);
+    // The worktrees' project directories exist before the subscription.
+    await writeTranscript({ cwd: made });
+    await writeTranscript({ cwd: user });
+    const { rowsOf, agent } = await subscribedAgent(repo);
+    const madeId = randomUUID();
+    const inMade = await writeTranscript({
+      sessionId: madeId,
+      cwd: made,
+      trailer: [worktreeState(madeId, { path: made })],
+    });
+    const inUser = await writeTranscript({ cwd: user });
+    expect(await waitFor(() => rowsOf(inMade.id).length > 0 && rowsOf(inUser.id).length > 0)).toBe(
+      true,
+    );
+    expect(agentWorktreeOfRow(rowsOf(inMade.id).at(-1))).toBe(true);
+    expect(agentWorktreeOfRow(rowsOf(inUser.id).at(-1))).toBeUndefined();
+    // The session leaves the worktree: the row changes and loses the field.
+    await fs.appendFile(inMade.file, JSON.stringify(worktreeState(madeId, null)) + "\n");
+    expect(
+      await waitFor(
+        () =>
+          rowsOf(inMade.id).length > 1 &&
+          agentWorktreeOfRow(rowsOf(inMade.id).at(-1)) === undefined,
+      ),
+    ).toBe(true);
     await agent.dispose();
   });
 
@@ -2596,6 +2777,63 @@ describe("tail growth", () => {
     await fs.writeFile(file, `${big(id, at - 1000, 10)}\n${big(id, at, 2_000_000)}\n`);
     const { size } = await fs.stat(file);
     expect((await scanTranscriptFile(file, size)).lastMessageAt).toBe(at);
+  });
+
+  it("reads the worktree record of the tail, else of an earlier scan, else of the head", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    // `claude --worktree` writes the record at the start; 200 KB of
+    // messages push it out of the tail.
+    const messages = Array.from({ length: 20 }, (_, i) => big(id, at + i, 10_000)).join("\n");
+    const inHead = path.join(workspace, `${id}.jsonl`);
+    const headContent = `${record({ path: "/wt" })}\n${messages}\n`;
+    await fs.writeFile(inHead, headContent);
+    expect((await scanTranscriptFile(inHead, Buffer.byteLength(headContent))).agentWorktree).toBe(
+      true,
+    );
+    // A later record in the tail wins over the head.
+    const nullRecord = `${record(null)}\n`;
+    await fs.appendFile(inHead, nullRecord);
+    expect(
+      (await scanTranscriptFile(inHead, Buffer.byteLength(headContent + nullRecord))).agentWorktree,
+    ).toBe(false);
+    // The record an earlier scan found stands when the file grew within the
+    // tail and the new tail lost it, not the older one of the head.
+    const grown = path.join(workspace, `${randomUUID()}.jsonl`);
+    const before = `${record({ path: "/wt" })}\n${messages}\n${record(null)}\n${big(id, at + 50, 10_000)}\n`;
+    await fs.writeFile(grown, before);
+    const first = await scanTranscriptFile(grown, Buffer.byteLength(before));
+    expect(first.agentWorktree).toBe(false);
+    const appended = `${big(id, at + 100, 60_000)}\n`;
+    await fs.appendFile(grown, appended);
+    const second = await scanTranscriptFile(
+      grown,
+      Buffer.byteLength(before + appended),
+      undefined,
+      {
+        ...first,
+        size: Buffer.byteLength(before),
+      },
+    );
+    expect(second.agentWorktree).toBe(false);
+  });
+
+  it("takes the worktree record of a wider tail over the head's", async () => {
+    const id = randomUUID();
+    const at = Date.parse("2026-07-01T00:00:00Z");
+    const record = (worktree: { path: string } | null) =>
+      JSON.stringify(worktreeState(id, worktree));
+    const messages = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => big(id, at + from + i, 10_000)).join("\n");
+    // No prompt, so the tail grows; the null record lies beyond the 64 KB
+    // tail and the 64 KB head, within the 256 KB window.
+    const file = path.join(workspace, `${id}.jsonl`);
+    const content = `${record({ path: "/wt" })}\n${messages(0, 10)}\n${record(null)}\n${messages(100, 10)}\n`;
+    await fs.writeFile(file, content);
+    const facts = await scanTranscriptFile(file, Buffer.byteLength(content));
+    expect(facts.agentWorktree).toBe(false);
   });
 
   it("does not search a transcript of the same size again", async () => {

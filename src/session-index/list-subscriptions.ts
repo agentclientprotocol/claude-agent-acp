@@ -1199,7 +1199,10 @@ export class ListSubscriptions {
       if (!watch.rows.has(id)) candidates.push(...(priorFiles.get(id) ?? []));
     }
     if (candidates.length === 0) return new Set();
-    const { rows, unknown } = await this.deps.index.cachedRowsOf(paths, candidates);
+    // Only the ids count: no worktree check.
+    const { rows, unknown } = await this.deps.index.cachedRowsOf(paths, candidates, {
+      mark: false,
+    });
     for (const row of rows) unknown.add(row.sessionId);
     return unknown;
   }
