@@ -7954,8 +7954,20 @@ export class ClaudeAcpAgent {
             session.titles.reset();
             break;
           }
-          case "tool_use_summary":
           case "prompt_suggestion":
+            // The SDK sends this only when the session set the
+            // `promptSuggestions` option. It usually arrives after the turn's
+            // result, so it rides on a session_info_update rather than the
+            // prompt response.
+            await this.client.sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "session_info_update",
+                _meta: { "_claude/promptSuggestion": message.suggestion },
+              },
+            });
+            break;
+          case "tool_use_summary":
             break;
           case "auth_status":
             if (!message.isAuthenticating && message.error === undefined) {

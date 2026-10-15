@@ -17191,6 +17191,45 @@ describe("emitRawSDKMessages", () => {
     expect(extNotifications.every((n) => n.method === "_claude/sdkMessage")).toBe(true);
   });
 
+  it("sends a prompt suggestion as session_info_update metadata", async () => {
+    const { agent, updates, extNotifications } = createMockAgentWithExtNotification();
+    injectSession(
+      agent,
+      [
+        createResultMessage(),
+        {
+          type: "prompt_suggestion",
+          suggestion: "Run the tests",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        { type: "system", subtype: "session_state_changed", state: "idle" },
+      ],
+      false,
+    );
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    // The suggestion follows the result, so it is sent after prompt() returns.
+    const suggestions = await vi.waitFor(() => {
+      const found = updates.filter(
+        (n) => n.update._meta?.["_claude/promptSuggestion"] !== undefined,
+      );
+      expect(found).toHaveLength(1);
+      return found;
+    });
+    expect(suggestions).toEqual([
+      {
+        sessionId: "test-session",
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: { "_claude/promptSuggestion": "Run the tests" },
+        },
+      },
+    ]);
+    expect(extNotifications).toHaveLength(0);
+  });
+
   it("does not emit when set to false", async () => {
     const { agent, extNotifications } = createMockAgentWithExtNotification();
     injectSession(

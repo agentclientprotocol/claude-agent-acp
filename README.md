@@ -18,6 +18,7 @@ This tool implements an ACP agent by using the official [Claude Agent SDK](https
 - Custom [Slash commands](https://docs.anthropic.com/en/docs/claude-code/slash-commands)
 - Client MCP servers
 - `/mcp` in the chat: the MCP server status as a list. The adapter runs `/mcp reconnect`, `/mcp enable`, and `/mcp disable` through the SDK control API, because Claude Code refuses them in SDK mode. A reconnect of an ACP server that needs authentication starts MCP OAuth through URL elicitation
+- Next-prompt suggestions: set `promptSuggestions: true` in `_meta.claudeCode.options` on `session/new`, `session/load` or `session/resume`, and each suggestion arrives as a `session_info_update` with `_meta["_claude/promptSuggestion"]`. It usually arrives after the prompt response, and Claude Code does not suggest after every turn
 - Session-scoped long-running goals for AIR through the [goal extension](docs/air-extensions.md#goal) under `_meta.jetbrains.air.goal`
 - Structured errors, recovery, and warnings through the opt-in [session failure extension](docs/air-extensions.md#session-failure)
 - Concrete model and effort defaults through the opt-in [recommended config value extension](docs/air-extensions.md#recommended-config-values)
