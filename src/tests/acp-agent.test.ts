@@ -14135,6 +14135,77 @@ describe("usage_update computation", () => {
     expect(usageUpdates[1].update.cost).toBeDefined();
   });
 
+  it("forwards thinking-token estimates as usage_update while the model thinks", async () => {
+    // Redacted thinking streams no text; Claude Code sends `thinking_tokens`
+    // estimates instead (the running total for the current thinking block).
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      createStreamEvent("message_start", {
+        model: "claude-opus-4-20250514",
+        usage: {
+          input_tokens: 1000,
+          output_tokens: 0,
+          cache_read_input_tokens: 200,
+          cache_creation_input_tokens: 100,
+        },
+      }),
+      {
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 150,
+        estimated_tokens_delta: 150,
+      },
+      {
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 400,
+        estimated_tokens_delta: 250,
+      },
+      // A frame without a usable estimate sends nothing.
+      {
+        type: "system",
+        subtype: "thinking_tokens",
+        estimated_tokens: 0,
+        estimated_tokens_delta: 0,
+      },
+      createStreamEvent("message_delta", {
+        usage: { output_tokens: 500 },
+      }),
+      createResultMessageWithModel({
+        modelUsage: {
+          "claude-opus-4-20250514": {
+            inputTokens: 1000,
+            outputTokens: 500,
+            cacheReadInputTokens: 200,
+            cacheCreationInputTokens: 100,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 200000,
+            maxOutputTokens: 16384,
+          },
+        },
+      }),
+      { type: "system", subtype: "session_state_changed", state: "idle" },
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "test" }] });
+
+    const usageUpdates = updates
+      .filter((u: any) => u.update?.sessionUpdate === "usage_update")
+      .map((u: any) => u.update);
+    // message_start, two estimates, message_delta, result.
+    expect(usageUpdates.map((u: any) => u.used)).toEqual([1300, 1450, 1700, 1800, 1800]);
+    expect(usageUpdates.map((u: any) => u._meta?.["_claude/thinkingTokens"])).toEqual([
+      undefined,
+      150,
+      400,
+      undefined,
+      undefined,
+    ]);
+    // The estimates carry the model like every other usage_update.
+    expect(usageUpdates[1]._meta?.["_claude/model"]).toBe("claude-opus-4-20250514");
+  });
+
   it("includes the effective model id on usage_update notifications", async () => {
     const { agent, updates } = createMockAgentWithCapture();
     injectSession(agent, [
