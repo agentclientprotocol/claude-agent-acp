@@ -1651,3 +1651,337 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     );
   });
 });
+
+describe("NativeSubagentRuntime in the AIR form, for an agent from before a load or resume", () => {
+  const worker: HistoricalSubagent = {
+    agentId: "worker-1",
+    launchId: "launch-1",
+    name: "worker",
+    agentType: "Explore",
+    description: "Inspect",
+  };
+  const coordinator: HistoricalSubagent = {
+    agentId: "coordinator-1",
+    launchId: "launch-c",
+    name: "coordinator",
+    agentType: "general-purpose",
+    description: "Coordinate",
+  };
+  const NOW = 1_760_000_000_000;
+
+  const output = (parentToolUseId: string, text = "working"): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text },
+        _meta: { claudeCode: { parentToolUseId } },
+      },
+    }) as AcpSessionNotification;
+  const agentCall = (toolCallId: string): AcpSessionNotification => {
+    const launch = control("tool_call", "pending");
+    return { ...launch, update: { ...launch.update, toolCallId } } as AcpSessionNotification;
+  };
+  const spawned = (published: AcpSessionNotification[]) =>
+    published.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate === "subagent_spawned"
+        ? [`${sessionId} -> ${update.subagentSessionId}`]
+        : [],
+    );
+
+  /** A runtime that knows no child, with the history's lineages and launches. */
+  function reloaded(
+    lineages: Record<string, readonly HistoricalSubagent[]>,
+    { lookUpLaunches = true } = {},
+  ) {
+    const published: AcpSessionNotification[] = [];
+    const log = vi.fn();
+    const lineage = vi.fn(async (agentId: string) => lineages[agentId] ?? []);
+    const launchedAgent = vi.fn(
+      async (launchId: string) =>
+        Object.values(lineages)
+          .flat()
+          .find((entry) => entry.launchId === launchId)?.agentId,
+    );
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log },
+      lineage,
+      lookUpLaunches ? launchedAgent : undefined,
+    );
+    return { runtime, published, lineage, launchedAgent, log };
+  }
+
+  /** Runs `test` with the clock at {@link NOW}. */
+  async function atNow(test: () => Promise<void>) {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    try {
+      await test();
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  /** Output waits under the launch id; a resume signal restores the agent and a later resume numbers on from the first id. */
+  it("restores the agent on a resume signal, delivers its buffered output, and numbers later generations from it", async () => {
+    await atNow(async () => {
+      const { runtime, published } = reloaded({ "worker-1": [worker] }, { lookUpLaunches: false });
+      const delivered: AcpSessionNotification[] = [];
+      const deliver = async (n: AcpSessionNotification) => void delivered.push(n);
+
+      await expect(runtime.route(output("launch-1", "early"), deliver)).resolves.toBeNull();
+      await runtime.taskResumed("worker-1", deliver, "Say PING");
+
+      expect(spawned(published)).toEqual([`root -> worker-1:generation:${NOW}`]);
+      expect(published[0]?.update).toMatchObject({
+        sessionUpdate: "subagent_spawned",
+        subagentSessionId: `worker-1:generation:${NOW}`,
+        name: "worker",
+        task: "Inspect",
+        prompt: "Say PING",
+      });
+      expect(delivered).toHaveLength(1);
+      await expect(runtime.route(output("launch-1"), deliver)).resolves.toMatchObject({
+        sessionId: `worker-1:generation:${NOW}`,
+      });
+
+      await runtime.finishTask("worker-1", "completed", deliver);
+      await runtime.taskResumed("worker-1", deliver);
+      expect(spawned(published)).toEqual([
+        `root -> worker-1:generation:${NOW}`,
+        `root -> worker-1:generation:${NOW + 1}`,
+      ]);
+    });
+  });
+
+  /** A message under a launch id that the history knows restores the agent with no resume signal. */
+  it("restores the agent from a message under an unknown parent_tool_use_id alone, and routes it", async () => {
+    const { runtime, published, launchedAgent } = reloaded({ "worker-1": [worker] });
+    const delivered: AcpSessionNotification[] = [];
+    const deliver = async (n: AcpSessionNotification) => void delivered.push(n);
+
+    await expect(runtime.route(output("launch-1"), deliver)).resolves.toBeNull();
+
+    expect(launchedAgent).toHaveBeenCalledWith("launch-1");
+    expect(spawned(published)).toHaveLength(1);
+    expect(delivered).toHaveLength(1);
+    await expect(runtime.route(output("launch-1"), deliver)).resolves.toMatchObject({
+      sessionId: expect.stringMatching(/^worker-1:generation:\d+$/),
+    });
+  });
+
+  /** An Agent call seen in this process waits for its task_started and is never looked up. */
+  it("buffers a new Agent call of this process until its task_started, with no history lookup", async () => {
+    const { runtime, published, launchedAgent } = reloaded({});
+    const delivered: AcpSessionNotification[] = [];
+    const deliver = async (n: AcpSessionNotification) => void delivered.push(n);
+
+    await runtime.route(agentCall("launch-2"), deliver);
+    await expect(runtime.route(output("launch-2"), deliver)).resolves.toBeNull();
+    expect(launchedAgent).not.toHaveBeenCalled();
+    expect(published).toEqual([]);
+
+    await runtime.taskStarted(
+      { taskId: "fresh-1", toolUseId: "launch-2", subagentType: "Explore" },
+      deliver,
+    );
+    expect(spawned(published)).toEqual(["root -> fresh-1"]);
+    expect(delivered).toHaveLength(1);
+  });
+
+  /** A launch id that resolves to no agent is looked up once. */
+  it("looks up a launch id that the history does not know only once", async () => {
+    const { runtime, published, launchedAgent } = reloaded({});
+
+    await runtime.route(output("launch-9"), async () => {});
+    await runtime.route(output("launch-9"), async () => {});
+
+    expect(launchedAgent).toHaveBeenCalledTimes(1);
+    expect(published).toEqual([]);
+  });
+
+  /** An agent launched by a live restored agent opens under it. */
+  it("opens a nested agent under its parent while the parent is live", async () => {
+    const { runtime, published } = reloaded({
+      "coordinator-1": [coordinator],
+      "worker-1": [coordinator, { ...worker, parentAgentId: "coordinator-1" }],
+    });
+    await runtime.taskResumed("coordinator-1", async () => {});
+    await runtime.taskResumed("worker-1", async () => {});
+
+    const parentId = (published[0]?.update as { subagentSessionId: string }).subagentSessionId;
+    expect(published[1]?.sessionId).toBe(parentId);
+    expect(spawned(published)).toEqual([
+      `root -> ${parentId}`,
+      expect.stringMatching(/^coordinator-1:generation:\d+ -> worker-1:generation:\d+$/),
+    ]);
+  });
+
+  /** An agent whose parent is not live opens under the root. */
+  it("opens a nested agent under the root when its parent is not live", async () => {
+    const { runtime, published } = reloaded({
+      "worker-1": [coordinator, { ...worker, parentAgentId: "coordinator-1" }],
+    });
+    await runtime.taskResumed("worker-1", async () => {});
+
+    expect(published[0]?.sessionId).toBe("root");
+  });
+
+  /** An agent that the history cannot place is not announced. */
+  it("opens nothing when the history cannot place the agent", async () => {
+    const { runtime, published, lineage } = reloaded({});
+
+    await runtime.taskResumed("worker-1", async () => {});
+
+    expect(lineage).toHaveBeenCalledWith("worker-1");
+    expect(published).toEqual([]);
+  });
+
+  /** After clear(), a resume signal restores the agent again. */
+  it("restores the agent again after the runtime was cleared", async () => {
+    const { runtime, published } = reloaded({ "worker-1": [worker] });
+    await runtime.taskResumed("worker-1", async () => {});
+    runtime.clear();
+    await runtime.taskResumed("worker-1", async () => {});
+
+    const ids = spawned(published);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  /** After every child ended, a launch id that resolved to nothing is looked up again. */
+  it("looks up an unknown launch again after the runtime ended every child", async () => {
+    const { runtime, launchedAgent } = reloaded({});
+    await runtime.route(output("launch-9"), async () => {});
+    await runtime.finishAll("cancelled", async () => {});
+    await runtime.route(output("launch-9"), async () => {});
+
+    expect(launchedAgent).toHaveBeenCalledTimes(2);
+  });
+
+  /** Three signals for one agent in flight together open a single generation. */
+  it("opens one generation for a message, a resumedAgentId and a task_updated that arrive together", async () => {
+    const { runtime, published, lineage } = reloaded({ "worker-1": [worker] });
+    const delivered: AcpSessionNotification[] = [];
+    const deliver = async (n: AcpSessionNotification) => void delivered.push(n);
+
+    await Promise.all([
+      runtime.route(output("launch-1"), deliver),
+      runtime.sendMessageResumed("worker-1", deliver, "Say PING", "send-1"),
+      runtime.taskResumed("worker-1", deliver),
+    ]);
+
+    expect(spawned(published)).toHaveLength(1);
+    expect(lineage).toHaveBeenCalledTimes(1);
+    expect(delivered).toHaveLength(1);
+  });
+
+  /** After a lineage that places no agent, every later message skips the history. */
+  it("reads the history once for a launch whose agent cannot be placed", async () => {
+    const published: AcpSessionNotification[] = [];
+    const lineage = vi.fn(async () => []);
+    const launchedAgent = vi.fn(async () => "worker-1");
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (notification) => void published.push(notification),
+      { log: vi.fn() },
+      lineage,
+      launchedAgent,
+    );
+
+    for (let i = 0; i < 5; i++) await runtime.route(output("launch-1"), async () => {});
+
+    expect(launchedAgent).toHaveBeenCalledTimes(1);
+    expect(lineage).toHaveBeenCalledTimes(1);
+    expect(published).toEqual([]);
+  });
+
+  /** A clear() while the lineage is read leaves the stale restore announcing nothing. */
+  it("announces nothing for a restore that a clear() overtook", async () => {
+    const release = deferred();
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (notification) => void published.push(notification),
+      { log: vi.fn() },
+      async () => {
+        await release.promise;
+        return [worker];
+      },
+    );
+
+    const resumed = runtime.taskResumed("worker-1", async () => {});
+    runtime.clear();
+    release.resolve();
+    await resumed;
+
+    expect(published).toEqual([]);
+  });
+
+  const sendMessage = (toolCallId: string): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "SendMessage",
+        status: "pending",
+        _meta: { claudeCode: { toolName: "SendMessage" } },
+      },
+    }) as AcpSessionNotification;
+
+  /** A SendMessage task_started restores the agent, and its id and the launch id both route. */
+  it("restores the agent from a task_started under a SendMessage id", async () => {
+    const { runtime, published } = reloaded({ "worker-1": [worker] }, { lookUpLaunches: false });
+    const deliver = async () => {};
+
+    await runtime.route(sendMessage("send-1"), deliver);
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "send-1", subagentType: "Explore", prompt: "Say PING" },
+      deliver,
+    );
+    await expect(runtime.route(output("launch-1"), deliver)).resolves.toMatchObject({
+      sessionId: expect.stringMatching(/^worker-1:generation:\d+$/),
+    });
+    await runtime.finishTask("worker-1", "completed", deliver, "send-1");
+
+    expect(spawned(published)).toHaveLength(1);
+    expect(published[0]?.update).toMatchObject({ prompt: "Say PING" });
+    expect(published.at(-1)?.update.sessionUpdate).toBe("subagent_state_update");
+  });
+
+  /** A task_started without a subagent type, such as a background shell, reads no history. */
+  it("does not read the history for a task_started without a subagent type", async () => {
+    const { runtime, lineage } = reloaded({ "worker-1": [worker] });
+
+    await runtime.route(sendMessage("send-1"), async () => {});
+    await runtime.taskStarted({ taskId: "shell-1", toolUseId: "send-1" }, async () => {});
+
+    expect(lineage).not.toHaveBeenCalled();
+  });
+
+  /** A new Agent whose task_started precedes its tool call frame opens under its bare id and waits. */
+  it("opens a new Agent whose task_started comes before its frame as the bare id, unannounced", async () => {
+    const { runtime, published, lineage } = reloaded({ "worker-1": [worker] });
+
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+
+    expect(lineage).not.toHaveBeenCalled();
+    expect(published).toEqual([]);
+    await runtime.route(agentCall("launch-1"), async () => {});
+    expect(spawned(published)).toEqual(["root -> worker-1"]);
+  });
+});

@@ -7506,22 +7506,8 @@ describe("subagent permission attribution (issue #851)", () => {
           ].join("\n") + "\n",
         );
         // The SDK reads no transcript for a session id that is not a UUID, as
-        // the test session's is, so it answers with the transcript above.
+        // the test session's is, so it has no session info.
         vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
-        vi.mocked(getSessionMessages).mockResolvedValueOnce([
-          {
-            type: "assistant",
-            uuid: "a1",
-            session_id: "test-session",
-            parent_tool_use_id: null,
-            message: {
-              role: "assistant",
-              content: [
-                { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
-              ],
-            },
-          },
-        ] as Awaited<ReturnType<typeof getSessionMessages>>);
         await writeFile(
           path.join(directory, "test-session", "subagents", "agent-agent-7.meta.json"),
           JSON.stringify({
@@ -8397,6 +8383,167 @@ describe("subagent permission attribution (issue #851)", () => {
       expect(lifecycle).toEqual(expected);
       expect(JSON.stringify(updates)).not.toContain("stray");
       expect(JSON.stringify(updates)).toContain("resumed");
+    });
+  });
+
+  /** After an adapter restart the child's messages carry the old launch id; SendMessage resumes it. */
+  describe("an agent from before an adapter restart, in the AIR form", () => {
+    /**
+     * Writes the history on disk, as the restarted adapter finds it: the root
+     * launched agent-7 with `toolu_old` before a compaction, which drops that
+     * call from the SDK's active chain. Runs `messages` through a new agent
+     * and returns the lifecycle and output the client saw.
+     */
+    async function restarted(messages: unknown[]) {
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-air-restore-"));
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      try {
+        const directory = path.join(configDir, "projects", "-tmp-proj");
+        await mkdir(path.join(directory, "test-session", "subagents"), { recursive: true });
+        const record = (uuid: string, parentUuid: string | null, extra: object) =>
+          JSON.stringify({
+            sessionId: "test-session",
+            cwd: "/tmp/proj",
+            version: "2.0.0",
+            userType: "external",
+            isSidechain: false,
+            timestamp: "2026-10-13T00:00:00.000Z",
+            uuid,
+            parentUuid,
+            ...extra,
+          });
+        await writeFile(
+          path.join(directory, "test-session.jsonl"),
+          [
+            record("u1", null, { type: "user", message: { role: "user", content: "Go" } }),
+            record("a1", "u1", {
+              type: "assistant",
+              message: {
+                id: "m-a1",
+                role: "assistant",
+                model: "claude-opus-5",
+                content: [
+                  { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
+                ],
+              },
+            }),
+            record("b1", null, {
+              type: "system",
+              subtype: "compact_boundary",
+              content: "Conversation compacted",
+            }),
+            record("u2", "b1", { type: "user", message: { role: "user", content: "More" } }),
+          ].join("\n") + "\n",
+        );
+        // The test session id is no UUID, so the SDK finds no session info.
+        vi.mocked(getSessionInfo).mockResolvedValue({ cwd: "/tmp/proj" } as any);
+        await writeFile(
+          path.join(directory, "test-session", "subagents", "agent-agent-7.meta.json"),
+          JSON.stringify({
+            agentType: "Explore",
+            description: "Echo a word",
+            name: "echoer",
+            toolUseId: "toolu_old",
+          }),
+        );
+
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: AcpSessionNotification) => {
+              updates.push(update);
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: AIR_NATIVE_SUBAGENTS,
+        });
+        injectGeneratorSession(agent, makeGenerator(messages));
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+        return updates.flatMap(({ sessionId, update }) =>
+          update.sessionUpdate === "subagent_spawned"
+            ? [[sessionId, update.sessionUpdate, update.subagentSessionId]]
+            : update.sessionUpdate === "agent_message_chunk"
+              ? [[sessionId, update.sessionUpdate, (update.content as { text: string }).text]]
+              : update.sessionUpdate === "subagent_state_update"
+                ? [[sessionId, update.sessionUpdate, update.subagentSessionId]]
+                : [],
+        );
+      } finally {
+        vi.mocked(getSessionInfo).mockReset();
+        if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+        await rm(configDir, { recursive: true, force: true });
+      }
+    }
+    const childMessage = (text: string) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_old",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text },
+      },
+    });
+    const resumed = {
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      tool_use_result: { success: true, resumedAgentId: "agent-7" },
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Resuming" }],
+      },
+    };
+    const childId = expect.stringMatching(/^agent-7:generation:\d+$/);
+
+    /** SendMessage resumes the agent; its launch is before a compaction; a repeated resume signal adds nothing. */
+    it("restores it on a SendMessage resume and routes its run to one generation", async () => {
+      const seen = await restarted([
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-7", message: "Say PING" }),
+        { ...taskStarted("agent-7", "toolu_send"), subagent_type: "Explore", prompt: "Say PING" },
+        childMessage("PING"),
+        resumed,
+        childMessage("PONG"),
+        { ...resumed, uuid: randomUUID() },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-7",
+          tool_use_id: "toolu_send",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]);
+
+      expect(seen).toEqual([
+        ["test-session", "subagent_spawned", childId],
+        [childId, "agent_message_chunk", "PING"],
+        [childId, "agent_message_chunk", "PONG"],
+        ["test-session", "subagent_state_update", childId],
+      ]);
+    });
+
+    /** Only a message under the old launch id arrives, with no resume signal. */
+    it("restores it from a message under the old launch id alone", async () => {
+      const seen = await restarted([childMessage("PING"), childMessage("PONG"), successResult()]);
+
+      expect(seen).toEqual([
+        ["test-session", "subagent_spawned", childId],
+        [childId, "agent_message_chunk", "PING"],
+        [childId, "agent_message_chunk", "PONG"],
+      ]);
     });
   });
 

@@ -70,7 +70,7 @@ describe("subagentLineage", () => {
       let parentUuid: string | null = null;
       return records
         .map((record) => {
-          const linked = { ...record, parentUuid };
+          const linked = "parentUuid" in record ? record : { ...record, parentUuid };
           parentUuid = (record as { uuid: string }).uuid;
           return JSON.stringify(linked);
         })
@@ -129,6 +129,66 @@ describe("subagentLineage", () => {
       { agentId: "coordinator1", launchId: "launch-coordinator", parentAgentId: undefined },
       { agentId: "worker1", launchId: "launch-worker", parentAgentId: "coordinator1" },
     ]);
+  });
+
+  const boundary = (uuid: string) => ({
+    ...base,
+    type: "system",
+    subtype: "compact_boundary",
+    uuid,
+    parentUuid: null,
+    content: "Conversation compacted",
+  });
+
+  /** The root's launch comes before a compaction, which drops it from the SDK's active chain. */
+  it("places an agent whose launch the root made before a compaction", async () => {
+    await writeSession(
+      [user("u1", "Go"), launch("a1", "launch-echoer"), boundary("b1"), user("u2", "More")],
+      { echoer1: { meta: meta("launch-echoer", "echoer"), records: [user("e1", "Work")] } },
+    );
+
+    const lineage = await subagentLineage(sessionId, "echoer1", logger);
+
+    expect(lineage.map(({ agentId, launchId }) => ({ agentId, launchId }))).toEqual([
+      { agentId: "echoer1", launchId: "launch-echoer" },
+    ]);
+  });
+
+  /** An agent's own launch of a nested agent comes before a compaction in that agent's transcript. */
+  it("places a nested agent whose launch its parent agent made before a compaction", async () => {
+    await writeSession([user("u1", "Go"), launch("a1", "launch-coordinator")], {
+      coordinator1: {
+        meta: meta("launch-coordinator", "coordinator"),
+        records: [
+          user("c1", "Work"),
+          launch("c2", "launch-worker"),
+          boundary("c3"),
+          user("c4", "More"),
+        ],
+      },
+      worker1: { meta: meta("launch-worker", "worker"), records: [user("w1", "Work")] },
+    });
+
+    const lineage = await subagentLineage(sessionId, "worker1", logger);
+
+    expect(
+      lineage.map(({ agentId, launchId, parentAgentId }) => ({ agentId, launchId, parentAgentId })),
+    ).toEqual([
+      { agentId: "coordinator1", launchId: "launch-coordinator", parentAgentId: undefined },
+      { agentId: "worker1", launchId: "launch-worker", parentAgentId: "coordinator1" },
+    ]);
+  });
+
+  /** A sidechain record in the root file is an agent's launch, so it does not make the root the parent. */
+  it("does not take a launch in a sidechain record of the root file for the root's", async () => {
+    await writeSession(
+      [user("u1", "Go"), { ...launch("a1", "launch-worker"), isSidechain: true }],
+      {
+        worker1: { meta: meta("launch-worker", "worker"), records: [user("w1", "Work")] },
+      },
+    );
+
+    await expect(subagentLineage(sessionId, "worker1", logger)).resolves.toEqual([]);
   });
 
   it("is empty for an agent whose launch no transcript has, since its parent is unknown", async () => {

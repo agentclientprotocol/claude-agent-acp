@@ -188,6 +188,7 @@ import {
   readSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
+  subagentLaunchedBy,
   subagentLineage,
 } from "./subagent-history.js";
 import {
@@ -4329,6 +4330,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
       (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
+      (launchId) => subagentLaunchedBy(params.sessionId, launchId),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
