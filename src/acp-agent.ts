@@ -295,7 +295,7 @@ import {
   type ToolCallUpdate,
   type ToolUpdateMeta,
 } from "./tool-calls/renderer.js";
-import { resolveSkillPath } from "./tool-calls/reporters/interaction.js";
+import { resolveSkillPath, type SkillScanCache } from "./tool-calls/reporters/interaction.js";
 import {
   messageLoopYielder,
   nodeToWebReadable,
@@ -12552,10 +12552,12 @@ function getAvailableSlashCommands(
   skillPaths?: Map<string, string | undefined>,
   query?: Query,
 ): AvailableCommand[] {
+  // The container listings of this one pass, so a list of a hundred commands lists each container once.
+  const skillScans: SkillScanCache = new Map();
   const skillPath = (name: string, cwd: string): string | undefined => {
     const key = `${cwd}\0${name}`;
     if (skillPaths?.has(key)) return skillPaths.get(key);
-    const resolved = resolveSkillPath(name, cwd);
+    const resolved = resolveSkillPath(name, cwd, skillScans);
     skillPaths?.set(key, resolved);
     return resolved;
   };
