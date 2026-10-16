@@ -3067,6 +3067,9 @@ export class ClaudeAcpAgent {
       logger: this.logger,
       messageIdForGrouping,
     });
+    // The fork row can lack `forkedFrom`: the scan reads it from the first
+    // 64 KB of the transcript only. So the fork is held back by its id too.
+    this.sessionIndex.onForkCreated(params.sessionId, sessionId);
     const { modes, configOptions } = await this.getOrCreateSession({
       sessionId,
       cwd: params.cwd,
@@ -3077,6 +3080,13 @@ export class ClaudeAcpAgent {
     });
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
     return { sessionId, modes, configOptions };
+  }
+
+  /** Runs `fork`, the handler of a `session/fork` request of `sourceId`,
+   *  with its forks held back from the session list (see
+   *  {@link sessionIndex.SessionIndexConnection.forking}). */
+  forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
+    return this.sessionIndex.forking(sourceId, fork);
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -13380,7 +13390,9 @@ export function v1AgentApp(
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
-    .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
+    .onRequest(methods.agent.session.fork, (ctx) =>
+      agent.forking(ctx.params.sessionId, () => agent.unstable_forkSession(ctx.params)),
+    )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))

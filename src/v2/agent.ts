@@ -100,15 +100,17 @@ export function v2AgentApp(
         ...(await setupCommands(agent, params.sessionId, logger)),
       };
     })
-    .onRequest(v2.methods.agent.session.fork, async ({ params }) => {
-      // The agent starts the forked session, so the client can prompt it.
-      const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
-      return {
-        sessionId: response.sessionId,
-        ...v2ResumeSessionResponse(response),
-        ...(await setupCommands(agent, response.sessionId, logger)),
-      };
-    })
+    .onRequest(v2.methods.agent.session.fork, ({ params }) =>
+      agent.forking(params.sessionId, async () => {
+        // The agent starts the forked session, so the client can prompt it.
+        const response = await agent.unstable_forkSession(v1ForkSessionRequest(params));
+        return {
+          sessionId: response.sessionId,
+          ...v2ResumeSessionResponse(response),
+          ...(await setupCommands(agent, response.sessionId, logger)),
+        };
+      }),
+    )
     .onRequest(v2.methods.agent.session.close, async ({ params }) => {
       const response = await agent.closeSession(params);
       client.terminals.forget(params.sessionId);
