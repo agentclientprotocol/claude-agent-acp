@@ -29,6 +29,7 @@ It describes only this adapter.
 - [Session index](#session-index)
 - [Context compaction](#context-compaction)
 - [Question custom answers](#question-custom-answers)
+- [Load replay end](#load-replay-end)
 - [Session fork point](#session-fork-point)
 - [Presentation hints](#presentation-hints)
 - [Removed keys](#removed-keys)
@@ -158,6 +159,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
 | `sessionWorktrees`       | with `sessionIndex` | Nothing on its own: the agent lists it to tell that rows carry `agentWorktree` for a worktree Claude Code made. | [List response](#list-response)                         |
+| `loadReplayEnd`          | no                  | Sends one `session_info_update` after the whole history replay of a loaded session.                             | [Load replay end](#load-replay-end)                     |
 | `rawInputRendering`      | no                  | Sends no display copy of readable input in `content`. The client renders `rawInput`.                            | [Tool call contract](#tool-call-contract)               |
 
 The adapter ignores `planContentDelta`.
@@ -193,6 +195,7 @@ The adapter sends these keys only to an AIR client. "AIR" in the Gate column mea
 | `kind`                         | session mode `_meta.jetbrains.air` and mode config option value `_meta.jetbrains.air` | `standard`, `plan`, `auto_review`, or `full_access`                    | AIR                                                                                    |
 | `kind`                         | available command `_meta.jetbrains.air` of a skill                                    | `skill`                                                                | AIR, when the skill's `SKILL.md` is found; not for a built-in command or an MCP prompt |
 | `skillPath`                    | available command `_meta.jetbrains.air` of a skill                                    | absolute path of the skill's `SKILL.md`                                | AIR, together with `kind: "skill"`                                                     |
+| `loadReplayEnd`                | `session_info_update._meta.jetbrains.air`                                             | `true`                                                                 | `loadReplayEnd`                                                                        |
 | `fork`                         | `session/fork` request `_meta.jetbrains.air` (client to agent)                        | `{version: 1, messageId, messageFingerprint?, messageOccurrence?}`     | none                                                                                   |
 
 ## JetBrains shared keys
@@ -1575,6 +1578,32 @@ A client can render the companion as the free-text choice of that question.
 For AIR, the companion field also carries the same value under the root key `_meta._askUserQuestionCustomAnswer`.
 Released AIR versions read only that key.
 A client that is not AIR gets neither key.
+
+## Load replay end
+
+ACP has no signal that the history replay of `session/load` is over, other than the response.
+The adapter replays the transcript while the Claude Code CLI starts, so the history can arrive long before the response.
+
+The client declares `loadReplayEnd` in its capabilities. The agent does not advertise it.
+After the history replay of the loaded session, the agent then sends one more update for that session:
+
+```json
+{
+  "sessionId": "<loaded session>",
+  "update": {
+    "sessionUpdate": "session_info_update",
+    "_meta": { "jetbrains": { "air": { "version": 1, "loadReplayEnd": true } } }
+  }
+}
+```
+
+- The update has no `title` and no `updatedAt`. A `null` there would clear the value.
+- It comes after every replayed update, the subagent history that the replay sends to the child sessions included, and before the `session/load` response.
+- It comes also for an empty history.
+- It comes for `session/load` of a new or an already live session, and for the ACP v2 `session/resume` with `replayFrom: {type: "start"}`.
+- It does not come when the replay stops or fails. The replay stops when the CLI start fails during the replay.
+- It does not come for a live update, and it does not come to a client without the capability.
+- The `session/load` can still fail after it, for example when the CLI start fails after the replay. The event means that the recorded history arrived whole. The client decides what to do with the failed load.
 
 ## Session fork point
 
