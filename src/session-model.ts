@@ -264,25 +264,40 @@ function resolveSettingsModel(
 const MODEL_FAMILY_ALIASES = new Set(["opus", "sonnet", "haiku", "fable"]);
 
 /** A model id without the spellings that name the same model: provider
- *  prefixes, dates, version suffixes, `-fast` and context hints. `deniedModels`
- *  and gateway listings both match on it. */
+ *  prefixes, dates, version suffixes, `:variant` suffixes, dotted versions,
+ *  `-fast` and context hints. `deniedModels` and gateway listings both match on
+ *  it. OpenRouter lists `anthropic/claude-opus-5.5:batch[1m]`, which normalizes
+ *  to `claude-opus-5-5`; `anthropic/openai/gpt-5` keeps its `openai/` prefix and
+ *  matches no Claude id. */
 function normalizeModelId(value: string): string {
   let id = stripContextHints(value.trim().toLowerCase());
   const providerPrefix = id.lastIndexOf("anthropic.");
   if (providerPrefix !== -1) id = id.slice(providerPrefix + "anthropic.".length);
-  return id
-    .replace(/@.*$/, "")
-    .replace(/-v\d+(?::\d+)?$/, "")
-    .replace(/-fast$/, "")
-    .replace(/-\d{8}$/, "");
+  return (
+    id
+      // Only a leading `anthropic/`: OpenRouter's `anthropic/openai/gpt-5` must
+      // keep `openai/`, which `lastIndexOf` would strip along with it.
+      .replace(/^anthropic\//, "")
+      // `:batch`, `:free`. A letter must follow the colon, so Bedrock's `-v1:0`
+      // is left for the `-vN:M` step below.
+      .replace(/:[a-z][a-z0-9-]*$/, "")
+      // `claude-opus-5.5` -> `claude-opus-5-5`; only dots between two digits.
+      .replace(/(?<=\d)\.(?=\d)/g, "-")
+      .replace(/@.*$/, "")
+      .replace(/-v\d+(?::\d+)?$/, "")
+      .replace(/-fast$/, "")
+      .replace(/-\d{8}$/, "")
+  );
 }
 
 /**
  * Whether managed `deniedModels` blocks a model id, following the CLI's rules
  * closely enough for the picker: a family alias blocks the whole family, and a
  * model id blocks that version in every spelling plus the later minor versions
- * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). The CLI stays
- * the enforcer; this only keeps the picker from offering a refused row.
+ * it prefixes (`claude-opus-5` also blocks `claude-opus-5-5`). Entries share
+ * `normalizeModelId`, so `claude-opus-4.5` or `anthropic/claude-opus-4.5` also
+ * blocks `claude-opus-4-5`, which the CLI may still allow. The CLI stays the
+ * enforcer; this only keeps the picker from offering a refused row.
  */
 export function isDeniedModel(modelId: string, deniedModels: readonly string[]): boolean {
   const id = normalizeModelId(modelId);
