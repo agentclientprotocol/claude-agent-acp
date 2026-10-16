@@ -132,6 +132,8 @@ import {
   AIR_PLAN_FILE_CAPABILITY,
   AIR_GOAL_KEY,
   AIR_KIND_KEY,
+  AIR_LOAD_REPLAY_END_CAPABILITY,
+  AIR_LOAD_REPLAY_END_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
   AIR_SKILL_PATH_KEY,
   clientSupportsAirCapability,
@@ -9301,6 +9303,22 @@ export class ClaudeAcpAgent {
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=publish durationMs=${Math.round(replayFinishedAt - historyLoadedAt)} totalMs=${Math.round(replayFinishedAt - replayStartedAt)} messages=${messages.length}`,
     );
+    // A client with `loadReplayEnd` gets one more update after the whole
+    // replay, the subagent history included. A stopped replay (the CLI start
+    // failed) does not get it, and a failed replay throws before this line.
+    if (
+      !pending?.stopped &&
+      clientSupportsAirCapability(this.clientCapabilities, AIR_LOAD_REPLAY_END_CAPABILITY)
+    ) {
+      await this.client.sessionUpdate({
+        sessionId,
+        // No `title` and no `updatedAt`: `null` would clear them.
+        update: {
+          sessionUpdate: "session_info_update",
+          _meta: withAirMeta(undefined, AIR_LOAD_REPLAY_END_KEY, true),
+        },
+      });
+    }
   }
 
   async readTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {

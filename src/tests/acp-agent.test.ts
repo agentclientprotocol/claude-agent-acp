@@ -3656,7 +3656,14 @@ describe("subagent transcript replay", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
-      await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+      // With `loadReplayEnd`, the end event comes after the child history too.
+      await initializeClient(agent, {
+        _meta: {
+          jetbrains: {
+            air: { version: 1, capabilities: ["nativeSubagentSessions", "loadReplayEnd"] },
+          },
+        },
+      } as ClientCapabilities);
       vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
       vi.mocked(getSubagentMessages).mockClear();
       await (
@@ -3688,7 +3695,11 @@ describe("subagent transcript replay", () => {
         [sessionId, "agent_message_chunk", "Done."],
         [sessionId, "subagent_state_update", child2],
         [sessionId, "subagent_state_update", child1],
+        [sessionId, "session_info_update", undefined],
       ]);
+      expect(updates.at(-1)!.update._meta).toEqual({
+        jetbrains: { air: { version: 1, loadReplayEnd: true } },
+      });
       expect(
         updates.flatMap(({ update }) =>
           update.sessionUpdate === "subagent_state_update" ? [(update as any).state] : [],
