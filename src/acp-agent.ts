@@ -87,6 +87,7 @@ import {
   SDKPartialAssistantMessage,
   SessionMessage,
   SDKUserMessage,
+  SDKUserMessageReplay,
   Settings,
   SlashCommand,
   ThinkingConfig,
@@ -588,6 +589,19 @@ function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteContr
   const argument = match[1]?.trim();
   if (argument?.toLowerCase() === "off") return { action: "disconnect" };
   return argument ? { action: "connect", name: argument } : { action: "connect" };
+}
+
+/** A top-level message a person typed in another client of the session, such
+ *  as claude.ai or the Claude mobile app over Remote Control. Tool results and
+ *  the CLI's own synthetic messages are user-role too, but carry no human
+ *  origin. */
+function isRemoteHumanMessage(message: SDKUserMessage | SDKUserMessageReplay): boolean {
+  return (
+    message.type === "user" &&
+    message.origin?.kind === "human" &&
+    message.parent_tool_use_id === null &&
+    !message.isSynthetic
+  );
 }
 
 /** Whether Claude Code offers a slash command of this name to an ACP client.
@@ -7808,7 +7822,29 @@ export class ClaudeAcpAgent {
                 ) {
                   session.activeTurn.steeredAwaitingResult = true;
                 }
-                // Unrelated replay (e.g. the echo of an already-settled turn).
+                // The echo of a prompt typed in another client of the session
+                // (Remote Control from claude.ai or the mobile app). Claude
+                // Code stamps those as human; the echoes of this adapter's own
+                // prompts carry no origin, so they never reach this.
+                if (isRemoteHumanMessage(message)) {
+                  for (const notification of toAcpNotifications(
+                    message.message.content,
+                    "user",
+                    params.sessionId,
+                    session.toolUseCache,
+                    routedNotificationClient,
+                    this.logger,
+                    {
+                      clientCapabilities: this.clientCapabilities,
+                      toolCallCapabilities: this.toolCallCapabilities,
+                      cwd: session.cwd,
+                      messageId: messageIdForGrouping(message),
+                    },
+                  )) {
+                    await sendUpdate(notification);
+                  }
+                }
+                // Otherwise an unrelated replay (e.g. the echo of an already-settled turn).
                 break;
               }
             }
