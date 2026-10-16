@@ -14,6 +14,7 @@ import {
   type InitializeResponse,
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
 
 /** The v1 `initialize` request that a v2 client means. */
 export function v1InitializeRequest(request: v2.InitializeRequest): InitializeRequest {
@@ -102,6 +103,7 @@ export function v2InitializeResponse(response: InitializeResponse): v2.Initializ
  * - The prompt content and MCP transports that the agent's v1 `initialize`
  *   lists: images, embedded context, and HTTP servers. Stdio servers are in the
  *   v1 baseline; v2 has no SSE transport.
+ * - `systemPrompt`, in `append` and `override` mode.
  */
 const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   prompt: { image: {}, embeddedContext: {} },
@@ -109,6 +111,7 @@ const V2_SESSION_CAPABILITIES: v2.SessionCapabilities = {
   delete: {},
   fork: {},
   additionalDirectories: {},
+  systemPrompt: SYSTEM_PROMPT_CAPABILITY,
 };
 
 /** v2 names the id of a method `methodId`, requires `type`, and lists `env` as name and value pairs. */

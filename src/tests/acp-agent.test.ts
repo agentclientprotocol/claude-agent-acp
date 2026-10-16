@@ -13204,6 +13204,27 @@ describe("session/close", () => {
     await expect(agent.closeSession({ sessionId: "session-1" })).resolves.toEqual({});
   });
 
+  it("answers a prompt that the close stops before it is queued as cancelled", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-1");
+    // The prompt waits in the subscription guard while the close runs.
+    const guard = Promise.withResolvers<void>();
+    const guarded = Promise.withResolvers<void>();
+    vi.spyOn(agent as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
+      guarded.resolve();
+      return guard.promise;
+    });
+    const prompt = agent.prompt({
+      sessionId: "session-1",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await guarded.promise;
+    await agent.closeSession({ sessionId: "session-1" });
+    guard.resolve();
+
+    await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
   it("should not affect other sessions when closing one", async () => {
     const agent = createMockAgent();
     injectSession(agent, "session-a");

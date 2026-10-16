@@ -4,15 +4,17 @@
  *
  * The agent gives each v1 tool call report the `_meta` keys of that report.
  * An AIR client merges them by key (see `ToolCallFieldTracker`), and another
- * v1 client reads them per report. A v2 client stores a tool call's `_meta`,
- * and a report that carries `_meta` replaces it. So the earlier keys must
- * travel again, or the `{ toolName }` of a tool's result would replace, for
- * example, the reason of the denial before it.
+ * v1 client reads them per report. A v2 client patches its stored `_meta` by
+ * top-level key: a key the report leaves out keeps its value, a key set to
+ * `null` is removed, and any other value replaces the key whole, nested
+ * objects included.
  *
  * {@link V2ToolCallMeta} therefore keeps the merged `_meta` of each tool call,
  * with the `claudeCode` keys merged one by one and every other key replaced
- * whole, as `ToolCallFieldTracker` models it. A report that changes it carries
- * all of it; a report that changes nothing carries no `_meta`.
+ * whole, as `ToolCallFieldTracker` models it. A report carries the top-level
+ * keys that changed: all of `claudeCode` when one of its keys changed, since
+ * the client does not merge it, and `null` for a key that is gone. A report
+ * that changes nothing carries no `_meta`.
  *
  * `claudeCode.toolName` repeats the name of the tool, which v2 has a field
  * for. It becomes the `name` of a tool call that has none yet, and is left out
@@ -31,18 +33,28 @@ export class V2ToolCallMeta {
   private readonly calls = new Map<string, { meta: Meta; named: boolean }>();
 
   /**
-   * `report` with the tool call's whole `_meta` when the report changes it,
-   * without `_meta` when it does not, and with `name` when it names the tool
-   * call for the first time. `starts` says that the report starts the tool
-   * call (a v1 `tool_call`), which forgets what an earlier one stored.
+   * The v2 reports of `report`: the report with the `_meta` keys it changes,
+   * without `_meta` when it changes none, and with `name` when it names the
+   * tool call for the first time.
+   *
+   * `starts` says that the report starts the tool call (a v1 `tool_call`),
+   * which forgets what an earlier one with the same id stored: the report sets
+   * `null` for each of its keys. `replaying` says that the client may hold
+   * `_meta` of the tool call from before this connection, for example from an
+   * earlier live session. A replayed start of a tool call this connection has
+   * not reported then clears it with `_meta: null`, and a second report sets
+   * the current keys.
    */
   apply<Report extends ToolCall | ToolCallUpdate>(
     sessionId: string,
     report: Report,
     starts: boolean,
-  ): Report {
+    replaying = false,
+  ): [Report] | [Report, ToolCallUpdate] {
     const key = `${sessionId} ${report.toolCallId}`;
-    const call = (!starts && this.calls.get(key)) || { meta: {}, named: false };
+    const previous = this.calls.get(key);
+    const held = previous?.meta ?? {};
+    const call = (!starts && previous) || { meta: {}, named: false };
     this.remember(key, call);
 
     const { _meta, ...fields } = report;
@@ -57,27 +69,41 @@ export class V2ToolCallMeta {
 
     const meta: Meta = { ...call.meta };
     for (const [name, value] of Object.entries(_meta ?? {})) {
-      if (name !== "claudeCode") meta[name] = value;
+      if (name === "claudeCode") continue;
+      // `null` removes the key in v2, so it is not stored.
+      if (value === null) delete meta[name];
+      else meta[name] = value;
     }
     if (Object.keys(claudeCode).length > 0) {
       meta.claudeCode = { ...asRecord(call.meta.claudeCode), ...claudeCode };
     }
-    if (JSON.stringify(meta) !== JSON.stringify(call.meta)) {
-      call.meta = meta;
-      result._meta = meta;
+    call.meta = meta;
+
+    if (starts && replaying && !previous) {
+      result._meta = null;
+      if (Object.keys(meta).length === 0) return [result];
+      return [result, { toolCallId: report.toolCallId, _meta: meta }];
     }
-    return result;
+    const patch: Meta = {};
+    for (const name of Object.keys(held)) {
+      if (!(name in meta)) patch[name] = null;
+    }
+    for (const [name, value] of Object.entries(meta)) {
+      if (JSON.stringify(value) !== JSON.stringify(held[name])) patch[name] = value;
+    }
+    if (Object.keys(patch).length > 0) result._meta = patch;
+    return [result];
   }
 
   /**
    * The tool call of a permission request's subject: like {@link apply}, but
-   * with the tool call's whole `_meta` even when the subject changes nothing,
-   * since a client can show the request from the request alone.
+   * with every stored `_meta` key even when the subject changes nothing, since
+   * a client can show the request from the request alone.
    */
   subject<Report extends ToolCall | ToolCallUpdate>(sessionId: string, toolCall: Report): Report {
-    const result = this.apply(sessionId, toolCall, false);
+    const [result] = this.apply(sessionId, toolCall, false);
     const stored = this.calls.get(`${sessionId} ${toolCall.toolCallId}`)?.meta ?? {};
-    if (result._meta === undefined && Object.keys(stored).length > 0) result._meta = stored;
+    if (Object.keys(stored).length > 0) result._meta = { ...result._meta, ...stored };
     return result;
   }
 
