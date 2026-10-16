@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
@@ -4589,12 +4589,24 @@ describe("Skill tool rendering", () => {
       rmSync(root, { recursive: true, force: true });
     });
 
-    const writeSkill = (relativeDir: string) => {
+    const writeSkill = (relativeDir: string, declaredName?: string) => {
       const dir = path.join(root, relativeDir);
       mkdirSync(dir, { recursive: true });
       const file = path.join(dir, "SKILL.md");
-      writeFileSync(file, "# skill\n");
+      writeFileSync(
+        file,
+        declaredName ? `---\nname: ${declaredName}\n---\n# skill\n` : "# skill\n",
+      );
       return file;
+    };
+
+    // The skill directory is outside the container, so only a link into the container can hold it.
+    const linkSkill = (relativeLink: string, declaredName?: string) => {
+      const file = writeSkill(`external/${relativeLink.replaceAll("/", "-")}-target`, declaredName);
+      const link = path.join(root, relativeLink);
+      mkdirSync(path.dirname(link), { recursive: true });
+      symlinkSync(path.dirname(file), link);
+      return path.join(link, "SKILL.md");
     };
 
     it("resolves a project-level .claude/skills skill", () => {
@@ -4625,6 +4637,50 @@ describe("Skill tool rendering", () => {
     it("omits the path when the session has no cwd", () => {
       writeSkill(".claude/skills/commits");
       expect(skillMeta("commits").path).toBeUndefined();
+    });
+
+    it("resolves a skill whose directory name differs from its declared name", () => {
+      const file = writeSkill(".claude/skills/rubymine", "rubymine-workflows");
+      expect(skillMeta("rubymine-workflows", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill whose link name differs from its declared name", () => {
+      const file = linkSkill(".claude/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill of .agents/skills by its declared name", () => {
+      const file = linkSkill(".agents/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("prefers the directory that carries the name over a declared name elsewhere", () => {
+      const byName = writeSkill(".claude/skills/commits");
+      writeSkill(".agents/skills/other", "commits");
+      expect(skillMeta("commits", root).path).toBe(byName);
+    });
+
+    it("resolves a directory-scoped skill by its declared name", () => {
+      const file = writeSkill("apps/web/.claude/skills/deployment", "deploy");
+      expect(skillMeta("apps/web:deploy", root).path).toBe(file);
+    });
+
+    it("resolves a plugin skill by its declared name", () => {
+      const file = writeSkill(".claude/plugins/reviewer/skills/auditor", "audit");
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("ignores a name that the frontmatter does not declare", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("rubymine-workflows", root)).toEqual({ name: "rubymine-workflows" });
+    });
+
+    it("picks up a declared name that changed after the first resolution", () => {
+      const file = writeSkill(".claude/skills/commits", "commits");
+      expect(skillMeta("renamed", root).path).toBeUndefined();
+      writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
+      utimesSync(file, new Date(), new Date(Date.now() + 2000));
+      expect(skillMeta("renamed", root).path).toBe(file);
     });
   });
 });

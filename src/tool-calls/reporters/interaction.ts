@@ -5,7 +5,7 @@ import type {
   TaskUpdateInput,
   TodoWriteInput,
 } from "@anthropic-ai/claude-agent-sdk/sdk-tools.js";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { exitPlanModeRawOutput } from "../../exit-plan.js";
@@ -213,6 +213,81 @@ export class AgentControlReporter extends GenericReporter {
 /** Roots a skill's directory may sit under, relative to the directory the scope resolves to. */
 const SKILL_CONTAINER_DIRS = [".claude/skills", ".agents/skills"] as const;
 
+/** Bytes of a `SKILL.md` that are read to find its declared name. A frontmatter block is far shorter. */
+const MAX_FRONTMATTER_BYTES = 8192;
+
+/**
+ * The `name:` that the frontmatter of [skillMdPath] declares, or `undefined` when it declares none.
+ *
+ * Only the frontmatter block is parsed, so a `name:` further down the body is not a name.
+ */
+function declaredSkillName(skillMdPath: string): string | undefined {
+  let head: string;
+  try {
+    head = readFileSync(skillMdPath, "utf8").slice(0, MAX_FRONTMATTER_BYTES);
+  } catch {
+    return undefined;
+  }
+  const lines = head.split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") {
+    return undefined;
+  }
+  for (const line of lines.slice(1)) {
+    if (line.trim() === "---") {
+      break;
+    }
+    const match = /^name:[ \t]*(.*?)[ \t]*$/.exec(line);
+    if (match) {
+      const value = match[1].replace(/^(["'])(.*)\1$/, "$2").trim();
+      return value || undefined;
+    }
+  }
+  return undefined;
+}
+
+/** What one scan of a container directory read, so that an unchanged `SKILL.md` is not parsed again. */
+type ScannedSkill = { mtimeMs: number; declaredName: string | undefined };
+
+const scannedContainers = new Map<string, Map<string, ScannedSkill>>();
+
+/**
+ * The `SKILL.md` paths of [containerDir], keyed by the name their frontmatter declares.
+ *
+ * The directory is listed on every call, and a `SKILL.md` whose modification time is unchanged keeps the name of
+ * the last scan. `statSync` follows links, so a skill reached through a symlinked directory is scanned like any
+ * other. When two skills declare one name, the first entry of the listing owns it, as the probe of
+ * [resolveSkillPath] prefers the first layout that holds the name.
+ */
+function skillsByDeclaredName(containerDir: string): Map<string, string> {
+  let entries: string[];
+  try {
+    entries = readdirSync(containerDir);
+  } catch {
+    scannedContainers.delete(containerDir);
+    return new Map();
+  }
+  const previous = scannedContainers.get(containerDir);
+  const scanned = new Map<string, ScannedSkill>();
+  const byName = new Map<string, string>();
+  for (const entry of entries) {
+    const file = path.join(containerDir, entry, "SKILL.md");
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(file).mtimeMs;
+    } catch {
+      continue;
+    }
+    const cached = previous?.get(entry);
+    const name = cached?.mtimeMs === mtimeMs ? cached.declaredName : declaredSkillName(file);
+    scanned.set(entry, { mtimeMs, declaredName: name });
+    if (name !== undefined && !byName.has(name)) {
+      byName.set(name, file);
+    }
+  }
+  scannedContainers.set(containerDir, scanned);
+  return byName;
+}
+
 /**
  * Absolute path of a skill's `SKILL.md`, or `undefined` when none of the known layouts holds one.
  *
@@ -221,6 +296,10 @@ const SKILL_CONTAINER_DIRS = [".claude/skills", ".agents/skills"] as const;
  * for a `<prefix>:<name>` spelling either a plugin (`.claude/plugins/<prefix>/skills/<name>`) or a
  * directory-scoped skill (`<prefix>/.claude/skills/<name>`), which share that spelling. Only a path that exists
  * on disk is returned, so a wrong guess costs nothing and clients never render a link to a missing file.
+ *
+ * Claude Code advertises a skill by the `name:` of its frontmatter, which can differ from the name of the
+ * directory, or of the symlink, that holds the file. The join by name then misses, so the same containers are
+ * scanned for a `SKILL.md` that declares the name, in the same order.
  */
 export function resolveSkillPath(skillName: string, cwd?: string): string | undefined {
   if (!cwd) {
@@ -232,18 +311,30 @@ export function resolveSkillPath(skillName: string, cwd?: string): string | unde
   if (!name) {
     return undefined;
   }
-  const candidates: string[] = [];
-  const addCandidates = (base: string) => {
+  const containers: string[] = [];
+  const addContainers = (base: string) => {
     for (const container of SKILL_CONTAINER_DIRS) {
-      candidates.push(path.join(base, container, name, "SKILL.md"));
+      containers.push(path.join(base, container));
     }
   };
   if (scope) {
     // A `<prefix>:<name>` skill is either directory-scoped or a plugin's; both spellings look identical.
-    addCandidates(path.join(cwd, scope));
-    candidates.push(path.join(cwd, ".claude/plugins", scope, "skills", name, "SKILL.md"));
+    addContainers(path.join(cwd, scope));
+    containers.push(path.join(cwd, ".claude/plugins", scope, "skills"));
   }
-  addCandidates(cwd);
-  addCandidates(os.homedir());
-  return candidates.find((candidate) => existsSync(candidate));
+  addContainers(cwd);
+  addContainers(os.homedir());
+  const named = containers
+    .map((container) => path.join(container, name, "SKILL.md"))
+    .find((candidate) => existsSync(candidate));
+  if (named) {
+    return named;
+  }
+  for (const container of containers) {
+    const declared = skillsByDeclaredName(container).get(name);
+    if (declared) {
+      return declared;
+    }
+  }
+  return undefined;
 }
