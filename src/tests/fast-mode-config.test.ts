@@ -385,7 +385,7 @@ describe("syncFastModeState (SDK-driven state changes)", () => {
       sessionUpdate: "agent_message_chunk",
       content: {
         type: "text",
-        text: "**Fast mode turned off:** requires extra usage to be enabled for this account.",
+        text: "\n\n> **Fast mode turned off:** requires extra usage to be enabled for this account.\n\n",
       },
     });
     expect(sessionUpdates[1].update).toMatchObject({ sessionUpdate: "config_option_update" });
