@@ -99,6 +99,19 @@ describe("/remote-control", () => {
     },
   );
 
+  it("refuses the command while Claude Code runs a cycle of its own", async () => {
+    const enableRemoteControl = vi.fn(async () => ({}));
+    const { agent, sessionUpdate } = createAgent({ enableRemoteControl });
+    (agent as any).startForeground("session-1", "autonomous-cycle");
+
+    await expect(agent.prompt(prompt("/remote-control"))).rejects.toThrow(
+      /while Claude is working/,
+    );
+
+    expect(enableRemoteControl).not.toHaveBeenCalled();
+    expect(sessionUpdate).not.toHaveBeenCalled();
+  });
+
   it("answers while only settled turns remain in the queue", async () => {
     const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
     const { agent } = createAgent({ enableRemoteControl }, { turnQueue: [{ settled: true }] });

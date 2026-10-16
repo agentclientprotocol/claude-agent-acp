@@ -3816,8 +3816,13 @@ export class ClaudeAcpAgent {
     ) {
       // The reply bypasses the turn queue, so it would land inside the output of
       // a turn that is still running, and v2 would report no `running` state
-      // around it. Refuse instead of interleaving.
-      if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+      // around it. Refuse instead of interleaving. `foregroundWork` also covers
+      // a cycle that Claude Code started on its own, such as its follow-up
+      // after a background subagent finished, which is not in `turnQueue`.
+      if (
+        this.foregroundWork.has(params.sessionId) ||
+        (session.turnQueue ?? []).some((turn) => !turn.settled)
+      ) {
         throw RequestError.invalidRequest(
           undefined,
           "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
