@@ -618,26 +618,33 @@ function parseAsyncTaskStopRequest(value: unknown): AsyncTaskStopRequest {
 }
 
 /** How urgently the SDK delivers a steered message relative to the running
- *  turn — an internal Claude implementation detail, not part of the wire
- *  contract. `now` pre-empts the current generation, while `later` waits for a
- *  pending permission/elicitation callback to settle instead of cancelling its
- *  ACP request and hiding the client's user-input card (IJAI-1191). */
+ *  turn. `now` (the default) pre-empts the current generation, while `later`
+ *  waits for a pending permission/elicitation callback to settle instead of
+ *  cancelling its ACP request and hiding the client's user-input card
+ *  (IJAI-1191). A client may ask for `next` in `_meta.steering.priority`. */
 const STEER_PRIORITY_NOW = "now" as const;
 const STEER_PRIORITY_LATER = "later" as const;
 
+/** SDK delivery priorities a client may request for a steered message. `next`
+ *  joins the turn after the running tool call finishes, as Claude Code does for a
+ *  message typed during work; `now` aborts the running cycle. */
+const STEER_PRIORITIES = ["now", "next", "later"] as const;
+type SteerPriority = (typeof STEER_PRIORITIES)[number];
+
 /** Request-level steering options. `promptRequired` is opt-in so existing Hosts
- *  keep the established idle fallback behavior. */
+ *  keep the established idle fallback behavior. `priority` is optional and
+ *  defaults to `now`; a pending permission/elicitation still forces `later`. */
 type SteerMeta = {
   [key: string]: unknown;
   steering?: {
     idleBehavior?: "promptRequired";
+    priority?: SteerPriority;
   };
 };
 
 /** Params of a {@link STEER_METHOD} request. Shaped like the relevant subset of
- *  a `PromptRequest` so the same `promptToClaude` conversion applies. Delivery
- *  priority is deliberately NOT exposed here — it's an internal detail the agent
- *  chooses (see {@link STEER_PRIORITY}). */
+ *  a `PromptRequest` so the same `promptToClaude` conversion applies. A client
+ *  may request a delivery priority in `_meta.steering.priority`. */
 export type SteerRequest = {
   sessionId: string;
   prompt: PromptRequest["prompt"];
@@ -674,6 +681,13 @@ function parseSteerRequest(params: unknown): SteerRequest {
       : undefined;
   if (idleBehavior !== undefined && idleBehavior !== "promptRequired") {
     throw RequestError.invalidParams(undefined, "unsupported steering idleBehavior");
+  }
+  const priority =
+    steering && typeof steering === "object"
+      ? (steering as Record<string, unknown>).priority
+      : undefined;
+  if (priority !== undefined && !STEER_PRIORITIES.includes(priority as SteerPriority)) {
+    throw RequestError.invalidParams(undefined, "unsupported steering priority");
   }
   return {
     sessionId,
@@ -4183,9 +4197,11 @@ export class ClaudeAcpAgent {
     const steeredUuid = randomUUID();
     userMessage.uuid = steeredUuid;
     // Deliver into the running turn rather than queuing behind it as a fresh
-    // prompt would.
+    // prompt would, at the priority the client asked for (default `now`).
     userMessage.priority =
-      (session.openUserInputs?.size ?? 0) > 0 ? STEER_PRIORITY_LATER : STEER_PRIORITY_NOW;
+      (session.openUserInputs?.size ?? 0) > 0
+        ? STEER_PRIORITY_LATER
+        : (params._meta?.steering?.priority ?? STEER_PRIORITY_NOW);
     // Mark before the push and in the same synchronous section as the in-flight
     // check: the interrupt can have the CLI finalizing the aborted cycle by the
     // time the consumer next runs, and an unmarked result would settle the turn
