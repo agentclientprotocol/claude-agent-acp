@@ -3848,6 +3848,11 @@ export class ClaudeAcpAgent {
           "Remote Control is already being changed. Try again in a moment.",
         );
       }
+      // Once Remote Control is on, other clients can start turns or send
+      // messages on their own. Something has to read the query stream for
+      // those to reach this client, and a command that answers without a turn
+      // would otherwise leave the stream unread until the next prompt.
+      this.ensureConsumer(session, params.sessionId);
       // Answered by the adapter without a model turn; v2 clients treat an
       // `ended` without a prior `inserted` as a refused prompt.
       events.inserted(randomUUID());
