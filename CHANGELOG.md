@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.93.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.92.0...v0.93.0) (2026-10-16)
+
+
+### Features
+
+* add /remote-control command to start Remote Control for a session ([#1197](https://github.com/agentclientprotocol/claude-agent-acp/issues/1197)) ([db9f50f](https://github.com/agentclientprotocol/claude-agent-acp/commit/db9f50f02145d088c0f6080672969a0673ba6359))
+
+
+### Bug Fixes
+
+* hold a fork back from the session list until its session/fork response is out ([#1368](https://github.com/agentclientprotocol/claude-agent-acp/issues/1368)) ([f5967fd](https://github.com/agentclientprotocol/claude-agent-acp/commit/f5967fd6b49ce4821cc829c26902ccf46f671992))
+
 ## [0.92.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.91.0...v0.92.0) (2026-10-16)
 
 
