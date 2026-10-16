@@ -133,6 +133,101 @@ describe("/remote-control", () => {
     expect(push).toHaveBeenCalledOnce();
   });
 
+  it("handles the command when Claude Code lists it as terminal-only", async () => {
+    const enableRemoteControl = vi.fn(async () => ({ session_url: "https://claude.ai/code/s" }));
+    const supportedCommands = async () => [
+      { name: "remote-control", description: "", argumentHint: "" },
+    ];
+    const { agent, sessionUpdate } = createAgent(
+      { enableRemoteControl, supportedCommands },
+      { terminalSlashCommands: ["remote-control"] },
+    );
+
+    await agent.prompt(prompt("/remote-control"));
+    await (agent as any).sendAvailableCommandsUpdate("session-1");
+
+    expect(enableRemoteControl).toHaveBeenCalledOnce();
+    const advertised = (sessionUpdate.mock.calls as any[][])
+      .map(([notification]) => notification.update.availableCommands)
+      .find(Boolean);
+    expect(advertised.filter((command: any) => command.name === "remote-control")).toHaveLength(1);
+  });
+
+  describe("while the request is in flight", () => {
+    const events = { inserted() {}, ended() {}, failed() {} };
+
+    function pendingRequest() {
+      let finish!: (result: { session_url: string }) => void;
+      const enableRemoteControl = vi.fn(
+        () =>
+          new Promise<{ session_url: string }>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      return { enableRemoteControl, finish: (result: { session_url: string }) => finish(result) };
+    }
+
+    function createPendingAgent() {
+      const request = pendingRequest();
+      const push = vi.fn();
+      const created = createAgent(
+        Object.assign((async function* () {})(), {
+          enableRemoteControl: request.enableRemoteControl,
+          supportedCommands: async () => [],
+        }) as any,
+        { input: { push } },
+      );
+      return { ...created, ...request, push };
+    }
+
+    it("holds a following prompt back until the reply is sent", async () => {
+      const { agent, sessionUpdate, enableRemoteControl, finish, push } = createPendingAgent();
+
+      const command = agent.startTurn(prompt("/remote-control"), events);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      const following = agent.startTurn(prompt("hello"), events);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(push).not.toHaveBeenCalled();
+
+      finish({ session_url: "https://claude.ai/code/s" });
+      await Promise.all([command, following]);
+
+      expect(sessionUpdate).toHaveBeenCalledOnce();
+      expect(push).toHaveBeenCalledOnce();
+      expect(sessionUpdate.mock.invocationCallOrder[0]).toBeLessThan(
+        push.mock.invocationCallOrder[0],
+      );
+    });
+
+    it("refuses a second command", async () => {
+      const { agent, enableRemoteControl, finish } = createPendingAgent();
+
+      const command = agent.startTurn(prompt("/remote-control"), events);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+
+      await expect(agent.startTurn(prompt("/remote-control off"), events)).rejects.toThrow(
+        /already being changed/,
+      );
+      expect(enableRemoteControl).toHaveBeenCalledOnce();
+
+      finish({ session_url: "https://claude.ai/code/s" });
+      await command;
+    });
+
+    it("lets prompts through again once the command is done", async () => {
+      const { agent, finish, enableRemoteControl, push } = createPendingAgent();
+
+      const command = agent.startTurn(prompt("/remote-control"), events);
+      await vi.waitFor(() => expect(enableRemoteControl).toHaveBeenCalled());
+      finish({ session_url: "https://claude.ai/code/s" });
+      await command;
+      await agent.startTurn(prompt("hello"), events);
+
+      expect(push).toHaveBeenCalledOnce();
+    });
+  });
+
   it("advertises the command only when the query supports it", async () => {
     const supportedCommands = async () => [{ name: "compact", description: "", argumentHint: "" }];
     const supported = createAgent({ enableRemoteControl: vi.fn(), supportedCommands });

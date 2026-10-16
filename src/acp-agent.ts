@@ -584,12 +584,19 @@ function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteContr
   return argument ? { action: "connect", name: argument } : { action: "connect" };
 }
 
-/** Whether Claude Code itself offers a slash command of this name. The adapter
- *  only stands in for the command when it does not, so a command or skill of
- *  the user's own is never shadowed. */
-async function claudeCodeAdvertisesCommand(query: Query, name: string): Promise<boolean> {
-  const commands = await query.supportedCommands();
-  return commands.some((command) => command.name === name);
+/** Whether Claude Code offers a slash command of this name to an ACP client.
+ *  This is the rule `getAvailableSlashCommands` applies when it lists the
+ *  commands, so the adapter stands in for the command exactly when the client
+ *  sees the adapter's entry: Claude Code's terminal-bound commands are not
+ *  offered, and a user's own command or skill of the name is never shadowed. */
+function claudeCodeOffersCommand(
+  commands: readonly SlashCommand[],
+  terminalCommands: readonly string[] | undefined,
+  name: string,
+): boolean {
+  return commands.some(
+    (command) => command.name === name && !terminalCommands?.includes(command.name),
+  );
 }
 
 /** Wait for a polling interval, resolving false when the session is aborted. */
@@ -1058,6 +1065,9 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The `/remote-control` command that is running, from its request to its
+   *  reply. Prompts wait for it, and a second command is refused meanwhile. */
+  remoteControlCommand?: Promise<void>;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -3771,7 +3781,11 @@ export class ClaudeAcpAgent {
     if (
       remoteControlCommand &&
       supportsRemoteControl(session.query) &&
-      !(await claudeCodeAdvertisesCommand(session.query, REMOTE_CONTROL_COMMAND_NAME))
+      !claudeCodeOffersCommand(
+        await session.query.supportedCommands(),
+        session.terminalSlashCommands,
+        REMOTE_CONTROL_COMMAND_NAME,
+      )
     ) {
       // The reply bypasses the turn queue, so it would land inside the output of
       // a turn that is still running, and v2 would report no `running` state
@@ -3782,10 +3796,29 @@ export class ClaudeAcpAgent {
           "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
         );
       }
+      if (session.remoteControlCommand) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control is already being changed. Try again in a moment.",
+        );
+      }
       // Answered by the adapter without a model turn; v2 clients treat an
       // `ended` without a prior `inserted` as a refused prompt.
       events.inserted(randomUUID());
-      await this.runRemoteControlCommand(params.sessionId, session.query, remoteControlCommand);
+      // The request goes over the network. Until it and its reply are done,
+      // `remoteControlCommand` holds back the prompts that follow, which would
+      // otherwise start a turn that the reply lands in.
+      const command = this.runRemoteControlCommand(
+        params.sessionId,
+        session.query,
+        remoteControlCommand,
+      );
+      session.remoteControlCommand = command;
+      try {
+        await command;
+      } finally {
+        session.remoteControlCommand = undefined;
+      }
       events.ended({ stopReason: "end_turn" });
       return;
     }
@@ -3829,6 +3862,12 @@ export class ClaudeAcpAgent {
     } else {
       session.promptSuggestionExpected = false;
     }
+
+    // A `/remote-control` command still in flight answers into the session's
+    // output; wait for its reply before this prompt's turn can begin. Nothing
+    // below awaits before the turn is queued, so no command can start between.
+    // A failure of the command's reply is reported to the command's own prompt.
+    if (session.remoteControlCommand) await session.remoteControlCommand.catch(() => {});
 
     // Each prompt is a Turn that the persistent consumer settles once the
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
@@ -12480,7 +12519,7 @@ function getAvailableSlashCommands(
     ...advertised,
     MCP_AVAILABLE_COMMAND,
     ...remoteControlCommands.filter(
-      (command) => !advertised.some((existing) => existing.name === command.name),
+      (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
     ),
   ];
 }
