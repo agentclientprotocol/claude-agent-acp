@@ -88,6 +88,13 @@ export function v2AgentApp(
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
+      // v2 requires a snapshot of the foreground state after the replay and
+      // before the response, also without a replay: a resumed live session can
+      // be running a turn, or waiting on a permission request.
+      void client.send({
+        sessionId: params.sessionId,
+        update: stateSnapshot(agent.foregroundState(params.sessionId)),
+      });
       return {
         ...v2ResumeSessionResponse(response),
         ...(await setupCommands(agent, params.sessionId, logger)),
@@ -121,6 +128,13 @@ export function v2AgentApp(
       }),
     )
     .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+}
+
+/** The `state_update` that reports `state` as the current foreground state. */
+function stateSnapshot(state: "idle" | "running" | "requires_action"): v2.SessionUpdate {
+  if (state === "idle") return { sessionUpdate: "state_update", state: "idle" };
+  if (state === "running") return { sessionUpdate: "state_update", state: "running" };
+  return { sessionUpdate: "state_update", state: "requires_action" };
 }
 
 /**
@@ -160,6 +174,14 @@ class V2ClientConnection implements AcpClient {
   /** The session whose replay announced each replaying subagent. */
   private readonly replayRoots = new Map<string, string>();
 
+  /**
+   * The last work state that a replay reported for each subagent, as the
+   * `state_update` of the child's own stream. It goes out once the replay
+   * ends: v2 forbids replaying a child's past `running` and `idle` as current
+   * activity.
+   */
+  private readonly replayedChildStates = new Map<string, v2.UpdateSessionNotification>();
+
   /** The display terminals of the commands that the agent runs. */
   readonly terminals = new V2Terminals();
 
@@ -178,17 +200,27 @@ class V2ClientConnection implements AcpClient {
    * replayed message, and chunks append, so before the first replayed chunk of
    * each message the client gets the message with no content, which clears it,
    * as v2 requires of a message replayed as chunks.
+   *
+   * Each replayed subagent gets one `state_update` on its own stream, with its
+   * last state, after the replay.
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
     this.replays.set(sessionId, new Set());
+    const children = () =>
+      [...this.replayRoots].filter(([, root]) => root === sessionId).map(([child]) => child);
     try {
-      return await restore();
+      const result = await restore();
+      for (const child of children()) {
+        const state = this.replayedChildStates.get(child);
+        if (state) void this.send(state);
+      }
+      return result;
     } finally {
       this.replays.delete(sessionId);
-      for (const [child, root] of this.replayRoots) {
-        if (root !== sessionId) continue;
+      for (const child of children()) {
         this.replays.delete(child);
         this.replayRoots.delete(child);
+        this.replayedChildStates.delete(child);
       }
     }
   }
@@ -234,8 +266,13 @@ class V2ClientConnection implements AcpClient {
       return clear ? [clear, v2Update] : [v2Update];
     });
     // A subagent's work state also goes to the child's own stream, after the
-    // parent's copy.
-    const childState = v2ChildStateUpdate(update);
+    // parent's copy. During a replay, only its last state goes, after the
+    // replay (see `replayedChildStates`).
+    let childState = v2ChildStateUpdate(update);
+    if (childState && this.replays.has(notification.sessionId)) {
+      this.replayedChildStates.set(childState.sessionId, childState);
+      childState = undefined;
+    }
     // Every update goes to the connection before any is awaited, so an update
     // that another call sends meanwhile cannot come between them.
     await Promise.all([
@@ -249,7 +286,8 @@ class V2ClientConnection implements AcpClient {
   /**
    * The v2 updates of a v1 update: for a tool call report, the updates of its
    * terminal first (see {@link V2Terminals}), then the report itself, with the
-   * `_meta` that the client stores (see {@link V2ToolCallMeta}).
+   * `_meta` keys that it changes (see {@link V2ToolCallMeta}), and during a
+   * replay the `_meta` of a tool call that the report cleared.
    */
   private v2Updates(
     sessionId: string,
@@ -262,8 +300,21 @@ class V2ClientConnection implements AcpClient {
     const { terminal, report } = this.terminals.split(sessionId, update);
     if (!report) return terminal;
     const starts = report.sessionUpdate === "tool_call";
-    const reportUpdate = v2SessionUpdate(this.toolCallMeta.apply(sessionId, report, starts));
-    return [...terminal, ...(reportUpdate ? [reportUpdate] : [])];
+    const [reported, metaPatch] = this.toolCallMeta.apply(
+      sessionId,
+      report,
+      starts,
+      this.replays.has(sessionId),
+    );
+    const reportUpdate = v2SessionUpdate(reported);
+    const metaUpdate = metaPatch
+      ? v2SessionUpdate({ sessionUpdate: "tool_call_update", ...metaPatch })
+      : undefined;
+    return [
+      ...terminal,
+      ...(reportUpdate ? [reportUpdate] : []),
+      ...(metaUpdate ? [metaUpdate] : []),
+    ];
   }
 
   /**

@@ -108,6 +108,12 @@ export type HistoricalSubagent = {
  */
 export type SubagentLineage = (agentId: string) => Promise<readonly HistoricalSubagent[]>;
 
+/**
+ * The agent that the Agent or Task call `launchId` launched, from the session's
+ * subagent history; undefined when the history has no such call.
+ */
+export type LaunchedAgent = (launchId: string) => Promise<string | undefined>;
+
 const MAX_PENDING_PARENTS = 64;
 const MAX_PENDING_UPDATES = 256;
 const MAX_PENDING_UPDATES_PER_PARENT = 32;
@@ -136,17 +142,30 @@ export class NativeSubagentRuntime {
    */
   private readonly childByToolCall = new Map<string, NativeSubagent>();
   private readonly taskFinishPromises = new Map<string, Promise<void>>();
-  /** The RFD form: the session that made each SendMessage call. */
+  /** The session that made each SendMessage call. */
   private readonly senderByToolUse = new Map<string, string>();
   private readonly generationByTaskId = new Map<string, number>();
   private readonly pending = new Map<string, AcpSessionNotification[]>();
   private pendingCount = 0;
+  /** The AIR form: agents being restored from the history, by agent id. */
+  private readonly agentRestores = new Map<string, Promise<void>>();
+  /** The AIR form: launch ids being resolved to an agent, by launch id. */
+  private readonly launchRestores = new Map<string, Promise<void>>();
+  /** The AIR form: launch ids that the history has no restorable agent for. */
+  private readonly unresolvedLaunches = new Set<string>();
+  /** The AIR form: agents that the history could not place, so it is read once. */
+  private readonly unrestorableAgents = new Set<string>();
+  /** The latest generation number given to a restored agent. */
+  private lastRestoredGeneration = 0;
+  /** Bumped when the restore state is dropped; a restore that began before it is void. */
+  private restoreEpoch = 0;
   /** The RFD form: how many times the parent was cancelled (see {@link awaitingUser}). */
   private parentCancels = 0;
 
   /**
    * `form` is undefined for a client without native subagent sessions. The RFD
-   * form restores an agent from before a load or resume with `lineage`.
+   * form restores an agent from before a load or resume with `lineage`. The AIR
+   * form does too, and `launchedAgent` finds the agent that a launch call made.
    */
   constructor(
     form: SubagentForm | undefined,
@@ -155,6 +174,7 @@ export class NativeSubagentRuntime {
     private readonly publish: Publish,
     private readonly logger: Logger,
     private readonly lineage?: SubagentLineage,
+    private readonly launchedAgent?: LaunchedAgent,
   ) {
     this.form = form;
     this.enabled = form !== undefined;
@@ -174,7 +194,7 @@ export class NativeSubagentRuntime {
     forcedSessionId?: string,
   ): Promise<AcpSessionNotification | null> {
     const routed = await this.routeUpdate(notification, deliver, forcedSessionId);
-    if (routed && this.form === "rfd") this.rememberSendMessage(routed);
+    if (routed) this.rememberSendMessage(routed);
     return routed;
   }
 
@@ -266,7 +286,13 @@ export class NativeSubagentRuntime {
     if (this.enabled && claudeMeta?.parentToolUseId) {
       const child = this.childByParentToolUse.get(claudeMeta.parentToolUseId);
       if (!child || !child.announced) {
-        this.buffer(claudeMeta.parentToolUseId, notification);
+        const launchId = claudeMeta.parentToolUseId;
+        this.buffer(launchId, notification);
+        // An id that this process never saw is the launch call of an agent
+        // from before a load or resume; a new Agent call is known by now.
+        if (!child && this.form === "air" && this.isUnseenLaunch(launchId)) {
+          await this.restoreLaunch(launchId, deliver);
+        }
         return null;
       }
       return this.toChild(child, notification, toolCallId);
@@ -293,6 +319,24 @@ export class NativeSubagentRuntime {
         deliver,
       );
       return;
+    }
+    // The SDK starts an agent from before a restart under the id of the
+    // SendMessage call that resumed it, as in the RFD form (see `restore`).
+    // Its output comes under the id of the call that launched it.
+    if (
+      this.form === "air" &&
+      task.subagentType &&
+      task.toolUseId &&
+      this.senderByToolUse.has(task.toolUseId) &&
+      !this.children.has(task.taskId)
+    ) {
+      await this.restoreAgent(task.taskId, deliver, promptText(task.prompt));
+      const restored = this.children.get(task.taskId);
+      if (restored) {
+        this.taskByToolUse.set(task.toolUseId, task.taskId);
+        this.childByParentToolUse.set(task.toolUseId, restored);
+        return;
+      }
     }
     if (!task.subagentType) {
       if (task.toolUseId) {
@@ -350,11 +394,17 @@ export class NativeSubagentRuntime {
    * In the RFD form, the running patch only reports that the child runs: its
    * prompt is a guess (the latest SendMessage to the agent), and the
    * `task_started` or the SendMessage result carries the delegation.
+   *
+   * In the AIR form, an agent that the runtime does not know is restored from
+   * the session's history (see {@link restoreAgent}).
    */
   async taskResumed(taskId: string, deliver: Publish, prompt?: string): Promise<void> {
     if (!this.enabled) return;
     const previous = this.children.get(taskId);
-    if (!previous) return;
+    if (!previous) {
+      if (this.form === "air") await this.restoreAgent(taskId, deliver, prompt);
+      return;
+    }
     const finishing = this.taskFinishPromises.get(taskId) ?? previous.terminalPromise;
     if (finishing) await finishing.catch(() => {});
     if (this.form === "rfd") {
@@ -508,6 +558,7 @@ export class NativeSubagentRuntime {
       this.identityByToolUse.clear();
       this.controlByToolUse.clear();
       this.parentByToolUse.clear();
+      this.forgetRestores();
     }
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) throw new AggregateError(errors, "Failed to finish native subagents");
@@ -660,6 +711,115 @@ export class NativeSubagentRuntime {
       for (const pending of this.takePending(entry.launchId)) await deliver(pending);
     }
     return this.children.get(agentId);
+  }
+
+  /**
+   * The AIR form: whether no call of this process made `launchId`. A new Agent
+   * call has a control update before its `task_started`, and a launch that was
+   * restored or looked up is registered or remembered.
+   */
+  private isUnseenLaunch(launchId: string): boolean {
+    return (
+      !!this.launchedAgent && !this.unresolvedLaunches.has(launchId) && this.isUnseenCall(launchId)
+    );
+  }
+
+  /** Whether this runtime has no record of the tool call `toolUseId`. */
+  private isUnseenCall(toolUseId: string): boolean {
+    return (
+      !this.taskByToolUse.has(toolUseId) &&
+      !this.childByParentToolUse.has(toolUseId) &&
+      !this.controlByToolUse.has(toolUseId) &&
+      !this.parentByToolUse.has(toolUseId) &&
+      !this.identityByToolUse.has(toolUseId)
+    );
+  }
+
+  /**
+   * The AIR form: restores the agent that the call `launchId` launched, once.
+   * Concurrent callers wait for the same lookup. Without an agent, the updates
+   * buffered under `launchId` stay buffered and `launchId` is not looked up again.
+   */
+  private restoreLaunch(launchId: string, deliver: Publish): Promise<void> {
+    const existing = this.launchRestores.get(launchId);
+    if (existing) return existing;
+    const epoch = this.restoreEpoch;
+    const restoring = (async () => {
+      const agentId = await this.launchedAgent?.(launchId).catch((error: unknown) => {
+        this.logger.log(
+          `Session ${this.rootSessionId}: failed to read the history of launch ${launchId}: ${error}`,
+        );
+        return undefined;
+      });
+      if (epoch !== this.restoreEpoch) return;
+      if (agentId) await this.restoreAgent(agentId, deliver);
+      if (epoch !== this.restoreEpoch) return;
+      const child = this.childByParentToolUse.get(launchId);
+      if (!child) {
+        this.unresolvedLaunches.add(launchId);
+        return;
+      }
+      // Updates that arrived while the generation was announced.
+      if (child.announced) for (const pending of this.takePending(launchId)) await deliver(pending);
+    })().finally(() => {
+      if (this.launchRestores.get(launchId) === restoring) this.launchRestores.delete(launchId);
+    });
+    this.launchRestores.set(launchId, restoring);
+    return restoring;
+  }
+
+  /**
+   * The AIR form: opens a generation for the agent `agentId` that the runtime
+   * does not know, because it ran before the session was loaded or resumed.
+   * The session's subagent history (see {@link SubagentLineage}) gives the
+   * call that launched it: Claude Code sends the resumed run's messages under
+   * that call's id, so it is the generation's parent tool use, and the updates
+   * buffered under it are delivered. The parent is the agent that made the call
+   * if it is live, else the root. An agent that the history cannot place is
+   * not restored. Concurrent signals for one agent open one generation.
+   */
+  private restoreAgent(agentId: string, deliver: Publish, prompt?: string): Promise<void> {
+    if (!this.lineage || this.children.has(agentId) || this.unrestorableAgents.has(agentId)) {
+      return Promise.resolve();
+    }
+    const existing = this.agentRestores.get(agentId);
+    if (existing) return existing;
+    const lineage = this.lineage;
+    const epoch = this.restoreEpoch;
+    const restoring = (async () => {
+      const entries = await lineage(agentId).catch((error: unknown) => {
+        this.logger.log(
+          `Session ${this.rootSessionId}: failed to read the history of subagent ${agentId}: ${error}`,
+        );
+        return [];
+      });
+      if (epoch !== this.restoreEpoch || this.children.has(agentId)) return;
+      const entry = entries.at(-1);
+      if (!entry || entry.agentId !== agentId) {
+        this.unrestorableAgents.add(agentId);
+        return;
+      }
+      const parent = entry.parentAgentId ? this.children.get(entry.parentAgentId) : undefined;
+      await this.openGeneration(
+        agentId,
+        undefined,
+        {
+          parentSessionId:
+            parent && this.isLiveSession(parent.sessionId) ? parent.sessionId : this.rootSessionId,
+          parentToolUseId: entry.launchId,
+          name: subagentDisplayName(entry.name, entry.description, entry.agentType, agentId),
+          task: subagentDescription(undefined, entry.description),
+          ...promptField(promptText(prompt)),
+        },
+        true,
+        deliver,
+        true,
+      );
+    })().finally(() => {
+      if (this.agentRestores.get(agentId) === restoring) this.agentRestores.delete(agentId);
+    });
+    this.agentRestores.set(agentId, restoring);
+    return restoring;
   }
 
   /**
@@ -862,6 +1022,16 @@ export class NativeSubagentRuntime {
     this.generationByTaskId.clear();
     this.pending.clear();
     this.pendingCount = 0;
+    this.forgetRestores();
+  }
+
+  /** Lets a later resume signal restore an agent again, and look up a launch again. */
+  private forgetRestores(): void {
+    this.agentRestores.clear();
+    this.launchRestores.clear();
+    this.unresolvedLaunches.clear();
+    this.unrestorableAgents.clear();
+    this.restoreEpoch++;
   }
 
   private takePending(parentToolUseId: string): AcpSessionNotification[] {
@@ -932,9 +1102,10 @@ export class NativeSubagentRuntime {
     >,
     announce: boolean,
     deliver: Publish,
+    restored = false,
   ): Promise<void> {
     const child: NativeSubagent = {
-      sessionId: this.nextChildSessionId(taskId, previous),
+      sessionId: this.nextChildSessionId(taskId, previous, restored),
       ...fields,
     };
     const toolUseId = child.parentToolUseId;
@@ -958,8 +1129,25 @@ export class NativeSubagentRuntime {
    * `subagents/` history, so a fork cannot resume an agent of the original.
    * If a fork ever can, the RFD requires remapping the copied ids, for
    * example by deriving the child id from the root session id.
+   *
+   * An agent restored from the history (`restored`) is not on its first
+   * generation: before the restart the client already stored ids such as
+   * `taskId` and `taskId:generation:2`. Its generation is the current time in
+   * milliseconds, so it is `taskId:generation:1760000000000`, and each later
+   * resume in this process adds one.
    */
-  private nextChildSessionId(taskId: string, previous: NativeSubagent | undefined): string {
+  private nextChildSessionId(
+    taskId: string,
+    previous: NativeSubagent | undefined,
+    restored = false,
+  ): string {
+    if (restored) {
+      // A clear() and a new restore within one millisecond must not repeat an id.
+      const generation = Math.max(Date.now(), this.lastRestoredGeneration + 1);
+      this.lastRestoredGeneration = generation;
+      this.generationByTaskId.set(taskId, generation);
+      return `${taskId}:generation:${generation}`;
+    }
     if (!previous) {
       this.generationByTaskId.set(taskId, 1);
       return taskId;

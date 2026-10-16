@@ -100,9 +100,8 @@ export class V2Terminals {
 /**
  * The report without the extension's keys, or undefined when it carried
  * nothing else but `_meta`: the output report of a command carries the output
- * alone, and only the stamps that every report of the tool call repeats. In v2
- * a concrete `_meta` replaces the stored one, so sending them would drop the
- * other keys that the tool call holds.
+ * alone, and only the stamps that every report of the tool call repeats. The
+ * client already holds those stamps, so the report goes without them.
  */
 function withoutTerminalKeys(report: V1ToolCallReport): V1ToolCallReport | undefined {
   if (!report._meta || !TERMINAL_KEYS.some((key) => key in report._meta!)) return report;
