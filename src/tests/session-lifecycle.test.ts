@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { RequestError } from "@agentclientprotocol/sdk";
 import { ClaudeAcpAgent, computeSessionFingerprint, type AcpClient } from "../acp-agent.js";
 import { mockSessionState, wrapQuery } from "./session-doubles.js";
 import { Pushable } from "../utils.js";
@@ -55,6 +56,78 @@ function fixture() {
 }
 
 describe("session lifecycle serialization", () => {
+  it.each(["resume", "load"] as const)(
+    "preserves a live session after invalid systemPrompt on %s and accepts the next request",
+    async (operation) => {
+      const f = fixture();
+      const original = f.install("s1");
+      const teardown = vi.spyOn(f.agent as any, "teardownSession");
+      const params = { sessionId: "s1", cwd: "/new", mcpServers: [] };
+      f.creation.release();
+      try {
+        const invalidParams = {
+          ...params,
+          systemPrompt: {
+            mode: "_vendor" as const,
+            content: [{ type: "text" as const, text: "Unsupported" }],
+          },
+        };
+        const requests = await Promise.allSettled([
+          operation === "resume"
+            ? f.agent.resumeSession(invalidParams)
+            : f.agent.loadSession(invalidParams),
+          operation === "resume" ? f.agent.resumeSession(params) : f.agent.loadSession(params),
+        ]);
+
+        expect(requests[0]).toMatchObject({
+          status: "rejected",
+          reason: { code: RequestError.invalidParams().code },
+        });
+        expect(f.agent.sessions.s1).toBe(original);
+        expect(teardown).not.toHaveBeenCalled();
+        expect(f.create).not.toHaveBeenCalled();
+        expect(original.settingsManager.dispose).not.toHaveBeenCalled();
+        expect(f.queries[0].close).not.toHaveBeenCalled();
+        expect(requests[1]).toMatchObject({ status: "fulfilled", value: { sessionId: "s1" } });
+        expect((f.agent as any).sessionLifecycleLocks.size).toBe(0);
+      } finally {
+        await f.agent.dispose();
+      }
+    },
+  );
+
+  it("keeps a later queued creator registered when the previous creator fails", async () => {
+    const f = fixture();
+    const firstStarted = gate();
+    const firstCreation = gate();
+    const failure = new Error("First creation failed");
+    f.create.mockImplementationOnce(async () => {
+      firstStarted.release();
+      await firstCreation.promise;
+      throw failure;
+    });
+    const params = { sessionId: "s1", cwd: "/new", mcpServers: [] };
+    const first = f.agent.resumeSession(params).catch((error: unknown) => error);
+    let second: ReturnType<ClaudeAcpAgent["resumeSession"]> | undefined;
+    try {
+      await firstStarted.promise;
+      second = f.agent.resumeSession(params);
+      firstCreation.release();
+      expect(await first).toBe(failure);
+      await f.started.promise;
+      expect((f.agent as any).sessionLifecycleLocks.has("s1")).toBe(true);
+      f.creation.release();
+      await expect(second).resolves.toMatchObject({ sessionId: "s1" });
+      expect((f.agent as any).sessionLifecycleLocks.size).toBe(0);
+      expect(f.create).toHaveBeenCalledTimes(2);
+    } finally {
+      firstCreation.release();
+      f.creation.release();
+      await Promise.allSettled([first, second]);
+      await f.agent.dispose();
+    }
+  });
+
   it("creates an initially absent session only once for concurrent loads", async () => {
     const f = fixture();
     const params = { sessionId: "s1", cwd: "/new", mcpServers: [] };

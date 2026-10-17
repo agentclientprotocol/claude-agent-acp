@@ -185,9 +185,15 @@ import {
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
 import {
+  clientSystemPrompt,
+  sdkSystemPrompt,
+  SYSTEM_PROMPT_CAPABILITY,
+} from "./client-system-prompt.js";
+import {
   readSubagentMessages,
   subagentHistory,
   subagentLaunchIds,
+  subagentLaunchedBy,
   subagentLineage,
 } from "./subagent-history.js";
 import {
@@ -550,6 +556,53 @@ type McpOAuthQuery = Query & {
 
 function supportsMcpOAuth(query: Query): query is McpOAuthQuery {
   return typeof (query as Partial<McpOAuthQuery>).mcpAuthenticate === "function";
+}
+
+/** Runtime Remote Control control exposed by the pinned Agent SDK. Like
+ *  `mcpAuthenticate`, it is not in the public `Query` declaration yet. The CLI's
+ *  own `/remote-control` is terminal-bound and not offered to SDK hosts, so the
+ *  adapter handles the command itself and answers with the session URL. */
+type RemoteControlQuery = Query & {
+  enableRemoteControl(
+    enabled: boolean,
+    name?: string,
+  ): Promise<{ session_url?: string; connect_url?: string }>;
+};
+
+function supportsRemoteControl(query: Query): query is RemoteControlQuery {
+  return typeof (query as Partial<RemoteControlQuery>).enableRemoteControl === "function";
+}
+
+const REMOTE_CONTROL_COMMAND_NAME = "remote-control";
+
+type RemoteControlCommand = { action: "connect"; name?: string } | { action: "disconnect" };
+
+/** Parses `/remote-control [name]` and `/remote-control off` from a single-text
+ *  prompt. Connecting is idempotent, so the command never needs to know whether
+ *  Remote Control is already on. */
+function parseRemoteControlCommand(prompt: PromptRequest["prompt"]): RemoteControlCommand | null {
+  const [first] = prompt;
+  if (prompt.length !== 1 || first?.type !== "text") return null;
+  const match = /^\/remote-control(?:\s+([\s\S]*))?$/.exec(first.text.trim());
+  if (!match) return null;
+  const argument = match[1]?.trim();
+  if (argument?.toLowerCase() === "off") return { action: "disconnect" };
+  return argument ? { action: "connect", name: argument } : { action: "connect" };
+}
+
+/** Whether Claude Code offers a slash command of this name to an ACP client.
+ *  This is the rule `getAvailableSlashCommands` applies when it lists the
+ *  commands, so the adapter stands in for the command exactly when the client
+ *  sees the adapter's entry: Claude Code's terminal-bound commands are not
+ *  offered, and a user's own command or skill of the name is never shadowed. */
+function claudeCodeOffersCommand(
+  commands: readonly SlashCommand[],
+  terminalCommands: readonly string[] | undefined,
+  name: string,
+): boolean {
+  return commands.some(
+    (command) => command.name === name && !terminalCommands?.includes(command.name),
+  );
 }
 
 /** Wait for a polling interval, resolving false when the session is aborted. */
@@ -1018,6 +1071,9 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The `/remote-control` command that is running, from its request to its
+   *  reply. Prompts wait for it, and a second command is refused meanwhile. */
+  remoteControlCommand?: Promise<void>;
   /** The resolved SKILL.md paths of the skill commands, keyed by the cwd and
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
@@ -1035,6 +1091,9 @@ export type Session = {
    *  hanging (or silently restarting a consumer that resolves `end_turn`
    *  without ever reaching the model). */
   queryClosed?: boolean;
+  /** Set when `teardownSession` starts (a `session/close` or the connection
+   *  closing), so a prompt that was still starting ends cancelled. */
+  tornDown?: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers, skills)
    *  used to detect when loadSession/resumeSession is called with changed values. */
@@ -1641,6 +1700,7 @@ export function computeSessionFingerprint(params: {
   cwd: string;
   mcpServers?: NewSessionRequest["mcpServers"];
   additionalDirectories?: NewSessionRequest["additionalDirectories"];
+  systemPrompt?: NewSessionRequest["systemPrompt"];
   _meta?: NewSessionRequest["_meta"];
 }): string {
   const servers = [...(params.mcpServers ?? [])].sort((a, b) => a.name.localeCompare(b.name));
@@ -1658,6 +1718,7 @@ export function computeSessionFingerprint(params: {
       additionalDirectories: params.additionalDirectories,
       additionalRoots: meta?.additionalRoots,
       systemPrompt: meta?.systemPrompt,
+      clientSystemPrompt: params.systemPrompt ?? undefined,
       disableBuiltInTools: meta?.disableBuiltInTools,
       emitRawSDKMessages: meta?.claudeCode?.emitRawSDKMessages,
       options,
@@ -2910,6 +2971,7 @@ export class ClaudeAcpAgent {
       fork: {},
       list: {},
       resume: {},
+      systemPrompt: SYSTEM_PROMPT_CAPABILITY,
       ...(this.toolCallCapabilities.air.client ? { subagents: {} } : {}),
     };
 
@@ -3013,6 +3075,7 @@ export class ClaudeAcpAgent {
     timing: SessionTiming,
   ): Promise<NewSessionResponse> {
     await this.validateCwd(params.cwd);
+    clientSystemPrompt(params.systemPrompt);
     const pending: PendingReplay = {
       state: {
         cwd: params.cwd,
@@ -3037,6 +3100,7 @@ export class ClaudeAcpAgent {
           cwd: params.cwd,
           mcpServers: params.mcpServers ?? [],
           additionalDirectories: params.additionalDirectories,
+          systemPrompt: params.systemPrompt,
           _meta: params._meta,
         },
         {
@@ -3069,20 +3133,33 @@ export class ClaudeAcpAgent {
    */
   async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
     while (this.providerUpdate) await this.providerUpdate;
+    // Reject a prompt the agent cannot apply before copying the transcript.
+    clientSystemPrompt(params.systemPrompt);
     const { sessionId } = await forkSession(params, {
       liveMessageIdToUuid: this.sessions[params.sessionId]?.messageIdToUuid,
       logger: this.logger,
       messageIdForGrouping,
     });
+    // The fork row can lack `forkedFrom`: the scan reads it from the first
+    // 64 KB of the transcript only. So the fork is held back by its id too.
+    this.sessionIndex.onForkCreated(params.sessionId, sessionId);
     const { modes, configOptions } = await this.getOrCreateSession({
       sessionId,
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     });
     this.afterSetupResponse(sessionId, params.mcpServers ?? []);
     return { sessionId, modes, configOptions };
+  }
+
+  /** Runs `fork`, the handler of a `session/fork` request of `sourceId`,
+   *  with its forks held back from the session list (see
+   *  {@link sessionIndex.SessionIndexConnection.forking}). */
+  forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
+    return this.sessionIndex.forking(sourceId, fork);
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -3753,6 +3830,57 @@ export class ClaudeAcpAgent {
       throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
     }
 
+    const remoteControlCommand = parseRemoteControlCommand(params.prompt);
+    if (
+      remoteControlCommand &&
+      supportsRemoteControl(session.query) &&
+      !claudeCodeOffersCommand(
+        await session.query.supportedCommands(),
+        session.terminalSlashCommands,
+        REMOTE_CONTROL_COMMAND_NAME,
+      )
+    ) {
+      // The reply bypasses the turn queue, so it would land inside the output of
+      // a turn that is still running, and v2 would report no `running` state
+      // around it. Refuse instead of interleaving. `foregroundWork` also covers
+      // a cycle that Claude Code started on its own, such as its follow-up
+      // after a background subagent finished, which is not in `turnQueue`.
+      if (
+        this.foregroundWork.has(params.sessionId) ||
+        (session.turnQueue ?? []).some((turn) => !turn.settled)
+      ) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+        );
+      }
+      if (session.remoteControlCommand) {
+        throw RequestError.invalidRequest(
+          undefined,
+          "Remote Control is already being changed. Try again in a moment.",
+        );
+      }
+      // Answered by the adapter without a model turn; v2 clients treat an
+      // `ended` without a prior `inserted` as a refused prompt.
+      events.inserted(randomUUID());
+      // The request goes over the network. Until it and its reply are done,
+      // `remoteControlCommand` holds back the prompts that follow, which would
+      // otherwise start a turn that the reply lands in.
+      const command = this.runRemoteControlCommand(
+        params.sessionId,
+        session.query,
+        remoteControlCommand,
+      );
+      session.remoteControlCommand = command;
+      try {
+        await command;
+      } finally {
+        session.remoteControlCommand = undefined;
+      }
+      events.ended({ stopReason: "end_turn" });
+      return;
+    }
+
     const subscriptionGuard = this.runClaudeSubscriptionGuard(params.sessionId, session);
     if (subscriptionGuard) await subscriptionGuard;
 
@@ -3793,6 +3921,25 @@ export class ClaudeAcpAgent {
       session.promptSuggestionExpected = false;
     }
 
+    // A `/remote-control` command still in flight answers into the session's
+    // output; wait for its reply before this prompt's turn can begin. Nothing
+    // below awaits before the turn is queued, so no command can start between.
+    // A failure of the command's reply is reported to the command's own prompt.
+    if (session.remoteControlCommand) await session.remoteControlCommand.catch(() => {});
+
+    // A `session/close` during the awaits above tore the session down, and
+    // its consumer is gone, so the prompt would never be inserted. End it as
+    // the close ends a queued turn: `cancelled` on v1, -32800 on v2. A stream
+    // that ended meanwhile fails the prompt as the check above does.
+    if (session.tornDown) {
+      session.fileChangeReporter?.finish(fileChangeReport, "cancelled");
+      events.ended({ stopReason: "cancelled" });
+      return;
+    }
+    if (this.sessions[params.sessionId] !== session || session.queryClosed) {
+      throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    }
+
     // Each prompt is a Turn that the persistent consumer settles once the
     // turn's outcome is known. `startTurn()` owns no loop: it enqueues the
     // turn, pushes the user message onto the streaming input, and makes sure
@@ -3830,6 +3977,38 @@ export class ClaudeAcpAgent {
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
       this.logger.error(`Session ${params.sessionId}: failed to publish the prompt's goal:`, error),
     );
+  }
+
+  /** Connects Remote Control (again, if it is already on) or disconnects it. */
+  private async runRemoteControlCommand(
+    sessionId: string,
+    query: RemoteControlQuery,
+    command: RemoteControlCommand,
+  ): Promise<void> {
+    let text: string;
+    if (command.action === "disconnect") {
+      try {
+        await query.enableRemoteControl(false);
+        text = "Remote Control is off. Run /remote-control to reconnect.";
+      } catch (error) {
+        this.logger.error(`Failed to disable Remote Control: ${error}`);
+        text = `Could not stop Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    } else {
+      try {
+        const result = await query.enableRemoteControl(true, command.name);
+        text = result.session_url
+          ? `Remote Control is active. Continue this session from claude.ai/code or the Claude mobile app:\n\n${result.session_url}\n\nRun /remote-control off to disconnect.`
+          : "Remote Control is active, but Claude Code did not return a session URL.";
+      } catch (error) {
+        this.logger.error(`Failed to enable Remote Control: ${error}`);
+        text = `Could not start Remote Control: ${error instanceof Error ? error.message : error}`;
+      }
+    }
+    await this.client.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+    });
   }
 
   /** `--hide-claude-auth` applies only to the CLI's own login. A provider
@@ -4359,6 +4538,7 @@ export class ClaudeAcpAgent {
       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
       this.logger,
       (agentId) => subagentLineage(params.sessionId, agentId, this.logger),
+      (launchId) => subagentLaunchedBy(params.sessionId, launchId),
     ));
     // Adapter-composed advisories (hook feedback, model fallbacks) are live
     // events, not something the model said. Clients on the notice contract get
@@ -5443,12 +5623,19 @@ export class ClaudeAcpAgent {
       );
     };
 
-    /** Reject every in-flight turn — used when the stream dies. */
+    /** Reject every in-flight turn — used when the stream dies. After a
+     *  cancel, the active turn and an autonomous cycle end "cancelled"
+     *  instead: the abort the cancel started can kill the stream, and that
+     *  error is the cancel's, not the work's. */
     const failAllTurns = (error: unknown) => {
       disarmForceCancel(session);
-      this.endAutonomousCycle(params.sessionId, { error });
-      const turns = session.activeTurn
-        ? [session.activeTurn, ...(session.turnQueue ?? []).filter((t) => t !== session.activeTurn)]
+      this.endAutonomousCycle(
+        params.sessionId,
+        session.cancelled ? { outcome: { stopReason: "cancelled" } } : { error },
+      );
+      const active = session.activeTurn;
+      const turns = active
+        ? [active, ...(session.turnQueue ?? []).filter((t) => t !== active)]
         : [...(session.turnQueue ?? [])];
       session.activeTurn = null;
       session.turnQueue = [];
@@ -5463,7 +5650,11 @@ export class ClaudeAcpAgent {
             // background failure, not the turn's. Resolve with the real
             // outcome, mirroring the stream-done path.
             turn.resolve(turn.deferredSettle);
+          } else if (session.cancelled && turn === active) {
+            turn.resolve(cancelledOutcome(session, turn));
           } else {
+            // A queued turn never ran. One queued at the cancel was settled
+            // by it, so this one came later and was not part of the cancel.
             turn.reject(error);
           }
         }
@@ -6117,6 +6308,7 @@ export class ClaudeAcpAgent {
                       session.terminalSlashCommands,
                       this.toolCallCapabilities.air.client ? session.cwd : undefined,
                       session.skillPaths,
+                      session.query,
                     ),
                   },
                 });
@@ -8095,6 +8287,18 @@ export class ClaudeAcpAgent {
         session.cancelled ? "stopped" : "failed",
         "after stream error",
       );
+      if (session.cancelled) {
+        // End the cancelled turn as a cancel does, closing its open tool calls
+        // first; failAllTurns below settles it if this could not.
+        try {
+          await settleActive(cancelledOutcome(session, session.activeTurn));
+        } catch (settleError) {
+          this.logger.error(
+            `Session ${params.sessionId}: failed to settle the cancelled turn after a stream error`,
+            settleError,
+          );
+        }
+      }
       if (supportsAirSessionFailures(this.clientCapabilities) && session.activeTurn) {
         if (!isHeldOpen(session.activeTurn)) {
           await failActiveWithSessionFailure(
@@ -8706,8 +8910,10 @@ export class ClaudeAcpAgent {
     if (!session) {
       return;
     }
+    session.tornDown = true;
+    const turns = [...(session.turnQueue ?? [])];
     const turnsEnded = Promise.all(
-      (session.turnQueue ?? []).flatMap((turn) => (turn.completion ? [turn.completion] : [])),
+      turns.flatMap((turn) => (turn.completion ? [turn.completion] : [])),
     );
     try {
       await this.cancelTurns({ sessionId }, { awaitInterrupt: false });
@@ -8748,6 +8954,23 @@ export class ClaudeAcpAgent {
       this.logger.error(
         `Session ${sessionId}: its cancelled turns did not end within ${TEARDOWN_TURN_END_TIMEOUT_MS}ms of the teardown`,
       );
+      // Settle them here, so the close still answers after each turn's end: a
+      // v1 prompt gets `cancelled`, a v2 prompt not yet inserted gets -32800,
+      // and an inserted one ends in an `idle` with `cancelled`.
+      for (const turn of turns) {
+        if (turn.settled) continue;
+        session.fileChangeReporter?.finish(turn.fileChangeReport, "cancelled");
+        turn.settled = true;
+        turn.resolve(cancelledOutcome(session, turn));
+      }
+      session.turnQueue = [];
+      session.activeTurn = null;
+      // Foreground work that no turn owns, such as a cycle that Claude Code
+      // started after the endAutonomousCycle call above.
+      const work = this.foregroundWork.get(sessionId);
+      if (work) {
+        this.endForeground(sessionId, work.owner, { outcome: { stopReason: "cancelled" } });
+      }
     }
   }
 
@@ -9475,6 +9698,16 @@ export class ClaudeAcpAgent {
     work.awaitingUser = waiting;
     if (waiting) work.events.awaitingUser();
     else if (!withdrawnByCancel) work.events.running();
+  }
+
+  /** The foreground state of the session `sessionId` now, as v2's
+   *  `state_update` names it: `idle` while no work runs, `requires_action`
+   *  while the work awaits the user (see {@link syncAwaitingUser}), and
+   *  `running` otherwise. */
+  foregroundState(sessionId: string): "idle" | "running" | "requires_action" {
+    const work = this.foregroundWork.get(sessionId);
+    if (!work) return "idle";
+    return work.awaitingUser ? "requires_action" : "running";
   }
 
   /** Make `owner` the foreground work of the session `sessionId` (see
@@ -10249,6 +10482,7 @@ export class ClaudeAcpAgent {
       session.terminalSlashCommands,
       this.toolCallCapabilities.air.client ? session.cwd : undefined,
       (session.skillPaths ??= new Map()),
+      session.query,
     );
   }
 
@@ -10699,6 +10933,7 @@ export class ClaudeAcpAgent {
       cwd: string;
       mcpServers?: NewSessionRequest["mcpServers"];
       additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
     resumedSession?: ResumedSessionSnapshot,
@@ -10719,10 +10954,13 @@ export class ClaudeAcpAgent {
       cwd: string;
       mcpServers?: NewSessionRequest["mcpServers"];
       additionalDirectories?: NewSessionRequest["additionalDirectories"];
+      systemPrompt?: NewSessionRequest["systemPrompt"];
       _meta?: NewSessionRequest["_meta"];
     },
     resumedSession?: ResumedSessionSnapshot,
   ): Promise<NewSessionResponse> {
+    // Reject a prompt the agent cannot apply before reusing a live session.
+    clientSystemPrompt(params.systemPrompt);
     const existingSession = this.sessions[params.sessionId];
     // A recreated live session keeps its mode, not the mode of the transcript.
     const livePermissionMode = existingSession?.modes.currentModeId as PermissionMode | undefined;
@@ -10747,6 +10985,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       mcpServers: params.mcpServers ?? [],
       additionalDirectories: params.additionalDirectories,
+      systemPrompt: params.systemPrompt,
       _meta: params._meta,
     };
     const creation = {
@@ -10832,6 +11071,7 @@ export class ClaudeAcpAgent {
     // failure only surfaces later as a confusing "native binary failed to
     // launch" error from the SDK (see issue #749).
     await this.validateCwd(params.cwd);
+    const clientPrompt = clientSystemPrompt(params.systemPrompt);
 
     // We want to create a new session id unless it is resume,
     // but not resume + forkSession.
@@ -10927,6 +11167,9 @@ export class ClaudeAcpAgent {
         } as Options["systemPrompt"];
       }
     }
+    // The spec's `systemPrompt` takes precedence over the `_meta.systemPrompt`
+    // extension above.
+    if (clientPrompt) systemPrompt = sdkSystemPrompt(clientPrompt, customInstructions);
 
     // Extract options from _meta if provided
     const sessionMeta = params._meta as NewSessionMeta | undefined;
@@ -12424,6 +12667,7 @@ function getAvailableSlashCommands(
   airSkillCwd?: string,
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
+  query?: Query,
 ): AvailableCommand[] {
   const skillPath = (name: string, cwd: string): string | undefined => {
     const key = `${cwd}\0${name}`;
@@ -12443,6 +12687,18 @@ function getAvailableSlashCommands(
     "release-notes",
     "todos",
   ];
+
+  const remoteControlCommands: AvailableCommand[] =
+    query && supportsRemoteControl(query)
+      ? [
+          {
+            name: REMOTE_CONTROL_COMMAND_NAME,
+            description:
+              "Continue this session from claude.ai/code or the Claude mobile app; `off` disconnects",
+            input: { hint: "[session name | off]" },
+          },
+        ]
+      : [];
 
   // The adapter replaces the terminal text of `/mcp` and runs its actions,
   // even when Claude Code tags the command terminal-bound.
@@ -12481,7 +12737,14 @@ function getAvailableSlashCommands(
       };
     })
     .filter((command: AvailableCommand) => !UNSUPPORTED_COMMANDS.includes(command.name));
-  return [...advertised, MCP_AVAILABLE_COMMAND];
+
+  return [
+    ...advertised,
+    MCP_AVAILABLE_COMMAND,
+    ...remoteControlCommands.filter(
+      (command) => !claudeCodeOffersCommand(commands, terminalCommands, command.name),
+    ),
+  ];
 }
 
 function formatUriAsLink(uri: string): string {
@@ -13405,7 +13668,9 @@ export function v1AgentApp(
     .onRequest(methods.agent.initialize, (ctx) => agent.initialize(ctx.params))
     .onRequest(methods.agent.session.new, (ctx) => agent.newSession(ctx.params))
     .onRequest(methods.agent.session.load, (ctx) => agent.loadSession(ctx.params))
-    .onRequest(methods.agent.session.fork, (ctx) => agent.unstable_forkSession(ctx.params))
+    .onRequest(methods.agent.session.fork, (ctx) =>
+      agent.forking(ctx.params.sessionId, () => agent.unstable_forkSession(ctx.params)),
+    )
     .onRequest(methods.agent.session.list, (ctx) => agent.listSessions(ctx.params))
     .onRequest(methods.agent.session.delete, (ctx) => agent.deleteSession(ctx.params))
     .onRequest(methods.agent.session.resume, (ctx) => agent.resumeSession(ctx.params))

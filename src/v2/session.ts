@@ -17,13 +17,19 @@ import {
   type SessionConfigSelectGroup,
   type SessionConfigSelectOptions,
   type SetSessionConfigOptionRequest,
+  type SystemPrompt,
 } from "@agentclientprotocol/sdk";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { v1ContentBlock } from "./prompt.js";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {
-  const { mcpServers, ...request } = params;
+  const { mcpServers, systemPrompt, ...request } = params;
   // v1 requires the list; v2 treats an omitted list as an empty one.
-  return { ...request, mcpServers: (mcpServers ?? []).map(v1McpServer) };
+  return {
+    ...request,
+    mcpServers: (mcpServers ?? []).map(v1McpServer),
+    ...v1SystemPromptField(systemPrompt),
+  };
 }
 
 /**
@@ -40,7 +46,8 @@ export function v1RestoreSessionRequest(
 ):
   | { method: "resume"; request: ResumeSessionRequest }
   | { method: "load"; request: LoadSessionRequest } {
-  const { replayFrom, mcpServers, ...request } = params;
+  const { replayFrom, mcpServers, systemPrompt, ...rest } = params;
+  const request = { ...rest, ...v1SystemPromptField(systemPrompt) };
   if (replayFrom == null) {
     return {
       method: "resume",
@@ -64,8 +71,23 @@ export function v1RestoreSessionRequest(
  * returns a session that the client can prompt, with its config options.
  */
 export function v1ForkSessionRequest(params: v2.ForkSessionRequest): ForkSessionRequest {
-  const { mcpServers, ...request } = params;
-  return { ...request, ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}) };
+  const { mcpServers, systemPrompt, ...request } = params;
+  return {
+    ...request,
+    ...(mcpServers ? { mcpServers: mcpServers.map(v1McpServer) } : {}),
+    ...v1SystemPromptField(systemPrompt),
+  };
+}
+
+/**
+ * The v1 `systemPrompt`. Its content converts like prompt content: a v2
+ * annotation audience can be any string, and v1 takes only `user` or `assistant`.
+ */
+function v1SystemPromptField(systemPrompt: v2.SystemPrompt | null | undefined): {
+  systemPrompt?: SystemPrompt;
+} {
+  if (systemPrompt == null) return {};
+  return { systemPrompt: { ...systemPrompt, content: systemPrompt.content.map(v1ContentBlock) } };
 }
 
 /** v2 drops `modes`: the session mode is the `mode` config option, which the agent always lists. */

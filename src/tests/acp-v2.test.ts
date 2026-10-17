@@ -28,7 +28,13 @@ import { v1PromptRequest } from "../v2/prompt.js";
 import { V2Terminals } from "../v2/terminal.js";
 import { V2ToolCallMeta } from "../v2/tool-call-meta.js";
 import { v2ChildStateUpdate, v2SessionUpdate } from "../v2/session-update.js";
-import { v1SetSessionConfigOptionRequest, v2ConfigOptions } from "../v2/session.js";
+import {
+  v1ForkSessionRequest,
+  v1NewSessionRequest,
+  v1RestoreSessionRequest,
+  v1SetSessionConfigOptionRequest,
+  v2ConfigOptions,
+} from "../v2/session.js";
 import packageJson from "../../package.json" with { type: "json" };
 
 const execFileSpy = vi.hoisted(() => vi.fn());
@@ -298,6 +304,7 @@ describe("ACP protocol routing", () => {
       delete: {},
       fork: {},
       additionalDirectories: {},
+      systemPrompt: { mode: { override: {} } },
     });
     expect(response.capabilities?.providers).toEqual({});
     // Not `_session/steering`, which v1 advertises in the top-level `_meta`.
@@ -1069,8 +1076,9 @@ describe("ACP v2 prompts", () => {
     const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
       sessionId === "abc123" ? [update] : [],
     );
+    // The child's past `running` does not replay; its last state goes once,
+    // after the replay.
     expect(child).toEqual([
-      { sessionUpdate: "state_update", state: "running" },
       expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
@@ -1211,6 +1219,7 @@ describe("ACP v2 prompts", () => {
           summary: text("1. Primary Request and Intent:\n   Count upward."),
         },
         { sessionUpdate: "agent_message", messageId: "msg_after", content: [] },
+        { sessionUpdate: "state_update", state: "idle" },
       ]);
       await client.authUpdate(1);
     });
@@ -1263,6 +1272,8 @@ describe("ACP v2 prompts", () => {
           messageId: "msg_answer",
           content: text("Hello!")[0],
         },
+        // The current foreground state, after the replay and before the response.
+        { sessionUpdate: "state_update", state: "idle" },
       ]);
 
       // Live chunks after the replay get no clear.
@@ -1274,6 +1285,31 @@ describe("ACP v2 prompts", () => {
       expect(
         client.sessionUpdates.slice(afterReplay).map(({ update }) => update.sessionUpdate),
       ).not.toContain("agent_message");
+      await client.authUpdate(1);
+    });
+  });
+
+  it("reports the running turn of a live session it resumes, before the response", async () => {
+    const answer = Promise.withResolvers<void>();
+    scriptTurns(async function* (options) {
+      await answer.promise;
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("running"));
+
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      expect(client.sessionUpdates.slice(before).map(({ update }) => update)).toEqual([
+        { sessionUpdate: "state_update", state: "running" },
+      ]);
+
+      answer.resolve();
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
       await client.authUpdate(1);
     });
   });
@@ -1373,6 +1409,105 @@ describe("ACP v2 prompts", () => {
       "agent_message_chunk",
       "idle cancelled",
     ]);
+  });
+
+  it("reports idle cancelled when the stream dies while a cancel stops the turn", async () => {
+    const interrupted = Promise.withResolvers<void>();
+    sdk.interrupt = async () => interrupted.resolve();
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Working on it");
+      await interrupted.promise;
+      // Stopping the work kills Claude Code.
+      throw new Error("Claude Code process terminated by signal SIGTERM");
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+      );
+
+      await agent.notify(v2.methods.agent.session.cancel, { sessionId });
+
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates).some((state) => state.startsWith("idle"))).toBe(
+          true,
+        ),
+      );
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([
+      "user_message",
+      "running",
+      "agent_message_chunk",
+      "idle cancelled",
+    ]);
+  });
+
+  it("answers a prompt that a session/close stops before it is queued with -32800", async () => {
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      // The prompt waits in the subscription guard while the close runs.
+      const guard = Promise.withResolvers<void>();
+      const guarded = Promise.withResolvers<void>();
+      vi.spyOn(agents[0] as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
+        guarded.resolve();
+        return guard.promise;
+      });
+      const prompt = agent.request(v2.methods.agent.session.prompt, {
+        sessionId,
+        prompt: text("go"),
+      });
+      await guarded.promise;
+      await agent.request(v2.methods.agent.session.close, { sessionId });
+      guard.resolve();
+
+      await expect(prompt).rejects.toMatchObject({ code: -32800 });
+      await client.authUpdate(1);
+    });
+
+    expect(turnTrace(client.sessionUpdates)).toEqual([]);
+  });
+
+  it("ends a turn with idle cancelled before it answers session/close, when the turn does not end on its own", async () => {
+    // Claude Code never answers again, and the consumer misses the teardown's
+    // wake-up (its `cancelController` is replaced below).
+    scriptTurns(async function* (options) {
+      yield assistantText(options, "Working on it");
+      await new Promise(() => {});
+    });
+    const client = v2Client();
+    let atClose: string[] = [];
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("go") });
+      await vi.waitFor(() =>
+        expect(turnTrace(client.sessionUpdates)).toContain("agent_message_chunk"),
+      );
+      agents[0].sessions[sessionId]!.cancelController = new AbortController();
+
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      try {
+        const closed = agent.request(v2.methods.agent.session.close, { sessionId });
+        await vi.advanceTimersByTimeAsync(5_000);
+        await closed;
+      } finally {
+        vi.useRealTimers();
+      }
+      atClose = turnTrace(client.sessionUpdates);
+      await client.authUpdate(1);
+    });
+
+    expect(atClose).toEqual(["user_message", "running", "agent_message_chunk", "idle cancelled"]);
   });
 
   // Hook callbacks bypass the SDK's message queue, so the hook can also come
@@ -4664,6 +4799,30 @@ describe("ACP v2 session translation", () => {
     ]);
   });
 
+  it("passes systemPrompt to every v1 session lifecycle request", () => {
+    const systemPrompt = {
+      mode: "override",
+      content: [{ type: "text" as const, text: "Be brief.", annotations: { audience: ["_bot"] } }],
+    };
+    // The audience holds only a role v1 does not know, so it is dropped.
+    const v1SystemPrompt = {
+      mode: "override",
+      content: [{ type: "text", text: "Be brief.", annotations: {} }],
+    };
+    const cwd = "/work";
+    expect(v1NewSessionRequest({ cwd, systemPrompt }).systemPrompt).toEqual(v1SystemPrompt);
+    expect(v1ForkSessionRequest({ sessionId: "s", cwd, systemPrompt }).systemPrompt).toEqual(
+      v1SystemPrompt,
+    );
+    expect(
+      v1RestoreSessionRequest({ sessionId: "s", cwd, systemPrompt }).request.systemPrompt,
+    ).toEqual(v1SystemPrompt);
+    expect(
+      v1RestoreSessionRequest({ sessionId: "s", cwd, systemPrompt, replayFrom: { type: "start" } })
+        .request.systemPrompt,
+    ).toEqual(v1SystemPrompt);
+  });
+
   it("rejects a config option value type that v1 cannot express", () => {
     expect(() =>
       v1SetSessionConfigOptionRequest({
@@ -4972,31 +5131,31 @@ describe("ACP v2 session translation", () => {
 
     it("gives the tool's name as name, once, and leaves it out of _meta", () => {
       const meta = new V2ToolCallMeta();
-      expect(meta.apply("s", report({ claudeCode: { toolName: "memory_recall" } }), true)).toEqual({
-        toolCallId: "t",
-        name: "memory_recall",
-      });
-      expect(meta.apply("s", report({ claudeCode: { toolName: "Bash" } }), false)).toEqual({
-        toolCallId: "t",
-      });
+      expect(meta.apply("s", report({ claudeCode: { toolName: "memory_recall" } }), true)).toEqual([
+        { toolCallId: "t", name: "memory_recall" },
+      ]);
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Bash" } }), false)).toEqual([
+        { toolCallId: "t" },
+      ]);
       // A report's own name wins.
       expect(
         meta.apply("s", report({ claudeCode: { toolName: "Bash" } }, { name: "Read" }), true),
-      ).toEqual({ toolCallId: "t", name: "Read" });
+      ).toEqual([{ toolCallId: "t", name: "Read" }]);
     });
 
     it("sends the earlier claudeCode keys again with a key that changes", () => {
       const meta = new V2ToolCallMeta();
       const denial = { toolResponse: { decisionReasonType: "rule" } };
-      expect(meta.apply("s", report({ claudeCode: denial }), true)).toEqual(
+      expect(meta.apply("s", report({ claudeCode: denial }), true)).toEqual([
         report({ claudeCode: denial }),
-      );
+      ]);
+      // The client replaces `claudeCode` whole, so all of it goes again.
       expect(
         meta.apply("s", report({ claudeCode: { nonExecutionKind: "permission-rule" } }), false),
-      ).toEqual(report({ claudeCode: { ...denial, nonExecutionKind: "permission-rule" } }));
+      ).toEqual([report({ claudeCode: { ...denial, nonExecutionKind: "permission-rule" } })]);
     });
 
-    it("replaces a claudeCode key whole, and other _meta keys whole", () => {
+    it("sends only the top-level keys that change, each whole", () => {
       const meta = new V2ToolCallMeta();
       meta.apply(
         "s",
@@ -5005,10 +5164,18 @@ describe("ACP v2 session translation", () => {
       );
       expect(
         meta.apply("s", report({ claudeCode: { toolResponse: { status: "ok" } } }), false),
-      ).toEqual(report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { a: 1 } }));
-      expect(meta.apply("s", report({ flag: { b: 2 } }), false)).toEqual(
-        report({ claudeCode: { toolResponse: { status: "ok" } }, flag: { b: 2 } }),
-      );
+      ).toEqual([report({ claudeCode: { toolResponse: { status: "ok" } } })]);
+      expect(meta.apply("s", report({ flag: { b: 2 } }), false)).toEqual([
+        report({ flag: { b: 2 } }),
+      ]);
+    });
+
+    it("removes a key that a v1 report sets to null", () => {
+      const meta = new V2ToolCallMeta();
+      meta.apply("s", report({ flag: 1, other: 2 }), true);
+      expect(meta.apply("s", report({ flag: null }), false)).toEqual([report({ flag: null })]);
+      // A key the client does not hold needs no removal.
+      expect(meta.apply("s", report({ flag: null }), false)).toEqual([{ toolCallId: "t" }]);
     });
 
     it("sends no _meta on a report that changes nothing", () => {
@@ -5023,7 +5190,7 @@ describe("ACP v2 session translation", () => {
           ),
           false,
         ),
-      ).toEqual({ toolCallId: "t", status: "completed" });
+      ).toEqual([{ toolCallId: "t", status: "completed" }]);
     });
 
     it("gives a permission request's subject the whole _meta, also when it changes nothing", () => {
@@ -5034,11 +5201,11 @@ describe("ACP v2 session translation", () => {
       );
       // Its own keys are stored, since the subject updates the tool call.
       meta.subject("s", report({ claudeCode: { mcpServer: { name: "docs" } } }));
-      expect(meta.apply("s", report({ claudeCode: { nonExecutionKind: "x" } }), false)).toEqual(
+      expect(meta.apply("s", report({ claudeCode: { nonExecutionKind: "x" } }), false)).toEqual([
         report({
           claudeCode: { parentToolUseId: "p", mcpServer: { name: "docs" }, nonExecutionKind: "x" },
         }),
-      );
+      ]);
     });
 
     it("keeps the tool calls of each session apart, and forgets a closed session's", () => {
@@ -5048,19 +5215,35 @@ describe("ACP v2 session translation", () => {
       meta.apply("open", report(started), true);
       meta.forget("closed");
       const failed = report({ claudeCode: { nonExecutionKind: "x" } });
-      expect(meta.apply("closed", failed, false)._meta).toEqual(failed._meta);
-      expect(meta.apply("open", failed, false)._meta).toEqual({
+      expect(meta.apply("closed", failed, false)[0]._meta).toEqual(failed._meta);
+      expect(meta.apply("open", failed, false)[0]._meta).toEqual({
         claudeCode: { parentToolUseId: "p", nonExecutionKind: "x" },
       });
     });
 
-    it("forgets what an earlier tool call with the same id stored, when one starts", () => {
+    it("removes what an earlier tool call with the same id stored, when one starts", () => {
       const meta = new V2ToolCallMeta();
       meta.apply("s", report({ claudeCode: { toolName: "Bash", parentToolUseId: "p" } }), true);
-      expect(meta.apply("s", report({ claudeCode: { toolName: "Read" } }), true)).toEqual({
-        toolCallId: "t",
-        name: "Read",
-      });
+      expect(meta.apply("s", report({ claudeCode: { toolName: "Read" } }), true)).toEqual([
+        { toolCallId: "t", name: "Read", _meta: { claudeCode: null } },
+      ]);
+    });
+
+    it("clears the _meta that the client may hold when a replay starts a tool call", () => {
+      const meta = new V2ToolCallMeta();
+      const started = report({ claudeCode: { parentToolUseId: "p" } }, { title: "ls" });
+      expect(meta.apply("s", started, true, true)).toEqual([
+        { toolCallId: "t", title: "ls", _meta: null },
+        { toolCallId: "t", _meta: { claudeCode: { parentToolUseId: "p" } } },
+      ]);
+      // A tool call without `_meta` needs only the clear.
+      expect(meta.apply("s", report(undefined, { toolCallId: "u" }), true, true)).toEqual([
+        { toolCallId: "u", _meta: null },
+      ]);
+      // A tool call this connection reported holds what it sent.
+      expect(meta.apply("s", report(undefined, { title: "ls" }), true, true)).toEqual([
+        { toolCallId: "t", title: "ls", _meta: { claudeCode: null } },
+      ]);
     });
   });
 

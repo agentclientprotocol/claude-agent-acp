@@ -111,6 +111,8 @@ export type ListSubscriptionDeps = {
   /** What this connection knows of a session it runs. */
   own: (sessionId: string) => OwnSessionState | undefined;
   notify: (changes: ListChanges) => Promise<void>;
+  /** The forks whose rows wait for their fork response. */
+  forkHolds?: ForkHolds;
   logError: (message: string, error: unknown) => void;
   now?: () => number;
   debounceMs?: number;
@@ -242,6 +244,54 @@ function transcriptId(filename: string): string | undefined {
   return isSessionId(id) ? id : undefined;
 }
 
+/**
+ * The `session/fork` requests in flight. A client must get the id of a fork
+ * from the fork response before a list shows the fork. Otherwise the client
+ * sees an unknown session and lists it as a session of its own.
+ */
+export class ForkHolds {
+  /** Source session id → the number of its forks in flight, and the forks
+   *  they copied the transcript into. */
+  private readonly sources = new Map<string, { count: number; forks: Set<string> }>();
+
+  started(sourceId: string): void {
+    const source = this.sources.get(sourceId);
+    if (source) source.count++;
+    else this.sources.set(sourceId, { count: 1, forks: new Set() });
+  }
+
+  /** A fork of `sourceId` copied the transcript into `forkId`. */
+  created(sourceId: string, forkId: string): void {
+    this.sources.get(sourceId)?.forks.add(forkId);
+  }
+
+  /** The response of a fork of `sourceId` is out. Returns whether that
+   *  freed rows: the last fork of the source answered. */
+  answered(sourceId: string): boolean {
+    const source = this.sources.get(sourceId);
+    if (!source) return false;
+    if (--source.count > 0) return false;
+    this.sources.delete(sourceId);
+    return true;
+  }
+
+  /** Whether `id` is a fork whose fork response is not out yet. */
+  isHeld(id: string): boolean {
+    for (const { forks } of this.sources.values()) if (forks.has(id)) return true;
+    return false;
+  }
+
+  /**
+   * Whether the row of `id` waits. A fork that a fork in flight created
+   * waits. Before the copy returns its id, an unsent row of a fork of a
+   * source in flight waits too, by its `forkedFrom`.
+   */
+  holds(id: string, sent: boolean, forkedFrom: string | undefined): boolean {
+    if (this.isHeld(id)) return true;
+    return !sent && forkedFrom !== undefined && this.sources.has(forkedFrom);
+  }
+}
+
 export class ListSubscriptions {
   private readonly subscriptions = new Map<string, Subscription>();
   /** Sessions whose row shows this connection's SDK state: the rescan
@@ -345,6 +395,13 @@ export class ListSubscriptions {
         watch.dirtyRows.add(id);
         this.schedule(watch, "now");
       }
+    }
+  }
+
+  /** Sends the pending sessions now: {@link ForkHolds} held some back. */
+  deliverPending(): void {
+    for (const subscription of this.subscriptions.values()) {
+      if (subscription.pending.size > 0) this.deliver(subscription);
     }
   }
 
@@ -1225,6 +1282,12 @@ export class ListSubscriptions {
       const unchanged = current ? sent === current.signature : sent === null;
       if (unchanged) {
         subscription.pending.delete(id);
+        continue;
+      }
+      // A fork whose fork response is not out yet stays pending.
+      if (
+        this.deps.forkHolds?.holds(id, subscription.sent.has(id), current?.row.facts.forkedFrom)
+      ) {
         continue;
       }
       const dueAt = (subscription.sentAt.get(id) ?? -Infinity) + this.minIntervalMs;
