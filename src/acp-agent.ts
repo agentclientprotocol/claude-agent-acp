@@ -6598,9 +6598,37 @@ export class ClaudeAcpAgent {
               }
               case "plugin_install":
               case "notification":
-              case "thinking_tokens":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "thinking_tokens": {
+                // Recent models stream no thinking text (`thinking.display`
+                // defaults to "omitted"), so during a long think the client
+                // received nothing for minutes and could not tell a model that
+                // is thinking from a stalled session. Claude Code still sends
+                // an estimate of the tokens thought so far (the running total
+                // for the current thinking block, about every second). Forward
+                // it: the context meter advances by the estimate, and the
+                // estimate itself is in `_meta["_claude/thinkingTokens"]` for
+                // clients that show thinking progress. The response's own
+                // usage (message_delta, result) replaces it when it ends.
+                if (session.cancelled && this.workEndReported(params.sessionId, session)) break;
+                const estimated = message.estimated_tokens;
+                if (!Number.isFinite(estimated) || estimated <= 0) break;
+                // The context before this response (set by its message_start).
+                // Unknown, the meter would jump down to the bare estimate.
+                const before = lastAssistantTotalUsage ?? session.contextUsedTokens;
+                if (before === undefined) break;
+                await sendUpdate({
+                  sessionId: params.sessionId,
+                  update: attachUsageModel({
+                    sessionUpdate: "usage_update",
+                    used: before + estimated,
+                    size: session.contextWindowSize,
+                    _meta: { "_claude/thinkingTokens": estimated },
+                  }),
+                });
+                break;
+              }
               case "api_retry": {
                 const kind =
                   message.error_status === null
