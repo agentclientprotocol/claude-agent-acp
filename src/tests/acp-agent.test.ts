@@ -27793,3 +27793,273 @@ describe("permission_denied", () => {
     expect(denials(updates)).toHaveLength(1);
   });
 });
+
+describe("_session/rewind", () => {
+  beforeEach(() => {
+    vi.mocked(importSessionToStore).mockClear();
+  });
+
+  const modes = { currentModeId: "plan", availableModes: [] };
+  const fingerprint = (text: string) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
+
+  /** The conversation of the session under rewind: two prompts, each answered,
+   *  and a tool result the second turn wrote after its last assistant message —
+   *  the entry a resume that keeps that turn has to keep with it. */
+  const conversation = () => [
+    {
+      type: "user",
+      uuid: "user-1",
+      isSidechain: false,
+      sessionId: "s",
+      message: { role: "user", content: "first" },
+    },
+    {
+      type: "assistant",
+      uuid: "assistant-1",
+      parentUuid: "user-1",
+      isSidechain: false,
+      sessionId: "s",
+      message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "one" }] },
+    },
+    {
+      type: "user",
+      uuid: "tool-result-1",
+      parentUuid: "assistant-1",
+      isSidechain: false,
+      sessionId: "s",
+      message: { role: "user", content: [{ type: "tool_result", content: "done" }] },
+    },
+    {
+      type: "user",
+      uuid: "user-2",
+      parentUuid: "tool-result-1",
+      isSidechain: false,
+      sessionId: "s",
+      message: { role: "user", content: "second" },
+    },
+    {
+      type: "assistant",
+      uuid: "assistant-2",
+      parentUuid: "user-2",
+      isSidechain: false,
+      sessionId: "s",
+      message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "two" }] },
+    },
+  ];
+
+  function storedConversation(entries: Record<string, any>[] = conversation()) {
+    vi.mocked(importSessionToStore).mockImplementationOnce(async (_sessionId, store) => {
+      await store.append({ projectKey: "-workspace", sessionId: "s" }, entries as any);
+    });
+  }
+
+  /** An agent holding the live session `s`, whose `createSession` records how
+   *  it was asked to rebuild that session instead of starting Claude Code.
+   *  `failures` fails the nth creation, by its index. */
+  function rewindingAgent(
+    sessionOverrides: Record<string, any> = {},
+    failures: Record<number, Error> = {},
+  ) {
+    const agent = new ClaudeAcpAgent({ sessionUpdate: async () => {} } as unknown as AcpClient, {
+      log: () => {},
+      error: () => {},
+    });
+    const creations: any[] = [];
+    const register = (sessionId: string, overrides: Record<string, any> = {}) => {
+      async function* nothing() {}
+      agent.sessions[sessionId] = mockSessionState(
+        {
+          cwd: "/workspace",
+          creationParams: { cwd: "/workspace", mcpServers: [] },
+          query: Object.assign(wrapQuery(nothing()), { supportedCommands: async () => [] }),
+          input: new Pushable<any>(),
+          modes,
+          ...overrides,
+        },
+        agent,
+        sessionId,
+      );
+    };
+    const createSession = vi
+      .spyOn(agent as any, "createSession")
+      .mockImplementation(async (_params: any, creationOpts: any) => {
+        creations.push(creationOpts);
+        const failure = failures[creations.length - 1];
+        if (failure) throw failure;
+        const sessionId = (creationOpts.resume ??
+          creationOpts.publicSessionId ??
+          creationOpts.reuseSessionId) as string;
+        register(sessionId, { messageIdToUuid: creationOpts.replayState?.messageIdToUuid });
+        return { sessionId, modes, configOptions: [] };
+      });
+    register("s", sessionOverrides);
+    return { agent, creations, createSession };
+  }
+
+  const droppedPrompt = {
+    messageId: "air-local-id",
+    messageFingerprint: fingerprint("second"),
+    messageOccurrence: 1,
+  };
+  const retainedMessage = {
+    messageId: "msg_1",
+    messageFingerprint: fingerprint("one"),
+    messageOccurrence: 1,
+  };
+
+  it("resumes the session's own conversation up to the entry before the dropped prompt", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation();
+
+    const response = await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect(response).toEqual({ rewound: true });
+    expect(creations).toHaveLength(1);
+    expect(creations[0]).toMatchObject({
+      // The same session id, so the same transcript and the same subagents.
+      resume: "s",
+      // The tool result of the kept turn, not its last assistant message: the
+      // CLI refuses a fork that leaves the kept turn's own payload behind.
+      rewindTo: "tool-result-1",
+      rewindDropsTurn: "user-2",
+    });
+    expect(agent.sessions["s"]).toBeDefined();
+  });
+
+  it("resolves the dropped prompt by the id this adapter reported for it", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      // The id of a user message is its transcript uuid, and AIR can send the
+      // id of the visible segment it was shown as.
+      beforeMessage: { messageId: "user-2:segment:0" },
+    });
+
+    expect(creations[0]).toMatchObject({ rewindTo: "tool-result-1", rewindDropsTurn: "user-2" });
+  });
+
+  it("resolves the dropped prompt through the retained message when its text does not match", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: {
+        messageId: "air-local-id",
+        messageFingerprint: fingerprint("the prompt as the client spells it"),
+        messageOccurrence: 1,
+      },
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect(creations[0]).toMatchObject({ rewindTo: "tool-result-1", rewindDropsTurn: "user-2" });
+  });
+
+  it("rejects a rewind point the conversation does not contain", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation();
+
+    await expect(
+      agent.rewindSession({
+        sessionId: "s",
+        beforeMessage: { messageId: "no-such-message", messageFingerprint: fingerprint("gone") },
+      }),
+    ).rejects.toMatchObject({ code: RequestError.invalidParams().code });
+    expect(creations).toHaveLength(0);
+  });
+
+  it("gives the recreated session only the messages the rewind retained", async () => {
+    const { agent, creations } = rewindingAgent({
+      messageIdToUuid: new Map([
+        ["msg_1", "assistant-1"],
+        ["msg_2", "assistant-2"],
+      ]),
+      taskState: new Map([["task-1", { subject: "ship it", status: "pending" }]]),
+    });
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    // A later fork or rewind must not resolve a message this one dropped.
+    expect([...creations[0].replayState.messageIdToUuid]).toEqual([
+      ["tool-result-1", "tool-result-1"],
+      ["msg_1", "assistant-1"],
+      ["user-1", "user-1"],
+    ]);
+    // The task list is keyed by ids of its own, which no turn owns.
+    expect([...creations[0].replayState.taskState.keys()]).toEqual(["task-1"]);
+  });
+
+  it("starts a fresh conversation under the same id when the dropped prompt opens it", async () => {
+    const { agent, creations } = rewindingAgent();
+    storedConversation();
+
+    const response = await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: {
+        messageId: "air-local-id",
+        messageFingerprint: fingerprint("first"),
+        messageOccurrence: 1,
+      },
+    });
+
+    expect(response).toEqual({ rewound: true });
+    // Nothing is retained, so there is no conversation to resume — and the id
+    // the client prompts stays the one it holds.
+    expect(creations[0]).toMatchObject({ publicSessionId: "s" });
+    expect(creations[0].resume).toBeUndefined();
+    expect(agent.sessions["s"]).toBeDefined();
+  });
+
+  it("recovers into the untruncated conversation when the CLI refuses the truncation", async () => {
+    const refusal = new Error(
+      "Resume rejected by --resume-drops-turn: the discarded range holds a queued user message",
+    );
+    const { agent, creations } = rewindingAgent({}, { 0: refusal });
+    storedConversation();
+
+    const response = await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect(response).toEqual({ rewound: false });
+    // The refusal is deterministic, so the rewind is never retried — and the
+    // session the client holds is left promptable.
+    expect(creations).toHaveLength(2);
+    expect(creations[1]).toMatchObject({ resume: "s" });
+    expect(creations[1].rewindTo).toBeUndefined();
+    expect(creations[1].rewindDropsTurn).toBeUndefined();
+    expect(agent.sessions["s"]).toBeDefined();
+  });
+
+  it("refuses a rewind while a turn is running", async () => {
+    const { agent, creations } = rewindingAgent({ activeTurn: { settled: false } });
+    storedConversation();
+
+    expect(await agent.rewindSession({ sessionId: "s", beforeMessage: droppedPrompt })).toEqual({
+      rewound: false,
+    });
+    expect(creations).toHaveLength(0);
+    expect(importSessionToStore).not.toHaveBeenCalled();
+  });
+
+  it("reports an unknown session rather than rewinding nothing", async () => {
+    const { agent } = rewindingAgent();
+
+    await expect(
+      agent.rewindSession({ sessionId: "other", beforeMessage: droppedPrompt }),
+    ).rejects.toMatchObject({ code: RequestError.resourceNotFound().code });
+  });
+});

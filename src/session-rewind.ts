@@ -144,15 +144,18 @@ function promptAfterRetainedMessage(
   request: SessionRewindRequest,
   dependencies: SessionRewindDependencies,
 ): string | undefined {
-  const retainedUuid = request.resumeAtMessage
-    ? resolveHistoryPointUuid(
-        entries,
-        assistantGroups(entries, dependencies.messageIdForGrouping),
-        request.resumeAtMessage,
-        dependencies.messageIdForGrouping,
-      )
-    : undefined;
-  if (request.resumeAtMessage && !retainedUuid) return undefined;
+  // With nothing retained the only prompt this could name is the one that
+  // opens the conversation, and an unresolvable point is no evidence that it
+  // is that one. Dropping the whole conversation on a guess is the one outcome
+  // worse than refusing the rewind.
+  if (!request.resumeAtMessage) return undefined;
+  const retainedUuid = resolveHistoryPointUuid(
+    entries,
+    assistantGroups(entries, dependencies.messageIdForGrouping),
+    request.resumeAtMessage,
+    dependencies.messageIdForGrouping,
+  );
+  if (!retainedUuid) return undefined;
 
   const distanceToRetained = (entry: SessionStoreEntry): number | undefined => {
     let distance = 0;
@@ -162,9 +165,7 @@ function promptAfterRetainedMessage(
       if (cursor === retainedUuid) return distance;
       cursor = (byUuid.get(cursor)?.parentUuid as string | undefined) || undefined;
     }
-    // A prompt with no parent opens the conversation, and so is the first
-    // dropped message when nothing is retained.
-    return retainedUuid ? undefined : distance;
+    return undefined;
   };
 
   const ranked = entries
