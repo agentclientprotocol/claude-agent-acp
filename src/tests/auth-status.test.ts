@@ -301,6 +301,14 @@ describe("auth status mappers", () => {
     });
   });
 
+  it("maps a setup-token CLI login without profile fields to an account", () => {
+    expect(
+      fromCliStatus(
+        JSON.stringify({ loggedIn: true, authMethod: "oauth_token", apiProvider: "firstParty" }),
+      ),
+    ).toEqual({ kind: "account", label: "Claude subscription", detail: "OAuth token" });
+  });
+
   it("lets a third-party backend outrank the logged-out flag", () => {
     // `loggedIn` tracks the claude.ai login only; on Bedrock the credentials
     // are external and the agent is authenticated all the same.
