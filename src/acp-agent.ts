@@ -7840,6 +7840,13 @@ export class ClaudeAcpAgent {
               message.message.model === "<synthetic>" &&
               compaction.hasDeliveredOutput
             ) {
+              if (isSyntheticUsageLimitMessage(message.message)) {
+                lastAssistantWasUsageLimit = true;
+                lastAssistantFailureTitle = assistantMessageText(message.message);
+                if (message.error) {
+                  lastAssistantError = message.error;
+                }
+              }
               break;
             }
 
