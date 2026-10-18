@@ -130,6 +130,7 @@ import {
   airCustomInstructions,
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,
+  AIR_SESSION_REWIND_CAPABILITY,
   AIR_GOAL_KEY,
   AIR_KIND_KEY,
   AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
@@ -184,6 +185,15 @@ import {
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
 import { forkSession } from "./fork-session.js";
+import {
+  isRewindRefusal,
+  parseSessionRewindRequest,
+  planSessionRewind,
+  SESSION_REWIND_METHOD,
+  type SessionRewindPlan,
+  type SessionRewindRequest,
+  type SessionRewindResponse,
+} from "./session-rewind.js";
 import {
   clientSystemPrompt,
   sdkSystemPrompt,
@@ -3014,6 +3024,7 @@ export class ClaudeAcpAgent {
                 AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY,
                 AIR_DIFF_PATCH_CAPABILITY,
                 AIR_PLAN_FILE_CAPABILITY,
+                AIR_SESSION_REWIND_CAPABILITY,
                 ...this.sessionIndex.capabilities(),
               ),
               AIR_GOAL_KEY,
@@ -3137,6 +3148,92 @@ export class ClaudeAcpAgent {
    *  {@link sessionIndex.SessionIndexConnection.forking}). */
   forking<T>(sourceId: string, fork: () => Promise<T>): Promise<T> {
     return this.sessionIndex.forking(sourceId, fork);
+  }
+
+  /**
+   * Drops one user turn and everything after it from the conversation, keeping
+   * the session the client already holds: the query is replaced by a resume of
+   * the session's own stored conversation that stops at the last retained
+   * entry. The session id, the transcript behind it and its `subagents/`
+   * history are the ones the client was prompting all along — a fork would
+   * copy the transcript into a second session instead, and copy none of the
+   * subagent history with it.
+   *
+   * `{ rewound: false }` means the conversation was left as it was and the
+   * client keeps its own history too. A point the transcript does not contain
+   * is a bad request, not a refusal.
+   */
+  async rewindSession(params: SessionRewindRequest): Promise<SessionRewindResponse> {
+    while (this.providerUpdate) await this.providerUpdate;
+    const session = this.sessions[params.sessionId];
+    if (!session) throw RequestError.resourceNotFound(params.sessionId);
+    const creationParams = session.creationParams;
+    if (!creationParams) throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+    // AIR stops the turn before it rewinds. A turn still running here means the
+    // two views of the conversation disagree about what the turn has written,
+    // and the dropped range would be decided against a transcript that is
+    // still growing.
+    if (session.activeTurn && !session.activeTurn.settled) {
+      this.logger.log(`Rewind of session ${params.sessionId} refused: a turn is running`);
+      return { rewound: false };
+    }
+
+    const plan = await planSessionRewind(params, {
+      cwd: session.cwd,
+      liveMessageIdToUuid: session.messageIdToUuid,
+      messageIdForGrouping,
+    });
+    const permissionMode = session.modes.currentModeId as PermissionMode;
+    const replayState: ReplayState = {
+      cwd: session.cwd,
+      // The task list and the published failures outlive the dropped turns:
+      // their entries are keyed by ids of their own, which the transcript does
+      // not attribute to a turn, and a cleared failure must stay clearable.
+      taskState: session.taskState,
+      forwardSubagentText: session.forwardSubagentText,
+      sessionFailureState: session.sessionFailureState,
+      // Dropped messages must not resolve a later fork or rewind.
+      messageIdToUuid: plan.retainedMessageIdToUuid,
+    };
+    this.closeQueryStream(session);
+    try {
+      await this.createRewoundSession(creationParams, params.sessionId, plan, {
+        permissionMode,
+        replayState,
+      });
+    } catch (error) {
+      // The CLI validates the dropped range and refuses deterministically, so
+      // the same rewind can only fail again. Recover once into the untruncated
+      // conversation: the query of the session is already closed, and a session
+      // the client cannot prompt is worse than one that was not rewound.
+      this.logger.log(
+        `Rewind of session ${params.sessionId} ${isRewindRefusal(error) ? "was refused by the CLI" : `failed: ${error}`}; resuming the untruncated conversation`,
+      );
+      await this.recreateLiveSession(creationParams, params.sessionId, { permissionMode });
+      return { rewound: false };
+    }
+    return { rewound: true };
+  }
+
+  /** The query of a rewound session: a truncating resume of its own stored
+   *  conversation. A rewind of the first user turn retains nothing, so it
+   *  starts a fresh conversation under the same client-visible id instead —
+   *  the same restart a cleared context performs. */
+  private createRewoundSession(
+    creationParams: NewSessionRequest,
+    sessionId: string,
+    plan: SessionRewindPlan,
+    options: { permissionMode: PermissionMode; replayState: ReplayState },
+  ): Promise<NewSessionResponse> {
+    if (!plan.resumeSessionAt) {
+      return this.createSession(creationParams, { publicSessionId: sessionId, ...options });
+    }
+    return this.createSession(creationParams, {
+      resume: sessionId,
+      rewindTo: plan.resumeSessionAt,
+      rewindDropsTurn: plan.droppedPromptUuid,
+      ...options,
+    });
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -10946,6 +11043,12 @@ export class ClaudeAcpAgent {
        *  wrote one; this keeps the ACP session id alive with an empty history.
        *  The SDK accepts a caller-chosen id as long as `resume` is not set. */
       reuseSessionId?: string;
+      /** With `resume`: the conversation is resumed only up to this transcript
+       *  entry, and everything after it is dropped. `rewindDropsTurn` names the
+       *  turn that may legitimately be in the dropped range; the CLI refuses the
+       *  resume when it finds anything else there. */
+      rewindTo?: string;
+      rewindDropsTurn?: string;
       /** Concrete model id from the resumed transcript's last real assistant
        *  message. Claude Code restores from this same record, so it lets us
        *  report the live model without a slow getContextUsage control request. */
@@ -11368,6 +11471,10 @@ export class ClaudeAcpAgent {
       },
       ...(creationOpts.resume !== undefined && { resume: creationOpts.resume }),
       ...(creationOpts.forkSession !== undefined && { forkSession: creationOpts.forkSession }),
+      ...(creationOpts.rewindTo !== undefined && { resumeSessionAt: creationOpts.rewindTo }),
+      ...(creationOpts.rewindDropsTurn !== undefined && {
+        resumeDropsTurn: creationOpts.rewindDropsTurn,
+      }),
       abortController,
     };
 
@@ -13583,6 +13690,11 @@ export function v1AgentApp(
       GOAL_CONTROL_METHOD,
       { parse: parseGoalRequest },
       (ctx) => agent.goal(ctx.params),
+    )
+    .onRequest<SessionRewindRequest, SessionRewindResponse>(
+      SESSION_REWIND_METHOD,
+      { parse: parseSessionRewindRequest },
+      (ctx) => agent.rewindSession(ctx.params),
     );
   return sessionIndex.onSessionIndexRequests(app, () => agent);
 }
