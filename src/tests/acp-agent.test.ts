@@ -27865,6 +27865,7 @@ describe("_session/rewind", () => {
       error: () => {},
     });
     const creations: any[] = [];
+    const requests: any[] = [];
     const register = (sessionId: string, overrides: Record<string, any> = {}) => {
       async function* nothing() {}
       agent.sessions[sessionId] = mockSessionState(
@@ -27882,8 +27883,9 @@ describe("_session/rewind", () => {
     };
     const createSession = vi
       .spyOn(agent as any, "createSession")
-      .mockImplementation(async (_params: any, creationOpts: any) => {
+      .mockImplementation(async (params: any, creationOpts: any) => {
         creations.push(creationOpts);
+        requests.push(params);
         const failure = failures[creations.length - 1];
         if (failure) throw failure;
         const sessionId = (creationOpts.resume ??
@@ -27893,8 +27895,15 @@ describe("_session/rewind", () => {
         return { sessionId, modes, configOptions: [] };
       });
     register("s", sessionOverrides);
-    return { agent, creations, createSession };
+    return { agent, creations, requests, createSession };
   }
+
+  /** A session the user moved off its creation-time configuration. */
+  const reconfigured = {
+    models: { currentModelId: "claude-opus-4-1" },
+    currentAgent: "reviewer",
+    effortPinnedLevel: "high",
+  };
 
   const droppedPrompt = {
     messageId: "air-local-id",
@@ -28053,6 +28062,75 @@ describe("_session/rewind", () => {
     });
     expect(creations).toHaveLength(0);
     expect(importSessionToStore).not.toHaveBeenCalled();
+  });
+
+  it("recreates the session on the model, agent and effort the user left it on", async () => {
+    const { agent, creations, requests } = rewindingAgent(reconfigured);
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect((requests[0]._meta as any).claudeCode.options).toMatchObject({
+      model: "claude-opus-4-1",
+      agent: "reviewer",
+      effort: "high",
+    });
+    // Without the hint the model comes from the transcript tail, which still
+    // ends inside the dropped turn.
+    expect(creations[0].resumedModelHint).toBe("claude-opus-4-1");
+  });
+
+  it("keeps the chosen model when the rewind starts the conversation over", async () => {
+    const { agent, requests } = rewindingAgent(reconfigured);
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: {
+        messageId: "air-local-id",
+        messageFingerprint: fingerprint("first"),
+        messageOccurrence: 1,
+      },
+    });
+
+    expect((requests[0]._meta as any).claudeCode.options).toMatchObject({
+      model: "claude-opus-4-1",
+    });
+  });
+
+  it("keeps the chosen model when it recovers from a refused truncation", async () => {
+    const { agent, requests } = rewindingAgent(reconfigured, { 0: new Error("refused") });
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    expect((requests[1]._meta as any).claudeCode.options).toMatchObject({
+      model: "claude-opus-4-1",
+    });
+  });
+
+  it("restores Fast mode on the recreated session", async () => {
+    const { agent } = rewindingAgent({ fastModeEnabled: true });
+    const applyFastMode = vi.spyOn(agent as any, "applyFastMode").mockResolvedValue(undefined);
+    storedConversation();
+
+    await agent.rewindSession({
+      sessionId: "s",
+      beforeMessage: droppedPrompt,
+      resumeAtMessage: retainedMessage,
+    });
+
+    // The recreated session reports whatever the CLI started it with; the
+    // toggle belongs to the session the user is looking at.
+    expect(applyFastMode).toHaveBeenCalledWith(agent.sessions["s"], true);
   });
 
   it("reports an unknown session rather than rewinding nothing", async () => {

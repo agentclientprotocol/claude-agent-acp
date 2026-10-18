@@ -194,6 +194,7 @@ import {
   type SessionRewindRequest,
   type SessionRewindResponse,
 } from "./session-rewind.js";
+import { restartParams } from "./session-restart-params.js";
 import {
   clientSystemPrompt,
   sdkSystemPrompt,
@@ -3184,6 +3185,14 @@ export class ClaudeAcpAgent {
       messageIdForGrouping,
     });
     const permissionMode = session.modes.currentModeId as PermissionMode;
+    // The session is recreated, so it is recreated as the user left it: the
+    // model, the agent and the effort it runs now, not the ones it was created
+    // with. The model hint carries the same choice past the transcript tail,
+    // which still ends inside the dropped turn and would otherwise restore the
+    // model that turn ran on.
+    const restartRequest = restartParams(session);
+    const resumedModelHint = session.models.currentModelId;
+    const fastModeEnabled = session.fastModeEnabled;
     const replayState: ReplayState = {
       cwd: session.cwd,
       // The task list and the published failures outlive the dropped turns:
@@ -3197,9 +3206,10 @@ export class ClaudeAcpAgent {
     };
     this.closeQueryStream(session);
     try {
-      await this.createRewoundSession(creationParams, params.sessionId, plan, {
+      await this.createRewoundSession(restartRequest, params.sessionId, plan, {
         permissionMode,
         replayState,
+        resumedModelHint,
       });
     } catch (error) {
       // The CLI validates the dropped range and refuses deterministically, so
@@ -3209,10 +3219,27 @@ export class ClaudeAcpAgent {
       this.logger.log(
         `Rewind of session ${params.sessionId} ${isRewindRefusal(error) ? "was refused by the CLI" : `failed: ${error}`}; resuming the untruncated conversation`,
       );
-      await this.recreateLiveSession(creationParams, params.sessionId, { permissionMode });
+      await this.recreateLiveSession(restartRequest, params.sessionId, {
+        permissionMode,
+        resumedModelHint,
+      });
       return { rewound: false };
     }
+    await this.restoreFastMode(params.sessionId, fastModeEnabled);
     return { rewound: true };
+  }
+
+  /** Fast mode is the session's, not the conversation's: a recreated session
+   *  reports whatever the CLI starts it with, so the user's choice is pushed
+   *  back onto it. A failure leaves the session usable, so it is logged only. */
+  private async restoreFastMode(sessionId: string, enabled: boolean): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session || session.fastModeEnabled === enabled) return;
+    try {
+      await this.applyFastMode(session, enabled);
+    } catch (error) {
+      this.logger.error(`Failed to restore Fast mode after rewinding session ${sessionId}:`, error);
+    }
   }
 
   /** The query of a rewound session: a truncating resume of its own stored
@@ -3223,7 +3250,11 @@ export class ClaudeAcpAgent {
     creationParams: NewSessionRequest,
     sessionId: string,
     plan: SessionRewindPlan,
-    options: { permissionMode: PermissionMode; replayState: ReplayState },
+    options: {
+      permissionMode: PermissionMode;
+      replayState: ReplayState;
+      resumedModelHint: string;
+    },
   ): Promise<NewSessionResponse> {
     if (!plan.resumeSessionAt) {
       return this.createSession(creationParams, { publicSessionId: sessionId, ...options });
