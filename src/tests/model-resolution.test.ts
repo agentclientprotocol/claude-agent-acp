@@ -263,6 +263,14 @@ describe("isDeniedModel", () => {
     expect(isDeniedModel("us.anthropic.claude-opus-5-v1:0", denied)).toBe(true);
     expect(isDeniedModel("claude-opus-5-5", denied)).toBe(true);
     expect(isDeniedModel("claude-opus-4-8", denied)).toBe(false);
+    expect(isDeniedModel("anthropic/claude-opus-5.5:batch[1m]", denied)).toBe(true);
+    expect(isDeniedModel("anthropic/us.anthropic.claude-opus-5-v1:0", denied)).toBe(true);
+  });
+
+  it("reads an entry in OpenRouter or dotted spelling as the dashed SDK id", () => {
+    expect(isDeniedModel("claude-opus-4-5", ["claude-opus-4.5"])).toBe(true);
+    expect(isDeniedModel("claude-opus-5-5", ["anthropic/claude-opus-5.5"])).toBe(true);
+    expect(isDeniedModel("claude-opus-5", ["anthropic/claude-opus-5.5"])).toBe(false);
   });
 
   it("blocks only that version when the entry names a minor", () => {

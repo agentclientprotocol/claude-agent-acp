@@ -280,9 +280,46 @@ describe("narrowToGatewayModels", () => {
     expect(narrowed.map((m) => m.value)).toEqual(["sonnet"]);
   });
 
+  it("matches OpenRouter ids: vendor prefix, dotted version and :variant suffix", () => {
+    const models: ModelInfo[] = [
+      {
+        value: "default",
+        resolvedModel: "claude-opus-5-5[1m]",
+        displayName: "Default",
+        description: "",
+      },
+      { value: "opus", displayName: "Opus", description: "" },
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5-5",
+        displayName: "Sonnet",
+        description: "",
+      },
+      { value: "haiku", resolvedModel: "claude-haiku-4-5", displayName: "Haiku", description: "" },
+      { value: "fable", resolvedModel: "claude-fable-5-1", displayName: "Fable", description: "" },
+    ];
+
+    const narrowed = narrowToGatewayModels(models, [
+      "anthropic/claude-opus-5.5:batch[1m]",
+      "anthropic/claude-opus-5.5[1m]",
+      "anthropic/claude-sonnet-5.5[1m]",
+      "anthropic/openai/gpt-6.1-sol:batch[1m]",
+      "anthropic/google/gemini-4-argon[1m]",
+    ]);
+
+    expect(narrowed.map((m) => m.value)).toEqual(["default", "opus", "sonnet"]);
+  });
+
+  it("matches a model OpenRouter lists only as a :variant", () => {
+    const narrowed = narrowToGatewayModels(MODELS, ["anthropic/claude-sonnet-5:batch[1m]"]);
+
+    expect(narrowed.map((m) => m.value)).toEqual(["sonnet", "sonnet[1m]"]);
+  });
+
   it("leaves no model when the listing matches none", () => {
     expect(narrowToGatewayModels(MODELS, ["gpt-5", "gemini-3-pro"])).toEqual([]);
     expect(narrowToGatewayModels(MODELS, [])).toEqual([]);
+    expect(narrowToGatewayModels(MODELS, ["anthropic/openai/gpt-5"])).toEqual([]);
     // A default row without resolvedModel is not a match on its own.
     expect(
       narrowToGatewayModels(
