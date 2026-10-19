@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { AcpClient, toAcpNotifications, ToolUseCache } from "../acp-agent.js";
 import { ClientCapabilities as ToolCallCapabilities } from "../tool-calls/client-capabilities.js";
 import { backgroundedBashToolCall, withRunningTerminal } from "../tool-calls/background.js";

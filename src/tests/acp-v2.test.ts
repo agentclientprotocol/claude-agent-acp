@@ -9,8 +9,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as v1 from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import * as v1 from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   forkSession,
   getSessionMessages,

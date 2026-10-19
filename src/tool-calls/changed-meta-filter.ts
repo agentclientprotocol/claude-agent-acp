@@ -1,4 +1,4 @@
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 
 type SessionUpdate = SessionNotification["update"];
 

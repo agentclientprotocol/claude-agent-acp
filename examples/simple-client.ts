@@ -82,10 +82,10 @@ import {
   client as acpClient,
   methods,
   ndJsonStream,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 // Type-only: Node's type stripping does not elide value imports, and these two
 // exist only in the .d.ts — importing them normally is a runtime SyntaxError.
-import type { AnyMessage, Stream } from "@agentclientprotocol/sdk";
+import type { AnyMessage, Stream } from "@agentclientprotocol/sdk/unstable";
 
 // ---------------------------------------------------------------- steering
 

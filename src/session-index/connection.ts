@@ -15,7 +15,7 @@ import {
   type InitializeRequest,
   type ListSessionsRequest,
   type ListSessionsResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { Query } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, Logger, Session } from "../acp-agent.js";
 import {

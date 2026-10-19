@@ -1,4 +1,4 @@
-import type { SessionNotification, ToolCallContent } from "@agentclientprotocol/sdk";
+import type { SessionNotification, ToolCallContent } from "@agentclientprotocol/sdk/unstable";
 
 type SessionUpdate = SessionNotification["update"];
 

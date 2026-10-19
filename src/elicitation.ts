@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { CreateElicitationResponse } from "@agentclientprotocol/sdk";
+import { CreateElicitationResponse } from "@agentclientprotocol/sdk/unstable";
 import type {
   CreateElicitationRequest,
   ElicitationAcceptAction,
   ElicitationPropertySchema,
   ElicitationSchema,
   EnumOption,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type {
   AskUserQuestionInput,

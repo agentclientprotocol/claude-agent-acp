@@ -55,7 +55,7 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
   ToolCallContent,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,

@@ -1,5 +1,5 @@
 import type { Options, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";

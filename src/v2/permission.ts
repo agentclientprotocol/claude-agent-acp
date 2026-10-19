@@ -2,8 +2,8 @@
  * The v2 form of the permission requests that `ClaudeAcpAgent` sends, and the
  * v1 form of their answers.
  */
-import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
 import { v2ToolCallPatch } from "./tool-call.js";
 

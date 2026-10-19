@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { resolveSkillPath, type SkillScanCache } from "../tool-calls/reporters/interaction.js";
-import { ClientCapabilities } from "@agentclientprotocol/sdk";
+import { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
   BetaMCPToolResultBlock,

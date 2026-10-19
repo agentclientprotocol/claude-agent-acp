@@ -19,7 +19,7 @@ import {
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";

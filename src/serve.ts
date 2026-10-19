@@ -1,5 +1,5 @@
-import { ndJsonStream } from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { ndJsonStream } from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
 import { v2AgentApp } from "./v2/agent.js";

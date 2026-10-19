@@ -4,7 +4,7 @@
  * their own vi.fn spies via `overrides`.
  */
 
-import type { ClientCapabilities, InitializeRequest } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, InitializeRequest } from "@agentclientprotocol/sdk/unstable";
 
 /** The context-usage report the base mock query returns. `rawMaxTokens`
  *  matches the agent's DEFAULT_CONTEXT_WINDOW so window-related assertions

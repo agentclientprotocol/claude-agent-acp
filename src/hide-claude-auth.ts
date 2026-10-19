@@ -32,7 +32,7 @@
  * until the next prompt. Awaiting it would add a CLI run to every turn.
  */
 
-import { RequestError } from "@agentclientprotocol/sdk";
+import { RequestError } from "@agentclientprotocol/sdk/unstable";
 import type { AccountInfo, Query } from "@anthropic-ai/claude-agent-sdk";
 
 export function shouldHideClaudeAuth(): boolean {

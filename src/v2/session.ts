@@ -18,8 +18,8 @@ import {
   type SessionConfigSelectOptions,
   type SetSessionConfigOptionRequest,
   type SystemPrompt,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { v1ContentBlock } from "./prompt.js";
 
 export function v1NewSessionRequest(params: v2.NewSessionRequest): NewSessionRequest {

@@ -1,4 +1,4 @@
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   type ClearContextCoordinatorHost,

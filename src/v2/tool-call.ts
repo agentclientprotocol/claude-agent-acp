@@ -2,8 +2,8 @@
  * The v2 form of the tool call reports that `ClaudeAcpAgent` sends as v1
  * `tool_call` and `tool_call_update` updates, and in permission requests.
  */
-import type { ToolCall, ToolCallContent, ToolCallUpdate } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import type { ToolCall, ToolCallContent, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 
 type V1ToolCallReport =
   | (ToolCall & { sessionUpdate: "tool_call" })

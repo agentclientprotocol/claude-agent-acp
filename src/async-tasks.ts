@@ -1,4 +1,4 @@
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, AsyncTaskState } from "./acp-subagents.js";
 import { AIR_ASYNC_TASKS_CAPABILITY, clientSupportsAirCapability } from "./air-extension.js";
 import { noticeOrTranscriptUpdate } from "./session-notices.js";
