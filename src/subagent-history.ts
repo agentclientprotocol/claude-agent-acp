@@ -202,7 +202,8 @@ async function readLaunchIdsFromTranscript(
   const stream = createReadStream(file, { encoding: "utf8" });
   try {
     for await (const line of readline.createInterface({ input: stream, crlfDelay: Infinity })) {
-      if (!line.includes('"tool_use"')) continue;
+      const forkDirective = owner !== null && line.includes(FORK_BOILERPLATE_OPEN);
+      if (!line.includes('"tool_use"') && !forkDirective) continue;
       let record: {
         type?: unknown;
         isSidechain?: unknown;
@@ -212,6 +213,13 @@ async function readLaunchIdsFromTranscript(
       try {
         record = JSON.parse(line);
       } catch {
+        continue;
+      }
+      // Every record of a fork child's transcript before its directive message
+      // is inherited context: a copy of the launching message, whose launch
+      // calls are the parent's, not the fork's.
+      if (forkDirective && record !== null && isForkDirectiveMessage(record)) {
+        launches.clear();
         continue;
       }
       if (record?.type !== "assistant") continue;
@@ -248,11 +256,68 @@ export async function readSubagentMessages(
   try {
     if (history.dir) {
       const messages = await getSubagentMessages(sessionId, agentId, { dir: history.dir });
-      if (messages.length > 0) return messages;
+      if (messages.length > 0) return stripForkPrefix(messages);
     }
-    return await getSubagentMessages(sessionId, agentId);
+    return stripForkPrefix(await getSubagentMessages(sessionId, agentId));
   } catch (error) {
     logger.error(`Failed to read the history of subagent ${agentId}:`, error);
     return [];
   }
+}
+
+/** How Claude Code opens the directive message of a `subagent_type: "fork"` child. */
+const FORK_BOILERPLATE_OPEN = "<fork-boilerplate>";
+/** What follows the boilerplate, right before the prompt of the Agent call. */
+const FORK_DIRECTIVE_MARKER = "</fork-boilerplate>\nYour directive: ";
+
+/** Whether `block` is the text block of a fork child's directive message. */
+function isForkDirectiveText(block: unknown): block is { type: "text"; text: string } {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string" &&
+    (block as { text: string }).text.startsWith(FORK_BOILERPLATE_OPEN)
+  );
+}
+
+/** Whether the transcript record `message` is the directive message of a fork child. */
+function isForkDirectiveMessage(message: { type?: unknown; message?: unknown }): boolean {
+  if (message.type !== "user") return false;
+  const content = (message.message as { content?: unknown } | null | undefined)?.content;
+  return Array.isArray(content) && content.some(isForkDirectiveText);
+}
+
+/**
+ * The transcript of a `subagent_type: "fork"` child without the context it
+ * inherited. A fork transcript starts with a copy of the parent's launching
+ * assistant message (its text, thinking and every tool_use, including the
+ * Agent call itself), then a user message with a "Fork started — processing
+ * in background" tool_result for each of those tool_uses and the text
+ * `<fork-boilerplate>…</fork-boilerplate>\nYour directive: <prompt>`. A fork
+ * launched from inside a subagent also gets a copy of that subagent's history
+ * before them. None of it is the child's own work: replayed as is, the
+ * parent's text and tool calls would show again in the child.
+ *
+ * This drops every record before the directive message, and reduces that
+ * message to the prompt. Other transcripts are returned unchanged.
+ */
+export function stripForkPrefix(messages: SessionMessage[]): SessionMessage[] {
+  const index = messages.findIndex(isForkDirectiveMessage);
+  if (index === -1) return messages;
+  const directive = messages[index];
+  const content = (directive.message as { content: unknown[] }).content;
+  const prompt = content.flatMap((block) => {
+    if (!isForkDirectiveText(block)) return [];
+    const start = block.text.indexOf(FORK_DIRECTIVE_MARKER);
+    return start === -1
+      ? []
+      : [{ type: "text", text: block.text.slice(start + FORK_DIRECTIVE_MARKER.length) }];
+  });
+  const rest = messages.slice(index + 1);
+  if (prompt.length === 0) return rest;
+  return [
+    { ...directive, message: { ...(directive.message as object), content: prompt } },
+    ...rest,
+  ];
 }

@@ -2,7 +2,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { subagentLineage } from "../subagent-history.js";
+import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
+import { stripForkPrefix, subagentLineage } from "../subagent-history.js";
 
 const sessionId = "33333333-3333-4333-8333-333333333333";
 const base = {
@@ -34,6 +35,29 @@ const launch = (uuid: string, launchId: string) => ({
         id: launchId,
         name: "Agent",
         input: { description: "Work", prompt: "Work" },
+      },
+    ],
+  },
+});
+/**
+ * The directive message that Claude Code writes after the copy of the launching
+ * message in a `subagent_type: "fork"` child's transcript.
+ */
+const forkDirective = (uuid: string, launchIds: string[], prompt: string) => ({
+  ...base,
+  type: "user",
+  uuid,
+  message: {
+    role: "user",
+    content: [
+      ...launchIds.map((id) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [{ type: "text", text: "Fork started — processing in background" }],
+      })),
+      {
+        type: "text",
+        text: `<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\nYour directive: ${prompt}`,
       },
     ],
   },
@@ -213,11 +237,81 @@ describe("subagentLineage", () => {
     await expect(subagentLineage(sessionId, "worker1", logger)).resolves.toEqual([]);
   });
 
+  it("does not take the launches copied into a fork's transcript for the fork's", async () => {
+    // The coordinator launched a worker, then a fork. The fork's transcript
+    // starts with a copy of the coordinator's history and of its launching
+    // message, so both launch calls appear in it too.
+    const coordinatorRecords = [user("c1", "Work"), launch("c2", "launch-worker")];
+    await writeSession([user("u1", "Go"), launch("a1", "launch-coordinator")], {
+      afork1: {
+        meta: { ...meta("launch-fork", "fork"), agentType: "fork" },
+        records: [
+          ...coordinatorRecords,
+          launch("f1", "launch-fork"),
+          forkDirective("f2", ["launch-fork"], "Inspect"),
+          user("f3", "own work"),
+        ],
+      },
+      coordinator1: {
+        meta: meta("launch-coordinator", "coordinator"),
+        records: [...coordinatorRecords, launch("c3", "launch-fork")],
+      },
+      worker1: { meta: meta("launch-worker", "worker"), records: [user("w1", "Work")] },
+    });
+
+    const parents = async (agentId: string) =>
+      (await subagentLineage(sessionId, agentId, logger)).map((entry) => entry.parentAgentId);
+    await expect(parents("worker1")).resolves.toEqual([undefined, "coordinator1"]);
+    await expect(parents("afork1")).resolves.toEqual([undefined, "coordinator1"]);
+  });
+
   it("is empty for an agent without metadata", async () => {
     await writeSession([user("u1", "Go"), launch("a1", "launch-echoer")], {
       echoer1: { meta: meta("launch-echoer", "echoer"), records: [user("e1", "Work")] },
     });
 
     await expect(subagentLineage(sessionId, "other1", logger)).resolves.toEqual([]);
+  });
+});
+
+describe("stripForkPrefix", () => {
+  /** A transcript record as the SDK's `getSubagentMessages` returns it. */
+  const record = (entry: { type: string; uuid: string; message: unknown }): SessionMessage => ({
+    type: entry.type as SessionMessage["type"],
+    uuid: entry.uuid,
+    session_id: sessionId,
+    message: entry.message,
+    parent_tool_use_id: null,
+    parent_agent_id: null,
+  });
+
+  it("drops the copy of the launching message and keeps only the directive's prompt", () => {
+    const clone = record(launch("clone", "launch-fork"));
+    const directive = record(forkDirective("d1", ["launch-fork"], "Inspect the parser"));
+    const work = record(user("w1", "own work"));
+
+    expect(stripForkPrefix([clone, directive, work])).toEqual([
+      {
+        ...directive,
+        message: { role: "user", content: [{ type: "text", text: "Inspect the parser" }] },
+      },
+      work,
+    ]);
+  });
+
+  it("drops the inherited history of a fork launched from inside a subagent", () => {
+    const inherited = [record(user("c1", "Work")), record(launch("c2", "launch-worker"))];
+    const clone = record(launch("clone", "launch-fork"));
+    const directive = record(forkDirective("d1", ["launch-fork"], "Inspect"));
+    const work = record(user("w1", "own work"));
+
+    const stripped = stripForkPrefix([...inherited, clone, directive, work]);
+
+    expect(stripped.map((message) => message.uuid)).toEqual(["d1", "w1"]);
+  });
+
+  it("returns a transcript without a fork directive unchanged", () => {
+    const messages = [record(user("u1", "Work")), record(launch("a1", "launch-worker"))];
+    expect(stripForkPrefix(messages)).toBe(messages);
   });
 });

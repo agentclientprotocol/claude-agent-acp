@@ -3825,6 +3825,68 @@ describe("subagent transcript replay", () => {
       }
     }
 
+    it("replays a fork child without the launching message and boilerplate it inherited", async () => {
+      // A `subagent_type: "fork"` transcript starts with a copy of the
+      // launching message (same API message id) and a directive message with
+      // a "Fork started" result for each of its tool_uses.
+      const launching = [
+        { type: "text", text: "I'll fork a worker." },
+        toolUse("toolu_fork", "Agent", {
+          subagent_type: "fork",
+          description: "Check the parser",
+          prompt: "Inspect the parser",
+        }),
+        toolUse("toolu_read", "Read", { file_path: "/tmp/proj/a.ts" }),
+      ];
+      const forkStarted = (id: string) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [{ type: "text", text: "Fork started — processing in background" }],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Check it"),
+          assistant("a1", launching),
+          user("u2", [toolResult("toolu_fork", "Parser is fine."), toolResult("toolu_read", "x")]),
+          assistant("a2", [{ type: "text", text: "Done." }]),
+        ],
+        {
+          fork1: {
+            meta: {
+              agentType: "fork",
+              isFork: true,
+              description: "Check the parser",
+              toolUseId: "toolu_fork",
+            },
+            records: [
+              { ...assistant("f1", launching), message: { ...assistant("a1", launching).message } },
+              user("f2", [
+                forkStarted("toolu_fork"),
+                forkStarted("toolu_read"),
+                {
+                  type: "text",
+                  text: "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\nYour directive: Inspect the parser",
+                },
+              ]),
+              assistant("f3", [{ type: "text", text: "Parser is fine." }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Check it",
+        "root agent_message_chunk I'll fork a worker.",
+        "root tool_call toolu_fork",
+        "root tool_call toolu_read",
+        'root subagent_update fork1 {"state":"running"}',
+        `fork1 session_message toolu_fork from=${sessionId} Inspect the parser`,
+        "fork1 agent_message_chunk Parser is fine.",
+        "root agent_message_chunk Done.",
+        'root subagent_update fork1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
     it("replays each child under its live session id, with its incoming messages, before the response", async () => {
       const trace = await replayRfd(
         [

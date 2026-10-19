@@ -337,6 +337,16 @@ describe("the ACP tool call contract", () => {
     expect(report(terminalAir, "Agent", input).call.title).toBe("Explore (high effort)");
   });
 
+  it("does not show an effort for a fork, which runs at the parent's effort", () => {
+    const input = {
+      description: "Explore",
+      prompt: "Inspect",
+      effort: "high",
+      subagent_type: "fork",
+    };
+    expect(report(terminalAir, "Agent", input).call.title).toBe("Explore");
+  });
+
   it("reports TodoWrite as a plan, not as a tool call", () => {
     const { call } = report(terminalAir, "TodoWrite", {
       todos: [{ content: "Test", status: "pending", activeForm: "Testing" }],
