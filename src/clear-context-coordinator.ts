@@ -44,6 +44,7 @@ export type ClearContextSession<Turn extends ClearContextTurn = ClearContextTurn
   turnQueue?: Turn[];
   pendingExitPlanContextReset?: ClearContextReset;
   contextUsedTokens?: number;
+  sentUserUuids?: Set<string>;
   input: { push(message: SDKUserMessage): unknown };
 };
 
@@ -158,6 +159,7 @@ export async function continuePlanInFreshContext<
   }
   assertRestartActive(freshSession);
 
+  (freshSession.sentUserUuids ??= new Set()).add(turn.promptUuid);
   freshSession.input.push(host.continuationMessage(sessionId, reset.plan, turn.promptUuid));
   assertRestartActive(freshSession);
   host.ensureConsumer(freshSession, sessionId);

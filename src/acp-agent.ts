@@ -1087,6 +1087,10 @@ export type Session = {
    *  terminal (e.g. /doctor, /color). ACP clients aren't that terminal, so
    *  these are filtered out of `available_commands_update` payloads. */
   terminalSlashCommands?: string[];
+  /** The uuids of the user messages this adapter pushed whose echo has not come
+   *  back yet. Claude Code stamps the echo with the same human origin as a
+   *  message typed in another client, so the uuid is what tells the two apart. */
+  sentUserUuids?: Set<string>;
   /** The `/remote-control` command that is running, from its request to its
    *  reply. Prompts wait for it, and a second command is refused meanwhile. */
   remoteControlCommand?: Promise<void>;
@@ -3965,6 +3969,7 @@ export class ClaudeAcpAgent {
 
     session.turnQueue ??= [];
     session.turnQueue.push(turn);
+    (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
     // The prompt is queued, so its turn goes ahead even if the client misses
@@ -4401,6 +4406,7 @@ export class ClaudeAcpAgent {
       // The held turn's work had ended at its result; the steer resumes it.
       this.startForeground(sessionId, turnInFlight);
     }
+    (session.sentUserUuids ??= new Set()).add(steeredUuid);
     session.input.push(userMessage);
     const firstText = params.prompt[0]?.type === "text" ? params.prompt[0].text : "";
     await this.publishGoalFromPrompt(sessionId, firstText, steeredUuid);
@@ -7747,6 +7753,9 @@ export class ClaudeAcpAgent {
               if (session.pendingGoalUpdate?.commandUuid === message.uuid) {
                 session.pendingGoalUpdate.started = true;
               }
+              // Taken out for every echo, not only in the branch below, so the
+              // set does not grow with each prompt.
+              const sentByAdapter = session.sentUserUuids?.delete(message.uuid) ?? false;
               const queued = findUnsettledTurn(message.uuid);
               if (queued) {
                 // Only (re)activate if this isn't already the active turn — a
@@ -7829,13 +7838,18 @@ export class ClaudeAcpAgent {
                 ) {
                   session.activeTurn.steeredAwaitingResult = true;
                 }
-                // The echo of a prompt typed in another client of the session
-                // (Remote Control from claude.ai or the mobile app). Claude
-                // Code stamps those as human; the echoes of this adapter's own
-                // prompts carry no origin, so they never reach this.
-                if (isRemoteHumanMessage(message)) {
+                // A message typed in another client of the session (Remote
+                // Control from claude.ai or the mobile app). The adapter's own
+                // prompts and steers are stamped human too, so they are told
+                // apart by uuid: a steer matches no turn, and a turn can settle
+                // before its echo comes.
+                const remoteContent =
+                  !sentByAdapter && isRemoteHumanMessage(message)
+                    ? stripLocalCommandMetadata(message.message.content)
+                    : null;
+                if (remoteContent !== null) {
                   for (const notification of toAcpNotifications(
-                    message.message.content,
+                    remoteContent as ContentBlockParam[] | string,
                     "user",
                     params.sessionId,
                     session.toolUseCache,

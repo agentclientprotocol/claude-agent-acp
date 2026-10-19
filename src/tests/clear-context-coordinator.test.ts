@@ -144,6 +144,9 @@ describe("continuePlanInFreshContext", () => {
         }),
       }),
     );
+    // Its echo carries the same human origin as a message typed in another
+    // client, so the fresh session must know the uuid is its own.
+    expect(freshSession.sentUserUuids).toEqual(new Set([turn.promptUuid]));
     expect(host.ensureConsumer).toHaveBeenCalledWith(freshSession, "public-session");
   });
 
