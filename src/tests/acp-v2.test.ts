@@ -1123,20 +1123,24 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
+    // The end event closes the replay. v2 then requires the state snapshot
+    // after the replay and before the response.
     expect(atResponse.map(({ update }) => update.sessionUpdate)).toEqual([
       "user_message",
       "user_message_chunk",
       "agent_message",
       "agent_message_chunk",
       "session_info_update",
+      "state_update",
     ]);
-    expect(atResponse.at(-1)).toEqual({
+    expect(atResponse.at(-2)).toEqual({
       sessionId: resumedSessionId,
       update: {
         sessionUpdate: "session_info_update",
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
+    expect(atResponse.at(-1)?.update).toEqual({ sessionUpdate: "state_update", state: "idle" });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
 
