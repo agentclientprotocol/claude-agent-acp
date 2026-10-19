@@ -1,11 +1,6 @@
 import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk";
-import type {
-  EffortLevel,
-  Options,
-  PermissionMode,
-  SDKUserMessage,
-} from "@anthropic-ai/claude-agent-sdk";
-import { DEFAULT_AGENT_ID, DEFAULT_MODEL_ID } from "./session-config-ids.js";
+import type { PermissionMode, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { restartParams } from "./session-restart-params.js";
 
 export type ClearContextReset = {
   toolUseId: string;
@@ -67,37 +62,6 @@ export type ClearContextCoordinatorHost<
   ensureConsumer(session: Session, sessionId: string): void;
   logError(message: string, error: unknown): void;
 };
-
-function restartParams<Session extends ClearContextSession>(session: Session): NewSessionRequest {
-  const originalParams = session.creationParams ?? { cwd: session.cwd, mcpServers: [] };
-  const originalMeta = originalParams._meta as
-    ({ claudeCode?: { options?: Options } } & Record<string, unknown>) | undefined;
-  const originalOptions = originalMeta?.claudeCode?.options;
-  const unmanagedOptions = { ...(originalOptions ?? {}) };
-  delete unmanagedOptions.model;
-  delete unmanagedOptions.agent;
-  delete unmanagedOptions.effort;
-
-  return {
-    ...originalParams,
-    _meta: {
-      ...(originalMeta ?? {}),
-      claudeCode: {
-        ...(originalMeta?.claudeCode ?? {}),
-        options: {
-          ...unmanagedOptions,
-          ...(session.models.currentModelId !== DEFAULT_MODEL_ID
-            ? { model: session.models.currentModelId }
-            : {}),
-          ...(session.currentAgent !== DEFAULT_AGENT_ID ? { agent: session.currentAgent } : {}),
-          ...(session.effortPinnedLevel !== undefined
-            ? { effort: session.effortPinnedLevel as EffortLevel }
-            : {}),
-        },
-      },
-    },
-  };
-}
 
 /** Replace Claude's private conversation and attach the still-pending ACP turn
  * to it. The host owns provider-specific creation and stream mechanics; this

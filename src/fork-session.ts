@@ -2,177 +2,33 @@ import { ForkSessionRequest, ForkSessionResponse, RequestError } from "@agentcli
 import {
   forkSession as forkClaudeSession,
   getSessionMessages,
-  importSessionToStore,
-  type SessionStore,
-  type SessionStoreEntry,
 } from "@anthropic-ai/claude-agent-sdk";
-import { createHash } from "node:crypto";
-import { assistantMessageText } from "./session-failure-extension.js";
+import {
+  assistantGroups,
+  historyPoint,
+  historyPointMessageIdCandidates,
+  loadFullSessionHistory,
+  resolveHistoryPointUuid,
+  type MessageIdForGrouping,
+  type SessionHistoryPoint,
+} from "./session-history-point.js";
 import { SessionTiming } from "./session-timing.js";
 
 type ForkSessionMeta = {
   [key: string]: unknown;
-  jetbrains?: {
-    air?: {
-      fork?: {
-        version?: number;
-        messageId?: string;
-        messageFingerprint?: string;
-        messageOccurrence?: number;
-      };
-    };
-  };
+  jetbrains?: { air?: { fork?: { version?: number } & Record<string, unknown> } };
 };
 
 type ForkSessionDependencies = {
   liveMessageIdToUuid?: ReadonlyMap<string, string>;
   logger?: { log: (...args: unknown[]) => void };
-  messageIdForGrouping: (message: {
-    type?: string;
-    uuid?: string | null;
-    message?: unknown;
-  }) => string | undefined;
+  messageIdForGrouping: MessageIdForGrouping;
 };
 
-type ForkPoint = {
-  messageId: string;
-  messageFingerprint?: string;
-  messageOccurrence?: number;
-};
-
-function forkPoint(meta: unknown): ForkPoint | undefined {
+function forkPoint(meta: unknown): SessionHistoryPoint | undefined {
   const fork = (meta as ForkSessionMeta | null | undefined)?.jetbrains?.air?.fork;
   if (fork?.version !== 1) return undefined;
-  const messageId = fork.messageId?.trim();
-  if (!messageId) return undefined;
-  const messageFingerprint = fork.messageFingerprint?.trim();
-  const messageOccurrence = fork.messageOccurrence;
-  return {
-    messageId,
-    ...(messageFingerprint ? { messageFingerprint } : {}),
-    // AIR computes this with count(...) over the visible prefix, so it is 1-based.
-    ...(typeof messageOccurrence === "number" &&
-    Number.isSafeInteger(messageOccurrence) &&
-    messageOccurrence > 0
-      ? { messageOccurrence }
-      : {}),
-  };
-}
-
-function forkPointMessageIdCandidates(messageId: string): string[] {
-  // Older AIR builds sent their visible segment id. Prefer the exact id before its ACP source id.
-  const protocolMessageId = messageId.replace(/:segment:\d+$/, "");
-  return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
-}
-
-async function loadFullSessionHistory(
-  sessionId: string,
-  cwd: string,
-): Promise<SessionStoreEntry[]> {
-  // getSessionMessages returns only the active parentUuid chain. The import keeps inactive branches that AIR can still reference.
-  const entries: SessionStoreEntry[] = [];
-  const store: SessionStore = {
-    append: async (_key, batch) => {
-      entries.push(...batch);
-    },
-    load: async () => null,
-  };
-  await importSessionToStore(sessionId, store, { dir: cwd, includeSubagents: false });
-  return entries;
-}
-
-function assistantGroups(
-  entries: SessionStoreEntry[],
-  messageIdForGrouping: ForkSessionDependencies["messageIdForGrouping"],
-) {
-  const groups = new Map<string, { uuid?: string; text: string }>();
-  for (const entry of entries) {
-    if (
-      entry.type !== "assistant" ||
-      entry.isSidechain === true ||
-      entry.parent_tool_use_id != null ||
-      entry.parent_agent_id != null
-    ) {
-      continue;
-    }
-    const messageId = messageIdForGrouping(entry);
-    if (!messageId) continue;
-    const group = groups.get(messageId) ?? { text: "" };
-    if (typeof entry.uuid === "string" && entry.uuid.length > 0) group.uuid = entry.uuid;
-    group.text += assistantMessageText(entry.message) ?? "";
-    groups.set(messageId, group);
-  }
-  return groups;
-}
-
-function fingerprint(text: string): string {
-  return `sha256:${createHash("sha256").update(text).digest("hex")}`;
-}
-
-function fingerprintOccurrenceOnBranch(
-  targetUuid: string,
-  expectedFingerprint: string,
-  entries: SessionStoreEntry[],
-  groups: ReturnType<typeof assistantGroups>,
-  messageIdForGrouping: ForkSessionDependencies["messageIdForGrouping"],
-): number {
-  const entriesByUuid = new Map(
-    entries.flatMap((entry) => (typeof entry.uuid === "string" ? [[entry.uuid, entry]] : [])),
-  );
-  const seenGroups = new Set<string>();
-  let occurrence = 0;
-  let cursor: string | undefined = targetUuid;
-  while (cursor) {
-    const entry = entriesByUuid.get(cursor);
-    if (!entry) break;
-    if (
-      entry.type === "assistant" &&
-      entry.isSidechain !== true &&
-      entry.parent_tool_use_id == null &&
-      entry.parent_agent_id == null
-    ) {
-      const messageId = messageIdForGrouping(entry);
-      if (messageId && !seenGroups.has(messageId)) {
-        seenGroups.add(messageId);
-        const group = groups.get(messageId);
-        if (group && fingerprint(group.text) === expectedFingerprint) occurrence++;
-      }
-    }
-    cursor = typeof entry.parentUuid === "string" ? entry.parentUuid : undefined;
-  }
-  return occurrence;
-}
-
-function resolveFromFullHistory(
-  entries: SessionStoreEntry[],
-  candidates: string[],
-  point: ForkPoint,
-  messageIdForGrouping: ForkSessionDependencies["messageIdForGrouping"],
-): string | undefined {
-  const groups = assistantGroups(entries, messageIdForGrouping);
-  const exact = candidates.map((candidate) => groups.get(candidate)?.uuid).find(Boolean);
-  if (exact) return exact;
-  if (!point.messageFingerprint || !point.messageOccurrence) return undefined;
-
-  const fingerprintMatches = [...groups.values()].filter(
-    (group) => group.uuid && fingerprint(group.text) === point.messageFingerprint,
-  );
-  // If only one persisted message has this content, the fingerprint already
-  // identifies it even when an older client supplied an incompatible index.
-  if (fingerprintMatches.length === 1) return fingerprintMatches[0]?.uuid;
-
-  const occurrenceMatches = fingerprintMatches.filter(
-    (group) =>
-      group.uuid &&
-      fingerprintOccurrenceOnBranch(
-        group.uuid,
-        point.messageFingerprint!,
-        entries,
-        groups,
-        messageIdForGrouping,
-      ) === point.messageOccurrence,
-  );
-  return occurrenceMatches.length === 1 ? occurrenceMatches[0]?.uuid : undefined;
+  return historyPoint(fork);
 }
 
 export async function forkSession(
@@ -187,7 +43,7 @@ export async function forkSession(
     return { sessionId: forked.sessionId };
   }
 
-  const candidateIds = forkPointMessageIdCandidates(point.messageId);
+  const candidateIds = historyPointMessageIdCandidates(point.messageId);
   const liveUuid = candidateIds
     .map((candidateId) => dependencies.liveMessageIdToUuid?.get(candidateId))
     .find(Boolean);
@@ -208,12 +64,7 @@ export async function forkSession(
       .find(Boolean);
   const fullHistoryUuid = messageUuid
     ? undefined
-    : resolveFromFullHistory(
-        await loadFullSessionHistory(params.sessionId, params.cwd),
-        candidateIds,
-        point,
-        dependencies.messageIdForGrouping,
-      );
+    : await resolveFromFullHistory(params.sessionId, params.cwd, point, dependencies);
   timing.phase(
     "full-history",
     ` resolution=${liveUuid ? "live" : messageUuid ? "active" : fullHistoryUuid ? "full" : "missing"}`,
@@ -232,4 +83,19 @@ export async function forkSession(
   });
   timing.phase("sdk-fork");
   return { sessionId: forked.sessionId };
+}
+
+async function resolveFromFullHistory(
+  sessionId: string,
+  cwd: string,
+  point: SessionHistoryPoint,
+  dependencies: ForkSessionDependencies,
+): Promise<string | undefined> {
+  const entries = await loadFullSessionHistory(sessionId, cwd);
+  return resolveHistoryPointUuid(
+    entries,
+    assistantGroups(entries, dependencies.messageIdForGrouping),
+    point,
+    dependencies.messageIdForGrouping,
+  );
 }

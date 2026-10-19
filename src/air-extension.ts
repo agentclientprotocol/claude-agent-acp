@@ -12,6 +12,12 @@ export const AIR_RAW_INPUT_RENDERING_CAPABILITY = "rawInputRendering";
  */
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
 /**
+ * The agent supports `_session/rewind`: it drops one user turn and everything
+ * after it from the conversation it already holds, instead of answering the
+ * edit of a message with a fork. The client does not declare it.
+ */
+export const AIR_SESSION_REWIND_CAPABILITY = "sessionRewind";
+/**
  * The session index: a bounded, ordered `session/list` with row metadata, and
  * `_session/rename`, `_session/archive`, `_session/unarchive` and the list
  * subscription. Advertised only to a client that declares it.
