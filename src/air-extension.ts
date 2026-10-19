@@ -40,6 +40,14 @@ export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
  * {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not declare it.
  */
 export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
+/**
+ * The client wants to know when the history replay of a loaded session is
+ * whole. After the last replayed update, the agent sends one
+ * `session_info_update` with `_meta.jetbrains.air.loadReplayEnd: true` (see
+ * {@link AIR_LOAD_REPLAY_END_KEY}). The client declares it; the agent does not
+ * advertise it.
+ */
+export const AIR_LOAD_REPLAY_END_CAPABILITY = "loadReplayEnd";
 
 /** The `_meta.jetbrains.air` keys that the ACP tool call contract defines. */
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
@@ -53,6 +61,8 @@ export const AIR_KIND_KEY = "kind";
 export const AIR_SKILL_PATH_KEY = "skillPath";
 export const AIR_PERMISSION_KEY = "permission";
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/** The `_meta.jetbrains.air` key of the update that ends a whole history replay. */
+export const AIR_LOAD_REPLAY_END_KEY = "loadReplayEnd";
 /**
  * The root `_meta` spelling of {@link AIR_CUSTOM_ANSWER_KEY} that released
  * AIR versions read. Remove it when the ACP registry no longer serves AIR

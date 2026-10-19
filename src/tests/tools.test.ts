@@ -1,7 +1,16 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { resolveSkillPath, type SkillScanCache } from "../tool-calls/reporters/interaction.js";
 import { ClientCapabilities } from "@agentclientprotocol/sdk";
 import { ImageBlockParam, ToolResultBlockParam } from "@anthropic-ai/sdk/resources";
 import {
@@ -4580,21 +4589,54 @@ describe("Skill tool rendering", () => {
       )?._meta?.jetbrains?.air?.skill;
 
     let root: string;
+    let home: string;
+    let realHome: string | undefined;
 
     beforeEach(() => {
       root = mkdtempSync(path.join(tmpdir(), "acp-skill-path-"));
+      // A miss scans the user-level containers, so the real home of whoever runs this must stay out of it.
+      home = path.join(root, "home");
+      mkdirSync(home, { recursive: true });
+      realHome = process.env.HOME;
+      process.env.HOME = home;
     });
 
     afterEach(() => {
+      if (realHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = realHome;
+      }
       rmSync(root, { recursive: true, force: true });
     });
 
-    const writeSkill = (relativeDir: string) => {
+    const writeSkill = (relativeDir: string, declaredName?: string) => {
       const dir = path.join(root, relativeDir);
       mkdirSync(dir, { recursive: true });
       const file = path.join(dir, "SKILL.md");
-      writeFileSync(file, "# skill\n");
+      writeFileSync(
+        file,
+        declaredName ? `---\nname: ${declaredName}\n---\n# skill\n` : "# skill\n",
+      );
       return file;
+    };
+
+    /** A skill whose whole `SKILL.md` is given, for the frontmatter spellings `writeSkill` cannot express. */
+    const writeSkillFile = (relativeDir: string, content: string) => {
+      const dir = path.join(root, relativeDir);
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, content);
+      return file;
+    };
+
+    // The skill directory is outside the container, so only a link into the container can hold it.
+    const linkSkill = (relativeLink: string, declaredName?: string) => {
+      const file = writeSkill(`external/${relativeLink.replaceAll("/", "-")}-target`, declaredName);
+      const link = path.join(root, relativeLink);
+      mkdirSync(path.dirname(link), { recursive: true });
+      symlinkSync(path.dirname(file), link);
+      return path.join(link, "SKILL.md");
     };
 
     it("resolves a project-level .claude/skills skill", () => {
@@ -4625,6 +4667,171 @@ describe("Skill tool rendering", () => {
     it("omits the path when the session has no cwd", () => {
       writeSkill(".claude/skills/commits");
       expect(skillMeta("commits").path).toBeUndefined();
+    });
+
+    it("resolves a skill whose directory name differs from its declared name", () => {
+      const file = writeSkill(".claude/skills/rubymine", "rubymine-workflows");
+      expect(skillMeta("rubymine-workflows", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill whose link name differs from its declared name", () => {
+      const file = linkSkill(".claude/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("resolves a symlinked skill of .agents/skills by its declared name", () => {
+      const file = linkSkill(".agents/skills/linked", "commits");
+      expect(skillMeta("commits", root).path).toBe(file);
+    });
+
+    it("prefers the directory that carries the name when its file declares no name", () => {
+      const byName = writeSkill(".claude/skills/commits");
+      writeSkill(".agents/skills/other", "commits");
+      expect(skillMeta("commits", root).path).toBe(byName);
+    });
+
+    it("prefers the file that declares the name over a directory of that name declaring another", () => {
+      writeSkill(".claude/skills/commits", "git-commits");
+      const declared = writeSkill(".agents/skills/other", "commits");
+      expect(skillMeta("commits", root).path).toBe(declared);
+    });
+
+    it("omits the path when the directory of that name belongs to another skill", () => {
+      writeSkill(".claude/skills/commits", "git-commits");
+      expect(skillMeta("commits", root)).toEqual({ name: "commits" });
+    });
+
+    it("resolves a directory-scoped skill by its declared name", () => {
+      const file = writeSkill("apps/web/.claude/skills/deployment", "deploy");
+      expect(skillMeta("apps/web:deploy", root).path).toBe(file);
+    });
+
+    it("resolves a plugin skill by its declared name", () => {
+      const file = writeSkill(".claude/plugins/reviewer/skills/auditor", "audit");
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("ignores a name that the frontmatter does not declare", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("rubymine-workflows", root)).toEqual({ name: "rubymine-workflows" });
+    });
+
+    it("picks up a declared name that changed after the first resolution", () => {
+      const file = writeSkill(".claude/skills/commits", "commits");
+      expect(skillMeta("renamed", root).path).toBeUndefined();
+      writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
+      utimesSync(file, new Date(), new Date(Date.now() + 2000));
+      expect(skillMeta("renamed", root).path).toBe(file);
+    });
+
+    it("picks up a rewrite that restored the modification time of the file", () => {
+      const file = writeSkill(".claude/skills/commits", "commits");
+      const stamp = new Date(Math.floor(Date.now() / 1000) * 1000);
+      utimesSync(file, stamp, stamp);
+      const before = statSync(file).mtimeMs;
+      expect(skillMeta("renamed", root).path).toBeUndefined();
+      // The rename keeps the length of the file, so only the inode change time tells the two apart.
+      writeFileSync(file, "---\nname: renamed\n---\n# skill\n");
+      // `git checkout`, `cp -p`, and a filesystem of one-second time resolution all leave the same trace.
+      utimesSync(file, stamp, stamp);
+      expect(statSync(file).mtimeMs).toBe(before);
+      expect(skillMeta("renamed", root).path).toBe(file);
+    });
+
+    it("resolves a user-level skill by its declared name", () => {
+      const dir = path.join(home, ".claude/skills/rubymine");
+      mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, "SKILL.md");
+      writeFileSync(file, "---\nname: rubymine-workflows\n---\n# skill\n");
+      expect(skillMeta("rubymine-workflows", root).path).toBe(file);
+    });
+
+    it("resolves a marketplace plugin skill by its declared name", () => {
+      const file = writeSkill(
+        ".claude/plugins/marketplaces/official/plugins/reviewer/skills/auditor",
+        "audit",
+      );
+      expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("gives one name to the same skill on every machine", () => {
+      const first = writeSkill(".claude/skills/a-first", "commits");
+      writeSkill(".claude/skills/z-last", "commits");
+      expect(skillMeta("commits", root).path).toBe(first);
+    });
+
+    it("leaves a prompt command of .claude/commands unresolved", () => {
+      writeSkill(".agents/skills/other", "deploy");
+      mkdirSync(path.join(root, ".claude/commands"), { recursive: true });
+      writeFileSync(path.join(root, ".claude/commands/deploy.md"), "# prompt\n");
+      expect(skillMeta("deploy", root)).toEqual({ name: "deploy" });
+    });
+
+    it("keeps a name that escapes its container off the filesystem", () => {
+      writeSkill(".claude/skills/commits");
+      expect(skillMeta("../commits", root).path).toBeUndefined();
+      expect(skillMeta("..:commits", root).path).toBeUndefined();
+      expect(skillMeta("a/b", root).path).toBeUndefined();
+    });
+
+    // One list of slash commands is resolved in one pass, and the containers are listed once for the whole
+    // pass rather than once per command.
+    it("lists a container once for the whole resolution pass", () => {
+      const scans: SkillScanCache = new Map();
+      writeSkill(".claude/skills/holder", "first");
+      expect(resolveSkillPath("first", root, scans)).toBe(
+        path.join(root, ".claude/skills/holder/SKILL.md"),
+      );
+      const added = writeSkill(".claude/skills/later", "second");
+      expect(resolveSkillPath("second", root, scans)).toBeUndefined();
+      expect(resolveSkillPath("second", root)).toBe(added);
+    });
+
+    describe("frontmatter", () => {
+      const resolves = (content: string, name = "commits") => {
+        const file = writeSkillFile(".claude/skills/holder", content);
+        return skillMeta(name, root).path === file;
+      };
+
+      it("reads a quoted name", () => {
+        expect(resolves('---\nname: "commits"\n---\n')).toBe(true);
+      });
+
+      it("reads a name with a trailing comment", () => {
+        expect(resolves("---\nname: commits # the one\n---\n")).toBe(true);
+      });
+
+      it("keeps a hash that starts no comment", () => {
+        expect(resolves("---\nname: c#1\n---\n", "c#1")).toBe(true);
+      });
+
+      it("reads a name written with CRLF line endings", () => {
+        expect(resolves("---\r\nname: commits\r\n---\r\n")).toBe(true);
+      });
+
+      it("reads a name of a block that ends with ...", () => {
+        expect(resolves("---\nname: commits\n...\n")).toBe(true);
+      });
+
+      it("ignores a value that no space separates from the key", () => {
+        expect(resolves("---\nname:commits\n---\n")).toBe(false);
+      });
+
+      it("ignores a name nested under another key", () => {
+        expect(resolves("---\nmetadata:\n  name: commits\n---\n")).toBe(false);
+      });
+
+      it("ignores a name below the frontmatter", () => {
+        expect(resolves("---\ndescription: d\n---\nname: commits\n")).toBe(false);
+      });
+
+      it("ignores a file with no frontmatter", () => {
+        expect(resolves("name: commits\n")).toBe(false);
+      });
+
+      it("ignores a name past the frontmatter the reader covers", () => {
+        expect(resolves(`---\ndescription: ${"d".repeat(9000)}\nname: commits\n---\n`)).toBe(false);
+      });
     });
   });
 });

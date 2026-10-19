@@ -1091,6 +1091,55 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("ends a resume with replay with one end event for a client with loadReplayEnd", async () => {
+    const client = v2Client();
+    const isEnd = (notification: v2.UpdateSessionNotification) =>
+      (notification.update._meta as any)?.jetbrains?.air?.loadReplayEnd === true;
+    let atResponse: v2.UpdateSessionNotification[] = [];
+    let resumedSessionId = "";
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["loadReplayEnd"] } } },
+      } as v2.ClientCapabilities);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      resumedSessionId = sessionId;
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("user", randomUUID(), { role: "user", content: "Say hello" }),
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_hello",
+          role: "assistant",
+          content: [{ type: "text", text: "Hello!" }],
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      client.sessionUpdates.length = 0;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      atResponse = [...client.sessionUpdates];
+      // A resume without a replay sends no end event.
+      await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+      await client.authUpdate(1);
+    });
+
+    expect(atResponse.map(({ update }) => update.sessionUpdate)).toEqual([
+      "user_message",
+      "user_message_chunk",
+      "agent_message",
+      "agent_message_chunk",
+      "session_info_update",
+    ]);
+    expect(atResponse.at(-1)).toEqual({
+      sessionId: resumedSessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
+      },
+    });
+    expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
+  });
+
   it("replays the plan of an approved ExitPlanMode as a markdown plan", async () => {
     const client = v2Client();
     await client.app.connectWith(connectRouter(), async (agent) => {

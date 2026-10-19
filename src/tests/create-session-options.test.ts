@@ -1882,5 +1882,167 @@ describe("createSession options merging", () => {
       expect(updates).toEqual([]);
       expect(getSessionMessages).not.toHaveBeenCalled();
     });
+
+    describe("load replay end", () => {
+      const LOAD_REPLAY_END_CLIENT: ClientCapabilities = {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["loadReplayEnd"] } } },
+      };
+
+      async function endAgent(
+        updates: SessionNotification[],
+        sessionUpdate?: (notification: SessionNotification) => Promise<void>,
+        clientCapabilities: ClientCapabilities = LOAD_REPLAY_END_CLIENT,
+      ) {
+        const endAgent = new ClaudeAcpAgent({
+          ...createMockClient(),
+          sessionUpdate:
+            sessionUpdate ??
+            (async (notification: SessionNotification) => {
+              updates.push(notification);
+            }),
+        } as AcpClient);
+        await endAgent.initialize({ protocolVersion: 1, clientCapabilities });
+        return endAgent;
+      }
+
+      const isEnd = (notification: SessionNotification) =>
+        (notification.update._meta as any)?.jetbrains?.air?.loadReplayEnd === true;
+
+      /** The update kinds, with the end event as "end". */
+      const kinds = (updates: SessionNotification[]) =>
+        updates.map((update) => (isEnd(update) ? "end" : update.update.sessionUpdate));
+
+      it("sends one end event after the replay and before the response", async () => {
+        sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        let atResponse: string[] | undefined;
+        await loadAgent
+          .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+        // `afterSetupResponse` sends the commands after the response.
+        await vi.waitFor(() => expect(kinds(updates)).toContain("available_commands_update"));
+
+        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+        expect(updates.filter(isEnd)).toHaveLength(1);
+        const end = updates.find(isEnd)!;
+        expect(end.sessionId).toBe("replay-probe");
+        // No `title` and no `updatedAt` key: a `null` would clear them.
+        expect(end.update).toEqual({
+          sessionUpdate: "session_info_update",
+          _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
+        });
+      });
+
+      it("sends the end event before the CLI start finishes", async () => {
+        let releaseInit!: () => void;
+        initGate = new Promise((resolve) => (releaseInit = resolve));
+        sessionMessages = [userMessage("u1", "first")];
+        const updates: SessionNotification[] = [];
+        const loading = (await endAgent(updates)).loadSession({
+          sessionId: "replay-probe",
+          cwd: process.cwd(),
+          mcpServers: [],
+        });
+
+        await vi.waitFor(() => expect(kinds(updates)).toEqual(["user_message_chunk", "end"]));
+
+        releaseInit();
+        await loading;
+      });
+
+      it("sends the end event for an empty history", async () => {
+        sessionMessages = [];
+        const updates: SessionNotification[] = [];
+        let atResponse: string[] | undefined;
+        await (
+          await endAgent(updates)
+        )
+          .loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+
+        expect(atResponse).toEqual(["end"]);
+      });
+
+      it("sends the end event after the replay of a session that is already live", async () => {
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        const { sessionId } = await loadAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        sessionMessages = [userMessage("u1", "first"), userMessage("u2", "second")];
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        updates.length = 0;
+
+        let atResponse: string[] | undefined;
+        await loadAgent
+          .loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
+          .then(() => (atResponse = kinds(updates)));
+
+        expect(atResponse).toEqual(["user_message_chunk", "user_message_chunk", "end"]);
+      });
+
+      it("sends no end event when the CLI start fails part way through the replay", async () => {
+        let failInit!: () => void;
+        initGate = new Promise((resolve) => (failInit = resolve));
+        initError = new Error("Claude Code process exited with code 1");
+        sessionMessages = [
+          userMessage("u1", "first"),
+          userMessage("u2", "second"),
+          userMessage("u3", "third"),
+        ];
+        const updates: SessionNotification[] = [];
+        let releaseClient!: () => void;
+        const clientGate = new Promise<void>((resolve) => (releaseClient = resolve));
+        const loading = (
+          await endAgent(updates, async (notification) => {
+            updates.push(notification);
+            await clientGate;
+          })
+        ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+        const failed = expect(loading).rejects.toThrow("exited with code 1");
+
+        // The client still handles the first replayed update when the CLI start fails.
+        await vi.waitFor(() => expect(updates).toHaveLength(1));
+        failInit();
+        await vi.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+        releaseClient();
+        await failed;
+        for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+
+        expect(updates.length).toBeLessThan(3);
+        expect(updates.some(isEnd)).toBe(false);
+      });
+
+      it("sends no end event when the replay fails", async () => {
+        const updates: SessionNotification[] = [];
+        const loadAgent = await endAgent(updates);
+        const { sessionId } = await loadAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        updates.length = 0;
+        sessionMessagesResult = async () => {
+          throw new Error("history unreadable");
+        };
+
+        await expect(
+          loadAgent.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] }),
+        ).rejects.toThrow("history unreadable");
+        expect(updates.some(isEnd)).toBe(false);
+      });
+
+      it("sends no end event to a client without the capability", async () => {
+        sessionMessages = [userMessage("u1", "first")];
+        for (const clientCapabilities of [
+          {},
+          { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } },
+        ] as ClientCapabilities[]) {
+          const updates: SessionNotification[] = [];
+          await (
+            await endAgent(updates, undefined, clientCapabilities)
+          ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+          await vi.waitFor(() => expect(kinds(updates)).toContain("available_commands_update"));
+
+          expect(kinds(updates)).toEqual(["user_message_chunk", "available_commands_update"]);
+        }
+      });
+    });
   });
 });
