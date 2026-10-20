@@ -2734,6 +2734,7 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
       activeForm: "Current active form",
       description: "Current description",
     };
+    const completedBeforeReplay = { ...completed };
     const state: TaskState = new Map([["1", completed]]);
     state.set("2", { subject: "Next task", status: "pending" });
 
@@ -2748,6 +2749,7 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     );
 
     expect(state.get("1")).toBe(completed);
+    expect(state.get("1")).toEqual(completedBeforeReplay);
     expect([...state.keys()]).toEqual(["1", "2"]);
   });
 
