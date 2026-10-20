@@ -100,6 +100,90 @@ describe("versioned model display names", () => {
     ]);
   });
 
+  it("does not override a present resolved model with conflicting fallback metadata", async () => {
+    const models: ModelInfo[] = [
+      {
+        value: "sonnet-9",
+        resolvedModel: "provider-default",
+        displayName: "Sonnet",
+        description: "Sonnet 8 · Stale description",
+      },
+      {
+        value: "haiku-9",
+        resolvedModel: "claude-opus-5",
+        displayName: "Haiku",
+        description: "Haiku 8 · Different resolved family",
+      },
+      {
+        value: "fable-9",
+        resolvedModel:
+          "arn:aws:bedrock:us-east-1:123456789012:inference-profile/custom-provider-route",
+        displayName: "Fable",
+        description: "Fable 8 · Opaque provider route",
+      },
+    ];
+    const originalModels = structuredClone(models);
+
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    expect(state.availableModels).toEqual(
+      models.map((model) => ({
+        modelId: model.value,
+        name: model.displayName,
+        description: model.description,
+      })),
+    );
+    expect(models).toEqual(originalModels);
+  });
+
+  it("keeps description and value fallbacks when resolvedModel is absent", async () => {
+    const models: ModelInfo[] = [
+      {
+        value: "sonnet-alias",
+        displayName: "Sonnet",
+        description: "Sonnet 5 · Description fallback",
+      },
+      {
+        value: "claude-haiku-4-5",
+        displayName: "Claude Haiku",
+        description: "",
+      },
+    ];
+    const originalModels = structuredClone(models);
+
+    const state = await getAvailableModels(
+      {} as Query,
+      models,
+      models,
+      { getSettings: () => ({}) },
+      { log: vi.fn(), error: vi.fn() },
+      false,
+      "model-presentation-test",
+    );
+
+    expect(state.availableModels).toEqual([
+      {
+        modelId: "sonnet-alias",
+        name: "Sonnet 5",
+        description: "Sonnet 5 · Description fallback",
+      },
+      {
+        modelId: "claude-haiku-4-5",
+        name: "Claude Haiku 4.5",
+        description: "",
+      },
+    ]);
+    expect(models).toEqual(originalModels);
+  });
+
   it("only moves the context hint out of the name when the description retains it", async () => {
     const models: ModelInfo[] = [
       {
