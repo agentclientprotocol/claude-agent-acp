@@ -17,7 +17,8 @@ export { AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY } from "./air-extension.js";
  * - `rfd`: the subagents RFD (agentclientprotocol/agent-client-protocol#1992,
  *   as revised): `subagent_update` and `session_message`, which the SDK types.
  *   A client that declares `clientCapabilities.subagents` and is not AIR gets
- *   it. (ACP v2 clients do not get subagents yet.)
+ *   it. (An ACP v2 client gets it without declaring anything, since subagents
+ *   are part of v2's baseline.)
  * - `air`: the earlier draft of that RFD, which AIR implements:
  *   `subagent_spawned` and `subagent_state_update`, typed below. AIR gets it,
  *   whichever capability it declares (`docs/air-extensions.md`).
