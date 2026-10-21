@@ -301,6 +301,45 @@ describe("auth status mappers", () => {
     });
   });
 
+  it.each([undefined, null, ""])(
+    "keeps a positive claude.ai login with subscriptionType=%s indeterminate",
+    (subscriptionType) => {
+      expect(
+        fromCliStatus(
+          JSON.stringify({
+            loggedIn: true,
+            authMethod: "claude.ai",
+            apiProvider: "firstParty",
+            subscriptionType,
+          }),
+        ),
+      ).toBeUndefined();
+    },
+  );
+
+  it("keeps a positive CLI login without identity fields indeterminate", () => {
+    expect(fromCliStatus(JSON.stringify({ loggedIn: true }))).toBeUndefined();
+  });
+
+  it("preserves explicit logout even when stale subscription metadata remains", () => {
+    expect(fromCliStatus(JSON.stringify({ loggedIn: false, subscriptionType: "max" }))).toEqual({
+      kind: "none",
+      label: "Not logged in",
+    });
+  });
+
+  it("preserves API and external auth when a positive login has no plan", () => {
+    expect(
+      fromCliStatus(
+        JSON.stringify({ loggedIn: true, apiProvider: "firstParty", apiKeySource: "apiKeyHelper" }),
+      ),
+    ).toEqual({ kind: "api_key", label: "Anthropic API key", detail: "API key helper" });
+    expect(fromCliStatus(JSON.stringify({ loggedIn: true, apiProvider: "bedrock" }))).toEqual({
+      kind: "external",
+      label: "AWS Bedrock",
+    });
+  });
+
   it("lets a third-party backend outrank the logged-out flag", () => {
     // `loggedIn` tracks the claude.ai login only; on Bedrock the credentials
     // are external and the agent is authenticated all the same.

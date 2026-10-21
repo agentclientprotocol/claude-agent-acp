@@ -210,6 +210,11 @@ export function fromCliStatus(stdout: string, apiKeyHelper?: string): AuthStatus
   if (!externalBackend && !status.loggedIn && !status.apiKeySource) {
     return notLoggedInAuthStatus();
   }
+  // A positive login can lack subscription metadata. Report no information
+  // until a later read identifies the account instead of declaring it logged out.
+  if (!externalBackend && status.loggedIn && !status.apiKeySource && !status.subscriptionType) {
+    return undefined;
+  }
   return mapAuthFields({
     apiProvider: status.apiProvider,
     subscriptionType: status.subscriptionType,
