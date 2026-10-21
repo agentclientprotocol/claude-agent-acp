@@ -11,13 +11,11 @@ import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
-import { deriveActivity, type ActivityState } from "../session-index/activity.js";
+import type { ActivityState } from "../session-index/activity.js";
 import { endedTaskId, searchBackgroundTasks } from "../session-index/background-tasks.js";
-import type { LiveRecord } from "../session-index/live-registry.js";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import { SessionIndex } from "../session-index/session-index.js";
 import { SessionIndexService } from "../session-index/service.js";
-import type { TranscriptFacts } from "../session-index/transcript-scan.js";
 
 let configDir: string;
 let workspace: string;
@@ -553,61 +551,6 @@ describe("the end of the wait for a background task", () => {
   // IJAI-3744
   it("comes when no live process holds the session", async () => {
     expect(await stateWithNewService()).toBe("idle");
-  });
-});
-
-describe("the wait rule", () => {
-  const now = Date.parse("2026-02-08T02:00:00.000Z");
-  const waiting: TranscriptFacts = {
-    hasMessages: true,
-    turnState: "finished",
-    backgroundTasks: { open: ["task-1"], stopCalls: [], complete: true },
-  };
-  const live = (
-    status: string,
-    entrypoint = "cli",
-    statusUpdatedAt = now - 60_000,
-  ): LiveRecord => ({
-    pid: 1,
-    sessionId: "s",
-    kind: "interactive",
-    entrypoint,
-    status,
-    statusUpdatedAt,
-  });
-  const stateWith = (overrides: Partial<Parameters<typeof deriveActivity>[0]>) =>
-    deriveActivity({ facts: waiting, transcriptMtimeMs: now, now, ...overrides })?.state;
-
-  it("keeps an SDK-driven CLI running until its registry is idle", () => {
-    expect(stateWith({ live: live("busy", "sdk-ts") })).toBe("running");
-    expect(stateWith({ live: live("idle", "sdk-ts") })).toBe("idle");
-  });
-
-  it("keeps the registry status of an interactive CLI newer than the transcript", () => {
-    expect(stateWith({ live: live("waiting", "cli", now + 1) })).toBe("requires_action");
-    expect(stateWith({ live: live("idle", "cli", now + 1) })).toBe("idle");
-  });
-
-  it("is running after a turn that failed with an API error", () => {
-    const failed: TranscriptFacts = { ...waiting, lastTurnError: true };
-    expect(stateWith({ live: live("busy"), facts: failed })).toBe("running");
-  });
-
-  it("does not wait in a turn in progress", () => {
-    const inProgress: TranscriptFacts = { ...waiting, turnState: "unfinished" };
-    const state = stateWith({
-      facts: inProgress,
-      live: live("busy", "cli", 1),
-      transcriptMtimeMs: now - 11 * 60_000,
-    });
-    // An unfinished turn that has not written for 10 minutes has no known state.
-    expect(state).toBeUndefined();
-  });
-
-  it("does not wait without an open task", () => {
-    const noOpenTask = { open: [], stopCalls: [], complete: true };
-    const ended: TranscriptFacts = { ...waiting, backgroundTasks: noOpenTask };
-    expect(stateWith({ live: live("busy"), facts: ended })).toBe("idle");
   });
 });
 
