@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { AgentSideConnection as AcpClient } from "@agentclientprotocol/sdk";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { mockSessionState } from "./session-doubles.js";
 
 /** A stream that stays open, like the real one: a consumer that reaches its end

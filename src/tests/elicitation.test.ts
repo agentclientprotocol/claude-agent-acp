@@ -3,7 +3,7 @@ import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
   EnumOption,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ElicitationRequest } from "@anthropic-ai/claude-agent-sdk";
 import {
   applyAskElicitationResponse,

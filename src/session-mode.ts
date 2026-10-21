@@ -5,7 +5,7 @@ import {
   type SessionNotification,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type {
   ModelInfo,
   PermissionMode,

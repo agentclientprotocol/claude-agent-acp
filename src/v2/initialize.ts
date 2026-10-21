@@ -12,8 +12,8 @@ import {
   type AuthMethod,
   type InitializeRequest,
   type InitializeResponse,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { SYSTEM_PROMPT_CAPABILITY } from "../client-system-prompt.js";
 
 /** The v1 `initialize` request that a v2 client means. */

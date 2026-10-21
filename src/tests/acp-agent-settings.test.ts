@@ -515,7 +515,7 @@ describe("ClaudeAcpAgent settings", () => {
         _meta: { disableBuiltInTools: true },
       });
       await agent.setSessionMode({ sessionId, modeId: "default" });
-      const { RequestError } = await import("@agentclientprotocol/sdk");
+      const { RequestError } = await import("@agentclientprotocol/sdk/unstable");
       const createSession = (agent as any).createSession.bind(agent);
       const creations: object[] = [];
       (agent as any).createSession = async (params: object, options: { resume?: string }) => {

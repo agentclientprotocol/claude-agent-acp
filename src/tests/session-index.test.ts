@@ -17,7 +17,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,

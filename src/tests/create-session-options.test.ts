@@ -3,8 +3,8 @@ import {
   CreateElicitationRequest,
   RequestError,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
-import type { ClientCapabilities } from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
+import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";

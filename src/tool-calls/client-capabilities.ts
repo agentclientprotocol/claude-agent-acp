@@ -1,4 +1,4 @@
-import type { ClientCapabilities as AcpClientCapabilities } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities as AcpClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_DIFF_PATCH_CAPABILITY,
   AIR_PLAN_FILE_CAPABILITY,

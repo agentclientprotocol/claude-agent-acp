@@ -21,7 +21,7 @@
  * of the stored `_meta`. Subagent routing reads it before this, on the agent's
  * v1 reports.
  */
-import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk";
+import type { ToolCall, ToolCallUpdate } from "@agentclientprotocol/sdk/unstable";
 
 type Meta = Record<string, unknown>;
 

@@ -14,7 +14,7 @@
  * {@link SessionTitles.reset} on `conversation_reset`.
  */
 
-import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk";
+import type { ContentBlock, PromptRequest } from "@agentclientprotocol/sdk/unstable";
 import { getSessionInfo, type Query, type SDKSessionInfo } from "@anthropic-ai/claude-agent-sdk";
 import type { ClaudeAcpAgent, Session } from "./acp-agent.js";
 import { ExplicitTitle } from "./session-index/explicit-title.js";

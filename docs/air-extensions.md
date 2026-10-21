@@ -994,6 +994,20 @@ When an announced task leaves that list, the adapter reports `stopped`.
 A later terminal event can correct that state to `completed` or `failed`.
 At shutdown, the adapter finishes each open task as `failed` or `stopped`.
 
+### Autonomous turn
+
+Claude Code can start a turn of its own after the prompt ended, for example to answer the notification of a finished background task.
+ACP v1 has no session state, so the adapter publishes such a turn as an async task.
+The task has the id `autonomous-turn-<uuid>`, the name `Claude is working`, `taskType: "turn"`, and `showInTranscript: false`.
+Its description is the summary of the last task notification, when there is one.
+The task starts at the SDK `running` state while no prompt is active or queued.
+When the state stays `running`, as it does while background agents run, it starts at the first root output with no prompt open.
+It ends `completed` at the result of the turn or at the SDK `idle` state, and `failed` at an error result.
+A coalesced placeholder result (`num_turns: 0`) does not end it.
+A prompt that the turn takes in ends the task, because that prompt owns the turn now.
+A stop request interrupts the turn instead of stopping an SDK task.
+It returns `{ "stopped": false }` while a prompt waits for its turn, because the interrupt would drop that prompt.
+
 ### Stop request
 
 The client sends `_session/async_task/stop`:
@@ -1356,6 +1370,7 @@ Each row carries `_meta.jetbrains.air` with flat row fields of the RFDs. `archiv
   - a session this connection runs: the SDK `session_state_changed` state; `error` instead of `idle` when its last turn failed (an error result, `is_error` or an `error_*` subtype, that was not a cancel). A session whose query failed here (not a cancel) is reported as any other session, but `error` until its transcript shows a prompt or a turn end after the failure, unless a busy or waiting interactive CLI holds it;
   - a session no live Claude Code process holds: `idle`, or `error` when its last turn ended with an API error (an assistant record with `isApiErrorMessage: true`, also when the CLI's turn-end records follow it, with no prompt after it);
   - a session that an interactive CLI holds (not an `sdk-*` entrypoint) whose registry status is newer than the transcript: `busy` and `shell` are `running`, `waiting` is `requires_action`, `idle` is `idle`, or `error` after such an API error;
+  - any other held session whose last turn ended with an open background task: `running`, also after 10 minutes, until the registry status is `idle`. Claude Code wakes the session again when the task ends, so the session gets one `idle` at the last turn end, not one for each task. A background shell command (`toolUseResult.backgroundTaskId`) or an async sub-agent (`isAsync` with an `agentId`) opens a task. Its `<task-notification>` with a `<status>`, as a user record or a `queue-operation` `remove`, or the result of a `TaskStop` call closes it. A notification without a `<status>`, such as the check-in of a quiet shell or a `Monitor` event, keeps it open. Sidechain records open no task. The tail gives the tasks on top of those of an earlier scan when the file only grew within the tail; else the whole transcript is read, and only for such a held session. A background task that a sub-agent starts is not seen: it is only in the transcript of the sub-agent;
   - any other held session: `idle` after a finished turn (an assistant `end_turn`, a user interrupt, or the CLI turn-end records), `error` after a turn that ended with an API error, `running` for an unfinished turn written in the last 10 minutes, and no state otherwise.
 - The live processes come from `<config>/sessions/<pid>.json`, with the liveness rules of Claude Desktop: `kill(pid, 0)` (or `EPERM`), a matching `procStart`, no foreign `pidDomain`, and records older than 24 hours only with a matching `procStart`.
   The adapter never reads the `.key` files there and never changes the directory.

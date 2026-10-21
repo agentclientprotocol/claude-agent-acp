@@ -55,7 +55,7 @@ import {
   WriteTextFileRequest,
   WriteTextFileResponse,
   ToolCallContent,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "./turn-events.js";
 import {
   AccountInfo,
@@ -317,6 +317,12 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import {
+  markerTagText,
+  type PersistedTaskNotification,
+  TASK_NOTIFICATION_TAG,
+  taskNotificationsOf,
+} from "./task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
@@ -2141,7 +2147,6 @@ const LOCAL_COMMAND_MARKERS = [
 // model that a background task stopped; live, the SDK `task_notification`
 // frame reports the same stop, so replay restores the task state from it (see
 // taskNotificationsOf) instead of showing it.
-const TASK_NOTIFICATION_TAG = "task-notification";
 const INJECTED_CONTEXT_MARKERS = ["system-reminder", TASK_NOTIFICATION_TAG].map((tag) => ({
   open: `<${tag}>`,
   close: `</${tag}>`,
@@ -2178,16 +2183,6 @@ function stripMarkerTags(text: string): string {
     i++;
   }
   return result + text.slice(copiedUpTo);
-}
-
-function markerTagText(text: string, tag: string): string | undefined {
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  const start = text.indexOf(open);
-  if (start === -1) return undefined;
-  const end = text.indexOf(close, start + open.length);
-  if (end === -1) return undefined;
-  return text.slice(start + open.length, end);
 }
 
 function hasMarkerTag(text: string, tag: string): boolean {
@@ -2248,57 +2243,6 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
 
 export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
-}
-
-/** The fields of a persisted `<task-notification>`, in the shape of the SDK
- *  `task_notification` frame that reported the same stop live. */
-type PersistedTaskNotification = {
-  task_id: string;
-  status: string;
-  tool_use_id?: string;
-  summary?: string;
-  output_file?: string;
-};
-
-/**
- * Returns each `<task-notification>` in user-message content (a string or its
- * text blocks). The `<result>` body is model context that the live frame does
- * not carry, so the scan stops at it and a tag quoted in it cannot match.
- */
-function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
-  const texts =
-    typeof content === "string"
-      ? [content]
-      : Array.isArray(content)
-        ? content.flatMap((block) =>
-            block?.type === "text" && typeof block.text === "string" ? [block.text as string] : [],
-          )
-        : [];
-  const open = `<${TASK_NOTIFICATION_TAG}>`;
-  const close = `</${TASK_NOTIFICATION_TAG}>`;
-  const notifications: PersistedTaskNotification[] = [];
-  for (const text of texts) {
-    let start = text.indexOf(open);
-    while (start !== -1) {
-      const end = text.indexOf(close, start + open.length);
-      if (end === -1) break;
-      const body = text.slice(start + open.length, end).split("<result>", 1)[0];
-      const field = (tag: string) => markerTagText(body, tag)?.trim() || undefined;
-      const taskId = field("task-id");
-      const status = field("status");
-      if (taskId && status) {
-        notifications.push({
-          task_id: taskId,
-          status,
-          tool_use_id: field("tool-use-id"),
-          summary: field("summary"),
-          output_file: field("output-file"),
-        });
-      }
-      start = text.indexOf(open, end + close.length);
-    }
-  }
-  return notifications;
 }
 
 /**
@@ -4419,7 +4363,18 @@ export class ClaudeAcpAgent {
     if (!session || !asyncTasks?.claimStop(params.asyncTaskId)) return { stopped: false };
 
     try {
-      await session.query.stopTask(params.asyncTaskId);
+      if (asyncTasks.isAutonomousTurn(params.asyncTaskId)) {
+        // The task stands for a turn that Claude Code started on its own, so
+        // stopping it interrupts that turn. A prompt that waits for its turn
+        // would be folded into it, and the interrupt would drop that prompt.
+        if ((session.turnQueue ?? []).some((turn) => !turn.settled)) {
+          asyncTasks.releaseStop(params.asyncTaskId);
+          return { stopped: false };
+        }
+        await session.query.interrupt();
+      } else {
+        await session.query.stopTask(params.asyncTaskId);
+      }
       await asyncTasks.taskStopped(params.asyncTaskId);
       return { stopped: true };
     } catch (error) {
@@ -5008,6 +4963,7 @@ export class ClaudeAcpAgent {
       if (!head) {
         return;
       }
+      if (asyncTasks.autonomousTurnOpen) await asyncTasks.autonomousTurnEnded("completed");
       activateTurn(head);
     };
 
@@ -5968,6 +5924,21 @@ export class ClaudeAcpAgent {
 
         this.startAutonomousCycle(params.sessionId, session, message);
 
+        // From CLI 2.1.270 the state stays `running` while background agents
+        // run, so a turn that their notification starts has no `running`
+        // transition. Its first output with no prompt open starts its task.
+        if (
+          asyncTasks.enabled &&
+          !asyncTasks.autonomousTurnOpen &&
+          (message.type === "assistant" || message.type === "stream_event") &&
+          message.parent_tool_use_id === null &&
+          !session.cancelled &&
+          !session.activeTurn &&
+          !firstUnsettledQueuedTurn()
+        ) {
+          await asyncTasks.autonomousTurnStarted();
+        }
+
         switch (message.type) {
           case "system":
             switch (message.subtype) {
@@ -6116,6 +6087,20 @@ export class ClaudeAcpAgent {
                 sessionIndex.noteSessionState(session, previousState, message.state);
                 if (message.state === "running") this.sessionIndex.onTurnStarted(params.sessionId);
                 this.sessionIndex.onOwnSessionChanged(params.sessionId);
+                // With no prompt active or queued, the agent runs a turn of
+                // its own, for example for a task notification. The client
+                // sees it as an async task (see autonomousTurnStarted).
+                if (
+                  asyncTasks.enabled &&
+                  message.state === "running" &&
+                  previousState !== "running" &&
+                  !session.activeTurn &&
+                  !firstUnsettledQueuedTurn()
+                ) {
+                  await asyncTasks.autonomousTurnStarted();
+                } else if (message.state === "idle" && asyncTasks.autonomousTurnOpen) {
+                  await asyncTasks.autonomousTurnEnded("completed");
+                }
                 if (
                   message.state === "running" &&
                   previousState !== "running" &&
@@ -6824,6 +6809,15 @@ export class ClaudeAcpAgent {
             const startedByClaudeCode =
               message.origin != null && AUTONOMOUS_RESULT_ORIGINS.has(message.origin.kind);
             const isAutonomousResult = startedByClaudeCode && !answersPendingPrompt(message);
+            // A placeholder result (`num_turns: 0`, see below) comes before
+            // the followup that answers it, so the autonomous turn goes on.
+            if (
+              isAutonomousResult &&
+              asyncTasks.autonomousTurnOpen &&
+              (message.num_turns > 0 || message.is_error)
+            ) {
+              await asyncTasks.autonomousTurnEnded(message.is_error ? "failed" : "completed");
+            }
             const pendingExitPlanModeInterruption = session.pendingExitPlanModeInterruption;
             const pendingExitPlanContextReset = session.pendingExitPlanContextReset;
             try {
@@ -7821,6 +7815,10 @@ export class ClaudeAcpAgent {
                   // mid-message, so deltas already streamed belong to the turn
                   // being activated — clearing would forget them and let its
                   // result re-emit the answer.
+                  // A prompt folded into an autonomous turn owns that turn now.
+                  if (asyncTasks.autonomousTurnOpen) {
+                    await asyncTasks.autonomousTurnEnded("completed");
+                  }
                   activateTurn(queued);
                 }
                 break;

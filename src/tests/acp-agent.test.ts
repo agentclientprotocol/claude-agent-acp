@@ -19,7 +19,7 @@ import {
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
@@ -3824,6 +3824,68 @@ describe("subagent transcript replay", () => {
         await rm(configDir, { recursive: true, force: true });
       }
     }
+
+    it("replays a fork child without the launching message and boilerplate it inherited", async () => {
+      // A `subagent_type: "fork"` transcript starts with a copy of the
+      // launching message (same API message id) and a directive message with
+      // a "Fork started" result for each of its tool_uses.
+      const launching = [
+        { type: "text", text: "I'll fork a worker." },
+        toolUse("toolu_fork", "Agent", {
+          subagent_type: "fork",
+          description: "Check the parser",
+          prompt: "Inspect the parser",
+        }),
+        toolUse("toolu_read", "Read", { file_path: "/tmp/proj/a.ts" }),
+      ];
+      const forkStarted = (id: string) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [{ type: "text", text: "Fork started — processing in background" }],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Check it"),
+          assistant("a1", launching),
+          user("u2", [toolResult("toolu_fork", "Parser is fine."), toolResult("toolu_read", "x")]),
+          assistant("a2", [{ type: "text", text: "Done." }]),
+        ],
+        {
+          fork1: {
+            meta: {
+              agentType: "fork",
+              isFork: true,
+              description: "Check the parser",
+              toolUseId: "toolu_fork",
+            },
+            records: [
+              { ...assistant("f1", launching), message: { ...assistant("a1", launching).message } },
+              user("f2", [
+                forkStarted("toolu_fork"),
+                forkStarted("toolu_read"),
+                {
+                  type: "text",
+                  text: "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\nYour directive: Inspect the parser",
+                },
+              ]),
+              assistant("f3", [{ type: "text", text: "Parser is fine." }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Check it",
+        "root agent_message_chunk I'll fork a worker.",
+        "root tool_call toolu_fork",
+        "root tool_call toolu_read",
+        'root subagent_update fork1 {"state":"running"}',
+        `fork1 session_message toolu_fork from=${sessionId} Inspect the parser`,
+        "fork1 agent_message_chunk Parser is fine.",
+        "root agent_message_chunk Done.",
+        'root subagent_update fork1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
 
     it("replays each child under its live session id, with its incoming messages, before the response", async () => {
       const trace = await replayRfd(
@@ -23190,6 +23252,233 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.outputTokens).toBe(5);
       stream.end();
       await agent.sessions["test-session"]?.consumer;
+    });
+  });
+  describe("autonomous turn as an async task", () => {
+    const airAgent = async (capabilities: string[] = ["asyncTasks"]) => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities } } },
+        },
+      });
+      const asyncTaskUpdates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate.startsWith("async_task_") ? [update as any] : [],
+        );
+      return { agent, updates, asyncTaskUpdates };
+    };
+
+    const shellNotification = () => ({
+      ...taskNotification("bg-1"),
+      summary: 'Background command "sleep 20" completed (exit code 0)',
+    });
+
+    it("publishes a turn that Claude Code runs after end_turn and ends it at its result", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield assistantText("started it");
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield shellNotification();
+          yield running();
+          yield assistantText("it finished");
+          // A coalesced placeholder does not end the turn.
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0 });
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "run it in the background" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+      expect(asyncTaskUpdates()).toEqual([]);
+
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      const [spawned, ...rest] = asyncTaskUpdates();
+      expect(spawned).toEqual({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: expect.stringMatching(/^autonomous-turn-/),
+        name: "Claude is working",
+        taskType: "turn",
+        description: 'Background command "sleep 20" completed (exit code 0)',
+        showInTranscript: false,
+        canStop: true,
+      });
+      expect(rest).toEqual([
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: spawned.asyncTaskId,
+          state: "completed",
+        },
+      ]);
+    });
+
+    it("starts at the first output when the state never left running", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          await woken;
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+    });
+
+    it("ends the turn task when a prompt is folded into the turn", async () => {
+      const { agent, updates, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let autonomousRunning = () => {};
+      const autonomous = new Promise<void>((resolve) => (autonomousRunning = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          autonomousRunning();
+          yield userEcho((await iter.next()).value);
+          yield assistantText("answer to the folded prompt");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await autonomous;
+      const second = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and this" }],
+      });
+      expect(second.stopReason).toBe("end_turn");
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+      const kinds = updates.map(({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+          ? update.content.text
+          : update.sessionUpdate,
+      );
+      expect(kinds.indexOf("async_task_state_update")).toBeLessThan(
+        kinds.indexOf("answer to the folded prompt"),
+      );
+    });
+
+    it("interrupts the turn when the client stops its task", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let finish = () => {};
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          await finished;
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            subtype: "error_during_execution",
+            is_error: true,
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await waitFor(() => asyncTaskUpdates().length === 1);
+      const session = agent.sessions["test-session"]!;
+      const asyncTaskId = asyncTaskUpdates()[0].asyncTaskId;
+
+      await expect(
+        agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId }),
+      ).resolves.toEqual({ stopped: true });
+      expect(session.query.interrupt).toHaveBeenCalledTimes(1);
+      expect(session.query.stopTask).not.toHaveBeenCalled();
+      finish();
+      await session.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "stopped",
+      ]);
+    });
+
+    it("publishes nothing to a client without async tasks", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent([]);
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          yield running();
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+      expect(asyncTaskUpdates()).toEqual([]);
     });
   });
 });

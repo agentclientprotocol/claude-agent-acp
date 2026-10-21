@@ -95,10 +95,13 @@ root session. Clients that use the historical `_meta["subagent-transcript"]` cap
 
 ### Experimental ACP v2
 
-Started with `CLAUDE_AGENT_ACP_EXPERIMENTAL_V2=1`, the adapter also serves the
-[draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview): a client that asks for
-protocol version 2 or later in `initialize` gets v2, and every other client gets v1, as before.
-The draft can still change, and this surface changes with it.
+The adapter also serves the [draft ACP v2](https://agentclientprotocol.com/protocol/v2/overview):
+a client that asks for protocol version 2 or later in `initialize` gets v2, and every other client
+gets v1. The draft can still change, and this surface changes with it.
+
+`CLAUDE_AGENT_ACP_PROTOCOL` limits the adapter to one version. With `v1`, a client that asks
+for v2 is negotiated down to v1. With `v2`, the adapter rejects the `initialize` of a v1 client.
+`auto`, the default, serves both.
 
 On v2 the adapter serves the session baseline (`session/new`, `session/list`, `session/resume`
 with replay, `session/close`, `session/prompt`, `session/cancel`), `session/delete`,

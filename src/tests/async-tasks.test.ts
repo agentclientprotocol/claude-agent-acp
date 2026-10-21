@@ -7,6 +7,24 @@ import {
 } from "../async-tasks.js";
 
 describe("AsyncTaskRuntime", () => {
+  it("keeps an autonomous turn open across the SDK task list and fails it at shutdown", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const runtime = new AsyncTaskRuntime(true, "root", async (notification) => {
+      updates.push(notification);
+    });
+
+    await runtime.autonomousTurnStarted();
+    await runtime.autonomousTurnStarted();
+    await runtime.backgroundTasksChanged([]);
+    expect(runtime.autonomousTurnOpen).toBe(true);
+    await runtime.finishAll("failed");
+
+    expect(runtime.autonomousTurnOpen).toBe(false);
+    expect(
+      updates.map(({ update }) => (update as { state?: string }).state ?? update.sessionUpdate),
+    ).toEqual(["async_task_spawned", "failed"]);
+  });
+
   it("recovers a background Bash task from its structured tool result", async () => {
     const updates: AcpSessionNotification[] = [];
     const runtime = new AsyncTaskRuntime(true, "root", async (notification) => {

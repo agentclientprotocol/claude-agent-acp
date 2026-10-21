@@ -1,4 +1,4 @@
-import { RequestError, type SessionNotification } from "@agentclientprotocol/sdk";
+import { RequestError, type SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 
