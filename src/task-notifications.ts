@@ -1,7 +1,8 @@
 /**
  * The `<task-notification>` inputs that Claude Code writes to a transcript
- * when a background task stops. The replay of a session (`acp-agent.ts`)
- * reads them here.
+ * when a background task stops. The replay of a session (`acp-agent.ts`) and
+ * the session index (`session-index/background-tasks.ts`) read them here, so
+ * both read the same fields.
  */
 
 export const TASK_NOTIFICATION_TAG = "task-notification";
@@ -31,6 +32,11 @@ export type PersistedTaskNotification = {
  * Returns each `<task-notification>` in user-message content (a string or its
  * text blocks). The `<result>` body is model context that the live frame does
  * not carry, so the scan stops at it and a tag quoted in it cannot match.
+ *
+ * Only a notification with a `<task-id>` and a `<status>` is returned. A
+ * notification without a status comes while its task still runs: the
+ * check-in of a quiet shell ("is still running after …") or a `Monitor`
+ * event.
  */
 export function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
   const texts =

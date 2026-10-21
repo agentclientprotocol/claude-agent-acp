@@ -17,6 +17,10 @@
  *   record, or as a `queue-operation` `remove` when a running turn takes it
  *   in. A notification that waits in the queue (`enqueue`) keeps the task
  *   open, because the session still runs a turn for it;
+ * - only a notification with a `<status>` closes a task. A notification
+ *   without one comes while the task still runs: the check-in of a quiet
+ *   shell ("is still running after …", since Claude Code 2.1.303) or a
+ *   `Monitor` event;
  * - a `TaskStop` result closes the task of its `toolUseResult.task_id`:
  *   Claude Code writes no notification for it. The result does not name its
  *   tool, so its `tool_use_id` must match a `TaskStop` call. A `task_id` in
@@ -36,6 +40,7 @@
 
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { TASK_NOTIFICATION_TAG, taskNotificationsOf } from "../task-notifications.js";
 
 export type BackgroundTasks = {
   /** The ids of the tasks that started and did not end, in start order. */
@@ -79,21 +84,11 @@ type ToolUseResult = {
   task_id?: string;
 };
 
+const NOTIFICATION_TAG = `<${TASK_NOTIFICATION_TAG}>`;
+
 /** Text that a line must hold to bear on a task, so that the other lines
  *  are not parsed. */
-const TASK_MARKERS = [
-  "backgroundTaskId",
-  '"isAsync"',
-  "<task-notification>",
-  "TaskStop",
-  "task_id",
-];
-
-const NOTIFICATION_TAG = "<task-notification>";
-const TASK_ID_PATTERN = /<task-id>([\s\S]*?)<\/task-id>/;
-/** A notification states its task id at its start; a large sub-agent result
- *  follows it. */
-const NOTIFICATION_HEAD_CHARS = 4096;
+const TASK_MARKERS = ["backgroundTaskId", '"isAsync"', NOTIFICATION_TAG, "TaskStop", "task_id"];
 
 function parseRecord(line: string): TranscriptRecord | undefined {
   try {
@@ -116,14 +111,13 @@ function inputTextOf(record: TranscriptRecord): string | undefined {
   return blocksOf(record).find((block) => block.type === "text")?.text;
 }
 
-/** The task id of a `<task-notification>` input, as AIR's `TaskNotification`
- *  reads it: only an input that starts with the tag, after whitespace. */
-export function notifiedTaskId(input: string | undefined): string | undefined {
-  const notification = input?.trimStart();
-  if (!notification?.startsWith(NOTIFICATION_TAG)) return undefined;
-  const head = notification.slice(0, NOTIFICATION_HEAD_CHARS);
-  const taskId = TASK_ID_PATTERN.exec(head)?.[1]?.trim();
-  return taskId || undefined;
+/** The task that a `<task-notification>` input ends: only an input that
+ *  starts with the tag, after whitespace, as AIR's `TaskNotification` reads
+ *  it. Only a notification with a `<status>` ends a task (see
+ *  `taskNotificationsOf`). */
+export function endedTaskId(input: string | undefined): string | undefined {
+  if (!input?.trimStart().startsWith(NOTIFICATION_TAG)) return undefined;
+  return taskNotificationsOf(input)[0]?.task_id;
 }
 
 /** The task that a tool result started: a background shell command, or an
@@ -139,9 +133,9 @@ function startedTaskId(record: TranscriptRecord): string | undefined {
 /** The task whose notification reached the session: as a user record, or
  *  as a queue `remove` when a running turn takes it in. */
 function deliveredTaskId(record: TranscriptRecord): string | undefined {
-  if (record.type === "user") return notifiedTaskId(inputTextOf(record));
+  if (record.type === "user") return endedTaskId(inputTextOf(record));
   if (record.type === "queue-operation" && record.operation === "remove") {
-    return notifiedTaskId(record.content);
+    return endedTaskId(record.content);
   }
   return undefined;
 }

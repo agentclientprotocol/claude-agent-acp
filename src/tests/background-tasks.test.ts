@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
 import { deriveActivity, type ActivityState } from "../session-index/activity.js";
-import { notifiedTaskId, searchBackgroundTasks } from "../session-index/background-tasks.js";
+import { endedTaskId, searchBackgroundTasks } from "../session-index/background-tasks.js";
 import type { LiveRecord } from "../session-index/live-registry.js";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import { SessionIndex } from "../session-index/session-index.js";
@@ -124,8 +124,23 @@ const notification = (timestamp: string, taskId: string, status = "completed") =
     message: { role: "user", content: notificationText(taskId, status) },
   });
 
-const queueOperation = (timestamp: string, taskId: string, operation = "enqueue") =>
-  record(timestamp, { type: "queue-operation", operation, content: notificationText(taskId) });
+const queueOperation = (
+  timestamp: string,
+  taskId: string,
+  operation = "enqueue",
+  content = notificationText(taskId),
+) => record(timestamp, { type: "queue-operation", operation, content });
+
+/** The notification that Claude Code 2.1.303 sends for a quiet background
+ *  shell that still runs. It has no `<status>`. */
+const checkInText = (taskId: string) =>
+  `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>tu_1</tool-use-id>\n` +
+  `<output-file>/tmp/${taskId}.output</output-file>\n` +
+  `<summary>Background command "npm run dev" is still running after 10m, with no new output for 10m</summary>\n` +
+  `</task-notification>\nThis is a check-in, not a completion.`;
+
+const checkIn = (timestamp: string, taskId: string) =>
+  record(timestamp, { type: "user", message: { role: "user", content: checkInText(taskId) } });
 
 const taskStopResult = (timestamp: string, taskId: string, toolUseId = "tu_stop") =>
   record(timestamp, {
@@ -285,6 +300,49 @@ describe.each([
       ],
       "idle",
     ]);
+  });
+
+  // IJAI-3744
+  it("keeps a quiet shell open at its check-ins", async () => {
+    await expectStateAfterEachStep(
+      [
+        [
+          ...before,
+          user("2026-02-08T01:00:00.000Z", "Start the dev server"),
+          toolUse("2026-02-08T01:00:01.000Z"),
+          backgroundShellResult("2026-02-08T01:00:02.000Z", "task-1"),
+          assistant("2026-02-08T01:00:03.000Z", "Started"),
+        ],
+        "running",
+      ],
+      // The check-in wakes the session for a short turn.
+      [
+        [
+          queueOperation("2026-02-08T01:10:00.000Z", "task-1", "enqueue", checkInText("task-1")),
+          queueOperation("2026-02-08T01:10:00.000Z", "task-1", "dequeue", ""),
+          checkIn("2026-02-08T01:10:00.000Z", "task-1"),
+          assistant("2026-02-08T01:10:01.000Z", "The server still runs"),
+        ],
+        "running",
+      ],
+      // A running turn takes the next check-in in.
+      [
+        [
+          user("2026-02-08T01:20:00.000Z", "Next"),
+          queueOperation("2026-02-08T01:20:01.000Z", "task-1", "enqueue", checkInText("task-1")),
+          queueOperation("2026-02-08T01:20:02.000Z", "task-1", "remove", checkInText("task-1")),
+          assistant("2026-02-08T01:20:03.000Z"),
+        ],
+        "running",
+      ],
+      [
+        [
+          notification("2026-02-08T01:30:00.000Z", "task-1"),
+          assistant("2026-02-08T01:30:01.000Z", "The server stopped"),
+        ],
+        "idle",
+      ],
+    );
   });
 
   // IJAI-3744
@@ -555,12 +613,21 @@ describe("the wait rule", () => {
 
 describe("the task notification", () => {
   it("is read only at the start of the input", () => {
-    expect(notifiedTaskId(notificationText("task-1"))).toBe("task-1");
-    expect(notifiedTaskId(`\n  ${notificationText("task-1")}`)).toBe("task-1");
-    expect(notifiedTaskId(`Look: ${notificationText("task-1")}`)).toBeUndefined();
-    expect(notifiedTaskId("<task-notification><task-id> </task-id>")).toBeUndefined();
-    expect(notifiedTaskId("<task-notification><task-id>task-1")).toBeUndefined();
-    expect(notifiedTaskId(undefined)).toBeUndefined();
+    expect(endedTaskId(notificationText("task-1"))).toBe("task-1");
+    expect(endedTaskId(`\n  ${notificationText("task-1")}`)).toBe("task-1");
+    expect(endedTaskId(`Look: ${notificationText("task-1")}`)).toBeUndefined();
+    const status = "<status>completed</status></task-notification>";
+    expect(endedTaskId(`<task-notification><task-id> </task-id>${status}`)).toBeUndefined();
+    expect(endedTaskId(`<task-notification><task-id>task-1${status}`)).toBeUndefined();
+    expect(endedTaskId(undefined)).toBeUndefined();
+  });
+
+  it("ends no task without a status", () => {
+    expect(endedTaskId(checkInText("task-1"))).toBeUndefined();
+    const monitorEvent =
+      "<task-notification>\n<task-id>task-1</task-id>\n" +
+      '<summary>Monitor event: "test log"</summary>\n<event>FAILED</event>\n</task-notification>';
+    expect(endedTaskId(monitorEvent)).toBeUndefined();
   });
 
   it("is read as a text block of a user record", async () => {
