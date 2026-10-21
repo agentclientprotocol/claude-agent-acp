@@ -316,6 +316,12 @@ import {
 } from "./exit-plan.js";
 import { DEFAULT_AGENT_ID } from "./session-config-ids.js";
 import { parseToolResultMeta } from "./tool-result-meta.js";
+import {
+  markerTagText,
+  type PersistedTaskNotification,
+  TASK_NOTIFICATION_TAG,
+  taskNotificationsOf,
+} from "./task-notifications.js";
 import { formatUsageResponse, isUsageCommandText, parseUsageResponse } from "./usage-markdown.js";
 
 export { DEFAULT_AGENT_ID } from "./session-config-ids.js";
@@ -2123,7 +2129,6 @@ const LOCAL_COMMAND_MARKERS = [
 // model that a background task stopped; live, the SDK `task_notification`
 // frame reports the same stop, so replay restores the task state from it (see
 // taskNotificationsOf) instead of showing it.
-const TASK_NOTIFICATION_TAG = "task-notification";
 const INJECTED_CONTEXT_MARKERS = ["system-reminder", TASK_NOTIFICATION_TAG].map((tag) => ({
   open: `<${tag}>`,
   close: `</${tag}>`,
@@ -2160,16 +2165,6 @@ function stripMarkerTags(text: string): string {
     i++;
   }
   return result + text.slice(copiedUpTo);
-}
-
-function markerTagText(text: string, tag: string): string | undefined {
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  const start = text.indexOf(open);
-  if (start === -1) return undefined;
-  const end = text.indexOf(close, start + open.length);
-  if (end === -1) return undefined;
-  return text.slice(start + open.length, end);
 }
 
 function hasMarkerTag(text: string, tag: string): boolean {
@@ -2230,57 +2225,6 @@ export function stripLocalCommandMetadata(content: unknown): unknown | null {
 
 export function isLocalCommandMetadata(content: unknown): boolean {
   return stripLocalCommandMetadata(content) === null;
-}
-
-/** The fields of a persisted `<task-notification>`, in the shape of the SDK
- *  `task_notification` frame that reported the same stop live. */
-type PersistedTaskNotification = {
-  task_id: string;
-  status: string;
-  tool_use_id?: string;
-  summary?: string;
-  output_file?: string;
-};
-
-/**
- * Returns each `<task-notification>` in user-message content (a string or its
- * text blocks). The `<result>` body is model context that the live frame does
- * not carry, so the scan stops at it and a tag quoted in it cannot match.
- */
-function taskNotificationsOf(content: unknown): PersistedTaskNotification[] {
-  const texts =
-    typeof content === "string"
-      ? [content]
-      : Array.isArray(content)
-        ? content.flatMap((block) =>
-            block?.type === "text" && typeof block.text === "string" ? [block.text as string] : [],
-          )
-        : [];
-  const open = `<${TASK_NOTIFICATION_TAG}>`;
-  const close = `</${TASK_NOTIFICATION_TAG}>`;
-  const notifications: PersistedTaskNotification[] = [];
-  for (const text of texts) {
-    let start = text.indexOf(open);
-    while (start !== -1) {
-      const end = text.indexOf(close, start + open.length);
-      if (end === -1) break;
-      const body = text.slice(start + open.length, end).split("<result>", 1)[0];
-      const field = (tag: string) => markerTagText(body, tag)?.trim() || undefined;
-      const taskId = field("task-id");
-      const status = field("status");
-      if (taskId && status) {
-        notifications.push({
-          task_id: taskId,
-          status,
-          tool_use_id: field("tool-use-id"),
-          summary: field("summary"),
-          output_file: field("output-file"),
-        });
-      }
-      start = text.indexOf(open, end + close.length);
-    }
-  }
-  return notifications;
 }
 
 /**
