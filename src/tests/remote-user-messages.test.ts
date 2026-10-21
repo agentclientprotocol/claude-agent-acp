@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { AgentSideConnection as AcpClient } from "@agentclientprotocol/sdk";
-import { ClaudeAcpAgent } from "../acp-agent.js";
+import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
 import { mockSessionState, successfulResultMessage, wrapQuery } from "./session-doubles.js";
 
@@ -67,14 +66,6 @@ async function promptWithChunks(messages: (promptUuid: string) => unknown[]) {
 }
 
 describe("user messages typed in another client of the session", () => {
-  it("forwards a human-origin message that this adapter did not send", async () => {
-    const texts = await promptWith(() => [
-      userReplay("phone-1", "typed on the phone", { origin: HUMAN }),
-    ]);
-
-    expect(texts).toEqual(["typed on the phone"]);
-  });
-
   it("does not repeat the echo of the prompt the adapter sent", async () => {
     expect(await promptWith(() => [])).toEqual([]);
   });
@@ -156,93 +147,59 @@ describe("user messages typed in another client of the session", () => {
     expect(agent.sessions["test-session"].sentUserUuids?.size ?? 0).toBe(0);
   });
 
-  it("shows an image sent from another client", async () => {
+  const text = (value: string) => ({ type: "text", text: value });
+  const png = {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
+  };
+  // The shape Claude Code delivered for a photo uploaded in the mobile app: one
+  // message, one base64 JPEG block, no text.
+  const photo = {
+    type: "image",
+    source: { type: "base64", media_type: "image/jpeg", data: "/9j/4AAQ" },
+  };
+  const urlImage = { type: "image", source: { type: "url", url: "https://example.com/a.png" } };
+  const pdf = {
+    type: "document",
+    source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" },
+  };
+
+  it.each([
+    ["text", [text("typed on the phone")], [text("typed on the phone")]],
+    [
+      "text and an image",
+      [text("what is in this picture?"), png],
+      [
+        text("what is in this picture?"),
+        { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+      ],
+    ],
+    ["a photo on its own", [photo], [{ type: "image", data: "/9j/4AAQ", mimeType: "image/jpeg" }]],
+    [
+      "only a url image",
+      [urlImage],
+      [expect.objectContaining({ type: "image", uri: "https://example.com/a.png" })],
+    ],
+    [
+      "text with a document, keeping the text",
+      [text("summarize the attached file"), pdf],
+      [text("summarize the attached file")],
+    ],
+    [
+      "text with command markup removed",
+      [text("<command-name>/review</command-name>please look at this")],
+      [text("please look at this")],
+    ],
+    [
+      "only command markup, skipping it",
+      [text("<local-command-stdout>output</local-command-stdout>")],
+      [],
+    ],
+  ])("shows %s sent from another client", async (_description, content, expected) => {
     const chunks = await promptWithChunks(() => [
-      userReplayContent(
-        "phone-1",
-        [
-          { type: "text", text: "what is in this picture?" },
-          {
-            type: "image",
-            source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" },
-          },
-        ],
-        { origin: HUMAN },
-      ),
+      userReplayContent("phone-1", content, { origin: HUMAN }),
     ]);
 
-    expect(chunks.map((chunk) => chunk.content)).toEqual([
-      { type: "text", text: "what is in this picture?" },
-      { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
-    ]);
-  });
-
-  it("shows a base64 photo that arrives as a message of its own", async () => {
-    // The shape Claude Code delivered for a photo uploaded in the mobile app:
-    // one message, one base64 JPEG block, no text.
-    const chunks = await promptWithChunks(() => [
-      userReplayContent(
-        "phone-1",
-        [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "/9j/4AAQ" } }],
-        { origin: HUMAN },
-      ),
-    ]);
-
-    expect(chunks.map((chunk) => chunk.content)).toEqual([
-      { type: "image", data: "/9j/4AAQ", mimeType: "image/jpeg" },
-    ]);
-  });
-
-  it("shows an image that is the whole message", async () => {
-    const chunks = await promptWithChunks(() => [
-      userReplayContent(
-        "phone-1",
-        [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }],
-        { origin: HUMAN },
-      ),
-    ]);
-
-    expect(chunks).toHaveLength(1);
-    expect(chunks[0].content).toMatchObject({ type: "image", uri: "https://example.com/a.png" });
-  });
-
-  it("shows the text of a message whose attachment is a document", async () => {
-    const chunks = await promptWithChunks(() => [
-      userReplayContent(
-        "phone-1",
-        [
-          { type: "text", text: "summarize the attached file" },
-          {
-            type: "document",
-            source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" },
-          },
-        ],
-        { origin: HUMAN },
-      ),
-    ]);
-
-    expect(chunks.map((chunk) => chunk.content)).toEqual([
-      { type: "text", text: "summarize the attached file" },
-    ]);
-  });
-
-  it("removes command markup from a message before showing it", async () => {
-    const texts = await promptWith(() => [
-      userReplay("phone-1", "<command-name>/review</command-name>please look at this", {
-        origin: HUMAN,
-      }),
-    ]);
-
-    expect(texts).toEqual(["please look at this"]);
-  });
-
-  it("skips a message that is only command markup", async () => {
-    const texts = await promptWith(() => [
-      userReplay("phone-1", "<local-command-stdout>output</local-command-stdout>", {
-        origin: HUMAN,
-      }),
-    ]);
-
-    expect(texts).toEqual([]);
+    expect(chunks.map((chunk) => chunk.content)).toEqual(expected);
   });
 });
