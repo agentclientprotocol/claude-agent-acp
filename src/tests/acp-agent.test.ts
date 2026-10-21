@@ -19,7 +19,7 @@ import {
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
@@ -3656,7 +3656,14 @@ describe("subagent transcript replay", () => {
         } as unknown as AcpClient,
         { log: () => {}, error: () => {} },
       );
-      await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+      // With `loadReplayEnd`, the end event comes after the child history too.
+      await initializeClient(agent, {
+        _meta: {
+          jetbrains: {
+            air: { version: 1, capabilities: ["nativeSubagentSessions", "loadReplayEnd"] },
+          },
+        },
+      } as ClientCapabilities);
       vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
       vi.mocked(getSubagentMessages).mockClear();
       await (
@@ -3688,7 +3695,11 @@ describe("subagent transcript replay", () => {
         [sessionId, "agent_message_chunk", "Done."],
         [sessionId, "subagent_state_update", child2],
         [sessionId, "subagent_state_update", child1],
+        [sessionId, "session_info_update", undefined],
       ]);
+      expect(updates.at(-1)!.update._meta).toEqual({
+        jetbrains: { air: { version: 1, loadReplayEnd: true } },
+      });
       expect(
         updates.flatMap(({ update }) =>
           update.sessionUpdate === "subagent_state_update" ? [(update as any).state] : [],
@@ -3813,6 +3824,68 @@ describe("subagent transcript replay", () => {
         await rm(configDir, { recursive: true, force: true });
       }
     }
+
+    it("replays a fork child without the launching message and boilerplate it inherited", async () => {
+      // A `subagent_type: "fork"` transcript starts with a copy of the
+      // launching message (same API message id) and a directive message with
+      // a "Fork started" result for each of its tool_uses.
+      const launching = [
+        { type: "text", text: "I'll fork a worker." },
+        toolUse("toolu_fork", "Agent", {
+          subagent_type: "fork",
+          description: "Check the parser",
+          prompt: "Inspect the parser",
+        }),
+        toolUse("toolu_read", "Read", { file_path: "/tmp/proj/a.ts" }),
+      ];
+      const forkStarted = (id: string) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [{ type: "text", text: "Fork started — processing in background" }],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Check it"),
+          assistant("a1", launching),
+          user("u2", [toolResult("toolu_fork", "Parser is fine."), toolResult("toolu_read", "x")]),
+          assistant("a2", [{ type: "text", text: "Done." }]),
+        ],
+        {
+          fork1: {
+            meta: {
+              agentType: "fork",
+              isFork: true,
+              description: "Check the parser",
+              toolUseId: "toolu_fork",
+            },
+            records: [
+              { ...assistant("f1", launching), message: { ...assistant("a1", launching).message } },
+              user("f2", [
+                forkStarted("toolu_fork"),
+                forkStarted("toolu_read"),
+                {
+                  type: "text",
+                  text: "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\nYour directive: Inspect the parser",
+                },
+              ]),
+              assistant("f3", [{ type: "text", text: "Parser is fine." }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Check it",
+        "root agent_message_chunk I'll fork a worker.",
+        "root tool_call toolu_fork",
+        "root tool_call toolu_read",
+        'root subagent_update fork1 {"state":"running"}',
+        `fork1 session_message toolu_fork from=${sessionId} Inspect the parser`,
+        "fork1 agent_message_chunk Parser is fine.",
+        "root agent_message_chunk Done.",
+        'root subagent_update fork1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
 
     it("replays each child under its live session id, with its incoming messages, before the response", async () => {
       const trace = await replayRfd(
@@ -7506,22 +7579,8 @@ describe("subagent permission attribution (issue #851)", () => {
           ].join("\n") + "\n",
         );
         // The SDK reads no transcript for a session id that is not a UUID, as
-        // the test session's is, so it answers with the transcript above.
+        // the test session's is, so it has no session info.
         vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
-        vi.mocked(getSessionMessages).mockResolvedValueOnce([
-          {
-            type: "assistant",
-            uuid: "a1",
-            session_id: "test-session",
-            parent_tool_use_id: null,
-            message: {
-              role: "assistant",
-              content: [
-                { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
-              ],
-            },
-          },
-        ] as Awaited<ReturnType<typeof getSessionMessages>>);
         await writeFile(
           path.join(directory, "test-session", "subagents", "agent-agent-7.meta.json"),
           JSON.stringify({
@@ -8397,6 +8456,167 @@ describe("subagent permission attribution (issue #851)", () => {
       expect(lifecycle).toEqual(expected);
       expect(JSON.stringify(updates)).not.toContain("stray");
       expect(JSON.stringify(updates)).toContain("resumed");
+    });
+  });
+
+  /** After an adapter restart the child's messages carry the old launch id; SendMessage resumes it. */
+  describe("an agent from before an adapter restart, in the AIR form", () => {
+    /**
+     * Writes the history on disk, as the restarted adapter finds it: the root
+     * launched agent-7 with `toolu_old` before a compaction, which drops that
+     * call from the SDK's active chain. Runs `messages` through a new agent
+     * and returns the lifecycle and output the client saw.
+     */
+    async function restarted(messages: unknown[]) {
+      const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-air-restore-"));
+      const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+      process.env.CLAUDE_CONFIG_DIR = configDir;
+      try {
+        const directory = path.join(configDir, "projects", "-tmp-proj");
+        await mkdir(path.join(directory, "test-session", "subagents"), { recursive: true });
+        const record = (uuid: string, parentUuid: string | null, extra: object) =>
+          JSON.stringify({
+            sessionId: "test-session",
+            cwd: "/tmp/proj",
+            version: "2.0.0",
+            userType: "external",
+            isSidechain: false,
+            timestamp: "2026-10-13T00:00:00.000Z",
+            uuid,
+            parentUuid,
+            ...extra,
+          });
+        await writeFile(
+          path.join(directory, "test-session.jsonl"),
+          [
+            record("u1", null, { type: "user", message: { role: "user", content: "Go" } }),
+            record("a1", "u1", {
+              type: "assistant",
+              message: {
+                id: "m-a1",
+                role: "assistant",
+                model: "claude-opus-5",
+                content: [
+                  { type: "tool_use", id: "toolu_old", name: "Agent", input: { prompt: "Go" } },
+                ],
+              },
+            }),
+            record("b1", null, {
+              type: "system",
+              subtype: "compact_boundary",
+              content: "Conversation compacted",
+            }),
+            record("u2", "b1", { type: "user", message: { role: "user", content: "More" } }),
+          ].join("\n") + "\n",
+        );
+        // The test session id is no UUID, so the SDK finds no session info.
+        vi.mocked(getSessionInfo).mockResolvedValue({ cwd: "/tmp/proj" } as any);
+        await writeFile(
+          path.join(directory, "test-session", "subagents", "agent-agent-7.meta.json"),
+          JSON.stringify({
+            agentType: "Explore",
+            description: "Echo a word",
+            name: "echoer",
+            toolUseId: "toolu_old",
+          }),
+        );
+
+        const updates: AcpSessionNotification[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async (update: AcpSessionNotification) => {
+              updates.push(update);
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        await agent.initialize({
+          protocolVersion: 1,
+          clientCapabilities: AIR_NATIVE_SUBAGENTS,
+        });
+        injectGeneratorSession(agent, makeGenerator(messages));
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+
+        return updates.flatMap(({ sessionId, update }) =>
+          update.sessionUpdate === "subagent_spawned"
+            ? [[sessionId, update.sessionUpdate, update.subagentSessionId]]
+            : update.sessionUpdate === "agent_message_chunk"
+              ? [[sessionId, update.sessionUpdate, (update.content as { text: string }).text]]
+              : update.sessionUpdate === "subagent_state_update"
+                ? [[sessionId, update.sessionUpdate, update.subagentSessionId]]
+                : [],
+        );
+      } finally {
+        vi.mocked(getSessionInfo).mockReset();
+        if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+        else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+        await rm(configDir, { recursive: true, force: true });
+      }
+    }
+    const childMessage = (text: string) => ({
+      type: "stream_event" as const,
+      parent_tool_use_id: "toolu_old",
+      uuid: randomUUID(),
+      session_id: "test-session",
+      event: {
+        type: "content_block_delta" as const,
+        index: 0,
+        delta: { type: "text_delta" as const, text },
+      },
+    });
+    const resumed = {
+      type: "user",
+      parent_tool_use_id: null,
+      uuid: randomUUID(),
+      session_id: "test-session",
+      tool_use_result: { success: true, resumedAgentId: "agent-7" },
+      message: {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "Resuming" }],
+      },
+    };
+    const childId = expect.stringMatching(/^agent-7:generation:\d+$/);
+
+    /** SendMessage resumes the agent; its launch is before a compaction; a repeated resume signal adds nothing. */
+    it("restores it on a SendMessage resume and routes its run to one generation", async () => {
+      const seen = await restarted([
+        rootToolUse("toolu_send", "SendMessage", { to: "agent-7", message: "Say PING" }),
+        { ...taskStarted("agent-7", "toolu_send"), subagent_type: "Explore", prompt: "Say PING" },
+        childMessage("PING"),
+        resumed,
+        childMessage("PONG"),
+        { ...resumed, uuid: randomUUID() },
+        {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "agent-7",
+          tool_use_id: "toolu_send",
+          status: "completed",
+          output_file: "",
+          summary: "done",
+          uuid: randomUUID(),
+          session_id: "test-session",
+        },
+        successResult(),
+      ]);
+
+      expect(seen).toEqual([
+        ["test-session", "subagent_spawned", childId],
+        [childId, "agent_message_chunk", "PING"],
+        [childId, "agent_message_chunk", "PONG"],
+        ["test-session", "subagent_state_update", childId],
+      ]);
+    });
+
+    /** Only a message under the old launch id arrives, with no resume signal. */
+    it("restores it from a message under the old launch id alone", async () => {
+      const seen = await restarted([childMessage("PING"), childMessage("PONG"), successResult()]);
+
+      expect(seen).toEqual([
+        ["test-session", "subagent_spawned", childId],
+        [childId, "agent_message_chunk", "PING"],
+        [childId, "agent_message_chunk", "PONG"],
+      ]);
     });
   });
 
@@ -13202,6 +13422,27 @@ describe("session/close", () => {
     injectSession(agent, "session-1");
     await agent.closeSession({ sessionId: "session-1" });
     await expect(agent.closeSession({ sessionId: "session-1" })).resolves.toEqual({});
+  });
+
+  it("answers a prompt that the close stops before it is queued as cancelled", async () => {
+    const agent = createMockAgent();
+    injectSession(agent, "session-1");
+    // The prompt waits in the subscription guard while the close runs.
+    const guard = Promise.withResolvers<void>();
+    const guarded = Promise.withResolvers<void>();
+    vi.spyOn(agent as any, "runClaudeSubscriptionGuard").mockImplementation(() => {
+      guarded.resolve();
+      return guard.promise;
+    });
+    const prompt = agent.prompt({
+      sessionId: "session-1",
+      prompt: [{ type: "text", text: "go" }],
+    });
+    await guarded.promise;
+    await agent.closeSession({ sessionId: "session-1" });
+    guard.resolve();
+
+    await expect(prompt).resolves.toEqual({ stopReason: "cancelled" });
   });
 
   it("should not affect other sessions when closing one", async () => {
@@ -23032,6 +23273,233 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.outputTokens).toBe(5);
       stream.end();
       await agent.sessions["test-session"]?.consumer;
+    });
+  });
+  describe("autonomous turn as an async task", () => {
+    const airAgent = async (capabilities: string[] = ["asyncTasks"]) => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities } } },
+        },
+      });
+      const asyncTaskUpdates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate.startsWith("async_task_") ? [update as any] : [],
+        );
+      return { agent, updates, asyncTaskUpdates };
+    };
+
+    const shellNotification = () => ({
+      ...taskNotification("bg-1"),
+      summary: 'Background command "sleep 20" completed (exit code 0)',
+    });
+
+    it("publishes a turn that Claude Code runs after end_turn and ends it at its result", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield assistantText("started it");
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield shellNotification();
+          yield running();
+          yield assistantText("it finished");
+          // A coalesced placeholder does not end the turn.
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0 });
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "run it in the background" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+      expect(asyncTaskUpdates()).toEqual([]);
+
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      const [spawned, ...rest] = asyncTaskUpdates();
+      expect(spawned).toEqual({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: expect.stringMatching(/^autonomous-turn-/),
+        name: "Claude is working",
+        taskType: "turn",
+        description: 'Background command "sleep 20" completed (exit code 0)',
+        showInTranscript: false,
+        canStop: true,
+      });
+      expect(rest).toEqual([
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: spawned.asyncTaskId,
+          state: "completed",
+        },
+      ]);
+    });
+
+    it("starts at the first output when the state never left running", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          await woken;
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+    });
+
+    it("ends the turn task when a prompt is folded into the turn", async () => {
+      const { agent, updates, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let autonomousRunning = () => {};
+      const autonomous = new Promise<void>((resolve) => (autonomousRunning = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          autonomousRunning();
+          yield userEcho((await iter.next()).value);
+          yield assistantText("answer to the folded prompt");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await autonomous;
+      const second = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and this" }],
+      });
+      expect(second.stopReason).toBe("end_turn");
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+      const kinds = updates.map(({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+          ? update.content.text
+          : update.sessionUpdate,
+      );
+      expect(kinds.indexOf("async_task_state_update")).toBeLessThan(
+        kinds.indexOf("answer to the folded prompt"),
+      );
+    });
+
+    it("interrupts the turn when the client stops its task", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let finish = () => {};
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          await finished;
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            subtype: "error_during_execution",
+            is_error: true,
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await waitFor(() => asyncTaskUpdates().length === 1);
+      const session = agent.sessions["test-session"]!;
+      const asyncTaskId = asyncTaskUpdates()[0].asyncTaskId;
+
+      await expect(
+        agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId }),
+      ).resolves.toEqual({ stopped: true });
+      expect(session.query.interrupt).toHaveBeenCalledTimes(1);
+      expect(session.query.stopTask).not.toHaveBeenCalled();
+      finish();
+      await session.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "stopped",
+      ]);
+    });
+
+    it("publishes nothing to a client without async tasks", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent([]);
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          yield running();
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+      expect(asyncTaskUpdates()).toEqual([]);
     });
   });
 });

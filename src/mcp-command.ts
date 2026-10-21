@@ -1,4 +1,4 @@
-import type { AvailableCommand } from "@agentclientprotocol/sdk";
+import type { AvailableCommand } from "@agentclientprotocol/sdk/unstable";
 import type { McpServerStatus, Query } from "@anthropic-ai/claude-agent-sdk";
 import { escapeMarkdown } from "./usage-markdown.js";
 import { raceTimeoutAndAbort } from "./utils.js";

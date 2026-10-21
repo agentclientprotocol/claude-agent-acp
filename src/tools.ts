@@ -3,7 +3,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolKind,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { HookCallback } from "@anthropic-ai/claude-agent-sdk";
 import type {
   TaskCreateInput,

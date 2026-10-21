@@ -1,4 +1,4 @@
-import type { RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import type { RequestPermissionResponse } from "@agentclientprotocol/sdk/unstable";
 import type {
   PermissionMode,
   PermissionResult,

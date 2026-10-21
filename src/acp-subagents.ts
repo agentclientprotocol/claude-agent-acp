@@ -2,7 +2,7 @@ import type {
   ClientCapabilities,
   SessionCapabilities,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
   clientSupportsAirCapability,

@@ -10,8 +10,8 @@ import {
   type ContentBlock,
   type PromptRequest,
   type Role,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 
@@ -149,7 +149,7 @@ export function v1PromptRequest({ prompt, ...request }: v2.PromptRequest): Promp
   return { ...request, prompt: prompt.map(v1ContentBlock) };
 }
 
-function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
+export function v1ContentBlock(block: v2.ContentBlock): ContentBlock {
   if (
     v2.ContentBlock.isText(block) ||
     v2.ContentBlock.isImage(block) ||

@@ -1,4 +1,4 @@
-import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest, SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type {
   EffortLevel,
   Options,

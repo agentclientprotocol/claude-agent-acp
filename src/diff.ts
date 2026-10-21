@@ -1,5 +1,5 @@
-import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk";
-import type * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import { ToolCallContent, ToolCallLocation } from "@agentclientprotocol/sdk/unstable";
+import type * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { structuredPatch } from "diff";
 import { constants } from "node:fs";
 import { type FileHandle, open } from "node:fs/promises";

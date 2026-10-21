@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { randomUUID } from "crypto";
-import { RequestError, SessionNotification } from "@agentclientprotocol/sdk";
+import { RequestError, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { query, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import { Pushable } from "../utils.js";

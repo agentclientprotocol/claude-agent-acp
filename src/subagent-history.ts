@@ -1,11 +1,12 @@
 import {
   getSessionInfo,
-  getSessionMessages,
   getSubagentMessages,
   type SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { createReadStream } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
 import { isNativeSubagentControlTool, type HistoricalSubagent } from "./native-subagents.js";
 import { findTranscript } from "./resumed-session.js";
 
@@ -48,7 +49,7 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
   const agents = new Map<string, SubagentRecord>();
   const transcript = await findTranscript(sessionId);
   if (!transcript) return { agents };
-  const directory = path.join(path.dirname(transcript), sessionId, "subagents");
+  const directory = subagentsDirectory(transcript, sessionId);
   let names: string[];
   try {
     names = await readdir(directory);
@@ -86,6 +87,22 @@ export async function subagentHistory(sessionId: string): Promise<SubagentHistor
   return dir ? { agents, dir } : { agents };
 }
 
+/** The folder of the subagent transcripts, next to the session transcript `transcript`. */
+function subagentsDirectory(transcript: string, sessionId: string): string {
+  return path.join(path.dirname(transcript), sessionId, "subagents");
+}
+
+/**
+ * The agent that the Agent or Task call `launchId` launched, from the subagent
+ * history of the session `sessionId`.
+ */
+export async function subagentLaunchedBy(
+  sessionId: string,
+  launchId: string,
+): Promise<string | undefined> {
+  return (await subagentHistory(sessionId)).agents.get(launchId)?.agentId;
+}
+
 /**
  * The agent `agentId` and its ancestors, root first, from the subagent history
  * of the session `sessionId`. The runtime restores an agent from it when Claude
@@ -109,15 +126,11 @@ export async function subagentLineage(
   }
   if (!launchOf.has(agentId)) return [];
 
-  // Without the project directory, as the replay reads it (`readResumedSession`).
-  const rootLaunches = new Set(
-    launchIdsIn(
-      await getSessionMessages(sessionId).catch((error: unknown) => {
-        logger.error(`Failed to read the transcript of session ${sessionId}:`, error);
-        return [];
-      }),
-    ),
-  );
+  // The SDK's readers return only the active chain, which starts after the
+  // last compaction, so the launch calls come from the transcript files.
+  const transcript = await findTranscript(sessionId);
+  if (!transcript) return [];
+  const rootLaunches = await readLaunchIdsFromTranscript(transcript, null, logger);
   const agentLaunches = new Map<string, Set<string>>();
   /** The agent whose transcript has the launch `launchId`, `null` for the root's. */
   const launcherOf = async (launchId: string): Promise<string | null | undefined> => {
@@ -125,8 +138,10 @@ export async function subagentLineage(
     for (const candidate of launchOf.keys()) {
       let launches = agentLaunches.get(candidate);
       if (!launches) {
-        launches = new Set(
-          launchIdsIn(await readSubagentMessages(sessionId, candidate, history, logger)),
+        launches = await readLaunchIdsFromTranscript(
+          path.join(subagentsDirectory(transcript, sessionId), `agent-${candidate}.jsonl`),
+          candidate,
+          logger,
         );
         agentLaunches.set(candidate, launches);
       }
@@ -170,10 +185,60 @@ export function subagentLaunchIds(content: unknown): string[] {
   );
 }
 
-function launchIdsIn(messages: readonly SessionMessage[]): string[] {
-  return messages.flatMap((message) =>
-    subagentLaunchIds((message as { message?: { content?: unknown } }).message?.content),
-  );
+/**
+ * The ids of the launch calls in the transcript `file`, every record of it,
+ * including those before a compaction. `owner` is the agent the transcript
+ * belongs to, null for the session's. The session's transcript can hold
+ * sidechain records, which are an agent's, not the root's; an agent's
+ * transcript keeps only the records of that agent. A file that cannot be read
+ * has no launches, so the agent is not placed under the root.
+ */
+async function readLaunchIdsFromTranscript(
+  file: string,
+  owner: string | null,
+  logger: { error(...args: unknown[]): void },
+): Promise<Set<string>> {
+  const launches = new Set<string>();
+  const stream = createReadStream(file, { encoding: "utf8" });
+  try {
+    for await (const line of readline.createInterface({ input: stream, crlfDelay: Infinity })) {
+      const forkDirective = owner !== null && line.includes(FORK_BOILERPLATE_OPEN);
+      if (!line.includes('"tool_use"') && !forkDirective) continue;
+      let record: {
+        type?: unknown;
+        isSidechain?: unknown;
+        agentId?: unknown;
+        message?: { content?: unknown };
+      } | null;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      // Every record of a fork child's transcript before its directive message
+      // is inherited context: a copy of the launching message, whose launch
+      // calls are the parent's, not the fork's.
+      if (forkDirective && record !== null && isForkDirectiveMessage(record)) {
+        launches.clear();
+        continue;
+      }
+      if (record?.type !== "assistant") continue;
+      if (
+        owner === null
+          ? record.isSidechain === true
+          : record.agentId !== undefined && record.agentId !== owner
+      ) {
+        continue;
+      }
+      for (const id of subagentLaunchIds(record.message?.content)) launches.add(id);
+    }
+  } catch (error) {
+    logger.error(`Failed to read the transcript ${file}:`, error);
+    return new Set();
+  } finally {
+    stream.destroy();
+  }
+  return launches;
 }
 
 /**
@@ -191,11 +256,68 @@ export async function readSubagentMessages(
   try {
     if (history.dir) {
       const messages = await getSubagentMessages(sessionId, agentId, { dir: history.dir });
-      if (messages.length > 0) return messages;
+      if (messages.length > 0) return stripForkPrefix(messages);
     }
-    return await getSubagentMessages(sessionId, agentId);
+    return stripForkPrefix(await getSubagentMessages(sessionId, agentId));
   } catch (error) {
     logger.error(`Failed to read the history of subagent ${agentId}:`, error);
     return [];
   }
+}
+
+/** How Claude Code opens the directive message of a `subagent_type: "fork"` child. */
+const FORK_BOILERPLATE_OPEN = "<fork-boilerplate>";
+/** What follows the boilerplate, right before the prompt of the Agent call. */
+const FORK_DIRECTIVE_MARKER = "</fork-boilerplate>\nYour directive: ";
+
+/** Whether `block` is the text block of a fork child's directive message. */
+function isForkDirectiveText(block: unknown): block is { type: "text"; text: string } {
+  return (
+    typeof block === "object" &&
+    block !== null &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string" &&
+    (block as { text: string }).text.startsWith(FORK_BOILERPLATE_OPEN)
+  );
+}
+
+/** Whether the transcript record `message` is the directive message of a fork child. */
+function isForkDirectiveMessage(message: { type?: unknown; message?: unknown }): boolean {
+  if (message.type !== "user") return false;
+  const content = (message.message as { content?: unknown } | null | undefined)?.content;
+  return Array.isArray(content) && content.some(isForkDirectiveText);
+}
+
+/**
+ * The transcript of a `subagent_type: "fork"` child without the context it
+ * inherited. A fork transcript starts with a copy of the parent's launching
+ * assistant message (its text, thinking and every tool_use, including the
+ * Agent call itself), then a user message with a "Fork started — processing
+ * in background" tool_result for each of those tool_uses and the text
+ * `<fork-boilerplate>…</fork-boilerplate>\nYour directive: <prompt>`. A fork
+ * launched from inside a subagent also gets a copy of that subagent's history
+ * before them. None of it is the child's own work: replayed as is, the
+ * parent's text and tool calls would show again in the child.
+ *
+ * This drops every record before the directive message, and reduces that
+ * message to the prompt. Other transcripts are returned unchanged.
+ */
+export function stripForkPrefix(messages: SessionMessage[]): SessionMessage[] {
+  const index = messages.findIndex(isForkDirectiveMessage);
+  if (index === -1) return messages;
+  const directive = messages[index];
+  const content = (directive.message as { content: unknown[] }).content;
+  const prompt = content.flatMap((block) => {
+    if (!isForkDirectiveText(block)) return [];
+    const start = block.text.indexOf(FORK_DIRECTIVE_MARKER);
+    return start === -1
+      ? []
+      : [{ type: "text", text: block.text.slice(start + FORK_DIRECTIVE_MARKER.length) }];
+  });
+  const rest = messages.slice(index + 1);
+  if (prompt.length === 0) return rest;
+  return [
+    { ...directive, message: { ...(directive.message as object), content: prompt } },
+    ...rest,
+  ];
 }

@@ -1,4 +1,8 @@
-import { ForkSessionRequest, ForkSessionResponse, RequestError } from "@agentclientprotocol/sdk";
+import {
+  ForkSessionRequest,
+  ForkSessionResponse,
+  RequestError,
+} from "@agentclientprotocol/sdk/unstable";
 import {
   forkSession as forkClaudeSession,
   getSessionMessages,

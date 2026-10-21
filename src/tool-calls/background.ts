@@ -1,4 +1,4 @@
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import { AIR_ASYNC_TASKS_CAPABILITY, withAirMeta } from "../air-extension.js";
 
 /**

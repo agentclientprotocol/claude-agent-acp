@@ -4,7 +4,10 @@
  * Claude Code: it echoes each prompt, then runs the turn's script.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RequestPermissionRequest, SessionNotification } from "@agentclientprotocol/sdk";
+import type {
+  RequestPermissionRequest,
+  SessionNotification,
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpClient, ClaudeAcpAgent } from "../acp-agent.js";
 import type { ForegroundEvents, TurnEvents } from "../turn-events.js";
 import { DEFAULT_CONTEXT_USAGE } from "./helpers.js";

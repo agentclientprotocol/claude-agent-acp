@@ -1,4 +1,4 @@
-import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 
 /** Fire-and-forget advisory text for the user: live events rather than
  *  conversation history. See the ACP Session Notices RFD
