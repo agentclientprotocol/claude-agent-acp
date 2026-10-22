@@ -21759,6 +21759,245 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           expect.stringContaining("no turn to continue the accepted plan"),
         );
       });
+
+      /** Agent whose client keeps the last permission request and rejects it. */
+      const rejectingAgent = () => {
+        const requests: RequestPermissionRequest[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              requests.push(params);
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        return { agent, requests };
+      };
+      const askExitPlan = (agent: ClaudeAcpAgent) =>
+        agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "tool-plan",
+        } as any);
+      const offersClearContext = (request: RequestPermissionRequest | undefined) =>
+        (request?.options ?? []).some((o) => o.optionId.startsWith("exit-plan-clear-"));
+
+      it("offers the clear-context option to a prompt before its echo", async () => {
+        const { agent, requests } = rejectingAgent();
+        let echo!: () => void;
+        const echoGate = new Promise<void>((resolve) => (echo = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            // Claude Code asks for the prompt before the consumer reaches its echo.
+            await echoGate;
+            yield userEcho(first);
+            yield running();
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        await waitFor(() => (session.turnQueue ?? []).some((turn) => !turn.settled));
+        expect(session.activeTurn).toBeFalsy();
+
+        await askExitPlan(agent);
+        expect(offersClearContext(requests[0])).toBe(true);
+        echo();
+        await prompt;
+        await session.consumer;
+      });
+
+      it("offers no clear-context option to an autonomous cycle while a prompt waits for its echo", async () => {
+        const { agent, requests } = rejectingAgent();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            const { value: first } = await iter.next();
+            yield userEcho(first);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            // A followup cycle that Claude Code starts on its own.
+            yield assistantText("followup");
+            const { value: second } = await iter.next();
+            await gate;
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage({ origin: { kind: "task-notification" } });
+            yield idle();
+            yield userEcho(second);
+            yield running();
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const first = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        expect(first.stopReason).toBe("end_turn");
+        await waitFor(() => (agent as any).runsAutonomousCycle("test-session"));
+        const second = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "next" }],
+        });
+        await waitFor(() => (session.turnQueue ?? []).some((turn) => !turn.settled));
+
+        // The queued prompt does not own the request of the running cycle.
+        await askExitPlan(agent);
+        expect(requests).toHaveLength(1);
+        expect(offersClearContext(requests[0])).toBe(false);
+        release();
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+        await session.consumer;
+      });
+
+      it("continues an accepted plan of an interleaved followup in the turn that took it over", async () => {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        let continuation: unknown;
+        const createSession = vi
+          .spyOn(agent as any, "createSession")
+          .mockImplementation(async (_params: any, options: any) => {
+            const input = new Pushable<any>();
+            async function* freshGenerator() {
+              const next = await input[Symbol.asyncIterator]().next();
+              continuation = next.value;
+              yield userEcho(next.value);
+              yield running();
+              yield assistantText("Implemented");
+              yield resultMessage({ stop_reason: "max_tokens" });
+              yield idle();
+            }
+            agent.sessions["test-session"] = mockSessionState({
+              query: wrapQuery(freshGenerator()),
+              input,
+              modes: { currentModeId: options.permissionMode, availableModes: [] },
+              fastModeEnabled: false,
+            });
+            return { sessionId: "test-session" };
+          });
+        injectGeneratorSession(
+          agent,
+          (input) => {
+            async function* messageGenerator() {
+              const { value: first } = await input[Symbol.asyncIterator]().next();
+              // The echo activates the turn, and a task-notification followup
+              // plans inside it.
+              yield userEcho(first);
+              yield running();
+              yield {
+                type: "assistant",
+                parent_tool_use_id: null,
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "tool_use",
+                      id: "tool-plan",
+                      name: "ExitPlanMode",
+                      input: { plan: "Implement it" },
+                    },
+                  ],
+                  usage: {},
+                },
+              };
+              yield {
+                type: "user",
+                parent_tool_use_id: null,
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: "tool-plan",
+                      content: "User accepted the plan and requested a fresh context",
+                      is_error: true,
+                    },
+                  ],
+                },
+                tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+              };
+              // The result names no prompt, so it takes the autonomous lane.
+              yield resultMessage({
+                subtype: "error_during_execution",
+                is_error: true,
+                stop_reason: null,
+                errors: [
+                  "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+                ],
+                origin: { kind: "task-notification" },
+              });
+              yield idle();
+            }
+            return messageGenerator();
+          },
+          {
+            creationParams: { cwd: "/test", mcpServers: [] },
+            pendingExitPlanContextReset: {
+              toolUseId: "tool-plan",
+              plan: "Implement it",
+              mode: "auto",
+            },
+          },
+        );
+        await declareBackgroundSubagents(agent);
+
+        const response = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+
+        expect(createSession).toHaveBeenCalledWith(
+          expect.objectContaining({ cwd: "/test" }),
+          expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
+        );
+        expect(JSON.stringify(continuation)).toContain(
+          "Implement the following plan:\\n\\nImplement it",
+        );
+        expect(response.stopReason).toBe("max_tokens");
+        await agent.sessions["test-session"]?.consumer;
+      });
     });
   });
 
@@ -22403,6 +22642,67 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       await session.consumer;
       expect(session.liveBackgroundTasks.has("agent-1")).toBe(false);
       expect(session.owedTrailingIdles).toBe(0);
+    });
+
+    it("keeps the streamed tool input of a running subagent when the turn ends at its result", async () => {
+      const { agent, updates } = recordingAgent();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const childStream = (event: unknown) => ({
+        type: "stream_event",
+        parent_tool_use_id: "toolu_agent-1",
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event,
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          // The subagent starts to stream a tool use before the parent result.
+          yield childStream({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: "toolu_child_read", name: "Read", input: {} },
+          });
+          yield resultMessage();
+          yield idle();
+          await gate;
+          yield childStream({
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"file_path":"/test/src/late.ts","offset":',
+            },
+          });
+          yield taskNotification("agent-1");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+
+      // The input delta after the prompt response still refines the tool call.
+      release();
+      await session.consumer;
+      expect(
+        updates.find(
+          (n) =>
+            n.update.sessionUpdate === "tool_call_update" &&
+            n.update.toolCallId === "toolu_child_read",
+        )?.update,
+      ).toMatchObject({ locations: [{ path: "/test/src/late.ts" }] });
     });
 
     it("does not settle the next prompt at the followup result after the turn ended", async () => {

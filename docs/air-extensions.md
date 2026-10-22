@@ -1577,6 +1577,10 @@ The followup cycle can call ExitPlanMode. AIR then gets the permission request o
 The request has no clear-context option, because the fresh query must continue an ACP turn.
 "No, keep planning" stops only the followup cycle. There is no turn to end.
 
+A prompt turn owns the request when the turn is active, or when Claude Code asks before the echo of its prompt.
+Then the request has the clear-context option.
+A turn that took over a followup cycle also owns the request of that cycle, and the accepted plan continues in that turn.
+
 ## Context compaction
 
 The adapter implements the ACP session compaction RFD for a client that declares `clientCapabilities.session.compaction`.

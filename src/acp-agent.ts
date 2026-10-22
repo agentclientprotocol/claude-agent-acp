@@ -4502,10 +4502,27 @@ export class ClaudeAcpAgent {
     // Tool-use blocks start streaming before their JSON input. Keep the
     // partial input per parent message and block index so completed top-level
     // fields can refine the pending tool call while it streams. Entries are
-    // dropped at block/message boundaries; the whole map is swept when a turn
+    // dropped at block/message boundaries; the map is swept when a turn
     // settles, since an interrupted subagent stream (keyed by a
     // parent_tool_use_id that never recurs) has no boundary event of its own.
     const streamedToolInputs: StreamedToolInputCache = new Map();
+    /** Sweeps `streamedToolInputs` when a turn ends. A turn of a client with
+     *  `backgroundSubagents` can end while its subagents still stream tool
+     *  input, so the sweep keeps the lanes of live subagents, unless the turn
+     *  ends cancelled. Their own message boundaries drop them later. */
+    const sweepStreamedToolInputs = (turnStopReason?: StopReason) => {
+      if (turnStopReason === "cancelled" || !this.endsTurnsWithLiveSubagents()) {
+        streamedToolInputs.clear();
+        return;
+      }
+      const liveLanes = new Set<string>();
+      for (const task of session.liveBackgroundTasks.values()) {
+        if (task.isSubagent && task.parentToolUseId) liveLanes.add(task.parentToolUseId);
+      }
+      for (const lane of streamedToolInputs.keys()) {
+        if (!liveLanes.has(lane)) streamedToolInputs.delete(lane);
+      }
+    };
     // Stop reason accumulated for the active turn (result subtype, refusal,
     // max_tokens, …). Reset per turn; read when the turn settles at idle.
     let stopReason: StopReason = "end_turn";
@@ -5520,7 +5537,7 @@ export class ClaudeAcpAgent {
       disarmForceCancel(session);
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
-      streamedToolInputs.clear();
+      sweepStreamedToolInputs(result.stopReason);
       if (wasHeld) {
         // Settling a held turn is its delivery-stretch boundary: the turn's
         // answer finished long ago, so text streamed since the last boundary
@@ -5554,7 +5571,7 @@ export class ClaudeAcpAgent {
       turn.settled = true;
       session.turnQueue = (session.turnQueue ?? []).filter((t) => t !== turn);
       session.activeTurn = null;
-      streamedToolInputs.clear();
+      sweepStreamedToolInputs();
       // A failed turn's stretch is over, and some failure lanes (the issue
       // #825 idle-fail) never see the result whose `finally` would close it —
       // start the next stretch clean, or its stale delivery record would
@@ -7197,19 +7214,35 @@ export class ClaudeAcpAgent {
                   break;
                 }
                 // The same followup with no held turn: the client declared
-                // `backgroundSubagents`, or the hold already ended. The user
-                // answered out of a turn, so there is no turn to end. The
-                // interrupt only stops this autonomous cycle. Drop the markers,
-                // so that a later user-turn result is not read as this
-                // interruption. A clear-context reset cannot run here, because
-                // the fresh query continues an ACP turn. `canUseTool` offers
-                // no clear-context option out of a turn for such a client, so
-                // a reset here is only a race with the end of a turn.
+                // `backgroundSubagents`, or the hold already ended. A user
+                // turn that took the cycle over owns the request (see
+                // `requestOwnerTurn`), so it continues the accepted plan in a
+                // fresh context, as the user lane does. With no such turn
+                // the user answered out of a turn, and the interrupt only
+                // stops this autonomous cycle. Drop the markers, so that a
+                // later user-turn result is not read as this interruption.
+                // `canUseTool` offers no clear-context option to a request
+                // without an owner turn, so a reset here is only a race with
+                // the end of a turn.
                 if (
                   pendingExitPlanModeInterruption &&
                   isExitPlanInterruptionResult(message, pendingExitPlanModeInterruption)
                 ) {
                   session.pendingExitPlanModeInterruption = undefined;
+                  const ownerTurn = this.requestOwnerTurn(params.sessionId, session);
+                  if (
+                    pendingExitPlanContextReset?.toolUseId ===
+                      pendingExitPlanModeInterruption.toolUseId &&
+                    ownerTurn !== undefined &&
+                    ownerTurn === session.activeTurn
+                  ) {
+                    await this.exitPlan.restart(
+                      params.sessionId,
+                      session,
+                      pendingExitPlanContextReset,
+                    );
+                    return;
+                  }
                   if (pendingExitPlanContextReset) {
                     session.pendingExitPlanContextReset = undefined;
                     this.logger.error(
@@ -9897,6 +9930,20 @@ export class ClaudeAcpAgent {
     return this.foregroundWork.get(sessionId)?.owner === AUTONOMOUS_CYCLE;
   }
 
+  /** The ACP turn that owns a root request of the session now, if any. A
+   *  model cycle that Claude Code started on its own owns no turn. A turn that
+   *  took a cycle over owns it. A queued turn owns the request too, because
+   *  Claude Code can ask for a queued prompt before the consumer reaches its
+   *  echo (see `recordForegroundToolCall`). The ExitPlanMode request and the
+   *  result of its interruption use this one rule, so an offered
+   *  clear-context option always has a turn to continue. */
+  private requestOwnerTurn(sessionId: string, session: Session): Turn | undefined {
+    if (this.runsAutonomousCycle(sessionId)) return undefined;
+    const active = session.activeTurn;
+    if (active && !active.settled) return active;
+    return session.turnQueue?.find((queued) => !queued.settled);
+  }
+
   /** Forward a permission request to the client, wiring the tool call's
    *  `signal` through as a `cancellationSignal`. When the turn is cancelled
    *  while the client's prompt is still open the signal aborts, the SDK sends
@@ -10296,12 +10343,12 @@ export class ClaudeAcpAgent {
         defaultToNo,
         availableModes: this.sessionModes.availableModeIds(session.modes),
         prePlanMode: session.prePlanMode,
-        // A fresh context continues the active ACP turn. With
+        // A fresh context continues the ACP turn that owns the request. With
         // `backgroundSubagents` a followup cycle can ask out of a turn, and
         // then there is no turn to continue.
         allowContextReset:
           !this.endsTurnsWithLiveSubagents() ||
-          (session.activeTurn != null && !session.activeTurn.settled),
+          this.requestOwnerTurn(sessionId, session) !== undefined,
         contextUsedPercent:
           session.contextUsedTokens === undefined || session.contextWindowSize <= 0
             ? undefined
