@@ -12077,6 +12077,56 @@ describe("stop reason propagation", () => {
     expect((err as { data: unknown }).data).toEqual({ errorKind: "rate_limit" });
   });
 
+  it.each(
+    [false, true].flatMap((typedFailures) =>
+      [undefined, "authentication_failed" as const].map((staleError) => ({
+        typedFailures,
+        staleError,
+      })),
+    ),
+  )(
+    "preserves a usage-limit failure after compaction (typed: $typedFailures, stale error: $staleError)",
+    async ({ typedFailures, staleError }) => {
+      const agent = createMockAgent();
+      if (typedFailures) await initializeClient(agent, airSessionFailureCapabilities);
+      const staleFrame = createAssistantError(staleError, "stale compaction output");
+      staleFrame.message.model = "<synthetic>";
+      injectSession(agent, [
+        {
+          type: "system",
+          subtype: "status",
+          status: null,
+          compact_result: "success",
+          uuid: "compact-completed",
+          session_id: "test-session",
+        },
+        createUsageLimitAssistantError(),
+        staleFrame,
+        createResultMessage({
+          subtype: "success",
+          stop_reason: "end_turn",
+          is_error: true,
+          result: "private provider detail",
+        }),
+      ]);
+
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "test" }],
+      });
+      if (typedFailures) {
+        expect(sessionFailureFromResponse(await prompt)).toMatchObject({
+          category: "limit",
+          actions: [],
+          title:
+            "You've hit your individual spend limit · run /usage-credits to ask your admin for a higher limit",
+        });
+      } else {
+        await expect(prompt).rejects.toMatchObject({ data: { errorKind: "rate_limit" } });
+      }
+    },
+  );
+
   it("omits errorKind data when no SDKAssistantMessage.error was observed", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
