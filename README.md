@@ -46,7 +46,9 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   unless a cancel withdrew it: the child is stopping then), and `idle` when its work ends, with
   `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the `error`
   stop reason and the SDK's error text as its `error`. The child keeps its session for every
-  delegation to it.
+  delegation to it. The announce carries `_meta.claudeCode.model`, the model the Agent or Task
+  call asked for, and `_meta.claudeCode.background` for a child the parent's turn does not wait
+  for, each only when known.
 - Session messages replace the Agent or Task call that launches the child, which its parent is
   not shown:
   - The launch's prompt is a `session_message` in both transcripts: the parent's outgoing view and

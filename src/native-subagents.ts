@@ -27,6 +27,19 @@ export type NativeSubagent = {
   /** The RFD form: the child's purpose, `subagent_update.description`. */
   description?: string;
   /**
+   * The model the Agent/Task call asked for (`model` in its input), sent as
+   * `_meta.claudeCode.model` on the announce. Absent when the call named
+   * none: the child then runs on the model its definition or the session
+   * picks, which the adapter does not know here.
+   */
+  model?: string;
+  /**
+   * The Agent/Task call ran the child in the background
+   * (`run_in_background`), sent as `_meta.claudeCode.background` on the
+   * announce: the parent's turn does not wait for it.
+   */
+  background?: boolean;
+  /**
    * The RFD form: the work state the client holds. The child is reusable, so
    * `idle` is not terminal. AIR's draft uses {@link terminalState} instead.
    */
@@ -90,6 +103,9 @@ type SubagentIdentity = {
   description?: string;
   prompt?: string;
   subagentType?: string;
+  model?: string;
+  /** Only ever `true`: a launch that is not in the background says nothing. */
+  background?: true;
 };
 
 /** An agent of the session's subagent history, as the runtime restores it. */
@@ -416,6 +432,8 @@ export class NativeSubagentRuntime {
           identity?.subagentType ?? task.subagentType,
           identity?.description ?? task.description,
         ),
+        ...(identity?.model ? { model: identity.model } : {}),
+        ...(identity?.background ? { background: true } : {}),
       },
       !!knownParentSessionId || !task.toolUseId,
       deliver,
@@ -1242,6 +1260,8 @@ export class NativeSubagentRuntime {
       | "title"
       | "role"
       | "description"
+      | "model"
+      | "background"
     >,
     announce: boolean,
     deliver: Publish,
@@ -1328,6 +1348,7 @@ export async function announceNativeSubagent(
           ...(child.description ? { description: child.description } : {}),
           capabilities: { cancel: {} },
           state: { state: "running" },
+          ...announceMeta(child),
         },
       });
       child.announced = true;
@@ -1353,6 +1374,7 @@ export async function announceNativeSubagent(
         task: child.task,
         ...promptField(child.prompt),
         capabilities: {},
+        ...announceMeta(child),
       },
     });
     child.announced = true;
@@ -1532,6 +1554,23 @@ function replyContent(
       ? [{ type: "text" as const, text: item.content.text }]
       : [],
   );
+}
+
+/**
+ * What the announce says about the child beyond the protocol's fields, under
+ * the adapter's `_meta.claudeCode` key as on tool calls: the model the launch
+ * asked for and whether it runs in the background, each only when known. The
+ * protocol has no field for either, in `subagent_spawned` or the RFD's
+ * `subagent_update` (#1172).
+ */
+function announceMeta(child: NativeSubagent): {
+  _meta?: { claudeCode: { model?: string; background?: boolean } };
+} {
+  const claudeCode = {
+    ...(child.model ? { model: child.model } : {}),
+    ...(child.background ? { background: true } : {}),
+  };
+  return Object.keys(claudeCode).length > 0 ? { _meta: { claudeCode } } : {};
 }
 
 /** Whether an Agent/Task call's input runs its child in the background. */
@@ -1814,6 +1853,8 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
     description: nonBlankString(value.description),
     prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
+    model: nonBlankString(value.model),
+    ...(isBackgroundLaunch(input) ? { background: true as const } : {}),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
 }
@@ -1827,6 +1868,8 @@ function mergeSubagentIdentity(
     description: next.description ?? previous?.description,
     prompt: next.prompt ?? previous?.prompt,
     subagentType: next.subagentType ?? previous?.subagentType,
+    model: next.model ?? previous?.model,
+    ...(next.background || previous?.background ? { background: true as const } : {}),
   };
 }
 
@@ -1847,6 +1890,8 @@ function applySubagentIdentity(
     child.task = subagentDescription(identity.prompt, identity.description);
   }
   child.prompt ??= identity.prompt;
+  child.model = identity.model ?? child.model;
+  if (identity.background) child.background = true;
   const labels = rfdLabels(
     identity.name,
     identity.subagentType ?? child.role,

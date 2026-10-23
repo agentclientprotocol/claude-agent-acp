@@ -57,7 +57,7 @@ A client that does not declare `_meta.jetbrains.air` is not AIR. Zed is such a c
 It gets the same information in the same fields as from the upstream adapter:
 
 - the standard ACP fields with the upstream values, and the [Zed conventions](#zed-conventions);
-- the upstream `_meta` keys: `claudeCode.toolName`, `claudeCode.parentToolUseId`, the full `claudeCode.toolResponse`, `claudeCode.promptQueueing`, and the `_claude/*` keys;
+- the upstream `_meta` keys: `claudeCode.toolName`, `claudeCode.parentToolUseId`, the full `claudeCode.toolResponse`, `claudeCode.promptQueueing`, `claudeCode.model` and `claudeCode.background` on a subagent's announce (the model its Agent or Task call asked for, and that it runs in the background, each only when known), and the `_claude/*` keys;
 - the keys of other teams: `steering`, `quota`, `authStatus`, and `gateway`.
 
 It gets no key that exists only for AIR.
