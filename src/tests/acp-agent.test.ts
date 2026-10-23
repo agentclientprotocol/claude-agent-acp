@@ -13795,6 +13795,31 @@ describe("session/delete", () => {
     );
   });
 
+  it.each([
+    "Invalid sessionId permissions unavailable",
+    "Invalid sessionId: another-session",
+    `Invalid sessionId: ${SESSION_1}`,
+    `Session ${SESSION_1} not found in storage index`,
+    `Session ${SESSION_1} not found in any project directory: permission denied`,
+    "Session another-session not found in project directory for /tmp",
+  ])("propagates a similar but unrelated SDK error: %s", async (message) => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error(message));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).rejects.toThrow(message);
+  });
+
+  it.each([
+    `Session ${SESSION_1} not found in project directory for /tmp`,
+    `Session ${SESSION_1} not found in any project directory`,
+  ])("succeeds for the SDK's missing transcript error: %s", async (message) => {
+    const agent = createMockAgent();
+    vi.mocked(deleteSession).mockRejectedValueOnce(new Error(message));
+
+    await expect(agent.deleteSession({ sessionId: SESSION_1 })).resolves.toEqual({});
+    expect(deleteSession).toHaveBeenCalledWith(SESSION_1);
+  });
+
   it("does not affect other sessions when deleting one", async () => {
     const agent = createMockAgent();
     injectSession(agent, SESSION_1);
