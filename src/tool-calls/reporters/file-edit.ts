@@ -97,21 +97,22 @@ export function normalizeWriteInput(input: unknown): NormalizedWriteInput | unde
 export class EditReporter implements ToolReporter {
   toolUse(input: unknown, { cwd, capabilities }: ToolUseContext): ToolUseFacts {
     const edit = input as FileEditInput | undefined;
-    const displayPath = edit?.file_path ? toDisplayPath(edit.file_path, cwd) : undefined;
+    const filePath = typeof edit?.file_path === "string" ? edit.file_path : undefined;
+    const displayPath = filePath ? toDisplayPath(filePath, cwd) : undefined;
     const facts: ToolUseFacts = {
       title: displayPath ? `Edit ${displayPath}` : "Edit",
       kind: "edit",
-      locations: edit?.file_path ? [{ path: edit.file_path }] : [],
+      locations: filePath ? [{ path: filePath }] : [],
     };
     // The standard diff, also for a client that negotiated patches: the input
     // holds a snippet, not the file, so a patch would need line numbers that
     // the adapter does not know here. A v2 diff cannot hold a snippet, so a v2
     // client gets the patch from the PostToolUse hook alone.
-    if (edit?.file_path && (edit.old_string || edit.new_string) && !capabilities.v2) {
+    if (filePath && (edit?.old_string || edit?.new_string) && !capabilities.v2) {
       facts.change = [
         {
           type: "diff",
-          path: edit.file_path,
+          path: filePath,
           oldText: edit.old_string || null,
           newText: edit.new_string ?? "",
         },

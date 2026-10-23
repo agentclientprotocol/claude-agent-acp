@@ -18,17 +18,18 @@ import type {
 export class ReadReporter implements ToolReporter {
   toolUse(input: unknown, { cwd }: ToolUseContext): ToolUseFacts {
     const read = input as FileReadInput | undefined;
+    const filePath = typeof read?.file_path === "string" ? read.file_path : undefined;
     let limit = "";
     if (read?.limit && read.limit > 0) {
       limit = " (" + (read.offset ?? 1) + " - " + ((read.offset ?? 1) + read.limit - 1) + ")";
     } else if (read?.offset) {
       limit = " (from line " + read.offset + ")";
     }
-    const displayPath = read?.file_path ? toDisplayPath(read.file_path, cwd) : "File";
+    const displayPath = filePath ? toDisplayPath(filePath, cwd) : "File";
     return {
       title: "Read " + displayPath + limit,
       kind: "read",
-      locations: read?.file_path ? [{ path: read.file_path, line: read.offset ?? 1 }] : [],
+      locations: filePath ? [{ path: filePath, line: read?.offset ?? 1 }] : [],
     };
   }
 
