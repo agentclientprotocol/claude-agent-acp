@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.95.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.94.0...v0.95.0) (2026-10-23)
+
+
+### Features
+
+* end a turn at its result for AIR clients with backgroundSubagents ([#1262](https://github.com/agentclientprotocol/claude-agent-acp/issues/1262)) ([9b3a5c8](https://github.com/agentclientprotocol/claude-agent-acp/commit/9b3a5c891c75e78b985adb31f4e4b59a16ad2ebc))
+* report read-only subagent configuration ([#1417](https://github.com/agentclientprotocol/claude-agent-acp/issues/1417)) ([6ab670b](https://github.com/agentclientprotocol/claude-agent-acp/commit/6ab670baaefb30aaac2606d8ee6524e08243e5b5))
+* report RFD delegations as linked session messages ([#1405](https://github.com/agentclientprotocol/claude-agent-acp/issues/1405)) ([59e292e](https://github.com/agentclientprotocol/claude-agent-acp/commit/59e292e29f773cc6f03c0999993cbe8a2d97a7e3))
+* serve experimental ACP v2 ([#1400](https://github.com/agentclientprotocol/claude-agent-acp/issues/1400)) ([4d378f9](https://github.com/agentclientprotocol/claude-agent-acp/commit/4d378f93f36d37ba5ef64af87b617706dd9c6e82))
+* show messages typed in other Remote Control clients ([#1371](https://github.com/agentclientprotocol/claude-agent-acp/issues/1371)) ([5b11f47](https://github.com/agentclientprotocol/claude-agent-acp/commit/5b11f470b1c05b114c876b3b6e5b4df9441b1087))
+* update to Claude Code 2.1.309 ([#1413](https://github.com/agentclientprotocol/claude-agent-acp/issues/1413)) ([a1521b6](https://github.com/agentclientprotocol/claude-agent-acp/commit/a1521b6196c58dbc5065f9c19fc9694273d3d435))
+
+
+### Bug Fixes
+
+* bump fast-uri from 3.1.8 to 3.1.9 ([#1410](https://github.com/agentclientprotocol/claude-agent-acp/issues/1410)) ([0fe22ae](https://github.com/agentclientprotocol/claude-agent-acp/commit/0fe22ae5a172b228a574665bb7136b900746041d))
+* bump postcss from 8.5.30 to 8.5.31 in the minor group ([#1403](https://github.com/agentclientprotocol/claude-agent-acp/issues/1403)) ([ecaa2c9](https://github.com/agentclientprotocol/claude-agent-acp/commit/ecaa2c935b9f2b63c1846ca17c6c3398390fb0ef))
+* bump the minor group across 1 directory with 2 updates ([#1416](https://github.com/agentclientprotocol/claude-agent-acp/issues/1416)) ([f7d6030](https://github.com/agentclientprotocol/claude-agent-acp/commit/f7d6030c04af23171058772480d55f6d2aee5298))
+* IJAI-3744 keep a session running while its background tasks are open ([#1399](https://github.com/agentclientprotocol/claude-agent-acp/issues/1399)) ([e9f986b](https://github.com/agentclientprotocol/claude-agent-acp/commit/e9f986b8a941f5c1789078a39e474f247bd0db60))
+* publish the session title as soon as the CLI has it ([#1406](https://github.com/agentclientprotocol/claude-agent-acp/issues/1406)) ([50cd76e](https://github.com/agentclientprotocol/claude-agent-acp/commit/50cd76e78dd9bb1ab0e4850a8d95431175ab5947))
+* publish turns that Claude Code starts after end_turn as an async task in v1 ([#1390](https://github.com/agentclientprotocol/claude-agent-acp/issues/1390)) ([a1d0eee](https://github.com/agentclientprotocol/claude-agent-acp/commit/a1d0eeeaad3d67a0765f4b89e3d81c1af6ca0dbb))
+
 ## [0.94.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.93.0...v0.94.0) (2026-10-19)
 
 
