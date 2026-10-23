@@ -458,18 +458,25 @@ export class AsyncTaskRuntime {
    * example to answer a task notification. ACP v1 has no session state, and
    * the client already got the stop reason of its last prompt, so this task is
    * the only sign that the agent works. The tool calls of the turn are in the
-   * transcript already, so the task is not shown there. Does nothing while
-   * such a task is open.
+   * transcript already, so the task is not shown there.
+   *
+   * [cause] names what started the turn when Claude Code says so, for example
+   * "A scheduled wakeup fired." It replaces the description of a task that is
+   * already open; without it, an open task is left as it is.
    */
-  async autonomousTurnStarted(): Promise<void> {
-    if (!this.enabled || this.autonomousTurn) return;
+  async autonomousTurnStarted(cause?: string): Promise<void> {
+    if (!this.enabled) return;
+    if (this.autonomousTurn) {
+      if (cause) await this.publishProgress(this.autonomousTurn, { description: cause });
+      return;
+    }
     const task = this.task(`autonomous-turn-${randomUUID()}`);
     task.autonomousTurn = true;
     task.startedObserved = true;
     task.name = "Claude is working";
     task.taskType = "turn";
     task.description =
-      this.lastNotificationSummary ?? "Claude Code started a turn without a prompt.";
+      cause ?? this.lastNotificationSummary ?? "Claude Code started a turn without a prompt.";
     task.showInTranscript = false;
     this.lastNotificationSummary = undefined;
     this.autonomousTurn = task;

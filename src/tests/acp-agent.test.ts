@@ -24129,6 +24129,93 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       ]);
     });
 
+    describe("started by a scheduler fire", () => {
+      const lifecycleStarted = (fire: { wakeup_source?: string; scheduled_for?: number }) =>
+        ({
+          type: "command_lifecycle",
+          command_uuid: "scheduler-fire",
+          state: "started",
+          ...fire,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        }) as any;
+
+      const autonomousTurn = async (fireFrames: (afterRunning: boolean) => any[]) => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        let wake = () => {};
+        const woken = new Promise<void>((resolve) => (wake = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            await woken;
+            yield* fireFrames(false);
+            yield running();
+            yield* fireFrames(true);
+            yield assistantText("woke up");
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        wake();
+        await agent.sessions["test-session"]?.consumer;
+        return asyncTaskUpdates()
+          .filter((update) => update.sessionUpdate !== "async_task_state_update")
+          .map(({ sessionUpdate, description }) => ({ sessionUpdate, description }));
+      };
+
+      it("names a ScheduleWakeup fire that arrives before the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? []
+            : [
+                lifecycleStarted({
+                  wakeup_source: "loop_wakeup",
+                  scheduled_for: 1_790_000_000_000,
+                }),
+              ],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "A scheduled wakeup fired (set for 2026-09-21T14:13:20.000Z).",
+          },
+        ]);
+      });
+
+      it("renames the open task for a scheduled task fire after the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning ? [lifecycleStarted({ wakeup_source: "schedule_wakeup" })] : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+          { sessionUpdate: "async_task_progress", description: "A scheduled task fired." },
+        ]);
+      });
+
+      it("leaves the task as before for a started frame without a known wakeup source", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? [lifecycleStarted({}), lifecycleStarted({ wakeup_source: "future_source" })]
+            : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+        ]);
+      });
+    });
+
     it("ends the turn task when a prompt is folded into the turn", async () => {
       const { agent, updates, asyncTaskUpdates } = await airAgent();
       let wake = () => {};

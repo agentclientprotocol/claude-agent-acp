@@ -5875,9 +5875,28 @@ export class ClaudeAcpAgent {
         // turn activation and settlement stay driven by echoes/results/idle.
         // (Raw-mode emission above still forwards these frames.)
         if ((message as { type: string }).type === "command_lifecycle") {
-          const frame = message as unknown as { command_uuid: string; state: string };
+          const frame = message as unknown as {
+            command_uuid: string;
+            state: string;
+            wakeup_source?: string;
+            scheduled_for?: number;
+          };
           switch (frame.state) {
             case "started": {
+              // CLIs 2.1.307+ (capability lifecycle_wakeup_source_v1) mark a
+              // command that a scheduler fire started. With no prompt of ours
+              // open, it starts an autonomous turn: name the fire as its cause,
+              // whether `session_state_changed` already opened the task or not.
+              const cause = scheduledFireCause(frame);
+              if (
+                cause &&
+                asyncTasks.enabled &&
+                !session.cancelled &&
+                !session.activeTurn &&
+                !firstUnsettledQueuedTurn()
+              ) {
+                await asyncTasks.autonomousTurnStarted(cause);
+              }
               // Remember dispatch on the live turn so a cancel() that orphans
               // it seeds the right state (see Turn.commandStarted)...
               const queued = findUnsettledTurn(frame.command_uuid);
@@ -13969,5 +13988,31 @@ function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentMo
     // handler caches under that spelling too, for seed-time reads that fall
     // back to a bare id (rows without `resolvedModel`).
     return { key: bestKey, usage: modelUsage[bestKey] };
+  }
+}
+
+/**
+ * What a `command_lifecycle` "started" frame says started the command: a
+ * ScheduleWakeup (dynamic `/loop`) wakeup, with the time it was set for in
+ * epoch milliseconds, or another scheduled task such as a cron job. Undefined
+ * for any other command, and for a value this adapter does not know. The time
+ * is given in UTC because the agent does not know the client's time zone.
+ */
+function scheduledFireCause(frame: {
+  wakeup_source?: string;
+  scheduled_for?: number;
+}): string | undefined {
+  switch (frame.wakeup_source) {
+    case "loop_wakeup": {
+      const scheduledFor =
+        typeof frame.scheduled_for === "number" ? new Date(frame.scheduled_for) : undefined;
+      return scheduledFor && !Number.isNaN(scheduledFor.getTime())
+        ? `A scheduled wakeup fired (set for ${scheduledFor.toISOString()}).`
+        : "A scheduled wakeup fired.";
+    }
+    case "schedule_wakeup":
+      return "A scheduled task fired.";
+    default:
+      return undefined;
   }
 }
