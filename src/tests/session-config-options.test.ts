@@ -324,14 +324,17 @@ describe("session config options", () => {
       expect(modelOption?.currentValue).toBe("claude-sonnet-4-6");
     });
 
-    it("throws for completely invalid model value", async () => {
-      await expect(
-        agent.setSessionConfigOption({
-          sessionId: SESSION_ID,
-          configId: "model",
-          value: "gpt-4",
-        }),
-      ).rejects.toThrow("Invalid value for config option model: gpt-4");
+    it("passes through out-of-picker model IDs to the SDK", async () => {
+      const response = await agent.setSessionConfigOption({
+        sessionId: SESSION_ID,
+        configId: "model",
+        value: "claude-opus-4-8",
+      });
+
+      expect(setModelSpy).toHaveBeenCalledWith("claude-opus-4-8");
+      expect(response.configOptions.find((o) => o.id === "model")?.currentValue).toBe(
+        "claude-opus-4-8",
+      );
     });
 
     it("returns full configOptions in the response", async () => {
