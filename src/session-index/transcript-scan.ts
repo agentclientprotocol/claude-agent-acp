@@ -334,6 +334,36 @@ const MESSAGE_MARKERS = [
   '"type": "assistant"',
 ];
 
+/** Whether `head` or `tail` holds a user or an assistant message. */
+export function hasMessageMarkers({ head, tail }: Pick<HeadTail, "head" | "tail">): boolean {
+  return MESSAGE_MARKERS.some((marker) => head.includes(marker) || tail.includes(marker));
+}
+
+/**
+ * Whether the transcript at `filePath` holds a user or an assistant message.
+ * A file with none is a metadata-only stub: what Claude Code leaves when it
+ * writes a session's title and bookkeeping after the session was deleted,
+ * or when `persistSession` is off. Such a file lists through the SDK with
+ * a title, but cannot be resumed. One that cannot be read (gone, or
+ * elsewhere than expected) counts as having messages: listed, not lost.
+ */
+export async function transcriptHasMessages(filePath: string): Promise<boolean> {
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(filePath, "r");
+  } catch {
+    return true;
+  }
+  try {
+    const { size } = await handle.stat();
+    return hasMessageMarkers(await readHeadTailOf(handle, size));
+  } catch {
+    return true;
+  } finally {
+    await handle.close();
+  }
+}
+
 /** System records that the CLI writes when a turn ends. */
 const TURN_END_SYSTEM_SUBTYPES = new Set(["stop_hook_summary", "turn_duration"]);
 
@@ -418,7 +448,7 @@ export function scanTranscript(
   options: { wide?: boolean; known?: { model?: string; tailCwd?: string } } = {},
 ): TranscriptFacts {
   const facts: TranscriptFacts = {
-    hasMessages: MESSAGE_MARKERS.some((marker) => head.includes(marker) || tail.includes(marker)),
+    hasMessages: hasMessageMarkers({ head, tail }),
   };
   const headCwd = CWD_PATTERN.exec(head)?.[1];
   if (headCwd !== undefined) facts.headCwd = decodeJsonString(headCwd);
