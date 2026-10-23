@@ -3950,6 +3950,7 @@ export class ClaudeAcpAgent {
     (session.sentUserUuids ??= new Set()).add(promptUuid);
     session.input.push(userMessage);
     this.ensureConsumer(session, params.sessionId);
+    session.titles.onPromptQueued(session, params.prompt);
     // The prompt is queued, so its turn goes ahead even if the client misses
     // the goal it sets; the turn's events report the outcome.
     await this.publishGoalFromPrompt(params.sessionId, firstText, promptUuid).catch((error) =>
