@@ -3828,7 +3828,8 @@ describe("subagent transcript replay", () => {
     it("replays a fork child without the launching message and boilerplate it inherited", async () => {
       // A `subagent_type: "fork"` transcript starts with a copy of the
       // launching message (same API message id) and a directive message with
-      // a "Fork started" result for each of its tool_uses.
+      // a placeholder result for each of its tool_uses, worded as Claude Code
+      // 2.1.307+ writes them.
       const launching = [
         { type: "text", text: "I'll fork a worker." },
         toolUse("toolu_fork", "Agent", {
@@ -3841,7 +3842,15 @@ describe("subagent transcript replay", () => {
       const forkStarted = (id: string) => ({
         type: "tool_result",
         tool_use_id: id,
-        content: [{ type: "text", text: "Fork started — processing in background" }],
+        content: [
+          {
+            type: "text",
+            text:
+              id === "toolu_fork"
+                ? "Fork started — that fork is you."
+                : "This is the parent's call, not yours. It may not have run yet, and its result goes to the parent.",
+          },
+        ],
       });
       const trace = await replayRfd(
         [
