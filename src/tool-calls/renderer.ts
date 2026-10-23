@@ -236,13 +236,18 @@ export class AcpToolCallRenderer {
    */
   toolCall(
     toolUse: ToolUse,
-    options: { cwd?: string; inputComplete?: boolean; previewContent?: ToolCallContent[] } = {},
+    options: {
+      cwd?: string;
+      additionalDirectories?: readonly string[];
+      inputComplete?: boolean;
+      previewContent?: ToolCallContent[];
+    } = {},
   ): ToolCallUpdate {
     const facts = this.facts(toolUse, options.cwd);
     const isMcp = toolUse.name.startsWith("mcp__");
     return {
       _meta: {
-        ...this.toolUseMeta(toolUse, options.cwd),
+        ...this.toolUseMeta(toolUse, options.cwd, options.additionalDirectories),
         ...(this.hasTerminal(facts) ? { terminal_info: { terminal_id: toolUse.id } } : {}),
         // Only AIR gets the MCP flag. The upstream adapter does not send it.
         ...(isMcp && this.capabilities.air.client ? { is_mcp_tool_call: true } : {}),
@@ -264,10 +269,14 @@ export class AcpToolCallRenderer {
   }
 
   /** The report of a tool call whose input is complete now. */
-  refinement(toolUse: ToolUse, cwd?: string): ToolCallUpdate {
+  refinement(
+    toolUse: ToolUse,
+    cwd?: string,
+    additionalDirectories?: readonly string[],
+  ): ToolCallUpdate {
     const facts = this.facts(toolUse, cwd);
     return {
-      _meta: this.toolUseMeta(toolUse, cwd),
+      _meta: this.toolUseMeta(toolUse, cwd, additionalDirectories),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       rawInput: this.rawInput(facts, toolUse.input),
@@ -285,10 +294,15 @@ export class AcpToolCallRenderer {
    * invalid. AIR gets no `rawInput`, which goes out once it is complete. Every
    * other client gets the partial input as `rawInput`.
    */
-  partialRefinement(toolUse: Pick<ToolUse, "id" | "name">, input: unknown, cwd?: string) {
+  partialRefinement(
+    toolUse: Pick<ToolUse, "id" | "name">,
+    input: unknown,
+    cwd?: string,
+    additionalDirectories?: readonly string[],
+  ) {
     const facts = this.facts({ name: toolUse.name, input }, cwd);
     return {
-      _meta: this.toolUseMeta({ name: toolUse.name, input }, cwd),
+      _meta: this.toolUseMeta({ name: toolUse.name, input }, cwd, additionalDirectories),
       toolCallId: toolUse.id,
       sessionUpdate: "tool_call_update",
       ...(this.capabilities.air.client ? {} : { rawInput: input }),
@@ -760,9 +774,14 @@ export class AcpToolCallRenderer {
    * The `_meta` of a tool use report: the tool name, and for AIR the tool
    * flags under `_meta.jetbrains.air`. A shell description stays out of the
    * standard `title`, which clients use as the command preview. Every other
-   * client gets only the upstream tool name.
+   * client gets only the upstream tool name. [additionalDirectories] are the
+   * session's `--add-dir` roots, where a Skill tool's SKILL.md can also be.
    */
-  toolUseMeta(toolUse: { name: string; input?: unknown }, cwd?: string): ToolUpdateMeta {
+  toolUseMeta(
+    toolUse: { name: string; input?: unknown },
+    cwd?: string,
+    additionalDirectories?: readonly string[],
+  ): ToolUpdateMeta {
     const input =
       toolUse.input !== null && typeof toolUse.input === "object"
         ? (toolUse.input as Record<string, unknown>)
@@ -779,7 +798,7 @@ export class AcpToolCallRenderer {
     if (description) meta = withAirMeta(meta, AIR_COMMAND_TITLE_KEY, description);
     if (subagent) meta = withAirMeta(meta, AIR_SUBAGENT_KEY, true);
     if (skillName) {
-      const skillPath = resolveSkillPath(skillName, cwd);
+      const skillPath = resolveSkillPath(skillName, cwd, undefined, additionalDirectories);
       meta = withAirMeta(meta, AIR_SKILL_KEY, {
         name: skillName,
         ...(skillPath ? { path: skillPath } : {}),

@@ -4575,7 +4575,7 @@ describe("Skill tool rendering", () => {
   });
 
   describe("_meta.jetbrains.air.skill.path", () => {
-    const skillMeta = (skill: string, cwd?: string) =>
+    const skillMeta = (skill: string, cwd?: string, additionalDirectories?: string[]) =>
       (
         toAcpNotifications(
           [{ type: "tool_use", id: "toolu_skill_path", name: "Skill", input: { skill } }] as any,
@@ -4584,7 +4584,7 @@ describe("Skill tool rendering", () => {
           {},
           {} as AcpClient,
           mockLogger,
-          { clientCapabilities: AIR_CLIENT, ...(cwd ? { cwd } : {}) },
+          { clientCapabilities: AIR_CLIENT, ...(cwd ? { cwd } : {}), additionalDirectories },
         )[0]?.update as any
       )?._meta?.jetbrains?.air?.skill;
 
@@ -4657,6 +4657,53 @@ describe("Skill tool rendering", () => {
     it("resolves a plugin skill spelled plugin:name", () => {
       const file = writeSkill(".claude/plugins/reviewer/skills/audit");
       expect(skillMeta("reviewer:audit", root).path).toBe(file);
+    });
+
+    it("never resolves a prefix:name skill to the unscoped skill of that name", () => {
+      // Claude Code 2.1.309 offers an --add-dir skill whose name is taken as `<folder>:<name>`.
+      writeSkill(".claude/skills/review");
+      writeSkill(".claude/skills/audit", "audit");
+      expect(skillMeta("repoB:review", root)).toEqual({ name: "repoB:review" });
+      expect(skillMeta("repoB:audit", root)).toEqual({ name: "repoB:audit" });
+      expect(skillMeta("review", root).path).toBe(
+        path.join(root, ".claude/skills/review/SKILL.md"),
+      );
+    });
+
+    describe("in an --add-dir root", () => {
+      const cwd = () => path.join(root, "w/repoA");
+
+      it("resolves <basename>:<name> to the root's skill and <name> to the cwd's", () => {
+        const own = writeSkill("w/repoA/.claude/skills/review");
+        const added = writeSkill("w/repoB/.claude/skills/review");
+        expect(skillMeta("repoB:review", cwd(), ["../repoB"]).path).toBe(added);
+        expect(skillMeta("review", cwd(), ["../repoB"]).path).toBe(own);
+      });
+
+      it("labels a root <parent>/<basename> when another root has its basename", () => {
+        writeSkill("w/one/app/.claude/skills/deploy");
+        const second = writeSkill("w/two/app/.claude/skills/deploy");
+        const roots = [path.join(root, "w/one/app"), path.join(root, "w/two/app")];
+        expect(skillMeta("two/app:deploy", cwd(), roots).path).toBe(second);
+        expect(skillMeta("app:deploy", cwd(), roots)).toEqual({ name: "app:deploy" });
+      });
+
+      it("resolves a skill of a .claude folder below the root by its path", () => {
+        const nested = writeSkill("w/repoB/tools/.claude/skills/lint");
+        expect(skillMeta("repoB/tools:lint", cwd(), ["../repoB"]).path).toBe(nested);
+      });
+
+      it("resolves a root's skill that no other skill names by its plain name", () => {
+        const added = writeSkill("w/repoB/.claude/skills/release");
+        expect(skillMeta("release", cwd(), ["../repoB"]).path).toBe(added);
+      });
+
+      it("never leaves the root for a scope with ..", () => {
+        writeSkill("w/outside/.claude/skills/review");
+        expect(skillMeta("repoB/../outside:review", cwd(), ["../repoB"])).toEqual({
+          name: "repoB/../outside:review",
+        });
+      });
     });
 
     it("omits the path when no known layout holds the skill", () => {

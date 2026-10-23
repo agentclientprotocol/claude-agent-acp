@@ -389,6 +389,28 @@ function escapesContainer(segment: string): boolean {
 }
 
 /**
+ * The folder whose `.claude/skills` holds the `<scope>:<name>` skill of an `--add-dir` root, as Claude Code
+ * 2.1.309+ spells it. The scope starts with the root's label: its basename, or `<parent>/<basename>` when
+ * another root has the same basename. A skill in a `.claude` folder below the root adds the path to that
+ * folder. With `/w/repoB` added, `repoB:review` is `/w/repoB/.claude/skills/review` and `repoB/tools:lint`
+ * is `/w/repoB/tools/.claude/skills/lint`.
+ */
+function addDirSkillBase(scope: string, addDirs: readonly string[]): string | undefined {
+  for (const dir of addDirs) {
+    const basename = path.basename(dir);
+    const parent = path.basename(path.dirname(dir));
+    const sharesBasename = addDirs.some(
+      (other) => other !== dir && path.basename(other) === basename,
+    );
+    const label = sharesBasename && parent !== "" ? `${parent}/${basename}` : basename;
+    if (label === "") continue;
+    if (scope === label) return dir;
+    if (scope.startsWith(`${label}/`)) return path.join(dir, scope.slice(label.length + 1));
+  }
+  return undefined;
+}
+
+/**
  * Absolute path of a skill's `SKILL.md`, or `undefined` when none of the known layouts holds one.
  *
  * The `Skill` tool reports only the skill's name, so the file has to be located by probing the layouts skills
@@ -404,11 +426,16 @@ function escapesContainer(segment: string): boolean {
  *
  * [scans] holds the container listings of one resolution pass. Pass the same cache for every command of one
  * list, and each container is listed once instead of once per command.
+ *
+ * [additionalDirectories] are the session's `--add-dir` roots, relative ones taken from [cwd]. Claude Code
+ * offers a skill of such a root by its plain name, or as `<label>:<name>` when another skill holds the name
+ * (see {@link addDirSkillBase}).
  */
 export function resolveSkillPath(
   skillName: string,
   cwd?: string,
   scans?: SkillScanCache,
+  additionalDirectories?: readonly string[],
 ): string | undefined {
   if (!cwd) {
     return undefined;
@@ -450,10 +477,21 @@ export function resolveSkillPath(
       containers.push(path.join(marketplaces, marketplace, "plugins", scope, "skills"));
     }
   };
+  const addDirs = (additionalDirectories ?? []).map((dir) => path.resolve(cwd, dir));
+  if (scope !== undefined) {
+    const base = addDirSkillBase(scope, addDirs);
+    if (base !== undefined) addContainers(base);
+  }
   addScopedContainers(cwd);
   addScopedContainers(os.homedir());
-  addContainers(cwd);
-  addContainers(os.homedir());
+  // A `<prefix>:<name>` command is never the unscoped `<name>` skill. Since Claude Code 2.1.309 an
+  // `--add-dir` skill whose name is taken is offered as `<folder>:<name>`, and `<cwd>/.claude/skills/<name>`
+  // is then the other skill that holds the name.
+  if (scope === undefined) {
+    addContainers(cwd);
+    addContainers(os.homedir());
+    for (const dir of addDirs) addContainers(dir);
+  }
   for (const container of containers) {
     const candidate = path.join(container, name, "SKILL.md");
     let stats: Stats;

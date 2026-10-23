@@ -973,7 +973,12 @@ type Turn = {
  *  while the CLI starts. The session record then takes the same objects. */
 type ReplayState = Pick<
   Session,
-  "cwd" | "taskState" | "forwardSubagentText" | "messageIdToUuid" | "sessionFailureState"
+  | "cwd"
+  | "additionalDirectories"
+  | "taskState"
+  | "forwardSubagentText"
+  | "messageIdToUuid"
+  | "sessionFailureState"
 >;
 
 /** A replay that runs before its session record exists. */
@@ -1118,6 +1123,10 @@ export type Session = {
    *  the command name. A `commands_changed` clears it, because the skill
    *  files can have changed then. */
   skillPaths?: Map<string, string | undefined>;
+  /** The `--add-dir` roots the SDK got: `_meta.claudeCode.options` ones, then
+   *  the ACP `additionalDirectories`. Skill commands of these roots resolve to
+   *  their SKILL.md for AIR clients. */
+  additionalDirectories?: string[];
   /** Serialized `system`/init `plugin_errors` last logged, so the per-turn
    *  init re-emit logs a plugin load failure once, not every turn. */
   loggedPluginErrors?: string;
@@ -3054,6 +3063,7 @@ export class ClaudeAcpAgent {
     const pending: PendingReplay = {
       state: {
         cwd: params.cwd,
+        additionalDirectories: sessionAdditionalDirectories(params),
         taskState: new Map(),
         forwardSubagentText: this.forwardsSubagentText(params._meta),
         messageIdToUuid: new Map(),
@@ -5392,6 +5402,7 @@ export class ClaudeAcpAgent {
           toolCallCapabilities: this.toolCallCapabilities,
           parentToolUseId: message.parent_tool_use_id,
           cwd: session.cwd,
+          additionalDirectories: session.additionalDirectories,
           taskState: session.taskState,
           emittedToolCalls: session.emittedToolCalls,
           toolCallFields: toolCallFieldsOf(session),
@@ -6346,7 +6357,7 @@ export class ClaudeAcpAgent {
                     availableCommands: getAvailableSlashCommands(
                       message.commands,
                       session.terminalSlashCommands,
-                      this.toolCallCapabilities.air.client ? session.cwd : undefined,
+                      this.toolCallCapabilities.air.client ? session : undefined,
                       session.skillPaths,
                       session.query,
                     ),
@@ -9586,6 +9597,7 @@ export class ClaudeAcpAgent {
           clientCapabilities: this.clientCapabilities,
           toolCallCapabilities: this.toolCallCapabilities,
           cwd: replayState()?.cwd,
+          additionalDirectories: replayState()?.additionalDirectories,
           taskState: replayState()?.taskState,
           messageId: replayMessageId,
           parentToolUseId,
@@ -10071,7 +10083,7 @@ export class ClaudeAcpAgent {
     (session.eagerToolCallSessions ??= new Map()).set(toolCallId, notificationSessionId);
     const update = new AcpToolCallRenderer(this.toolCallCapabilities).toolCall(
       { id: toolCallId, name: toolName, input: toolInput },
-      { cwd: session.cwd, previewContent },
+      { cwd: session.cwd, additionalDirectories: session.additionalDirectories, previewContent },
     );
     if (parentToolUseId) stampParentToolUseId(update, parentToolUseId);
     toolCallFieldsOf(session).apply(update);
@@ -10580,7 +10592,7 @@ export class ClaudeAcpAgent {
     return getAvailableSlashCommands(
       commands,
       session.terminalSlashCommands,
-      this.toolCallCapabilities.air.client ? session.cwd : undefined,
+      this.toolCallCapabilities.air.client ? session : undefined,
       (session.skillPaths ??= new Map()),
       session.query,
     );
@@ -11310,12 +11322,7 @@ export class ClaudeAcpAgent {
 
     // Resolve every workspace root once. The native checkpoint report uses
     // this same set for lexical path validation, and the SDK receives it below.
-    const acpAdditionalDirectories =
-      params.additionalDirectories ?? sessionMeta?.additionalRoots ?? [];
-    const additionalDirectories = [
-      ...(userProvidedOptions?.additionalDirectories ?? []),
-      ...acpAdditionalDirectories,
-    ];
+    const additionalDirectories = sessionAdditionalDirectories(params);
 
     const fileChangeReporter = supportsAgentFileChangeReport(this.clientCapabilities)
       ? createNativeFileChangeReporter({
@@ -11872,6 +11879,7 @@ export class ClaudeAcpAgent {
           settingsManager.getApiKeyHelper(configuredSettingsObject),
         )?.kind,
         fileChangeReporter,
+        additionalDirectories,
       };
       timing.phase("register");
       this.refreshContextWindowInBackground(sessionId, this.sessions[sessionId]);
@@ -12734,19 +12742,24 @@ function getAvailableSlashCommands(
   // the CLI's own terminal, which ACP clients aren't) — filtered alongside
   // the static list. Raw CLI names, matched before the MCP rename.
   terminalCommands?: readonly string[],
-  // The session cwd of an AIR client, or undefined for every other client.
-  // AIR gets the kind and the SKILL.md path of each skill command.
-  airSkillCwd?: string,
+  // The session cwd and `--add-dir` roots of an AIR client, or undefined for
+  // every other client. AIR gets the kind and the SKILL.md path of each skill
+  // command.
+  airSkillRoots?: Pick<Session, "cwd" | "additionalDirectories">,
   // The resolved SKILL.md paths of the session, keyed by the cwd and the name.
   skillPaths?: Map<string, string | undefined>,
   query?: Query,
 ): AvailableCommand[] {
   // The container listings of this one pass, so a list of a hundred commands lists each container once.
   const skillScans: SkillScanCache = new Map();
-  const skillPath = (name: string, cwd: string): string | undefined => {
+  const skillPath = (
+    name: string,
+    { cwd, additionalDirectories }: Pick<Session, "cwd" | "additionalDirectories">,
+  ): string | undefined => {
+    // A session's roots never change, so the cwd and the name are key enough.
     const key = `${cwd}\0${name}`;
     if (skillPaths?.has(key)) return skillPaths.get(key);
-    const resolved = resolveSkillPath(name, cwd, skillScans);
+    const resolved = resolveSkillPath(name, cwd, skillScans, additionalDirectories);
     skillPaths?.set(key, resolved);
     return resolved;
   };
@@ -12792,8 +12805,8 @@ function getAvailableSlashCommands(
         name = `mcp:${name.replace(" (MCP)", "")}`;
       }
       const skillMdPath =
-        airSkillCwd && !command.builtin && !mcpPrompt
-          ? skillPath(command.name, airSkillCwd)
+        airSkillRoots && !command.builtin && !mcpPrompt
+          ? skillPath(command.name, airSkillRoots)
           : undefined;
       return {
         name,
@@ -13129,6 +13142,8 @@ export function toAcpNotifications(
     toolCallCapabilities?: ToolCallClientCapabilities;
     parentToolUseId?: string | null;
     cwd?: string;
+    // The session's `--add-dir` roots, where a Skill tool's SKILL.md can also be.
+    additionalDirectories?: readonly string[];
     taskState?: TaskState;
     // Tracks tool_use ids already emitted as a `tool_call` so a permission
     // request (which emits the tool_call eagerly) and the streamed tool_use
@@ -13335,10 +13350,11 @@ export function toAcpNotifications(
             ? // Already surfaced (full assistant message after streaming, or a
               // permission request emitted it first): refine it with the
               // complete input.
-              renderer.refinement(toolUse, options?.cwd)
+              renderer.refinement(toolUse, options?.cwd, options?.additionalDirectories)
             : // First surface (streaming content_block_start or replay).
               renderer.toolCall(toolUse, {
                 cwd: options?.cwd,
+                additionalDirectories: options?.additionalDirectories,
                 inputComplete: options?.inputComplete,
               });
         }
@@ -13562,6 +13578,7 @@ export function streamEventToAcpNotifications(
     // See toAcpNotifications.
     toolCallCapabilities?: ToolCallClientCapabilities;
     cwd?: string;
+    additionalDirectories?: readonly string[];
     taskState?: TaskState;
     emittedToolCalls?: Set<string>;
     toolCallFields?: ToolCallFieldTracker;
@@ -13577,6 +13594,7 @@ export function streamEventToAcpNotifications(
     toolCallCapabilities: options?.toolCallCapabilities,
     parentToolUseId: message.parent_tool_use_id,
     cwd: options?.cwd,
+    additionalDirectories: options?.additionalDirectories,
     taskState: options?.taskState,
     emittedToolCalls: options?.emittedToolCalls,
     toolCallFields: options?.toolCallFields,
@@ -13643,6 +13661,7 @@ export function streamEventToAcpNotifications(
           streamedInput,
           input,
           options?.cwd,
+          options?.additionalDirectories,
         );
         if (message.parent_tool_use_id) stampParentToolUseId(update, message.parent_tool_use_id);
         applyMessageId(update, options?.messageId);
@@ -13972,4 +13991,20 @@ function getMatchingModelUsage(modelUsage: Record<string, ModelUsage>, currentMo
     // back to a bare id (rows without `resolvedModel`).
     return { key: bestKey, usage: modelUsage[bestKey] };
   }
+}
+
+/**
+ * The `--add-dir` roots of a session: the `_meta.claudeCode.options` ones,
+ * then the ACP `additionalDirectories`, or the legacy `_meta.additionalRoots`
+ * for clients that do not send the ACP field.
+ */
+function sessionAdditionalDirectories(params: {
+  additionalDirectories?: string[] | null;
+  _meta?: { [key: string]: unknown } | null;
+}): string[] {
+  const meta = params._meta as NewSessionMeta | undefined;
+  return [
+    ...(meta?.claudeCode?.options?.additionalDirectories ?? []),
+    ...(params.additionalDirectories ?? meta?.additionalRoots ?? []),
+  ];
 }

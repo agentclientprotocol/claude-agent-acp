@@ -12902,6 +12902,8 @@ describe("skill commands in available_commands_update", () => {
   async function advertisedCommands(
     clientCapabilities: Record<string, unknown>,
     change?: () => Promise<void>,
+    additionalDirectories?: string[],
+    extraCommands: Array<{ name: string; description: string; argumentHint: string }> = [],
   ) {
     const sessionUpdate = vi.fn(async () => {});
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
@@ -12934,6 +12936,7 @@ describe("skill commands in available_commands_update", () => {
           },
           { name: "missing", description: "No SKILL.md", argumentHint: "" },
           { name: "review (MCP)", description: "An MCP prompt", argumentHint: "" },
+          ...extraCommands,
         ],
       };
       yield commandsChanged;
@@ -12965,7 +12968,7 @@ describe("skill commands in available_commands_update", () => {
       };
       yield { type: "system", subtype: "session_state_changed", state: "idle" };
     }
-    injectGeneratorSession(agent, generator, { cwd });
+    injectGeneratorSession(agent, generator, { cwd, additionalDirectories });
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
 
@@ -12999,6 +13002,29 @@ describe("skill commands in available_commands_update", () => {
     expect(commands.find((c) => c.name === "missing")?._meta).toEqual({
       jetbrains: { air: { version: 1, kind: "skill", skillPath: missingPath } },
     });
+  });
+
+  it("resolves a skill of an --add-dir root, whose name another skill holds, as <basename>:<name>", async () => {
+    const addDir = path.join(cwd, "..", `${path.basename(cwd)}-repoB`);
+    const addDirSkill = path.join(addDir, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(addDirSkill), { recursive: true });
+    await writeFile(addDirSkill, "# review\n");
+    try {
+      const commands = await advertisedCommands(
+        AIR_CLIENT_CAPABILITIES,
+        undefined,
+        [addDir],
+        [{ name: `${path.basename(addDir)}:review`, description: "", argumentHint: "" }],
+      );
+      expect(commands.find((c) => c.name === "review")?._meta).toEqual({
+        jetbrains: { air: { version: 1, kind: "skill", skillPath } },
+      });
+      expect(commands.find((c) => c.name === `${path.basename(addDir)}:review`)?._meta).toEqual({
+        jetbrains: { air: { version: 1, kind: "skill", skillPath: addDirSkill } },
+      });
+    } finally {
+      await rm(addDir, { recursive: true, force: true });
+    }
   });
 
   it("gives a client that is not AIR no _meta", async () => {
