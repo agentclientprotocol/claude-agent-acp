@@ -842,6 +842,221 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       update.sessionUpdate === "subagent_update" && update.state ? [update.state] : [],
     );
 
+  it("reports only the observed child model and refreshes it on a model change", async () => {
+    const { runtime, published } = await runningWorker({ model: "inherit" });
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await runtime.reportModel(null, "parent-model", deliver);
+    await runtime.reportModel("launch-1", "<synthetic>", deliver);
+    expect(published.some(({ update }) => update.sessionUpdate === "config_option_update")).toBe(
+      false,
+    );
+
+    await runtime.reportModel("launch-1", "child-model", deliver);
+    await runtime.reportModel("launch-1", "child-model", deliver);
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "resume-1", prompt: "Continue" },
+      deliver,
+    );
+    await runtime.reportModel("resume-1", "fallback-model", deliver);
+
+    const configs = published.filter(
+      ({ update }) => update.sessionUpdate === "config_option_update",
+    );
+    expect(configs).toHaveLength(2);
+    for (const [index, model] of ["child-model", "fallback-model"].entries()) {
+      expect(configs[index]).toMatchObject({
+        sessionId: "worker-1",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "model",
+              category: "model",
+              type: "select",
+              currentValue: model,
+              options: [{ value: model, name: model }],
+            },
+          ],
+        },
+      });
+    }
+  });
+
+  it("buffers model observations until the child is announced", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await runtime.reportModel("launch-1", "child-model", deliver);
+    expect(published).toEqual([]);
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      deliver,
+    );
+    expect(published).toEqual([]);
+    await deliver(launch("launch-1", {}));
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual([
+      "subagent_update",
+      "config_option_update",
+    ]);
+    expect(published[1]?.sessionId).toBe("worker-1");
+  });
+
+  const effortOption = (level: string) => ({
+    id: "effort",
+    name: "Effort",
+    category: "thought_level",
+    type: "select" as const,
+    currentValue: level,
+    options: [{ value: level, name: level }],
+  });
+
+  it("merges hook observations with model snapshots without inheriting other sessions", async () => {
+    const { runtime, published } = await runningWorker();
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await runtime.reportConfiguration("worker-1", [
+      effortOption("high"),
+      {
+        id: "mode",
+        name: "Mode",
+        category: "mode",
+        type: "select",
+        currentValue: "plan",
+        options: [{ value: "plan", name: "Plan" }],
+      },
+    ]);
+    await runtime.reportModel("launch-1", "child-model", deliver);
+    await runtime.reportConfiguration("worker-1", [effortOption("low")]);
+    await runtime.reportModel("launch-1", "fallback-model", deliver);
+    const configs = published.flatMap(({ update }) =>
+      update.sessionUpdate === "config_option_update" ? [update.configOptions] : [],
+    );
+    expect(configs).toHaveLength(4);
+    expect(configs.at(-1)?.map((option) => [option.id, option.currentValue])).toEqual([
+      ["mode", "plan"],
+      ["model", "fallback-model"],
+      ["effort", "low"],
+    ]);
+    expect(
+      configs.at(-1)?.every((option) => option.type === "select" && option.options.length === 1),
+    ).toBe(true);
+    await runtime.reportConfiguration("root", [effortOption("max")]);
+    expect(
+      published.filter(({ update }) => update.sessionUpdate === "config_option_update"),
+    ).toHaveLength(4);
+  });
+
+  it("keeps hook observations pending until truthful parentage is announced", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    await runtime.reportConfiguration("worker-1", [effortOption("high")]);
+    expect(published).toEqual([]);
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      async () => {},
+    );
+    expect(published).toEqual([]);
+    await runtime.route(launch("launch-1", {}), async () => {});
+    expect(published.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
+      ["root", "subagent_update"],
+      ["worker-1", "config_option_update"],
+    ]);
+  });
+
+  it("serializes concurrent config publications and retries a failed snapshot", async () => {
+    const started = deferred();
+    const release = deferred();
+    const published: AcpSessionNotification[] = [];
+    const value = child({ announced: true });
+    let fail = false;
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      sessionWith(value),
+      async (notification) => {
+        if (fail) throw new Error("transport failed");
+        published.push(notification);
+        if (published.length === 1) {
+          started.resolve();
+          await release.promise;
+        }
+      },
+      { log: () => {} },
+    );
+    const first = runtime.reportConfiguration(value.sessionId, [effortOption("high")]);
+    await started.promise;
+    const second = runtime.reportConfiguration(value.sessionId, [effortOption("low")]);
+    release.resolve();
+    await Promise.all([first, second]);
+    expect(
+      published.flatMap(({ update }) =>
+        update.sessionUpdate === "config_option_update"
+          ? update.configOptions.map((option) => option.currentValue)
+          : [],
+      ),
+    ).toEqual(["high", "low"]);
+    fail = true;
+    await expect(
+      runtime.reportConfiguration(value.sessionId, [effortOption("max")]),
+    ).rejects.toThrow("transport failed");
+    fail = false;
+    await runtime.reportConfiguration(value.sessionId, [effortOption("max")]);
+    expect(published).toHaveLength(3);
+  });
+
+  it("forgets unannounced configuration when the runtime is cleared", async () => {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      "rfd",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+    );
+    await runtime.reportConfiguration("worker-1", [effortOption("high")]);
+    runtime.clear();
+    await runtime.taskStarted({ taskId: "worker-1", subagentType: "Explore" }, async () => {});
+    expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_update"]);
+  });
+
+  it.each(["air", undefined] as const)(
+    "does not report child config in the %s form",
+    async (form) => {
+      const deliver = vi.fn(async () => {});
+      const runtime = new NativeSubagentRuntime(form, "root", {}, deliver, { log: () => {} });
+      await runtime.reportModel("launch-1", "child-model", deliver);
+      await runtime.reportConfiguration("worker-1", [effortOption("high")]);
+      expect(deliver).not.toHaveBeenCalled();
+    },
+  );
+
   it("hides the Agent tool call, which the parent's session messages replace", async () => {
     const { runtime, control } = await runningWorker();
 

@@ -1,4 +1,8 @@
-import { RequestError, type SessionNotification } from "@agentclientprotocol/sdk/unstable";
+import {
+  RequestError,
+  type SessionConfigOption,
+  type SessionNotification,
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
@@ -63,6 +67,12 @@ export type NativeSubagentSession = {
 
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
 type Logger = { log(message: string): void };
+
+type ChildConfiguration = {
+  options: Map<string, SessionConfigOption>;
+  published?: string;
+  publishing: Promise<void>;
+};
 
 /** What the SDK says about the end of a task, beyond its status. */
 export type TaskEnd = {
@@ -137,6 +147,7 @@ export class NativeSubagentRuntime {
   private readonly parentByToolUse: Map<string, string>;
   private readonly identityByToolUse = new Map<string, SubagentIdentity>();
   private readonly controlByToolUse = new Map<string, AcpSessionNotification>();
+  private readonly configBySession = new Map<string, ChildConfiguration>();
   private readonly childByParentToolUse = new Map<string, NativeSubagent>();
   /**
    * The child session of each tool call that went to a child session. A later
@@ -214,6 +225,95 @@ export class NativeSubagentRuntime {
     const routed = await this.routeUpdate(notification, deliver, forcedSessionId);
     if (routed) this.rememberSendMessage(routed);
     return routed;
+  }
+
+  /** Report the model of a child response, not the parent's model or a launch-time alias. */
+  async reportModel(
+    parentToolUseId: string | null,
+    model: string | undefined,
+    deliver: Publish,
+  ): Promise<void> {
+    if (this.form !== "rfd" || !parentToolUseId || !model || model === "<synthetic>") {
+      return;
+    }
+    await deliver({
+      sessionId: this.rootSessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            type: "select",
+            currentValue: model,
+            options: [{ value: model, name: model }],
+          },
+        ],
+        _meta: { claudeCode: { parentToolUseId } },
+      },
+    });
+  }
+
+  /** Hook observations can precede the task event that establishes a child's parent. */
+  async reportConfiguration(
+    agentId: string,
+    options: SessionConfigOption[],
+    meta?: SessionNotification["update"]["_meta"],
+  ): Promise<void> {
+    if (this.form !== "rfd" || agentId === this.rootSessionId || options.length === 0) return;
+    let config = this.configBySession.get(agentId);
+    if (!config) {
+      const pending = [...this.configBySession.keys()].filter(
+        (id) => !this.children.has(id),
+      ).length;
+      if (!this.children.has(agentId) && pending >= MAX_PENDING_PARENTS) {
+        this.logger.log(
+          `Session ${this.rootSessionId}: dropping configuration for unannounced subagent ${agentId}; pending buffer limit reached`,
+        );
+        return;
+      }
+      config = { options: new Map(), publishing: Promise.resolve() };
+      this.configBySession.set(agentId, config);
+    }
+    for (const option of options) config.options.set(option.id, option);
+    const child = this.children.get(agentId);
+    if (child?.announced) await this.publishConfiguration(child, meta);
+  }
+
+  private async publishConfiguration(
+    child: NativeSubagent,
+    meta?: SessionNotification["update"]["_meta"],
+  ): Promise<void> {
+    const config = this.configBySession.get(child.sessionId);
+    if (!config) return;
+    // SDK hooks can run concurrently with streamed responses. Serialize snapshots
+    // so a delayed publication cannot replace newer settings with older ones.
+    const publishing = config.publishing.then(async () => {
+      if (this.configBySession.get(child.sessionId) !== config) return;
+      const priority = ["mode", "model", "thought_level", "model_config"];
+      const rank = (option: SessionConfigOption) => {
+        const index = priority.indexOf(option.category ?? "");
+        return index < 0 ? priority.length : index;
+      };
+      const configOptions = [...config.options.values()].sort(
+        (left, right) => rank(left) - rank(right),
+      );
+      const snapshot = JSON.stringify(configOptions);
+      if (config.published === snapshot) return;
+      await this.publish({
+        sessionId: child.sessionId,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions,
+          ...(meta ? { _meta: meta } : {}),
+        },
+      });
+      config.published = snapshot;
+    });
+    // The caller receives the error; later observations must still be able to retry.
+    config.publishing = publishing.catch(() => {});
+    await publishing;
   }
 
   private async routeUpdate(
@@ -316,6 +416,14 @@ export class NativeSubagentRuntime {
         ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)
         : undefined);
     if (this.form === "rfd" && announcedChild?.announced) {
+      if (update.sessionUpdate === "config_option_update") {
+        await this.reportConfiguration(
+          announcedChild.sessionId,
+          update.configOptions,
+          update._meta,
+        );
+        return null;
+      }
       const handback = await this.routeRfdHandback(notification, announcedChild);
       if (handback !== undefined) return handback;
     }
@@ -595,6 +703,7 @@ export class NativeSubagentRuntime {
       this.pendingCount = 0;
       this.identityByToolUse.clear();
       this.controlByToolUse.clear();
+      this.configBySession.clear();
       this.parentByToolUse.clear();
       this.forgetRestores();
     }
@@ -908,6 +1017,7 @@ export class NativeSubagentRuntime {
    */
   private withdraw(taskId: string, child: NativeSubagent): void {
     this.children.delete(taskId);
+    this.configBySession.delete(child.sessionId);
     if (child.parentToolUseId) {
       this.takePending(child.parentToolUseId);
       this.cleanupControl(child.parentToolUseId);
@@ -932,6 +1042,7 @@ export class NativeSubagentRuntime {
   /** Announces `child` in the client's form. A runtime without one never does. */
   private async announce(child: NativeSubagent): Promise<void> {
     if (this.form) await announceNativeSubagent(child, this.publish, this.form);
+    await this.publishConfiguration(child);
   }
 
   /** The RFD form: publishes the work state of `child` on its parent. */
@@ -1157,6 +1268,7 @@ export class NativeSubagentRuntime {
     this.parentByToolUse.clear();
     this.identityByToolUse.clear();
     this.controlByToolUse.clear();
+    this.configBySession.clear();
     this.childByParentToolUse.clear();
     this.taskFinishPromises.clear();
     this.senderByToolUse.clear();

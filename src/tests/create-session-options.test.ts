@@ -7,7 +7,9 @@ import {
 import type { ClientCapabilities } from "@agentclientprotocol/sdk/unstable";
 import { getSessionMessages, type Options } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpClient, ClaudeAcpAgent as ClaudeAcpAgentType } from "../acp-agent.js";
+import type { AcpSessionNotification } from "../acp-subagents.js";
 import { ALLOW_BYPASS } from "../permissions/modes.js";
+import { NativeSubagentRuntime } from "../native-subagents.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -183,6 +185,122 @@ describe("createSession options merging", () => {
     expect(capturedOptions!.hooks?.PreToolUse).toEqual([
       { matcher: "Edit|Write", hooks: [expect.any(Function)] },
     ]);
+  });
+
+  it.each([false, true])("reports child settings through registered hooks (v2: %s)", async (v2) => {
+    const updates: AcpSessionNotification[] = [];
+    const client = createMockClient();
+    client.sessionUpdate = async (notification) => {
+      updates.push(notification);
+    };
+    const observedAgent = new ClaudeAcpAgent(client, undefined, { v2 });
+    await observedAgent.initialize({ protocolVersion: 1, clientCapabilities: { subagents: {} } });
+    const { sessionId } = await observedAgent.newSession({ cwd: process.cwd(), mcpServers: [] });
+    const session = observedAgent.sessions[sessionId]!;
+    const parentOptions = structuredClone(session.configOptions);
+    const runtime = (session.nativeSubagentRuntime = new NativeSubagentRuntime(
+      "rfd",
+      sessionId,
+      session,
+      (notification) => client.sessionUpdate(notification),
+      { log: () => {} },
+    ));
+    const invoke = async (
+      event: "PreToolUse" | "PostToolUse" | "PostModelSwitch" | "SubagentStart" | "SubagentStop",
+      fields: Record<string, unknown>,
+    ) => {
+      const matcher = capturedOptions!.hooks![event]!.find((matcher) => !matcher.matcher);
+      expect(matcher).toBeDefined();
+      for (const hook of matcher!.hooks) {
+        await expect(
+          hook(
+            {
+              hook_event_name: event,
+              session_id: sessionId,
+              cwd: process.cwd(),
+              transcript_path: "/tmp/transcript",
+              ...fields,
+            } as any,
+            undefined,
+            { signal: new AbortController().signal },
+          ),
+        ).resolves.toMatchObject({ continue: true });
+      }
+    };
+    // A main-thread --agent persona has agent_type too, but no agent_id.
+    await invoke("PreToolUse", {
+      agent_type: "reviewer",
+      permission_mode: "plan",
+      effort: { level: "max" },
+    });
+    expect(updates).toEqual([]);
+    await invoke("SubagentStart", {
+      agent_id: "child",
+      agent_type: "Explore",
+      permission_mode: "acceptEdits",
+    });
+    expect(updates).toEqual([]);
+    await runtime.taskStarted({ taskId: "child", subagentType: "Explore" }, async () => {});
+    const configs = () =>
+      updates.flatMap(({ update }) =>
+        update.sessionUpdate === "config_option_update" ? [update.configOptions] : [],
+      );
+    expect(
+      configs()
+        .at(-1)
+        ?.map((option) => [option.id, option.currentValue]),
+    ).toEqual([
+      ["mode", "acceptEdits"],
+      ["agent", "Explore"],
+    ]);
+    await invoke("PreToolUse", {
+      agent_id: "child",
+      agent_type: "Explore",
+      effort: { level: "high" },
+    });
+    expect(
+      configs()
+        .at(-1)
+        ?.find((option) => option.id === "effort"),
+    ).toMatchObject({
+      category: "thought_level",
+      currentValue: "high",
+      options: [{ value: "high", name: "High" }],
+    });
+    await invoke("PostToolUse", {
+      agent_id: "child",
+      tool_name: "EnterPlanMode",
+      permission_mode: "plan",
+    });
+    await invoke("PostModelSwitch", {
+      agent_id: "child",
+      to_model: "child-model",
+      source: "auto",
+      effort: { level: "low" },
+    });
+    await invoke("SubagentStop", { agent_id: "child", agent_type: "Explore" });
+    expect(
+      configs()
+        .at(-1)
+        ?.map((option) => [option.id, option.currentValue]),
+    ).toEqual([
+      ["mode", "plan"],
+      ["model", "child-model"],
+      ["effort", "low"],
+      ["agent", "Explore"],
+    ]);
+    expect(
+      configs()
+        .at(-1)
+        ?.every((option) => option.type === "select" && option.options.length === 1),
+    ).toBe(true);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(session.configOptions).toEqual(parentOptions);
+    expect(
+      updates
+        .filter(({ update }) => update.sessionUpdate === "config_option_update")
+        .every(({ sessionId: target }) => target === "child"),
+    ).toBe(true);
   });
 
   it("merges user-provided disallowedTools with ACP internal list", async () => {

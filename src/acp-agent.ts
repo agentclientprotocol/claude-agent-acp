@@ -353,6 +353,7 @@ import {
   buildEffortConfigOption,
   EFFORT_CONFIG_ID,
   effortFlagSettings,
+  effortLevelName,
   mergeEffortSettings,
   settingsEffortForModel,
 } from "./session-effort.js";
@@ -7629,6 +7630,11 @@ export class ClaudeAcpAgent {
             // it) can all be tagged with the same, replay-stable id.
             if (message.event.type === "message_start") {
               currentStreamMessageId = message.event.message.id || undefined;
+              await subagents.reportModel(
+                message.parent_tool_use_id,
+                message.event.message.model,
+                sendUpdate,
+              );
               // A new top-level message starts: clear any streamed-content
               // residue from a prior message that never reached its
               // consolidated reset — a cancelled turn breaks out before the
@@ -7993,6 +7999,14 @@ export class ClaudeAcpAgent {
               compaction.hasDeliveredOutput
             ) {
               break;
+            }
+
+            if (message.type === "assistant") {
+              await subagents.reportModel(
+                message.parent_tool_use_id,
+                message.message.model,
+                sendUpdate,
+              );
             }
 
             // Snapshot the latest top-level assistant usage and model so the
@@ -10120,6 +10134,69 @@ export class ClaudeAcpAgent {
     };
   }
 
+  private subagentConfigurationHook(sessionId: string): HookCallback {
+    return async (input) => {
+      const session = this.sessions[sessionId];
+      if (!session || !input.agent_id) return { continue: true };
+      const options: SessionConfigOption[] = [];
+      if (input.permission_mode) {
+        const mode = session.modes.availableModes.find((mode) => mode.id === input.permission_mode);
+        options.push(
+          SessionModeManager.configOption({
+            currentModeId: input.permission_mode,
+            availableModes: [mode ?? { id: input.permission_mode, name: input.permission_mode }],
+          }),
+        );
+      }
+      if (input.hook_event_name === "PostModelSwitch" && input.to_model) {
+        options.push({
+          id: MODEL_CONFIG_ID,
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: input.to_model,
+          options: [{ value: input.to_model, name: input.to_model }],
+        });
+      }
+      if (input.effort?.level) {
+        options.push({
+          id: EFFORT_CONFIG_ID,
+          name: "Effort",
+          description: "Current reasoning effort",
+          category: "thought_level",
+          type: "select",
+          currentValue: input.effort.level,
+          options: [{ value: input.effort.level, name: effortLevelName(input.effort.level) }],
+        });
+      }
+      if (input.agent_type) {
+        const agent = session.agents.find((agent) => agent.name === input.agent_type);
+        options.push({
+          id: AGENT_CONFIG_ID,
+          name: "Agent",
+          description: "Subagent type",
+          type: "select",
+          currentValue: input.agent_type,
+          options: [
+            {
+              value: input.agent_type,
+              name: input.agent_type,
+              ...(agent?.description ? { description: agent.description } : {}),
+            },
+          ],
+        });
+      }
+      await session.nativeSubagentRuntime
+        ?.reportConfiguration(input.agent_id, options)
+        .catch((error) =>
+          this.logger.error(
+            `Session ${sessionId}: failed to report subagent configuration: ${error}`,
+          ),
+        );
+      return { continue: true };
+    };
+  }
+
   /**
    * The PreToolUse hook of a v2 connection, for Edit and Write: the tool call
    * shows the exact patch of the change before the tool runs.
@@ -11382,6 +11459,10 @@ export class ClaudeAcpAgent {
       `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${resolvedProvider?.baseUrl ?? "native"}`,
     );
 
+    const subagentConfigHook =
+      subagentForm(this.clientCapabilities) === "rfd"
+        ? this.subagentConfigurationHook(sessionId)
+        : undefined;
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],
@@ -11450,14 +11531,33 @@ export class ClaudeAcpAgent {
       tools,
       hooks: {
         ...userProvidedOptions?.hooks,
+        ...(subagentConfigHook
+          ? {
+              SubagentStart: [
+                ...(userProvidedOptions?.hooks?.SubagentStart ?? []),
+                { hooks: [subagentConfigHook] },
+              ],
+              SubagentStop: [
+                ...(userProvidedOptions?.hooks?.SubagentStop ?? []),
+                { hooks: [subagentConfigHook] },
+              ],
+              PostToolUseFailure: [
+                ...(userProvidedOptions?.hooks?.PostToolUseFailure ?? []),
+                { hooks: [subagentConfigHook] },
+              ],
+            }
+          : {}),
         // On v2, an Edit or Write shows its exact patch before it runs, also
         // when no permission request shows it (`fileChangePreviewHook`): a v2
         // diff cannot hold the input's snippet.
-        ...(this.v2
+        ...(this.v2 || subagentConfigHook
           ? {
               PreToolUse: [
                 ...(userProvidedOptions?.hooks?.PreToolUse || []),
-                { matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] },
+                ...(subagentConfigHook ? [{ hooks: [subagentConfigHook] }] : []),
+                ...(this.v2
+                  ? [{ matcher: "Edit|Write", hooks: [this.fileChangePreviewHook(sessionId)] }]
+                  : []),
               ],
             }
           : {}),
@@ -11465,6 +11565,7 @@ export class ClaudeAcpAgent {
           ...(userProvidedOptions?.hooks?.PostToolUse || []),
           {
             hooks: [
+              ...(subagentConfigHook ? [subagentConfigHook] : []),
               createPostToolUseHook({
                 onEnterPlanMode: async () => {
                   await this.sessionModes.publishCurrent(sessionId, "plan");
@@ -11488,9 +11589,11 @@ export class ClaudeAcpAgent {
           ...(userProvidedOptions?.hooks?.PostModelSwitch || []),
           {
             hooks: [
+              ...(subagentConfigHook ? [subagentConfigHook] : []),
               async (input) => {
                 if (
                   input.hook_event_name === "PostModelSwitch" &&
+                  !input.agent_id &&
                   input.source !== "sdk" &&
                   input.source !== "resume"
                 ) {

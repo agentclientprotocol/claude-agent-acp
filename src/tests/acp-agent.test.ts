@@ -7177,6 +7177,64 @@ describe("subagent permission attribution (issue #851)", () => {
       session_id: "test-session",
     });
 
+    it("reports the child's observed model as a singleton config without enabling changes", async () => {
+      const response = (model: string) => ({
+        type: "assistant",
+        parent_tool_use_id: "toolu_parent",
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: randomUUID(),
+          role: "assistant",
+          model,
+          content: [{ type: "text", text: "Working" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+      const first = response("child-model");
+      const { agent, updates } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_parent",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: { type: "message_start", message: first.message },
+        },
+        first,
+        response("fallback-model"),
+        taskUpdated({ status: "completed" }),
+      ]);
+      const configs = updates.filter(
+        ({ update }) => update.sessionUpdate === "config_option_update",
+      );
+      expect(configs).toHaveLength(2);
+      for (const [index, model] of ["child-model", "fallback-model"].entries()) {
+        expect(configs[index]).toMatchObject({
+          sessionId: "agent-42",
+          update: {
+            configOptions: [
+              {
+                id: "model",
+                currentValue: model,
+                options: [{ value: model, name: model }],
+              },
+            ],
+          },
+        });
+      }
+      expect(
+        updates.findIndex(({ update }) => update.sessionUpdate === "subagent_update"),
+      ).toBeLessThan(updates.indexOf(configs[0]!));
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "agent-42",
+          configId: "model",
+          value: "fallback-model",
+        }),
+      ).rejects.toThrow("Session not found");
+    });
+
     it("announces the child as running, then sends it the prompt as a message", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
