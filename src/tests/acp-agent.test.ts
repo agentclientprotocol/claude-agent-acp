@@ -3803,10 +3803,19 @@ describe("subagent transcript replay", () => {
           switch (update.sessionUpdate) {
             case "subagent_update":
               return [`${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}`];
-            case "session_message":
-              return [
-                `${on} session_message ${u.messageId} from=${u.senderSessionId ?? "-"} ${u.content[0].text}`,
+            case "session_message": {
+              const references = [
+                ...(u.senderMessageId ? [`senderMessageId=${u.senderMessageId}`] : []),
+                ...(u.recipientMessageId ? [`recipientMessageId=${u.recipientMessageId}`] : []),
               ];
+              return [
+                [
+                  `${on} session_message ${u.messageId} from=${u.senderSessionId ?? "-"}`,
+                  ...references,
+                  u.content[0].text,
+                ].join(" "),
+              ];
+            }
             case "tool_call":
               return [`${on} tool_call ${u.toolCallId}`];
             case "notice":
@@ -3877,11 +3886,12 @@ describe("subagent transcript replay", () => {
       expect(trace).toEqual([
         "root user_message_chunk Check it",
         "root agent_message_chunk I'll fork a worker.",
-        "root tool_call toolu_fork",
         "root tool_call toolu_read",
         'root subagent_update fork1 {"state":"running"}',
-        `fork1 session_message toolu_fork from=${sessionId} Inspect the parser`,
+        `root session_message toolu_fork from=${sessionId} recipientMessageId=toolu_fork Inspect the parser`,
+        `fork1 session_message toolu_fork from=${sessionId} senderMessageId=toolu_fork Inspect the parser`,
         "fork1 agent_message_chunk Parser is fine.",
+        "root session_message toolu_fork:reply from=fork1 Parser is fine.",
         "root agent_message_chunk Done.",
         'root subagent_update fork1 {"state":"idle","stopReason":"end_turn"}',
       ]);
@@ -3959,26 +3969,70 @@ describe("subagent transcript replay", () => {
 
       expect(trace).toEqual([
         "root user_message_chunk Explore it",
-        "root tool_call toolu_agent",
+        // The launch without metadata stays a tool call; the other one is
+        // replaced by the parent's session messages.
         "root tool_call toolu_lost",
         // The child is announced under its agent id, right after its launch.
         'root subagent_update abc123 {"state":"running"}',
-        "abc123 session_message toolu_agent from=" + sessionId + " Look around",
+        `root session_message toolu_agent from=${sessionId} recipientMessageId=toolu_agent Look around`,
+        `abc123 session_message toolu_agent from=${sessionId} senderMessageId=toolu_agent Look around`,
         "abc123 agent_message_chunk Child report.",
-        "abc123 tool_call toolu_nested",
         // A nested child is announced on the child that launched it.
         'abc123 subagent_update def456 {"state":"running"}',
-        "def456 session_message toolu_nested from=abc123 Read spec.md",
+        "abc123 session_message toolu_nested from=abc123 recipientMessageId=toolu_nested Read spec.md",
+        "def456 session_message toolu_nested from=abc123 senderMessageId=toolu_nested Read spec.md",
         "def456 agent_message_chunk X.",
-        // The delivered message has the id, text, and sender of its SendMessage call.
+        "abc123 session_message toolu_nested:reply from=def456 The spec says X.",
+        // The delivered message has the id, text, and sender of its SendMessage
+        // call, which stays a tool call of its sender.
         "abc123 session_message toolu_send from=" + sessionId + " Check the tests too",
         "abc123 agent_message_chunk Tests pass.",
+        "root session_message toolu_agent:reply from=abc123 Found it.",
         "root tool_call toolu_send",
         "root agent_message_chunk Done.",
         // Every end comes before the response.
         'abc123 subagent_update def456 {"state":"idle","stopReason":"end_turn"}',
         'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
         "root notice Some subagent history is not available: The history of 1 subagent of this session could not be restored.",
+      ]);
+    });
+
+    it("replays a child's hand-back as its message to the parent, instead of the launch's result", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Ask it"),
+          assistant("a1", [
+            toolUse("toolu_agent", "Agent", { subagent_type: "Explore", prompt: "Say PONG" }),
+          ]),
+          // In hand-back mode the launch's result only says where the report went.
+          user("u2", [toolResult("toolu_agent", "The report was delivered as a message.")]),
+          assistant("a2", [{ type: "text", text: "It said PONG." }]),
+        ],
+        {
+          abc123: {
+            meta: { agentType: "Explore", toolUseId: "toolu_agent", requestShape: "foreground" },
+            records: [
+              user("c1", "Say PONG"),
+              assistant("c2", [toolUse("toolu_handback", "SubagentHandback", { message: "PONG" })]),
+              user("c3", [toolResult("toolu_handback", "Report delivered to your caller.")]),
+              // A failed hand-back delivered nothing, so it stays a tool call.
+              assistant("c4", [toolUse("toolu_lost", "SubagentHandback", { message: "Again" })]),
+              user("c5", [{ ...toolResult("toolu_lost", "Not delivered"), is_error: true }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Ask it",
+        'root subagent_update abc123 {"state":"running"}',
+        `root session_message toolu_agent from=${sessionId} recipientMessageId=toolu_agent Say PONG`,
+        `abc123 session_message toolu_agent from=${sessionId} senderMessageId=toolu_agent Say PONG`,
+        "abc123 session_message toolu_handback from=abc123 recipientMessageId=toolu_handback PONG",
+        "root session_message toolu_handback from=abc123 senderMessageId=toolu_handback PONG",
+        "abc123 tool_call toolu_lost",
+        "root agent_message_chunk It said PONG.",
+        'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
       ]);
     });
 
@@ -6402,7 +6456,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(childEvents).toEqual(["tool_call pending agent-42", "subagent cancelled"]);
   });
 
-  it("keeps the Agent call's own heartbeat and result on the session that made the call (the subagents RFD)", async () => {
+  it("replaces the Agent call with the parent's session messages, and keeps its heartbeat out of the child (the subagents RFD)", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -6462,16 +6516,36 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    const agentCall = updates.flatMap(({ sessionId, update }) =>
-      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-      update.toolCallId === "toolu_parent"
-        ? [{ sessionId, status: update.status }]
-        : [],
-    );
-    expect(agentCall.map(({ status }) => status)).toEqual(
-      expect.arrayContaining(["in_progress", "completed"]),
-    );
-    expect(new Set(agentCall.map(({ sessionId }) => sessionId))).toEqual(new Set(["test-session"]));
+    // Neither the call nor its heartbeat reaches any session, the child's
+    // included: its prompt and result are the parent's session messages.
+    expect(
+      updates.filter(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId.startsWith("toolu_parent"),
+      ),
+    ).toEqual([]);
+    expect(
+      updates.flatMap(({ sessionId, update }) =>
+        sessionId === "test-session" && update.sessionUpdate === "session_message" ? [update] : [],
+      ),
+    ).toEqual([
+      {
+        sessionUpdate: "session_message",
+        messageId: "toolu_parent",
+        senderSessionId: "test-session",
+        recipientSessionId: "agent-42",
+        recipientMessageId: "toolu_parent",
+        content: [{ type: "text", text: "Find the parser" }],
+      },
+      {
+        sessionUpdate: "session_message",
+        messageId: "toolu_parent:reply",
+        senderSessionId: "agent-42",
+        recipientSessionId: "test-session",
+        content: [{ type: "text", text: "It is in x.ts." }],
+      },
+    ]);
   });
 
   it("routes a native child AskUserQuestion and its tool call to the child session", async () => {
@@ -7122,12 +7196,24 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         },
         {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_parent",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
           sessionId: "agent-42",
           update: {
             sessionUpdate: "session_message",
             messageId: "toolu_parent",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_parent",
             content: [{ type: "text", text: "Go" }],
           },
         },
@@ -7470,12 +7556,24 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         },
         {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_parent",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
           sessionId: "agent-42",
           update: {
             sessionUpdate: "session_message",
             messageId: "toolu_parent",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_parent",
             content: [{ type: "text", text: "Go" }],
           },
         },
@@ -7832,7 +7930,7 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
-    it("ends the Agent call with Claude Code's result, and the stopped child's tool call in the child's session", async () => {
+    it("reports the stop as the child's idle state, and closes its tool call in the child's session", async () => {
       const log: string[] = [];
       const updates: AcpSessionNotification[] = [];
       const agent = new ClaudeAcpAgent(
@@ -7916,25 +8014,21 @@ describe("subagent permission attribution (issue #851)", () => {
       ).resolves.toMatchObject({ stopReason: "cancelled" });
       await agent.sessions["test-session"]?.consumer;
 
-      // In the Agent call's own session, Claude Code's result; in the child's
-      // session, the report that closes its command, after the child went idle.
+      // The parent does not show the Agent call, so the child's idle state
+      // reports the stop. In the child's session, the report that closes its
+      // command comes after the child went idle.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
-        "tool @test-session toolu_agent failed",
         "tool @agent-42 toolu_child failed",
       ]);
-      const endOf = (toolCallId: string) =>
-        updates.find(
-          ({ update }) =>
-            update.sessionUpdate === "tool_call_update" &&
-            update.toolCallId === toolCallId &&
-            update.status === "failed",
-        )?.update;
-      expect(endOf("toolu_agent")).toMatchObject({
-        _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-      });
-      expect(JSON.stringify(endOf("toolu_child"))).toContain("The turn was cancelled");
+      const endOfChildCommand = updates.find(
+        ({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "toolu_child" &&
+          update.status === "failed",
+      )?.update;
+      expect(JSON.stringify(endOfChildCommand)).toContain("The turn was cancelled");
       for (const payload of updates) {
         expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
       }
@@ -8044,9 +8138,9 @@ describe("subagent permission attribution (issue #851)", () => {
       await agent.sessions["test-session"]?.consumer;
 
       // The command ends in the child's session, after the child reported idle.
+      // The background launch's own result is not shown in the parent.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
-        "tool @test-session toolu_agent completed",
         "prompt cancelled",
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
         "tool @agent-42 toolu_child failed",

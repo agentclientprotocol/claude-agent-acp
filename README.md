@@ -47,9 +47,18 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   `end_turn` or `cancelled` when the SDK gives the reason. A failure is `idle` with the `error`
   stop reason and the SDK's error text as its `error`. The child keeps its session for every
   delegation to it.
-- The prompt of the Agent or Task call that launches the child, and the message of each
-  SendMessage call that resumes it, is a `session_message` in the child's transcript. The tool
-  call stays a tool call of the session that made it.
+- Session messages replace the Agent or Task call that launches the child, which its parent is
+  not shown:
+  - The launch's prompt is a `session_message` in both transcripts: the parent's outgoing view and
+    the child's incoming one. Both use the launch's tool use id, and each names the other with the
+    draft RFD's `recipientMessageId` and `senderMessageId`.
+  - A foreground child's answer, from the launch's result, is the child's `session_message` to
+    the parent. In Claude Code's hand-back mode, the child's `SubagentHandback` call is its
+    message to the parent instead, in both transcripts and linked the same way.
+  - A launch whose child is never exposed is shown as a tool call after all, with its final
+    status.
+- The message of a SendMessage call that resumes the child is a `session_message` in the child's
+  transcript. The SendMessage call stays a tool call of the session that made it.
 - `session/cancel` on the parent interrupts Claude Code, which stops the foreground children that
   the turn waits on. Background children keep running, as the RFD prefers; a client stops one with
   its own `cancel`. Each stopped child reports `idle` with `cancelled` from Claude Code's own
@@ -65,8 +74,8 @@ Task subagent as its own child session, following the [subagents RFD](https://gi
   exits is `idle` with no stop reason.
 - A child whose parent is not yet known when it ends is not exposed, since the RFD forbids
   guessing its parent.
-- A replay restores each child under its live session id, from its own transcript: its prompt and
-  each SendMessage message are `session_message`s, and its end is an `idle` before the response.
+- A replay restores each child under its live session id, from its own transcript, with the same
+  session messages as live, and its end is an `idle` before the response.
   A launch without Claude Code's metadata file for the child stays an ordinary tool call of the
   parent, and a notice, for a client that takes notices, says that subagent history is missing.
 - After a load or resume, with or without replay, a SendMessage that resumes an agent from before

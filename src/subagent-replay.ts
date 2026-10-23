@@ -8,6 +8,13 @@
  * history to the child session. Every child's end goes out before the replay
  * ends, since no subagent from before the reload still runs.
  *
+ * As live, the parent is not shown the Agent or Task call of a child that the
+ * replay announces: the launch's prompt is the parent's outgoing message, and
+ * a foreground child's answer is its reply to the parent. A child's
+ * successful SubagentHandback call is its message to the parent instead.
+ * Unlike live, the replay does not tell runs apart, so a child that handed
+ * back any report gets no reply from its launch's result.
+ *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
  * parent, and a notice says that subagent history is missing.
@@ -15,7 +22,11 @@
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
 import {
+  HANDBACK_TOOL,
+  handbackMessage,
   isNativeSubagentControlTool,
+  launchReply,
+  linkedSessionMessages,
   nativeSubagentState,
   rfdEndState,
   rfdLabels,
@@ -43,6 +54,8 @@ export type ReplayChild = {
   notified?: SubagentState;
   announced: boolean;
   promptSent: boolean;
+  /** Whether it handed a report to its parent with a SubagentHandback call. */
+  handedBack?: boolean;
 };
 
 type SendMessageCall = {
@@ -62,6 +75,11 @@ export class RfdSubagentReplay {
   private readonly omitted = new Set<string>();
   /** Children whose transcript could not be read: only their association is replayed. */
   private withoutHistory = 0;
+  /** The SubagentHandback calls, with their report and whether their result failed. */
+  private readonly handbacks = new Map<
+    string,
+    { message: string; failed: boolean; sent: boolean }
+  >();
 
   constructor(
     private readonly history: SubagentHistory,
@@ -78,6 +96,9 @@ export class RfdSubagentReplay {
         if (block.type === "tool_use" && typeof block.id === "string") {
           if (isNativeSubagentControlTool(block.name)) {
             this.registerLaunch(block.id, inputOf(block), ownerSessionId);
+          } else if (block.name === HANDBACK_TOOL) {
+            const message = handbackMessage(block.input);
+            if (message) this.handbacks.set(block.id, { message, failed: false, sent: false });
           } else if (block.name === "SendMessage") {
             const input = inputOf(block);
             if (typeof input.to === "string" && typeof input.message === "string") {
@@ -91,6 +112,8 @@ export class RfdSubagentReplay {
             }
           }
         } else if (block.type === "tool_result" && typeof block.tool_use_id === "string") {
+          const handback = this.handbacks.get(block.tool_use_id);
+          if (handback && block.is_error === true) handback.failed = true;
           const child = this.children.get(block.tool_use_id);
           // A background launch answers at once; its result is not the end.
           if (child && !child.record.background) {
@@ -168,6 +191,51 @@ export class RfdSubagentReplay {
   }
 
   /**
+   * Takes a replayed update of a tool call, from the transcript of `owner`
+   * when it is a child's. Returns whether the client is not shown it: an
+   * update of the launch of a child that the replay shows, or of a successful
+   * SubagentHandback call of `owner`. A foreground launch's completed result
+   * goes out as the child's reply, and a hand-back as the child's message to
+   * its parent.
+   */
+  async toolCallUpdate(
+    update: AcpSessionNotification["update"],
+    owner: ReplayChild | undefined,
+  ): Promise<boolean> {
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return false;
+    }
+    const handback = owner ? this.handbacks.get(update.toolCallId) : undefined;
+    if (owner && handback && !handback.failed) {
+      if (!handback.sent) {
+        handback.sent = true;
+        owner.handedBack = true;
+        for (const view of linkedSessionMessages(
+          update.toolCallId,
+          owner.sessionId,
+          owner.parentSessionId,
+          handback.message,
+        )) {
+          await this.publish(view);
+        }
+      }
+      return true;
+    }
+    const child = this.children.get(update.toolCallId);
+    if (!child) return false;
+    if (
+      update.status === "completed" &&
+      child.announced &&
+      !child.record.background &&
+      !child.handedBack
+    ) {
+      const reply = launchReply(child.launchId, child.sessionId, child.parentSessionId, update);
+      if (reply) await this.publish(reply);
+    }
+    return true;
+  }
+
+  /**
    * Takes a persisted task notification. Returns whether it was a child's:
    * its task id is the agent id.
    */
@@ -234,10 +302,17 @@ export class RfdSubagentReplay {
     this.byAgentId.set(record.agentId, child);
   }
 
-  /** The prompt of the launch, with the launch's id, as live. */
+  /** The prompt of the launch, with the launch's id, to the parent and the child, as live. */
   private async sendPrompt(child: ReplayChild, text: string): Promise<void> {
     child.promptSent = true;
-    await this.sendMessage(child, child.launchId, text, child.parentSessionId);
+    for (const view of linkedSessionMessages(
+      child.launchId,
+      child.parentSessionId,
+      child.sessionId,
+      text,
+    )) {
+      await this.publish(view);
+    }
   }
 
   /**

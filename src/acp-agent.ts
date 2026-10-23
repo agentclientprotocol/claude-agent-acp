@@ -9601,6 +9601,7 @@ export class ClaudeAcpAgent {
         ) {
           continue;
         }
+        if (rfdReplay && (await rfdReplay.toolCallUpdate(notification.update, child))) continue;
         await this.client.sessionUpdate({ ...notification, sessionId: replayTargetSessionId });
       }
 

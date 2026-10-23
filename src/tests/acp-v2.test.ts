@@ -1927,24 +1927,19 @@ describe("ACP v2 prompts", () => {
 
       const { root, updates } = await cancelWhileRunning("toolu_child");
 
-      // The Agent call ends in the session that made it, with Claude Code's
-      // result and the kind that it stamped. The subagent's command ends in the
-      // child's session, whose own idle came first.
+      // The parent does not show the Agent call: the child's idle reports the
+      // stop. The subagent's command ends in the child's session, before the
+      // root's idle.
       const idle = idleAt(root, updates);
-      const agentEnd = lastStatusAt(updates, "toolu_agent");
-      expect(updates[agentEnd]).toMatchObject({
-        sessionId: root,
-        update: {
-          status: "cancelled",
-          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-        },
+      expect(lastStatusAt(updates, "toolu_agent")).toBe(-1);
+      expect(updates[idleAt("agent-1", updates)]).toMatchObject({
+        update: { stopReason: "cancelled" },
       });
       const childEnd = lastStatusAt(updates, "toolu_child");
       expect(updates[childEnd]).toMatchObject({
         sessionId: "agent-1",
         update: { status: "cancelled" },
       });
-      expect(agentEnd).toBeLessThan(idle);
       expect(childEnd).toBeLessThan(idle);
     });
 
@@ -2584,14 +2579,12 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
 
       const { root, updates } = await cancelCycle("toolu_child");
 
-      // Claude Code's result ends the Agent call. The command ends in the
-      // child's session, after the child's idle and before the cycle's.
-      expect(updates[lastStatusAt(updates, "toolu_agent")]).toMatchObject({
-        sessionId: root,
-        update: {
-          status: "cancelled",
-          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-        },
+      // The parent does not show the Agent call: the child's idle reports the
+      // stop. The command ends in the child's session, after the child's idle
+      // and before the cycle's.
+      expect(statusesOf(updates, "toolu_agent")).toEqual([]);
+      expect(updates[lastIdleAt(updates, "agent-1")]).toMatchObject({
+        update: { stopReason: "cancelled" },
       });
       const end = lastStatusAt(updates, "toolu_child");
       expect(updates[end]).toMatchObject({ sessionId: "agent-1", update: { status: "cancelled" } });
