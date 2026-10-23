@@ -2269,6 +2269,57 @@ describe("usage Markdown", () => {
     expect(formatted).not.toContain("lowest");
   });
 
+  it("renders each window's recommendations in order, escaped, before its MCP table", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      behaviors: {
+        ...usageResponse.behaviors,
+        day: {
+          ...usageResponse.behaviors.day,
+          recommendations: [
+            { key: "mcp_server", pct: 41, title: "Disable my_server", detail: "/mcp" },
+            { key: "effort", pct: 12, title: "Lower effort | max" },
+          ],
+          fix: { keys: ["mcp_server"], messages: ["/mcp disable my_server"] },
+        },
+        week: {
+          ...usageResponse.behaviors.week,
+          mcp_servers: [],
+          recommendations: [{ key: "agent", pct: 5, title: "Trim the reviewer agent" }],
+        },
+      },
+    });
+    const day = formatted.slice(
+      formatted.indexOf("**Last 24h**"),
+      formatted.indexOf("**Last 7d**"),
+    );
+    expect(day).toContain(
+      "- **41%** Disable my\\_server · /mcp\n- **12%** Lower effort \\| max\n\n| MCP server |",
+    );
+    expect(formatted).not.toContain("undefined");
+    expect(formatted).not.toContain("/mcp disable");
+    expect(
+      formatted.endsWith(
+        "**Last 7d** · 43 requests · 5 sessions\n\n- **5%** Trim the reviewer agent",
+      ),
+    ).toBe(true);
+  });
+
+  it("falls back to the CLI text for a malformed recommendation", () => {
+    expect(
+      parseUsageResponse({
+        ...usageResponse,
+        behaviors: {
+          ...usageResponse.behaviors,
+          day: {
+            ...usageResponse.behaviors.day,
+            recommendations: [{ key: "effort", pct: "high", title: "Lower effort" }],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
   it("recognizes only exact local usage commands", () => {
     expect(isUsageCommandText(" /usage ")).toBe(true);
     expect(isUsageCommandText("/cost")).toBe(false);
