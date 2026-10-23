@@ -142,6 +142,8 @@ import {
   withAirMeta,
 } from "./air-extension.js";
 import * as sessionIndex from "./session-index/connection.js";
+import { encodeProjectPath, projectsRoot } from "./session-index/project-dirs.js";
+import { transcriptHasMessages } from "./session-index/transcript-scan.js";
 import type { RenameSessionRequest, SessionIdRequest } from "./session-index/service.js";
 import type {
   ListSubscribeRequest,
@@ -3182,9 +3184,25 @@ export class ClaudeAcpAgent {
       offset,
     });
     const page = this.sessionIndex.hideArchived(sdkSessions.slice(0, SESSION_LIST_PAGE_SIZE));
+    // The SDK lists a transcript that holds no message (a stub left by the
+    // title and bookkeeping records written after a delete) with a title;
+    // loading it fails. Left out, as the session index leaves it out.
+    const withMessages = await Promise.all(
+      page.map((session) =>
+        session.cwd
+          ? transcriptHasMessages(
+              path.join(
+                projectsRoot(),
+                encodeProjectPath(session.cwd),
+                `${session.sessionId}.jsonl`,
+              ),
+            )
+          : false,
+      ),
+    );
     const visible = [];
-    for (const session of page) {
-      if (!session.cwd) continue;
+    for (const [index, session] of page.entries()) {
+      if (!session.cwd || !withMessages[index]) continue;
       visible.push({
         sessionId: session.sessionId,
         cwd: session.cwd,

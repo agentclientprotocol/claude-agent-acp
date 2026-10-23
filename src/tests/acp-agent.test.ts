@@ -3491,6 +3491,62 @@ describe("session/list", () => {
     return new ClaudeAcpAgent({} as AcpClient, { log: () => {}, error: () => {} });
   }
 
+  it("leaves out a transcript that holds no message, which the SDK lists but cannot load", async () => {
+    const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-list-stubs-"));
+    const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = configDir;
+    try {
+      const directory = path.join(configDir, "projects", "-tmp-proj");
+      await mkdir(directory, { recursive: true });
+      const lines = (records: object[]) => records.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      const chat = "11111111-1111-4111-8111-111111111111";
+      const stub = "22222222-2222-4222-8222-222222222222";
+      const gone = "33333333-3333-4333-8333-333333333333";
+      await writeFile(
+        path.join(directory, `${chat}.jsonl`),
+        lines([
+          { type: "user", uuid: "u1", cwd: "/tmp/proj", message: { role: "user", content: "hi" } },
+          {
+            type: "assistant",
+            uuid: "a1",
+            cwd: "/tmp/proj",
+            message: { role: "assistant", content: [] },
+          },
+        ]),
+      );
+      // What Claude Code writes after `session/delete`: the title and its bookkeeping, no conversation.
+      await writeFile(
+        path.join(directory, `${stub}.jsonl`),
+        lines([
+          { type: "last-prompt", lastPrompt: "Review the diff", sessionId: stub },
+          { type: "ai-title", aiTitle: "Diff review", sessionId: stub },
+          { type: "atis-latch", atis: "", sessionId: stub },
+          { type: "cost-state", sessionId: stub, totalCostUSD: 0.2 },
+        ]),
+      );
+      const listed = (sessionId: string, summary: string) => ({
+        sessionId,
+        summary,
+        lastModified: Date.UTC(2026, 8, 24),
+        cwd: "/tmp/proj",
+      });
+      vi.mocked(listSessions).mockResolvedValueOnce([
+        listed(chat, "A chat"),
+        listed(stub, "Diff review"),
+        // A file not where its cwd says (moved): listed, not lost.
+        listed(gone, "Elsewhere"),
+      ]);
+
+      const result = await agent().listSessions({ cwd: "/tmp/proj" });
+
+      expect(result.sessions.map((session) => session.sessionId)).toEqual([chat, gone]);
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
+      await rm(configDir, { recursive: true, force: true });
+    }
+  });
+
   it("returns one page and a cursor while more sessions exist", async () => {
     vi.mocked(listSessions)
       .mockResolvedValueOnce(Array.from({ length: 1001 }, (_, index) => sdkSession(index)))
