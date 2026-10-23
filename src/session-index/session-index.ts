@@ -26,6 +26,8 @@ import { effectiveTitle, visibleTitle } from "./archive-title.js";
 import {
   canonicalPath,
   encodeProjectPath,
+  errorCode,
+  exists,
   isExactProjectDir,
   isSessionId,
   normalizePath,
@@ -58,6 +60,8 @@ import { isInLinkedWorktree, worktreeCounterparts } from "./worktrees.js";
 
 export const DEFAULT_LIST_LIMIT = 50;
 export const MAX_LIST_LIMIT = 200;
+/** Discovery could not establish which sessions the store contains. */
+export class SessionStoreUnavailableError extends Error {}
 /** Entries of the metadata cache: a few hundred bytes each, so the
  *  transcripts of a large history (tens of thousands) stay cached and deep
  *  pages do not read them again. */
@@ -96,6 +100,24 @@ export type TranscriptCandidate = {
   /** Tells a replaced file from one that grew. */
   ino: number;
 };
+
+type TranscriptFile = Pick<
+  TranscriptCandidate,
+  "sessionId" | "filePath" | "dirName" | "projectPath"
+>;
+
+/** Non-empty transcript files, with bounded stats shared by lists and id lookups. */
+async function transcriptCandidates(
+  files: readonly TranscriptFile[],
+): Promise<TranscriptCandidate[]> {
+  const stats = await statFiles(files.map(({ filePath }) => filePath));
+  return files.flatMap((file, i) => {
+    const current = stats[i];
+    return current?.isFile() && current.size > 0
+      ? [{ ...file, mtimeMs: current.mtimeMs, size: current.size, ino: current.ino }]
+      : [];
+  });
+}
 
 /** The cached metadata of one transcript. */
 type TranscriptMetadata = {
@@ -526,25 +548,16 @@ export class SessionIndex {
     const listed = await this.listings.namesOfAll(dirPaths);
     const files = dirs.flatMap(({ dirName, projectPath }, i) =>
       listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6))).map(
-        (name) => ({ name, filePath: path.join(root, dirName, name), dirName, projectPath }),
+        (name) => ({
+          sessionId: name.slice(0, -6),
+          filePath: path.join(root, dirName, name),
+          dirName,
+          projectPath,
+        }),
       ),
     );
-    const stats = await statFiles(files.map(({ filePath }) => filePath));
-    const all: TranscriptCandidate[] = [];
-    files.forEach(({ name, filePath, dirName, projectPath }, i) => {
-      const fileStats = stats[i];
-      if (!fileStats?.isFile() || fileStats.size === 0) return;
-      all.push({
-        sessionId: name.slice(0, -6),
-        filePath,
-        dirName,
-        projectPath,
-        mtimeMs: fileStats.mtimeMs,
-        size: fileStats.size,
-        ino: fileStats.ino,
-      });
-    });
-    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates: all };
+    const candidates = await transcriptCandidates(files);
+    return { dirs: [root, ...dirPaths], names: [rootNames, ...listed], candidates };
   }
 
   /**
@@ -578,6 +591,57 @@ export class SessionIndex {
       }),
       sessionDirs: dirPaths.filter((_, i) => dirStats[i]?.isDirectory()),
     };
+  }
+
+  /** Known ids in request order, using the same rows as the list.
+   *  Reads the project names once, then addresses only exact transcript filenames. */
+  async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
+    if (sessionIds.length === 0) return [];
+    const root = projectsRoot();
+    let projectEntries: string[];
+    try {
+      projectEntries = await fs.readdir(root);
+    } catch (cause) {
+      if (errorCode(cause) === "ENOENT" && !(await exists(root))) {
+        return [];
+      }
+      throw new SessionStoreUnavailableError("Session store could not be read", { cause });
+    }
+    const ids = sessionIds.filter(isSessionId);
+    let candidates = await transcriptCandidates(
+      projectEntries.flatMap((dirName) =>
+        ids.map((sessionId) => ({
+          sessionId,
+          filePath: path.join(root, dirName, `${sessionId}.jsonl`),
+          dirName,
+        })),
+      ),
+    );
+    if (CASE_INSENSITIVE_PATHS) {
+      const exact = await Promise.all(
+        candidates.map(async ({ filePath }) => {
+          try {
+            const actual = path.basename(await fs.realpath(filePath));
+            const expected = path.basename(filePath);
+            return actual === expected || actual.toLowerCase() !== expected.toLowerCase();
+          } catch {
+            return false;
+          }
+        }),
+      );
+      candidates = candidates.filter((_, i) => exact[i]);
+    }
+    const rows = await this.collectRows(candidates.sort(byMtimeDescending), {
+      inScope: scopeOf(undefined),
+      archived: "all",
+      wanted: Infinity,
+      unread: () => [],
+    });
+    const byId = new Map(rows.map((row) => [row.sessionId, row]));
+    return sessionIds.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
   }
 
   /** Every transcript file of `sessionId` (see {@link scanSession}). Empty

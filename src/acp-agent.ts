@@ -142,7 +142,11 @@ import {
   withAirMeta,
 } from "./air-extension.js";
 import * as sessionIndex from "./session-index/connection.js";
-import type { RenameSessionRequest, SessionIdRequest } from "./session-index/service.js";
+import type {
+  BatchGetSessionsRequest,
+  RenameSessionRequest,
+  SessionIdRequest,
+} from "./session-index/service.js";
 import type {
   ListSubscribeRequest,
   ListUnsubscribeRequest,
@@ -3202,13 +3206,16 @@ export class ClaudeAcpAgent {
     return this.sessionIndex.clientTitle(title);
   }
 
-  /** `_session/list/subscribe`, `_session/list/unsubscribe`, `_session/rename`,
+  /** `_session/batch_get`, `_session/list/subscribe`, `_session/list/unsubscribe`, `_session/rename`,
    *  `_session/archive`, `_session/unarchive`. */
   async subscribeSessionList(params: ListSubscribeRequest) {
     return this.sessionIndex.subscribeList(params);
   }
   async unsubscribeSessionList(params: ListUnsubscribeRequest) {
     return this.sessionIndex.unsubscribeList(params);
+  }
+  async batchGetSessions(params: BatchGetSessionsRequest) {
+    return this.sessionIndex.batchGet(params);
   }
   renameSessionTitle(params: RenameSessionRequest) {
     return this.sessionIndex.rename(params);

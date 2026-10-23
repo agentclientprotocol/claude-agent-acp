@@ -141,8 +141,8 @@ The `initialize` response of an AIR client carries the agent side of the extensi
 }
 ```
 
-The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
-An extension is active only when the client declared its capability. The client does not declare `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
+The agent list does not depend on the capabilities that AIR declares, except `sessionIndex`: the agent lists it, together with `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`, only for a client that declared `sessionIndex`.
+An extension is active only when the client declared its capability. The client does not declare `sessionBatchGet`, `sessionArchive`, `sessionRename`, `sessionListSubscribe` and `sessionWorktrees`.
 The response to a client that is not AIR has no `_meta.jetbrains` key.
 
 ### Capabilities
@@ -158,6 +158,7 @@ The response to a client that is not AIR has no `_meta.jetbrains` key.
 | `planFile`               | yes                 | Sends the path of the plan file in place of the plan text of an ExitPlanMode.                                   | [Plan file](#plan-file)                                 |
 | `backgroundSubagents`    | yes                 | Ends a prompt turn at its result while background subagents still run.                                          | [Background subagents](#background-subagents)           |
 | `sessionIndex`           | on request          | Pages, orders and annotates `session/list`; adds rename, archive and a list subscription.                       | [Session index](#session-index)                         |
+| `sessionBatchGet`        | with `sessionIndex` | Supports `_session/batch_get` for metadata of known session IDs.                                                | [Batch get](#batch-get)                                 |
 | `sessionArchive`         | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/archive` and `_session/unarchive`.    | [Archive](#archive)                                     |
 | `sessionRename`          | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/rename`.                              | [Rename](#rename)                                       |
 | `sessionListSubscribe`   | with `sessionIndex` | Nothing on its own: the agent lists it to tell that it supports `_session/list/subscribe`.                      | [List subscription](#list-subscription)                 |
@@ -1282,8 +1283,8 @@ The session index makes `session/list` a bounded, ordered page with row metadata
 
 AIR declares `sessionIndex` in `_meta.jetbrains.air.capabilities`.
 Unlike the other capabilities, the agent advertises `sessionIndex` only to a client that declared it, and never under ACP v2.
-Exactly when it advertises `sessionIndex`, the agent also advertises `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)).
-The client does not declare these four; declaring them without `sessionIndex` enables nothing.
+Exactly when it advertises `sessionIndex`, the agent also advertises `sessionBatchGet` (it supports `_session/batch_get`), `sessionArchive` (it supports `_session/archive` and `_session/unarchive`), `sessionRename` (it supports `_session/rename`), `sessionListSubscribe` (it supports `_session/list/subscribe` and `_session/list/unsubscribe`) and `sessionWorktrees` (rows carry `agentWorktree`, see [List response](#list-response)).
+The client does not declare these five; declaring them without `sessionIndex` enables nothing.
 Everything in this section applies only to such a client, except where [Delete and close](#delete-and-close) says otherwise.
 A client without the capability gets the `session/list` of before: the SDK `listSessions` call, pages of 1000 by file mtime, `offset:N` cursors, and no row `_meta`.
 It gets no new notification, and the adapter starts no watcher for it.
@@ -1442,6 +1443,62 @@ In all of the session index methods and in `session/delete`, a session id matche
 Loading an archived session does not unarchive it.
 The CLI cleanup still deletes old transcripts (`cleanupPeriodDays`), archived or not.
 
+### Batch get
+
+`_session/batch_get` refreshes metadata for retained session IDs, such as pinned
+sessions and folder members outside the recent list page. Check for
+`sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
+calling it.
+
+The params object must contain only `sessionIds`: an array of 0–100 distinct,
+non-empty strings. IDs match exactly, without trimming or case normalization.
+Malformed params, duplicates, more than 100 IDs, or extra fields return
+`Invalid params` (`-32602`). Archived sessions and sessions in other projects
+or worktrees are eligible.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "_session/batch_get",
+  "params": { "sessionIds": ["oldA", "oldB", "oldC"] }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "sessions": [
+      {
+        "sessionId": "oldA",
+        "cwd": "/project",
+        "title": "Fix the build",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "_meta": { "jetbrains": { "air": { "version": 1, "archived": false } } }
+      }
+    ]
+  }
+}
+```
+
+The example IDs are placeholders for stored Claude session UUIDs. `sessions`
+contains the same full rows as `session/list` without a project filter, including
+archived sessions and `_meta.jetbrains.air`. Copies use the same
+newest-readable-copy selection as the list. Returned sessions preserve their
+relative request order. Absent, unreadable or ambiguous IDs are omitted.
+
+`{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
+A store-wide failure, such as an unreadable projects root, rejects the request.
+Individual results reflect the store as each ID is read.
+
+Lookup addresses only the requested transcript filenames in each project
+and reads their metadata. Work depends on the requested IDs and project
+directories, rather than the total session history. Merge returned rows with
+the recent page by `sessionId`. A batch read does not expand an existing list
+subscription's scope; refresh retained IDs outside that scope explicitly.
+
 ### List subscription
 
 `_session/list/subscribe { "cwd": "…" }` returns `{ "subscriptionId": "…" }`.
@@ -1465,6 +1522,7 @@ From then on the agent sends `_session/list/changes` notifications for the sessi
 
 - `cwd` is required and must be an absolute path; a missing, non-string or relative `cwd` is `-32602`. Other parameters are ignored.
 - The scope is the sessions of `cwd` and of the same subdirectory in every existing linked worktree of its repository, as a list with `includeWorktrees: true` resolves it, in any archive state. Sidechain and subagent transcripts are left out, as in the list.
+- There is no page or recent-session limit: changes to older pinned or folder sessions within that scope are reported even outside the page AIR loaded. Pinned IDs outside the subscribed project and worktrees are not tracked; `_session/batch_get` does not add them to the subscription. AIR must subscribe to their project scope or refresh them explicitly.
 - `sessions` holds the full current row of each session in scope that appeared, or whose `title`, `lastPromptAt`, `state`, `lastTurnEndedAt`, `cost`, `model`, `forkedFrom`, `agentWorktree` or `archived` changed since the last row sent for it on this subscription. A row is exactly the row of `session/list`, `_meta.jetbrains.air` included.
 - After subscribe, the first change of each session sends its row in full, even when only `updatedAt` changed. From then on, a change of `updatedAt` alone sends nothing; the new `updatedAt` comes with the next change.
 - `removed` holds the ids of sessions that left the scope: deleted (the transcript is gone), or moved to a path outside it. It may name a session the client does not list (one it never listed, one the list hides, such as a session continued in another one when that one changes); the client ignores such an id.
@@ -1517,6 +1575,7 @@ Names and semantics follow them; the transport differs, and so do the `archived`
 | capability `sessionIndex` (`_meta.jetbrains.air`)                                                 | `sessionCapabilities.list.limit`                                                                                                                                                                                |
 | capability `sessionArchive` (`_meta.jetbrains.air`)                                               | `sessionCapabilities.archive` (#2161)                                                                                                                                                                           |
 | capability `sessionRename` (`_meta.jetbrains.air`)                                                | `sessionCapabilities.setTitle` (#1987)                                                                                                                                                                          |
+| capability `sessionBatchGet`, `_session/batch_get`                                                | none                                                                                                                                                                                                            |
 | `_meta.jetbrains.air.list.limit`                                                                  | `session/list` `limit`                                                                                                                                                                                          |
 | `_meta.jetbrains.air.list.includeWorktrees`                                                       | `session/list` `includeWorktrees`                                                                                                                                                                               |
 | `_meta.jetbrains.air.list.archived` (`"unarchived"`, `"archived"`, `"all"`)                       | `session/list` `archived` (#2161), a boolean there                                                                                                                                                              |
