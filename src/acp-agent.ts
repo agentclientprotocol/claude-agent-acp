@@ -4330,10 +4330,28 @@ export class ClaudeAcpAgent {
 
     // "A turn is running" = the queue holds an unsettled turn. This covers both
     // the activated turn and one just submitted but not yet echoed/activated,
-    // which is exactly the window in which steering is meaningful. This check
+    // which is exactly the window in which steering is meaningful. The final check
     // and the active-path push below stay in one synchronous section so the
     // turn cannot settle in the gap between deciding to inject and enqueueing.
-    const turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    let turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    let adapterRemoteControl = false;
+    if (
+      turnInFlight &&
+      parseRemoteControlCommand(params.prompt) &&
+      supportsRemoteControl(session.query)
+    ) {
+      adapterRemoteControl = !claudeCodeOffersCommand(
+        await session.query.supportedCommands(),
+        session.terminalSlashCommands,
+        REMOTE_CONTROL_COMMAND_NAME,
+      );
+      if (session.tornDown || this.sessions[sessionId] !== session || session.queryClosed) {
+        throw RequestError.internalError(undefined, SESSION_ENDED_MESSAGE);
+      }
+      // Command discovery can outlive the turn. Recheck before choosing the
+      // idle path or marking and pushing into the current turn.
+      turnInFlight = (session.turnQueue ?? []).find((turn) => !turn.settled);
+    }
     if (!turnInFlight) {
       const promptRequest: PromptRequest = {
         sessionId,
@@ -4358,6 +4376,13 @@ export class ClaudeAcpAgent {
         this.logger.error(`Session ${sessionId}: steered new turn failed: ${error}`);
       });
       return { outcome: "startedNewTurn" };
+    }
+
+    if (adapterRemoteControl) {
+      throw RequestError.invalidRequest(
+        undefined,
+        "Remote Control can't be changed while Claude is working. Try again when the turn ends.",
+      );
     }
 
     const promptRequest: PromptRequest = {
