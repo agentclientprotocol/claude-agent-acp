@@ -492,6 +492,18 @@ describe("NativeSubagentRuntime lifecycle", () => {
       expect(update).not.toHaveProperty("prompt");
       expect(update.task).toBe("Investigate failure");
     });
+
+    it("names the model the launch asked for and a background launch in _meta.claudeCode (#1172)", async () => {
+      const update = await spawned(
+        {},
+        { description: "Investigate failure", model: "haiku", run_in_background: true },
+      );
+
+      expect(update._meta).toEqual({ claudeCode: { model: "haiku", background: true } });
+
+      const plain = await spawned({}, { description: "Investigate failure" });
+      expect(plain).not.toHaveProperty("_meta");
+    });
   });
 
   describe("resume after a terminal state", () => {
@@ -890,6 +902,23 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         },
       },
     ]);
+  });
+
+  it("announces the model the launch asked for and a background launch in _meta.claudeCode (#1172)", async () => {
+    const { published } = await runningWorker({ model: "haiku", run_in_background: true });
+
+    expect(published[0]).toEqual({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "subagent_update",
+        sessionId: "worker-1",
+        title: "Explore",
+        description: "Fix the build",
+        capabilities: { cancel: {} },
+        state: { state: "running" },
+        _meta: { claudeCode: { model: "haiku", background: true } },
+      },
+    });
   });
 
   it("sends a foreground child's answer to its parent as the child's reply", async () => {
