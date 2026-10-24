@@ -3403,7 +3403,9 @@ export class ClaudeAcpAgent {
     try {
       const cliPath = await claudeCliPath();
       const args = ["auth", "status", "--json"];
-      if (context?.override) args.push("--settings", JSON.stringify(context.override));
+      // `--settings` is a global CLI option: after the `auth status` subcommand the CLI rejects
+      // it with "unknown option '--settings'", so it has to come first.
+      if (context?.override) args.unshift("--settings", JSON.stringify(context.override));
       ({ stdout } = await execFileAsync(cliPath, args, {
         timeout: AUTH_STATUS_PROBE_TIMEOUT_MS,
         cwd: context?.manager.getCwd() ?? process.cwd(),
