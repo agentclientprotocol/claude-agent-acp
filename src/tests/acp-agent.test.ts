@@ -17290,7 +17290,7 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
     const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
-    expect(messageChunkTexts(updates)).toEqual(["**Warning:** hook says no"]);
+    expect(messageChunkTexts(updates)).toEqual(["\n\n> **Warning:** hook says no\n\n"]);
     expect(chunks[0]?.update).toMatchObject({
       _meta: { claudeCode: { kind: "informational", level: "warning" } },
     });
@@ -17313,10 +17313,31 @@ describe("assembled assistant text fallback", () => {
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
 
     const chunks = updates.filter(({ update }) => update.sessionUpdate === "agent_message_chunk");
-    expect(messageChunkTexts(updates)).toEqual(["plain hook detail"]);
+    expect(messageChunkTexts(updates)).toEqual(["\n\n> plain hook detail\n\n"]);
     expect(chunks[0]?.update).toMatchObject({
       _meta: { claudeCode: { kind: "informational", level: "info" } },
     });
+  });
+
+  it("renders a multi-line hook notice as one quote with a single speaker prefix", async () => {
+    const { agent, updates } = createMockAgentWithCapture();
+    injectSession(agent, [
+      {
+        type: "system",
+        subtype: "informational",
+        content: "Stop says: token: 3 calls\nStop says: hand off now",
+        level: "notice",
+        session_id: "test-session",
+      },
+      result(),
+      idle,
+    ]);
+
+    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "1+2" }] });
+
+    expect(messageChunkTexts(updates)).toEqual([
+      "\n\n> **Notice:** Stop says: token: 3 calls\n> hand off now\n\n",
+    ]);
   });
 
   it("delivers an informational frame as a notice and still owns the result text", async () => {

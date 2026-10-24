@@ -50,9 +50,33 @@ export function noticeOrTranscriptUpdate(
   if (supportsNotices) return noticeUpdate(notice);
   return {
     sessionUpdate: "agent_message_chunk",
-    content: { type: "text", text: transcriptText },
+    content: { type: "text", text: transcriptBlock(transcriptText) },
     ...(transcriptMeta ? { _meta: transcriptMeta } : {}),
   };
+}
+
+/** Clients render consecutive agent_message_chunks as one markdown stream, so
+ *  a bare `**Notice:** …` chunk lands mid-sentence: "…all done.**Notice:** Stop
+ *  says: …". Put it in its own blockquote paragraph, blank lines on both sides,
+ *  so it starts on a new line and Claude's next chunk does not continue the
+ *  quote. */
+export function transcriptBlock(text: string): string {
+  const lines = text.trim().split(/\r?\n/);
+  return `\n\n${lines.map((line) => (line ? `> ${line}` : ">")).join("\n")}\n\n`;
+}
+
+const HOOK_SPEAKER = /^[^\n:]{1,80} says: /;
+
+/** Claude Code prefixes every line of a hook's `systemMessage` with
+ *  "<HookEvent> says: ", so a two-line message reads "Stop says: a\nStop says:
+ *  b". Keep the prefix on the first line only when every line repeats it. */
+export function collapseHookSpeaker(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const prefix = lines[0].match(HOOK_SPEAKER)?.[0];
+  if (!prefix || lines.length < 2 || !lines.every((line) => line.startsWith(prefix))) {
+    return text;
+  }
+  return [lines[0], ...lines.slice(1).map((line) => line.slice(prefix.length))].join("\n");
 }
 
 /** Fragments that read on after a bold label stand alone as a notice
