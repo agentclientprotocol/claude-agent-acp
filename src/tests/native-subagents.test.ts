@@ -814,6 +814,19 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         },
       },
     }) as AcpSessionNotification;
+  const sendMessageResult = (
+    toolCallId: string,
+    status: "completed" | "failed",
+  ): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status,
+        _meta: { claudeCode: { toolName: "SendMessage" } },
+      },
+    }) as AcpSessionNotification;
 
   /** A runtime whose child `worker-1` was launched by `launch-1` and runs. */
   async function runningWorker(input: Record<string, unknown> = {}) {
@@ -1300,10 +1313,15 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     await expect(runtime.route(output("launch-1"), async () => {})).resolves.toMatchObject({
       sessionId: "worker-1",
     });
-    await runtime.route(sendMessage("send-1"), async () => {});
+    // The SendMessage call is not shown: its message replaces it.
+    await expect(runtime.route(sendMessage("send-1"), async () => {})).resolves.toBeNull();
     await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
     // A repeated resume signal of the running child changes nothing.
     await runtime.sendMessageResumed("worker-1", async () => {}, "Check the tests too", "send-1");
+    // The SDK reports the delivery before the call's result, which stays hidden.
+    await expect(
+      runtime.route(sendMessageResult("send-1", "completed"), async () => {}),
+    ).resolves.toBeNull();
     await runtime.finishTask("worker-1", "completed", async () => {});
 
     expect(states(published)).toEqual([
@@ -1312,21 +1330,19 @@ describe("NativeSubagentRuntime in the RFD form", () => {
       { state: "running" },
       { state: "idle", stopReason: "end_turn" },
     ]);
-    // The SendMessage call stays a tool call of its sender, so its message has
-    // only the child's view, with no reference.
+    // As a launch's prompt, the message goes to both, each view naming the other.
+    const message = {
+      sessionUpdate: "session_message",
+      messageId: "send-1",
+      senderSessionId: "root",
+      recipientSessionId: "worker-1",
+      content: [{ type: "text", text: "Check the tests too" }],
+    };
     expect(published.filter(({ update }) => update.sessionUpdate === "session_message")).toEqual([
       expect.objectContaining({ sessionId: "root" }),
       expect.objectContaining({ sessionId: "worker-1" }),
-      {
-        sessionId: "worker-1",
-        update: {
-          sessionUpdate: "session_message",
-          messageId: "send-1",
-          senderSessionId: "root",
-          recipientSessionId: "worker-1",
-          content: [{ type: "text", text: "Check the tests too" }],
-        },
-      },
+      { sessionId: "root", update: { ...message, recipientMessageId: "send-1" } },
+      { sessionId: "worker-1", update: { ...message, senderMessageId: "send-1" } },
     ]);
     expect(
       published.some(({ update }) => "sessionId" in update && update.sessionId !== "worker-1"),
@@ -1371,7 +1387,22 @@ describe("NativeSubagentRuntime in the RFD form", () => {
         .map(
           ({ sessionId, update }) => `${sessionId} ${(update as { messageId: string }).messageId}`,
         ),
-    ).toEqual(["root launch-1", "worker-1 launch-1", "worker-1 send-1"]);
+    ).toEqual(["root launch-1", "worker-1 launch-1", "root send-1", "worker-1 send-1"]);
+  });
+
+  it("shows a SendMessage call whose message reached no announced child", async () => {
+    const { runtime, published } = await runningWorker();
+    published.length = 0;
+    // A message to the parent, or to an agent this client was never shown,
+    // resumes no announced child.
+    await expect(runtime.route(sendMessage("send-2"), async () => {})).resolves.toBeNull();
+    await expect(
+      runtime.route(sendMessageResult("send-2", "completed"), async () => {}),
+    ).resolves.toMatchObject({
+      sessionId: "root",
+      update: { sessionUpdate: "tool_call", toolCallId: "send-2", status: "completed" },
+    });
+    expect(published).toEqual([]);
   });
 
   it("ignores a SendMessage result that arrives after the run it started ended", async () => {
@@ -1547,12 +1578,24 @@ describe("NativeSubagentRuntime in the RFD form", () => {
           },
         },
         {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "send-1",
+            senderSessionId: "root",
+            recipientSessionId: "echoer-1",
+            recipientMessageId: "send-1",
+            content: [{ type: "text", text: "Say PING" }],
+          },
+        },
+        {
           sessionId: "echoer-1",
           update: {
             sessionUpdate: "session_message",
             messageId: "send-1",
             senderSessionId: "root",
             recipientSessionId: "echoer-1",
+            senderMessageId: "send-1",
             content: [{ type: "text", text: "Say PING" }],
           },
         },
@@ -1630,7 +1673,7 @@ describe("NativeSubagentRuntime in the RFD form", () => {
 
       expect(
         published.map(({ sessionId, update }) => `${sessionId} ${update.sessionUpdate}`),
-      ).toEqual(["root subagent_update", "echoer-1 session_message"]);
+      ).toEqual(["root subagent_update", "root session_message", "echoer-1 session_message"]);
     });
 
     it("keeps an agent that the history cannot place, or not read, unexposed", async () => {

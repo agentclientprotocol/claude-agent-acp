@@ -16,6 +16,12 @@
  * Unlike live, the replay does not tell runs apart, so a child that handed
  * back any report gets no reply from its launch's result.
  *
+ * A SendMessage call whose message the replay delivered to a child before it
+ * reached the call is that message too: the sender's outgoing view, at the
+ * call, and the child's incoming one, in the child's history. A child's
+ * history follows its launch, so a call to a child from its parent is always
+ * delivered first. Any other SendMessage call stays a tool call.
+ *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
  * parent, and a notice says that subagent history is missing.
@@ -64,7 +70,12 @@ type SendMessageCall = {
   to: string;
   message: string;
   senderSessionId: string;
-  delivered: boolean;
+  /** The child the replay delivered the message to. */
+  recipientSessionId?: string;
+  /** The replay reached the call before the delivery, so it stays a tool call. */
+  shownAsToolCall: boolean;
+  /** The sender's view of the message went out, at the call. */
+  outgoingSent: boolean;
 };
 
 export class RfdSubagentReplay {
@@ -108,7 +119,8 @@ export class RfdSubagentReplay {
                 to: input.to,
                 message: input.message,
                 senderSessionId: ownerSessionId,
-                delivered: false,
+                shownAsToolCall: false,
+                outgoingSent: false,
               });
             }
           }
@@ -194,10 +206,11 @@ export class RfdSubagentReplay {
   /**
    * Takes a replayed update of a tool call, from the transcript of `owner`
    * when it is a child's. Returns whether the client is not shown it: an
-   * update of the launch of a child that the replay shows, or of a successful
+   * update of the launch of a child that the replay shows, of a SendMessage
+   * call whose message the replay already delivered, or of a successful
    * SubagentHandback call of `owner`. A foreground launch's completed result
-   * goes out as the child's reply, and a hand-back as the child's message to
-   * its parent.
+   * goes out as the child's reply, a delivered SendMessage as the sender's
+   * outgoing message, and a hand-back as the child's message to its parent.
    */
   async toolCallUpdate(
     update: AcpSessionNotification["update"],
@@ -205,6 +218,24 @@ export class RfdSubagentReplay {
   ): Promise<boolean> {
     if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
       return false;
+    }
+    const sendMessage = this.sendMessages.find((call) => call.toolUseId === update.toolCallId);
+    if (sendMessage) {
+      if (sendMessage.recipientSessionId === undefined) {
+        sendMessage.shownAsToolCall = true;
+        return false;
+      }
+      if (!sendMessage.outgoingSent) {
+        sendMessage.outgoingSent = true;
+        const [outgoing] = linkedSessionMessages(
+          sendMessage.toolUseId,
+          sendMessage.senderSessionId,
+          sendMessage.recipientSessionId,
+          sendMessage.message,
+        );
+        if (outgoing) await this.publish(outgoing);
+      }
+      return true;
     }
     const handback = owner ? this.handbacks.get(update.toolCallId) : undefined;
     if (owner && handback && !handback.failed) {
@@ -355,6 +386,9 @@ export class RfdSubagentReplay {
    * first undelivered SendMessage to the child whose message the delivered
    * text contains. With that call, the message has the call's id and text and
    * its sender, as live; without it, its transcript id and the delivered text.
+   * Unless the replay already showed the call as a tool call, the message
+   * replaces it, so this view names the sender's view, which goes out at the
+   * call (see {@link toolCallUpdate}).
    */
   private async sendDelivery(
     child: ReplayChild,
@@ -364,13 +398,15 @@ export class RfdSubagentReplay {
     const names = [child.sessionId, child.record.name, child.input.name];
     const call = this.sendMessages.find(
       (candidate) =>
-        !candidate.delivered &&
+        candidate.recipientSessionId === undefined &&
         names.includes(candidate.to) &&
         text.includes(candidate.message.trim()),
     );
     if (call) {
-      call.delivered = true;
-      await this.sendMessage(child, call.toolUseId, call.message, call.senderSessionId);
+      call.recipientSessionId = child.sessionId;
+      await this.sendMessage(child, call.toolUseId, call.message, call.senderSessionId, {
+        linked: !call.shownAsToolCall,
+      });
     } else {
       await this.sendMessage(child, message.uuid, text, undefined);
     }
@@ -381,6 +417,7 @@ export class RfdSubagentReplay {
     messageId: string,
     text: string,
     sender: string | undefined,
+    { linked = false }: { linked?: boolean } = {},
   ): Promise<void> {
     await this.publish({
       sessionId: child.sessionId,
@@ -389,6 +426,7 @@ export class RfdSubagentReplay {
         messageId,
         ...(sender ? { senderSessionId: sender } : {}),
         recipientSessionId: child.sessionId,
+        ...(linked ? { senderMessageId: messageId } : {}),
         content: [{ type: "text", text }],
       },
     });

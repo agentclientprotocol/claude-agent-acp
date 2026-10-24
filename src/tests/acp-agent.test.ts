@@ -4058,11 +4058,13 @@ describe("subagent transcript replay", () => {
         "def456 agent_message_chunk X.",
         "abc123 session_message toolu_nested:reply from=def456 The spec says X.",
         // The delivered message has the id, text, and sender of its SendMessage
-        // call, which stays a tool call of its sender.
-        "abc123 session_message toolu_send from=" + sessionId + " Check the tests too",
+        // call, which it replaces: the sender's view goes out at the call.
+        "abc123 session_message toolu_send from=" +
+          sessionId +
+          " senderMessageId=toolu_send Check the tests too",
         "abc123 agent_message_chunk Tests pass.",
         "root session_message toolu_agent:reply from=abc123 Found it.",
-        "root tool_call toolu_send",
+        `root session_message toolu_send from=${sessionId} recipientMessageId=toolu_send Check the tests too`,
         "root agent_message_chunk Done.",
         // Every end comes before the response.
         'abc123 subagent_update def456 {"state":"idle","stopReason":"end_turn"}',
@@ -4097,6 +4099,55 @@ describe("subagent transcript replay", () => {
         // Any other child's process is gone: its replayed end is its current
         // state, and nothing can cancel it.
         'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
+    it("keeps a SendMessage call that the replay reaches before its delivery as a tool call", async () => {
+      const launch = (id: string, name: string) =>
+        toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
+      const meta = (name: string, launchId: string) => ({
+        agentType: "Explore",
+        name,
+        toolUseId: launchId,
+        requestShape: "foreground",
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [launch("toolu_a", "alpha"), launch("toolu_b", "beta")]),
+          user("u2", [toolResult("toolu_a", "A."), toolResult("toolu_b", "B.")]),
+        ],
+        {
+          // alpha's history, which replays first, messages beta.
+          aaa111: {
+            meta: meta("alpha", "toolu_a"),
+            records: [
+              user("a1", "Run alpha"),
+              assistant("a2", [
+                toolUse("toolu_sib", "SendMessage", { to: "bbb222", message: "Ping sibling" }),
+              ]),
+              user("a3", [toolResult("toolu_sib", "Message sent.")]),
+            ],
+          },
+          bbb222: {
+            meta: meta("beta", "toolu_b"),
+            records: [
+              user("b1", "Run beta"),
+              user(
+                "b2",
+                "The coordinator sent a message while you were working:\nPing sibling\n\nAddress this before completing your current task.",
+                { isMeta: true, origin: { kind: "coordinator" } },
+              ),
+            ],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("toolu_sib"))).toEqual([
+        // The call came first, so it stays a tool call, and the message that
+        // arrives later names no other view.
+        "aaa111 tool_call toolu_sib",
+        "bbb222 session_message toolu_sib from=aaa111 Ping sibling",
       ]);
     });
 
@@ -7754,6 +7805,18 @@ describe("subagent permission attribution (issue #851)", () => {
             state: { state: "running" },
           },
         },
+        // The SendMessage call's message replaces it, as a launch's does.
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_send",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_send",
+            content: [{ type: "text", text: "Also check Windows" }],
+          },
+        },
         {
           sessionId: "agent-42",
           update: {
@@ -7761,6 +7824,7 @@ describe("subagent permission attribution (issue #851)", () => {
             messageId: "toolu_send",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_send",
             content: [{ type: "text", text: "Also check Windows" }],
           },
         },
@@ -7905,6 +7969,7 @@ describe("subagent permission attribution (issue #851)", () => {
               messageId: "toolu_send",
               senderSessionId: "test-session",
               recipientSessionId: "agent-7",
+              senderMessageId: "toolu_send",
               content: [{ type: "text", text: "Say PING" }],
             },
           },
@@ -7924,6 +7989,17 @@ describe("subagent permission attribution (issue #851)", () => {
             },
           },
         ]);
+        // The root has the message instead of the completed SendMessage call.
+        const root = updates.flatMap(({ sessionId, update }) =>
+          sessionId === "test-session" &&
+          "toolCallId" in update &&
+          update.toolCallId === "toolu_send"
+            ? [update.sessionUpdate]
+            : sessionId === "test-session" && update.sessionUpdate === "session_message"
+              ? [`session_message ${update.messageId} to=${update.recipientSessionId}`]
+              : [],
+        );
+        expect(root).toEqual(["session_message toolu_send to=agent-7"]);
       } finally {
         if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
         else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;

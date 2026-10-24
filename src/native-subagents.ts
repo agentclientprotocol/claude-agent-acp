@@ -165,6 +165,15 @@ export class NativeSubagentRuntime {
    */
   private readonly hiddenLaunches = new Map<string, { background: boolean }>();
   /**
+   * The RFD form: the SendMessage calls that the client is not shown, until
+   * their final update, with their first report and the session that made
+   * them. A message that reaches an announced child replaces its call.
+   */
+  private readonly hiddenSendMessages = new Map<
+    string,
+    { initial: AcpSessionNotification; sender: string; delivered: boolean }
+  >();
+  /**
    * The RFD form: the SubagentHandback calls of announced children that the
    * client is not shown yet, with their first report, the report from their
    * input, and the call that delegated the run.
@@ -223,8 +232,9 @@ export class NativeSubagentRuntime {
     forcedSessionId?: string,
   ): Promise<AcpSessionNotification | null> {
     const routed = await this.routeUpdate(notification, deliver, forcedSessionId);
-    if (routed) this.rememberSendMessage(routed);
-    return routed;
+    if (!routed) return routed;
+    this.rememberSendMessage(routed);
+    return this.form === "rfd" ? this.routeRfdSendMessage(routed, forcedSessionId) : routed;
   }
 
   /**
@@ -1007,13 +1017,16 @@ export class NativeSubagentRuntime {
       });
     }
     if (prompt && toolUseId) {
+      const sendMessage = this.hiddenSendMessages.get(toolUseId);
       await publishPrompt(
         child,
         prompt,
         toolUseId,
-        this.senderByToolUse.get(toolUseId),
+        sendMessage?.sender ?? this.senderByToolUse.get(toolUseId),
         this.publish,
+        { replacesCall: sendMessage !== undefined },
       );
+      if (sendMessage) sendMessage.delivered = true;
     }
     for (const pending of toolUseId ? this.takePending(toolUseId) : []) await deliver(pending);
   }
@@ -1221,6 +1234,44 @@ export class NativeSubagentRuntime {
     return unexposedControlFallback(handback.initial, notification, child.sessionId);
   }
 
+  /**
+   * The RFD form: an update of a SendMessage call, which its message replaces
+   * once it reaches an announced child: the sender's outgoing view and the
+   * child's incoming one, see {@link linkedSessionMessages}. The SDK reports
+   * that delivery before the call's final update. A call whose message reached
+   * no announced child, such as one to the parent, is shown after all, with its
+   * final status. Any other update is returned as is.
+   */
+  private routeRfdSendMessage(
+    notification: AcpSessionNotification,
+    forcedSessionId: string | undefined,
+  ): AcpSessionNotification | null {
+    const { update } = notification;
+    if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+      return notification;
+    }
+    const toolCallId = update.toolCallId;
+    // A permission request already showed the call to the client, so it keeps
+    // getting its updates, and its message goes only to the child.
+    if (forcedSessionId) {
+      this.hiddenSendMessages.delete(toolCallId);
+      return notification;
+    }
+    let sendMessage = this.hiddenSendMessages.get(toolCallId);
+    if (!sendMessage) {
+      const claudeMeta = update._meta?.claudeCode as { toolName?: string } | undefined;
+      if (update.sessionUpdate !== "tool_call" || claudeMeta?.toolName !== "SendMessage") {
+        return notification;
+      }
+      sendMessage = { initial: notification, sender: notification.sessionId, delivered: false };
+      this.hiddenSendMessages.set(toolCallId, sendMessage);
+    }
+    if (!isFinalToolCallStatus(update.status)) return null;
+    this.hiddenSendMessages.delete(toolCallId);
+    if (sendMessage.delivered) return null;
+    return unexposedControlFallback(sendMessage.initial, notification, sendMessage.sender);
+  }
+
   /** Whether `update` is of an Agent/Task call, by its tool name or, in the
    *  RFD form, by the id of a call the client is not shown. */
   private isControlUpdate(
@@ -1283,6 +1334,7 @@ export class NativeSubagentRuntime {
     this.taskFinishPromises.clear();
     this.senderByToolUse.clear();
     this.hiddenLaunches.clear();
+    this.hiddenSendMessages.clear();
     this.handbacks.clear();
     this.generationByTaskId.clear();
     this.pending.clear();
@@ -1461,7 +1513,7 @@ export async function announceNativeSubagent(
           child.parentToolUseId,
           child.parentSessionId,
           publish,
-          { replacesLaunch: true },
+          { replacesCall: true },
         );
       }
       return;
@@ -1523,9 +1575,9 @@ export async function finishNativeSubagent(
  * transcript is the same delegation and is not sent again. `sender` is the
  * session that made that call, when known.
  *
- * A launch's prompt (`replacesLaunch`) also goes to the parent, see
- * {@link linkedSessionMessages}. A SendMessage call stays a tool call of the
- * sender, so its message has only the incoming view.
+ * When the message replaces its call (`replacesCall`), a launch's or a
+ * SendMessage call the client is not shown, it also goes to the sender, see
+ * {@link linkedSessionMessages}. Otherwise it has only the incoming view.
  */
 async function publishPrompt(
   child: NativeSubagent,
@@ -1533,13 +1585,13 @@ async function publishPrompt(
   toolUseId: string | undefined,
   sender: string | undefined,
   publish: Publish,
-  { replacesLaunch = false }: { replacesLaunch?: boolean } = {},
+  { replacesCall = false }: { replacesCall?: boolean } = {},
 ): Promise<void> {
   child.promptIds ??= new Set();
   const messageId = toolUseId ?? `${child.sessionId}:prompt:${child.promptIds.size + 1}`;
   if (child.promptIds.has(messageId)) return;
   child.promptIds.add(messageId);
-  if (replacesLaunch && sender !== undefined && toolUseId !== undefined) {
+  if (replacesCall && sender !== undefined && toolUseId !== undefined) {
     for (const view of linkedSessionMessages(toolUseId, sender, child.sessionId, prompt)) {
       await publish(view);
     }
@@ -1561,8 +1613,9 @@ async function publishPrompt(
  * The RFD form: a message that a tool call sent, which the client is not
  * shown, as two session messages: the sender's outgoing view, then the
  * recipient's incoming one. That call is a launch's Agent/Task call, whose
- * prompt goes from the parent to the child, or a child's SubagentHandback
- * call, whose report goes from the child to the parent. Both views use the
+ * prompt goes from the parent to the child, a SendMessage call, whose message
+ * goes from its sender to a child, or a child's SubagentHandback call, whose
+ * report goes from the child to the parent. Both views use the
  * call's tool use id, and each names the other with the draft RFD's
  * `recipientMessageId` and `senderMessageId`.
  */
@@ -1832,7 +1885,8 @@ function isFailedToolCallUpdate(update: AcpSessionNotification["update"]): boole
  * A tool call that the client was not shown, as one `tool_call` with its
  * final status, shown after all: an Agent/Task call whose child was never
  * exposed (AIR's draft shows only a failed one, the RFD form also a completed
- * one), or a failed SubagentHandback call.
+ * one), a SendMessage call whose message reached no announced child, or a
+ * failed SubagentHandback call.
  */
 function unexposedControlFallback(
   initial: AcpSessionNotification | undefined,
