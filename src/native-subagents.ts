@@ -1718,13 +1718,41 @@ export function rfdLabels(
 }
 
 /**
- * The agent id that a successful SendMessage result resumed. The SDK puts it
- * in `tool_use_result.resumedAgentId` when a finished agent runs again.
+ * The agent id that a successful SendMessage result resumed. An inline
+ * handback reports it in `pin.id` instead of `resumedAgentId`.
  */
 export function resumedNativeSubagentId(toolUseResult: unknown): string | undefined {
   if (typeof toolUseResult !== "object" || toolUseResult === null) return undefined;
   const result = toolUseResult as { success?: unknown; resumedAgentId?: unknown };
-  return result.success === true ? nonBlankString(result.resumedAgentId) : undefined;
+  if (result.success !== true) return undefined;
+  return nonBlankString(result.resumedAgentId) ?? inlineNativeSubagentId(toolUseResult);
+}
+
+/** An inline handback is the completed run's reply, not a still-running task. */
+export function inlineNativeSubagentId(toolUseResult: unknown): string | undefined {
+  if (typeof toolUseResult !== "object" || toolUseResult === null) return undefined;
+  const result = toolUseResult as {
+    success?: unknown;
+    message?: unknown;
+    inlineHandback?: unknown;
+    pin?: unknown;
+  };
+  if (result.success !== true) return undefined;
+  // A pin also occurs on other successful results; only the observed resume
+  // handback identifies a child that ran again.
+  if (
+    typeof result.message !== "string" ||
+    !result.message.startsWith("Resumed agent.") ||
+    typeof result.inlineHandback !== "object" ||
+    result.inlineHandback === null ||
+    Array.isArray(result.inlineHandback) ||
+    typeof result.pin !== "object" ||
+    result.pin === null ||
+    Array.isArray(result.pin)
+  ) {
+    return undefined;
+  }
+  return nonBlankString((result.pin as { id?: unknown }).id);
 }
 
 /**

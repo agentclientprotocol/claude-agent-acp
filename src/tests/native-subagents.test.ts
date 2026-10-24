@@ -12,6 +12,80 @@ import {
   sendMessageResumePrompt,
 } from "../native-subagents.js";
 
+describe("resumedNativeSubagentId", () => {
+  const inlineResult = {
+    success: true,
+    message: "Resumed agent. Its report follows.",
+    inlineHandback: { status: "completed" },
+    pin: { id: "worker-1" },
+  };
+
+  it("recognizes a successful inline handback's pin without the legacy field", () => {
+    expect(resumedNativeSubagentId(inlineResult)).toBe("worker-1");
+  });
+
+  it("prefers the explicit legacy id when both formats are present", () => {
+    expect(resumedNativeSubagentId({ ...inlineResult, resumedAgentId: "legacy-worker" })).toBe(
+      "legacy-worker",
+    );
+    expect(resumedNativeSubagentId({ success: true, resumedAgentId: " legacy-worker " })).toBe(
+      "legacy-worker",
+    );
+  });
+
+  it("normalizes a nonblank inline handback id like the legacy field", () => {
+    expect(resumedNativeSubagentId({ ...inlineResult, pin: { id: " worker-1 " } })).toBe(
+      "worker-1",
+    );
+  });
+
+  it.each(["rfd", "air"] as const)(
+    "does not invent an unknown child's identity from an inline handback (%s)",
+    async (form) => {
+      const session: NativeSubagentSession = {};
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        session,
+        async (entry) => {
+          published.push(entry);
+        },
+        { log: () => {} },
+      );
+      const id = resumedNativeSubagentId(inlineResult);
+      expect(id).toBe("worker-1");
+      await runtime.sendMessageResumed(id!, async () => {}, "Continue", "send-1");
+      expect(session.nativeSubagentsByTaskId?.size).toBe(0);
+      expect(published).toEqual([]);
+    },
+  );
+
+  it.each([
+    null,
+    "worker-1",
+    {},
+    { ...inlineResult, success: false },
+    { ...inlineResult, success: "true" },
+    { ...inlineResult, success: undefined },
+    { ...inlineResult, message: "Message delivered" },
+    { ...inlineResult, message: undefined },
+    { ...inlineResult, message: 1 },
+    { ...inlineResult, inlineHandback: undefined },
+    { ...inlineResult, inlineHandback: null },
+    { ...inlineResult, inlineHandback: [] },
+    { ...inlineResult, inlineHandback: "completed" },
+    { ...inlineResult, pin: null },
+    { ...inlineResult, pin: [] },
+    { ...inlineResult, pin: "worker-1" },
+    { ...inlineResult, pin: {} },
+    { ...inlineResult, pin: { id: "   " } },
+    { ...inlineResult, pin: { id: 123 } },
+  ])("does not infer a resume from an unsuccessful or unrelated result: %j", (result) => {
+    expect(resumedNativeSubagentId(result)).toBeUndefined();
+  });
+});
+
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => {
