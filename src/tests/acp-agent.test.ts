@@ -7052,6 +7052,95 @@ describe("subagent permission attribution (issue #851)", () => {
     );
   });
 
+  it.each([
+    ["plain", {}, true],
+    ["rfd", { subagents: {} }, true],
+    ["air", AIR_NATIVE_SUBAGENTS, true],
+    ["plain", {}, false],
+    ["rfd", { subagents: {} }, false],
+    ["air", AIR_NATIVE_SUBAGENTS, false],
+  ])(
+    "does not reopen a completed inline-handback task or hold its prompt (%s, capabilities=%j, started=%s)",
+    async (_form, capabilities, taskStarts) => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (entry: AcpSessionNotification) => {
+            updates.push(entry);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: capabilities as ClientCapabilities,
+      });
+      const consumed = Promise.withResolvers<void>();
+      const close = Promise.withResolvers<void>();
+      const ended = (toolUseId: string) => ({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "agent-42",
+        tool_use_id: toolUseId,
+        status: "completed",
+        output_file: "",
+        summary: "done",
+        uuid: randomUUID(),
+        session_id: "test-session",
+      });
+      injectGeneratorSession(agent, async function* () {
+        yield rootToolUse("toolu_parent", "Agent");
+        yield { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" };
+        yield ended("toolu_parent");
+        yield rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" });
+        if (taskStarts) {
+          yield { ...taskStarted("agent-42", "toolu_send"), subagent_type: "Explore" };
+          yield ended("toolu_send");
+        }
+        const handback = {
+          type: "user",
+          parent_tool_use_id: null,
+          uuid: randomUUID(),
+          session_id: "test-session",
+          tool_use_result: {
+            success: true,
+            message: "Resumed agent. Its report follows.",
+            inlineHandback: { content: [] },
+            pin: { id: "agent-42" },
+          },
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: "toolu_send", content: "done" }],
+          },
+        };
+        yield handback;
+        yield handback;
+        yield successResult();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+        consumed.resolve();
+        // The SDK stays open after a turn; EOF must not be what settles the prompt.
+        await close.promise;
+      } as never);
+      const prompt = agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "go" }],
+      });
+      try {
+        await consumed.promise;
+        expect(agent.sessions["test-session"]?.liveBackgroundTasks.has("agent-42")).toBe(false);
+        const lifecycle = updates.filter(
+          ({ update }) => update.sessionUpdate === "subagent_spawned",
+        );
+        if (_form === "air") expect(lifecycle).toHaveLength(2);
+        await expect(prompt).resolves.toMatchObject({ stopReason: "end_turn" });
+      } finally {
+        close.resolve();
+        await agent.sessions["test-session"]?.consumer;
+        await prompt;
+      }
+    },
+  );
+
   describe("the subagents RFD, for a client that declares subagents and is not AIR", () => {
     // Each task_started names a subagent type: a task without one is not a subagent.
     /** The updates of `frames`, for a client that declares `subagents`. */
@@ -7525,6 +7614,66 @@ describe("subagent permission attribution (issue #851)", () => {
       );
       expect(order).toEqual(["idle", "output", "output", "idle"]);
     });
+
+    it.each([
+      ["completed", false],
+      ["failed", false],
+      ["completed", true],
+      ["failed", true],
+    ])(
+      "routes an inline-handback resume's tool lifecycle to the existing child (%s, running=%s)",
+      async (status, runningPatch) => {
+        const result = (toolUseId: string, extra: Record<string, unknown> = {}) => ({
+          type: "user",
+          parent_tool_use_id: toolUseId === "toolu_send" ? null : "toolu_send",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          message: {
+            role: "user",
+            content: [{ type: "tool_result", tool_use_id: toolUseId, content: "done", ...extra }],
+          },
+        });
+        const { agent, updates } = await runAgent([
+          { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
+          taskNotification("toolu_parent", "completed"),
+          rootToolUse("toolu_send", "SendMessage", { to: "agent-42", message: "Again" }),
+          ...(runningPatch ? [taskUpdated({ status: "running" })] : []),
+          // Inline handback has no resumedAgentId and need not send another task_started.
+          // Output can be buffered under the SendMessage id before its result.
+          {
+            ...rootToolUse("toolu_resumed", "Bash", { command: "echo resumed" }),
+            parent_tool_use_id: "toolu_send",
+          },
+          result("toolu_resumed", { is_error: status === "failed" }),
+          {
+            ...result("toolu_send"),
+            tool_use_result: {
+              success: true,
+              message: "Resumed agent. Its report follows.",
+              inlineHandback: { status: "completed" },
+              pin: { id: "agent-42" },
+            },
+          },
+        ]);
+
+        const tools = updates.filter(
+          ({ update }) =>
+            (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+            update.toolCallId === "toolu_resumed",
+        );
+        expect(tools.length).toBeGreaterThanOrEqual(2);
+        expect(tools[0]).toMatchObject({
+          sessionId: "agent-42",
+          update: { sessionUpdate: "tool_call", toolCallId: "toolu_resumed" },
+        });
+        expect(tools.at(-1)).toMatchObject({ sessionId: "agent-42", update: { status } });
+        expect(tools.every(({ sessionId }) => sessionId === "agent-42")).toBe(true);
+        expect(agent.sessions["test-session"]?.nativeSubagentsByTaskId?.size).toBe(1);
+        expect(
+          agent.sessions["test-session"]?.nativeSubagentsByTaskId?.get("agent-42")?.workState,
+        ).toBe("idle");
+      },
+    );
 
     it("keeps the resumed run's live task when an earlier delegation's end arrives late", async () => {
       const { agent } = await runAgent([
@@ -22409,6 +22558,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         parentToolUseId: "toolu_agent-1",
         isSubagent: true,
         backgrounded: true,
+        resumedWithoutTaskStart: true,
       });
       expect(
         updates.flatMap((n) =>
@@ -22476,6 +22626,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
         parentToolUseId: "toolu_agent-1",
         isSubagent: true,
         backgrounded: true,
+        resumedWithoutTaskStart: true,
       });
       expect(session.nativeSubagentsByTaskId?.get("agent-1")?.terminalState).toBeUndefined();
       expect(

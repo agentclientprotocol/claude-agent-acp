@@ -122,6 +122,7 @@ import {
   NativeSubagentRuntime,
   nativeSubagentState,
   resumedNativeSubagentId,
+  inlineNativeSubagentId,
   sendMessageResume,
   sendMessageResumePrompt,
 } from "./native-subagents.js";
@@ -1359,6 +1360,8 @@ export type Session = {
     {
       parentToolUseId?: string;
       isSubagent: boolean;
+      /** A resume signal restored this record without a new delegation id. */
+      resumedWithoutTaskStart?: true;
       /** The task's kind (`task_started.task_type`), such as `local_bash` or
        *  `local_workflow`. Absent when Claude Code did not say. */
       taskType?: string;
@@ -1413,6 +1416,8 @@ export type Session = {
    *  attribution stays the same. Bounded by
    *  `MAX_RESUMABLE_SUBAGENTS`, oldest first. */
   resumableSubagents?: Map<string, { parentToolUseId?: string }>;
+  /** Inline SendMessage replies already delivered and settled in this session. */
+  completedInlineReplies?: Set<string>;
   /** The latest `run_id` seen on each task's events, so a late frame of an
    *  earlier run is dropped (see `isLateTaskRun`). Run ids are per CLI
    *  process, as is a session. Bounded by `MAX_TASK_RUN_IDS`, oldest first. */
@@ -5183,7 +5188,10 @@ export class ClaudeAcpAgent {
       if (session.liveBackgroundTasks.has(taskId)) return;
       const settled = session.resumableSubagents?.get(taskId);
       // Claude Code always resumes a subagent in the background.
-      if (settled) registerLiveTask(taskId, settled.parentToolUseId, true, { backgrounded: true });
+      if (settled) {
+        registerLiveTask(taskId, settled.parentToolUseId, true, { backgrounded: true });
+        session.liveBackgroundTasks.get(taskId)!.resumedWithoutTaskStart = true;
+      }
     };
 
     /** Whether any background subagent this turn spawned is still live —
@@ -8206,25 +8214,64 @@ export class ClaudeAcpAgent {
               );
               const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
               if (resumedAgentId) {
+                const resultToolUseIds = Array.isArray(content)
+                  ? content.flatMap((block) =>
+                      block.type === "tool_result" ? [block.tool_use_id] : [],
+                    )
+                  : [];
                 const resume = sendMessageResume(
                   session.toolUseCache,
                   resumedAgentId,
-                  Array.isArray(content)
-                    ? content.flatMap((block) =>
-                        block.type === "tool_result" ? [block.tool_use_id] : [],
-                      )
-                    : [],
+                  resultToolUseIds,
                 );
-                // In the RFD form the result can arrive after the run it
-                // started ended, and then resumes nothing.
-                if (!subagents.isEndedDelegation(resumedAgentId, resume?.toolUseId)) {
-                  resumeLiveTask(resumedAgentId);
+                const inlineHandback =
+                  inlineNativeSubagentId(message.tool_use_result) === resumedAgentId;
+                const liveTask = session.liveBackgroundTasks.get(resumedAgentId);
+                const liveToolUseId = liveTask?.parentToolUseId;
+                const settled = session.resumableSubagents?.get(resumedAgentId);
+                const alreadySettledInline = resume
+                  ? session.completedInlineReplies?.has(resume.toolUseId)
+                  : resultToolUseIds.some((id) => session.completedInlineReplies?.has(id));
+                // The inline reply can follow task_notification in every
+                // client form. Its finished run must not be registered again.
+                const alreadyEnded =
+                  subagents.isEndedDelegation(resumedAgentId, resume?.toolUseId) ||
+                  alreadySettledInline ||
+                  (inlineHandback &&
+                    resume?.toolUseId !== undefined &&
+                    liveToolUseId !== undefined &&
+                    liveToolUseId !== resume.toolUseId &&
+                    !liveTask?.resumedWithoutTaskStart) ||
+                  (inlineHandback &&
+                    resume?.toolUseId !== undefined &&
+                    settled?.parentToolUseId === resume.toolUseId);
+                if (!alreadyEnded) {
+                  if (!inlineHandback) resumeLiveTask(resumedAgentId);
                   await subagents.sendMessageResumed(
                     resumedAgentId,
                     sendUpdate,
                     resume?.text,
                     resume?.toolUseId,
                   );
+                  if (inlineHandback) {
+                    // Drain any output buffered before the only resume signal,
+                    // then leave the child idle: its handback has already arrived.
+                    await subagents.finishTask(
+                      resumedAgentId,
+                      "completed",
+                      sendUpdate,
+                      subagents.form === "rfd" ? resume?.toolUseId : undefined,
+                    );
+                    settleLiveTask(resumedAgentId);
+                  }
+                }
+                if (inlineHandback && resume?.toolUseId) {
+                  (session.completedInlineReplies ??= new Set()).add(resume.toolUseId);
+                  while (session.completedInlineReplies.size > MAX_RESUMABLE_SUBAGENTS) {
+                    const oldest = session.completedInlineReplies.values().next().value;
+                    if (oldest === undefined) break;
+                    session.completedInlineReplies.delete(oldest);
+                  }
                 }
               }
             }
