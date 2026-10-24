@@ -6,7 +6,8 @@
  * `subagentHistory`). The replay announces each child right after that call,
  * under the session id it had live, the SDK agent id, and sends the child's
  * history to the child session. Every child's end goes out before the replay
- * ends, since no subagent from before the reload still runs.
+ * ends. These states are history to the client, so each child's current
+ * state goes out again after the load response (`currentStates`).
  *
  * As live, the parent is not shown the Agent or Task call of a child that the
  * replay announces: the launch's prompt is the parent's outgoing message, and
@@ -247,19 +248,19 @@ export class RfdSubagentReplay {
   }
 
   /**
-   * Sends the end of every announced child, and a notice when subagent history
-   * is missing. The end is the state of the child's last task notification,
-   * else `cancelled` for a child the user stopped, else the result of its
-   * foreground launch, else `idle` with no stop reason.
+   * Sends the end of every announced child (see `endState`), and a notice when
+   * subagent history is missing.
    */
   async finish(supportsNotices: boolean, rootSessionId: string): Promise<void> {
     for (const child of [...this.children.values()].reverse()) {
       if (!child.announced) continue;
-      const end = child.notified ?? (child.record.stoppedByUser ? "cancelled" : child.launchEnd);
-      const state: WorkState = end ? rfdEndState(end, undefined) : { state: "idle" };
       await this.publish({
         sessionId: child.parentSessionId,
-        update: { sessionUpdate: "subagent_update", sessionId: child.sessionId, state },
+        update: {
+          sessionUpdate: "subagent_update",
+          sessionId: child.sessionId,
+          state: endState(child),
+        },
       });
     }
     const missing = this.omitted.size + this.withoutHistory;
@@ -276,6 +277,38 @@ export class RfdSubagentReplay {
         }),
       });
     }
+  }
+
+  /**
+   * The current state of each announced child, to send after the load
+   * response. The RFD makes that response the freshness boundary: a client
+   * treats the replayed states before it as history, so they show no current
+   * activity and allow no cancel.
+   *
+   * `live` gives the work state of a child that still runs in this process, as
+   * when a live session is loaded again. Such a child reports that state and
+   * can be cancelled, as live. Any other child cannot be running, because the
+   * process that ran it is gone, so its replayed end is its current state.
+   */
+  currentStates(
+    live: (sessionId: string) => WorkState["state"] | undefined,
+  ): AcpSessionNotification[] {
+    return [...this.children.values()]
+      .filter((child) => child.announced)
+      .map((child) => {
+        const liveState = live(child.sessionId);
+        const state: WorkState =
+          liveState === undefined || liveState === "idle" ? endState(child) : { state: liveState };
+        return {
+          sessionId: child.parentSessionId,
+          update: {
+            sessionUpdate: "subagent_update",
+            sessionId: child.sessionId,
+            ...(liveState !== undefined ? { capabilities: { cancel: {} } } : {}),
+            state,
+          },
+        };
+      });
   }
 
   private registerLaunch(
@@ -374,6 +407,16 @@ export function replaySubagentTerminalState(
   return /\b(?:cancelled|canceled|interrupted|stopped|killed)\b/.test(text)
     ? "cancelled"
     : "failed";
+}
+
+/**
+ * How `child`'s work ended: the state of its last task notification, else
+ * `cancelled` for a child the user stopped, else the result of its foreground
+ * launch, else `idle` with no stop reason.
+ */
+function endState(child: ReplayChild): WorkState {
+  const end = child.notified ?? (child.record.stoppedByUser ? "cancelled" : child.launchEnd);
+  return end ? rfdEndState(end, undefined) : { state: "idle" };
 }
 
 function replayContentText(value: unknown, seen = new Set<unknown>()): string {

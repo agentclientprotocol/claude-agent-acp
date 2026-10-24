@@ -227,6 +227,16 @@ export class NativeSubagentRuntime {
     return routed;
   }
 
+  /**
+   * The RFD form: the work state that the client holds for the announced child
+   * `sessionId` of this live session, or undefined when no such child runs here.
+   */
+  liveWorkState(sessionId: string): WorkState["state"] | undefined {
+    if (this.form !== "rfd") return undefined;
+    const child = this.children.get(sessionId);
+    return child?.announced ? child.workState : undefined;
+  }
+
   /** Report the model of a child response, not the parent's model or a launch-time alias. */
   async reportModel(
     parentToolUseId: string | null,

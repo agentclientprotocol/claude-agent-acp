@@ -2715,6 +2715,11 @@ export class ClaudeAcpAgent {
    * express: see {@link ToolCallClientCapabilities.v2}.
    */
   private readonly v2: boolean;
+  /**
+   * The subagent replay of each session's last load, until
+   * {@link publishCurrentSubagentStates} sends its children's current states.
+   */
+  private readonly replayedSubagents = new Map<string, RfdSubagentReplay>();
   /** See the `foreground` constructor option. */
   private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
   /**
@@ -9680,6 +9685,7 @@ export class ClaudeAcpAgent {
     for (const message of messages) await replayMessage(message);
     if (rfdReplay && !pending?.stopped) {
       await rfdReplay.finish(clientSupportsNotices(this.clientCapabilities), sessionId);
+      this.replayedSubagents.set(sessionId, rfdReplay);
     }
 
     if (nativeReplayEnabled && !pending?.stopped) {
@@ -10695,14 +10701,39 @@ export class ClaudeAcpAgent {
 
   /**
    * The work that follows a session setup response: the session's commands,
-   * and MCP server authentication. A v2 client gets the commands in the setup
-   * response itself (`src/v2/agent.ts`), so it gets no update with them here.
+   * the current states of the subagents a load replayed, and MCP server
+   * authentication. A v2 client gets the commands in the setup response itself,
+   * and the subagent states from the v2 surface once it has sent its own
+   * response (`src/v2/agent.ts`), so it gets neither here.
    */
   private afterSetupResponse(sessionId: string, mcpServers: McpServer[]): void {
     setTimeout(() => {
-      if (!this.v2) this.sendAvailableCommandsUpdate(sessionId);
+      if (!this.v2) {
+        this.sendAvailableCommandsUpdate(sessionId);
+        void this.publishCurrentSubagentStates(sessionId);
+      }
       startMcpAuthentication(this, sessionId, mcpServers);
     }, 0);
+  }
+
+  /**
+   * Sends the current state of each subagent that the last load of
+   * `sessionId` replayed (see {@link RfdSubagentReplay.currentStates}). Run it
+   * only after the load response: before it, the client treats subagent states
+   * as history.
+   */
+  async publishCurrentSubagentStates(sessionId: string): Promise<void> {
+    const replay = this.replayedSubagents.get(sessionId);
+    if (!replay) return;
+    this.replayedSubagents.delete(sessionId);
+    const runtime = this.sessions[sessionId]?.nativeSubagentRuntime;
+    try {
+      for (const notification of replay.currentStates((child) => runtime?.liveWorkState(child))) {
+        await this.client.sessionUpdate(asSdkSessionNotification(notification));
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send current subagent states:`, error);
+    }
   }
 
   private async updateConfigOption(

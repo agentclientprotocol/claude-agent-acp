@@ -3808,6 +3808,7 @@ describe("subagent transcript replay", () => {
       root: object[],
       children: Record<string, { meta: object; records: object[] }>,
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
+      afterResponse?: { live: (childSessionId: string) => string | undefined },
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -3848,12 +3849,25 @@ describe("subagent transcript replay", () => {
         await (
           agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
         ).replaySessionHistory(sessionId);
-        return updates.flatMap(({ sessionId: target, update }) => {
+        const responseAt = updates.length;
+        if (afterResponse) {
+          // Stands in for the live session's runtime, which knows its running children.
+          (agent.sessions as Record<string, unknown>)[sessionId] = {
+            nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+          };
+          await agent.publishCurrentSubagentStates(sessionId);
+        }
+        return updates.flatMap(({ sessionId: target, update }, index) => {
           const on = target === sessionId ? "root" : target;
           const u = update as any;
+          const response = afterResponse && index === responseAt ? ["-- response --"] : [];
           switch (update.sessionUpdate) {
             case "subagent_update":
-              return [`${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}`];
+              return [
+                ...response,
+                `${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}` +
+                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : ""),
+              ];
             case "session_message": {
               const references = [
                 ...(u.senderMessageId ? [`senderMessageId=${u.senderMessageId}`] : []),
@@ -4054,6 +4068,35 @@ describe("subagent transcript replay", () => {
         'abc123 subagent_update def456 {"state":"idle","stopReason":"end_turn"}',
         'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
         "root notice Some subagent history is not available: The history of 1 subagent of this session could not be restored.",
+      ]);
+    });
+
+    it("sends each child's current state after the load response", async () => {
+      const launch = (id: string, name: string) =>
+        toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
+      const child = (name: string, launchId: string) => ({
+        meta: { agentType: "Explore", name, toolUseId: launchId, requestShape: "foreground" },
+        records: [user(`${name}1`, `Run ${name}`)],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [launch("toolu_live", "live"), launch("toolu_gone", "gone")]),
+          user("u2", [toolResult("toolu_live", "Live."), toolResult("toolu_gone", "Gone.")]),
+        ],
+        { aaa111: child("live", "toolu_live"), bbb222: child("gone", "toolu_gone") },
+        undefined,
+        // The session is loaded again in the process that still runs `aaa111`.
+        { live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined) },
+      );
+
+      expect(trace.slice(trace.indexOf("-- response --"))).toEqual([
+        "-- response --",
+        // A child that still runs reports its live state, and can be cancelled.
+        'root subagent_update aaa111 {"state":"running"} capabilities={"cancel":{}}',
+        // Any other child's process is gone: its replayed end is its current
+        // state, and nothing can cancel it.
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
       ]);
     });
 
