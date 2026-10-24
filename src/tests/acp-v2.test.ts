@@ -153,7 +153,7 @@ afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   execFileSpy.mockReset();
   vi.unstubAllEnvs();
-  await rm(tempDir, { recursive: true, force: true });
+  await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
