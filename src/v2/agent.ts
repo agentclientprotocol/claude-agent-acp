@@ -14,6 +14,7 @@ import type {
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
+import { z } from "zod";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
@@ -129,7 +130,16 @@ export function v2AgentApp(
         void client.send({ sessionId: params.sessionId, update });
       }),
     )
-    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params));
+    .onNotification(v2.methods.agent.session.cancel, ({ params }) => agent.cancel(params))
+    .onRequest(
+      "_session/async_task/stop",
+      z.object({ sessionId: z.string(), asyncTaskId: z.string() }),
+      ({ params }) => {
+        if (process.env.ACP_BACKGROUND_WORK_EXPERIMENT !== "1")
+          throw new Error("Background work experiment is disabled");
+        return agent.stopAsyncTask(params);
+      },
+    );
 }
 
 /** The `state_update` that reports `state` as the current foreground state. */

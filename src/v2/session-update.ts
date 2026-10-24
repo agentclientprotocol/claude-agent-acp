@@ -76,6 +76,15 @@ export function v2SessionUpdate(
       // `configOptions` of a `session/set_config_option` response.
       return undefined;
     default:
+      if (
+        process.env.ACP_BACKGROUND_WORK_EXPERIMENT === "1" &&
+        update.sessionUpdate.startsWith("async_task_")
+      ) {
+        return {
+          ...update,
+          sessionUpdate: `_${update.sessionUpdate}`,
+        } as unknown as v2.SessionUpdate;
+      }
       throw new Error(
         `The ACP v2 surface does not translate ${update.sessionUpdate} session updates yet`,
       );

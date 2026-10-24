@@ -1,3 +1,4 @@
+import { backgroundWorkStream } from "./background-work-experiment.js";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
 import { v1AgentApp, type ClaudeAcpAgent, type Logger } from "./acp-agent.js";
 import { nodeToWebReadable, nodeToWebWritable } from "./utils.js";
@@ -37,7 +38,7 @@ export function serveAcp(
     agent = created;
   };
   const { closed } = acpProtocolRouter(logger, onAgent, options.protocols).connect(
-    v2.ndJsonStream(output, input),
+    backgroundWorkStream(v2.ndJsonStream(output, input)),
   );
   return {
     closed,

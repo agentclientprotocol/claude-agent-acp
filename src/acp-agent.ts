@@ -4411,7 +4411,10 @@ export class ClaudeAcpAgent {
       } else {
         await session.query.stopTask(params.asyncTaskId);
       }
-      await asyncTasks.taskStopped(params.asyncTaskId);
+      // Acceptance is separate from the native terminal event in the RFD experiment.
+      if (process.env.ACP_BACKGROUND_WORK_EXPERIMENT !== "1") {
+        await asyncTasks.taskStopped(params.asyncTaskId);
+      }
       return { stopped: true };
     } catch (error) {
       asyncTasks.releaseStop(params.asyncTaskId);
@@ -6819,6 +6822,19 @@ export class ClaudeAcpAgent {
               case "control_request_progress":
                 break;
               case "background_tasks_changed":
+                if (process.env.ACP_BACKGROUND_WORK_EXPERIMENT === "1") {
+                  await this.client.sessionUpdate({
+                    sessionId: params.sessionId,
+                    update: {
+                      sessionUpdate: "session_info_update",
+                      _meta: {
+                        backgroundWorkExperiment: {
+                          taskIds: message.tasks.map((task) => task.task_id),
+                        },
+                      },
+                    },
+                  });
+                }
                 await asyncTasks.backgroundTasksChanged(message.tasks);
                 // A level signal: the full live background-task set on every
                 // membership change, with REPLACE semantics. Used only to
@@ -8629,7 +8645,13 @@ export class ClaudeAcpAgent {
     session.cancelled = true;
     // The interrupt below makes Claude Code withdraw the requests that are open
     // now (see `withPendingUserInput`).
-    for (const input of session.openUserInputs ?? []) input.cancelled = true;
+    for (const input of session.openUserInputs ?? []) {
+      if (
+        process.env.ACP_BACKGROUND_WORK_EXPERIMENT !== "1" ||
+        blocksForeground(session, input.agentID)
+      )
+        input.cancelled = true;
+    }
     // Before anything awaits, so a model request that the consumer reads in
     // the meantime is already judged against these prompts.
     session.cancelledPrompts ??= new Set();
@@ -11496,7 +11518,10 @@ export class ClaudeAcpAgent {
       // `stopBackgroundWorkflows` stops instead. Background commands survive an
       // interrupt either way. Before `userProvidedOptions`, so a client's own
       // `perTaskStopAffordance` wins.
-      ...(subagentForm(this.clientCapabilities) === "rfd" ? { perTaskStopAffordance: true } : {}),
+      ...(subagentForm(this.clientCapabilities) === "rfd" ||
+      process.env.ACP_BACKGROUND_WORK_EXPERIMENT === "1"
+        ? { perTaskStopAffordance: true }
+        : {}),
       // One predicted follow-up prompt per turn, published as
       // `session_info_update._meta.promptSuggestions`. It rides the turn's own
       // prompt cache, and the user can turn it off in settings.json
