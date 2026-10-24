@@ -2727,6 +2727,32 @@ describe("applyTaskCreate / applyTaskUpdate", () => {
     });
   });
 
+  it("does not replace an existing task when TaskCreate is replayed", () => {
+    const completed = {
+      subject: "Current subject",
+      status: "completed" as const,
+      activeForm: "Current active form",
+      description: "Current description",
+    };
+    const completedBeforeReplay = { ...completed };
+    const state: TaskState = new Map([["1", completed]]);
+    state.set("2", { subject: "Next task", status: "pending" });
+
+    applyTaskCreate(
+      state,
+      {
+        subject: "Original subject",
+        activeForm: "Original active form",
+        description: "Original description",
+      },
+      { task: { id: "1", subject: "Original subject" } },
+    );
+
+    expect(state.get("1")).toBe(completed);
+    expect(state.get("1")).toEqual(completedBeforeReplay);
+    expect([...state.keys()]).toEqual(["1", "2"]);
+  });
+
   it("is a no-op when the output has no task ID", () => {
     const state: TaskState = new Map();
     applyTaskCreate(state, { subject: "X", description: "Y" }, undefined);
