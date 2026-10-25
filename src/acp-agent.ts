@@ -8177,6 +8177,7 @@ export class ClaudeAcpAgent {
             }
 
             let content: typeof message.message.content;
+            let toolUseResult = message.type === "user" ? message.tool_use_result : undefined;
             if (
               message.type === "assistant" &&
               (message.parent_tool_use_id === null || forwardsSubagentText())
@@ -8197,6 +8198,20 @@ export class ClaudeAcpAgent {
                 (item) => item.type !== "text" && item.type !== "thinking",
               );
               streamedBlocksOf(message.parent_tool_use_id).length = 0;
+            } else if (
+              message.parent_tool_use_id !== null &&
+              Array.isArray(message.message.content)
+            ) {
+              // A foreground fork inherits a placeholder result for its own
+              // launch. Only the launching side can complete that Agent call
+              // with the fork's actual report.
+              const launchId = message.parent_tool_use_id;
+              content = message.message.content.filter(
+                (block) => block.type !== "tool_result" || block.tool_use_id !== launchId,
+              );
+              // The message-level sidecar cannot describe a remaining result
+              // after its launch result was removed.
+              if (content.length !== message.message.content.length) toolUseResult = undefined;
             } else {
               content = message.message.content;
             }
@@ -8214,7 +8229,7 @@ export class ClaudeAcpAgent {
               );
               const backgroundBashTask = backgroundBashTaskFromToolResult(
                 content,
-                message.tool_use_result,
+                toolUseResult,
                 session.toolUseCache,
               );
               if (backgroundBashTask) await asyncTasks.taskBackgrounded(backgroundBashTask);
@@ -8243,7 +8258,7 @@ export class ClaudeAcpAgent {
                 asyncTasks,
                 backgroundBashTask,
               );
-              const resumedAgentId = resumedNativeSubagentId(message.tool_use_result);
+              const resumedAgentId = resumedNativeSubagentId(toolUseResult);
               if (resumedAgentId) {
                 const resume = sendMessageResume(
                   session.toolUseCache,
@@ -8284,7 +8299,7 @@ export class ClaudeAcpAgent {
                 emittedToolCalls: session.emittedToolCalls,
                 toolCallFields: toolCallFieldsOf(session),
                 messageId: messageIdForGrouping(message),
-                toolUseResult: message.type === "user" ? message.tool_use_result : undefined,
+                toolUseResult,
                 // On the wire since CLI 2.1.216 but not in SDKUserMessage's
                 // type, hence the cast. Validated by parseToolResultMeta.
                 toolResultMeta:
