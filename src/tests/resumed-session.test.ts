@@ -294,12 +294,9 @@ describe("readHistoryAcrossCompactions", () => {
     ]);
 
     // getSessionMessages stops at the last boundary.
-    expect(texts(await getSessionMessages(sessionId))).toEqual([
-      "Summary s2",
-      "identify yourself",
-      "Claude",
-    ]);
-    expect(texts(await readHistoryAcrossCompactions(sessionId))).toEqual([
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s2", "identify yourself", "Claude"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
       "hi",
       "Hello",
       "Summary s1",
@@ -329,14 +326,9 @@ describe("readHistoryAcrossCompactions", () => {
     ]);
 
     // getSessionMessages moves the preserved messages after the summary.
-    expect(texts(await getSessionMessages(sessionId))).toEqual([
-      "Summary s1",
-      "keep this",
-      "Kept",
-      "after",
-      "After",
-    ]);
-    expect(texts(await readHistoryAcrossCompactions(sessionId))).toEqual([
+    const chain = await getSessionMessages(sessionId);
+    expect(texts(chain)).toEqual(["Summary s1", "keep this", "Kept", "after", "After"]);
+    expect(texts(await readHistoryAcrossCompactions(sessionId, chain))).toEqual([
       "hi",
       "Hello",
       "keep this",
@@ -345,5 +337,12 @@ describe("readHistoryAcrossCompactions", () => {
       "after",
       "After",
     ]);
+  });
+
+  it("returns the chain of a session without a compaction as it is", async () => {
+    await transcript([user("u1", "hi"), assistant("a1", "Hello")]);
+
+    const chain = await getSessionMessages(sessionId);
+    expect(await readHistoryAcrossCompactions(sessionId, chain)).toBe(chain);
   });
 });

@@ -9230,19 +9230,12 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    let messages = resumedMessages ?? (await getSessionMessages(sessionId));
-    // After a compaction, the chain starts at its summary. A load replays the
-    // whole conversation, so read the messages before each compaction too.
-    if (isCompactSummaryMessage(messages[0])) {
-      try {
-        messages = await readHistoryAcrossCompactions(sessionId);
-      } catch (error) {
-        this.logger.error(
-          `[session/replay] sessionId=${sessionId} failed to read the history before the last compaction:`,
-          error,
-        );
-      }
-    }
+    // A load replays the whole conversation, including the messages before each compaction.
+    const messages = await readHistoryAcrossCompactions(
+      sessionId,
+      resumedMessages ?? (await getSessionMessages(sessionId)),
+      this.logger,
+    );
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
