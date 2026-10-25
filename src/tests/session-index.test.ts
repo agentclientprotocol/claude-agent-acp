@@ -460,6 +460,53 @@ describe("_session/batch_get", () => {
     }
   });
 
+  it("does not suppress sibling cwd recovery in the next list", async () => {
+    const base = Date.parse("2026-04-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    const fillers: string[] = [];
+    for (let i = 1; i <= 16; i++) {
+      fillers.push((await writeTranscript({ lastMessageAt: base - i * 1000 })).id);
+    }
+    // This sibling is older than the transcripts needed to fill the page.
+    await writeTranscript({ cwd: other, lastMessageAt: base - 3600_000 });
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const list = vi.spyOn(index, "list").mockRejectedValue(new Error("must not list"));
+    const names = vi.spyOn(index.listings, "namesOfAll").mockRejectedValue(new Error("history"));
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const readdir = vi.mocked(fs.readdir);
+    readdir.mockClear();
+    try {
+      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
+      expect(transcriptsRead(agent)).toBe(1);
+      const root = path.join(configDir, "projects");
+      const storeReads = readdir.mock.calls
+        .map(([dir]) => String(dir))
+        .filter((dir) => dir === root || dir.startsWith(root + path.sep));
+      expect(storeReads).toEqual([root]);
+      expect(list).not.toHaveBeenCalled();
+      expect(names).not.toHaveBeenCalled();
+      expect(listSessions).not.toHaveBeenCalled();
+      expect(getSessionInfo).not.toHaveBeenCalled();
+      list.mockRestore();
+      names.mockRestore();
+
+      // Use the same index without changing files or letting the negative cache expire.
+      const page = await agent.listSessions({ _meta: listMeta({ limit: 2 }) });
+      expect(page.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([
+        [noCwd.id, other],
+        [fillers[0], workspace],
+      ]);
+    } finally {
+      list.mockRestore();
+      names.mockRestore();
+      now.mockRestore();
+      readdir.mockClear();
+      await agent.dispose();
+    }
+  });
+
   it("returns the same unscoped list rows for archived, worktree and duplicate copies in request order", async () => {
     const repo = path.join(workspace, "repo");
     const worktree = path.join(workspace, "worktree");

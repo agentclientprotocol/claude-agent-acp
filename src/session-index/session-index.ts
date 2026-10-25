@@ -635,7 +635,6 @@ export class SessionIndex {
       inScope: scopeOf(undefined),
       archived: "all",
       wanted: Infinity,
-      unread: () => [],
     });
     const byId = new Map(rows.map((row) => [row.sessionId, row]));
     return sessionIds.flatMap((id) => {
@@ -843,8 +842,8 @@ export class SessionIndex {
       after?: ListCursor;
       wanted: number;
       /** The transcripts not read (by path), which may supply a sibling's
-       *  cwd. */
-      unread: (read: ReadonlySet<string>) => readonly TranscriptCandidate[];
+       *  cwd. Omit to skip sibling recovery and its negative-cache writes. */
+      unread?: (read: ReadonlySet<string>) => readonly TranscriptCandidate[];
       restat?: boolean;
     },
   ): Promise<IndexRow[]> {
@@ -916,7 +915,7 @@ export class SessionIndex {
       }
       await settlePending();
     }
-    if (pending.length > 0) {
+    if (pending.length > 0 && options.unread) {
       // A row recovered after the scan stopped still sorts into the page: it
       // was read before the stop, and more rows only raise the bound. A
       // sibling that the archive filter or the cursor leaves out may still
