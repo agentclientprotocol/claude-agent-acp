@@ -69,9 +69,10 @@ function forkPointMessageIdCandidates(messageId: string): string[] {
   return protocolMessageId === messageId ? [messageId] : [messageId, protocolMessageId];
 }
 
-async function loadFullSessionHistory(
+/** Every record of the session's transcript. Without `cwd`, all project directories are searched. */
+export async function loadFullSessionHistory(
   sessionId: string,
-  cwd: string,
+  cwd?: string,
 ): Promise<SessionStoreEntry[]> {
   // getSessionMessages returns only the active parentUuid chain. The import keeps inactive branches that AIR can still reference.
   const entries: SessionStoreEntry[] = [];

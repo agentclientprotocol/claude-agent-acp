@@ -206,6 +206,7 @@ import {
   replaySubagentTerminalState,
 } from "./subagent-replay.js";
 import {
+  readHistoryAcrossCompactions,
   readResumedSession,
   readResumedTail,
   type ResumedSessionSnapshot,
@@ -9229,7 +9230,19 @@ export class ClaudeAcpAgent {
   ): Promise<void> {
     const replayStartedAt = performance.now();
     const toolUseCache: ToolUseCache = {};
-    const messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    let messages = resumedMessages ?? (await getSessionMessages(sessionId));
+    // After a compaction, the chain starts at its summary. A load replays the
+    // whole conversation, so read the messages before each compaction too.
+    if (isCompactSummaryMessage(messages[0])) {
+      try {
+        messages = await readHistoryAcrossCompactions(sessionId);
+      } catch (error) {
+        this.logger.error(
+          `[session/replay] sessionId=${sessionId} failed to read the history before the last compaction:`,
+          error,
+        );
+      }
+    }
     const historyLoadedAt = performance.now();
     this.logger.log(
       `[session/replay] sessionId=${sessionId} phase=read durationMs=${Math.round(historyLoadedAt - replayStartedAt)} messages=${messages.length}`,
