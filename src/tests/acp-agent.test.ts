@@ -3586,7 +3586,7 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
-  it("sends an AIR child's model as the session's entry once the session exists, before its end", async () => {
+  it("refines an ended AIR child's model after the load response, once the model list is known", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -3596,26 +3596,25 @@ describe("subagent transcript replay", () => {
       { log: () => {}, error: () => {} },
     );
     await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+    vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
     // A load replays while the CLI starts: the session and its model list come later.
-    let sessionCreated!: () => void;
-    const pending = {
-      state: { cwd: "/tmp", taskState: new Map(), messageIdToUuid: new Map() },
-      stopped: false,
-      sessionReady: new Promise<void>((resolve) => (sessionCreated = resolve)),
-    };
-    const replaying = (
-      agent as unknown as {
-        replaySessionHistory(
-          sessionId: string,
-          messages: unknown[],
-          pending: unknown,
-        ): Promise<void>;
-      }
-    ).replaySessionHistory("s1", replayHistory, pending);
-    await vi.waitFor(() =>
-      expect(updates.map(({ update }) => update.sessionUpdate)).toContain("tool_call"),
-    );
-    expect(updates.map(({ update }) => update.sessionUpdate)).not.toContain("config_option_update");
+    await (
+      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
+    ).replaySessionHistory("s1");
+    const child = "s1:replay-subagent:parent-agent-call";
+    const models = () =>
+      updates.flatMap(({ sessionId, update }) =>
+        update.sessionUpdate === "config_option_update"
+          ? update.configOptions.map((option) => [
+              sessionId,
+              option.currentValue,
+              (option as { options: Array<{ name: string }> }).options[0]?.name,
+            ])
+          : [],
+      );
+    // Without the list, the replay sends the model id, and then ends the child.
+    expect(models()).toEqual([[child, "claude-sonnet-4-5", "claude-sonnet-4-5"]]);
+    expect(updates.at(-1)?.update.sessionUpdate).toBe("subagent_state_update");
     (agent.sessions as Record<string, unknown>).s1 = {
       configOptions: [
         {
@@ -3636,29 +3635,14 @@ describe("subagent transcript replay", () => {
         },
       ],
     };
-    sessionCreated();
-    await replaying;
-    expect(updates.slice(-2)).toEqual([
-      {
-        sessionId: "s1:replay-subagent:parent-agent-call",
-        update: {
-          sessionUpdate: "config_option_update",
-          configOptions: [
-            {
-              id: "model",
-              name: "Model",
-              category: "model",
-              type: "select",
-              currentValue: "sonnet",
-              options: [{ value: "sonnet", name: "Sonnet 4.5" }],
-            },
-          ],
-        },
-      },
-      expect.objectContaining({
-        update: expect.objectContaining({ sessionUpdate: "subagent_state_update" }),
-      }),
+    await agent.publishCurrentSubagentStates("s1");
+    expect(models()).toEqual([
+      [child, "claude-sonnet-4-5", "claude-sonnet-4-5"],
+      [child, "sonnet", "Sonnet 4.5"],
     ]);
+    // Once only.
+    await agent.publishCurrentSubagentStates("s1");
+    expect(models()).toHaveLength(2);
   });
 
   it("replays a subagent from its own transcript file", async () => {
@@ -3817,13 +3801,13 @@ describe("subagent transcript replay", () => {
         [sessionId, "user_message_chunk", "Explore it"],
         [sessionId, "subagent_spawned", child1],
         [child1, "user_message_chunk", "Look around"],
+        // The model of the child's response, as the replay reaches it.
+        [child1, "config_option_update", undefined],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
         // Nothing names its model, so it gets none.
         [sessionId, "subagent_spawned", child2],
         [sessionId, "agent_message_chunk", "Done."],
-        // The model of the child's responses goes before its end, which allows no later update.
-        [child1, "config_option_update", undefined],
         [sessionId, "subagent_state_update", child2],
         [sessionId, "subagent_state_update", child1],
         [sessionId, "session_info_update", undefined],
@@ -4455,10 +4439,10 @@ describe("subagent transcript replay", () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["s1", "subagent_spawned"],
+      // The model of its response, as the replay reaches it.
+      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
-      // The model of its response, before its end.
-      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1", "subagent_state_update"],
     ]);
     expect(updates[0]?.update).toMatchObject({

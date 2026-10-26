@@ -122,8 +122,10 @@ import {
   NativeSubagent,
   NativeSubagentRuntime,
   nativeSubagentState,
+  type ModelEntry,
   responseModelEntry,
   resumedNativeSubagentId,
+  sameModelEntry,
   sendMessageResume,
   sendMessageResumePrompt,
   type SubagentModels,
@@ -986,8 +988,6 @@ type ReplayState = Pick<
 /** A replay that runs before its session record exists. */
 type PendingReplay = {
   state: ReplayState;
-  /** Settles when the session creation ends: the session record and its model list exist, or `stopped` is set. */
-  sessionReady?: Promise<void>;
   /** Set when the session creation fails. The replay then sends no more updates. */
   stopped: boolean;
 };
@@ -2728,6 +2728,15 @@ export class ClaudeAcpAgent {
    * {@link publishCurrentSubagentStates} sends its children's current states.
    */
   private readonly replayedSubagents = new Map<string, RfdSubagentReplay>();
+  /**
+   * AIR's draft: the model that the last load of each session replayed to each
+   * child session, as the model id and the entry that went out. See
+   * {@link publishReplayedChildModels}.
+   */
+  private readonly replayedChildModels = new Map<
+    string,
+    Map<string, { model: string; sent: ModelEntry }>
+  >();
   /** See the `foreground` constructor option. */
   private readonly foregroundEvents?: (sessionId: string) => ForegroundEvents;
   /**
@@ -2806,6 +2815,7 @@ export class ClaudeAcpAgent {
         clearHookCallbacks(id);
         session.nativeSubagentRuntime?.clear();
         session.asyncTaskRuntime?.clear();
+        this.replayedChildModels.delete(id);
         if (this.sessions[id] === session) delete this.sessions[id];
       },
       settleCancelledTurn: (original, session, turn) => {
@@ -3075,8 +3085,6 @@ export class ClaudeAcpAgent {
       },
       stopped: false,
     };
-    let sessionCreated!: () => void;
-    pending.sessionReady = new Promise((resolve) => (sessionCreated = resolve));
     const transcript = readResumedSession(params.sessionId, this.logger);
     const replay = transcript
       .then(({ messages }) => this.replaySessionHistory(params.sessionId, messages, pending))
@@ -3102,11 +3110,10 @@ export class ClaudeAcpAgent {
       );
     } catch (error) {
       pending.stopped = true;
-      sessionCreated();
       await replay;
+      this.replayedChildModels.delete(params.sessionId);
       throw error;
     }
-    sessionCreated();
     timing.phase("session-ready");
     const replayed = await replay;
     if (!replayed.ok) throw replayed.error;
@@ -8505,6 +8512,7 @@ export class ClaudeAcpAgent {
         clearHookCallbacks(params.sessionId);
         session.nativeSubagentRuntime?.clear();
         session.asyncTaskRuntime?.clear();
+        this.replayedChildModels.delete(params.sessionId);
         delete this.sessions[params.sessionId];
       } else {
         this.logger.error(`Session ${params.sessionId}: query stream error: ${message}`);
@@ -9083,6 +9091,7 @@ export class ClaudeAcpAgent {
     clearHookCallbacks(sessionId);
     session.nativeSubagentRuntime?.clear();
     session.asyncTaskRuntime?.clear();
+    this.replayedChildModels.delete(sessionId);
     delete this.sessions[sessionId];
     this.sessionIndex.onTeardown(sessionId);
     const ended = await raceTimeoutAndAbort(
@@ -9299,9 +9308,15 @@ export class ClaudeAcpAgent {
         notifiedState?: SubagentState;
         /** The model id of the child's latest response in its transcript. */
         responseModel?: string;
+        /** The `model` option entry that the replay sent to the child. */
+        model?: ModelEntry;
       }
     >();
-    const replayModels = this.subagentModels(sessionId);
+    // A load replays while the CLI starts, and the session's model list comes
+    // with the CLI at an unknown point of the replay. So a pending replay maps
+    // no model to the list, and each child's model is its id until the load
+    // response refines it (see `publishCurrentSubagentStates`).
+    const replayModels = pending ? undefined : this.subagentModels(sessionId);
 
     // Registers the Agent and Task launches of `list`, and the terminal state
     // of each launch from its tool_result.
@@ -9562,10 +9577,21 @@ export class ClaudeAcpAgent {
         if (rfdReplay && child) {
           await rfdReplay.responseModel(child, model);
         } else if (nativeReplayEnabled && parentToolUseId) {
-          // AIR's draft: sent before the child's end, when the model list is known.
+          // AIR's draft: the entry of the model list that is known now. A load
+          // can lack the list until the CLI started, so the entry goes again
+          // after the load response when the list maps it to another one.
           const replayChild = replayChildren.get(parentToolUseId);
-          if (replayChild && model && model !== "<synthetic>") {
+          const entry = responseModelEntry(model, replayModels);
+          if (replayChild?.announced && entry && !sameModelEntry(replayChild.model, entry)) {
             replayChild.responseModel = model;
+            replayChild.model = entry;
+            await this.client.sessionUpdate({
+              sessionId: replayChild.sessionId,
+              update: {
+                sessionUpdate: "config_option_update",
+                configOptions: [childModelOption(entry)],
+              },
+            });
           }
         }
       }
@@ -9718,24 +9744,14 @@ export class ClaudeAcpAgent {
       this.replayedSubagents.set(sessionId, rfdReplay);
     }
 
-    // AIR's draft: each child's model goes before its end, which allows no
-    // later update. The model maps to an entry of the session's model list,
-    // which a load knows only when the CLI started (see `sessionReady`).
-    if (nativeReplayEnabled && !pending?.stopped) await pending?.sessionReady;
     if (nativeReplayEnabled && !pending?.stopped) {
+      const childModels = new Map<string, { model: string; sent: ModelEntry }>();
       for (const child of replayChildren.values()) {
-        const model = child.announced
-          ? responseModelEntry(child.responseModel, replayModels)
-          : undefined;
-        if (!model) continue;
-        await this.client.sessionUpdate({
-          sessionId: child.sessionId,
-          update: {
-            sessionUpdate: "config_option_update",
-            configOptions: [childModelOption(model)],
-          },
-        });
+        if (child.responseModel && child.model) {
+          childModels.set(child.sessionId, { model: child.responseModel, sent: child.model });
+        }
       }
+      if (childModels.size > 0) this.replayedChildModels.set(sessionId, childModels);
       // Claude history persists sidechain messages and Agent/Task tool uses,
       // but not task_started/task_updated lifecycle frames. Recover terminal
       // state from the launch tool_result. Missing results and malformed or
@@ -10785,6 +10801,7 @@ export class ClaudeAcpAgent {
    * as history.
    */
   async publishCurrentSubagentStates(sessionId: string): Promise<void> {
+    await this.publishReplayedChildModels(sessionId);
     const replay = this.replayedSubagents.get(sessionId);
     if (!replay) return;
     this.replayedSubagents.delete(sessionId);
@@ -10798,6 +10815,36 @@ export class ClaudeAcpAgent {
       }
     } catch (error) {
       this.logger.error(`Session ${sessionId}: failed to send current subagent states:`, error);
+    }
+  }
+
+  /**
+   * AIR's draft: a load replays while the CLI starts, so the replay can lack
+   * the session's model list and send a child's model as its id. After the
+   * load response the list is known, and each replayed child whose model the
+   * list maps to another entry gets that entry. The replay already ended the
+   * child, and AIR's draft allows no other update after a child's end, but it
+   * takes this more exact snapshot of the same configuration.
+   */
+  private async publishReplayedChildModels(sessionId: string): Promise<void> {
+    const childModels = this.replayedChildModels.get(sessionId);
+    if (!childModels) return;
+    this.replayedChildModels.delete(sessionId);
+    const models = this.subagentModels(sessionId);
+    try {
+      for (const [childSessionId, { model, sent }] of childModels) {
+        const entry = responseModelEntry(model, models);
+        if (!entry || sameModelEntry(entry, sent)) continue;
+        await this.client.sessionUpdate({
+          sessionId: childSessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [childModelOption(entry)],
+          },
+        });
+      }
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send subagent models:`, error);
     }
   }
 

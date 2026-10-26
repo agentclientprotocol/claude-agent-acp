@@ -2158,6 +2158,66 @@ describe("createSession options merging", () => {
         await loading;
       });
 
+      it.each([
+        ["without subagents", [] as Record<string, unknown>[]],
+        [
+          "with a subagent",
+          [
+            {
+              type: "assistant",
+              uuid: "child-message",
+              session_id: "replay-probe",
+              parent_tool_use_id: "agent-call",
+              message: {
+                id: "api-child-message",
+                model: "claude-sonnet-4-6",
+                role: "assistant",
+                content: [{ type: "text", text: "child report" }],
+              },
+            },
+          ],
+        ],
+      ])(
+        "sends the end event before the CLI start finishes for native subagent sessions (%s)",
+        async (_label, history) => {
+          let releaseInit!: () => void;
+          initGate = new Promise((resolve) => (releaseInit = resolve));
+          sessionMessages = [userMessage("u1", "first"), ...history];
+          const updates: SessionNotification[] = [];
+          const loading = (
+            await endAgent(updates, undefined, {
+              _meta: {
+                jetbrains: {
+                  air: {
+                    version: 1,
+                    capabilities: ["loadReplayEnd", "nativeSubagentSessions"],
+                  },
+                },
+              },
+            } as ClientCapabilities)
+          ).loadSession({ sessionId: "replay-probe", cwd: process.cwd(), mcpServers: [] });
+
+          // The child's model goes as the replay reaches it, with no model list yet.
+          await vi.waitFor(() =>
+            expect(kinds(updates)).toEqual(
+              history.length === 0
+                ? ["user_message_chunk", "end"]
+                : [
+                    "user_message_chunk",
+                    "subagent_spawned",
+                    "config_option_update",
+                    "agent_message_chunk",
+                    "subagent_state_update",
+                    "end",
+                  ],
+            ),
+          );
+
+          releaseInit();
+          await loading;
+        },
+      );
+
       it("sends the end event for an empty history", async () => {
         sessionMessages = [];
         const updates: SessionNotification[] = [];

@@ -609,9 +609,17 @@ export async function getAvailableModels(
 
 /** The display name of the model id `model` in `modelInfos`, if it is there. */
 export function modelDisplayName(modelInfos: ModelInfo[], model: string): string | undefined {
-  return modelInfos.find((info) => info.value === model || info.resolvedModel === model)
-    ?.displayName;
+  let byModel = displayNameCache.get(modelInfos);
+  if (!byModel) displayNameCache.set(modelInfos, (byModel = new Map()));
+  if (!byModel.has(model)) {
+    const info = modelInfos.find((info) => info.value === model || info.resolvedModel === model);
+    byModel.set(model, info?.displayName);
+  }
+  return byModel.get(model);
 }
+
+/** {@link modelDisplayName} per model list, which a session replaces and never edits. */
+const displayNameCache = new WeakMap<ModelInfo[], Map<string, string | undefined>>();
 
 /** The flat entries of a session's `model` select option. */
 function modelOptionEntries(option: SessionConfigOption): Array<{ value: string; name: string }> {
@@ -639,6 +647,28 @@ function modelOptionEntries(option: SessionConfigOption): Array<{ value: string;
  * `claude-haiku-4-5-20251001` matches only the same dated id.
  */
 export function modelEntryFor(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  // Each response of a subagent reports its model, so the result is kept per
+  // list. A session replaces its lists on a change and never edits them.
+  let byInfos = modelEntryCache.get(configOptions);
+  if (!byInfos) modelEntryCache.set(configOptions, (byInfos = new WeakMap()));
+  let byModel = byInfos.get(modelInfos);
+  if (!byModel) byInfos.set(modelInfos, (byModel = new Map()));
+  if (byModel.has(model)) return byModel.get(model);
+  const entry = findModelEntry(configOptions, modelInfos, model);
+  byModel.set(model, entry);
+  return entry;
+}
+
+const modelEntryCache = new WeakMap<
+  readonly SessionConfigOption[],
+  WeakMap<ModelInfo[], Map<string, { value: string; name: string } | undefined>>
+>();
+
+function findModelEntry(
   configOptions: readonly SessionConfigOption[],
   modelInfos: ModelInfo[],
   model: string,

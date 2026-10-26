@@ -2628,6 +2628,77 @@ describe("NativeSubagentRuntime child models", () => {
     expect(modelUpdates(published)).toEqual([[generation, "sonnet", "Sonnet 4.6"]]);
   });
 
+  it.each(["rfd", "air"] as const)(
+    "%s: keeps only the latest model of a child that is not announced yet",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+        undefined,
+        undefined,
+        models,
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      // More responses than the buffer of one parent holds (32), before the launch call.
+      for (let index = 0; index < 40; index++) {
+        await runtime.reportModel(
+          "launch-1",
+          index % 2 ? "claude-opus-5" : "claude-sonnet-4-6",
+          deliver,
+        );
+      }
+      await runtime.route(
+        {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "working" },
+            _meta: { claudeCode: { parentToolUseId: "launch-1" } },
+          },
+        } as AcpSessionNotification,
+        deliver,
+      );
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(agentCall("launch-1", {}));
+      expect(modelUpdates(published)).toEqual([["worker-1", "claude-opus-5", "Opus 5"]]);
+      // The child's output is not crowded out of the buffer.
+      expect(published.map(({ update }) => update.sessionUpdate)).toContain("agent_message_chunk");
+    },
+  );
+
+  it("air: forgets the configuration of an ended child", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+    expect(runtime.configurationOf("worker-1")).toHaveLength(1);
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    expect(runtime.configurationOf("worker-1")).toBeUndefined();
+    // A hook after the end stores nothing either.
+    await runtime.reportConfiguration("worker-1", [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "sonnet",
+        options: [{ value: "sonnet", name: "Sonnet 4.6" }],
+      },
+    ]);
+    expect(runtime.configurationOf("worker-1")).toBeUndefined();
+    expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+  });
+
   it("air: sends no model to a child after its end", async () => {
     const { runtime, published, deliver } = await spawn("air");
     await runtime.finishTask("worker-1", "completed", deliver, "launch-1");

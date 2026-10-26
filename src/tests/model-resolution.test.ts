@@ -452,6 +452,23 @@ describe("modelEntryFor", () => {
     });
   });
 
+  it("maps a model again when the session replaces its option list", () => {
+    const before = options("haiku");
+    expect(modelEntryFor(before, infos, "claude-opus-4-6")).toEqual({
+      value: "opus",
+      name: "Opus 4.6",
+    });
+    // The user picks `opus[1m]`: the session replaces its option list.
+    expect(modelEntryFor(options("opus[1m]"), infos, "claude-opus-4-6")).toEqual({
+      value: "opus[1m]",
+      name: "Opus 4.6 (1M context)",
+    });
+    expect(modelEntryFor(before, infos, "claude-opus-4-6")).toEqual({
+      value: "opus",
+      name: "Opus 4.6",
+    });
+  });
+
   it("compares a dated or a provider model id as it is", () => {
     // `resolvedModel` is the wire id that a response reports, date and provider prefix included.
     const dated: ModelInfo[] = [

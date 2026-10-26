@@ -281,14 +281,23 @@ export class NativeSubagentRuntime {
     model: string | undefined,
     deliver: Publish,
   ): Promise<void> {
-    if (!this.form || !parentToolUseId || !model || model === "<synthetic>") {
-      return;
+    const entry = this.form && parentToolUseId ? responseModelEntry(model, this.models) : undefined;
+    if (!entry) return;
+    // Every response of a child reports its model: most repeat the model that
+    // the client already has, and need no routing.
+    const child = this.childByParentToolUse.get(parentToolUseId!);
+    const current = child?.announced
+      ? this.configBySession.get(child.sessionId)?.options.get(MODEL_CONFIG_ID)
+      : undefined;
+    if (current?.type === "select" && current.currentValue === entry.value) {
+      const shown = current.options[0];
+      if (shown && "name" in shown && shown.name === entry.name) return;
     }
     await deliver({
       sessionId: this.rootSessionId,
       update: {
         sessionUpdate: "config_option_update",
-        configOptions: [childModelOption(responseModelEntry(model, this.models)!)],
+        configOptions: [childModelOption(entry)],
         _meta: { claudeCode: { parentToolUseId } },
       },
     });
@@ -316,6 +325,14 @@ export class NativeSubagentRuntime {
     // `<agent id>:generation:<n>`, so the agent id names its current generation.
     const known = this.children.get(agentId) ?? this.childOfSession(agentId);
     const sessionId = known?.sessionId ?? agentId;
+    // AIR's draft takes no configuration of an ended child (see `finishTask`).
+    if (
+      this.form === "air" &&
+      known &&
+      (known.terminalState !== undefined || known.terminalPromise)
+    ) {
+      return;
+    }
     let config = this.configBySession.get(sessionId);
     if (!config) {
       const pending = [...this.configBySession.keys()].filter(
@@ -718,6 +735,8 @@ export class NativeSubagentRuntime {
           if (child.parentToolUseId) (child.endedRuns ??= new Set()).add(child.parentToolUseId);
         } else {
           await finishNativeSubagent(this.session, taskId, state, this.publish);
+          // AIR's draft takes no configuration of an ended child.
+          this.configBySession.delete(child.sessionId);
         }
       } finally {
         if (child.parentToolUseId) {
@@ -1399,6 +1418,17 @@ export class NativeSubagentRuntime {
 
   private buffer(parentToolUseId: string, notification: AcpSessionNotification): void {
     const updates = this.pending.get(parentToolUseId);
+    // A child reports its model with each response before its announcement.
+    // Only the latest configuration waits, so they do not fill the buffer.
+    if (notification.update.sessionUpdate === "config_option_update" && updates) {
+      const index = updates.findIndex(
+        ({ update }) => update.sessionUpdate === "config_option_update",
+      );
+      if (index >= 0) {
+        updates[index] = notification;
+        return;
+      }
+    }
     if (
       this.pendingCount >= MAX_PENDING_UPDATES ||
       (updates === undefined && this.pending.size >= MAX_PENDING_PARENTS) ||
@@ -1525,6 +1555,11 @@ export function childModelOption(entry: ModelEntry): SessionConfigOption {
     currentValue: entry.value,
     options: [{ value: entry.value, name: entry.name }],
   };
+}
+
+/** Whether two model entries have the same value and name. */
+export function sameModelEntry(left: ModelEntry | undefined, right: ModelEntry): boolean {
+  return left?.value === right.value && left.name === right.name;
 }
 
 /**
