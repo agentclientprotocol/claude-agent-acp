@@ -17,7 +17,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { spawn } from "node:child_process";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
-import type { SessionInfo } from "@agentclientprotocol/sdk";
+import type { SessionInfo } from "@agentclientprotocol/sdk/unstable";
 import { encodeProjectPath } from "../session-index/project-dirs.js";
 import {
   archiveInsteadOfDelete,
@@ -69,10 +69,15 @@ beforeEach(async () => {
   configDir = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-cfg-")));
   workspace = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-ws-")));
   process.env.CLAUDE_CONFIG_DIR = configDir;
+  // Integration runs leave CLAUDE_CODE_EXECUTABLE unset, so initialize would run
+  // the real `claude auth status` in the background. It writes into configDir
+  // while afterEach removes it, and the rm fails with ENOTEMPTY.
+  vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
   vi.clearAllMocks();
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
   else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
   await fs.rm(configDir, { recursive: true, force: true });
@@ -271,6 +276,7 @@ describe("sessionIndex negotiation", () => {
     "recommendedValue",
     "diffPatch",
     "planFile",
+    "backgroundSubagents",
   ];
 
   it("is advertised with sessionArchive and sessionRename only to an AIR client that declares it", async () => {
@@ -1294,6 +1300,38 @@ describe("_session/list/subscribe", () => {
       ["Named", false],
       ["Done", true],
     ]);
+    await agent.dispose();
+  });
+
+  it("holds a fork back until the response of its session/fork is out", async () => {
+    const { rowsOf, agent } = await subscribedAgent();
+    const parent = await writeTranscript({ prompt: "Parent" });
+    expect(await waitFor(() => rowsOf(parent.id).length > 0)).toBe(true);
+    let answer!: () => void;
+    const responded = new Promise<void>((resolve) => (answer = resolve));
+    const forkWritten = writeTranscript({ prompt: "Parent", forkedFrom: parent.id });
+    // A fork whose head has no `forkedFrom`, as one with a first record over 64 KB.
+    const unmarkedWritten = writeTranscript({ prompt: "Parent" });
+    const forked = agent.forking(parent.id, async () => {
+      await forkWritten;
+      (agent as any).sessionIndex.onForkCreated(parent.id, (await unmarkedWritten).id);
+      await responded;
+    });
+    const fork = await forkWritten;
+    const unmarked = await unmarkedWritten;
+    // A session that is no fork of the parent goes out meanwhile.
+    const other = await writeTranscript({ prompt: "Other" });
+    expect(await waitFor(() => rowsOf(other.id).length > 0)).toBe(true);
+    expect(rowsOf(fork.id)).toEqual([]);
+    expect(rowsOf(unmarked.id)).toEqual([]);
+    const listed = await agent.listSessions({ cwd: workspace });
+    expect(listed.sessions.map((s) => s.sessionId)).not.toContain(unmarked.id);
+
+    answer();
+    await forked;
+    expect(await waitFor(() => rowsOf(fork.id).length > 0)).toBe(true);
+    expect(await waitFor(() => rowsOf(unmarked.id).length > 0)).toBe(true);
+    expect(airRow(rowsOf(fork.id)[0]!).forkedFrom).toBe(parent.id);
     await agent.dispose();
   });
 
@@ -3495,7 +3533,8 @@ describe("paths that share a project directory", () => {
         .filter((s) => s.sessionId === mine.id);
     const removed = () =>
       changesFor(notifications, fromDotted.subscriptionId).flatMap((c) => c.removed);
-    expect(await waitFor(() => added().length > 0 && removed().length > 0)).toBe(true);
+    // Wait for mine.id itself: the other path's session can be removed first.
+    expect(await waitFor(() => added().length > 0 && removed().includes(mine.id))).toBe(true);
     expect(added().map((s) => [s.sessionId, s.cwd])).toEqual([[mine.id, dashed]]);
     // It may also name the other path's session, never listed here.
     expect(removed()).toContain(mine.id);

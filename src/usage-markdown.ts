@@ -8,10 +8,18 @@ const usageWindowSchema = z
   .nullable()
   .optional();
 const contributionSchema = z.object({ name: z.string(), pct: percentSchema });
+// Claude Code 2.1.305+ suggests one change per notable source, largest share first.
+const recommendationSchema = z.object({
+  key: z.string(),
+  pct: percentSchema,
+  title: z.string(),
+  detail: z.string().optional(),
+});
 const behaviorPeriodSchema = z.object({
   request_count: countSchema,
   session_count: countSchema,
   mcp_servers: z.array(contributionSchema),
+  recommendations: z.array(recommendationSchema).optional(),
 });
 const modelUsageSchema = z.object({
   inputTokens: countSchema,
@@ -133,12 +141,23 @@ function appendContributions(
     request_count: number;
     session_count: number;
     mcp_servers: { name: string; pct: number }[];
+    recommendations?: { pct: number; title: string; detail?: string }[];
   },
 ): void {
   lines.push(
     "",
     `**${label}** · ${period.request_count} requests · ${period.session_count} sessions`,
   );
+  // Rendered in the order Claude Code sends them, as its own `/usage` does. The
+  // window's `fix` is left out: its messages must be queued at priority "later"
+  // with `client_composed` set, which an ACP prompt cannot express.
+  if (period.recommendations?.length) {
+    lines.push("");
+    for (const recommendation of period.recommendations) {
+      const detail = recommendation.detail ? ` · ${escapeMarkdown(recommendation.detail)}` : "";
+      lines.push(`- **${recommendation.pct}%** ${escapeMarkdown(recommendation.title)}${detail}`);
+    }
+  }
   if (period.mcp_servers.length === 0) return;
   lines.push("", "| MCP server | Usage |", "|:--|--:|");
   for (const server of [...period.mcp_servers].sort((a, b) => b.pct - a.pct).slice(0, 3)) {

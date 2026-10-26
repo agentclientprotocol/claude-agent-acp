@@ -1,4 +1,4 @@
-import type { RequestPermissionRequest, ToolCallContent } from "@agentclientprotocol/sdk";
+import type { RequestPermissionRequest, ToolCallContent } from "@agentclientprotocol/sdk/unstable";
 import { AIR_PERMISSION_KEY, withAirMeta } from "../air-extension.js";
 import { ClientCapabilities } from "../tool-calls/client-capabilities.js";
 import { AcpToolCallRenderer } from "../tool-calls/renderer.js";

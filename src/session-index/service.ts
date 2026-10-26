@@ -15,7 +15,7 @@ import {
   RequestError,
   type ListSessionsRequest,
   type ListSessionsResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
@@ -28,6 +28,7 @@ import {
   visibleTitle,
 } from "./archive-title.js";
 import {
+  ForkHolds,
   ListSubscriptions,
   type ListChanges,
   type ListSubscribeResponse,
@@ -470,6 +471,9 @@ export class SessionIndexService {
   readonly index: SessionIndex;
   readonly registry: LiveSessionRegistry;
   private subscriptions?: ListSubscriptions;
+  /** Here and not in the subscriptions, which start with the first subscribe:
+   *  a subscribe during a fork holds that fork back too. */
+  private readonly forkHolds = new ForkHolds();
   /** Set for good by {@link dispose}: no subscription is made after it. */
   private disposed = false;
   /** The mutation in flight per session, which the next one waits for. */
@@ -478,10 +482,16 @@ export class SessionIndexService {
   private readonly deleteSession: (sessionId: string) => Promise<void>;
 
   constructor(private readonly deps: SessionIndexDeps) {
-    this.index = new SessionIndex();
     this.registry = deps.registry ?? new LiveSessionRegistry();
+    this.index = new SessionIndex({ isLive: (sessionId) => this.isLive(sessionId) });
     this.now = deps.now ?? Date.now;
     this.deleteSession = deps.deleteSession ?? ((id) => sdkDeleteSession(id));
+  }
+
+  /** Whether a live process holds the session, by the live registry. */
+  private async isLive(sessionId: string): Promise<boolean> {
+    const live = await this.registry.snapshot();
+    return live.has(sessionId);
   }
 
   /** `session/list` of a `sessionIndex` client. `own` reports the sessions
@@ -508,9 +518,10 @@ export class SessionIndexService {
     });
     const live = await livePromise;
     const now = this.now();
-    const sessions = rows.map((row) =>
-      sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now),
-    );
+    const sessions = rows
+      // A fork whose fork response is not out yet is left out, as in the list subscriptions.
+      .filter((row) => !this.forkHolds.isHeld(row.sessionId))
+      .map((row) => sessionInfoOf(row, own(row.sessionId), live.get(row.sessionId), now));
     const last = rows[rows.length - 1];
     return hasMore && last ? { sessions, nextCursor: encodeListCursor(last, scope) } : { sessions };
   }
@@ -714,6 +725,7 @@ export class SessionIndexService {
       registry: this.registry,
       own: (sessionId) => this.deps.ownSessionState?.(sessionId),
       notify: (changes) => this.deps.notifyListChanges?.(changes) ?? Promise.resolve(),
+      forkHolds: this.forkHolds,
       logError: this.deps.logError,
       ...this.deps.listSubscriptionTiming,
     });
@@ -728,6 +740,22 @@ export class SessionIndexService {
   /** A session this connection runs changed what its row shows. */
   ownSessionChanged(sessionId: string): void {
     this.subscriptions?.ownSessionChanged(sessionId);
+  }
+
+  /** A `session/fork` of `sourceId` started (see {@link ForkHolds}). */
+  forkStarted(sourceId: string): void {
+    this.forkHolds.started(sourceId);
+  }
+
+  /** The `session/fork` of `sourceId` copied the transcript into `forkId`. */
+  forkCreated(sourceId: string, forkId: string): void {
+    this.forkHolds.created(sourceId, forkId);
+  }
+
+  /** The response of a `session/fork` of `sourceId` is out: the list
+   *  subscriptions send the rows they held back. */
+  forkAnswered(sourceId: string): void {
+    if (this.forkHolds.answered(sourceId)) this.subscriptions?.deliverPending();
   }
 
   dispose(): void {

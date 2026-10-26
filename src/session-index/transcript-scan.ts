@@ -7,9 +7,13 @@
  *
  * A last message longer than the tail window leaves no message in it: then
  * the tail window grows, up to {@link MAX_TAIL_SIZE}, until it holds one.
+ *
+ * The open background tasks come from the tail, on top of the tasks of an
+ * earlier scan (see `background-tasks.ts`).
  */
 
 import * as fs from "node:fs/promises";
+import { backgroundTasksOf, type BackgroundTasks } from "./background-tasks.js";
 import { firstPrompt, isUserPrompt, mediaPrompt, promptOf } from "./first-prompt.js";
 
 const CHUNK_SIZE = 64 * 1024;
@@ -56,6 +60,9 @@ export type TranscriptFacts = {
    *  worktree and the session is in it), false when it says otherwise.
    *  Undefined when no such record was read. See {@link agentWorktreeOf}. */
   agentWorktree?: boolean;
+  /** The background tasks that did not end. From the tail, on top of what
+   *  an earlier scan found when the file only grew within the tail. */
+  backgroundTasks?: BackgroundTasks;
   /** Whether the head or the tail holds a user or an assistant message. A
    *  transcript without one is a metadata-only stub. */
   hasMessages: boolean;
@@ -77,7 +84,7 @@ const INHERITED_FACTS = ["model", "tailCwd", "lastTurnEndedAt", "agentWorktree"]
 /** What an earlier scan of the same file found, at `size`. */
 export type PreviousScan = { size: number } & Pick<
   TranscriptFacts,
-  "lastPromptAt" | "promptSearched" | (typeof INHERITED_FACTS)[number]
+  "lastPromptAt" | "promptSearched" | "backgroundTasks" | (typeof INHERITED_FACTS)[number]
 >;
 
 /** The last `window` bytes of a file of `size` bytes, without the first,
@@ -157,6 +164,8 @@ export async function scanTranscriptFile(
       }
     }
   }
+  const previousTasks = grownWithinTail ? previous.backgroundTasks : undefined;
+  facts.backgroundTasks = tailBackgroundTasks(read.tail, size, previousTasks);
   // No worktree record in the tail (or before it, by an earlier scan): the
   // one `claude --worktree` writes at the start may still be in the head.
   if (facts.agentWorktree === undefined) {
@@ -174,7 +183,8 @@ export async function scanTranscriptFile(
   if (!facts.hasMessages || complete(facts) || size <= CHUNK_SIZE) return facts;
   const key = `${filePath}\0${size}\0${identity ?? ""}`;
   const searched = fullySearched.get(key);
-  if (searched) return searched;
+  // The tasks can differ by the earlier scan.
+  if (searched) return { ...searched, backgroundTasks: facts.backgroundTasks };
   let result = facts;
   const handle = await fs.open(filePath, "r");
   try {
@@ -218,6 +228,7 @@ export async function scanTranscriptFile(
         // A turn end the wider tail lacks may lie before it: the
         // narrow scan inherited it from an earlier scan of this file.
         lastTurnEndedAt: wider.lastTurnEndedAt ?? facts.lastTurnEndedAt,
+        backgroundTasks: facts.backgroundTasks,
         hasMessages: facts.hasMessages,
         lastPromptAt,
         // Searched to the start of the file, or found.
@@ -235,6 +246,22 @@ export async function scanTranscriptFile(
     fullySearched.delete(fullySearched.keys().next().value as string);
   }
   return result;
+}
+
+/**
+ * The background tasks of the tail of a file of `size` bytes. `previous`:
+ * the tasks of an earlier scan, when the file only grew within the tail
+ * since. The set is complete when the tail is the whole file, or when it
+ * holds all records after a complete earlier set.
+ */
+function tailBackgroundTasks(
+  tail: string,
+  size: number,
+  previous: BackgroundTasks | undefined,
+): BackgroundTasks {
+  if (size <= CHUNK_SIZE) return backgroundTasksOf(tail, { complete: true });
+  if (previous?.complete) return backgroundTasksOf(tail, { complete: true, after: previous });
+  return backgroundTasksOf(tail, { complete: false });
 }
 
 const RELOCATED_MARKER = '"relocated"';
