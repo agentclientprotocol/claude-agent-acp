@@ -367,7 +367,7 @@ describe("_session/batch_get", () => {
     }
   });
 
-  it("accepts only 0–100 distinct, non-empty string ids and no other fields", () => {
+  it("accepts only distinct, non-empty string ids and no other fields", () => {
     for (const params of [
       null,
       [],
@@ -378,7 +378,6 @@ describe("_session/batch_get", () => {
       { sessionIds: [" "] },
       { sessionIds: [1] },
       { sessionIds: ["id", "id"] },
-      { sessionIds: Array.from({ length: 101 }, (_, i) => `id-${i}`) },
       ...["cwd", "archived", "includeWorktrees", "limit", "cursor"].map((key) => ({
         sessionIds: [],
         [key]: null,
@@ -388,7 +387,7 @@ describe("_session/batch_get", () => {
         expect.objectContaining({ code: -32602 }),
       );
     }
-    const sessionIds = Array.from({ length: 100 }, (_, i) => `id-${i}`);
+    const sessionIds = Array.from({ length: 1000 }, (_, i) => `id-${i}`);
     expect(parseBatchGetSessionsRequest({ sessionIds })).toEqual({ sessionIds });
     // Ids are exact, not trimmed or otherwise normalized.
     expect(parseBatchGetSessionsRequest({ sessionIds: [" id ", "id"] })).toEqual({
@@ -456,6 +455,33 @@ describe("_session/batch_get", () => {
       expect(getSessionInfo).not.toHaveBeenCalled();
     } finally {
       readdir.mockClear();
+      await agent.dispose();
+    }
+  });
+
+  it("keeps request order and copy selection across lookup chunks", async () => {
+    const base = Date.parse("2026-03-01T00:00:00Z");
+    const first = await writeTranscript({ lastMessageAt: base });
+    const last = await writeTranscript({ lastMessageAt: base - 60_000 });
+    const copyId = randomUUID();
+    await writeTranscript({ sessionId: copyId, prompt: "Old copy", lastMessageAt: base - 120_000 });
+    await writeTranscript({
+      sessionId: copyId,
+      cwd: path.join(workspace, "other"),
+      prompt: "New copy",
+      lastMessageAt: base - 30_000,
+    });
+    // 250 ids: three lookup chunks of 100, with found ids in the first, second and third.
+    const sessionIds: string[] = Array.from({ length: 250 }, () => randomUUID());
+    sessionIds[0] = last.id;
+    sessionIds[120] = copyId;
+    sessionIds[249] = first.id;
+    const { agent } = await indexAgent();
+    try {
+      const result = await agent.batchGetSessions({ sessionIds });
+      expect(result.sessions.map((s) => s.sessionId)).toEqual([last.id, copyId, first.id]);
+      expect(result.sessions[1]!.title).toBe("New copy");
+    } finally {
       await agent.dispose();
     }
   });

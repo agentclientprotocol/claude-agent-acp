@@ -86,13 +86,12 @@ export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRe
   if (
     Object.keys(record).length !== 1 ||
     !Array.isArray(ids) ||
-    ids.length > 100 ||
     ids.some((id) => typeof id !== "string" || !id.trim()) ||
     new Set(ids).size !== ids.length
   ) {
     throw RequestError.invalidParams(
       undefined,
-      "params require only sessionIds: 0–100 distinct, non-empty strings",
+      "params require only sessionIds: distinct, non-empty strings",
     );
   }
   return { sessionIds: ids };

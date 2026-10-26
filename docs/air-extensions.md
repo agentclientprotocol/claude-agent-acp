@@ -1450,10 +1450,11 @@ sessions and folder members outside the recent list page. Check for
 `sessionBatchGet` in `initialize.result._meta.jetbrains.air.capabilities` before
 calling it.
 
-The params object must contain only `sessionIds`: an array of 0–100 distinct,
+The params object must contain only `sessionIds`: an array of distinct,
 non-empty strings. IDs match exactly, without trimming or case normalization.
-Malformed params, duplicates, more than 100 IDs, or extra fields return
-`Invalid params` (`-32602`). Archived sessions and sessions in other projects
+Malformed params, duplicates or extra fields return `Invalid params` (`-32602`).
+The agent sets no limit on the number of IDs; the client chooses the batch size
+for the latency it accepts. Archived sessions and sessions in other projects
 or worktrees are eligible.
 
 ```json
@@ -1495,7 +1496,8 @@ Individual results reflect the store as each ID is read.
 
 Lookup addresses only the requested transcript filenames in each project
 and reads their metadata. Work depends on the requested IDs and project
-directories, rather than the total session history. Merge returned rows with
+directories, rather than the total session history. The agent looks up 100 IDs
+at a time, so memory stays bounded for any request size. Merge returned rows with
 the recent page by `sessionId`. A batch read does not expand an existing list
 subscription's scope; refresh retained IDs outside that scope explicitly.
 

@@ -67,6 +67,8 @@ export class SessionStoreUnavailableError extends Error {}
  *  pages do not read them again. */
 const METADATA_CACHE_SIZE = 50_000;
 const READ_BATCH_SIZE = 16;
+/** Session ids looked up together by {@link SessionIndex.getSessions}. */
+const LOOKUP_CHUNK_SIZE = 100;
 /** Transcripts read at most per directory to recover a sibling's cwd. */
 const MAX_CWD_PROBES_PER_DIR = 64;
 /** How long a directory that gave no cwd is not probed again. */
@@ -608,6 +610,27 @@ export class SessionIndex {
       throw new SessionStoreUnavailableError("Session store could not be read", { cause });
     }
     const ids = sessionIds.filter(isSessionId);
+    const byId = new Map<string, IndexRow>();
+    // Paths are project directories × ids: bound them per chunk, not per request.
+    for (let start = 0; start < ids.length; start += LOOKUP_CHUNK_SIZE) {
+      const chunk = ids.slice(start, start + LOOKUP_CHUNK_SIZE);
+      for (const row of await this.lookupRows(root, projectEntries, chunk)) {
+        byId.set(row.sessionId, row);
+      }
+    }
+    return sessionIds.flatMap((id) => {
+      const row = byId.get(id);
+      return row ? [row] : [];
+    });
+  }
+
+  /** The rows of `ids` found under `projectEntries`. All copies of an id are
+   *  in the same call, so copy selection is unchanged by chunking. */
+  private async lookupRows(
+    root: string,
+    projectEntries: readonly string[],
+    ids: readonly string[],
+  ): Promise<IndexRow[]> {
     let candidates = await transcriptCandidates(
       projectEntries.flatMap((dirName) =>
         ids.map((sessionId) => ({
@@ -631,15 +654,10 @@ export class SessionIndex {
       );
       candidates = candidates.filter((_, i) => exact[i]);
     }
-    const rows = await this.collectRows(candidates.sort(byMtimeDescending), {
+    return this.collectRows(candidates.sort(byMtimeDescending), {
       inScope: scopeOf(undefined),
       archived: "all",
       wanted: Infinity,
-    });
-    const byId = new Map(rows.map((row) => [row.sessionId, row]));
-    return sessionIds.flatMap((id) => {
-      const row = byId.get(id);
-      return row ? [row] : [];
     });
   }
 
