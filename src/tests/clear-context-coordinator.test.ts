@@ -31,6 +31,7 @@ function testSession(overrides: Partial<TestSession> = {}): TestSession {
     configOptions: [],
     currentAgent: "default",
     fastModeEnabled: false,
+    ultracodeEnabled: false,
     input: { push: vi.fn() },
     ...overrides,
   };
@@ -49,6 +50,7 @@ function testHost(
       return freshSession;
     }),
     applyFastMode: vi.fn(async () => {}),
+    applyUltracode: vi.fn(async () => {}),
     publishSessionState: vi.fn(async () => {}),
     continuationMessage: vi.fn((sessionId, plan, promptUuid) => ({
       type: "user" as const,
@@ -250,6 +252,25 @@ describe("continuePlanInFreshContext", () => {
     );
 
     expect(host.applyFastMode).toHaveBeenCalledWith(freshSession, false);
+  });
+
+  it("restores ultracode turned on before clearing context", async () => {
+    const turn: ClearContextTurn = {
+      settled: false,
+      promptUuid: "00000000-0000-4000-8000-000000000000",
+    };
+    const oldSession = testSession({ activeTurn: turn, ultracodeEnabled: true });
+    const freshSession = testSession({ ultracodeEnabled: false });
+    const host = testHost(oldSession, freshSession);
+
+    await continuePlanInFreshContext(
+      "public-session",
+      oldSession,
+      { toolUseId: "tool-plan", plan: "Ship it", mode: "auto" },
+      host,
+    );
+
+    expect(host.applyUltracode).toHaveBeenCalledWith(freshSession, true);
   });
 
   it("does not publish or continue a restart cancelled while creating the fresh session", async () => {

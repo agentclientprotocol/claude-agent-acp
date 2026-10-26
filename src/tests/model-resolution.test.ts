@@ -381,17 +381,17 @@ describe("settingsEffortForModel", () => {
 });
 
 describe("effortFlagSettings", () => {
-  it("carries ultracode only when settings request it", () => {
-    expect(effortFlagSettings("high", { ultracode: true })).toEqual({
+  it("carries ultracode only while the session has it on", () => {
+    expect(effortFlagSettings("high", true)).toEqual({
       effortLevel: "high",
       ultracode: true,
     });
-    expect(effortFlagSettings("default", { ultracode: true })).toEqual({
+    expect(effortFlagSettings("default", true)).toEqual({
       effortLevel: null,
       ultracode: true,
     });
-    expect(effortFlagSettings("high", { ultracode: false })).toEqual({ effortLevel: "high" });
-    expect(effortFlagSettings(undefined, {})).toEqual({ effortLevel: null });
+    expect(effortFlagSettings("high", false)).toEqual({ effortLevel: "high" });
+    expect(effortFlagSettings(undefined, false)).toEqual({ effortLevel: null });
   });
 });
 

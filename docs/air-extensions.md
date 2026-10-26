@@ -707,7 +707,7 @@ A non-empty plan also gets one clear-context choice with the same priority.
 After that choice, the adapter stops the old private Claude query and hides that internal rejection.
 It starts a new private query under the same ACP session.
 It continues the turn with `Implement the following plan:` and the complete plan.
-The mode, model, agent, effort, Fast mode, and turn usage stay the same.
+The mode, model, agent, effort, Fast mode, ultracode, and turn usage stay the same.
 The SDK cannot apply `allowedPrompts` again, so those hints do not survive the handoff.
 
 The adapter does not allow a callback only because the session mode is `bypassPermissions`.
