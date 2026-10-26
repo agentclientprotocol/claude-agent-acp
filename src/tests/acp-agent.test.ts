@@ -16,10 +16,11 @@ import {
   RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
@@ -67,6 +68,7 @@ import {
   type HookCallback,
   importSessionToStore,
   listSessions,
+  type ModelInfo,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
@@ -2269,6 +2271,57 @@ describe("usage Markdown", () => {
     expect(formatted).not.toContain("lowest");
   });
 
+  it("renders each window's recommendations in order, escaped, before its MCP table", () => {
+    const formatted = formatUsageResponse({
+      ...usageResponse,
+      behaviors: {
+        ...usageResponse.behaviors,
+        day: {
+          ...usageResponse.behaviors.day,
+          recommendations: [
+            { key: "mcp_server", pct: 41, title: "Disable my_server", detail: "/mcp" },
+            { key: "effort", pct: 12, title: "Lower effort | max" },
+          ],
+          fix: { keys: ["mcp_server"], messages: ["/mcp disable my_server"] },
+        },
+        week: {
+          ...usageResponse.behaviors.week,
+          mcp_servers: [],
+          recommendations: [{ key: "agent", pct: 5, title: "Trim the reviewer agent" }],
+        },
+      },
+    });
+    const day = formatted.slice(
+      formatted.indexOf("**Last 24h**"),
+      formatted.indexOf("**Last 7d**"),
+    );
+    expect(day).toContain(
+      "- **41%** Disable my\\_server · /mcp\n- **12%** Lower effort \\| max\n\n| MCP server |",
+    );
+    expect(formatted).not.toContain("undefined");
+    expect(formatted).not.toContain("/mcp disable");
+    expect(
+      formatted.endsWith(
+        "**Last 7d** · 43 requests · 5 sessions\n\n- **5%** Trim the reviewer agent",
+      ),
+    ).toBe(true);
+  });
+
+  it("falls back to the CLI text for a malformed recommendation", () => {
+    expect(
+      parseUsageResponse({
+        ...usageResponse,
+        behaviors: {
+          ...usageResponse.behaviors,
+          day: {
+            ...usageResponse.behaviors.day,
+            recommendations: [{ key: "effort", pct: "high", title: "Lower effort" }],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
   it("recognizes only exact local usage commands", () => {
     expect(isUsageCommandText(" /usage ")).toBe(true);
     expect(isUsageCommandText("/cost")).toBe(false);
@@ -3533,6 +3586,73 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
+  it("refines an ended AIR child's model after the load response, once the model list is known", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) =>
+          updates.push(update as AcpSessionNotification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+    // A load replays while the CLI starts: the session and its model list come later.
+    await (
+      agent as unknown as {
+        replaySessionHistory(
+          sessionId: string,
+          messages: unknown[],
+          pending: unknown,
+        ): Promise<void>;
+      }
+    ).replaySessionHistory("s1", replayHistory, {
+      state: { cwd: "/tmp", taskState: new Map(), messageIdToUuid: new Map() },
+      stopped: false,
+    });
+    const child = "s1:replay-subagent:parent-agent-call";
+    const models = () =>
+      updates.flatMap(({ sessionId, update }) =>
+        update.sessionUpdate === "config_option_update"
+          ? update.configOptions.map((option) => [
+              sessionId,
+              option.currentValue,
+              (option as { options: Array<{ name: string }> }).options[0]?.name,
+            ])
+          : [],
+      );
+    // Without the list, the replay sends the model id, and then ends the child.
+    expect(models()).toEqual([[child, "claude-sonnet-4-5", "claude-sonnet-4-5"]]);
+    expect(updates.at(-1)?.update.sessionUpdate).toBe("subagent_state_update");
+    (agent.sessions as Record<string, unknown>).s1 = {
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "sonnet",
+          options: [{ value: "sonnet", name: "Sonnet 4.5" }],
+        },
+      ],
+      modelInfos: [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-4-5",
+          displayName: "Sonnet 4.5",
+          description: "",
+        },
+      ],
+    };
+    await agent.publishCurrentSubagentStates("s1");
+    expect(models()).toEqual([
+      [child, "claude-sonnet-4-5", "claude-sonnet-4-5"],
+      [child, "sonnet", "Sonnet 4.5"],
+    ]);
+    // Once only.
+    await agent.publishCurrentSubagentStates("s1");
+    expect(models()).toHaveLength(2);
+  });
+
   it("replays a subagent from its own transcript file", async () => {
     // Claude keeps a subagent history in <session>/subagents/, and the SDK
     // returns the main transcript without it and without parent_tool_use_id.
@@ -3689,8 +3809,11 @@ describe("subagent transcript replay", () => {
         [sessionId, "user_message_chunk", "Explore it"],
         [sessionId, "subagent_spawned", child1],
         [child1, "user_message_chunk", "Look around"],
+        // The model of the child's response, as the replay reaches it.
+        [child1, "config_option_update", undefined],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
+        // Nothing names its model, so it gets none.
         [sessionId, "subagent_spawned", child2],
         [sessionId, "agent_message_chunk", "Done."],
         [sessionId, "subagent_state_update", child2],
@@ -3757,6 +3880,19 @@ describe("subagent transcript replay", () => {
       root: object[],
       children: Record<string, { meta: object; records: object[] }>,
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
+      afterResponse?: {
+        live: (childSessionId: string) => string | undefined;
+        /** The session's config options and model list, known after the response. */
+        models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
+      },
+      {
+        traceModels = false,
+        load = false,
+      }: {
+        traceModels?: boolean;
+        /** Replay as a load does, while the CLI starts: without the session record. */
+        load?: boolean;
+      } = {},
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -3794,21 +3930,64 @@ describe("subagent transcript replay", () => {
         );
         await initializeClient(agent, capabilities);
         vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+        const pending = load
+          ? {
+              state: { cwd: "/tmp/proj", taskState: new Map(), messageIdToUuid: new Map() },
+              stopped: false,
+            }
+          : undefined;
         await (
-          agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-        ).replaySessionHistory(sessionId);
-        return updates.flatMap(({ sessionId: target, update }) => {
+          agent as unknown as {
+            replaySessionHistory(
+              sessionId: string,
+              messages?: unknown[],
+              pending?: unknown,
+            ): Promise<void>;
+          }
+        ).replaySessionHistory(sessionId, undefined, pending);
+        const responseAt = updates.length;
+        if (afterResponse) {
+          // Stands in for the live session's runtime, which knows its running children.
+          (agent.sessions as Record<string, unknown>)[sessionId] = {
+            nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+            configOptions: afterResponse.models?.configOptions ?? [],
+            modelInfos: afterResponse.models?.modelInfos ?? [],
+          };
+          await agent.publishCurrentSubagentStates(sessionId);
+        }
+        return updates.flatMap(({ sessionId: target, update }, index) => {
           const on = target === sessionId ? "root" : target;
           const u = update as any;
+          const response = afterResponse && index === responseAt ? ["-- response --"] : [];
           switch (update.sessionUpdate) {
             case "subagent_update":
-              return [`${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}`];
-            case "session_message":
               return [
-                `${on} session_message ${u.messageId} from=${u.senderSessionId ?? "-"} ${u.content[0].text}`,
+                ...response,
+                `${on} subagent_update ${u.sessionId} ${JSON.stringify(u.state)}` +
+                  (u.capabilities ? ` capabilities=${JSON.stringify(u.capabilities)}` : ""),
               ];
+            case "session_message": {
+              const references = [
+                ...(u.senderMessageId ? [`senderMessageId=${u.senderMessageId}`] : []),
+                ...(u.recipientMessageId ? [`recipientMessageId=${u.recipientMessageId}`] : []),
+              ];
+              return [
+                [
+                  `${on} session_message ${u.messageId} from=${u.senderSessionId ?? "-"}`,
+                  ...references,
+                  u.content[0].text,
+                ].join(" "),
+              ];
+            }
             case "tool_call":
               return [`${on} tool_call ${u.toolCallId}`];
+            case "config_option_update":
+              return traceModels
+                ? u.configOptions.map(
+                    (option: any) =>
+                      `${on} model ${option.currentValue} ${JSON.stringify(option.options)}`,
+                  )
+                : [];
             case "notice":
               return [`${on} notice ${u.title}: ${u.description}`];
             case "user_message_chunk":
@@ -3824,6 +4003,78 @@ describe("subagent transcript replay", () => {
         await rm(configDir, { recursive: true, force: true });
       }
     }
+
+    it("replays a fork child without the launching message and boilerplate it inherited", async () => {
+      // A `subagent_type: "fork"` transcript starts with a copy of the
+      // launching message (same API message id) and a directive message with
+      // a placeholder result for each of its tool_uses, worded as Claude Code
+      // 2.1.307+ writes them.
+      const launching = [
+        { type: "text", text: "I'll fork a worker." },
+        toolUse("toolu_fork", "Agent", {
+          subagent_type: "fork",
+          description: "Check the parser",
+          prompt: "Inspect the parser",
+        }),
+        toolUse("toolu_read", "Read", { file_path: "/tmp/proj/a.ts" }),
+      ];
+      const forkStarted = (id: string) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [
+          {
+            type: "text",
+            text:
+              id === "toolu_fork"
+                ? "Fork started — that fork is you."
+                : "This is the parent's call, not yours. It may not have run yet, and its result goes to the parent.",
+          },
+        ],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Check it"),
+          assistant("a1", launching),
+          user("u2", [toolResult("toolu_fork", "Parser is fine."), toolResult("toolu_read", "x")]),
+          assistant("a2", [{ type: "text", text: "Done." }]),
+        ],
+        {
+          fork1: {
+            meta: {
+              agentType: "fork",
+              isFork: true,
+              description: "Check the parser",
+              toolUseId: "toolu_fork",
+            },
+            records: [
+              { ...assistant("f1", launching), message: { ...assistant("a1", launching).message } },
+              user("f2", [
+                forkStarted("toolu_fork"),
+                forkStarted("toolu_read"),
+                {
+                  type: "text",
+                  text: "<fork-boilerplate>\nYou are a worker fork.\n</fork-boilerplate>\nYour directive: Inspect the parser",
+                },
+              ]),
+              assistant("f3", [{ type: "text", text: "Parser is fine." }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Check it",
+        "root agent_message_chunk I'll fork a worker.",
+        "root tool_call toolu_read",
+        'root subagent_update fork1 {"state":"running"}',
+        `root session_message toolu_fork from=${sessionId} recipientMessageId=toolu_fork Inspect the parser`,
+        `fork1 session_message toolu_fork from=${sessionId} senderMessageId=toolu_fork Inspect the parser`,
+        "fork1 agent_message_chunk Parser is fine.",
+        "root session_message toolu_fork:reply from=fork1 Parser is fine.",
+        "root agent_message_chunk Done.",
+        'root subagent_update fork1 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
 
     it("replays each child under its live session id, with its incoming messages, before the response", async () => {
       const trace = await replayRfd(
@@ -3897,26 +4148,264 @@ describe("subagent transcript replay", () => {
 
       expect(trace).toEqual([
         "root user_message_chunk Explore it",
-        "root tool_call toolu_agent",
+        // The launch without metadata stays a tool call; the other one is
+        // replaced by the parent's session messages.
         "root tool_call toolu_lost",
         // The child is announced under its agent id, right after its launch.
         'root subagent_update abc123 {"state":"running"}',
-        "abc123 session_message toolu_agent from=" + sessionId + " Look around",
+        `root session_message toolu_agent from=${sessionId} recipientMessageId=toolu_agent Look around`,
+        `abc123 session_message toolu_agent from=${sessionId} senderMessageId=toolu_agent Look around`,
         "abc123 agent_message_chunk Child report.",
-        "abc123 tool_call toolu_nested",
         // A nested child is announced on the child that launched it.
         'abc123 subagent_update def456 {"state":"running"}',
-        "def456 session_message toolu_nested from=abc123 Read spec.md",
+        "abc123 session_message toolu_nested from=abc123 recipientMessageId=toolu_nested Read spec.md",
+        "def456 session_message toolu_nested from=abc123 senderMessageId=toolu_nested Read spec.md",
         "def456 agent_message_chunk X.",
-        // The delivered message has the id, text, and sender of its SendMessage call.
-        "abc123 session_message toolu_send from=" + sessionId + " Check the tests too",
+        "abc123 session_message toolu_nested:reply from=def456 The spec says X.",
+        // The delivered message has the id, text, and sender of its SendMessage
+        // call, which it replaces: the sender's view goes out at the call.
+        "abc123 session_message toolu_send from=" +
+          sessionId +
+          " senderMessageId=toolu_send Check the tests too",
         "abc123 agent_message_chunk Tests pass.",
-        "root tool_call toolu_send",
+        "root session_message toolu_agent:reply from=abc123 Found it.",
+        `root session_message toolu_send from=${sessionId} recipientMessageId=toolu_send Check the tests too`,
         "root agent_message_chunk Done.",
         // Every end comes before the response.
         'abc123 subagent_update def456 {"state":"idle","stopReason":"end_turn"}',
         'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
         "root notice Some subagent history is not available: The history of 1 subagent of this session could not be restored.",
+      ]);
+    });
+
+    it("sends each child's current state after the load response", async () => {
+      const launch = (id: string, name: string) =>
+        toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
+      const child = (name: string, launchId: string) => ({
+        meta: { agentType: "Explore", name, toolUseId: launchId, requestShape: "foreground" },
+        records: [user(`${name}1`, `Run ${name}`)],
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [launch("toolu_live", "live"), launch("toolu_gone", "gone")]),
+          user("u2", [toolResult("toolu_live", "Live."), toolResult("toolu_gone", "Gone.")]),
+        ],
+        { aaa111: child("live", "toolu_live"), bbb222: child("gone", "toolu_gone") },
+        undefined,
+        // The session is loaded again in the process that still runs `aaa111`.
+        { live: (childSessionId) => (childSessionId === "aaa111" ? "running" : undefined) },
+      );
+
+      expect(trace.slice(trace.indexOf("-- response --"))).toEqual([
+        "-- response --",
+        // A child that still runs reports its live state, and can be cancelled.
+        'root subagent_update aaa111 {"state":"running"} capabilities={"cancel":{}}',
+        // Any other child's process is gone: its replayed end is its current
+        // state, and nothing can cancel it.
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
+    it("sends the model of each child's responses, and after the load response only a changed entry", async () => {
+      const launch = (id: string, name: string, input: object = {}) =>
+        toolUse(id, "Agent", {
+          name,
+          subagent_type: "general-purpose",
+          prompt: `Run ${name}`,
+          ...input,
+        });
+      const answer = (uuid: string, model: string, text: string) => ({
+        ...assistant(uuid, []),
+        message: {
+          id: `m-${uuid}`,
+          role: "assistant",
+          model,
+          content: [{ type: "text", text }],
+        },
+      });
+      const meta = (name: string, launchId: string) => ({
+        agentType: "general-purpose",
+        name,
+        toolUseId: launchId,
+        requestShape: "foreground",
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [
+            launch("toolu_answered", "answered"),
+            launch("toolu_unlisted", "unlisted", { model: "haiku" }),
+            launch("toolu_silent", "silent"),
+          ]),
+          user("u2", [
+            toolResult("toolu_answered", "Done."),
+            toolResult("toolu_unlisted", "Done."),
+            toolResult("toolu_silent", "Done."),
+          ]),
+        ],
+        {
+          aaa111: {
+            meta: meta("answered", "toolu_answered"),
+            records: [
+              user("x1", "Run answered"),
+              answer("x2", "claude-haiku-4-5", "First."),
+              answer("x3", "claude-haiku-4-5", "Same model."),
+              answer("x4", "claude-opus-5", "Fallback."),
+            ],
+          },
+          // A model that the session's list does not have.
+          bbb222: {
+            meta: meta("unlisted", "toolu_unlisted"),
+            records: [user("y1", "Run unlisted"), answer("y2", "claude-fable-9", "Done.")],
+          },
+          // No response: the replay does not guess the launch input's or the parent's model.
+          ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
+        },
+        undefined,
+        {
+          live: () => undefined,
+          models: {
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "opus",
+                options: [
+                  { value: "opus", name: "Opus 5" },
+                  { value: "haiku", name: "Haiku 4.5" },
+                ],
+              },
+            ],
+            modelInfos: [
+              {
+                value: "opus",
+                displayName: "Opus 5",
+                description: "",
+                resolvedModel: "claude-opus-5",
+              },
+              {
+                value: "haiku",
+                displayName: "Haiku 4.5",
+                description: "",
+                resolvedModel: "claude-haiku-4-5",
+              },
+            ],
+          },
+        },
+        { traceModels: true, load: true },
+      );
+
+      const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
+      const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
+      expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
+        // During the replay the session has no model list yet, so the model is the id.
+        'root subagent_update aaa111 {"state":"running"}',
+        `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
+        // A response on another model sends the model again; the same model does not.
+        `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
+        'root subagent_update bbb222 {"state":"running"}',
+        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
+        'root subagent_update ccc333 {"state":"running"}',
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        // After the response, a model goes again only when the root session's
+        // `model` option maps it to another entry.
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        `aaa111 model opus ${opus}`,
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
+    it("keeps a SendMessage call that the replay reaches before its delivery as a tool call", async () => {
+      const launch = (id: string, name: string) =>
+        toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
+      const meta = (name: string, launchId: string) => ({
+        agentType: "Explore",
+        name,
+        toolUseId: launchId,
+        requestShape: "foreground",
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [launch("toolu_a", "alpha"), launch("toolu_b", "beta")]),
+          user("u2", [toolResult("toolu_a", "A."), toolResult("toolu_b", "B.")]),
+        ],
+        {
+          // alpha's history, which replays first, messages beta.
+          aaa111: {
+            meta: meta("alpha", "toolu_a"),
+            records: [
+              user("a1", "Run alpha"),
+              assistant("a2", [
+                toolUse("toolu_sib", "SendMessage", { to: "bbb222", message: "Ping sibling" }),
+              ]),
+              user("a3", [toolResult("toolu_sib", "Message sent.")]),
+            ],
+          },
+          bbb222: {
+            meta: meta("beta", "toolu_b"),
+            records: [
+              user("b1", "Run beta"),
+              user(
+                "b2",
+                "The coordinator sent a message while you were working:\nPing sibling\n\nAddress this before completing your current task.",
+                { isMeta: true, origin: { kind: "coordinator" } },
+              ),
+            ],
+          },
+        },
+      );
+
+      expect(trace.filter((line) => line.includes("toolu_sib"))).toEqual([
+        // The call came first, so it stays a tool call, and the message that
+        // arrives later names no other view.
+        "aaa111 tool_call toolu_sib",
+        "bbb222 session_message toolu_sib from=aaa111 Ping sibling",
+      ]);
+    });
+
+    it("replays a child's hand-back as its message to the parent, instead of the launch's result", async () => {
+      const trace = await replayRfd(
+        [
+          user("u1", "Ask it"),
+          assistant("a1", [
+            toolUse("toolu_agent", "Agent", { subagent_type: "Explore", prompt: "Say PONG" }),
+          ]),
+          // In hand-back mode the launch's result only says where the report went.
+          user("u2", [toolResult("toolu_agent", "The report was delivered as a message.")]),
+          assistant("a2", [{ type: "text", text: "It said PONG." }]),
+        ],
+        {
+          abc123: {
+            meta: { agentType: "Explore", toolUseId: "toolu_agent", requestShape: "foreground" },
+            records: [
+              user("c1", "Say PONG"),
+              assistant("c2", [toolUse("toolu_handback", "SubagentHandback", { message: "PONG" })]),
+              user("c3", [toolResult("toolu_handback", "Report delivered to your caller.")]),
+              // A failed hand-back delivered nothing, so it stays a tool call.
+              assistant("c4", [toolUse("toolu_lost", "SubagentHandback", { message: "Again" })]),
+              user("c5", [{ ...toolResult("toolu_lost", "Not delivered"), is_error: true }]),
+            ],
+          },
+        },
+      );
+
+      expect(trace).toEqual([
+        "root user_message_chunk Ask it",
+        'root subagent_update abc123 {"state":"running"}',
+        `root session_message toolu_agent from=${sessionId} recipientMessageId=toolu_agent Say PONG`,
+        `abc123 session_message toolu_agent from=${sessionId} senderMessageId=toolu_agent Say PONG`,
+        "abc123 session_message toolu_handback from=abc123 recipientMessageId=toolu_handback PONG",
+        "root session_message toolu_handback from=abc123 senderMessageId=toolu_handback PONG",
+        "abc123 tool_call toolu_lost",
+        "root agent_message_chunk It said PONG.",
+        'root subagent_update abc123 {"state":"idle","stopReason":"end_turn"}',
       ]);
     });
 
@@ -3977,6 +4466,8 @@ describe("subagent transcript replay", () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["s1", "subagent_spawned"],
+      // The model of its response, as the replay reaches it.
+      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
       ["s1", "subagent_state_update"],
@@ -6340,7 +6831,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(childEvents).toEqual(["tool_call pending agent-42", "subagent cancelled"]);
   });
 
-  it("keeps the Agent call's own heartbeat and result on the session that made the call (the subagents RFD)", async () => {
+  it("replaces the Agent call with the parent's session messages, and keeps its heartbeat out of the child (the subagents RFD)", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -6400,16 +6891,36 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    const agentCall = updates.flatMap(({ sessionId, update }) =>
-      (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
-      update.toolCallId === "toolu_parent"
-        ? [{ sessionId, status: update.status }]
-        : [],
-    );
-    expect(agentCall.map(({ status }) => status)).toEqual(
-      expect.arrayContaining(["in_progress", "completed"]),
-    );
-    expect(new Set(agentCall.map(({ sessionId }) => sessionId))).toEqual(new Set(["test-session"]));
+    // Neither the call nor its heartbeat reaches any session, the child's
+    // included: its prompt and result are the parent's session messages.
+    expect(
+      updates.filter(
+        ({ update }) =>
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          update.toolCallId.startsWith("toolu_parent"),
+      ),
+    ).toEqual([]);
+    expect(
+      updates.flatMap(({ sessionId, update }) =>
+        sessionId === "test-session" && update.sessionUpdate === "session_message" ? [update] : [],
+      ),
+    ).toEqual([
+      {
+        sessionUpdate: "session_message",
+        messageId: "toolu_parent",
+        senderSessionId: "test-session",
+        recipientSessionId: "agent-42",
+        recipientMessageId: "toolu_parent",
+        content: [{ type: "text", text: "Find the parser" }],
+      },
+      {
+        sessionUpdate: "session_message",
+        messageId: "toolu_parent:reply",
+        senderSessionId: "agent-42",
+        recipientSessionId: "test-session",
+        content: [{ type: "text", text: "It is in x.ts." }],
+      },
+    ]);
   });
 
   it("routes a native child AskUserQuestion and its tool call to the child session", async () => {
@@ -7041,6 +7552,64 @@ describe("subagent permission attribution (issue #851)", () => {
       session_id: "test-session",
     });
 
+    it("reports the child's observed model as a singleton config without enabling changes", async () => {
+      const response = (model: string) => ({
+        type: "assistant",
+        parent_tool_use_id: "toolu_parent",
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: randomUUID(),
+          role: "assistant",
+          model,
+          content: [{ type: "text", text: "Working" }],
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      });
+      const first = response("child-model");
+      const { agent, updates } = await runAgent([
+        { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore" },
+        {
+          type: "stream_event",
+          parent_tool_use_id: "toolu_parent",
+          uuid: randomUUID(),
+          session_id: "test-session",
+          event: { type: "message_start", message: first.message },
+        },
+        first,
+        response("fallback-model"),
+        taskUpdated({ status: "completed" }),
+      ]);
+      const configs = updates.filter(
+        ({ update }) => update.sessionUpdate === "config_option_update",
+      );
+      expect(configs).toHaveLength(2);
+      for (const [index, model] of ["child-model", "fallback-model"].entries()) {
+        expect(configs[index]).toMatchObject({
+          sessionId: "agent-42",
+          update: {
+            configOptions: [
+              {
+                id: "model",
+                currentValue: model,
+                options: [{ value: model, name: model }],
+              },
+            ],
+          },
+        });
+      }
+      expect(
+        updates.findIndex(({ update }) => update.sessionUpdate === "subagent_update"),
+      ).toBeLessThan(updates.indexOf(configs[0]!));
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: "agent-42",
+          configId: "model",
+          value: "fallback-model",
+        }),
+      ).rejects.toThrow("Session not found");
+    });
+
     it("announces the child as running, then sends it the prompt as a message", async () => {
       const updates = await run([
         { ...taskStarted("agent-42", "toolu_parent"), subagent_type: "Explore", prompt: "Go" },
@@ -7060,12 +7629,24 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         },
         {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_parent",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
           sessionId: "agent-42",
           update: {
             sessionUpdate: "session_message",
             messageId: "toolu_parent",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_parent",
             content: [{ type: "text", text: "Go" }],
           },
         },
@@ -7408,12 +7989,24 @@ describe("subagent permission attribution (issue #851)", () => {
           },
         },
         {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_parent",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_parent",
+            content: [{ type: "text", text: "Go" }],
+          },
+        },
+        {
           sessionId: "agent-42",
           update: {
             sessionUpdate: "session_message",
             messageId: "toolu_parent",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_parent",
             content: [{ type: "text", text: "Go" }],
           },
         },
@@ -7433,6 +8026,18 @@ describe("subagent permission attribution (issue #851)", () => {
             state: { state: "running" },
           },
         },
+        // The SendMessage call's message replaces it, as a launch's does.
+        {
+          sessionId: "test-session",
+          update: {
+            sessionUpdate: "session_message",
+            messageId: "toolu_send",
+            senderSessionId: "test-session",
+            recipientSessionId: "agent-42",
+            recipientMessageId: "toolu_send",
+            content: [{ type: "text", text: "Also check Windows" }],
+          },
+        },
         {
           sessionId: "agent-42",
           update: {
@@ -7440,6 +8045,7 @@ describe("subagent permission attribution (issue #851)", () => {
             messageId: "toolu_send",
             senderSessionId: "test-session",
             recipientSessionId: "agent-42",
+            senderMessageId: "toolu_send",
             content: [{ type: "text", text: "Also check Windows" }],
           },
         },
@@ -7584,6 +8190,7 @@ describe("subagent permission attribution (issue #851)", () => {
               messageId: "toolu_send",
               senderSessionId: "test-session",
               recipientSessionId: "agent-7",
+              senderMessageId: "toolu_send",
               content: [{ type: "text", text: "Say PING" }],
             },
           },
@@ -7603,6 +8210,17 @@ describe("subagent permission attribution (issue #851)", () => {
             },
           },
         ]);
+        // The root has the message instead of the completed SendMessage call.
+        const root = updates.flatMap(({ sessionId, update }) =>
+          sessionId === "test-session" &&
+          "toolCallId" in update &&
+          update.toolCallId === "toolu_send"
+            ? [update.sessionUpdate]
+            : sessionId === "test-session" && update.sessionUpdate === "session_message"
+              ? [`session_message ${update.messageId} to=${update.recipientSessionId}`]
+              : [],
+        );
+        expect(root).toEqual(["session_message toolu_send to=agent-7"]);
       } finally {
         if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
         else process.env.CLAUDE_CONFIG_DIR = originalConfigDir;
@@ -7770,7 +8388,7 @@ describe("subagent permission attribution (issue #851)", () => {
       }
     });
 
-    it("ends the Agent call with Claude Code's result, and the stopped child's tool call in the child's session", async () => {
+    it("reports the stop as the child's idle state, and closes its tool call in the child's session", async () => {
       const log: string[] = [];
       const updates: AcpSessionNotification[] = [];
       const agent = new ClaudeAcpAgent(
@@ -7854,25 +8472,21 @@ describe("subagent permission attribution (issue #851)", () => {
       ).resolves.toMatchObject({ stopReason: "cancelled" });
       await agent.sessions["test-session"]?.consumer;
 
-      // In the Agent call's own session, Claude Code's result; in the child's
-      // session, the report that closes its command, after the child went idle.
+      // The parent does not show the Agent call, so the child's idle state
+      // reports the stop. In the child's session, the report that closes its
+      // command comes after the child went idle.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
-        "tool @test-session toolu_agent failed",
         "tool @agent-42 toolu_child failed",
       ]);
-      const endOf = (toolCallId: string) =>
-        updates.find(
-          ({ update }) =>
-            update.sessionUpdate === "tool_call_update" &&
-            update.toolCallId === toolCallId &&
-            update.status === "failed",
-        )?.update;
-      expect(endOf("toolu_agent")).toMatchObject({
-        _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-      });
-      expect(JSON.stringify(endOf("toolu_child"))).toContain("The turn was cancelled");
+      const endOfChildCommand = updates.find(
+        ({ update }) =>
+          update.sessionUpdate === "tool_call_update" &&
+          update.toolCallId === "toolu_child" &&
+          update.status === "failed",
+      )?.update;
+      expect(JSON.stringify(endOfChildCommand)).toContain("The turn was cancelled");
       for (const payload of updates) {
         expect(validateRecorded({ kind: "sessionUpdate", payload }, new Set())).toEqual([]);
       }
@@ -7982,9 +8596,9 @@ describe("subagent permission attribution (issue #851)", () => {
       await agent.sessions["test-session"]?.consumer;
 
       // The command ends in the child's session, after the child reported idle.
+      // The background launch's own result is not shown in the parent.
       expect(log).toEqual([
         'agent-42 {"state":"running"}',
-        "tool @test-session toolu_agent completed",
         "prompt cancelled",
         'agent-42 {"state":"idle","stopReason":"cancelled"}',
         "tool @agent-42 toolu_child failed",
@@ -8274,6 +8888,8 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["test-session", "subagent_spawned"],
       ["agent-42", "agent_message_chunk"],
+      // The model of the child's response.
+      ["agent-42", "config_option_update"],
       ["agent-42", "tool_call"],
       ["agent-42", "agent_message_chunk"],
       ["test-session", "subagent_state_update"],
@@ -12932,6 +13548,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "backgroundSubagents",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
@@ -12955,6 +13572,7 @@ describe("logout", () => {
         "recommendedValue",
         "diffPatch",
         "planFile",
+        "backgroundSubagents",
       ],
       goal: { version: 1, controlMethod: GOAL_CONTROL_METHOD, actions: ["set", "clear"] },
     });
@@ -15344,6 +15962,132 @@ describe("usage_update computation", () => {
     expect(session.contextWindowSize).toBe(555_000);
     expect(session.contextWindowAuthoritative).toBe(true);
   });
+});
+
+describe("foreground fork tool results", () => {
+  it.each([
+    ["plain", {}, null],
+    ["AIR", AIR_CLIENT_CAPABILITIES, null],
+    ["plain nested", {}, "toolu_outer"],
+    ["AIR nested", AIR_CLIENT_CAPABILITIES, "toolu_outer"],
+  ] as const)(
+    "waits for the launching side's result for a %s client",
+    async (_, capabilities, parent) => {
+      const updates: SessionNotification[] = [];
+      const logger = { log: vi.fn(), error: vi.fn() };
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: SessionNotification) => {
+            updates.push(notification);
+          },
+        } as unknown as AcpClient,
+        logger,
+      );
+      await initializeClient(agent, capabilities);
+      const input = new Pushable<any>();
+      const assistant = (content: unknown[], parentToolUseId: string | null) => ({
+        type: "assistant",
+        parent_tool_use_id: parentToolUseId,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: {
+          id: randomUUID(),
+          role: "assistant",
+          model: "claude-sonnet-4-6",
+          content,
+          usage: successfulResultMessage().usage,
+        },
+      });
+      const user = (content: unknown[], parentToolUseId: string | null) => ({
+        type: "user",
+        parent_tool_use_id: parentToolUseId,
+        uuid: randomUUID(),
+        session_id: "test-session",
+        message: { role: "user", content },
+      });
+      const toolResult = (id: string, text: string) => ({
+        type: "tool_result",
+        tool_use_id: id,
+        content: [{ type: "text", text }],
+      });
+      async function* messages() {
+        const { value } = await input[Symbol.asyncIterator]().next();
+        yield userEcho(value);
+        yield assistant(
+          [
+            {
+              type: "tool_use",
+              id: "toolu_fork",
+              name: "Agent",
+              input: {
+                subagent_type: "fork",
+                run_in_background: false,
+                prompt: "Inspect the parser",
+              },
+            },
+          ],
+          parent,
+        );
+        // The fork inherits a result for its own launch. It cannot complete
+        // that call: the launching side sends the actual report later.
+        yield user([toolResult("toolu_fork", "Fork started — that fork is you.")], "toolu_fork");
+        yield assistant(
+          [
+            {
+              type: "tool_use",
+              id: "toolu_child",
+              name: "Agent",
+              input: { subagent_type: "general-purpose", prompt: "Read the parser" },
+            },
+          ],
+          "toolu_fork",
+        );
+        // Keep results of tools the fork itself called, even in a message
+        // that also carries the copied launch result.
+        yield {
+          ...user(
+            [
+              toolResult("toolu_fork", "Fork started — processing in background"),
+              toolResult("toolu_child", "child report"),
+            ],
+            "toolu_fork",
+          ),
+          // Filtering must not attribute the inherited launch sidecar to
+          // the one result that remains in this message.
+          tool_use_result: {
+            status: "completed",
+            content: [{ type: "text", text: "inherited launch report" }],
+          },
+        };
+        yield user([toolResult("toolu_fork", "fork report")], parent);
+        yield successfulResultMessage();
+        yield { type: "system", subtype: "session_state_changed", state: "idle" };
+      }
+      agent.sessions["test-session"] = mockSessionState({ query: wrapQuery(messages()), input });
+
+      await expect(
+        agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "Inspect it" }] }),
+      ).resolves.toMatchObject({ stopReason: "end_turn" });
+
+      const completed = updates.flatMap(({ update }) =>
+        update.sessionUpdate === "tool_call_update" && update.status === "completed"
+          ? [{ id: update.toolCallId, content: update.content, rawOutput: update.rawOutput }]
+          : [],
+      );
+      expect(completed.map(({ id }) => id)).toEqual(["toolu_child", "toolu_fork"]);
+      expect(completed.map(({ content }) => content)).toEqual([
+        [{ type: "content", content: { type: "text", text: "child report" } }],
+        [{ type: "content", content: { type: "text", text: "fork report" } }],
+      ]);
+      if (!("_meta" in capabilities)) {
+        expect(completed.map(({ rawOutput }) => rawOutput)).toEqual([
+          [{ type: "text", text: "child report" }],
+          [{ type: "text", text: "fork report" }],
+        ]);
+      }
+      expect(logger.error.mock.calls.flat().join("\n")).not.toContain("wasn't tracked");
+    },
+  );
 });
 
 describe("assembled assistant text fallback", () => {
@@ -20915,6 +21659,19 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
   // 2.1.270: no idle until the subagent drains) and settles once its
   // subagents are done — at the followup's terminal result, or at an idle
   // with none of them left.
+  //
+  // The tests without `declareBackgroundSubagents` are the cases of a client
+  // that does not declare the AIR `backgroundSubagents` capability. Such a
+  // client keeps the hold.
+
+  /** Declares the AIR `backgroundSubagents` capability: no turn is held. */
+  const declareBackgroundSubagents = (agent: ClaudeAcpAgent) =>
+    agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
+      },
+    });
 
   function createMockAgent() {
     const mockClient = {
@@ -21507,6 +22264,421 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       // cycle, which the error-shaped diagnostic of the answer ends cancelled.
       expect(foreground).toEqual(["running", "ended end_turn", "running", "ended cancelled"]);
     });
+
+    describe("with backgroundSubagents", () => {
+      it("asks out of the turn without a clear-context option and drops the interrupt", async () => {
+        let request: RequestPermissionRequest | undefined;
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              request = params;
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        const createSession = vi.spyOn(agent as any, "createSession");
+        let answer!: () => void;
+        const answered = new Promise<void>((resolve) => (answer = resolve));
+        let planToolSeen = false;
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            const { value: first } = await iter.next();
+            // The followup asks before its tool result, as Claude Code does.
+            const followup = heldTurnPlanningFollowup(first);
+            for (let step = followup.next(); !step.done; step = followup.next()) {
+              const message: any = step.value;
+              if (message.type === "user" && message.tool_result_meta) {
+                planToolSeen = true;
+                await answered;
+              }
+              yield message;
+            }
+            yield idle();
+            const { value: second } = await iter.next();
+            yield userEcho(second);
+            yield running();
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const first = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        // The turn ends at its own result; the plan comes after it.
+        expect(first.stopReason).toBe("end_turn");
+        await waitFor(() => planToolSeen);
+        expect(session.activeTurn).toBeNull();
+
+        await expect(
+          agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+            signal: new AbortController().signal,
+            suggestions: [],
+            toolUseID: "tool-plan",
+          } as any),
+        ).resolves.toMatchObject({ behavior: "deny", interrupt: true });
+        // No ACP turn can continue a fresh context out of a turn.
+        expect(request?.options.map((o) => o.optionId)).not.toEqual(
+          expect.arrayContaining([expect.stringMatching(/^exit-plan-clear-/)]),
+        );
+        expect(request?.options.map((o) => o.optionId)).toContain("reject");
+
+        answer();
+        await waitFor(() => session.pendingExitPlanModeInterruption === undefined);
+        const second = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "next" }],
+        });
+        expect(second.stopReason).toBe("end_turn");
+        expect(createSession).not.toHaveBeenCalled();
+        await session.consumer;
+      });
+
+      it("offers the clear-context option inside a turn", async () => {
+        let request: RequestPermissionRequest | undefined;
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              request = params;
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        let asked!: () => void;
+        const askedGate = new Promise<void>((resolve) => (asked = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            yield userEcho(first);
+            yield running();
+            await askedGate;
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        await waitFor(() => !!agent.sessions["test-session"]?.activeTurn);
+        await agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "tool-plan",
+        } as any);
+        expect(request?.options.map((o) => o.optionId)).toEqual(
+          expect.arrayContaining([expect.stringMatching(/^exit-plan-clear-/)]),
+        );
+        asked();
+        await prompt;
+        await agent.sessions["test-session"]?.consumer;
+      });
+
+      it("drops a clear-context reset that has no turn to continue", async () => {
+        const error = vi.fn();
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error },
+        );
+        const createSession = vi.spyOn(agent as any, "createSession");
+        injectGeneratorSession(
+          agent,
+          (input) => {
+            async function* messageGenerator() {
+              const { value: first } = await input[Symbol.asyncIterator]().next();
+              yield* heldTurnPlanningFollowup(first);
+              yield idle();
+            }
+            return messageGenerator();
+          },
+          {
+            creationParams: { cwd: "/test", mcpServers: [] },
+            pendingExitPlanContextReset: {
+              toolUseId: "tool-plan",
+              plan: "Implement it",
+              mode: "auto",
+            },
+          },
+        );
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const response = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+
+        expect(response.stopReason).toBe("end_turn");
+        await session.consumer;
+        expect(createSession).not.toHaveBeenCalled();
+        expect(session.pendingExitPlanModeInterruption).toBeUndefined();
+        expect(session.pendingExitPlanContextReset).toBeUndefined();
+        expect(error).toHaveBeenCalledWith(
+          expect.stringContaining("no turn to continue the accepted plan"),
+        );
+      });
+
+      /** Agent whose client keeps the last permission request and rejects it. */
+      const rejectingAgent = () => {
+        const requests: RequestPermissionRequest[] = [];
+        const agent = new ClaudeAcpAgent(
+          {
+            sessionUpdate: async () => {},
+            requestPermission: async (params: RequestPermissionRequest) => {
+              requests.push(params);
+              return { outcome: { outcome: "selected", optionId: "reject" } };
+            },
+          } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        return { agent, requests };
+      };
+      const askExitPlan = (agent: ClaudeAcpAgent) =>
+        agent.canUseTool("test-session")("ExitPlanMode", { plan: "Implement it" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "tool-plan",
+        } as any);
+      const offersClearContext = (request: RequestPermissionRequest | undefined) =>
+        (request?.options ?? []).some((o) => o.optionId.startsWith("exit-plan-clear-"));
+
+      it("offers the clear-context option to a prompt before its echo", async () => {
+        const { agent, requests } = rejectingAgent();
+        let echo!: () => void;
+        const echoGate = new Promise<void>((resolve) => (echo = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const { value: first } = await input[Symbol.asyncIterator]().next();
+            // Claude Code asks for the prompt before the consumer reaches its echo.
+            await echoGate;
+            yield userEcho(first);
+            yield running();
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const prompt = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        await waitFor(() => (session.turnQueue ?? []).some((turn) => !turn.settled));
+        expect(session.activeTurn).toBeFalsy();
+
+        await askExitPlan(agent);
+        expect(offersClearContext(requests[0])).toBe(true);
+        echo();
+        await prompt;
+        await session.consumer;
+      });
+
+      it("offers no clear-context option to an autonomous cycle while a prompt waits for its echo", async () => {
+        const { agent, requests } = rejectingAgent();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            const { value: first } = await iter.next();
+            yield userEcho(first);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            // A followup cycle that Claude Code starts on its own.
+            yield assistantText("followup");
+            const { value: second } = await iter.next();
+            await gate;
+            yield {
+              type: "user",
+              parent_tool_use_id: null,
+              uuid: randomUUID(),
+              session_id: "test-session",
+              message: {
+                role: "user",
+                content: [{ type: "tool_result", tool_use_id: "tool-plan", content: "no" }],
+              },
+            };
+            yield resultMessage({ origin: { kind: "task-notification" } });
+            yield idle();
+            yield userEcho(second);
+            yield running();
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await declareBackgroundSubagents(agent);
+        const session = agent.sessions["test-session"]!;
+
+        const first = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+        expect(first.stopReason).toBe("end_turn");
+        await waitFor(() => (agent as any).runsAutonomousCycle("test-session"));
+        const second = agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "next" }],
+        });
+        await waitFor(() => (session.turnQueue ?? []).some((turn) => !turn.settled));
+
+        // The queued prompt does not own the request of the running cycle.
+        await askExitPlan(agent);
+        expect(requests).toHaveLength(1);
+        expect(offersClearContext(requests[0])).toBe(false);
+        release();
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+        await session.consumer;
+      });
+
+      it("continues an accepted plan of an interleaved followup in the turn that took it over", async () => {
+        const agent = new ClaudeAcpAgent(
+          { sessionUpdate: async () => {} } as unknown as AcpClient,
+          { log: () => {}, error: () => {} },
+        );
+        let continuation: unknown;
+        const createSession = vi
+          .spyOn(agent as any, "createSession")
+          .mockImplementation(async (_params: any, options: any) => {
+            const input = new Pushable<any>();
+            async function* freshGenerator() {
+              const next = await input[Symbol.asyncIterator]().next();
+              continuation = next.value;
+              yield userEcho(next.value);
+              yield running();
+              yield assistantText("Implemented");
+              yield resultMessage({ stop_reason: "max_tokens" });
+              yield idle();
+            }
+            agent.sessions["test-session"] = mockSessionState({
+              query: wrapQuery(freshGenerator()),
+              input,
+              modes: { currentModeId: options.permissionMode, availableModes: [] },
+              fastModeEnabled: false,
+            });
+            return { sessionId: "test-session" };
+          });
+        injectGeneratorSession(
+          agent,
+          (input) => {
+            async function* messageGenerator() {
+              const { value: first } = await input[Symbol.asyncIterator]().next();
+              // The echo activates the turn, and a task-notification followup
+              // plans inside it.
+              yield userEcho(first);
+              yield running();
+              yield {
+                type: "assistant",
+                parent_tool_use_id: null,
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "tool_use",
+                      id: "tool-plan",
+                      name: "ExitPlanMode",
+                      input: { plan: "Implement it" },
+                    },
+                  ],
+                  usage: {},
+                },
+              };
+              yield {
+                type: "user",
+                parent_tool_use_id: null,
+                uuid: randomUUID(),
+                session_id: "test-session",
+                message: {
+                  role: "user",
+                  content: [
+                    {
+                      type: "tool_result",
+                      tool_use_id: "tool-plan",
+                      content: "User accepted the plan and requested a fresh context",
+                      is_error: true,
+                    },
+                  ],
+                },
+                tool_result_meta: [{ id: "tool-plan", non_execution_kind: "user-rejected" }],
+              };
+              // The result names no prompt, so it takes the autonomous lane.
+              yield resultMessage({
+                subtype: "error_during_execution",
+                is_error: true,
+                stop_reason: null,
+                errors: [
+                  "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+                ],
+                origin: { kind: "task-notification" },
+              });
+              yield idle();
+            }
+            return messageGenerator();
+          },
+          {
+            creationParams: { cwd: "/test", mcpServers: [] },
+            pendingExitPlanContextReset: {
+              toolUseId: "tool-plan",
+              plan: "Implement it",
+              mode: "auto",
+            },
+          },
+        );
+        await declareBackgroundSubagents(agent);
+
+        const response = await agent.prompt({
+          sessionId: "test-session",
+          prompt: [{ type: "text", text: "plan" }],
+        });
+
+        expect(createSession).toHaveBeenCalledWith(
+          expect.objectContaining({ cwd: "/test" }),
+          expect.objectContaining({ publicSessionId: "test-session", permissionMode: "auto" }),
+        );
+        expect(JSON.stringify(continuation)).toContain(
+          "Implement the following plan:\\n\\nImplement it",
+        );
+        expect(response.stopReason).toBe("max_tokens");
+        await agent.sessions["test-session"]?.consumer;
+      });
+    });
   });
 
   // CLI 2.1.270+ stays `running` while background agents live (verified
@@ -21794,7 +22966,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
     /** Turn 1 spawns agent-1, which fails inside the turn. Turn 2 resumes it
      *  with `resume` and holds at `gate` until the test releases it; then
      *  agent-1 completes and the model sends its followup. */
-    function run(resume: unknown[], options: { subagents?: boolean } = {}) {
+    function run(
+      resume: unknown[],
+      options: { subagents?: boolean; backgroundSubagents?: boolean } = {},
+    ) {
       const updates: AcpSessionNotification[] = [];
       const requests: RequestPermissionRequest[] = [];
       const agent = new ClaudeAcpAgent(
@@ -21844,6 +23019,7 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
             clientCapabilities: AIR_NATIVE_SUBAGENTS,
           });
         }
+        if (options.backgroundSubagents) await declareBackgroundSubagents(agent);
         const first = await agent.prompt({
           sessionId: "test-session",
           prompt: [{ type: "text", text: "explore" }],
@@ -21853,7 +23029,10 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
           sessionId: "test-session",
           prompt: [{ type: "text", text: "continue" }],
         });
-        await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+        // With `backgroundSubagents` the turn is never held.
+        if (!options.backgroundSubagents) {
+          await waitFor(() => !!agent.sessions["test-session"]?.activeTurn?.deferredSettle);
+        }
         // Wrapped: an async function would unwrap and wait for the held prompt.
         return { second };
       };
@@ -22000,6 +23179,275 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(notified()).toBe(false);
       release();
       await agent.sessions["test-session"]?.consumer;
+    });
+
+    describe("with backgroundSubagents", () => {
+      const summaryChunks = (updates: AcpSessionNotification[]) =>
+        updates.filter(
+          (n) =>
+            n.update.sessionUpdate === "agent_message_chunk" &&
+            (n.update.content as { text?: string }).text === "resumed summary",
+        );
+
+      it("settles the SendMessage turn at its result while the resumed subagent runs", async () => {
+        const { agent, updates, release, notified, start } = run([sendMessageResult()], {
+          backgroundSubagents: true,
+        });
+        const { second } = await start();
+        const session = agent.sessions["test-session"]!;
+
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+        expect(notified()).toBe(false);
+        expect(session.liveBackgroundTasks.has("agent-1")).toBe(true);
+        expect(session.activeTurn).toBeNull();
+
+        // The followup summary goes out after the prompt response.
+        release();
+        await waitFor(() => summaryChunks(updates).length === 1);
+        await waitFor(() => !session.liveBackgroundTasks.has("agent-1"));
+        await session.consumer;
+        expect(session.owedTrailingIdles).toBe(0);
+      });
+
+      it("sends a permission request of the resumed subagent after the prompt response", async () => {
+        const { agent, updates, requests, release, start } = run([sendMessageResult()], {
+          backgroundSubagents: true,
+        });
+        const { second } = await start();
+        await expect(second).resolves.toMatchObject({ stopReason: "end_turn" });
+
+        const result = await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+          signal: new AbortController().signal,
+          suggestions: [],
+          toolUseID: "toolu_sub",
+          agentID: "agent-1",
+        } as any);
+
+        expect(result).toMatchObject({ behavior: "allow" });
+        expect(requests).toHaveLength(1);
+        expect(requests[0].toolCall.toolCallId).toBe("toolu_sub");
+        expect(
+          updates.find(
+            (n) => n.update.sessionUpdate === "tool_call" && n.update.toolCallId === "toolu_sub",
+          )?.update,
+        ).toMatchObject({ _meta: { claudeCode: { parentToolUseId: "toolu_agent-1" } } });
+        release();
+        await agent.sessions["test-session"]?.consumer;
+      });
+    });
+  });
+
+  describe("with backgroundSubagents", () => {
+    /** Agent whose client records the chunk texts as `chunk:<text>`, keeps
+     *  every update, and allows every permission request. */
+    const recordingAgent = () => {
+      const events: string[] = [];
+      const updates: AcpSessionNotification[] = [];
+      const requests: RequestPermissionRequest[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (n: AcpSessionNotification) => {
+            updates.push(n);
+            if (n.update.sessionUpdate === "agent_message_chunk") {
+              events.push(`chunk:${(n.update.content as { text?: string }).text}`);
+            }
+          },
+          requestPermission: async (params: RequestPermissionRequest) => {
+            requests.push(params);
+            return { outcome: { outcome: "selected", optionId: "allow-once" } };
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      return { agent, events, updates, requests };
+    };
+
+    it("settles at the result while a fresh subagent runs and sends its traffic after the response", async () => {
+      const { agent, events, updates, requests } = recordingAgent();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage();
+          yield idle();
+          await gate;
+          yield taskNotification("agent-1");
+          yield assistantText("late summary");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      events.push("resolved");
+
+      expect(response.stopReason).toBe("end_turn");
+      expect(response.usage?.totalTokens).toBe(15);
+      expect(session.activeTurn).toBeNull();
+      expect(session.liveBackgroundTasks.get("agent-1")).toMatchObject({
+        parentToolUseId: "toolu_agent-1",
+        isSubagent: true,
+      });
+
+      // The subagent asks after the prompt response. The request keeps the
+      // parent tool call of the subagent, and the client answers it.
+      const result = await agent.canUseTool("test-session")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "toolu_sub",
+        agentID: "agent-1",
+      } as any);
+      expect(result).toMatchObject({ behavior: "allow" });
+      expect(requests.map((r) => r.toolCall.toolCallId)).toEqual(["toolu_sub"]);
+      expect(
+        updates.find(
+          (n) => n.update.sessionUpdate === "tool_call" && n.update.toolCallId === "toolu_sub",
+        )?.update,
+      ).toMatchObject({ _meta: { claudeCode: { parentToolUseId: "toolu_agent-1" } } });
+
+      // The followup summary is an out-of-turn session/update.
+      release();
+      await waitFor(() => events.includes("chunk:late summary"));
+      expect(events.indexOf("chunk:late summary")).toBeGreaterThan(events.indexOf("resolved"));
+      await session.consumer;
+      expect(session.liveBackgroundTasks.has("agent-1")).toBe(false);
+      expect(session.owedTrailingIdles).toBe(0);
+    });
+
+    it("keeps the streamed tool input of a running subagent when the turn ends at its result", async () => {
+      const { agent, updates } = recordingAgent();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const childStream = (event: unknown) => ({
+        type: "stream_event",
+        parent_tool_use_id: "toolu_agent-1",
+        uuid: randomUUID(),
+        session_id: "test-session",
+        event,
+      });
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const { value: first } = await input[Symbol.asyncIterator]().next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          // The subagent starts to stream a tool use before the parent result.
+          yield childStream({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: "toolu_child_read", name: "Read", input: {} },
+          });
+          yield resultMessage();
+          yield idle();
+          await gate;
+          yield childStream({
+            type: "content_block_delta",
+            index: 0,
+            delta: {
+              type: "input_json_delta",
+              partial_json: '{"file_path":"/test/src/late.ts","offset":',
+            },
+          });
+          yield taskNotification("agent-1");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+
+      // The input delta after the prompt response still refines the tool call.
+      release();
+      await session.consumer;
+      expect(
+        updates.find(
+          (n) =>
+            n.update.sessionUpdate === "tool_call_update" &&
+            n.update.toolCallId === "toolu_child_read",
+        )?.update,
+      ).toMatchObject({ locations: [{ path: "/test/src/late.ts" }] });
+    });
+
+    it("does not settle the next prompt at the followup result after the turn ended", async () => {
+      const { agent, events } = recordingAgent();
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          const { value: first } = await iter.next();
+          yield userEcho(first);
+          yield running();
+          yield subagentStarted("agent-1");
+          yield resultMessage();
+          yield idle();
+          // The next prompt is queued before the subagent ends.
+          const { value: second } = await iter.next();
+          yield taskNotification("agent-1");
+          yield assistantText("late summary");
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            stop_reason: "max_tokens",
+            usage: {
+              input_tokens: 100,
+              output_tokens: 100,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield idle();
+          yield userEcho(second);
+          yield running();
+          yield assistantText("second answer");
+          yield resultMessage({
+            usage: {
+              input_tokens: 20,
+              output_tokens: 7,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+      await declareBackgroundSubagents(agent);
+      const session = agent.sessions["test-session"]!;
+
+      const first = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "explore" }],
+      });
+      expect(first.stopReason).toBe("end_turn");
+
+      const second = await agent
+        .prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "next" }] })
+        .then((r) => {
+          events.push("resolved:second");
+          return r;
+        });
+
+      // The second prompt settles at its own result, with its own usage.
+      expect(second.stopReason).toBe("end_turn");
+      expect(second.usage?.totalTokens).toBe(27);
+      expect(events).toEqual(["chunk:late summary", "chunk:second answer", "resolved:second"]);
+      await session.consumer;
+      expect(session.owedTrailingIdles).toBe(0);
     });
   });
 
@@ -23190,6 +24638,320 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       expect(response.usage?.outputTokens).toBe(5);
       stream.end();
       await agent.sessions["test-session"]?.consumer;
+    });
+  });
+  describe("autonomous turn as an async task", () => {
+    const airAgent = async (capabilities: string[] = ["asyncTasks"]) => {
+      const updates: AcpSessionNotification[] = [];
+      const agent = new ClaudeAcpAgent(
+        {
+          sessionUpdate: async (notification: AcpSessionNotification) => {
+            updates.push(notification);
+          },
+        } as unknown as AcpClient,
+        { log: () => {}, error: () => {} },
+      );
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {
+          _meta: { jetbrains: { air: { version: 1, capabilities } } },
+        },
+      });
+      const asyncTaskUpdates = () =>
+        updates.flatMap(({ update }) =>
+          update.sessionUpdate.startsWith("async_task_") ? [update as any] : [],
+        );
+      return { agent, updates, asyncTaskUpdates };
+    };
+
+    const shellNotification = () => ({
+      ...taskNotification("bg-1"),
+      summary: 'Background command "sleep 20" completed (exit code 0)',
+    });
+
+    it("publishes a turn that Claude Code runs after end_turn and ends it at its result", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield assistantText("started it");
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield shellNotification();
+          yield running();
+          yield assistantText("it finished");
+          // A coalesced placeholder does not end the turn.
+          yield resultMessage({ origin: { kind: "task-notification" }, num_turns: 0 });
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      const response = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "run it in the background" }],
+      });
+      expect(response.stopReason).toBe("end_turn");
+      expect(asyncTaskUpdates()).toEqual([]);
+
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      const [spawned, ...rest] = asyncTaskUpdates();
+      expect(spawned).toEqual({
+        sessionUpdate: "async_task_spawned",
+        asyncTaskId: expect.stringMatching(/^autonomous-turn-/),
+        name: "Claude is working",
+        taskType: "turn",
+        description: 'Background command "sleep 20" completed (exit code 0)',
+        showInTranscript: false,
+        canStop: true,
+      });
+      expect(rest).toEqual([
+        {
+          sessionUpdate: "async_task_state_update",
+          asyncTaskId: spawned.asyncTaskId,
+          state: "completed",
+        },
+      ]);
+    });
+
+    it("starts at the first output when the state never left running", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          await woken;
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+    });
+
+    describe("started by a scheduler fire", () => {
+      const lifecycleStarted = (fire: { wakeup_source?: string; scheduled_for?: number }) =>
+        ({
+          type: "command_lifecycle",
+          command_uuid: "scheduler-fire",
+          state: "started",
+          ...fire,
+          uuid: randomUUID(),
+          session_id: "test-session",
+        }) as any;
+
+      const autonomousTurn = async (fireFrames: (afterRunning: boolean) => any[]) => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        let wake = () => {};
+        const woken = new Promise<void>((resolve) => (wake = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            await woken;
+            yield* fireFrames(false);
+            yield running();
+            yield* fireFrames(true);
+            yield assistantText("woke up");
+            yield resultMessage();
+            yield idle();
+          }
+          return messageGenerator();
+        });
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        wake();
+        await agent.sessions["test-session"]?.consumer;
+        return asyncTaskUpdates()
+          .filter((update) => update.sessionUpdate !== "async_task_state_update")
+          .map(({ sessionUpdate, description }) => ({ sessionUpdate, description }));
+      };
+
+      it("names a ScheduleWakeup fire that arrives before the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? []
+            : [
+                lifecycleStarted({
+                  wakeup_source: "loop_wakeup",
+                  scheduled_for: 1_790_000_000_000,
+                }),
+              ],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "A scheduled wakeup fired (set for 2026-09-21T14:13:20.000Z).",
+          },
+        ]);
+      });
+
+      it("renames the open task for a scheduled task fire after the running state", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning ? [lifecycleStarted({ wakeup_source: "schedule_wakeup" })] : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+          { sessionUpdate: "async_task_progress", description: "A scheduled task fired." },
+        ]);
+      });
+
+      it("leaves the task as before for a started frame without a known wakeup source", async () => {
+        const updates = await autonomousTurn((afterRunning) =>
+          afterRunning
+            ? [lifecycleStarted({}), lifecycleStarted({ wakeup_source: "future_source" })]
+            : [],
+        );
+        expect(updates).toEqual([
+          {
+            sessionUpdate: "async_task_spawned",
+            description: "Claude Code started a turn without a prompt.",
+          },
+        ]);
+      });
+    });
+
+    it("ends the turn task when a prompt is folded into the turn", async () => {
+      const { agent, updates, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let autonomousRunning = () => {};
+      const autonomous = new Promise<void>((resolve) => (autonomousRunning = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          autonomousRunning();
+          yield userEcho((await iter.next()).value);
+          yield assistantText("answer to the folded prompt");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await autonomous;
+      const second = await agent.prompt({
+        sessionId: "test-session",
+        prompt: [{ type: "text", text: "and this" }],
+      });
+      expect(second.stopReason).toBe("end_turn");
+      await agent.sessions["test-session"]?.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "completed",
+      ]);
+      const kinds = updates.map(({ update }) =>
+        update.sessionUpdate === "agent_message_chunk" && update.content.type === "text"
+          ? update.content.text
+          : update.sessionUpdate,
+      );
+      expect(kinds.indexOf("async_task_state_update")).toBeLessThan(
+        kinds.indexOf("answer to the folded prompt"),
+      );
+    });
+
+    it("interrupts the turn when the client stops its task", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent();
+      let wake = () => {};
+      const woken = new Promise<void>((resolve) => (wake = resolve));
+      let finish = () => {};
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          await woken;
+          yield running();
+          yield assistantText("on my own");
+          await finished;
+          yield resultMessage({
+            origin: { kind: "task-notification" },
+            subtype: "error_during_execution",
+            is_error: true,
+          });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      wake();
+      await waitFor(() => asyncTaskUpdates().length === 1);
+      const session = agent.sessions["test-session"]!;
+      const asyncTaskId = asyncTaskUpdates()[0].asyncTaskId;
+
+      await expect(
+        agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId }),
+      ).resolves.toEqual({ stopped: true });
+      expect(session.query.interrupt).toHaveBeenCalledTimes(1);
+      expect(session.query.stopTask).not.toHaveBeenCalled();
+      finish();
+      await session.consumer;
+
+      expect(asyncTaskUpdates().map((update) => update.state ?? update.sessionUpdate)).toEqual([
+        "async_task_spawned",
+        "stopped",
+      ]);
+    });
+
+    it("publishes nothing to a client without async tasks", async () => {
+      const { agent, asyncTaskUpdates } = await airAgent([]);
+      injectGeneratorSession(agent, (input) => {
+        async function* messageGenerator() {
+          const iter = input[Symbol.asyncIterator]();
+          yield userEcho((await iter.next()).value);
+          yield running();
+          yield resultMessage();
+          yield idle();
+          yield running();
+          yield assistantText("on my own");
+          yield resultMessage({ origin: { kind: "task-notification" } });
+          yield idle();
+        }
+        return messageGenerator();
+      });
+
+      await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+      await agent.sessions["test-session"]?.consumer;
+      expect(asyncTaskUpdates()).toEqual([]);
     });
   });
 });

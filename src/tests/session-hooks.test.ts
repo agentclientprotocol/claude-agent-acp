@@ -9,7 +9,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import type { NewSessionRequest } from "@agentclientprotocol/sdk";
+import type { NewSessionRequest } from "@agentclientprotocol/sdk/unstable";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 

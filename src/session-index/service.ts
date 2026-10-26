@@ -15,7 +15,7 @@ import {
   RequestError,
   type ListSessionsRequest,
   type ListSessionsResponse,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import { deleteSession as sdkDeleteSession } from "@anthropic-ai/claude-agent-sdk";
 import { airExtensionMeta } from "../air-extension.js";
 import { sanitizeTitle } from "../session-titles.js";
@@ -476,10 +476,16 @@ export class SessionIndexService {
   private readonly deleteSession: (sessionId: string) => Promise<void>;
 
   constructor(private readonly deps: SessionIndexDeps) {
-    this.index = new SessionIndex();
     this.registry = deps.registry ?? new LiveSessionRegistry();
+    this.index = new SessionIndex({ isLive: (sessionId) => this.isLive(sessionId) });
     this.now = deps.now ?? Date.now;
     this.deleteSession = deps.deleteSession ?? ((id) => sdkDeleteSession(id));
+  }
+
+  /** Whether a live process holds the session, by the live registry. */
+  private async isLive(sessionId: string): Promise<boolean> {
+    const live = await this.registry.snapshot();
+    return live.has(sessionId);
   }
 
   /** `session/list` of a `sessionIndex` client. `own` reports the sessions

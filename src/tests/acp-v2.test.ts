@@ -9,8 +9,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import * as v1 from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+import * as v1 from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   forkSession,
   getSessionMessages,
@@ -21,7 +21,7 @@ import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { AuthStatusUpdateNotification } from "../auth-status.js";
 import { clientSupportsCompactionUpdates } from "../context-compaction.js";
 import { v2DiffContent } from "../diff.js";
-import { acpProtocolRouter } from "../serve.js";
+import { type AcpProtocols, acpProtocolRouter, acpProtocolsFromEnv } from "../serve.js";
 import { clientSupportsNotices } from "../session-notices.js";
 import { v1PermissionResponse, v2PermissionRequest } from "../v2/permission.js";
 import { v1PromptRequest } from "../v2/prompt.js";
@@ -157,10 +157,10 @@ afterEach(async () => {
 });
 
 /** Connects a fresh router to a client, and returns the client end of the stream. */
-function connectRouter(): v2.Stream {
+function connectRouter(protocols?: AcpProtocols): v2.Stream {
   const toAgent = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
   const toClient = new TransformStream<v2.AnyWireMessage, v2.AnyWireMessage>();
-  acpProtocolRouter(undefined, (agent) => agents.push(agent)).connect({
+  acpProtocolRouter(undefined, (agent) => agents.push(agent), protocols).connect({
     readable: toAgent.readable,
     writable: toClient.writable,
   });
@@ -315,6 +315,52 @@ describe("ACP protocol routing", () => {
       expect(method).toMatchObject({ methodId: expect.any(String), type: "terminal" });
       expect((method as v2.AuthMethodTerminal).args?.[0]).toBe("--cli");
     }
+  });
+
+  it("negotiates a v2 client down to v1 when limited to v1", async () => {
+    // On the raw stream, since the v2 client app cannot read the v1 response
+    // that a real client would switch to v1 on.
+    const stream = connectRouter("v1");
+    const writer = stream.writable.getWriter();
+    await writer.write({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: v2.PROTOCOL_VERSION, info: V2_CLIENT_INFO, capabilities: {} },
+    });
+    const reader = stream.readable.getReader();
+    let response: v2.AnyWireMessage | undefined;
+    while (!response) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!Array.isArray(value) && "id" in value && value.id === 1) response = value;
+    }
+    await writer.close();
+
+    expect(response).toMatchObject({ id: 1, result: { protocolVersion: 1 } });
+  });
+
+  it("rejects a v1 client when limited to v2", async () => {
+    const initialize = v1
+      .client({ name: "v1-test-client" })
+      .connectWith(connectRouter("v2") as unknown as v1.Stream, (agent) =>
+        agent.request(v1.methods.agent.initialize, {
+          protocolVersion: v1.PROTOCOL_VERSION,
+          clientCapabilities: {},
+        }),
+      );
+
+    await expect(initialize).rejects.toThrow(/Unsupported protocol version/);
+    expect(agents).toHaveLength(0);
+  });
+
+  it("reads the protocols to serve from CLAUDE_AGENT_ACP_PROTOCOL", () => {
+    expect(acpProtocolsFromEnv(undefined)).toBe("auto");
+    expect(acpProtocolsFromEnv("")).toBe("auto");
+    expect(acpProtocolsFromEnv("auto")).toBe("auto");
+    expect(acpProtocolsFromEnv("v1")).toBe("v1");
+    expect(acpProtocolsFromEnv("v2")).toBe("v2");
+    expect(() => acpProtocolsFromEnv("1")).toThrow(/CLAUDE_AGENT_ACP_PROTOCOL/);
   });
 });
 
@@ -1070,15 +1116,37 @@ describe("ACP v2 prompts", () => {
         cwd,
         replayFrom: { type: "start" },
       });
+      client.sessionUpdates.push({
+        sessionId: "response",
+        update: { sessionUpdate: "response" },
+      } as never);
+      await vi.waitFor(() =>
+        expect(
+          client.sessionUpdates.filter(
+            ({ sessionId, update }) =>
+              sessionId === "abc123" && update.sessionUpdate === "state_update",
+          ),
+        ).toHaveLength(2),
+      );
       await client.authUpdate(1);
     });
 
     const child = client.sessionUpdates.flatMap(({ sessionId, update }) =>
-      sessionId === "abc123" ? [update] : [],
+      sessionId === "abc123" || sessionId === "response" ? [update] : [],
     );
     // The child's past `running` does not replay; its last state goes once,
-    // after the replay.
+    // after the replay. That state is history to the client, so the child's
+    // current state follows the response: its process is gone, so it is idle.
+    // The child's model, from its transcript, goes right after its
+    // announcement. It does not go again after the response: it is unchanged.
+    const model = expect.objectContaining({
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        expect.objectContaining({ configId: "model", currentValue: "claude-haiku-4-5" }),
+      ],
+    });
     expect(child).toEqual([
+      model,
       expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
@@ -1088,7 +1156,16 @@ describe("ACP v2 prompts", () => {
         content: text("Child report.")[0],
       }),
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+      { sessionUpdate: "response" },
+      { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
     ]);
+    // The current state on the parent grants nothing: the child cannot run again here.
+    expect(
+      client.sessionUpdates.filter(
+        ({ update }) =>
+          update.sessionUpdate === "subagent_update" && (update as any).capabilities != null,
+      ),
+    ).toEqual([]);
   });
 
   it("ends a resume with replay with one end event for a client with loadReplayEnd", async () => {
@@ -1123,20 +1200,24 @@ describe("ACP v2 prompts", () => {
       await client.authUpdate(1);
     });
 
+    // The end event closes the replay. v2 then requires the state snapshot
+    // after the replay and before the response.
     expect(atResponse.map(({ update }) => update.sessionUpdate)).toEqual([
       "user_message",
       "user_message_chunk",
       "agent_message",
       "agent_message_chunk",
       "session_info_update",
+      "state_update",
     ]);
-    expect(atResponse.at(-1)).toEqual({
+    expect(atResponse.at(-2)).toEqual({
       sessionId: resumedSessionId,
       update: {
         sessionUpdate: "session_info_update",
         _meta: { jetbrains: { air: { version: 1, loadReplayEnd: true } } },
       },
     });
+    expect(atResponse.at(-1)?.update).toEqual({ sessionUpdate: "state_update", state: "idle" });
     expect(client.sessionUpdates.filter(isEnd)).toHaveLength(1);
   });
 
@@ -1877,24 +1958,19 @@ describe("ACP v2 prompts", () => {
 
       const { root, updates } = await cancelWhileRunning("toolu_child");
 
-      // The Agent call ends in the session that made it, with Claude Code's
-      // result and the kind that it stamped. The subagent's command ends in the
-      // child's session, whose own idle came first.
+      // The parent does not show the Agent call: the child's idle reports the
+      // stop. The subagent's command ends in the child's session, before the
+      // root's idle.
       const idle = idleAt(root, updates);
-      const agentEnd = lastStatusAt(updates, "toolu_agent");
-      expect(updates[agentEnd]).toMatchObject({
-        sessionId: root,
-        update: {
-          status: "cancelled",
-          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-        },
+      expect(lastStatusAt(updates, "toolu_agent")).toBe(-1);
+      expect(updates[idleAt("agent-1", updates)]).toMatchObject({
+        update: { stopReason: "cancelled" },
       });
       const childEnd = lastStatusAt(updates, "toolu_child");
       expect(updates[childEnd]).toMatchObject({
         sessionId: "agent-1",
         update: { status: "cancelled" },
       });
-      expect(agentEnd).toBeLessThan(idle);
       expect(childEnd).toBeLessThan(idle);
     });
 
@@ -2534,14 +2610,12 @@ describe("ACP v2 model cycles that Claude Code starts on its own", () => {
 
       const { root, updates } = await cancelCycle("toolu_child");
 
-      // Claude Code's result ends the Agent call. The command ends in the
-      // child's session, after the child's idle and before the cycle's.
-      expect(updates[lastStatusAt(updates, "toolu_agent")]).toMatchObject({
-        sessionId: root,
-        update: {
-          status: "cancelled",
-          _meta: { claudeCode: { nonExecutionKind: "user-rejected" } },
-        },
+      // The parent does not show the Agent call: the child's idle reports the
+      // stop. The command ends in the child's session, after the child's idle
+      // and before the cycle's.
+      expect(statusesOf(updates, "toolu_agent")).toEqual([]);
+      expect(updates[lastIdleAt(updates, "agent-1")]).toMatchObject({
+        update: { stopReason: "cancelled" },
       });
       const end = lastStatusAt(updates, "toolu_child");
       expect(updates[end]).toMatchObject({ sessionId: "agent-1", update: { status: "cancelled" } });

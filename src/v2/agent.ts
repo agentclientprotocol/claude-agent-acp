@@ -12,8 +12,8 @@ import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
   RequestPermissionResponse,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import { ClaudeAcpAgent, type AcpClient, type Logger } from "../acp-agent.js";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import type { AcpPermissionRequest } from "../permissions/presentation.js";
@@ -95,10 +95,11 @@ export function v2AgentApp(
         sessionId: params.sessionId,
         update: stateSnapshot(agent.foregroundState(params.sessionId)),
       });
-      return {
-        ...v2ResumeSessionResponse(response),
-        ...(await setupCommands(agent, params.sessionId, logger)),
-      };
+      const commands = await setupCommands(agent, params.sessionId, logger);
+      // The response ends a replay. The subagents RFD treats the replayed
+      // subagent states before it as history, so their current states follow it.
+      setTimeout(() => void agent.publishCurrentSubagentStates(params.sessionId), 0);
+      return { ...v2ResumeSessionResponse(response), ...commands };
     })
     .onRequest(v2.methods.agent.session.fork, ({ params }) =>
       agent.forking(params.sessionId, async () => {

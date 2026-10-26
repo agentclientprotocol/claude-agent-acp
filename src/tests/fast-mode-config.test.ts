@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+import type { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk/unstable";
 import type { FastModeDisabledReason, ModelInfo } from "@anthropic-ai/claude-agent-sdk";
 import {
   buildConfigOptions,

@@ -21,8 +21,8 @@ import type {
   CreateElicitationRequest,
   RequestPermissionRequest,
   SessionNotification,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -58,6 +58,7 @@ export const AIR_CAPABILITY_NAMES = [
   "rawInputRendering",
   "planFile",
   "agentFileChangeReport",
+  "backgroundSubagents",
 ];
 
 const baseCapabilities: ClientCapabilities = {

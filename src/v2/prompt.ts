@@ -10,8 +10,8 @@ import {
   type ContentBlock,
   type PromptRequest,
   type Role,
-} from "@agentclientprotocol/sdk";
-import * as v2 from "@agentclientprotocol/sdk/experimental/v2";
+} from "@agentclientprotocol/sdk/unstable";
+import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import type { ClaudeAcpAgent } from "../acp-agent.js";
 import type { ForegroundEvents, StopReason, TurnEvents, TurnOutcome } from "../turn-events.js";
 

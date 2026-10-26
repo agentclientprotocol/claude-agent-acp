@@ -52,6 +52,7 @@ import {
   type SdkTitles,
   type TranscriptFacts,
 } from "./transcript-scan.js";
+import { searchBackgroundTasks } from "./background-tasks.js";
 import { DirListings, statFiles } from "./dir-listing.js";
 import { isInLinkedWorktree, worktreeCounterparts } from "./worktrees.js";
 
@@ -400,7 +401,15 @@ function scopeOf(
   };
 }
 
+export type SessionIndexOptions = {
+  /** Whether a live process holds the session. Only for such a session the
+   *  whole transcript is searched for its background tasks. */
+  isLive?: (sessionId: string) => Promise<boolean>;
+};
+
 export class SessionIndex {
+  constructor(private readonly options: SessionIndexOptions = {}) {}
+
   private readonly listings = new DirListings();
   private readonly metadata = new Lru<string, CacheEntry>(METADATA_CACHE_SIZE);
   /** The metadata reads in flight, by path: a list and a subscription that
@@ -992,14 +1001,15 @@ export class SessionIndex {
     this.reads++;
     const headTail = await readHeadTail(candidate.filePath, candidate.size);
     if (isSidechainTranscript(headTail.head)) return null;
-    const facts = await scanTranscriptFile(
+    const scanned = await scanTranscriptFile(
       candidate.filePath,
       candidate.size,
       headTail,
       previous,
       candidate.ino,
     );
-    if (!facts.hasMessages) return null;
+    if (!scanned.hasMessages) return null;
+    const facts = await this.withAllBackgroundTasks(candidate, scanned);
     // The last relocation names the session's cwd, as the SDK reads it; the
     // messages before it keep the old one.
     const fileCwd = await this.recoverCwd(candidate.dirName, [
@@ -1030,6 +1040,24 @@ export class SessionIndex {
       updatedAtMs: Math.min(lastMessageAt, candidate.mtimeMs),
       facts,
     };
+  }
+
+  /**
+   * `facts` with the background tasks of the whole transcript, when the
+   * tasks of its tail are not complete: a task can start before the tail.
+   * Only a finished turn of a live session waits for the tasks, so only
+   * then the whole transcript is read.
+   */
+  private async withAllBackgroundTasks(
+    candidate: TranscriptCandidate,
+    facts: TranscriptFacts,
+  ): Promise<TranscriptFacts> {
+    if (facts.turnState !== "finished") return facts;
+    if (facts.backgroundTasks?.complete) return facts;
+    const isLive = await this.options.isLive?.(candidate.sessionId);
+    if (!isLive) return facts;
+    const backgroundTasks = await searchBackgroundTasks(candidate.filePath, candidate.size);
+    return { ...facts, backgroundTasks };
   }
 
   /**

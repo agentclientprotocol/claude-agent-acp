@@ -1,4 +1,4 @@
-import type { SessionConfigOption } from "@agentclientprotocol/sdk";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { EffortLevel, ModelInfo, Settings } from "@anthropic-ai/claude-agent-sdk";
 import { AIR_RECOMMENDED_CONFIG_VALUE_CAPABILITY, withAirMeta } from "./air-extension.js";
 import { EFFORT_CONFIG_ID } from "./session-config-ids.js";
@@ -79,6 +79,13 @@ export function mergeEffortSettings(base: Settings, override: Settings | undefin
   };
 }
 
+export function effortLevelName(level: string): string {
+  return level
+    .split(/[_-]/)
+    .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+    .join(" ");
+}
+
 export function buildEffortConfigOption(
   modelInfos: ModelInfo[],
   currentModelId: string,
@@ -98,10 +105,7 @@ export function buildEffortConfigOption(
     ...(useRecommendedValue ? [] : [{ value: "default", name: "Default" }]),
     ...supportedLevels.map((level) => ({
       value: level,
-      name: level
-        .split(/[_-]/)
-        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
-        .join(" "),
+      name: effortLevelName(level),
     })),
   ];
   const includes = (level: string) =>

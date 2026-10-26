@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.96.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.95.0...v0.96.0) (2026-10-26)
+
+
+### Features
+
+* report SendMessage delegations as linked session messages ([#1424](https://github.com/agentclientprotocol/claude-agent-acp/issues/1424)) ([739dde3](https://github.com/agentclientprotocol/claude-agent-acp/commit/739dde3ae5bb848bdb90e2c9150e2cc4687d480c))
+* report the model of each native subagent ([#1432](https://github.com/agentclientprotocol/claude-agent-acp/issues/1432)) ([c319e5e](https://github.com/agentclientprotocol/claude-agent-acp/commit/c319e5e542aabe353bb2c5e177e4c5853392b8c4))
+
+
+### Bug Fixes
+
+* do not hold an AIR load replay until the CLI starts ([#1433](https://github.com/agentclientprotocol/claude-agent-acp/issues/1433)) ([eb9d63e](https://github.com/agentclientprotocol/claude-agent-acp/commit/eb9d63e5fde9b8fd8fe692dfb3280faba6626a42))
+* refine RFD child models after a load, and retry a failed model update ([#1434](https://github.com/agentclientprotocol/claude-agent-acp/issues/1434)) ([9a8bf71](https://github.com/agentclientprotocol/claude-agent-acp/commit/9a8bf71d454fa85d03f55d4101a77e3ea7a149d0))
+* send subagents' current state after a load response ([#1423](https://github.com/agentclientprotocol/claude-agent-acp/issues/1423)) ([17a967b](https://github.com/agentclientprotocol/claude-agent-acp/commit/17a967b4dab78bbb9cf9fedae60e6821578dc5cb))
+* update to Claude Code 2.1.310 ([#1435](https://github.com/agentclientprotocol/claude-agent-acp/issues/1435)) ([2f3c6bb](https://github.com/agentclientprotocol/claude-agent-acp/commit/2f3c6bb7b3451a00cd77d7bb31c09e690ca220b3))
+
+## [0.95.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.94.0...v0.95.0) (2026-10-23)
+
+
+### Features
+
+* end a turn at its result for AIR clients with backgroundSubagents ([#1262](https://github.com/agentclientprotocol/claude-agent-acp/issues/1262)) ([9b3a5c8](https://github.com/agentclientprotocol/claude-agent-acp/commit/9b3a5c891c75e78b985adb31f4e4b59a16ad2ebc))
+* report read-only subagent configuration ([#1417](https://github.com/agentclientprotocol/claude-agent-acp/issues/1417)) ([6ab670b](https://github.com/agentclientprotocol/claude-agent-acp/commit/6ab670baaefb30aaac2606d8ee6524e08243e5b5))
+* report RFD delegations as linked session messages ([#1405](https://github.com/agentclientprotocol/claude-agent-acp/issues/1405)) ([59e292e](https://github.com/agentclientprotocol/claude-agent-acp/commit/59e292e29f773cc6f03c0999993cbe8a2d97a7e3))
+* serve experimental ACP v2 ([#1400](https://github.com/agentclientprotocol/claude-agent-acp/issues/1400)) ([4d378f9](https://github.com/agentclientprotocol/claude-agent-acp/commit/4d378f93f36d37ba5ef64af87b617706dd9c6e82))
+* show messages typed in other Remote Control clients ([#1371](https://github.com/agentclientprotocol/claude-agent-acp/issues/1371)) ([5b11f47](https://github.com/agentclientprotocol/claude-agent-acp/commit/5b11f470b1c05b114c876b3b6e5b4df9441b1087))
+* update to Claude Code 2.1.309 ([#1413](https://github.com/agentclientprotocol/claude-agent-acp/issues/1413)) ([a1521b6](https://github.com/agentclientprotocol/claude-agent-acp/commit/a1521b6196c58dbc5065f9c19fc9694273d3d435))
+
+
+### Bug Fixes
+
+* bump fast-uri from 3.1.8 to 3.1.9 ([#1410](https://github.com/agentclientprotocol/claude-agent-acp/issues/1410)) ([0fe22ae](https://github.com/agentclientprotocol/claude-agent-acp/commit/0fe22ae5a172b228a574665bb7136b900746041d))
+* bump postcss from 8.5.30 to 8.5.31 in the minor group ([#1403](https://github.com/agentclientprotocol/claude-agent-acp/issues/1403)) ([ecaa2c9](https://github.com/agentclientprotocol/claude-agent-acp/commit/ecaa2c935b9f2b63c1846ca17c6c3398390fb0ef))
+* bump the minor group across 1 directory with 2 updates ([#1416](https://github.com/agentclientprotocol/claude-agent-acp/issues/1416)) ([f7d6030](https://github.com/agentclientprotocol/claude-agent-acp/commit/f7d6030c04af23171058772480d55f6d2aee5298))
+* IJAI-3744 keep a session running while its background tasks are open ([#1399](https://github.com/agentclientprotocol/claude-agent-acp/issues/1399)) ([e9f986b](https://github.com/agentclientprotocol/claude-agent-acp/commit/e9f986b8a941f5c1789078a39e474f247bd0db60))
+* publish the session title as soon as the CLI has it ([#1406](https://github.com/agentclientprotocol/claude-agent-acp/issues/1406)) ([50cd76e](https://github.com/agentclientprotocol/claude-agent-acp/commit/50cd76e78dd9bb1ab0e4850a8d95431175ab5947))
+* publish turns that Claude Code starts after end_turn as an async task in v1 ([#1390](https://github.com/agentclientprotocol/claude-agent-acp/issues/1390)) ([a1d0eee](https://github.com/agentclientprotocol/claude-agent-acp/commit/a1d0eeeaad3d67a0765f4b89e3d81c1af6ca0dbb))
+
+## [0.94.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.93.0...v0.94.0) (2026-10-19)
+
+
+### Features
+
+* send one end event after the session/load history replay for AIR ([#1361](https://github.com/agentclientprotocol/claude-agent-acp/issues/1361)) ([1420994](https://github.com/agentclientprotocol/claude-agent-acp/commit/1420994ced20919aad127a8bd0294de022449e35))
+
+
+### Bug Fixes
+
+* match OpenRouter model ids in the gateway model listing ([#1365](https://github.com/agentclientprotocol/claude-agent-acp/issues/1365)) ([bcf74c2](https://github.com/agentclientprotocol/claude-agent-acp/commit/bcf74c2fe8e32bd24714d45122529dcf2f99a279))
+* resolve a skill's SKILL.md by its declared name, not by its directory name ([#1372](https://github.com/agentclientprotocol/claude-agent-acp/issues/1372)) ([424db87](https://github.com/agentclientprotocol/claude-agent-acp/commit/424db8753581bfaf4c5bf278f8df8c089eec35da))
+* update to ACP SDK 2.0.0 ([#1386](https://github.com/agentclientprotocol/claude-agent-acp/issues/1386)) ([ff01e06](https://github.com/agentclientprotocol/claude-agent-acp/commit/ff01e06579225e00643914692994cd60da4d6225))
+* update to Claude Code 2.1.303 ([#1384](https://github.com/agentclientprotocol/claude-agent-acp/issues/1384)) ([2dab922](https://github.com/agentclientprotocol/claude-agent-acp/commit/2dab92264414d133fd6774f7a90241ea5192ba32))
+
 ## [0.93.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.92.0...v0.93.0) (2026-10-16)
 
 

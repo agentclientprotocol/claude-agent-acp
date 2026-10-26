@@ -5,7 +5,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   ToolCallStatus,
-} from "@agentclientprotocol/sdk";
+} from "@agentclientprotocol/sdk/unstable";
 import {
   AIR_COMMAND_TITLE_KEY,
   AIR_MCP_KEY,
