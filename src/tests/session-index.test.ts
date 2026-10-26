@@ -69,10 +69,15 @@ beforeEach(async () => {
   configDir = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-cfg-")));
   workspace = fsSync.realpathSync(await fs.mkdtemp(path.join(os.tmpdir(), "session-index-ws-")));
   process.env.CLAUDE_CONFIG_DIR = configDir;
+  // Integration runs leave CLAUDE_CODE_EXECUTABLE unset, so initialize would run
+  // the real `claude auth status` in the background. It writes into configDir
+  // while afterEach removes it, and the rm fails with ENOTEMPTY.
+  vi.stubEnv("CLAUDE_CODE_EXECUTABLE", "/usr/bin/false");
   vi.clearAllMocks();
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
   else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
   await fs.rm(configDir, { recursive: true, force: true });
@@ -3528,7 +3533,8 @@ describe("paths that share a project directory", () => {
         .filter((s) => s.sessionId === mine.id);
     const removed = () =>
       changesFor(notifications, fromDotted.subscriptionId).flatMap((c) => c.removed);
-    expect(await waitFor(() => added().length > 0 && removed().length > 0)).toBe(true);
+    // Wait for mine.id itself: the other path's session can be removed first.
+    expect(await waitFor(() => added().length > 0 && removed().includes(mine.id))).toBe(true);
     expect(added().map((s) => [s.sessionId, s.cwd])).toEqual([[mine.id, dashed]]);
     // It may also name the other path's session, never listed here.
     expect(removed()).toContain(mine.id);

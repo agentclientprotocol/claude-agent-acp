@@ -238,19 +238,18 @@ it.skipIf(!process.env.RUN_INTEGRATION_TESTS)(
     const q = query({ prompt: input(), options: { persistSession: false, abortController } });
     try {
       const { models } = await q.initializationResult();
-      const opusModels = models.filter(
-        (model) =>
-          model.value !== "default" &&
-          /\bopus\b/i.test(`${model.value} ${model.resolvedModel} ${model.displayName}`),
-      );
+      // Only alias rows ("opus", "opus[1m]"). The catalogue also lists pinned
+      // older versions such as "claude-opus-4-8"; those are separate models.
+      const opusModels = models.filter((model) => /^opus\b/i.test(model.value));
       expect(opusModels).toHaveLength(1);
       // CLI 2.1.283 dropped the "[1m]" / "(1M context)" spelling from the Opus
       // row: Opus is natively 1M, so the row names the plain model.
       expect(opusModels[0]).toMatchObject({
         value: "opus",
-        displayName: "Opus",
+        displayName: expect.stringMatching(/^Opus\b/),
         resolvedModel: expect.stringMatching(/^claude-opus-[\d-]+$/),
       });
+      expect(opusModels[0].displayName).not.toMatch(/\b1m\b/i);
       expect(opusModels[0].description).not.toMatch(/\b1m\b/i);
     } finally {
       clearTimeout(timeout);
