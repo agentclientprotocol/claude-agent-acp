@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.96.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.95.0...v0.96.0) (2026-10-26)
+
+
+### Features
+
+* report SendMessage delegations as linked session messages ([#1424](https://github.com/agentclientprotocol/claude-agent-acp/issues/1424)) ([739dde3](https://github.com/agentclientprotocol/claude-agent-acp/commit/739dde3ae5bb848bdb90e2c9150e2cc4687d480c))
+* report the model of each native subagent ([#1432](https://github.com/agentclientprotocol/claude-agent-acp/issues/1432)) ([c319e5e](https://github.com/agentclientprotocol/claude-agent-acp/commit/c319e5e542aabe353bb2c5e177e4c5853392b8c4))
+
+
+### Bug Fixes
+
+* do not hold an AIR load replay until the CLI starts ([#1433](https://github.com/agentclientprotocol/claude-agent-acp/issues/1433)) ([eb9d63e](https://github.com/agentclientprotocol/claude-agent-acp/commit/eb9d63e5fde9b8fd8fe692dfb3280faba6626a42))
+* refine RFD child models after a load, and retry a failed model update ([#1434](https://github.com/agentclientprotocol/claude-agent-acp/issues/1434)) ([9a8bf71](https://github.com/agentclientprotocol/claude-agent-acp/commit/9a8bf71d454fa85d03f55d4101a77e3ea7a149d0))
+* send subagents' current state after a load response ([#1423](https://github.com/agentclientprotocol/claude-agent-acp/issues/1423)) ([17a967b](https://github.com/agentclientprotocol/claude-agent-acp/commit/17a967b4dab78bbb9cf9fedae60e6821578dc5cb))
+* update to Claude Code 2.1.310 ([#1435](https://github.com/agentclientprotocol/claude-agent-acp/issues/1435)) ([2f3c6bb](https://github.com/agentclientprotocol/claude-agent-acp/commit/2f3c6bb7b3451a00cd77d7bb31c09e690ca220b3))
+
 ## [0.95.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.94.0...v0.95.0) (2026-10-23)
 
 
