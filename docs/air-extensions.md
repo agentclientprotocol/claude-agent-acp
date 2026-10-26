@@ -1451,7 +1451,7 @@ sessions and folder members outside the recent list page. Check for
 calling it.
 
 The params object must contain only `sessionIds`: an array of distinct,
-non-empty strings. IDs match exactly, without trimming or case normalization.
+non-blank strings. IDs match exactly, without trimming or case normalization.
 Malformed params, duplicates or extra fields return `Invalid params` (`-32602`).
 The agent sets no limit on the number of IDs; the client chooses the batch size
 for the latency it accepts. Archived sessions and sessions in other projects

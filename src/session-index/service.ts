@@ -91,7 +91,7 @@ export function parseBatchGetSessionsRequest(value: unknown): BatchGetSessionsRe
   ) {
     throw RequestError.invalidParams(
       undefined,
-      "params require only sessionIds: distinct, non-empty strings",
+      "params require only sessionIds: distinct, non-blank strings",
     );
   }
   return { sessionIds: ids };

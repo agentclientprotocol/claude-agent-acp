@@ -367,7 +367,7 @@ describe("_session/batch_get", () => {
     }
   });
 
-  it("accepts only distinct, non-empty string ids and no other fields", () => {
+  it("accepts only distinct, non-blank string ids and no other fields", () => {
     for (const params of [
       null,
       [],
@@ -599,74 +599,83 @@ describe("_session/batch_get", () => {
     await agent.dispose();
   });
 
-  it("returns readable sessions in request order and omits unavailable ids", async () => {
-    const first = await writeTranscript({});
-    const found = await writeTranscript({});
-    const unreadable = await writeTranscript({});
-    await fs.chmod(unreadable.file, 0);
-    const absent = randomUUID();
-    const { agent } = await indexAgent();
-    try {
-      const result = await agent.batchGetSessions({
-        sessionIds: [absent, first.id, unreadable.id, found.id],
-      });
-      expect(result.sessions.map((s) => s.sessionId)).toEqual([first.id, found.id]);
-      expect(Object.keys(result)).toEqual(["sessions"]);
-    } finally {
-      await fs.chmod(unreadable.file, 0o600);
-      await agent.dispose();
-    }
-  });
-
-  it("uses a readable copy when another copy cannot be read or stat'ed, as the unscoped list does", async () => {
-    const sessionId = randomUUID();
-    await writeTranscript({ sessionId, prompt: "Readable copy" });
-    const hiddenProject = path.join(workspace, "inaccessible");
-    const unreadable = await writeTranscript({
-      sessionId,
-      cwd: hiddenProject,
-      prompt: "Unreadable newer copy",
-      mtimeMs: Date.parse("2026-02-01"),
-    });
-    const { agent } = await indexAgent();
-    try {
-      // A failed metadata read, then a failed stat of the same copy.
-      for (const target of [unreadable.file, path.dirname(unreadable.file)]) {
-        await fs.chmod(target, 0);
-        const result = await agent.batchGetSessions({ sessionIds: [sessionId] });
-        const listed = await agent.listSessions({});
-        expect(result).toEqual({ sessions: listed.sessions });
-        expect(result.sessions[0]?.title).toBe("Readable copy");
-        await fs.chmod(target, 0o700);
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "returns readable sessions in request order and omits unavailable ids",
+    async () => {
+      const first = await writeTranscript({});
+      const found = await writeTranscript({});
+      const unreadable = await writeTranscript({});
+      await fs.chmod(unreadable.file, 0);
+      const absent = randomUUID();
+      const { agent } = await indexAgent();
+      try {
+        const result = await agent.batchGetSessions({
+          sessionIds: [absent, first.id, unreadable.id, found.id],
+        });
+        expect(result.sessions.map((s) => s.sessionId)).toEqual([first.id, found.id]);
+        expect(Object.keys(result)).toEqual(["sessions"]);
+      } finally {
+        await fs.chmod(unreadable.file, 0o600);
+        await agent.dispose();
       }
-    } finally {
-      await fs.chmod(path.dirname(unreadable.file), 0o700);
-      await fs.chmod(unreadable.file, 0o600);
-      await agent.dispose();
-    }
-  });
+    },
+  );
 
-  it("omits failed stats, dangling links and non-file transcripts", async () => {
-    const unreadable = await writeTranscript({ cwd: path.join(workspace, "inaccessible") });
-    const dangling = await writeTranscript({});
-    await fs.rm(dangling.file);
-    await fs.symlink(path.join(workspace, "not-there"), dangling.file);
-    const nonFile = await writeTranscript({});
-    await fs.rm(nonFile.file);
-    await fs.mkdir(nonFile.file);
-    const { agent } = await indexAgent();
-    const projectDir = path.dirname(unreadable.file);
-    await fs.chmod(projectDir, 0);
-    try {
-      const result = await agent.batchGetSessions({
-        sessionIds: [unreadable.id, dangling.id, nonFile.id],
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "uses a readable copy when another copy cannot be read or stat'ed, as the unscoped list does",
+    async () => {
+      const sessionId = randomUUID();
+      await writeTranscript({ sessionId, prompt: "Readable copy" });
+      const hiddenProject = path.join(workspace, "inaccessible");
+      const unreadable = await writeTranscript({
+        sessionId,
+        cwd: hiddenProject,
+        prompt: "Unreadable newer copy",
+        mtimeMs: Date.parse("2026-02-01"),
       });
-      expect(result).toEqual({ sessions: [] });
-    } finally {
-      await fs.chmod(projectDir, 0o700);
-      await agent.dispose();
-    }
-  });
+      const { agent } = await indexAgent();
+      try {
+        // A failed metadata read, then a failed stat of the same copy.
+        for (const target of [unreadable.file, path.dirname(unreadable.file)]) {
+          await fs.chmod(target, 0);
+          const result = await agent.batchGetSessions({ sessionIds: [sessionId] });
+          const listed = await agent.listSessions({});
+          expect(result).toEqual({ sessions: listed.sessions });
+          expect(result.sessions[0]?.title).toBe("Readable copy");
+          await fs.chmod(target, 0o700);
+        }
+      } finally {
+        await fs.chmod(path.dirname(unreadable.file), 0o700);
+        await fs.chmod(unreadable.file, 0o600);
+        await agent.dispose();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "omits failed stats, dangling links and non-file transcripts",
+    async () => {
+      const unreadable = await writeTranscript({ cwd: path.join(workspace, "inaccessible") });
+      const dangling = await writeTranscript({});
+      await fs.rm(dangling.file);
+      await fs.symlink(path.join(workspace, "not-there"), dangling.file);
+      const nonFile = await writeTranscript({});
+      await fs.rm(nonFile.file);
+      await fs.mkdir(nonFile.file);
+      const { agent } = await indexAgent();
+      const projectDir = path.dirname(unreadable.file);
+      await fs.chmod(projectDir, 0);
+      try {
+        const result = await agent.batchGetSessions({
+          sessionIds: [unreadable.id, dangling.id, nonFile.id],
+        });
+        expect(result).toEqual({ sessions: [] });
+      } finally {
+        await fs.chmod(projectDir, 0o700);
+        await agent.dispose();
+      }
+    },
+  );
 
   it("matches UUIDs exactly without case or whitespace normalization", async () => {
     const sessionId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -699,7 +708,9 @@ describe("_session/batch_get", () => {
     await agent.dispose();
   });
 
-  it.each(["unreadable", "unreadable after a cached list", "a file", "a dangling symlink"])(
+  it
+    .skipIf(process.platform === "win32" || process.getuid?.() === 0)
+    .each(["unreadable", "unreadable after a cached list", "a file", "a dangling symlink"])(
     "rejects a projects root that is %s",
     async (kind) => {
       const found = await writeTranscript({});

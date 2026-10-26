@@ -641,6 +641,10 @@ export class SessionIndex {
       ),
     );
     if (CASE_INSENSITIVE_PATHS) {
+      // On a case-insensitive file system, stat of `ABC.jsonl` also finds
+      // `abc.jsonl`. Keep a file only when its real name is the requested one,
+      // or differs by more than case (a symlink, as the list would read it).
+      // A failed realpath means the file is unreadable, so the id is omitted.
       const exact = await Promise.all(
         candidates.map(async ({ filePath }) => {
           try {
