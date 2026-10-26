@@ -112,6 +112,12 @@ export class RfdSubagentReplay {
     private readonly history: SubagentHistory,
     private readonly publish: Publish,
     private readonly models?: SubagentModels,
+    /**
+     * Whether the replay maps a model to the session's model list as it goes.
+     * A load lacks the list until the CLI started, so it maps only in
+     * {@link currentStates}, after the load response.
+     */
+    private readonly mapsDuringReplay = true,
   ) {}
 
   /**
@@ -189,7 +195,7 @@ export class RfdSubagentReplay {
    * whose model changes gets its `model` option again.
    */
   async responseModel(owner: ReplayChild, model: string | undefined): Promise<void> {
-    const entry = responseModelEntry(model, this.models);
+    const entry = responseModelEntry(model, this.mapsDuringReplay ? this.models : undefined);
     if (!entry || !owner.announced) return;
     owner.responseModel = model;
     await this.sendModel(owner, entry);

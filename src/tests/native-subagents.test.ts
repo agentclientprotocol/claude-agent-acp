@@ -2678,6 +2678,44 @@ describe("NativeSubagentRuntime child models", () => {
     },
   );
 
+  it.each(["rfd", "air"] as const)(
+    "%s: sends a model again after its publication failed",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      let failures = 1;
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        {},
+        async (notification) => {
+          if (notification.update.sessionUpdate === "config_option_update" && failures-- > 0) {
+            throw new Error("client gone");
+          }
+          published.push(notification);
+        },
+        { log: () => {} },
+        undefined,
+        undefined,
+        models,
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      await deliver(agentCall("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await expect(runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver)).rejects.toThrow(
+        "client gone",
+      );
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+      expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+    },
+  );
+
   it("air: forgets the configuration of an ended child", async () => {
     const { runtime, published, deliver } = await spawn("air");
     await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);

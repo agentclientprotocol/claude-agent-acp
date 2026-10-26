@@ -3596,11 +3596,19 @@ describe("subagent transcript replay", () => {
       { log: () => {}, error: () => {} },
     );
     await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
-    vi.mocked(getSessionMessages).mockResolvedValueOnce(replayHistory);
     // A load replays while the CLI starts: the session and its model list come later.
     await (
-      agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-    ).replaySessionHistory("s1");
+      agent as unknown as {
+        replaySessionHistory(
+          sessionId: string,
+          messages: unknown[],
+          pending: unknown,
+        ): Promise<void>;
+      }
+    ).replaySessionHistory("s1", replayHistory, {
+      state: { cwd: "/tmp", taskState: new Map(), messageIdToUuid: new Map() },
+      stopped: false,
+    });
     const child = "s1:replay-subagent:parent-agent-call";
     const models = () =>
       updates.flatMap(({ sessionId, update }) =>
@@ -3877,7 +3885,14 @@ describe("subagent transcript replay", () => {
         /** The session's config options and model list, known after the response. */
         models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
       },
-      { traceModels = false }: { traceModels?: boolean } = {},
+      {
+        traceModels = false,
+        load = false,
+      }: {
+        traceModels?: boolean;
+        /** Replay as a load does, while the CLI starts: without the session record. */
+        load?: boolean;
+      } = {},
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -3915,9 +3930,21 @@ describe("subagent transcript replay", () => {
         );
         await initializeClient(agent, capabilities);
         vi.mocked(getSessionInfo).mockResolvedValueOnce({ cwd: "/tmp/proj" } as any);
+        const pending = load
+          ? {
+              state: { cwd: "/tmp/proj", taskState: new Map(), messageIdToUuid: new Map() },
+              stopped: false,
+            }
+          : undefined;
         await (
-          agent as unknown as { replaySessionHistory(sessionId: string): Promise<void> }
-        ).replaySessionHistory(sessionId);
+          agent as unknown as {
+            replaySessionHistory(
+              sessionId: string,
+              messages?: unknown[],
+              pending?: unknown,
+            ): Promise<void>;
+          }
+        ).replaySessionHistory(sessionId, undefined, pending);
         const responseAt = updates.length;
         if (afterResponse) {
           // Stands in for the live session's runtime, which knows its running children.
@@ -4268,7 +4295,7 @@ describe("subagent transcript replay", () => {
             ],
           },
         },
-        { traceModels: true },
+        { traceModels: true, load: true },
       );
 
       const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);

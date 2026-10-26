@@ -90,6 +90,8 @@ export type SubagentModels = {
 type ChildConfiguration = {
   options: Map<string, SessionConfigOption>;
   published?: string;
+  /** The `model` option value and name that the client last got. */
+  publishedModel?: ModelEntry;
   publishing: Promise<void>;
 };
 
@@ -285,13 +287,13 @@ export class NativeSubagentRuntime {
     if (!entry) return;
     // Every response of a child reports its model: most repeat the model that
     // the client already has, and need no routing.
+    // A publication that failed sent nothing, so only the published model counts.
     const child = this.childByParentToolUse.get(parentToolUseId!);
-    const current = child?.announced
-      ? this.configBySession.get(child.sessionId)?.options.get(MODEL_CONFIG_ID)
-      : undefined;
-    if (current?.type === "select" && current.currentValue === entry.value) {
-      const shown = current.options[0];
-      if (shown && "name" in shown && shown.name === entry.name) return;
+    if (
+      child?.announced &&
+      sameModelEntry(this.configBySession.get(child.sessionId)?.publishedModel, entry)
+    ) {
+      return;
     }
     await deliver({
       sessionId: this.rootSessionId,
@@ -384,6 +386,11 @@ export class NativeSubagentRuntime {
         },
       });
       config.published = snapshot;
+      const model = configOptions.find((option) => option.id === MODEL_CONFIG_ID);
+      const shown = model?.type === "select" ? model.options[0] : undefined;
+      if (model && shown && "name" in shown && typeof model.currentValue === "string") {
+        config.publishedModel = { value: model.currentValue, name: shown.name };
+      }
     });
     // The caller receives the error; later observations must still be able to retry.
     config.publishing = publishing.catch(() => {});
@@ -1418,12 +1425,15 @@ export class NativeSubagentRuntime {
 
   private buffer(parentToolUseId: string, notification: AcpSessionNotification): void {
     const updates = this.pending.get(parentToolUseId);
-    // A child reports its model with each response before its announcement.
-    // Only the latest configuration waits, so they do not fill the buffer.
-    if (notification.update.sessionUpdate === "config_option_update" && updates) {
-      const index = updates.findIndex(
-        ({ update }) => update.sessionUpdate === "config_option_update",
-      );
+    // A child reports its model with each response before its announcement
+    // (see `reportModel`). Only the latest such report waits, so they do not
+    // fill the buffer. Any other configuration update waits as it is.
+    const modelOnly = ({ update }: AcpSessionNotification) =>
+      update.sessionUpdate === "config_option_update" &&
+      update.configOptions.length === 1 &&
+      update.configOptions[0]?.id === MODEL_CONFIG_ID;
+    if (updates && modelOnly(notification)) {
+      const index = updates.findIndex(modelOnly);
       if (index >= 0) {
         updates[index] = notification;
         return;

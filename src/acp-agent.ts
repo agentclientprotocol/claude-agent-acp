@@ -3116,7 +3116,10 @@ export class ClaudeAcpAgent {
     }
     timing.phase("session-ready");
     const replayed = await replay;
-    if (!replayed.ok) throw replayed.error;
+    if (!replayed.ok) {
+      this.replayedChildModels.delete(params.sessionId);
+      throw replayed.error;
+    }
     return {
       sessionId: response.sessionId,
       modes: response.modes,
@@ -9449,7 +9452,8 @@ export class ClaudeAcpAgent {
         ? new RfdSubagentReplay(
             rfdHistory,
             (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
-            replayModels,
+            this.subagentModels(sessionId),
+            !pending,
           )
         : undefined;
     rfdReplay?.scan(messages, sessionId);
