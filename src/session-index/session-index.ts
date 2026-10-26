@@ -596,7 +596,7 @@ export class SessionIndex {
   }
 
   /** Known ids in request order, using the same rows as the list.
-   *  Reads the project names once, then addresses only exact transcript filenames. */
+   *  Addresses exact filenames; only rows without a cwd need sibling discovery. */
   async getSessions(sessionIds: readonly string[]): Promise<IndexRow[]> {
     if (sessionIds.length === 0) return [];
     const root = projectsRoot();
@@ -658,6 +658,20 @@ export class SessionIndex {
       inScope: scopeOf(undefined),
       archived: "all",
       wanted: Infinity,
+      unread: async (read, dirNames) => {
+        const dirs = [...dirNames];
+        const listed = await this.listings.namesOfAll(dirs.map((dir) => path.join(root, dir)));
+        const siblings = dirs.flatMap((dirName, i) =>
+          listed[i]!.filter((name) => name.endsWith(".jsonl") && isSessionId(name.slice(0, -6)))
+            .map((name) => ({
+              sessionId: name.slice(0, -6),
+              filePath: path.join(root, dirName, name),
+              dirName,
+            }))
+            .filter(({ filePath }) => !read.has(filePath)),
+        );
+        return (await transcriptCandidates(siblings)).sort(byMtimeDescending);
+      },
     });
   }
 
@@ -859,9 +873,12 @@ export class SessionIndex {
       archived: ArchivedFilter;
       after?: ListCursor;
       wanted: number;
-      /** The transcripts not read (by path), which may supply a sibling's
-       *  cwd. Omit to skip sibling recovery and its negative-cache writes. */
-      unread?: (read: ReadonlySet<string>) => readonly TranscriptCandidate[];
+      /** The unread transcripts of the directories still eligible for cwd
+       *  recovery. Called only after checking the negative cache. */
+      unread?: (
+        read: ReadonlySet<string>,
+        dirNames: ReadonlySet<string>,
+      ) => readonly TranscriptCandidate[] | Promise<readonly TranscriptCandidate[]>;
       restat?: boolean;
     },
   ): Promise<IndexRow[]> {
@@ -933,14 +950,15 @@ export class SessionIndex {
       }
       await settlePending();
     }
-    if (pending.length > 0 && options.unread) {
+    const unread = options.unread;
+    if (pending.length > 0 && unread) {
       // A row recovered after the scan stopped still sorts into the page: it
       // was read before the stop, and more rows only raise the bound. A
       // sibling that the archive filter or the cursor leaves out may still
       // supply the cwd.
       await this.learnDirCwds(
         new Set(pending.map(({ candidate }) => candidate.dirName)),
-        options.unread(read),
+        (dirNames) => unread(read, dirNames),
         options.restat ?? false,
       );
       await settlePending();
@@ -974,7 +992,9 @@ export class SessionIndex {
    *  changes. `restat` as in {@link collectRows}. */
   private async learnDirCwds(
     dirNames: ReadonlySet<string>,
-    unread: readonly TranscriptCandidate[],
+    unread: (
+      dirNames: ReadonlySet<string>,
+    ) => readonly TranscriptCandidate[] | Promise<readonly TranscriptCandidate[]>,
     restatFirst: boolean,
   ): Promise<void> {
     const root = projectsRoot();
@@ -990,8 +1010,9 @@ export class SessionIndex {
       if (known && known.mtimeMs === mtimeMs && now - known.at < NO_CWD_RETRY_MS) continue;
       mtimes.set(dirName, mtimeMs);
     }
+    if (mtimes.size === 0) return;
     const probes = new Map<string, number>();
-    let remaining = unread.filter((candidate) => {
+    let remaining = (await unread(new Set(mtimes.keys()))).filter((candidate) => {
       if (!mtimes.has(candidate.dirName)) return false;
       const count = probes.get(candidate.dirName) ?? 0;
       if (count >= MAX_CWD_PROBES_PER_DIR) return false;

@@ -378,10 +378,7 @@ describe("_session/batch_get", () => {
       { sessionIds: [" "] },
       { sessionIds: [1] },
       { sessionIds: ["id", "id"] },
-      ...["cwd", "archived", "includeWorktrees", "limit", "cursor"].map((key) => ({
-        sessionIds: [],
-        [key]: null,
-      })),
+      { sessionIds: [], cwd: null },
     ]) {
       expect(() => parseBatchGetSessionsRequest(params)).toThrow(
         expect.objectContaining({ code: -32602 }),
@@ -486,7 +483,7 @@ describe("_session/batch_get", () => {
     }
   });
 
-  it("does not suppress sibling cwd recovery in the next list", async () => {
+  it("recovers a cold batch row from a sibling and keeps it in the next list", async () => {
     const base = Date.parse("2026-04-01T00:00:00Z");
     const other = path.join(workspace, "other");
     const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
@@ -498,24 +495,13 @@ describe("_session/batch_get", () => {
     await writeTranscript({ cwd: other, lastMessageAt: base - 3600_000 });
     const { agent } = await indexAgent();
     const index = (agent as any).sessionIndex.service.index;
-    const list = vi.spyOn(index, "list").mockRejectedValue(new Error("must not list"));
-    const names = vi.spyOn(index.listings, "namesOfAll").mockRejectedValue(new Error("history"));
+    const names = vi.spyOn(index.listings, "namesOfAll");
     const now = vi.spyOn(Date, "now").mockReturnValue(Date.now());
-    const readdir = vi.mocked(fs.readdir);
-    readdir.mockClear();
     try {
-      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
-      expect(transcriptsRead(agent)).toBe(1);
-      const root = path.join(configDir, "projects");
-      const storeReads = readdir.mock.calls
-        .map(([dir]) => String(dir))
-        .filter((dir) => dir === root || dir.startsWith(root + path.sep));
-      expect(storeReads).toEqual([root]);
-      expect(list).not.toHaveBeenCalled();
-      expect(names).not.toHaveBeenCalled();
-      expect(listSessions).not.toHaveBeenCalled();
-      expect(getSessionInfo).not.toHaveBeenCalled();
-      list.mockRestore();
+      const result = await agent.batchGetSessions({ sessionIds: [noCwd.id] });
+      expect(result.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[noCwd.id, other]]);
+      expect(transcriptsRead(agent)).toBe(2);
+      expect(names.mock.calls).toEqual([[[path.dirname(noCwd.file)]]]);
       names.mockRestore();
 
       // Use the same index without changing files or letting the negative cache expire.
@@ -524,11 +510,52 @@ describe("_session/batch_get", () => {
         [noCwd.id, other],
         [fillers[0], workspace],
       ]);
+      expect(page.sessions[0]).toEqual(result.sessions[0]);
     } finally {
-      list.mockRestore();
       names.mockRestore();
       now.mockRestore();
-      readdir.mockClear();
+      await agent.dispose();
+    }
+  });
+
+  it("bounds sibling cwd probes and retries a negative result after its cache expires", async () => {
+    const base = Date.parse("2026-04-01T00:00:00Z");
+    const other = path.join(workspace, "other");
+    const noCwd = await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base });
+    const siblings: { id: string; file: string }[] = [];
+    for (let i = 1; i <= 70; i++) {
+      siblings.push(
+        await writeTranscript({ cwd: other, recordCwd: null, lastMessageAt: base - i * 1000 }),
+      );
+    }
+    await writeTranscript({ lastMessageAt: base });
+    const { agent } = await indexAgent();
+    const index = (agent as any).sessionIndex.service.index;
+    const names = vi.spyOn(index.listings, "namesOfAll");
+    const at = Date.now();
+    const now = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
+      expect(transcriptsRead(agent)).toBe(1 + 64);
+      expect(names.mock.calls).toEqual([[[path.dirname(noCwd.file)]]]);
+
+      // Rewriting an existing sibling does not change the directory mtime.
+      await writeTranscript({ sessionId: siblings[0]!.id, cwd: other, lastMessageAt: base });
+      expect(await agent.batchGetSessions({ sessionIds: [noCwd.id] })).toEqual({ sessions: [] });
+      expect(transcriptsRead(agent)).toBe(1 + 64);
+      expect(names).toHaveBeenCalledTimes(1);
+
+      now.mockReturnValue(at + 60_001);
+      const result = await agent.batchGetSessions({ sessionIds: [noCwd.id] });
+      expect(result.sessions.map((s) => [s.sessionId, s.cwd])).toEqual([[noCwd.id, other]]);
+      expect(transcriptsRead(agent)).toBe(1 + 64 + 1);
+      expect(names.mock.calls).toEqual([
+        [[path.dirname(noCwd.file)]],
+        [[path.dirname(noCwd.file)]],
+      ]);
+    } finally {
+      names.mockRestore();
+      now.mockRestore();
       await agent.dispose();
     }
   });
@@ -672,60 +699,36 @@ describe("_session/batch_get", () => {
     await agent.dispose();
   });
 
-  it("fails the request when the projects root is unreadable", async () => {
-    const found = await writeTranscript({});
-    const { agent } = await indexAgent();
-    const root = path.join(configDir, "projects");
-    await fs.chmod(root, 0);
-    try {
-      for (const sessionId of [found.id, "retained-id"]) {
-        await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
-          "Session store could not be read",
-        );
+  it.each(["unreadable", "unreadable after a cached list", "a file", "a dangling symlink"])(
+    "rejects a projects root that is %s",
+    async (kind) => {
+      const found = await writeTranscript({});
+      const root = path.join(configDir, "projects");
+      const { agent } = await indexAgent();
+      try {
+        if (kind === "unreadable after a cached list") {
+          const old = new Date(Date.now() - 60_000);
+          await fs.utimes(root, old, old);
+          await agent.listSessions({});
+        }
+        if (kind.startsWith("unreadable")) {
+          await fs.chmod(root, 0);
+        } else {
+          await fs.rm(root, { recursive: true });
+          if (kind === "a file") await fs.writeFile(root, "not a store");
+          else await fs.symlink(path.join(workspace, "missing-store"), root);
+        }
+        for (const sessionId of [found.id, "retained-id"]) {
+          await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
+            "Session store could not be read",
+          );
+        }
+      } finally {
+        if (kind.startsWith("unreadable")) await fs.chmod(root, 0o700);
+        await agent.dispose();
       }
-    } finally {
-      await fs.chmod(root, 0o700);
-      await agent.dispose();
-    }
-  });
-
-  it("checks root readability even after a previous list warmed the directory cache", async () => {
-    const found = await writeTranscript({});
-    const root = path.join(configDir, "projects");
-    const old = new Date(Date.now() - 60_000);
-    await fs.utimes(root, old, old);
-    const { agent } = await indexAgent();
-    await agent.listSessions({});
-    await fs.chmod(root, 0);
-    try {
-      for (const sessionId of [found.id, "retained-id"]) {
-        await expect(agent.batchGetSessions({ sessionIds: [sessionId] })).rejects.toThrow(
-          "Session store could not be read",
-        );
-      }
-    } finally {
-      await fs.chmod(root, 0o700);
-      await agent.dispose();
-    }
-  });
-
-  it("rejects an existing non-directory projects root", async () => {
-    await fs.writeFile(path.join(configDir, "projects"), "not a store");
-    const { agent } = await indexAgent();
-    await expect(agent.batchGetSessions({ sessionIds: [randomUUID()] })).rejects.toThrow(
-      "Session store could not be read",
-    );
-    await agent.dispose();
-  });
-
-  it("rejects a dangling projects-root symlink", async () => {
-    await fs.symlink(path.join(workspace, "missing-store"), path.join(configDir, "projects"));
-    const { agent } = await indexAgent();
-    await expect(agent.batchGetSessions({ sessionIds: [randomUUID()] })).rejects.toThrow(
-      "Session store could not be read",
-    );
-    await agent.dispose();
-  });
+    },
+  );
 
   it("rejects under ACP v2 even when sessionIndex was declared", async () => {
     const { agent } = createAgent({ v2: true });

@@ -1488,18 +1488,25 @@ The example IDs are placeholders for stored Claude session UUIDs. `sessions`
 contains the same full rows as `session/list` without a project filter, including
 archived sessions and `_meta.jetbrains.air`. Copies use the same
 newest-readable-copy selection as the list. Returned sessions preserve their
-relative request order. Absent, unreadable or ambiguous IDs are omitted.
+relative request order. Non-UUID IDs and IDs without a listable transcript are
+omitted: absent, empty, unreadable or malformed transcripts, sidechains, sessions
+whose continuation has history, and transcripts whose cwd cannot be recovered.
+A sidecar alone does not supply a row.
 
 `{ "sessionIds": [] }` returns `{ "sessions": [] }` without reading the store.
 A store-wide failure, such as an unreadable projects root, rejects the request.
 Individual results reflect the store as each ID is read.
 
-Lookup addresses only the requested transcript filenames in each project
-and reads their metadata. Work depends on the requested IDs and project
-directories, rather than the total session history. The agent looks up 100 IDs
-at a time, so memory stays bounded for any request size. Merge returned rows with
-the recent page by `sessionId`. A batch read does not expand an existing list
-subscription's scope; refresh retained IDs outside that scope explicitly.
+Lookup normally addresses only the requested transcript filenames in each project
+and reads their metadata. A transcript without a cwd can use a sibling's cwd,
+as the list does. This fallback enumerates and stats sibling transcripts only
+in the directories of rows still missing a cwd, then reads at most 64 siblings
+per directory, newest mtime first. A failed recovery is cached for 60 seconds
+unless the directory mtime changes. Other project histories are not enumerated.
+The agent looks up 100 IDs at a time; the client may request any number of IDs.
+Merge returned rows with the recent page by `sessionId`. A batch read does not
+expand an existing list subscription's scope; refresh retained IDs outside that
+scope explicitly.
 
 ### List subscription
 
