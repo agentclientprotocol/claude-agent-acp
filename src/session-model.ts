@@ -606,3 +606,48 @@ export async function getAvailableModels(
     currentModelId: currentModel.value,
   };
 }
+
+/** The display name of the model id `model` in `modelInfos`, if it is there. */
+export function modelDisplayName(modelInfos: ModelInfo[], model: string): string | undefined {
+  return modelInfos.find((info) => info.value === model || info.resolvedModel === model)
+    ?.displayName;
+}
+
+/** The flat entries of a session's `model` select option. */
+function modelOptionEntries(option: SessionConfigOption): Array<{ value: string; name: string }> {
+  if (option.type !== "select") return [];
+  return option.options.flatMap((entry) =>
+    "value" in entry ? [{ value: entry.value, name: entry.name }] : entry.options,
+  );
+}
+
+/** The current entry of the `model` option among `configOptions`. */
+export function currentModelEntry(
+  configOptions: readonly SessionConfigOption[],
+): { value: string; name: string } | undefined {
+  const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
+  if (option?.type !== "select") return undefined;
+  const value = option.currentValue;
+  return (
+    modelOptionEntries(option).find((entry) => entry.value === value) ?? { value, name: value }
+  );
+}
+
+/**
+ * The entry of the `model` option among `configOptions` for `model`: an
+ * option value, or an alias or a model id that the model picker resolves to
+ * one (see {@link resolveModelPreference}). Undefined when no entry matches.
+ */
+export function modelEntryFor(
+  configOptions: readonly SessionConfigOption[],
+  modelInfos: ModelInfo[],
+  model: string,
+): { value: string; name: string } | undefined {
+  const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
+  if (!option) return undefined;
+  const entries = modelOptionEntries(option);
+  const direct = entries.find((entry) => entry.value === model);
+  if (direct) return direct;
+  const resolved = resolveModelPreference(modelInfos, model);
+  return resolved ? entries.find((entry) => entry.value === resolved.value) : undefined;
+}

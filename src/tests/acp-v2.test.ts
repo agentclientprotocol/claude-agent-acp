@@ -1137,7 +1137,16 @@ describe("ACP v2 prompts", () => {
     // The child's past `running` does not replay; its last state goes once,
     // after the replay. That state is history to the client, so the child's
     // current state follows the response: its process is gone, so it is idle.
+    // The child's model, from its transcript, goes right after its
+    // announcement, and again as current configuration after the response.
+    const model = expect.objectContaining({
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        expect.objectContaining({ configId: "model", currentValue: "claude-haiku-4-5" }),
+      ],
+    });
     expect(child).toEqual([
+      model,
       expect.objectContaining({ sessionUpdate: "session_message", content: text("Look around") }),
       // The client may still hold the child's message, so the replay clears it.
       { sessionUpdate: "agent_message", messageId: "msg_child", content: [] },
@@ -1149,6 +1158,7 @@ describe("ACP v2 prompts", () => {
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
       { sessionUpdate: "response" },
       { sessionUpdate: "state_update", state: "idle", stopReason: "end_turn" },
+      model,
     ]);
     // The current state on the parent grants nothing: the child cannot run again here.
     expect(
@@ -3885,6 +3895,8 @@ describe("ACP v2 requests that subagents make", () => {
       "root subagent_update agent-1 running ",
       "agent-1 state_update running ",
       "agent-1 session_message",
+      // The child inherits the parent's model.
+      "agent-1 config_option_update",
       "root subagent_update agent-1 idle error",
       "agent-1 state_update idle error",
     ]);

@@ -5,6 +5,7 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification, SubagentForm, SubagentState } from "./acp-subagents.js";
 import { AIR_SUBAGENT_KEY, airExtensionMeta } from "./air-extension.js";
+import { MODEL_CONFIG_ID } from "./session-model.js";
 import { isFinalToolCallStatus } from "./tool-calls/renderer.js";
 
 /** The work state of a child, as the RFD's `subagent_update.state` carries it. */
@@ -28,6 +29,8 @@ export type NativeSubagent = {
   title?: string;
   /** The RFD form: the child's role, its `subagent_type`, for the title. */
   role?: string;
+  /** The `model` input of the Agent/Task call that launched the child, if any. */
+  launchModel?: string;
   /** The RFD form: the child's purpose, `subagent_update.description`. */
   description?: string;
   /**
@@ -68,6 +71,29 @@ export type NativeSubagentSession = {
 type Publish = (notification: AcpSessionNotification) => Promise<void>;
 type Logger = { log(message: string): void };
 
+/** An entry of a session's `model` select option. */
+export type ModelEntry = { value: string; name: string };
+
+/**
+ * The models of the root session. A child's model is an entry of the root
+ * session's `model` option when one matches, so that a client can compare the
+ * two sessions' models.
+ */
+export type SubagentModels = {
+  /** The current entry of the root session's `model` option. */
+  sessionModel(): ModelEntry | undefined;
+  /**
+   * The entry of the root session's `model` option for `model`: an option
+   * value, an alias such as `sonnet`, or an exact model id. Undefined when no
+   * entry matches.
+   */
+  entry(model: string): ModelEntry | undefined;
+  /** The display name of the model id `model` in the session's model list, if the list has it. */
+  name(model: string): string | undefined;
+  /** The `model` of the agent definition named `agentType` (`AgentInfo.model`). */
+  agentModel(agentType: string): string | undefined;
+};
+
 type ChildConfiguration = {
   options: Map<string, SessionConfigOption>;
   published?: string;
@@ -100,6 +126,7 @@ type SubagentIdentity = {
   description?: string;
   prompt?: string;
   subagentType?: string;
+  model?: string;
 };
 
 /** An agent of the session's subagent history, as the runtime restores it. */
@@ -204,6 +231,8 @@ export class NativeSubagentRuntime {
    * `form` is undefined for a client without native subagent sessions. The RFD
    * form restores an agent from before a load or resume with `lineage`. The AIR
    * form does too, and `launchedAgent` finds the agent that a launch call made.
+   * `models` gives the model of a child before its first response (see
+   * {@link reportModel}).
    */
   constructor(
     form: SubagentForm | undefined,
@@ -213,6 +242,7 @@ export class NativeSubagentRuntime {
     private readonly logger: Logger,
     private readonly lineage?: SubagentLineage,
     private readonly launchedAgent?: LaunchedAgent,
+    private readonly models?: SubagentModels,
   ) {
     this.form = form;
     this.enabled = form !== undefined;
@@ -247,32 +277,35 @@ export class NativeSubagentRuntime {
     return child?.announced ? child.workState : undefined;
   }
 
-  /** Report the model of a child response, not the parent's model or a launch-time alias. */
+  /**
+   * Reports the model of a child response, an exact model id, as the entry of
+   * the root session's `model` option that matches it, else as the id. The
+   * client gets a new configuration only when it differs from the model that
+   * the child got at its announcement (see {@link assumeModel}).
+   */
   async reportModel(
     parentToolUseId: string | null,
     model: string | undefined,
     deliver: Publish,
   ): Promise<void> {
-    if (this.form !== "rfd" || !parentToolUseId || !model || model === "<synthetic>") {
+    if (!this.form || !parentToolUseId || !model || model === "<synthetic>") {
       return;
     }
     await deliver({
       sessionId: this.rootSessionId,
       update: {
         sessionUpdate: "config_option_update",
-        configOptions: [
-          {
-            id: "model",
-            name: "Model",
-            category: "model",
-            type: "select",
-            currentValue: model,
-            options: [{ value: model, name: model }],
-          },
-        ],
+        configOptions: [childModelOption(responseModelEntry(model, this.models)!)],
         _meta: { claudeCode: { parentToolUseId } },
       },
     });
+  }
+
+  /** The configuration that the client last got for the announced child `sessionId`, if any. */
+  configurationOf(sessionId: string): SessionConfigOption[] | undefined {
+    const published = this.configBySession.get(sessionId)?.published;
+    if (!this.childOfSession(sessionId)?.announced || !published) return undefined;
+    return JSON.parse(published) as SessionConfigOption[];
   }
 
   /** Hook observations can precede the task event that establishes a child's parent. */
@@ -281,13 +314,13 @@ export class NativeSubagentRuntime {
     options: SessionConfigOption[],
     meta?: SessionNotification["update"]["_meta"],
   ): Promise<void> {
-    if (this.form !== "rfd" || agentId === this.rootSessionId || options.length === 0) return;
+    if (!this.form || agentId === this.rootSessionId || options.length === 0) return;
     let config = this.configBySession.get(agentId);
     if (!config) {
       const pending = [...this.configBySession.keys()].filter(
-        (id) => !this.children.has(id),
+        (id) => !this.childOfSession(id),
       ).length;
-      if (!this.children.has(agentId) && pending >= MAX_PENDING_PARENTS) {
+      if (!this.childOfSession(agentId) && pending >= MAX_PENDING_PARENTS) {
         this.logger.log(
           `Session ${this.rootSessionId}: dropping configuration for unannounced subagent ${agentId}; pending buffer limit reached`,
         );
@@ -297,7 +330,8 @@ export class NativeSubagentRuntime {
       this.configBySession.set(agentId, config);
     }
     for (const option of options) config.options.set(option.id, option);
-    const child = this.children.get(agentId);
+    // In AIR's draft a later generation of an agent has its own session id.
+    const child = this.childOfSession(agentId);
     if (child?.announced) await this.publishConfiguration(child, meta);
   }
 
@@ -306,7 +340,8 @@ export class NativeSubagentRuntime {
     meta?: SessionNotification["update"]["_meta"],
   ): Promise<void> {
     const config = this.configBySession.get(child.sessionId);
-    if (!config) return;
+    // AIR's draft ends a child for good, so it gets no update after its end.
+    if (!config || (this.form === "air" && child.terminalState !== undefined)) return;
     // SDK hooks can run concurrently with streamed responses. Serialize snapshots
     // so a delayed publication cannot replace newer settings with older ones.
     const publishing = config.publishing.then(async () => {
@@ -435,15 +470,11 @@ export class NativeSubagentRuntime {
       (claudeMeta?.parentToolUseId
         ? this.childByParentToolUse.get(claudeMeta.parentToolUseId)
         : undefined);
+    if (announcedChild?.announced && update.sessionUpdate === "config_option_update") {
+      await this.reportConfiguration(announcedChild.sessionId, update.configOptions, update._meta);
+      return null;
+    }
     if (this.form === "rfd" && announcedChild?.announced) {
-      if (update.sessionUpdate === "config_option_update") {
-        await this.reportConfiguration(
-          announcedChild.sessionId,
-          update.configOptions,
-          update._meta,
-        );
-        return null;
-      }
       const handback = await this.routeRfdHandback(notification, announcedChild);
       if (handback !== undefined) return handback;
     }
@@ -539,6 +570,7 @@ export class NativeSubagentRuntime {
           identity?.description ?? task.description,
         ),
         ...promptField(promptText(task.prompt) ?? identity?.prompt),
+        ...(identity?.model ? { launchModel: identity.model } : {}),
         ...rfdLabels(
           identity?.name,
           identity?.subagentType ?? task.subagentType,
@@ -1062,10 +1094,47 @@ export class NativeSubagentRuntime {
     await this.reportState(child, rfdEndState("failed", { error }));
   }
 
-  /** Announces `child` in the client's form. A runtime without one never does. */
+  /**
+   * Announces `child` in the client's form, then its configuration. A runtime
+   * without a form never does.
+   */
   private async announce(child: NativeSubagent): Promise<void> {
-    if (this.form) await announceNativeSubagent(child, this.publish, this.form);
+    if (!this.form) return;
+    await announceNativeSubagent(child, this.publish, this.form);
+    this.assumeModel(child);
     await this.publishConfiguration(child);
+  }
+
+  /**
+   * Gives `child` a model before its first response reports the exact one
+   * (see {@link reportModel}). See {@link launchModelEntry} for the order. A
+   * child that already has a model keeps it.
+   */
+  private assumeModel(child: NativeSubagent): void {
+    const config = this.configBySession.get(child.sessionId);
+    if (config?.options.has(MODEL_CONFIG_ID)) return;
+    const entry = launchModelEntry(
+      child.launchModel,
+      child.role,
+      this.models,
+      this.modelOfSession(child.parentSessionId),
+    );
+    if (!entry) return;
+    const assumed = config ?? { options: new Map(), publishing: Promise.resolve() };
+    assumed.options.set(MODEL_CONFIG_ID, childModelOption(entry));
+    this.configBySession.set(child.sessionId, assumed);
+  }
+
+  /** The model entry of the session `sessionId`: a child's model, else the root's. */
+  private modelOfSession(sessionId: string): ModelEntry | undefined {
+    if (sessionId === this.rootSessionId) return this.models?.sessionModel();
+    const option = this.configBySession.get(sessionId)?.options.get(MODEL_CONFIG_ID);
+    if (option?.type === "select" && typeof option.currentValue === "string") {
+      const value = option.currentValue;
+      const name = option.options.find((entry) => "value" in entry && entry.value === value)?.name;
+      return { value, name: name ?? value };
+    }
+    return this.models?.sessionModel();
   }
 
   /** The RFD form: publishes the work state of `child` on its parent. */
@@ -1416,6 +1485,7 @@ export class NativeSubagentRuntime {
       | "title"
       | "role"
       | "description"
+      | "launchModel"
     >,
     announce: boolean,
     deliver: Publish,
@@ -1473,6 +1543,68 @@ export class NativeSubagentRuntime {
     this.generationByTaskId.set(taskId, generation);
     return `${taskId}:generation:${generation}`;
   }
+}
+
+/**
+ * The `model` option of a child session. The client cannot change a child's
+ * configuration, so the select offers only the current model.
+ */
+export function childModelOption(entry: ModelEntry): SessionConfigOption {
+  return {
+    id: MODEL_CONFIG_ID,
+    name: "Model",
+    category: "model",
+    type: "select",
+    currentValue: entry.value,
+    options: [{ value: entry.value, name: entry.name }],
+  };
+}
+
+/**
+ * The model entry for `model`, the model id of a child's response: the entry
+ * of the root session's `model` option that matches it, else the id, with its
+ * display name when the session's model list has one. Undefined for no model,
+ * and for `<synthetic>`, which marks a message that no model wrote.
+ */
+export function responseModelEntry(
+  model: unknown,
+  models: SubagentModels | undefined,
+): ModelEntry | undefined {
+  if (typeof model !== "string" || !model || model === "<synthetic>") return undefined;
+  return models?.entry(model) ?? { value: model, name: models?.name(model) ?? model };
+}
+
+/**
+ * The model that the launch input `inputModel` names, for a child from the
+ * history: the transcript has no other model for a child without responses.
+ * A fork ignores the input. `inherit` names no model.
+ */
+export function requestedModel(inputModel: unknown, agentType: unknown): string | undefined {
+  const model = nonBlankString(inputModel);
+  return agentType === "fork" || model === "inherit" ? undefined : model;
+}
+
+/**
+ * The model entry of a child before its first response, best first: the
+ * `model` input of the call that launched it, the `model` of its agent
+ * definition `agentType`, and `parentModel`. `inherit` means the parent's
+ * model, and a fork always runs on it. A model that matches no entry of the
+ * root session's `model` option gives undefined: an alias such as `sonnet` is
+ * no model id, so the child's first response reports the exact one.
+ */
+export function launchModelEntry(
+  inputModel: unknown,
+  agentType: unknown,
+  models: SubagentModels | undefined,
+  parentModel: ModelEntry | undefined,
+): ModelEntry | undefined {
+  if (agentType === "fork") return parentModel;
+  const definitionModel = typeof agentType === "string" ? models?.agentModel(agentType) : undefined;
+  const requested = [nonBlankString(inputModel), nonBlankString(definitionModel)].find(
+    (model) => model !== undefined && model !== "inherit",
+  );
+  if (!requested) return parentModel;
+  return models?.entry(requested);
 }
 
 /**
@@ -1990,6 +2122,7 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
     description: nonBlankString(value.description),
     prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
+    model: nonBlankString(value.model),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
 }
@@ -2003,6 +2136,7 @@ function mergeSubagentIdentity(
     description: next.description ?? previous?.description,
     prompt: next.prompt ?? previous?.prompt,
     subagentType: next.subagentType ?? previous?.subagentType,
+    model: next.model ?? previous?.model,
   };
 }
 
@@ -2023,6 +2157,7 @@ function applySubagentIdentity(
     child.task = subagentDescription(identity.prompt, identity.description);
   }
   child.prompt ??= identity.prompt;
+  child.launchModel ??= identity.model;
   const labels = rfdLabels(
     identity.name,
     identity.subagentType ?? child.role,

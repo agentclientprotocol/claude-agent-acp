@@ -16,6 +16,7 @@ import {
   RequestError,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionNotification,
   WriteTextFileRequest,
   WriteTextFileResponse,
@@ -67,6 +68,7 @@ import {
   type HookCallback,
   importSessionToStore,
   listSessions,
+  type ModelInfo,
   PermissionUpdate,
   query,
   SDKAssistantMessage,
@@ -3739,9 +3741,12 @@ describe("subagent transcript replay", () => {
       ).toEqual([
         [sessionId, "user_message_chunk", "Explore it"],
         [sessionId, "subagent_spawned", child1],
+        // Right after its announcement, the child gets the model of its first response.
+        [child1, "config_option_update", undefined],
         [child1, "user_message_chunk", "Look around"],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
+        // Nothing names its model, so it gets none.
         [sessionId, "subagent_spawned", child2],
         [sessionId, "agent_message_chunk", "Done."],
         [sessionId, "subagent_state_update", child2],
@@ -3808,7 +3813,12 @@ describe("subagent transcript replay", () => {
       root: object[],
       children: Record<string, { meta: object; records: object[] }>,
       capabilities: ClientCapabilities = { subagents: {}, session: { notices: {} } },
-      afterResponse?: { live: (childSessionId: string) => string | undefined },
+      afterResponse?: {
+        live: (childSessionId: string) => string | undefined;
+        /** The session's config options and model list, known after the response. */
+        models?: { configOptions: SessionConfigOption[]; modelInfos: ModelInfo[] };
+      },
+      { traceModels = false }: { traceModels?: boolean } = {},
     ): Promise<string[]> {
       const configDir = await mkdtemp(path.join(os.tmpdir(), "claude-acp-rfd-replay-"));
       const originalConfigDir = process.env.CLAUDE_CONFIG_DIR;
@@ -3854,6 +3864,8 @@ describe("subagent transcript replay", () => {
           // Stands in for the live session's runtime, which knows its running children.
           (agent.sessions as Record<string, unknown>)[sessionId] = {
             nativeSubagentRuntime: { liveWorkState: afterResponse.live },
+            configOptions: afterResponse.models?.configOptions ?? [],
+            modelInfos: afterResponse.models?.modelInfos ?? [],
           };
           await agent.publishCurrentSubagentStates(sessionId);
         }
@@ -3883,6 +3895,13 @@ describe("subagent transcript replay", () => {
             }
             case "tool_call":
               return [`${on} tool_call ${u.toolCallId}`];
+            case "config_option_update":
+              return traceModels
+                ? u.configOptions.map(
+                    (option: any) =>
+                      `${on} model ${option.currentValue} ${JSON.stringify(option.options)}`,
+                  )
+                : [];
             case "notice":
               return [`${on} notice ${u.title}: ${u.description}`];
             case "user_message_chunk":
@@ -4102,6 +4121,121 @@ describe("subagent transcript replay", () => {
       ]);
     });
 
+    it("sends the model that the transcript names for each child, and again after the load response", async () => {
+      const launch = (id: string, name: string, input: object = {}) =>
+        toolUse(id, "Agent", {
+          name,
+          subagent_type: "general-purpose",
+          prompt: `Run ${name}`,
+          ...input,
+        });
+      const answer = (uuid: string, model: string, text: string) => ({
+        ...assistant(uuid, []),
+        message: {
+          id: `m-${uuid}`,
+          role: "assistant",
+          model,
+          content: [{ type: "text", text }],
+        },
+      });
+      const meta = (name: string, launchId: string) => ({
+        agentType: "general-purpose",
+        name,
+        toolUseId: launchId,
+        requestShape: "foreground",
+      });
+      const trace = await replayRfd(
+        [
+          user("u1", "Go"),
+          assistant("a1", [
+            launch("toolu_answered", "answered"),
+            launch("toolu_requested", "requested", { model: "haiku" }),
+            launch("toolu_silent", "silent"),
+          ]),
+          user("u2", [
+            toolResult("toolu_answered", "Done."),
+            toolResult("toolu_requested", "Done."),
+            toolResult("toolu_silent", "Done."),
+          ]),
+        ],
+        {
+          aaa111: {
+            meta: meta("answered", "toolu_answered"),
+            records: [
+              user("x1", "Run answered"),
+              answer("x2", "claude-haiku-4-5", "First."),
+              answer("x3", "claude-haiku-4-5", "Same model."),
+              answer("x4", "claude-opus-5", "Fallback."),
+            ],
+          },
+          // No response, but the launch input names a model.
+          bbb222: {
+            meta: meta("requested", "toolu_requested"),
+            records: [user("y1", "Run requested")],
+          },
+          // The transcript names no model: the replay does not guess the parent's.
+          ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
+        },
+        undefined,
+        {
+          live: () => undefined,
+          models: {
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "opus",
+                options: [
+                  { value: "opus", name: "Opus 5" },
+                  { value: "haiku", name: "Haiku 4.5" },
+                ],
+              },
+            ],
+            modelInfos: [
+              {
+                value: "opus",
+                displayName: "Opus 5",
+                description: "",
+                resolvedModel: "claude-opus-5",
+              },
+              {
+                value: "haiku",
+                displayName: "Haiku 4.5",
+                description: "",
+                resolvedModel: "claude-haiku-4-5",
+              },
+            ],
+          },
+        },
+        { traceModels: true },
+      );
+
+      const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
+      const haiku = JSON.stringify([{ value: "haiku", name: "Haiku 4.5" }]);
+      const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
+      expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
+        // During the replay the session has no model list yet, so the model is the id.
+        'root subagent_update aaa111 {"state":"running"}',
+        `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
+        // A response on another model sends the model again; the same model does not.
+        `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
+        // An alias goes only as an entry of the session's model list.
+        'root subagent_update bbb222 {"state":"running"}',
+        'root subagent_update ccc333 {"state":"running"}',
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        // After the response, each model is the entry of the root session's `model` option.
+        'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
+        `aaa111 model opus ${opus}`,
+        'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
+        `bbb222 model haiku ${haiku}`,
+        'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
+      ]);
+    });
+
     it("keeps a SendMessage call that the replay reaches before its delivery as a tool call", async () => {
       const launch = (id: string, name: string) =>
         toolUse(id, "Agent", { name, subagent_type: "Explore", prompt: `Run ${name}` });
@@ -4247,6 +4381,8 @@ describe("subagent transcript replay", () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["s1", "subagent_spawned"],
+      // The model of its response: a child without launch metadata has no other.
+      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
       ["s1", "subagent_state_update"],
@@ -8667,6 +8803,8 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["test-session", "subagent_spawned"],
       ["agent-42", "agent_message_chunk"],
+      // The model of the child's response.
+      ["agent-42", "config_option_update"],
       ["agent-42", "tool_call"],
       ["agent-42", "agent_message_chunk"],
       ["test-session", "subagent_state_update"],

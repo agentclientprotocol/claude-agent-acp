@@ -22,21 +22,35 @@
  * history follows its launch, so a call to a child from its parent is always
  * delivered first. Any other SendMessage call stays a tool call.
  *
+ * Right after its announcement, each child gets its `model` option, when the
+ * transcript names the model: the model of its first response, else the
+ * `model` input of its launch. A later response with another model sends it
+ * again. The replay does not guess a model from the parent or from the agent
+ * definition. After the load response, the current configuration goes out
+ * again, with the entries of the session's model list, which the replay can
+ * lack.
+ *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
  * parent, and a notice says that subagent history is missing.
  */
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { AcpSessionNotification, SubagentState } from "./acp-subagents.js";
 import {
+  childModelOption,
   HANDBACK_TOOL,
   handbackMessage,
   isNativeSubagentControlTool,
   launchReply,
   linkedSessionMessages,
+  type ModelEntry,
   nativeSubagentState,
+  requestedModel,
+  responseModelEntry,
   rfdEndState,
   rfdLabels,
+  type SubagentModels,
   type WorkState,
 } from "./native-subagents.js";
 import { noticeUpdate } from "./session-notices.js";
@@ -63,6 +77,10 @@ export type ReplayChild = {
   promptSent: boolean;
   /** Whether it handed a report to its parent with a SubagentHandback call. */
   handedBack?: boolean;
+  /** The `model` option entry that the replay sent. */
+  model?: ModelEntry;
+  /** The model that the transcript names for it: of a response, or of the launch input. */
+  modelSource?: { model: string; response: boolean };
 };
 
 type SendMessageCall = {
@@ -96,6 +114,7 @@ export class RfdSubagentReplay {
   constructor(
     private readonly history: SubagentHistory,
     private readonly publish: Publish,
+    private readonly models?: SubagentModels,
   ) {}
 
   /**
@@ -142,8 +161,12 @@ export class RfdSubagentReplay {
     return this.children.get(toolUseId);
   }
 
-  /** Announces `child` on its parent, as live: running, with the parent's labels. */
-  async announce(child: ReplayChild): Promise<void> {
+  /**
+   * Announces `child` on its parent, as live: running, with the parent's
+   * labels. Then it sends the child's model: `firstModel`, the model of the
+   * child's first response, else the model its launch asked for.
+   */
+  async announce(child: ReplayChild, firstModel?: string): Promise<void> {
     if (child.announced) return;
     const labels = rfdLabels(
       child.record.name ?? child.input.name,
@@ -161,6 +184,42 @@ export class RfdSubagentReplay {
       },
     });
     child.announced = true;
+    if (firstModel) {
+      await this.responseModel(child, firstModel);
+      return;
+    }
+    const model = requestedModel(
+      child.input.model,
+      child.record.agentType ?? child.input.subagent_type,
+    );
+    if (!model) return;
+    child.modelSource = { model, response: false };
+    // An alias such as `sonnet` is no model id: it goes only as an entry.
+    const entry = this.models?.entry(model);
+    if (entry) await this.sendModel(child, entry);
+  }
+
+  /**
+   * Takes the model of a replayed response of the child `owner`. A child
+   * whose model changes gets its `model` option again.
+   */
+  async responseModel(owner: ReplayChild, model: unknown): Promise<void> {
+    const entry = responseModelEntry(model, this.models);
+    if (!entry || !owner.announced || typeof model !== "string") return;
+    owner.modelSource = { model, response: true };
+    await this.sendModel(owner, entry);
+  }
+
+  private async sendModel(child: ReplayChild, model: ModelEntry): Promise<void> {
+    if (child.model?.value === model.value && child.model.name === model.name) return;
+    child.model = model;
+    await this.publish({
+      sessionId: child.sessionId,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: [childModelOption(model)],
+      },
+    });
   }
 
   /**
@@ -323,22 +382,40 @@ export class RfdSubagentReplay {
    */
   currentStates(
     live: (sessionId: string) => WorkState["state"] | undefined,
+    liveConfiguration?: (sessionId: string) => SessionConfigOption[] | undefined,
   ): AcpSessionNotification[] {
     return [...this.children.values()]
       .filter((child) => child.announced)
-      .map((child) => {
+      .flatMap((child): AcpSessionNotification[] => {
         const liveState = live(child.sessionId);
         const state: WorkState =
           liveState === undefined || liveState === "idle" ? endState(child) : { state: liveState };
-        return {
-          sessionId: child.parentSessionId,
-          update: {
-            sessionUpdate: "subagent_update",
-            sessionId: child.sessionId,
-            ...(liveState !== undefined ? { capabilities: { cancel: {} } } : {}),
-            state,
+        // The session's model list may be known only now, after the load response.
+        const source = child.modelSource;
+        const entry = source?.response
+          ? responseModelEntry(source.model, this.models)
+          : source && this.models?.entry(source.model);
+        const configOptions =
+          liveConfiguration?.(child.sessionId) ?? (entry ? [childModelOption(entry)] : undefined);
+        return [
+          {
+            sessionId: child.parentSessionId,
+            update: {
+              sessionUpdate: "subagent_update",
+              sessionId: child.sessionId,
+              ...(liveState !== undefined ? { capabilities: { cancel: {} } } : {}),
+              state,
+            },
           },
-        };
+          ...(configOptions
+            ? [
+                {
+                  sessionId: child.sessionId,
+                  update: { sessionUpdate: "config_option_update" as const, configOptions },
+                },
+              ]
+            : []),
+        ];
       });
   }
 
@@ -431,6 +508,16 @@ export class RfdSubagentReplay {
       },
     });
   }
+}
+
+/** The model of the first response in `messages`, a subagent's transcript. */
+export function firstResponseModel(messages: readonly SessionMessage[]): string | undefined {
+  for (const message of messages) {
+    if (message.type !== "assistant") continue;
+    const model = (message.message as { model?: unknown } | undefined)?.model;
+    if (typeof model === "string" && model && model !== "<synthetic>") return model;
+  }
+  return undefined;
 }
 
 /**
