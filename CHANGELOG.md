@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.97.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.96.0...v0.97.0) (2026-10-26)
+
+
+### Features
+
+* add ultracode session config option ([#1438](https://github.com/agentclientprotocol/claude-agent-acp/issues/1438)) ([de96cef](https://github.com/agentclientprotocol/claude-agent-acp/commit/de96cef382d8daf27301f1f90ae4b5e7f665f73a))
+
+
+### Bug Fixes
+
+* bump body-parser from 2.3.0 to 2.4.0 ([#1436](https://github.com/agentclientprotocol/claude-agent-acp/issues/1436)) ([c26e640](https://github.com/agentclientprotocol/claude-agent-acp/commit/c26e640915739dc7a3cd0664f8f5879098e0fd83))
+* distinguish model options with duplicate labels ([#1286](https://github.com/agentclientprotocol/claude-agent-acp/issues/1286)) ([434be13](https://github.com/agentclientprotocol/claude-agent-acp/commit/434be13a33141af8655c6f7c30f574841bf2279c))
+* keep the usage-limit error when it arrives after compaction ([#1377](https://github.com/agentclientprotocol/claude-agent-acp/issues/1377)) ([2a1525e](https://github.com/agentclientprotocol/claude-agent-acp/commit/2a1525e57cd89246d1a50993fd6ba335c4e634ca))
+* pass --settings before the auth status subcommand ([#1392](https://github.com/agentclientprotocol/claude-agent-acp/issues/1392)) ([6a33ded](https://github.com/agentclientprotocol/claude-agent-acp/commit/6a33dedcbb90e7bf9db91207f0edbf19ca6d705e))
+* preserve foreground fork reports until launch completes ([#1431](https://github.com/agentclientprotocol/claude-agent-acp/issues/1431)) ([e369479](https://github.com/agentclientprotocol/claude-agent-acp/commit/e369479f93b34f84a11103323d097c44df42e02e))
+* settle advisor tool results before completing turns ([#1247](https://github.com/agentclientprotocol/claude-agent-acp/issues/1247)) ([bed795d](https://github.com/agentclientprotocol/claude-agent-acp/commit/bed795d261620e6d5113e427a7196d94e66e7034))
+* settle live steers folded into autonomous cycles ([#1185](https://github.com/agentclientprotocol/claude-agent-acp/issues/1185)) ([a4957d1](https://github.com/agentclientprotocol/claude-agent-acp/commit/a4957d17c1e1a925ba3b72b29c5dcde4faabbe17))
+
 ## [0.96.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.95.0...v0.96.0) (2026-10-26)
 
 
