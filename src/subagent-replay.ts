@@ -22,13 +22,11 @@
  * history follows its launch, so a call to a child from its parent is always
  * delivered first. Any other SendMessage call stays a tool call.
  *
- * Right after its announcement, each child gets its `model` option, when the
- * transcript names the model: the model of its first response, else the
- * `model` input of its launch. A later response with another model sends it
- * again. The replay does not guess a model from the parent or from the agent
- * definition. After the load response, the current configuration goes out
- * again, with the entries of the session's model list, which the replay can
- * lack.
+ * Right after its announcement, each child gets its `model` option: the model
+ * of its first response, in its transcript. A later response with another
+ * model sends it again. A child without responses gets none. After the load
+ * response, a model goes again only when the session's model list, which the
+ * replay can lack, maps it to another entry.
  *
  * A launch without metadata has no known id, so it is not announced: the RFD
  * forbids inventing one. Its Agent call stays an ordinary tool call of the
@@ -46,7 +44,6 @@ import {
   linkedSessionMessages,
   type ModelEntry,
   nativeSubagentState,
-  requestedModel,
   responseModelEntry,
   rfdEndState,
   rfdLabels,
@@ -79,8 +76,8 @@ export type ReplayChild = {
   handedBack?: boolean;
   /** The `model` option entry that the replay sent. */
   model?: ModelEntry;
-  /** The model that the transcript names for it: of a response, or of the launch input. */
-  modelSource?: { model: string; response: boolean };
+  /** The model id of the latest response in its transcript. */
+  responseModel?: string;
 };
 
 type SendMessageCall = {
@@ -163,8 +160,8 @@ export class RfdSubagentReplay {
 
   /**
    * Announces `child` on its parent, as live: running, with the parent's
-   * labels. Then it sends the child's model: `firstModel`, the model of the
-   * child's first response, else the model its launch asked for.
+   * labels. Then it sends `firstModel`, the model of the child's first
+   * response, when the transcript has one.
    */
   async announce(child: ReplayChild, firstModel?: string): Promise<void> {
     if (child.announced) return;
@@ -184,19 +181,7 @@ export class RfdSubagentReplay {
       },
     });
     child.announced = true;
-    if (firstModel) {
-      await this.responseModel(child, firstModel);
-      return;
-    }
-    const model = requestedModel(
-      child.input.model,
-      child.record.agentType ?? child.input.subagent_type,
-    );
-    if (!model) return;
-    child.modelSource = { model, response: false };
-    // An alias such as `sonnet` is no model id: it goes only as an entry.
-    const entry = this.models?.entry(model);
-    if (entry) await this.sendModel(child, entry);
+    await this.responseModel(child, firstModel);
   }
 
   /**
@@ -206,7 +191,7 @@ export class RfdSubagentReplay {
   async responseModel(owner: ReplayChild, model: unknown): Promise<void> {
     const entry = responseModelEntry(model, this.models);
     if (!entry || !owner.announced || typeof model !== "string") return;
-    owner.modelSource = { model, response: true };
+    owner.responseModel = model;
     await this.sendModel(owner, entry);
   }
 
@@ -391,12 +376,12 @@ export class RfdSubagentReplay {
         const state: WorkState =
           liveState === undefined || liveState === "idle" ? endState(child) : { state: liveState };
         // The session's model list may be known only now, after the load response.
-        const source = child.modelSource;
-        const entry = source?.response
-          ? responseModelEntry(source.model, this.models)
-          : source && this.models?.entry(source.model);
-        const configOptions =
+        const entry = responseModelEntry(child.responseModel, this.models);
+        const replayed = child.model ? JSON.stringify([childModelOption(child.model)]) : undefined;
+        const current =
           liveConfiguration?.(child.sessionId) ?? (entry ? [childModelOption(entry)] : undefined);
+        // A configuration that the replay already sent does not go again.
+        const configOptions = current && JSON.stringify(current) !== replayed ? current : undefined;
         return [
           {
             sessionId: child.parentSessionId,

@@ -29,8 +29,6 @@ export type NativeSubagent = {
   title?: string;
   /** The RFD form: the child's role, its `subagent_type`, for the title. */
   role?: string;
-  /** The `model` input of the Agent/Task call that launched the child, if any. */
-  launchModel?: string;
   /** The RFD form: the child's purpose, `subagent_update.description`. */
   description?: string;
   /**
@@ -80,23 +78,13 @@ export type ModelEntry = { value: string; name: string };
  * two sessions' models.
  */
 export type SubagentModels = {
-  /** The current entry of the root session's `model` option. */
-  sessionModel(): ModelEntry | undefined;
   /**
-   * The entry of the root session's `model` option for `model`: an option
-   * value, an alias such as `sonnet`, or an exact model id. Undefined when no
-   * entry matches.
+   * The entry of the root session's `model` option for `model`, a model id
+   * that a response reported. Undefined when no entry matches.
    */
   entry(model: string): ModelEntry | undefined;
   /** The display name of the model id `model` in the session's model list, if the list has it. */
   name(model: string): string | undefined;
-  /** The `model` of the agent definition named `agentType` (`AgentInfo.model`). */
-  agentModel(agentType: string): string | undefined;
-  /**
-   * The default subagent model, `CLAUDE_CODE_SUBAGENT_MODEL`. Claude Code runs
-   * an agent without a model on it, when it is set, instead of on the parent's.
-   */
-  defaultModel(): string | undefined;
 };
 
 type ChildConfiguration = {
@@ -131,7 +119,6 @@ type SubagentIdentity = {
   description?: string;
   prompt?: string;
   subagentType?: string;
-  model?: string;
 };
 
 /** An agent of the session's subagent history, as the runtime restores it. */
@@ -236,8 +223,8 @@ export class NativeSubagentRuntime {
    * `form` is undefined for a client without native subagent sessions. The RFD
    * form restores an agent from before a load or resume with `lineage`. The AIR
    * form does too, and `launchedAgent` finds the agent that a launch call made.
-   * `models` gives the model of a child before its first response (see
-   * {@link reportModel}).
+   * `models` maps the model of a child response to the root session's entry
+   * (see {@link reportModel}).
    */
   constructor(
     form: SubagentForm | undefined,
@@ -284,9 +271,10 @@ export class NativeSubagentRuntime {
 
   /**
    * Reports the model of a child response, an exact model id, as the entry of
-   * the root session's `model` option that matches it, else as the id. The
-   * client gets a new configuration only when it differs from the model that
-   * the child got at its announcement (see {@link assumeModel}).
+   * the root session's `model` option that matches it, else as the id (see
+   * {@link responseModelEntry}). The child gets no model before its first
+   * response: the adapter cannot tell the model that Claude Code picks for it.
+   * The client gets a new configuration only when the entry changes.
    */
   async reportModel(
     parentToolUseId: string | null,
@@ -575,7 +563,6 @@ export class NativeSubagentRuntime {
           identity?.description ?? task.description,
         ),
         ...promptField(promptText(task.prompt) ?? identity?.prompt),
-        ...(identity?.model ? { launchModel: identity.model } : {}),
         ...rfdLabels(
           identity?.name,
           identity?.subagentType ?? task.subagentType,
@@ -1106,40 +1093,7 @@ export class NativeSubagentRuntime {
   private async announce(child: NativeSubagent): Promise<void> {
     if (!this.form) return;
     await announceNativeSubagent(child, this.publish, this.form);
-    this.assumeModel(child);
     await this.publishConfiguration(child);
-  }
-
-  /**
-   * Gives `child` a model before its first response reports the exact one
-   * (see {@link reportModel}). See {@link launchModelEntry} for the order. A
-   * child that already has a model keeps it.
-   */
-  private assumeModel(child: NativeSubagent): void {
-    const config = this.configBySession.get(child.sessionId);
-    if (config?.options.has(MODEL_CONFIG_ID)) return;
-    const entry = launchModelEntry(
-      child.launchModel,
-      child.role,
-      this.models,
-      this.modelOfSession(child.parentSessionId),
-    );
-    if (!entry) return;
-    const assumed = config ?? { options: new Map(), publishing: Promise.resolve() };
-    assumed.options.set(MODEL_CONFIG_ID, childModelOption(entry));
-    this.configBySession.set(child.sessionId, assumed);
-  }
-
-  /** The model entry of the session `sessionId`: a child's model, else the root's. */
-  private modelOfSession(sessionId: string): ModelEntry | undefined {
-    if (sessionId === this.rootSessionId) return this.models?.sessionModel();
-    const option = this.configBySession.get(sessionId)?.options.get(MODEL_CONFIG_ID);
-    if (option?.type === "select" && typeof option.currentValue === "string") {
-      const value = option.currentValue;
-      const name = option.options.find((entry) => "value" in entry && entry.value === value)?.name;
-      return { value, name: name ?? value };
-    }
-    return this.models?.sessionModel();
   }
 
   /** The RFD form: publishes the work state of `child` on its parent. */
@@ -1490,7 +1444,6 @@ export class NativeSubagentRuntime {
       | "title"
       | "role"
       | "description"
-      | "launchModel"
     >,
     announce: boolean,
     deliver: Publish,
@@ -1578,49 +1531,6 @@ export function responseModelEntry(
   if (typeof model !== "string" || !model || model === "<synthetic>") return undefined;
   return models?.entry(model) ?? { value: model, name: models?.name(model) ?? model };
 }
-
-/**
- * The model that the launch input `inputModel` names, for a child from the
- * history: the transcript has no other model for a child without responses.
- * A fork ignores the input. `inherit` names no model.
- */
-export function requestedModel(inputModel: unknown, agentType: unknown): string | undefined {
-  const model = nonBlankString(inputModel);
-  return agentType === "fork" || model === "inherit" ? undefined : model;
-}
-
-/**
- * The model entry of a child before its first response, as Claude Code picks
- * the model, best first: the `model` input of the call that launched it, the
- * `model` of its agent definition `agentType`, the default subagent model,
- * and `parentModel`. `inherit` in the definition means the parent's model,
- * and a fork always runs on it. A model id that matches no entry of the root
- * session's `model` option goes as the id. An alias such as `sonnet` that
- * matches no entry gives undefined: it is no model id, so the child's first
- * response reports the exact one.
- */
-export function launchModelEntry(
-  inputModel: unknown,
-  agentType: unknown,
-  models: SubagentModels | undefined,
-  parentModel: ModelEntry | undefined,
-): ModelEntry | undefined {
-  if (agentType === "fork") return parentModel;
-  const definitionModel = nonBlankString(
-    typeof agentType === "string" ? models?.agentModel(agentType) : undefined,
-  );
-  const input = nonBlankString(inputModel);
-  const requested =
-    (input !== "inherit" ? input : undefined) ??
-    (definitionModel === "inherit" ? undefined : definitionModel) ??
-    (definitionModel === undefined ? nonBlankString(models?.defaultModel()) : undefined);
-  if (!requested) return parentModel;
-  if (MODEL_ALIAS.test(requested)) return models?.entry(requested);
-  return responseModelEntry(requested, models);
-}
-
-/** A model alias of Claude Code, such as `sonnet` or `opus[1m]`, not a model id. */
-const MODEL_ALIAS = /^[a-z]+(\[\d+[mk]\])?$/i;
 
 /**
  * Announces the child on its parent, once, before any update of the child.
@@ -2137,7 +2047,6 @@ function subagentIdentity(input: unknown): SubagentIdentity | undefined {
     description: nonBlankString(value.description),
     prompt: promptText(value.prompt),
     subagentType: nonBlankString(value.subagent_type),
-    model: nonBlankString(value.model),
   };
   return Object.values(identity).some(Boolean) ? identity : undefined;
 }
@@ -2151,7 +2060,6 @@ function mergeSubagentIdentity(
     description: next.description ?? previous?.description,
     prompt: next.prompt ?? previous?.prompt,
     subagentType: next.subagentType ?? previous?.subagentType,
-    model: next.model ?? previous?.model,
   };
 }
 
@@ -2172,7 +2080,6 @@ function applySubagentIdentity(
     child.task = subagentDescription(identity.prompt, identity.description);
   }
   child.prompt ??= identity.prompt;
-  child.launchModel ??= identity.model;
   const labels = rfdLabels(
     identity.name,
     identity.subagentType ?? child.role,

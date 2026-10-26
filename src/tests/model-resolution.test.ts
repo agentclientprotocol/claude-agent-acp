@@ -2,11 +2,13 @@ import { describe, it, expect } from "vitest";
 import { randomUUID } from "crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelInfo } from "@anthropic-ai/claude-agent-sdk";
+import type { SessionConfigOption } from "@agentclientprotocol/sdk/unstable";
 import {
   resolveModelPreference,
   applyAvailableModelsAllowlist,
   isDeniedModel,
   matchResumedModel,
+  modelEntryFor,
 } from "../session-model.js";
 import { effortFlagSettings, settingsEffortForModel } from "../session-effort.js";
 
@@ -390,5 +392,67 @@ describe("effortFlagSettings", () => {
     });
     expect(effortFlagSettings("high", { ultracode: false })).toEqual({ effortLevel: "high" });
     expect(effortFlagSettings(undefined, {})).toEqual({ effortLevel: null });
+  });
+});
+
+describe("modelEntryFor", () => {
+  const infos: ModelInfo[] = [
+    {
+      value: "default",
+      resolvedModel: "claude-opus-4-6[1m]",
+      displayName: "Default (recommended)",
+      description: "",
+    },
+    { value: "opus", resolvedModel: "claude-opus-4-6", displayName: "Opus 4.6", description: "" },
+    {
+      value: "opus[1m]",
+      resolvedModel: "claude-opus-4-6[1m]",
+      displayName: "Opus 4.6 (1M context)",
+      description: "",
+    },
+    {
+      value: "haiku",
+      resolvedModel: "claude-haiku-4-5",
+      displayName: "Haiku 4.5",
+      description: "",
+    },
+  ];
+  /** The session's `model` option with `current` selected. */
+  const options = (current: string): SessionConfigOption[] => [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: current,
+      options: infos.map((info) => ({ value: info.value, name: info.displayName })),
+    },
+  ];
+  const entryOf = (current: string, model: string) => modelEntryFor(options(current), infos, model);
+
+  it("prefers the entry that the user picked when it runs the model up to a context hint", () => {
+    // A response reports the model id without the context hint.
+    expect(entryOf("opus[1m]", "claude-opus-4-6")).toEqual({
+      value: "opus[1m]",
+      name: "Opus 4.6 (1M context)",
+    });
+    expect(entryOf("default", "claude-opus-4-6")).toEqual({
+      value: "default",
+      name: "Default (recommended)",
+    });
+  });
+
+  it("takes the listed entry of another model", () => {
+    expect(entryOf("opus[1m]", "claude-haiku-4-5")).toEqual({ value: "haiku", name: "Haiku 4.5" });
+    expect(entryOf("haiku", "claude-opus-4-6")).toEqual({ value: "opus", name: "Opus 4.6" });
+    expect(entryOf("haiku", "claude-opus-4-6[1m]")).toEqual({
+      value: "default",
+      name: "Default (recommended)",
+    });
+  });
+
+  it("matches no entry for a model that the list does not have", () => {
+    expect(entryOf("opus", "claude-sonnet-4-6")).toBeUndefined();
+    expect(entryOf("opus", "claude-opus-4-7")).toBeUndefined();
   });
 });

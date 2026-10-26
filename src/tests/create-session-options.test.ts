@@ -294,6 +294,24 @@ describe("createSession options merging", () => {
         .at(-1)
         ?.every((option) => option.type === "select" && option.options.length === 1),
     ).toBe(true);
+    // A model of the root session's list goes as that list's entry, with its name.
+    const rootModel = session.configOptions.find((option) => option.id === "model");
+    const listed =
+      rootModel?.type === "select"
+        ? (rootModel.options as Array<{ value: string; name: string }>).find(
+            (entry) => entry.value !== "default",
+          )
+        : undefined;
+    expect(listed).toBeDefined();
+    await invoke("PostModelSwitch", { agent_id: "child", to_model: listed!.value, source: "auto" });
+    expect(
+      configs()
+        .at(-1)
+        ?.find((option) => option.id === "model"),
+    ).toMatchObject({
+      currentValue: listed!.value,
+      options: [{ value: listed!.value, name: listed!.name }],
+    });
     await new Promise((resolve) => setImmediate(resolve));
     expect(session.configOptions).toEqual(parentOptions);
     expect(

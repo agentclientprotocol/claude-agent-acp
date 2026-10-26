@@ -621,22 +621,18 @@ function modelOptionEntries(option: SessionConfigOption): Array<{ value: string;
   );
 }
 
-/** The current entry of the `model` option among `configOptions`. */
-export function currentModelEntry(
-  configOptions: readonly SessionConfigOption[],
-): { value: string; name: string } | undefined {
-  const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
-  if (option?.type !== "select") return undefined;
-  const value = option.currentValue;
-  return (
-    modelOptionEntries(option).find((entry) => entry.value === value) ?? { value, name: value }
-  );
-}
-
 /**
- * The entry of the `model` option among `configOptions` for `model`: an
- * option value, or an alias or a model id that the model picker resolves to
- * one (see {@link resolveModelPreference}). Undefined when no entry matches.
+ * The entry of the `model` option among `configOptions` for `model`, a model
+ * id that a response reported, so that a client can compare it with the
+ * session's own model. Best first:
+ *
+ * 1. the current entry, when it runs that model up to a context hint: a
+ *    session on `opus[1m]` or `default` that answers as `claude-opus-4-6`;
+ * 2. the entry whose value or resolved model is that id;
+ * 3. an entry that runs that model up to a context hint.
+ *
+ * Undefined when no entry matches. A model's resolved id comes from
+ * `modelInfos` (`ModelInfo.resolvedModel`), as for {@link matchResumedModel}.
  */
 export function modelEntryFor(
   configOptions: readonly SessionConfigOption[],
@@ -644,10 +640,19 @@ export function modelEntryFor(
   model: string,
 ): { value: string; name: string } | undefined {
   const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
-  if (!option) return undefined;
+  if (option?.type !== "select") return undefined;
   const entries = modelOptionEntries(option);
-  const direct = entries.find((entry) => entry.value === model);
-  if (direct) return direct;
-  const resolved = resolveModelPreference(modelInfos, model);
-  return resolved ? entries.find((entry) => entry.value === resolved.value) : undefined;
+  const observed = canonicalizeModelId(model);
+  const resolved = (value: string) =>
+    canonicalizeModelId(modelInfos.find((info) => info.value === value)?.resolvedModel ?? value);
+  const sameModel = (value: string) =>
+    stripContextHints(resolved(value)) === stripContextHints(observed);
+  const current = entries.find((entry) => entry.value === option.currentValue);
+  if (current && (resolved(current.value) === observed || sameModel(current.value))) {
+    return current;
+  }
+  return (
+    entries.find((entry) => entry.value === model || resolved(entry.value) === observed) ??
+    entries.find((entry) => sameModel(entry.value))
+  );
 }

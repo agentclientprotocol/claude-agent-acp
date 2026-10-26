@@ -4121,7 +4121,7 @@ describe("subagent transcript replay", () => {
       ]);
     });
 
-    it("sends the model that the transcript names for each child, and again after the load response", async () => {
+    it("sends the model of each child's responses, and after the load response only a changed entry", async () => {
       const launch = (id: string, name: string, input: object = {}) =>
         toolUse(id, "Agent", {
           name,
@@ -4149,12 +4149,12 @@ describe("subagent transcript replay", () => {
           user("u1", "Go"),
           assistant("a1", [
             launch("toolu_answered", "answered"),
-            launch("toolu_requested", "requested", { model: "haiku" }),
+            launch("toolu_unlisted", "unlisted", { model: "haiku" }),
             launch("toolu_silent", "silent"),
           ]),
           user("u2", [
             toolResult("toolu_answered", "Done."),
-            toolResult("toolu_requested", "Done."),
+            toolResult("toolu_unlisted", "Done."),
             toolResult("toolu_silent", "Done."),
           ]),
         ],
@@ -4168,12 +4168,12 @@ describe("subagent transcript replay", () => {
               answer("x4", "claude-opus-5", "Fallback."),
             ],
           },
-          // No response, but the launch input names a model.
+          // A model that the session's list does not have.
           bbb222: {
-            meta: meta("requested", "toolu_requested"),
-            records: [user("y1", "Run requested")],
+            meta: meta("unlisted", "toolu_unlisted"),
+            records: [user("y1", "Run unlisted"), answer("y2", "claude-fable-9", "Done.")],
           },
-          // The transcript names no model: the replay does not guess the parent's.
+          // No response: the replay does not guess the launch input's or the parent's model.
           ccc333: { meta: meta("silent", "toolu_silent"), records: [user("z1", "Run silent")] },
         },
         undefined,
@@ -4213,7 +4213,6 @@ describe("subagent transcript replay", () => {
       );
 
       const opus = JSON.stringify([{ value: "opus", name: "Opus 5" }]);
-      const haiku = JSON.stringify([{ value: "haiku", name: "Haiku 4.5" }]);
       const raw = (model: string) => JSON.stringify([{ value: model, name: model }]);
       expect(trace.filter((line) => / (model|subagent_update) /.test(line))).toEqual([
         // During the replay the session has no model list yet, so the model is the id.
@@ -4221,17 +4220,17 @@ describe("subagent transcript replay", () => {
         `aaa111 model claude-haiku-4-5 ${raw("claude-haiku-4-5")}`,
         // A response on another model sends the model again; the same model does not.
         `aaa111 model claude-opus-5 ${raw("claude-opus-5")}`,
-        // An alias goes only as an entry of the session's model list.
         'root subagent_update bbb222 {"state":"running"}',
+        `bbb222 model claude-fable-9 ${raw("claude-fable-9")}`,
         'root subagent_update ccc333 {"state":"running"}',
         'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
         'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
         'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
-        // After the response, each model is the entry of the root session's `model` option.
+        // After the response, a model goes again only when the root session's
+        // `model` option maps it to another entry.
         'root subagent_update aaa111 {"state":"idle","stopReason":"end_turn"}',
         `aaa111 model opus ${opus}`,
         'root subagent_update bbb222 {"state":"idle","stopReason":"end_turn"}',
-        `bbb222 model haiku ${haiku}`,
         'root subagent_update ccc333 {"state":"idle","stopReason":"end_turn"}',
       ]);
     });

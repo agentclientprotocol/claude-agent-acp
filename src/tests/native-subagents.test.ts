@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   announceNativeSubagent,
@@ -2473,31 +2473,13 @@ describe("NativeSubagentRuntime child models", () => {
   const entries = {
     default: { value: "default", name: "Default (recommended)" },
     sonnet: { value: "sonnet", name: "Sonnet 4.6" },
-    haiku: { value: "haiku", name: "Haiku 4.5" },
   };
-  /** `CLAUDE_CODE_SUBAGENT_MODEL`, unset unless a test sets it. */
-  let defaultSubagentModel: string | undefined;
-  afterEach(() => {
-    defaultSubagentModel = undefined;
-  });
-  /** The root session's `model` option: `default` is selected. */
+  /** The root session's `model` option, as `modelEntryFor` maps a model id to it. */
   const models: SubagentModels = {
-    sessionModel: () => entries.default,
-    entry: (model) =>
-      ({
-        ...entries,
-        "claude-sonnet-4-6": entries.sonnet,
-        "claude-haiku-4-5": entries.haiku,
-      })[model],
+    entry: (model) => (model === "claude-sonnet-4-6" ? entries.sonnet : undefined),
     name: (model) => (model === "claude-opus-5" ? "Opus 5" : undefined),
-    agentModel: (agentType) => ({ Explore: "haiku", Plan: "inherit" })[agentType],
-    defaultModel: () => defaultSubagentModel,
   };
-  const agentCall = (
-    toolCallId: string,
-    input: Record<string, unknown>,
-    parentToolUseId?: string,
-  ): AcpSessionNotification =>
+  const agentCall = (toolCallId: string, input: Record<string, unknown>): AcpSessionNotification =>
     ({
       sessionId: "root",
       update: {
@@ -2507,18 +2489,14 @@ describe("NativeSubagentRuntime child models", () => {
         status: "pending",
         rawInput: { description: "Fix the build", prompt: "Make it pass", ...input },
         _meta: {
-          claudeCode: { toolName: "Agent", ...(parentToolUseId ? { parentToolUseId } : {}) },
+          claudeCode: { toolName: "Agent" },
           jetbrains: { air: { version: 1, subagent: true } },
         },
       },
     }) as AcpSessionNotification;
 
   /** A runtime of `form` whose child `worker-1` the call `launch-1` with `input` launched. */
-  async function spawn(
-    form: "rfd" | "air",
-    input: Record<string, unknown>,
-    subagentType = "general-purpose",
-  ) {
+  async function spawn(form: "rfd" | "air", input: Record<string, unknown> = {}) {
     const published: AcpSessionNotification[] = [];
     const runtime = new NativeSubagentRuntime(
       form,
@@ -2537,10 +2515,13 @@ describe("NativeSubagentRuntime child models", () => {
       if (routed) published.push(routed);
     };
     await deliver(agentCall("launch-1", input));
-    await runtime.taskStarted({ taskId: "worker-1", toolUseId: "launch-1", subagentType }, deliver);
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      deliver,
+    );
     return { runtime, published, deliver };
   }
-  /** Each child `model` option sent: its session, value, name, and its only choice. */
+  /** Each child `model` option sent: its session, value, and name, the only choice. */
   const modelUpdates = (published: AcpSessionNotification[]) =>
     published.flatMap(({ sessionId, update }) =>
       update.sessionUpdate === "config_option_update"
@@ -2552,31 +2533,29 @@ describe("NativeSubagentRuntime child models", () => {
           })
         : [],
     );
-  const announcement = (form: "rfd" | "air") =>
-    form === "rfd" ? "subagent_update" : "subagent_spawned";
 
   it.each(["rfd", "air"] as const)(
-    "%s: sends the parent's entry for the model of the launch input right after the announcement",
+    "%s: sends no model before the child's first response, whatever the launch asks for",
     async (form) => {
-      const { published } = await spawn(form, { model: "sonnet" });
-      const kinds = published.map(({ update }) => update.sessionUpdate);
-      expect(kinds.indexOf("config_option_update")).toBeGreaterThan(
-        kinds.indexOf(announcement(form)),
-      );
+      const { runtime, published, deliver } = await spawn(form, { model: "sonnet" });
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "<synthetic>", deliver);
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
       expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
     },
   );
 
   it.each(["rfd", "air"] as const)(
-    "%s: refines the model from the child's response only when the entry changes",
+    "%s: sends the model again only when the entry changes",
     async (form) => {
-      const { runtime, published, deliver } = await spawn(form, { model: "sonnet" });
-      // The parent's selector maps the exact id to the same entry.
+      const { runtime, published, deliver } = await spawn(form);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
       await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
       // The root session's own responses do not change the child.
-      await runtime.reportModel(null, "claude-haiku-4-5", deliver);
+      await runtime.reportModel(null, "claude-opus-5", deliver);
       expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
-      // A model that no entry matches goes as its full id, with its display name.
+      // A model id that matches no entry goes as the id, with its display name.
       await runtime.reportModel("launch-1", "claude-opus-5", deliver);
       await runtime.reportModel("launch-1", "claude-opus-5", deliver);
       expect(modelUpdates(published)).toEqual([
@@ -2586,71 +2565,10 @@ describe("NativeSubagentRuntime child models", () => {
     },
   );
 
-  it.each(["rfd", "air"] as const)(
-    "%s: takes the agent definition's model, and the parent's for inherit and a fork",
-    async (form) => {
-      expect(modelUpdates((await spawn(form, {}, "Explore")).published)).toEqual([
-        ["worker-1", "haiku", "Haiku 4.5"],
-      ]);
-      // A fork always runs on the parent's model.
-      expect(modelUpdates((await spawn(form, { model: "haiku" }, "fork")).published)).toEqual([
-        ["worker-1", "default", "Default (recommended)"],
-      ]);
-      // `inherit` in the agent definition is the parent's model.
-      expect(modelUpdates((await spawn(form, {}, "Plan")).published)).toEqual([
-        ["worker-1", "default", "Default (recommended)"],
-      ]);
-      expect(modelUpdates((await spawn(form, {}, "general-purpose")).published)).toEqual([
-        ["worker-1", "default", "Default (recommended)"],
-      ]);
-    },
-  );
-
-  it.each(["rfd", "air"] as const)(
-    "%s: takes the default subagent model for an agent that names no model",
-    async (form) => {
-      defaultSubagentModel = "haiku";
-      expect(modelUpdates((await spawn(form, {}, "general-purpose")).published)).toEqual([
-        ["worker-1", "haiku", "Haiku 4.5"],
-      ]);
-      // The launch input and the agent definition come first.
-      expect(modelUpdates((await spawn(form, { model: "sonnet" })).published)).toEqual([
-        ["worker-1", "sonnet", "Sonnet 4.6"],
-      ]);
-      // `inherit` and a fork run on the parent's model.
-      expect(modelUpdates((await spawn(form, {}, "Plan")).published)).toEqual([
-        ["worker-1", "default", "Default (recommended)"],
-      ]);
-      expect(modelUpdates((await spawn(form, {}, "fork")).published)).toEqual([
-        ["worker-1", "default", "Default (recommended)"],
-      ]);
-      // A model id that matches no entry goes as the id; such an alias goes not at all.
-      defaultSubagentModel = "claude-opus-5";
-      expect(modelUpdates((await spawn(form, {})).published)).toEqual([
-        ["worker-1", "claude-opus-5", "Opus 5"],
-      ]);
-      defaultSubagentModel = "opus";
-      expect(modelUpdates((await spawn(form, {})).published)).toEqual([]);
-    },
-  );
-
-  it("sends no alias that matches no entry, and waits for the child's response", async () => {
-    const { runtime, published, deliver } = await spawn("rfd", { model: "opus" });
+  it("air: sends no model to a child after its end", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
     expect(modelUpdates(published)).toEqual([]);
-    await runtime.reportModel("launch-1", "claude-opus-5", deliver);
-    expect(modelUpdates(published)).toEqual([["worker-1", "claude-opus-5", "Opus 5"]]);
-  });
-
-  it("gives a nested child the model of the child that launched it", async () => {
-    const { runtime, published, deliver } = await spawn("rfd", { model: "sonnet" });
-    await deliver(agentCall("launch-2", {}, "launch-1"));
-    await runtime.taskStarted(
-      { taskId: "worker-2", toolUseId: "launch-2", subagentType: "Plan" },
-      deliver,
-    );
-    expect(modelUpdates(published)).toEqual([
-      ["worker-1", "sonnet", "Sonnet 4.6"],
-      ["worker-2", "sonnet", "Sonnet 4.6"],
-    ]);
   });
 });
