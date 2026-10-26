@@ -10260,6 +10260,18 @@ export class ClaudeAcpAgent {
       agentModel: (agentType) =>
         this.sessions[sessionId]?.subagentDefinitions?.find((agent) => agent.name === agentType)
           ?.model,
+      // Claude Code applies the env of settings.json after the process env.
+      defaultModel: () => {
+        const session = this.sessions[sessionId];
+        const name = "CLAUDE_CODE_SUBAGENT_MODEL";
+        const sessionEnv = (session?.creationParams?._meta as NewSessionMeta | undefined)
+          ?.claudeCode?.options?.env;
+        return (
+          session?.settingsManager?.getSettings().env?.[name] ??
+          sessionEnv?.[name] ??
+          process.env[name]
+        );
+      },
     };
   }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import {
   announceNativeSubagent,
@@ -2475,6 +2475,11 @@ describe("NativeSubagentRuntime child models", () => {
     sonnet: { value: "sonnet", name: "Sonnet 4.6" },
     haiku: { value: "haiku", name: "Haiku 4.5" },
   };
+  /** `CLAUDE_CODE_SUBAGENT_MODEL`, unset unless a test sets it. */
+  let defaultSubagentModel: string | undefined;
+  afterEach(() => {
+    defaultSubagentModel = undefined;
+  });
   /** The root session's `model` option: `default` is selected. */
   const models: SubagentModels = {
     sessionModel: () => entries.default,
@@ -2486,6 +2491,7 @@ describe("NativeSubagentRuntime child models", () => {
       })[model],
     name: (model) => (model === "claude-opus-5" ? "Opus 5" : undefined),
     agentModel: (agentType) => ({ Explore: "haiku", Plan: "inherit" })[agentType],
+    defaultModel: () => defaultSubagentModel,
   };
   const agentCall = (
     toolCallId: string,
@@ -2597,6 +2603,34 @@ describe("NativeSubagentRuntime child models", () => {
       expect(modelUpdates((await spawn(form, {}, "general-purpose")).published)).toEqual([
         ["worker-1", "default", "Default (recommended)"],
       ]);
+    },
+  );
+
+  it.each(["rfd", "air"] as const)(
+    "%s: takes the default subagent model for an agent that names no model",
+    async (form) => {
+      defaultSubagentModel = "haiku";
+      expect(modelUpdates((await spawn(form, {}, "general-purpose")).published)).toEqual([
+        ["worker-1", "haiku", "Haiku 4.5"],
+      ]);
+      // The launch input and the agent definition come first.
+      expect(modelUpdates((await spawn(form, { model: "sonnet" })).published)).toEqual([
+        ["worker-1", "sonnet", "Sonnet 4.6"],
+      ]);
+      // `inherit` and a fork run on the parent's model.
+      expect(modelUpdates((await spawn(form, {}, "Plan")).published)).toEqual([
+        ["worker-1", "default", "Default (recommended)"],
+      ]);
+      expect(modelUpdates((await spawn(form, {}, "fork")).published)).toEqual([
+        ["worker-1", "default", "Default (recommended)"],
+      ]);
+      // A model id that matches no entry goes as the id; such an alias goes not at all.
+      defaultSubagentModel = "claude-opus-5";
+      expect(modelUpdates((await spawn(form, {})).published)).toEqual([
+        ["worker-1", "claude-opus-5", "Opus 5"],
+      ]);
+      defaultSubagentModel = "opus";
+      expect(modelUpdates((await spawn(form, {})).published)).toEqual([]);
     },
   );
 

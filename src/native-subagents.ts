@@ -92,6 +92,11 @@ export type SubagentModels = {
   name(model: string): string | undefined;
   /** The `model` of the agent definition named `agentType` (`AgentInfo.model`). */
   agentModel(agentType: string): string | undefined;
+  /**
+   * The default subagent model, `CLAUDE_CODE_SUBAGENT_MODEL`. Claude Code runs
+   * an agent without a model on it, when it is set, instead of on the parent's.
+   */
+  defaultModel(): string | undefined;
 };
 
 type ChildConfiguration = {
@@ -1585,12 +1590,14 @@ export function requestedModel(inputModel: unknown, agentType: unknown): string 
 }
 
 /**
- * The model entry of a child before its first response, best first: the
- * `model` input of the call that launched it, the `model` of its agent
- * definition `agentType`, and `parentModel`. `inherit` means the parent's
- * model, and a fork always runs on it. A model that matches no entry of the
- * root session's `model` option gives undefined: an alias such as `sonnet` is
- * no model id, so the child's first response reports the exact one.
+ * The model entry of a child before its first response, as Claude Code picks
+ * the model, best first: the `model` input of the call that launched it, the
+ * `model` of its agent definition `agentType`, the default subagent model,
+ * and `parentModel`. `inherit` in the definition means the parent's model,
+ * and a fork always runs on it. A model id that matches no entry of the root
+ * session's `model` option goes as the id. An alias such as `sonnet` that
+ * matches no entry gives undefined: it is no model id, so the child's first
+ * response reports the exact one.
  */
 export function launchModelEntry(
   inputModel: unknown,
@@ -1599,13 +1606,21 @@ export function launchModelEntry(
   parentModel: ModelEntry | undefined,
 ): ModelEntry | undefined {
   if (agentType === "fork") return parentModel;
-  const definitionModel = typeof agentType === "string" ? models?.agentModel(agentType) : undefined;
-  const requested = [nonBlankString(inputModel), nonBlankString(definitionModel)].find(
-    (model) => model !== undefined && model !== "inherit",
+  const definitionModel = nonBlankString(
+    typeof agentType === "string" ? models?.agentModel(agentType) : undefined,
   );
+  const input = nonBlankString(inputModel);
+  const requested =
+    (input !== "inherit" ? input : undefined) ??
+    (definitionModel === "inherit" ? undefined : definitionModel) ??
+    (definitionModel === undefined ? nonBlankString(models?.defaultModel()) : undefined);
   if (!requested) return parentModel;
-  return models?.entry(requested);
+  if (MODEL_ALIAS.test(requested)) return models?.entry(requested);
+  return responseModelEntry(requested, models);
 }
+
+/** A model alias of Claude Code, such as `sonnet` or `opus[1m]`, not a model id. */
+const MODEL_ALIAS = /^[a-z]+(\[\d+[mk]\])?$/i;
 
 /**
  * Announces the child on its parent, once, before any update of the child.
