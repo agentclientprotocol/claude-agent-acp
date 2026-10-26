@@ -301,31 +301,37 @@ export class NativeSubagentRuntime {
     return JSON.parse(published) as SessionConfigOption[];
   }
 
-  /** Hook observations can precede the task event that establishes a child's parent. */
+  /**
+   * Takes configuration options of the child `agentId`: an SDK agent id, as a
+   * hook names it, or a child session id. Hook observations can precede the
+   * task event that establishes a child's parent.
+   */
   async reportConfiguration(
     agentId: string,
     options: SessionConfigOption[],
     meta?: SessionNotification["update"]["_meta"],
   ): Promise<void> {
     if (!this.form || agentId === this.rootSessionId || options.length === 0) return;
-    let config = this.configBySession.get(agentId);
+    // In AIR's draft, the session id of a resumed or restored agent is
+    // `<agent id>:generation:<n>`, so the agent id names its current generation.
+    const known = this.children.get(agentId) ?? this.childOfSession(agentId);
+    const sessionId = known?.sessionId ?? agentId;
+    let config = this.configBySession.get(sessionId);
     if (!config) {
       const pending = [...this.configBySession.keys()].filter(
         (id) => !this.childOfSession(id),
       ).length;
-      if (!this.childOfSession(agentId) && pending >= MAX_PENDING_PARENTS) {
+      if (!known && pending >= MAX_PENDING_PARENTS) {
         this.logger.log(
           `Session ${this.rootSessionId}: dropping configuration for unannounced subagent ${agentId}; pending buffer limit reached`,
         );
         return;
       }
       config = { options: new Map(), publishing: Promise.resolve() };
-      this.configBySession.set(agentId, config);
+      this.configBySession.set(sessionId, config);
     }
     for (const option of options) config.options.set(option.id, option);
-    // In AIR's draft a later generation of an agent has its own session id.
-    const child = this.childOfSession(agentId);
-    if (child?.announced) await this.publishConfiguration(child, meta);
+    if (known?.announced) await this.publishConfiguration(known, meta);
   }
 
   private async publishConfiguration(
@@ -333,12 +339,15 @@ export class NativeSubagentRuntime {
     meta?: SessionNotification["update"]["_meta"],
   ): Promise<void> {
     const config = this.configBySession.get(child.sessionId);
-    // AIR's draft ends a child for good, so it gets no update after its end.
-    if (!config || (this.form === "air" && child.terminalState !== undefined)) return;
+    // AIR's draft ends a child for good, so it gets no update after its end,
+    // also when the end comes while this publication waits for an earlier one.
+    const ended = () =>
+      this.form === "air" && (child.terminalState !== undefined || !!child.terminalPromise);
+    if (!config || ended()) return;
     // SDK hooks can run concurrently with streamed responses. Serialize snapshots
     // so a delayed publication cannot replace newer settings with older ones.
     const publishing = config.publishing.then(async () => {
-      if (this.configBySession.get(child.sessionId) !== config) return;
+      if (this.configBySession.get(child.sessionId) !== config || ended()) return;
       const priority = ["mode", "model", "thought_level", "model_config"];
       const rank = (option: SessionConfigOption) => {
         const index = priority.indexOf(option.category ?? "");

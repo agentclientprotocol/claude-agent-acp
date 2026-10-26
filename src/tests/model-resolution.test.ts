@@ -445,10 +445,48 @@ describe("modelEntryFor", () => {
   it("takes the listed entry of another model", () => {
     expect(entryOf("opus[1m]", "claude-haiku-4-5")).toEqual({ value: "haiku", name: "Haiku 4.5" });
     expect(entryOf("haiku", "claude-opus-4-6")).toEqual({ value: "opus", name: "Opus 4.6" });
+    // A concrete entry comes before `default` when both run the model.
     expect(entryOf("haiku", "claude-opus-4-6[1m]")).toEqual({
-      value: "default",
-      name: "Default (recommended)",
+      value: "opus[1m]",
+      name: "Opus 4.6 (1M context)",
     });
+  });
+
+  it("compares a dated or a provider model id as it is", () => {
+    // `resolvedModel` is the wire id that a response reports, date and provider prefix included.
+    const dated: ModelInfo[] = [
+      {
+        value: "haiku",
+        resolvedModel: "claude-haiku-4-5-20251001",
+        displayName: "Haiku 4.5",
+        description: "",
+      },
+      {
+        value: "sonnet",
+        resolvedModel: "eu.anthropic.claude-sonnet-5",
+        displayName: "Sonnet 5",
+        description: "",
+      },
+    ];
+    const datedOptions: SessionConfigOption[] = [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "sonnet",
+        options: dated.map((info) => ({ value: info.value, name: info.displayName })),
+      },
+    ];
+    expect(modelEntryFor(datedOptions, dated, "claude-haiku-4-5-20251001")).toEqual({
+      value: "haiku",
+      name: "Haiku 4.5",
+    });
+    expect(modelEntryFor(datedOptions, dated, "eu.anthropic.claude-sonnet-5")).toEqual({
+      value: "sonnet",
+      name: "Sonnet 5",
+    });
+    expect(modelEntryFor(datedOptions, dated, "claude-haiku-4-5")).toBeUndefined();
   });
 
   it("matches no entry for a model that the list does not have", () => {

@@ -188,9 +188,9 @@ export class RfdSubagentReplay {
    * Takes the model of a replayed response of the child `owner`. A child
    * whose model changes gets its `model` option again.
    */
-  async responseModel(owner: ReplayChild, model: unknown): Promise<void> {
+  async responseModel(owner: ReplayChild, model: string | undefined): Promise<void> {
     const entry = responseModelEntry(model, this.models);
-    if (!entry || !owner.announced || typeof model !== "string") return;
+    if (!entry || !owner.announced) return;
     owner.responseModel = model;
     await this.sendModel(owner, entry);
   }

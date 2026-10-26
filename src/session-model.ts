@@ -631,8 +631,12 @@ function modelOptionEntries(option: SessionConfigOption): Array<{ value: string;
  * 2. the entry whose value or resolved model is that id;
  * 3. an entry that runs that model up to a context hint.
  *
- * Undefined when no entry matches. A model's resolved id comes from
- * `modelInfos` (`ModelInfo.resolvedModel`), as for {@link matchResumedModel}.
+ * Among several entries for one model, a concrete entry comes before
+ * `default`, as in {@link resolveModelPreference}. Undefined when no entry
+ * matches. A model's resolved id comes from `modelInfos`
+ * (`ModelInfo.resolvedModel`), the wire id that a response reports, as for
+ * {@link matchResumedModel}. It is compared as it is: a dated id such as
+ * `claude-haiku-4-5-20251001` matches only the same dated id.
  */
 export function modelEntryFor(
   configOptions: readonly SessionConfigOption[],
@@ -641,16 +645,17 @@ export function modelEntryFor(
 ): { value: string; name: string } | undefined {
   const option = configOptions.find((candidate) => candidate.id === MODEL_CONFIG_ID);
   if (option?.type !== "select") return undefined;
-  const entries = modelOptionEntries(option);
+  // Concrete entries first; `sort` keeps the list order otherwise.
+  const entries = modelOptionEntries(option).sort(
+    (left, right) => Number(left.value === "default") - Number(right.value === "default"),
+  );
   const observed = canonicalizeModelId(model);
   const resolved = (value: string) =>
     canonicalizeModelId(modelInfos.find((info) => info.value === value)?.resolvedModel ?? value);
   const sameModel = (value: string) =>
     stripContextHints(resolved(value)) === stripContextHints(observed);
   const current = entries.find((entry) => entry.value === option.currentValue);
-  if (current && (resolved(current.value) === observed || sameModel(current.value))) {
-    return current;
-  }
+  if (current && sameModel(current.value)) return current;
   return (
     entries.find((entry) => entry.value === model || resolved(entry.value) === observed) ??
     entries.find((entry) => sameModel(entry.value))

@@ -119,7 +119,6 @@ import {
   childModelOption,
   isNativeSubagentControlTool,
   isNativeSubagentControlUpdate,
-  type ModelEntry,
   NativeSubagent,
   NativeSubagentRuntime,
   nativeSubagentState,
@@ -987,6 +986,8 @@ type ReplayState = Pick<
 /** A replay that runs before its session record exists. */
 type PendingReplay = {
   state: ReplayState;
+  /** Settles when the session creation ends: the session record and its model list exist, or `stopped` is set. */
+  sessionReady?: Promise<void>;
   /** Set when the session creation fails. The replay then sends no more updates. */
   stopped: boolean;
 };
@@ -3074,6 +3075,8 @@ export class ClaudeAcpAgent {
       },
       stopped: false,
     };
+    let sessionCreated!: () => void;
+    pending.sessionReady = new Promise((resolve) => (sessionCreated = resolve));
     const transcript = readResumedSession(params.sessionId, this.logger);
     const replay = transcript
       .then(({ messages }) => this.replaySessionHistory(params.sessionId, messages, pending))
@@ -3099,9 +3102,11 @@ export class ClaudeAcpAgent {
       );
     } catch (error) {
       pending.stopped = true;
+      sessionCreated();
       await replay;
       throw error;
     }
+    sessionCreated();
     timing.phase("session-ready");
     const replayed = await replay;
     if (!replayed.ok) throw replayed.error;
@@ -9292,23 +9297,11 @@ export class ClaudeAcpAgent {
         /** The state of the last persisted task notification of the child.
          *  It comes after the launch tool_result, so it wins. */
         notifiedState?: SubagentState;
-        /** The `model` option entry that the replay sent to the child. */
-        model?: ModelEntry;
+        /** The model id of the child's latest response in its transcript. */
+        responseModel?: string;
       }
     >();
     const replayModels = this.subagentModels(sessionId);
-    /** Sends the `model` option of the replayed child `child`, when it changes. */
-    const sendReplayModel = async (
-      child: { sessionId: string; model?: ModelEntry },
-      model: ModelEntry,
-    ): Promise<void> => {
-      if (child.model?.value === model.value && child.model.name === model.name) return;
-      child.model = model;
-      await this.client.sessionUpdate({
-        sessionId: child.sessionId,
-        update: { sessionUpdate: "config_option_update", configOptions: [childModelOption(model)] },
-      });
-    };
 
     // Registers the Agent and Task launches of `list`, and the terminal state
     // of each launch from its tool_result.
@@ -9378,7 +9371,6 @@ export class ClaudeAcpAgent {
     const announceReplayChild = async (
       parentToolUseId: string,
       ancestors = new Set<string>(),
-      firstModel?: string,
     ): Promise<string> => {
       let child = replayChildren.get(parentToolUseId);
       if (!child) {
@@ -9418,9 +9410,6 @@ export class ClaudeAcpAgent {
           }),
         );
         child.announced = true;
-        // The model of the child's first response, from its transcript.
-        const model = responseModelEntry(firstModel, replayModels);
-        if (model) await sendReplayModel(child, model);
       }
       return child.sessionId;
     };
@@ -9569,13 +9558,15 @@ export class ClaudeAcpAgent {
           ? await announceReplayChild(parentToolUseId)
           : sessionId;
       if (message.type === "assistant") {
-        const model = (message.message as { model?: unknown }).model;
+        const model = (message.message as { model?: string }).model;
         if (rfdReplay && child) {
           await rfdReplay.responseModel(child, model);
         } else if (nativeReplayEnabled && parentToolUseId) {
+          // AIR's draft: sent before the child's end, when the model list is known.
           const replayChild = replayChildren.get(parentToolUseId);
-          const entry = responseModelEntry(model, replayModels);
-          if (entry && replayChild?.announced) await sendReplayModel(replayChild, entry);
+          if (replayChild && model && model !== "<synthetic>") {
+            replayChild.responseModel = model;
+          }
         }
       }
       if (
@@ -9688,15 +9679,16 @@ export class ClaudeAcpAgent {
       // a time, and keeps no subagent history after that.
       if (nativeReplayEnabled && message.type === "assistant") {
         for (const toolUseId of subagentLaunchIds(content)) {
+          await announceReplayChild(toolUseId);
           const agentId = subagents.agents.get(toolUseId)?.agentId;
-          const unreplayed = !!agentId && !replayedSubagents.has(agentId);
-          if (agentId) replayedSubagents.add(agentId);
-          const childMessages =
-            agentId && unreplayed
-              ? await readSubagentMessages(sessionId, agentId, subagents, this.logger)
-              : [];
-          await announceReplayChild(toolUseId, undefined, firstResponseModel(childMessages));
-          if (!unreplayed) continue;
+          if (!agentId || replayedSubagents.has(agentId)) continue;
+          replayedSubagents.add(agentId);
+          const childMessages = await readSubagentMessages(
+            sessionId,
+            agentId,
+            subagents,
+            this.logger,
+          );
           registerLaunches(childMessages);
           for (const childMessage of childMessages) await replayMessage(childMessage);
         }
@@ -9726,7 +9718,24 @@ export class ClaudeAcpAgent {
       this.replayedSubagents.set(sessionId, rfdReplay);
     }
 
+    // AIR's draft: each child's model goes before its end, which allows no
+    // later update. The model maps to an entry of the session's model list,
+    // which a load knows only when the CLI started (see `sessionReady`).
+    if (nativeReplayEnabled && !pending?.stopped) await pending?.sessionReady;
     if (nativeReplayEnabled && !pending?.stopped) {
+      for (const child of replayChildren.values()) {
+        const model = child.announced
+          ? responseModelEntry(child.responseModel, replayModels)
+          : undefined;
+        if (!model) continue;
+        await this.client.sessionUpdate({
+          sessionId: child.sessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: [childModelOption(model)],
+          },
+        });
+      }
       // Claude history persists sidechain messages and Agent/Task tool uses,
       // but not task_started/task_updated lifecycle frames. Recover terminal
       // state from the launch tool_result. Missing results and malformed or
@@ -11565,10 +11574,10 @@ export class ClaudeAcpAgent {
       `[session/query] sessionId=${sessionId} resume=${creationOpts?.resume ?? "none"} apiType=${resolvedProvider?.apiType ?? "native"} baseUrl=${resolvedProvider?.baseUrl ?? "native"}`,
     );
 
-    const subagentConfigHook =
-      subagentForm(this.clientCapabilities) === "rfd"
-        ? this.subagentConfigurationHook(sessionId)
-        : undefined;
+    // Both forms of native subagent sessions report the configuration of a child.
+    const subagentConfigHook = subagentForm(this.clientCapabilities)
+      ? this.subagentConfigurationHook(sessionId)
+      : undefined;
     const options: Options = {
       systemPrompt,
       settingSources: ["user", "project", "local"],

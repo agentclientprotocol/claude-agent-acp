@@ -2565,6 +2565,69 @@ describe("NativeSubagentRuntime child models", () => {
     },
   );
 
+  it("air: drops a model update that waits for an earlier one when the child ends", async () => {
+    const published: AcpSessionNotification[] = [];
+    const firstSent = deferred();
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+        // The client takes the first model update slowly.
+        if (notification.update.sessionUpdate === "config_option_update") await firstSent.promise;
+      },
+      { log: () => {} },
+      undefined,
+      undefined,
+      models,
+    );
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await deliver(agentCall("launch-1", {}));
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      deliver,
+    );
+    const first = runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+    await vi.waitFor(() => expect(modelUpdates(published)).toHaveLength(1));
+    // The child ends while the client has not taken the first update yet, and
+    // a model update comes in meanwhile.
+    const finished = runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    const second = runtime.reportModel("launch-1", "claude-opus-5", deliver);
+    firstSent.resolve();
+    await Promise.all([first, second, finished]);
+    // Nothing follows the end.
+    expect(published.at(-1)?.update.sessionUpdate).toBe("subagent_state_update");
+  });
+
+  it("air: reports a hook's configuration under the agent's current generation", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    // The SDK resumes the agent: AIR's draft opens a new generation session.
+    await runtime.taskResumed("worker-1", deliver, "Continue");
+    const generation = published
+      .flatMap(({ update }) =>
+        update.sessionUpdate === "subagent_spawned" ? [update.subagentSessionId] : [],
+      )
+      .at(-1);
+    expect(generation).toBe("worker-1:generation:2");
+    // A hook names the SDK agent id, not the generation session.
+    await runtime.reportConfiguration("worker-1", [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "sonnet",
+        options: [{ value: "sonnet", name: "Sonnet 4.6" }],
+      },
+    ]);
+    expect(modelUpdates(published)).toEqual([[generation, "sonnet", "Sonnet 4.6"]]);
+  });
+
   it("air: sends no model to a child after its end", async () => {
     const { runtime, published, deliver } = await spawn("air");
     await runtime.finishTask("worker-1", "completed", deliver, "launch-1");

@@ -3586,6 +3586,81 @@ describe("subagent transcript replay", () => {
     return updates;
   }
 
+  it("sends an AIR child's model as the session's entry once the session exists, before its end", async () => {
+    const updates: AcpSessionNotification[] = [];
+    const agent = new ClaudeAcpAgent(
+      {
+        sessionUpdate: async (update: SessionNotification) =>
+          updates.push(update as AcpSessionNotification),
+      } as unknown as AcpClient,
+      { log: () => {}, error: () => {} },
+    );
+    await initializeClient(agent, AIR_NATIVE_SUBAGENTS);
+    // A load replays while the CLI starts: the session and its model list come later.
+    let sessionCreated!: () => void;
+    const pending = {
+      state: { cwd: "/tmp", taskState: new Map(), messageIdToUuid: new Map() },
+      stopped: false,
+      sessionReady: new Promise<void>((resolve) => (sessionCreated = resolve)),
+    };
+    const replaying = (
+      agent as unknown as {
+        replaySessionHistory(
+          sessionId: string,
+          messages: unknown[],
+          pending: unknown,
+        ): Promise<void>;
+      }
+    ).replaySessionHistory("s1", replayHistory, pending);
+    await vi.waitFor(() =>
+      expect(updates.map(({ update }) => update.sessionUpdate)).toContain("tool_call"),
+    );
+    expect(updates.map(({ update }) => update.sessionUpdate)).not.toContain("config_option_update");
+    (agent.sessions as Record<string, unknown>).s1 = {
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "sonnet",
+          options: [{ value: "sonnet", name: "Sonnet 4.5" }],
+        },
+      ],
+      modelInfos: [
+        {
+          value: "sonnet",
+          resolvedModel: "claude-sonnet-4-5",
+          displayName: "Sonnet 4.5",
+          description: "",
+        },
+      ],
+    };
+    sessionCreated();
+    await replaying;
+    expect(updates.slice(-2)).toEqual([
+      {
+        sessionId: "s1:replay-subagent:parent-agent-call",
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: [
+            {
+              id: "model",
+              name: "Model",
+              category: "model",
+              type: "select",
+              currentValue: "sonnet",
+              options: [{ value: "sonnet", name: "Sonnet 4.5" }],
+            },
+          ],
+        },
+      },
+      expect.objectContaining({
+        update: expect.objectContaining({ sessionUpdate: "subagent_state_update" }),
+      }),
+    ]);
+  });
+
   it("replays a subagent from its own transcript file", async () => {
     // Claude keeps a subagent history in <session>/subagents/, and the SDK
     // returns the main transcript without it and without parent_tool_use_id.
@@ -3741,14 +3816,14 @@ describe("subagent transcript replay", () => {
       ).toEqual([
         [sessionId, "user_message_chunk", "Explore it"],
         [sessionId, "subagent_spawned", child1],
-        // Right after its announcement, the child gets the model of its first response.
-        [child1, "config_option_update", undefined],
         [child1, "user_message_chunk", "Look around"],
         [child1, "agent_message_chunk", "Child report."],
         // A launch without a subagent file still gets its child and its state.
         // Nothing names its model, so it gets none.
         [sessionId, "subagent_spawned", child2],
         [sessionId, "agent_message_chunk", "Done."],
+        // The model of the child's responses goes before its end, which allows no later update.
+        [child1, "config_option_update", undefined],
         [sessionId, "subagent_state_update", child2],
         [sessionId, "subagent_state_update", child1],
         [sessionId, "session_info_update", undefined],
@@ -4380,10 +4455,10 @@ describe("subagent transcript replay", () => {
     const updates = await replay("native");
     expect(updates.map(({ sessionId, update }) => [sessionId, update.sessionUpdate])).toEqual([
       ["s1", "subagent_spawned"],
-      // The model of its response: a child without launch metadata has no other.
-      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1:replay-subagent:parent-agent-call", "agent_message_chunk"],
       ["s1:replay-subagent:parent-agent-call", "tool_call"],
+      // The model of its response, before its end.
+      ["s1:replay-subagent:parent-agent-call", "config_option_update"],
       ["s1", "subagent_state_update"],
     ]);
     expect(updates[0]?.update).toMatchObject({
