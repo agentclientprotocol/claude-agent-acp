@@ -10188,6 +10188,35 @@ export class ClaudeAcpAgent {
     return raceWithAbort(this.client.createElicitation(request, signal), signal);
   }
 
+  /** Settle the tool call `ensureToolCallEmitted` emitted for a
+   *  SandboxNetworkAccess request once the request is answered. The callback
+   *  asks for permission and runs nothing, so the SDK never sends a
+   *  `tool_result` for its synthetic id, and the call would otherwise stay
+   *  pending in the client. */
+  private async settleSandboxNetworkCall(
+    sessionId: string,
+    toolCallSessionId: string,
+    toolCallId: string,
+    allowed: boolean,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const update: SessionNotification["update"] = {
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      status: allowed ? "completed" : "failed",
+    };
+    try {
+      if (session.nativeSubagentDeliver) {
+        await session.nativeSubagentDeliver({ sessionId, update });
+      } else {
+        await this.client.sessionUpdate({ sessionId: toolCallSessionId, update });
+      }
+    } catch (error) {
+      this.logger.error("Failed to settle the SandboxNetworkAccess tool call:", error);
+    }
+  }
+
   /** Emit the `tool_call` a permission request references if it hasn't been sent
    *  yet, so the client has the tool call before being asked to approve it. The
    *  matching streamed tool_use chunk later refines it with a `tool_call_update`
@@ -10637,6 +10666,14 @@ export class ClaudeAcpAgent {
       let permissionResult = decodedPermission.permissionResult;
       const autoFallback = this.sessionModes.applyPermissionFallback(session, permissionResult);
       permissionResult = autoFallback.permissionResult;
+      if (toolName === "SandboxNetworkAccess") {
+        await this.settleSandboxNetworkCall(
+          sessionId,
+          permissionSessionId,
+          toolUseID,
+          permissionResult.behavior === "allow",
+        );
+      }
       if (autoFallback.fallbackApplied) {
         await this.sessionModes.publishFallbackWarning(sessionId, session);
       }
