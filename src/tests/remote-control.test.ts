@@ -2,12 +2,19 @@ import { describe, it, expect, vi } from "vitest";
 import { ClaudeAcpAgent, type AcpClient } from "../acp-agent.js";
 import { mockSessionState } from "./session-doubles.js";
 
+/** A stream that stays open, like the real one: a consumer that reaches its end
+ *  closes the session. */
+async function* openStream(): AsyncGenerator<never> {
+  await new Promise<never>(() => {});
+  yield* [];
+}
+
 function createAgent(query: Record<string, unknown>, sessionOverrides: Record<string, any> = {}) {
   const sessionUpdate = vi.fn(async () => {});
   const client = { sessionUpdate } as unknown as AcpClient;
   const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
   agent.sessions["session-1"] = mockSessionState({
-    query: { supportedCommands: async () => [], ...query },
+    query: Object.assign(openStream(), { supportedCommands: async () => [] }, query),
     ...sessionOverrides,
   });
   return { agent, sessionUpdate };
@@ -183,10 +190,7 @@ describe("/remote-control", () => {
       const request = pendingRequest();
       const push = vi.fn();
       const created = createAgent(
-        Object.assign((async function* () {})(), {
-          enableRemoteControl: request.enableRemoteControl,
-          supportedCommands: async () => [],
-        }) as any,
+        { enableRemoteControl: request.enableRemoteControl },
         { input: { push } },
       );
       return { ...created, ...request, push };
@@ -238,6 +242,16 @@ describe("/remote-control", () => {
 
       expect(push).toHaveBeenCalledOnce();
     });
+  });
+
+  it("starts reading the query stream so other clients' messages reach this one", async () => {
+    const { agent } = createAgent({
+      enableRemoteControl: vi.fn(async () => ({ session_url: "https://claude.ai/code/s" })),
+    });
+
+    await agent.prompt(prompt("/remote-control"));
+
+    expect(agent.sessions["session-1"].consumer).toBeDefined();
   });
 
   it("advertises the command only when the query supports it", async () => {

@@ -97,6 +97,76 @@ describe("incomplete foreground tools", () => {
     expect(agent.sessions[sessionId].toolCallParents?.size ?? 0).toBe(0);
   });
 
+  it.each([
+    {
+      content: { type: "advisor_result", text: "Check the queue ordering." },
+      status: "completed",
+      text: "Check the queue ordering.",
+    },
+    {
+      content: { type: "advisor_redacted_result", encrypted_content: "opaque-advice" },
+      status: "completed",
+      text: "Advisor guidance applied server-side.",
+    },
+    {
+      content: { type: "advisor_tool_result_error", error_code: "overloaded" },
+      status: "failed",
+      text: "Advisor error: overloaded",
+    },
+  ] as const)(
+    "settles an advisor call with a $content.type result",
+    async ({ content, status, text }) => {
+      const advisorId = "srvtoolu_advisor";
+      const { prompt, updates, logError, agent } = createTestSession(async function* (input) {
+        yield* echoNextPrompt(input);
+        yield advisorStart(advisorId);
+        yield advisorToolUse(advisorId);
+        yield advisorResult(advisorId, content);
+        expect(hasHookCallback(advisorId)).toBe(false);
+        yield successfulResultMessage();
+      });
+
+      await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+      const terminal = updates.filter(
+        (update) =>
+          update.toolCallId === advisorId &&
+          (update.status === "completed" || update.status === "failed"),
+      );
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0]).toMatchObject({
+        sessionUpdate: "tool_call_update",
+        toolCallId: advisorId,
+        status,
+      });
+      expect(JSON.stringify(terminal[0])).toContain(text);
+      expect(JSON.stringify(updates)).not.toContain("opaque-advice");
+      expect(agent.sessions[sessionId].emittedToolCalls.has(advisorId)).toBe(false);
+      expect(agent.sessions[sessionId].dispatchedToolCalls?.has(advisorId)).toBe(false);
+      expect(logError).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails a dispatched advisor call without a result", async () => {
+    const advisorId = "srvtoolu_advisor";
+    const { prompt, updates, agent } = createTestSession(async function* (input) {
+      yield* echoNextPrompt(input);
+      yield advisorStart(advisorId);
+      yield advisorToolUse(advisorId);
+      yield successfulResultMessage();
+    });
+
+    await expect(prompt()).rejects.toMatchObject({ data: { errorKind: "incomplete_tool_call" } });
+    const terminal = updates.filter(
+      (update) =>
+        update.toolCallId === advisorId &&
+        (update.status === "completed" || update.status === "failed"),
+    );
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0]).toMatchObject({ status: "failed" });
+    expect(agent.sessions[sessionId].emittedToolCalls.has(advisorId)).toBe(false);
+    expect(agent.sessions[sessionId].dispatchedToolCalls?.has(advisorId)).toBe(false);
+  });
+
   it("allows a tool explicitly handed off to a background task", async () => {
     const { prompt, updates } = createTestSession(backgroundToolMessages);
 
@@ -121,6 +191,29 @@ describe("incomplete foreground tools", () => {
 
     await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
     expect(logError).not.toHaveBeenCalled();
+  });
+
+  it("with backgroundSubagents, settles at the result without failing the running subagent's tool", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const { agent, prompt, updates, logError } = createTestSession((input) =>
+      gatedBackgroundSubagentMessages(input, gate),
+    );
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {
+        _meta: { jetbrains: { air: { version: 1, capabilities: ["backgroundSubagents"] } } },
+      },
+    });
+
+    // The turn is not held, so the check runs while the subagent still runs.
+    await expect(prompt()).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(agent.sessions[sessionId].liveBackgroundTasks.has("child")).toBe(true);
+    expect(updates.some((u) => u.toolCallId === toolCallId && u.status === "failed")).toBe(false);
+    expect(logError).not.toHaveBeenCalled();
+    release();
+    await agent.sessions[sessionId].consumer;
+    expect(agent.sessions[sessionId].liveBackgroundTasks.has("child")).toBe(false);
   });
 
   it("fails every unfinished tool and allows a later prompt to succeed", async () => {
@@ -1100,6 +1193,44 @@ function toolUse(
   };
 }
 
+function advisorStart(id: string) {
+  return {
+    ...toolStart(id),
+    event: {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "server_tool_use", id, name: "advisor", input: {} },
+    },
+  };
+}
+
+/** The complete assistant message that dispatches the advisor server tool. */
+function advisorToolUse(id: string) {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "assistant",
+      usage: successfulResultMessage().usage,
+      content: [{ type: "server_tool_use", id, name: "advisor", input: {} }],
+    },
+  };
+}
+
+function advisorResult(id: string, content: unknown) {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    parent_tool_use_id: null,
+    message: {
+      role: "assistant",
+      usage: successfulResultMessage().usage,
+      content: [{ type: "advisor_tool_result", tool_use_id: id, content }],
+    },
+  };
+}
+
 function assistantText(text: string) {
   return {
     type: "assistant",
@@ -1273,6 +1404,36 @@ async function* deferredSettlementMessages(input: Pushable<any>) {
     summary: "done",
   };
   yield { type: "system", subtype: "session_state_changed", state: "idle" };
+}
+
+/** The tool call of a subagent that still runs in the background when the
+ *  result arrives. Its tool result comes after the result. */
+async function* gatedBackgroundSubagentMessages(input: Pushable<any>, gate: Promise<void>) {
+  yield* echoNextPrompt(input);
+  yield toolStart();
+  yield toolUse();
+  yield {
+    type: "system",
+    subtype: "task_started",
+    session_id: sessionId,
+    task_id: "child",
+    tool_use_id: toolCallId,
+    subagent_type: "Explore",
+    description: "investigate",
+  };
+  yield successfulResultMessage();
+  yield { type: "system", subtype: "session_state_changed", state: "idle" };
+  await gate;
+  yield toolResult();
+  yield {
+    type: "system",
+    subtype: "task_notification",
+    session_id: sessionId,
+    task_id: "child",
+    tool_use_id: toolCallId,
+    status: "completed",
+    summary: "done",
+  };
 }
 
 async function* incompleteThenSuccessfulTurnMessages(input: Pushable<any>) {

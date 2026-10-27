@@ -104,6 +104,17 @@ export async function canonicalPath(cwd: string): Promise<string> {
   }
 }
 
+/** Whether the path exists, including a symlink whose target is missing. */
+export async function exists(target: string): Promise<boolean> {
+  try {
+    await fs.lstat(target);
+    return true;
+  } catch (error) {
+    if (errorCode(error) === "ENOENT" || errorCode(error) === "ENOTDIR") return false;
+    throw error;
+  }
+}
+
 /** The names of the project directories of `cwd` among `rootEntries`. */
 export function projectDirsOf(cwd: string, rootEntries: readonly string[]): string[] {
   const exact = encodeProjectPath(cwd);
