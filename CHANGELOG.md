@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.98.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.97.0...v0.98.0) (2026-10-27)
+
+
+### Features
+
+* add batch session metadata lookup ([#1408](https://github.com/agentclientprotocol/claude-agent-acp/issues/1408)) ([0ce42f2](https://github.com/agentclientprotocol/claude-agent-acp/commit/0ce42f2c312d190f78024d8b4b1ae5f00d9e5939))
+
+
+### Bug Fixes
+
+* publish Monitor async tasks as monitors ([#1452](https://github.com/agentclientprotocol/claude-agent-acp/issues/1452)) ([4324dce](https://github.com/agentclientprotocol/claude-agent-acp/commit/4324dce4be877c55385b3389cebac1c63d08f456))
+* settle the tool call of a SandboxNetworkAccess permission request ([#1448](https://github.com/agentclientprotocol/claude-agent-acp/issues/1448)) ([8f43ac8](https://github.com/agentclientprotocol/claude-agent-acp/commit/8f43ac808931a3f14719bbed37b9b153c9933139))
+* **v2:** leave the tool call status out of permission subjects ([#1447](https://github.com/agentclientprotocol/claude-agent-acp/issues/1447)) ([c7c80f7](https://github.com/agentclientprotocol/claude-agent-acp/commit/c7c80f7b26f8d90f7f1c828036db64bc46dddddf))
+
 ## [0.97.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.96.0...v0.97.0) (2026-10-26)
 
 
