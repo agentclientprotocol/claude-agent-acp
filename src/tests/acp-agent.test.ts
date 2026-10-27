@@ -2980,7 +2980,16 @@ describe("task notification replay", () => {
     });
   });
 
-  it("sends nothing for a task that a Monitor tool call started", async () => {
+  /**
+   * Scenario:
+   * 1. A replayed transcript has a Monitor tool call that started a background task.
+   * 2. The task notification completes it.
+   * Expected:
+   * - The task spawn is a monitor with no transcript card and no Stop.
+   * - The task then reaches the completed state.
+   * - The Monitor tool call itself stays in the transcript.
+   */
+  it("replays a task that a Monitor tool call started as a monitor", async () => {
     const monitorLaunch = record({
       ...bashLaunch[1],
       message: {
@@ -3002,7 +3011,18 @@ describe("task notification replay", () => {
       notification("completed"),
     ]);
 
-    expect(asyncTaskUpdates(updates)).toEqual([]);
+    const taskUpdates = asyncTaskUpdates(updates);
+    expect(taskUpdates[0]).toMatchObject({
+      sessionUpdate: "async_task_spawned",
+      taskType: "monitor",
+      showInTranscript: false,
+      canStop: false,
+      toolCallId: "toolu_bash",
+    });
+    expect(taskUpdates.at(-1)).toMatchObject({
+      sessionUpdate: "async_task_state_update",
+      state: "completed",
+    });
     // The Monitor tool call itself stays in the transcript.
     expect(
       updates.some(
@@ -9731,7 +9751,18 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(backgrounded("child-cat")).toBe(false);
   });
 
-  it("hides the async task of a Monitor tool call and keeps the tool call", async () => {
+  /**
+   * Scenario:
+   * 1. The model calls Monitor twice; the SDK reports both tasks as `local_bash`.
+   * 2. The first task has its tool call id at start, the second only in a later progress.
+   * 3. The first task completes; the client asks to stop the second.
+   * Expected:
+   * - Both tasks are spawned as monitors with no transcript card and no Stop.
+   * - The first task reaches the completed state.
+   * - The stop request returns `stopped: false`.
+   * - Both Monitor tool calls stay in the transcript.
+   */
+  it("publishes the async task of a Monitor tool call as a monitor and keeps the tool call", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
       {
@@ -9835,9 +9866,25 @@ describe("subagent permission attribution (issue #851)", () => {
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
 
-    expect(updates.filter(({ update }) => update.sessionUpdate.startsWith("async_task_"))).toEqual(
-      [],
-    );
+    const taskUpdates = updates
+      .map(({ update }) => update)
+      .filter((update) => update.sessionUpdate.startsWith("async_task_"));
+    const spawns = taskUpdates.filter((update) => update.sessionUpdate === "async_task_spawned");
+    expect(spawns.map((update: any) => [update.asyncTaskId, update.toolCallId])).toEqual([
+      ["mon-a", "monitor-a"],
+      ["mon-b", "monitor-b"],
+    ]);
+    for (const spawn of spawns) {
+      expect(spawn).toMatchObject({ taskType: "monitor", showInTranscript: false, canStop: false });
+    }
+    expect(
+      taskUpdates.some(
+        (update: any) =>
+          update.sessionUpdate === "async_task_state_update" &&
+          update.asyncTaskId === "mon-a" &&
+          update.state === "completed",
+      ),
+    ).toBe(true);
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "mon-b" }),
     ).resolves.toEqual({ stopped: false });
@@ -10020,6 +10067,15 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(bashUpdate?._meta ?? {}).not.toHaveProperty("jetbrains");
   });
 
+  /**
+   * Scenario:
+   * 1. A subagent starts Bash tasks and a Monitor task; the root session starts one Bash task.
+   * 2. The client stops a Bash task and the Monitor task.
+   * Expected:
+   * - Subagent tasks, including the monitor, go to the subagent session; the root task stays in the root.
+   * - The monitor is spawned with no transcript card and no Stop.
+   * - Only the Bash task is stopped; the Monitor stop returns `stopped: false`.
+   */
   it("sends the background tasks of a subagent to its session and keeps a root task in the root", async () => {
     const updates: AcpSessionNotification[] = [];
     const agent = new ClaudeAcpAgent(
@@ -10155,7 +10211,7 @@ describe("subagent permission attribution (issue #851)", () => {
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "watch-child" }),
     ).resolves.toEqual({ stopped: true });
-    // The client never sees a Monitor task, so it cannot stop it.
+    // A Monitor task is published with canStop false, so the stop request is refused.
     await expect(
       agent.stopAsyncTask({ sessionId: "test-session", asyncTaskId: "monitor-child" }),
     ).resolves.toEqual({ stopped: false });
@@ -10172,6 +10228,7 @@ describe("subagent permission attribution (issue #851)", () => {
     expect(lifecycle).toEqual([
       ["agent-1", "async_task_spawned", "shell-child", undefined],
       ["agent-1", "async_task_spawned", "watch-child", undefined],
+      ["agent-1", "async_task_spawned", "monitor-child", undefined],
       ["agent-1", "async_task_spawned", "shell-late", undefined],
       ["test-session", "async_task_spawned", "shell-root", undefined],
       ["agent-1", "async_task_state_update", "shell-child", "completed"],
@@ -10181,6 +10238,15 @@ describe("subagent permission attribution (issue #851)", () => {
       ["agent-1", "async_task_spawned", "shell-held", undefined],
       ["agent-1", "async_task_state_update", "shell-held", "completed"],
     ]);
+    const monitorSpawn = updates.find(
+      ({ update }) =>
+        update.sessionUpdate === "async_task_spawned" && update.asyncTaskId === "monitor-child",
+    )?.update;
+    expect(monitorSpawn).toMatchObject({
+      taskType: "monitor",
+      showInTranscript: false,
+      canStop: false,
+    });
     // The stop acknowledgement goes to the transcript that holds the task.
     const stopAcknowledgement = updates.find(
       ({ update }) =>
