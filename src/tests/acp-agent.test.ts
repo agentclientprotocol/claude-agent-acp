@@ -24869,6 +24869,82 @@ describe("deferred settlement for live background subagents (issues #864/#866)",
       ]);
     });
 
+    // Issue #1453: a previous cycle's trailing idle completed the next turn task.
+    it.each(["result", "idle"] as const)(
+      "keeps the next turn task open across an owed idle until its own %s",
+      async (end) => {
+        const { agent, asyncTaskUpdates } = await airAgent();
+        let wake = () => {};
+        const woken = new Promise<void>((resolve) => (wake = resolve));
+        let finish = () => {};
+        const finished = new Promise<void>((resolve) => (finish = resolve));
+        injectGeneratorSession(agent, (input) => {
+          async function* messageGenerator() {
+            const iter = input[Symbol.asyncIterator]();
+            yield userEcho((await iter.next()).value);
+            yield running();
+            yield resultMessage();
+            yield idle();
+            await woken;
+            yield running();
+            yield assistantText("first autonomous cycle");
+            yield resultMessage({ origin: { kind: "task-notification" } });
+            // The CLI stays running: the next output opens a new turn task.
+            yield assistantText("next autonomous cycle");
+            yield idle(); // The previous autonomous result's late trailer.
+            await finished;
+            yield assistantText("still working in the next cycle");
+            if (end === "result") {
+              yield resultMessage({ origin: { kind: "task-notification" } });
+            }
+            yield idle();
+          }
+          return messageGenerator();
+        });
+
+        await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "go" }] });
+        wake();
+        try {
+          await waitFor(
+            () =>
+              asyncTaskUpdates().filter((u) => u.sessionUpdate === "async_task_spawned").length ===
+                2 && agent.sessions["test-session"].owedTrailingIdles === 0,
+          );
+          const [first, firstEnd, next] = asyncTaskUpdates();
+          expect(asyncTaskUpdates()).toEqual([
+            first,
+            {
+              sessionUpdate: "async_task_state_update",
+              asyncTaskId: first.asyncTaskId,
+              state: "completed",
+            },
+            next,
+          ]);
+          expect(firstEnd.state).toBe("completed");
+          expect(next.sessionUpdate).toBe("async_task_spawned");
+          expect(next.asyncTaskId).not.toBe(first.asyncTaskId);
+        } finally {
+          finish();
+          await agent.sessions["test-session"]?.consumer;
+        }
+        const [first, , next] = asyncTaskUpdates();
+        expect(asyncTaskUpdates()).toEqual([
+          first,
+          {
+            sessionUpdate: "async_task_state_update",
+            asyncTaskId: first.asyncTaskId,
+            state: "completed",
+          },
+          next,
+          {
+            sessionUpdate: "async_task_state_update",
+            asyncTaskId: next.asyncTaskId,
+            state: "completed",
+          },
+        ]);
+      },
+    );
+
     describe("started by a scheduler fire", () => {
       const lifecycleStarted = (fire: { wakeup_source?: string; scheduled_for?: number }) =>
         ({
