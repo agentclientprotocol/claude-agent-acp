@@ -143,9 +143,13 @@ function isGrouped(options: SessionConfigSelectOptions): options is SessionConfi
   return options.some((entry) => "group" in entry);
 }
 
-/** v2 tags the free-text input of a command with `type: "text"`. */
+/**
+ * v2 tags each command with `type: "command"` and its free-text input with
+ * `type: "text"`. A receiver drops a command without the `type` tag.
+ */
 export function v2AvailableCommands(commands: AvailableCommand[]): v2.AvailableCommand[] {
   return commands.map(({ input, ...command }) => ({
+    type: "command",
     ...command,
     ...(input != null ? { input: { type: "text", ...input } } : {}),
   }));

@@ -1746,11 +1746,11 @@ export function linkedSessionMessages(
   return [
     {
       sessionId: senderSessionId,
-      update: { ...message, recipientMessageId: toolUseId } as AcpSessionNotification["update"],
+      update: { ...message, recipientMessageId: toolUseId },
     },
     {
       sessionId: recipientSessionId,
-      update: { ...message, senderMessageId: toolUseId } as AcpSessionNotification["update"],
+      update: { ...message, senderMessageId: toolUseId },
     },
   ];
 }

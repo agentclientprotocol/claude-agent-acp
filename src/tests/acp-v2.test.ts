@@ -367,11 +367,13 @@ describe("ACP protocol routing", () => {
 /** The commands of every session of the mocked SDK, in v2 form. */
 const SESSION_COMMANDS: v2.AvailableCommand[] = [
   {
+    type: "command",
     name: "review",
     description: "Review a change",
     input: { type: "text", hint: "<pull request>" },
   },
   {
+    type: "command",
     name: "mcp",
     description: "Show the MCP servers and their status, or reconnect, enable, or disable a server",
     input: { type: "text", hint: "[reconnect|enable|disable [<server>|all]]" },
