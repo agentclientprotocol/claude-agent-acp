@@ -13428,6 +13428,10 @@ describe("MCP server startup failures", () => {
     ]);
 
     const withOAuth = setup([{ name: "client-api", status: "needs-auth" }]);
+    // The OAuth flow also needs the query's `mcpAuthenticate`.
+    (withOAuth.agent as any).sessions["test-session"].query.mcpAuthenticate = vi.fn(
+      async () => ({}),
+    );
     await withOAuth.agent.initialize({
       protocolVersion: 1,
       clientCapabilities: { session: { notices: {} }, elicitation: { url: {} } },

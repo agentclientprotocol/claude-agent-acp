@@ -4161,9 +4161,9 @@ export class ClaudeAcpAgent {
    *  reports as `failed` or `needs-auth`, once per server per session. Servers
    *  from the user's Claude Code settings are left to `/mcp`: they are the same
    *  in every session, so a broken one would be reported in every session. A
-   *  `needs-auth` server is reported only when the client can't run the OAuth
-   *  flow (no URL elicitation); otherwise `startMcpAuthentication` asks the
-   *  user to sign in. */
+   *  `needs-auth` server is reported only when the OAuth flow can't run (no
+   *  URL elicitation on the client, or no `mcpAuthenticate` on the query);
+   *  otherwise `startMcpAuthentication` asks the user to sign in. */
   private async reportMcpServerStartupFailures(
     session: Session,
     servers: SDKSystemMessage["mcp_servers"] | undefined,
@@ -4175,7 +4175,8 @@ export class ClaudeAcpAgent {
     const clientServers = new Set(
       (session.creationParams?.mcpServers ?? []).map((server) => server.name),
     );
-    const oauthAvailable = !!this.clientCapabilities?.elicitation?.url;
+    const oauthAvailable =
+      !!this.clientCapabilities?.elicitation?.url && supportsMcpOAuth(session.query);
     for (const server of servers) {
       if (!clientServers.has(server.name) || session.reportedMcpServers?.has(server.name)) {
         continue;
@@ -4221,6 +4222,12 @@ export class ClaudeAcpAgent {
       await this.recreateLiveSession(creationParams, sessionId, {
         permissionMode: session.modes.currentModeId as PermissionMode,
       });
+      // The new Session has the same MCP servers; keep the ones already
+      // reported so its first `system`/init doesn't repeat their notices.
+      const recreated = this.sessions[sessionId];
+      if (recreated && session.reportedMcpServers) {
+        recreated.reportedMcpServers = new Set(session.reportedMcpServers);
+      }
     } catch (error) {
       // Keep the husk addressable: the client answers the refusal with its own
       // auth flow and then retries this session.
