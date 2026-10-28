@@ -10,6 +10,7 @@ import {
   resumedNativeSubagentId,
   sendMessageResume,
   sendMessageResumePrompt,
+  type SubagentModels,
 } from "../native-subagents.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -1059,16 +1060,13 @@ describe("NativeSubagentRuntime in the RFD form", () => {
     expect(published.map(({ update }) => update.sessionUpdate)).toEqual(["subagent_update"]);
   });
 
-  it.each(["air", undefined] as const)(
-    "does not report child config in the %s form",
-    async (form) => {
-      const deliver = vi.fn(async () => {});
-      const runtime = new NativeSubagentRuntime(form, "root", {}, deliver, { log: () => {} });
-      await runtime.reportModel("launch-1", "child-model", deliver);
-      await runtime.reportConfiguration("worker-1", [effortOption("high")]);
-      expect(deliver).not.toHaveBeenCalled();
-    },
-  );
+  it("does not report child config without native subagent sessions", async () => {
+    const deliver = vi.fn(async () => {});
+    const runtime = new NativeSubagentRuntime(undefined, "root", {}, deliver, { log: () => {} });
+    await runtime.reportModel("launch-1", "child-model", deliver);
+    await runtime.reportConfiguration("worker-1", [effortOption("high")]);
+    expect(deliver).not.toHaveBeenCalled();
+  });
 
   it("hides the Agent tool call, which the parent's session messages replace", async () => {
     const { runtime, control } = await runningWorker();
@@ -2468,5 +2466,281 @@ describe("NativeSubagentRuntime in the AIR form, for an agent from before a load
     expect(published).toEqual([]);
     await runtime.route(agentCall("launch-1"), async () => {});
     expect(spawned(published)).toEqual(["root -> worker-1"]);
+  });
+});
+
+describe("NativeSubagentRuntime child models", () => {
+  const entries = {
+    default: { value: "default", name: "Default (recommended)" },
+    sonnet: { value: "sonnet", name: "Sonnet 4.6" },
+  };
+  /** The root session's `model` option, as `modelEntryFor` maps a model id to it. */
+  const models: SubagentModels = {
+    entry: (model) => (model === "claude-sonnet-4-6" ? entries.sonnet : undefined),
+    name: (model) => (model === "claude-opus-5" ? "Opus 5" : undefined),
+  };
+  const agentCall = (toolCallId: string, input: Record<string, unknown>): AcpSessionNotification =>
+    ({
+      sessionId: "root",
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: "Agent",
+        status: "pending",
+        rawInput: { description: "Fix the build", prompt: "Make it pass", ...input },
+        _meta: {
+          claudeCode: { toolName: "Agent" },
+          jetbrains: { air: { version: 1, subagent: true } },
+        },
+      },
+    }) as AcpSessionNotification;
+
+  /** A runtime of `form` whose child `worker-1` the call `launch-1` with `input` launched. */
+  async function spawn(form: "rfd" | "air", input: Record<string, unknown> = {}) {
+    const published: AcpSessionNotification[] = [];
+    const runtime = new NativeSubagentRuntime(
+      form,
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+      },
+      { log: () => {} },
+      undefined,
+      undefined,
+      models,
+    );
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await deliver(agentCall("launch-1", input));
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      deliver,
+    );
+    return { runtime, published, deliver };
+  }
+  /** Each child `model` option sent: its session, value, and name, the only choice. */
+  const modelUpdates = (published: AcpSessionNotification[]) =>
+    published.flatMap(({ sessionId, update }) =>
+      update.sessionUpdate === "config_option_update"
+        ? update.configOptions.map((option) => {
+            const choices = option.type === "select" ? option.options : [];
+            expect(option).toMatchObject({ id: "model", category: "model", type: "select" });
+            expect(choices).toEqual([{ value: option.currentValue, name: expect.any(String) }]);
+            return [sessionId, option.currentValue, (choices[0] as { name: string }).name];
+          })
+        : [],
+    );
+
+  it.each(["rfd", "air"] as const)(
+    "%s: sends no model before the child's first response, whatever the launch asks for",
+    async (form) => {
+      const { runtime, published, deliver } = await spawn(form, { model: "sonnet" });
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "<synthetic>", deliver);
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+      expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+    },
+  );
+
+  it.each(["rfd", "air"] as const)(
+    "%s: sends the model again only when the entry changes",
+    async (form) => {
+      const { runtime, published, deliver } = await spawn(form);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+      // The root session's own responses do not change the child.
+      await runtime.reportModel(null, "claude-opus-5", deliver);
+      expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+      // A model id that matches no entry goes as the id, with its display name.
+      await runtime.reportModel("launch-1", "claude-opus-5", deliver);
+      await runtime.reportModel("launch-1", "claude-opus-5", deliver);
+      expect(modelUpdates(published)).toEqual([
+        ["worker-1", "sonnet", "Sonnet 4.6"],
+        ["worker-1", "claude-opus-5", "Opus 5"],
+      ]);
+    },
+  );
+
+  it("air: drops a model update that waits for an earlier one when the child ends", async () => {
+    const published: AcpSessionNotification[] = [];
+    const firstSent = deferred();
+    const runtime = new NativeSubagentRuntime(
+      "air",
+      "root",
+      {},
+      async (notification) => {
+        published.push(notification);
+        // The client takes the first model update slowly.
+        if (notification.update.sessionUpdate === "config_option_update") await firstSent.promise;
+      },
+      { log: () => {} },
+      undefined,
+      undefined,
+      models,
+    );
+    const deliver = async (notification: AcpSessionNotification) => {
+      const routed = await runtime.route(notification, deliver);
+      if (routed) published.push(routed);
+    };
+    await deliver(agentCall("launch-1", {}));
+    await runtime.taskStarted(
+      { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+      deliver,
+    );
+    const first = runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+    await vi.waitFor(() => expect(modelUpdates(published)).toHaveLength(1));
+    // The child ends while the client has not taken the first update yet, and
+    // a model update comes in meanwhile.
+    const finished = runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    const second = runtime.reportModel("launch-1", "claude-opus-5", deliver);
+    firstSent.resolve();
+    await Promise.all([first, second, finished]);
+    // Nothing follows the end.
+    expect(published.at(-1)?.update.sessionUpdate).toBe("subagent_state_update");
+  });
+
+  it("air: reports a hook's configuration under the agent's current generation", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    // The SDK resumes the agent: AIR's draft opens a new generation session.
+    await runtime.taskResumed("worker-1", deliver, "Continue");
+    const generation = published
+      .flatMap(({ update }) =>
+        update.sessionUpdate === "subagent_spawned" ? [update.subagentSessionId] : [],
+      )
+      .at(-1);
+    expect(generation).toBe("worker-1:generation:2");
+    // A hook names the SDK agent id, not the generation session.
+    await runtime.reportConfiguration("worker-1", [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "sonnet",
+        options: [{ value: "sonnet", name: "Sonnet 4.6" }],
+      },
+    ]);
+    expect(modelUpdates(published)).toEqual([[generation, "sonnet", "Sonnet 4.6"]]);
+  });
+
+  it.each(["rfd", "air"] as const)(
+    "%s: keeps only the latest model of a child that is not announced yet",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        {},
+        async (notification) => {
+          published.push(notification);
+        },
+        { log: () => {} },
+        undefined,
+        undefined,
+        models,
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      // More responses than the buffer of one parent holds (32), before the launch call.
+      for (let index = 0; index < 40; index++) {
+        await runtime.reportModel(
+          "launch-1",
+          index % 2 ? "claude-opus-5" : "claude-sonnet-4-6",
+          deliver,
+        );
+      }
+      await runtime.route(
+        {
+          sessionId: "root",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "working" },
+            _meta: { claudeCode: { parentToolUseId: "launch-1" } },
+          },
+        } as AcpSessionNotification,
+        deliver,
+      );
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await deliver(agentCall("launch-1", {}));
+      expect(modelUpdates(published)).toEqual([["worker-1", "claude-opus-5", "Opus 5"]]);
+      // The child's output is not crowded out of the buffer.
+      expect(published.map(({ update }) => update.sessionUpdate)).toContain("agent_message_chunk");
+    },
+  );
+
+  it.each(["rfd", "air"] as const)(
+    "%s: sends a model again after its publication failed",
+    async (form) => {
+      const published: AcpSessionNotification[] = [];
+      let failures = 1;
+      const runtime = new NativeSubagentRuntime(
+        form,
+        "root",
+        {},
+        async (notification) => {
+          if (notification.update.sessionUpdate === "config_option_update" && failures-- > 0) {
+            throw new Error("client gone");
+          }
+          published.push(notification);
+        },
+        { log: () => {} },
+        undefined,
+        undefined,
+        models,
+      );
+      const deliver = async (notification: AcpSessionNotification) => {
+        const routed = await runtime.route(notification, deliver);
+        if (routed) published.push(routed);
+      };
+      await deliver(agentCall("launch-1", {}));
+      await runtime.taskStarted(
+        { taskId: "worker-1", toolUseId: "launch-1", subagentType: "Explore" },
+        deliver,
+      );
+      await expect(runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver)).rejects.toThrow(
+        "client gone",
+      );
+      expect(modelUpdates(published)).toEqual([]);
+      await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+      expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+    },
+  );
+
+  it("air: forgets the configuration of an ended child", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+    expect(runtime.configurationOf("worker-1")).toHaveLength(1);
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    expect(runtime.configurationOf("worker-1")).toBeUndefined();
+    // A hook after the end stores nothing either.
+    await runtime.reportConfiguration("worker-1", [
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "sonnet",
+        options: [{ value: "sonnet", name: "Sonnet 4.6" }],
+      },
+    ]);
+    expect(runtime.configurationOf("worker-1")).toBeUndefined();
+    expect(modelUpdates(published)).toEqual([["worker-1", "sonnet", "Sonnet 4.6"]]);
+  });
+
+  it("air: sends no model to a child after its end", async () => {
+    const { runtime, published, deliver } = await spawn("air");
+    await runtime.finishTask("worker-1", "completed", deliver, "launch-1");
+    await runtime.reportModel("launch-1", "claude-sonnet-4-6", deliver);
+    expect(modelUpdates(published)).toEqual([]);
   });
 });

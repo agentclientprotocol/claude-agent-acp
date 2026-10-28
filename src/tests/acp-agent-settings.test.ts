@@ -521,7 +521,7 @@ describe("ClaudeAcpAgent settings", () => {
       (agent as any).createSession = async (params: object, options: { resume?: string }) => {
         creations.push(options);
         // The CLI never wrote the conversation, so the resume fails.
-        if (options.resume) throw RequestError.resourceNotFound(sessionId);
+        if (options.resume) throw RequestError.sessionNotFound(sessionId);
         return createSession(params, options);
       };
 

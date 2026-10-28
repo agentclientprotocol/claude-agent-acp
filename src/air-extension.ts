@@ -22,6 +22,9 @@ export const AIR_PLAN_FILE_CAPABILITY = "planFile";
  * subscription. Advertised only to a client that declares it.
  */
 export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
+/** Metadata lookup of known ids with `_session/batch_get`. Advertised
+ *  exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is negotiated. */
+export const AIR_SESSION_BATCH_GET_CAPABILITY = "sessionBatchGet";
 /**
  * The agent supports `_session/archive` and `_session/unarchive`. Advertised
  * exactly when {@link AIR_SESSION_INDEX_CAPABILITY} is; the client does not

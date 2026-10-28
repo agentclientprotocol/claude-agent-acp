@@ -114,7 +114,10 @@ describe("resolveFastModeEnabled", () => {
 
   it("rejects any other value", () => {
     expect(() => resolveFastModeEnabled({ ...base, value: "maybe" })).toThrow(
-      /Invalid value for config option fast/,
+      expect.objectContaining({
+        code: -32602,
+        message: expect.stringContaining("Invalid value for config option fast"),
+      }),
     );
   });
 });

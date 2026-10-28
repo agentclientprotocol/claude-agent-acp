@@ -280,14 +280,37 @@ function joinMultiSelectAnswer(items: string[]): string {
  * cannot make the selection disappear. Decline yields empty answers (the model
  * is told the user skipped rather than the turn aborting); cancel — and any
  * custom/future action we don't understand — aborts the tool call.
+ *
+ * With `reportUnanswered` set (the session's `system/init` listed
+ * `ask_user_question_unanswered_v1`), each question left without an answer
+ * also gets `annotations[question].unanswered`: `"dismissed"` for every
+ * question when the user declined the form, `"skipped"` for a question left
+ * blank in an accepted form. The model does not see this field; the tool
+ * result carries it for clients and transcripts. A CLI without the capability
+ * can refuse the whole answer over it, so it is left out there.
  */
 export function applyAskElicitationResponse(
   response: CreateElicitationResponse,
   toolInput: Record<string, unknown>,
   questions: AskUserQuestion[],
+  options: { reportUnanswered?: boolean } = {},
 ): AskUserQuestionOutcome {
+  // Typed against the output schema: as of SDK 0.3.312 only it lists
+  // `unanswered`, though the tool reads the same annotations from its input.
+  const annotations: NonNullable<AskUserQuestionOutput["annotations"]> = {};
+  const withAnnotations = (answers: AskUserQuestionOutput["answers"]) => ({
+    ...toolInput,
+    answers,
+    ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
+  });
+
   if (response.action === "decline") {
-    return { action: "answered", updatedInput: { ...toolInput, answers: {} } };
+    if (options.reportUnanswered) {
+      for (const question of questions) {
+        annotations[question.question] = { unanswered: "dismissed" };
+      }
+    }
+    return { action: "answered", updatedInput: withAnnotations({}) };
   }
 
   if (response.action !== "accept") {
@@ -298,7 +321,6 @@ export function applyAskElicitationResponse(
   // Typed against the tool's own output schema so the answer/response shapes
   // stay in sync with what the built-in tool's call() expects to read back.
   const answers: AskUserQuestionOutput["answers"] = {};
-  const annotations: NonNullable<AskUserQuestionInput["annotations"]> = {};
   questions.forEach((question, index) => {
     const custom = content[questionCustomFieldKey(index)];
     const customText = typeof custom === "string" ? custom.trim() : "";
@@ -341,14 +363,15 @@ export function applyAskElicitationResponse(
     }
   });
 
-  return {
-    action: "answered",
-    updatedInput: {
-      ...toolInput,
-      answers,
-      ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
-    },
-  };
+  if (options.reportUnanswered) {
+    for (const question of questions) {
+      if (answers[question.question] === undefined) {
+        annotations[question.question] = { unanswered: "skipped" };
+      }
+    }
+  }
+
+  return { action: "answered", updatedInput: withAnnotations(answers) };
 }
 
 /**

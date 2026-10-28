@@ -284,6 +284,16 @@ export async function mockedSessionMessages(): Promise<Record<string, unknown>[]
   return activeScript?.transcript ?? [];
 }
 
+/** The `getSessionInfo` of the SDK mock: a stored title and modification
+ *  time for a scenario that replays a transcript, and none for a new
+ *  session, whose transcript the mock never writes. */
+export async function mockedSessionInfo(
+  sessionId: string,
+): Promise<{ sessionId: string; summary: string; lastModified: number } | undefined> {
+  if (!activeScript?.transcript.length) return undefined;
+  return { sessionId, summary: "Fix the app", lastModified: Date.UTC(2026, 0, 1) };
+}
+
 type AgentClass = new (client: any, logger?: any) => any;
 
 /** The outbound messages of one scenario run. */
