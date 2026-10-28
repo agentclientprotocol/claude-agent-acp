@@ -411,16 +411,11 @@ function escapesContainer(segment: string): boolean {
  *
  * [scans] holds the container listings of one resolution pass. Pass the same cache for every command of one
  * list, and each container is listed once instead of once per command.
- *
- * [pluginPaths] maps a plugin name to its root directory, as `system`/init reports it. A plugin loaded from a
- * path (`--plugin-dir`) or installed into `~/.claude/plugins/cache` lives outside the directories above, so
- * for `plug:name` its `<root>/skills` is probed first.
  */
 export function resolveSkillPath(
   skillName: string,
   cwd?: string,
   scans?: SkillScanCache,
-  pluginPaths?: ReadonlyMap<string, string>,
 ): string | undefined {
   if (!cwd) {
     return undefined;
@@ -462,10 +457,6 @@ export function resolveSkillPath(
       containers.push(path.join(marketplaces, marketplace, "plugins", scope, "skills"));
     }
   };
-  const pluginRoot = scope === undefined ? undefined : pluginPaths?.get(scope);
-  if (pluginRoot) {
-    containers.push(path.join(pluginRoot, "skills"));
-  }
   addScopedContainers(cwd);
   addScopedContainers(os.homedir());
   addContainers(cwd);
@@ -503,51 +494,4 @@ export function resolveSkillPath(
     }
   }
   return undefined;
-}
-
-/**
- * The `<rel>` of a nested skill's description, or `undefined` when it has none or `<rel>` leaves the session cwd.
- *
- * Claude Code loads a `.claude/skills` below the cwd once the agent works there, and lists the skill under its
- * bare name with the directory only in the description text, e.g.
- * `probe nested skill (from sub/.claude/skills — applies when working on files under sub/) (project)`.
- * That format is the CLI's own text: if it changes, the regex stops matching and the skill stays unmarked, as it
- * was before this lookup existed.
- */
-export function nestedSkillScope(
-  description: string,
-): { rel: string; container: string } | undefined {
-  const match = /\(from ([^()]+?)\/(\.claude\/skills|\.agents\/skills)(?=[\s/)])/.exec(description);
-  if (!match || !match[1] || escapesContainer(match[1])) {
-    return undefined;
-  }
-  return { rel: match[1], container: match[2] };
-}
-
-/**
- * Absolute path of the `SKILL.md` of a nested skill that [description] places under [cwd], or `undefined` when
- * the description names no such directory or the file is missing or declares another name. Like
- * [resolveSkillPath], only a file that exists is returned.
- */
-export function resolveNestedSkillPath(
-  skillName: string,
-  description: string,
-  cwd?: string,
-): string | undefined {
-  const scope = nestedSkillScope(description);
-  if (!cwd || !scope || !skillName || /[/\\]/.test(skillName) || skillName === "..") {
-    return undefined;
-  }
-  const candidate = path.join(cwd, scope.rel, scope.container, skillName, "SKILL.md");
-  let stats: Stats;
-  try {
-    stats = statSync(candidate);
-  } catch {
-    return undefined;
-  }
-  if (!stats.isFile()) {
-    return undefined;
-  }
-  const declared = cachedDeclaredName(candidate, stats);
-  return declared === undefined || declared === skillName ? candidate : undefined;
 }

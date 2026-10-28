@@ -23,7 +23,6 @@ import {
 } from "@agentclientprotocol/sdk/unstable";
 import type { AcpSessionNotification } from "../acp-subagents.js";
 import { NativeSubagentRuntime } from "../native-subagents.js";
-import { nestedSkillScope, resolveNestedSkillPath } from "../tool-calls/reporters/interaction.js";
 import { nodeToWebWritable, nodeToWebReadable } from "../utils.js";
 import {
   createPostToolUseHook,
@@ -13842,40 +13841,40 @@ describe("skill commands in available_commands_update", () => {
   });
 });
 
-describe("skills outside the cwd's .claude/skills in available_commands_update", () => {
-  const NESTED_DESCRIPTION =
-    "probe nested skill (from sub/.claude/skills \u2014 applies when working on files under sub/) (project)";
+describe("skill files from getContextUsage in available_commands_update", () => {
   let cwd: string;
-  let pluginRoot: string;
-
-  async function writeSkill(file: string, declaredName?: string) {
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, declaredName ? `---\nname: ${declaredName}\n---\n` : "# skill\n");
-  }
 
   beforeEach(async () => {
-    cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-sources-"));
-    pluginRoot = await mkdtemp(path.join(os.tmpdir(), "acp-skill-plugin-"));
+    cwd = await mkdtemp(path.join(os.tmpdir(), "acp-skill-files-"));
   });
 
   afterEach(async () => {
     await rm(cwd, { recursive: true, force: true });
-    await rm(pluginRoot, { recursive: true, force: true });
   });
 
-  /** Runs one turn that emits `inits` and then `commands_changed` with `commands`; returns every
-   *  available_commands_update. */
-  async function runTurn(
-    clientCapabilities: Record<string, unknown>,
-    commands: Array<Record<string, unknown>>,
-    inits: Array<Record<string, unknown>>,
-  ) {
+  const skillEntry = (entry: Record<string, unknown>) => ({
+    skills: { skillFrontmatter: [entry] },
+  });
+
+  /** Lets the background skill file reads and their updates finish. */
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  /** One turn that emits `inits` init frames, then `changes` commands_changed frames for
+   *  `commands`. `getContextUsage` is put on the query only when given. */
+  async function runTurn(options: {
+    capabilities: Record<string, unknown>;
+    commands: Array<Record<string, unknown>>;
+    getContextUsage?: ReturnType<typeof vi.fn>;
+    inits?: number;
+    changes?: number;
+  }) {
     const sessionUpdate = vi.fn(async () => {});
+    const logged: string[] = [];
     const agent = new ClaudeAcpAgent({ sessionUpdate } as unknown as AcpClient, {
       log: () => {},
-      error: () => {},
+      error: (...args: unknown[]) => logged.push(args.join(" ")),
     });
-    await agent.initialize({ protocolVersion: 1, clientCapabilities });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: options.capabilities });
     async function* generator(input: Pushable<any>) {
       const iter = input[Symbol.asyncIterator]();
       const { value: userMessage } = await iter.next();
@@ -13887,10 +13886,17 @@ describe("skills outside the cwd's .claude/skills in available_commands_update",
         session_id: "test-session",
         isReplay: true,
       };
-      for (const init of inits) {
-        yield { type: "system", subtype: "init", session_id: "test-session", ...init };
+      for (let i = 0; i < (options.inits ?? 1); i++) {
+        yield { type: "system", subtype: "init", session_id: "test-session" };
       }
-      yield { type: "system", subtype: "commands_changed", session_id: "test-session", commands };
+      for (let i = 0; i < (options.changes ?? 0); i++) {
+        yield {
+          type: "system",
+          subtype: "commands_changed",
+          session_id: "test-session",
+          commands: options.commands,
+        };
+      }
       yield {
         type: "result",
         subtype: "success",
@@ -13917,286 +13923,289 @@ describe("skills outside the cwd's .claude/skills in available_commands_update",
     }
     injectGeneratorSession(agent, generator, { cwd });
     Object.assign(agent.sessions["test-session"].query, {
-      supportedCommands: vi.fn(async () => commands),
+      supportedCommands: vi.fn(async () => options.commands),
+      ...(options.getContextUsage ? { getContextUsage: options.getContextUsage } : {}),
     });
 
     await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "hi" }] });
+    await flush();
 
-    return sessionUpdate.mock.calls
-      .map((c: any[]) => (c[0] as { update: any }).update)
-      .filter((u) => u.sessionUpdate === "available_commands_update")
-      .map((u) => u.availableCommands as Array<{ name: string; _meta?: unknown }>);
+    const commandUpdates = () =>
+      sessionUpdate.mock.calls
+        .map((c: any[]) => (c[0] as { update: any }).update)
+        .filter((u) => u.sessionUpdate === "available_commands_update");
+    return { commandUpdates, logged };
   }
 
-  /** The `_meta` of the command `name` in the last list of `lists`. */
-  function metaOf(lists: Array<Array<{ name: string; _meta?: unknown }>>, name: string) {
-    return lists.at(-1)?.find((c) => c.name === name)?._meta;
+  /** The `_meta` of the command `name` in the last available_commands_update. */
+  function lastMeta(commandUpdates: () => any[], name: string) {
+    const updates = commandUpdates();
+    return updates[updates.length - 1].availableCommands.find((c: any) => c.name === name)?._meta;
   }
 
-  const pluginInit = () => ({
-    skills: ["plug:pskill"],
-    plugins: [{ name: "plug", path: pluginRoot, source: "plug@inline" }],
+  /** The air `_meta` of a skill, with a path when there is one. */
+  const skillMeta = (skillPath?: string) => ({
+    jetbrains: { air: { version: 1, kind: "skill", ...(skillPath ? { skillPath } : {}) } },
   });
 
   /**
    * Scenario:
-   * 1. A plugin from a path has skills/pskill/SKILL.md outside the cwd.
-   * 2. init reports the plugin path, then commands_changed lists plug:pskill.
+   * 1. An AIR session lists the command `plug:pskill`.
+   * 2. getContextUsage reports it with source "plugin" and a path in the plugin directory.
+   * 3. The first init triggers the read.
    * Expected:
-   * - the command carries kind skill and the plugin's SKILL.md path.
+   * - The last update marks `plug:pskill` as a skill with that path.
    */
-  it("resolves a plugin skill from the plugin path that init reports", async () => {
-    const file = path.join(pluginRoot, "skills", "pskill", "SKILL.md");
-    await writeSkill(file);
-
-    const lists = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [{ name: "plug:pskill", description: "(plug) probe", argumentHint: "" }],
-      [pluginInit()],
+  it("takes the path of a plugin skill from getContextUsage", async () => {
+    const pluginSkill = "/plugins/plug/skills/pskill/SKILL.md";
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "plug:pskill", source: "plugin", pluginName: "plug", path: pluginSkill }),
     );
 
-    expect(metaOf(lists, "plug:pskill")).toEqual({
-      jetbrains: { air: { version: 1, kind: "skill", skillPath: file } },
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "plug:pskill", description: "Plugin skill", argumentHint: "" }],
+      getContextUsage,
     });
+
+    expect(lastMeta(commandUpdates, "plug:pskill")).toEqual(skillMeta(pluginSkill));
   });
 
   /**
    * Scenario:
-   * 1. The same plugin skill exists, but init reports no plugins.
-   * 2. commands_changed lists plug:pskill.
+   * 1. An AIR session lists the prompt command `deploy`.
+   * 2. getContextUsage reports it with a `.claude/commands/deploy.md` path.
+   * 3. commands_changed sends the command list.
    * Expected:
-   * - the command stays unmarked.
+   * - `deploy` has no `_meta`: a prompt command is no skill.
    */
-  it("leaves a plugin skill unmarked when init reports no plugin path", async () => {
-    await writeSkill(path.join(pluginRoot, "skills", "pskill", "SKILL.md"));
-
-    const lists = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [{ name: "plug:pskill", description: "(plug) probe", argumentHint: "" }],
-      [],
+  it("does not mark a prompt command that getContextUsage lists with a .md path", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({
+        name: "deploy",
+        source: "projectSettings",
+        path: "/proj/.claude/commands/deploy.md",
+      }),
     );
 
-    expect(metaOf(lists, "plug:pskill")).toBeUndefined();
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "deploy", description: "Deploy", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "deploy")).toBeUndefined();
   });
 
   /**
    * Scenario:
-   * 1. init lists simplify as a skill but not compact.
-   * 2. commands_changed lists both as builtin commands.
+   * 1. An AIR session lists the command `nested`.
+   * 2. getContextUsage lists no skills on the first read (init) and the nested one on the second.
+   * 3. commands_changed arrives after the first read.
    * Expected:
-   * - simplify gets kind skill and no skillPath.
-   * - compact stays unmarked.
+   * - Two reads happened.
+   * - The first update, from commands_changed, has no `_meta` on `nested`.
+   * - The last update marks `nested` with the path from the second read.
    */
-  it("marks a bundled skill with the kind only, and a plain builtin not at all", async () => {
-    const lists = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [
+  it("gives a nested skill reported after commands_changed its path", async () => {
+    const nestedSkill = "/proj/sub/.claude/skills/nested/SKILL.md";
+    const getContextUsage = vi
+      .fn()
+      .mockResolvedValueOnce({ skills: { skillFrontmatter: [] } })
+      .mockResolvedValue(
+        skillEntry({ name: "nested", source: "projectSettings", path: nestedSkill }),
+      );
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "nested", description: "Nested skill", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
+    expect(commandUpdates()[0].availableCommands[0]._meta).toBeUndefined();
+    expect(lastMeta(commandUpdates, "nested")).toEqual(skillMeta(nestedSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. An AIR session lists the builtin commands `simplify` and `compact`.
+   * 2. getContextUsage reports `simplify` with source "built-in" and no path; `compact` is absent.
+   * Expected:
+   * - `simplify` has kind "skill" and no skillPath.
+   * - `compact` has no `_meta`.
+   */
+  it("marks a built-in skill with the kind only and leaves compact unmarked", async () => {
+    const getContextUsage = vi.fn(async () => skillEntry({ name: "simplify", source: "built-in" }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [
         { name: "simplify", description: "Simplify", argumentHint: "", builtin: true },
         { name: "compact", description: "Compact", argumentHint: "", builtin: true },
       ],
-      [{ skills: ["simplify"] }],
+      getContextUsage,
+    });
+
+    expect(lastMeta(commandUpdates, "simplify")).toEqual(skillMeta());
+    expect(lastMeta(commandUpdates, "compact")).toBeUndefined();
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. An AIR session lists `review`; getContextUsage reports no skills.
+   * Expected:
+   * - `review` is marked as a skill with the path found in cwd/.claude/skills.
+   */
+  it("looks up a command that getContextUsage does not list on disk", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => ({ skills: { skillFrontmatter: [] } }));
+
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. The query has no getContextUsage.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - `review` still gets its path from the disk lookup.
+   * - No error is logged.
+   */
+  it("lists the commands as before when getContextUsage is missing", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      changes: 1,
+    });
+
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+    expect(logged.filter((line) => line.includes("skill files"))).toEqual([]);
+  });
+
+  /**
+   * Scenario:
+   * 1. cwd/.claude/skills/review/SKILL.md exists.
+   * 2. getContextUsage rejects.
+   * 3. An AIR session gets a commands_changed.
+   * Expected:
+   * - The prompt completes.
+   * - The error is logged.
+   * - `review` still gets its path from the disk lookup.
+   */
+  it("logs a failing getContextUsage and keeps the turn going", async () => {
+    const reviewSkill = path.join(cwd, ".claude", "skills", "review", "SKILL.md");
+    await mkdir(path.dirname(reviewSkill), { recursive: true });
+    await writeFile(reviewSkill, "# review\n");
+    const getContextUsage = vi.fn(async () => {
+      throw new Error("control request failed");
+    });
+
+    const { commandUpdates, logged } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
+    });
+
+    expect(logged.some((line) => line.includes("control request failed"))).toBe(true);
+    expect(lastMeta(commandUpdates, "review")).toEqual(skillMeta(reviewSkill));
+  });
+
+  /**
+   * Scenario:
+   * 1. A client without the AIR capability runs a turn with init and commands_changed.
+   * Expected:
+   * - getContextUsage is not called.
+   * - No command has `_meta`.
+   */
+  it("does not call getContextUsage for a client that is not AIR", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/x/SKILL.md" }),
     );
 
-    expect(metaOf(lists, "simplify")).toEqual({
-      jetbrains: { air: { version: 1, kind: "skill" } },
+    const { commandUpdates } = await runTurn({
+      capabilities: {},
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 1,
     });
-    expect(metaOf(lists, "compact")).toBeUndefined();
+
+    expect(getContextUsage).not.toHaveBeenCalled();
+    const metas = commandUpdates().flatMap((u) => u.availableCommands.map((c: any) => c._meta));
+    expect(metas.every((meta) => meta === undefined)).toBe(true);
   });
 
   /**
    * Scenario:
-   * 1. A client that is not AIR gets init with a bundled skill and a plugin skill on disk.
+   * 1. An AIR session gets three init frames and then one commands_changed.
+   * 2. Every getContextUsage read returns the same skill list.
    * Expected:
-   * - no command carries _meta.
+   * - Two updates: the one for commands_changed and the one for the first read.
+   * - getContextUsage ran exactly twice: once for init, once for commands_changed.
    */
-  it("gives a client that is not AIR no _meta for plugin and bundled skills", async () => {
-    await writeSkill(path.join(pluginRoot, "skills", "pskill", "SKILL.md"));
-
-    const lists = await runTurn(
-      {},
-      [
-        { name: "plug:pskill", description: "(plug) probe", argumentHint: "" },
-        { name: "simplify", description: "Simplify", argumentHint: "", builtin: true },
-      ],
-      [{ ...pluginInit(), skills: ["plug:pskill", "simplify"] }],
+  it("sends no extra update for an identical result and reads once for repeated inits", async () => {
+    const getContextUsage = vi.fn(async () =>
+      skillEntry({ name: "review", source: "projectSettings", path: "/p/review/SKILL.md" }),
     );
 
-    expect(lists.at(-1)?.map((c) => c._meta)).toEqual([undefined, undefined, undefined]);
+    const { commandUpdates } = await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      inits: 3,
+      changes: 1,
+    });
+
+    expect(commandUpdates()).toHaveLength(2);
+    expect(getContextUsage).toHaveBeenCalledTimes(2);
   });
 
   /**
    * Scenario:
-   * 1. sub/.claude/skills/nested/SKILL.md exists under the cwd.
-   * 2. commands_changed lists nested with the CLI's real description.
+   * 1. The first getContextUsage call stays pending.
+   * 2. An AIR session gets an init and two commands_changed meanwhile.
+   * 3. The pending call then resolves.
    * Expected:
-   * - the command carries kind skill and that SKILL.md path.
+   * - Only one call is made while the first is pending.
+   * - After it resolves, exactly one more call is made.
    */
-  it("resolves a nested skill from the directory in its description", async () => {
-    const file = path.join(cwd, "sub", ".claude", "skills", "nested", "SKILL.md");
-    await writeSkill(file);
-
-    const lists = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [{ name: "nested", description: NESTED_DESCRIPTION, argumentHint: "" }],
-      [],
-    );
-
-    expect(metaOf(lists, "nested")).toEqual({
-      jetbrains: { air: { version: 1, kind: "skill", skillPath: file } },
-    });
-  });
-
-  /**
-   * Scenario:
-   * 1. The description names a directory that exists in the cwd, but no nested/SKILL.md.
-   * Expected:
-   * - the command stays unmarked.
-   */
-  it("leaves a nested skill unmarked when its file is missing", async () => {
-    await mkdir(path.join(cwd, "sub", ".claude", "skills"), { recursive: true });
-
-    const lists = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [{ name: "nested", description: NESTED_DESCRIPTION, argumentHint: "" }],
-      [],
-    );
-
-    expect(metaOf(lists, "nested")).toBeUndefined();
-  });
-
-  /**
-   * Scenario:
-   * 1. init lists plug:pskill and a plugin path.
-   * 2. A second init repeats the same skills and plugins.
-   * Expected:
-   * - one extra available_commands_update for the first init, none for the repeat.
-   */
-  it("re-advertises once for new init skills and plugins, not for an identical repeat", async () => {
-    await writeSkill(path.join(pluginRoot, "skills", "pskill", "SKILL.md"));
-    const command = { name: "plug:pskill", description: "(plug) probe", argumentHint: "" };
-
-    const once = await runTurn(AIR_CLIENT_CAPABILITIES, [command], [pluginInit()]);
-    const twice = await runTurn(AIR_CLIENT_CAPABILITIES, [command], [pluginInit(), pluginInit()]);
-    const none = await runTurn(AIR_CLIENT_CAPABILITIES, [command], []);
-
-    // commands_changed contributes one update to every run.
-    expect(once.length - none.length).toBe(1);
-    expect(twice.length - none.length).toBe(1);
-  });
-
-  /**
-   * Scenario:
-   * 1. The first init carries terminal_slash_commands, skills and plugins.
-   * Expected:
-   * - exactly one update besides the commands_changed one, not one per change.
-   */
-  it("sends one update for an init that changes terminal commands and skills together", async () => {
-    await writeSkill(path.join(pluginRoot, "skills", "pskill", "SKILL.md"));
-    const command = { name: "plug:pskill", description: "(plug) probe", argumentHint: "" };
-
-    const both = await runTurn(
-      AIR_CLIENT_CAPABILITIES,
-      [command],
-      [{ ...pluginInit(), terminal_slash_commands: ["doctor"] }],
-    );
-    const none = await runTurn(AIR_CLIENT_CAPABILITIES, [command], []);
-
-    expect(both.length - none.length).toBe(1);
-  });
-
-  /**
-   * Scenario:
-   * 1. init reports plugin path A, then a later init reports path B for the same plugin.
-   * 2. Both paths hold skills/pskill/SKILL.md.
-   * Expected:
-   * - a second update is sent after the second init, with the SKILL.md of path B.
-   */
-  it("advertises the new skillPath when a later init changes the plugin path", async () => {
-    const otherRoot = await mkdtemp(path.join(os.tmpdir(), "acp-skill-plugin-b-"));
-    try {
-      await writeSkill(path.join(pluginRoot, "skills", "pskill", "SKILL.md"));
-      const fileB = path.join(otherRoot, "skills", "pskill", "SKILL.md");
-      await writeSkill(fileB);
-      const moved = { ...pluginInit(), plugins: [{ name: "plug", path: otherRoot }] };
-
-      const lists = await runTurn(
-        AIR_CLIENT_CAPABILITIES,
-        [{ name: "plug:pskill", description: "(plug) probe", argumentHint: "" }],
-        [pluginInit(), moved],
-      );
-
-      expect(lists).toHaveLength(3);
-      expect(metaOf([lists[1]], "plug:pskill")).toEqual({
-        jetbrains: { air: { version: 1, kind: "skill", skillPath: fileB } },
-      });
-    } finally {
-      await rm(otherRoot, { recursive: true, force: true });
-    }
-  });
-
-  describe("nested skill descriptions", () => {
-    /**
-     * Scenario:
-     * 1. Descriptions name an absolute directory, a `..` directory, and no directory.
-     * Expected:
-     * - none yields a scope.
-     */
-    it("nestedSkillScope rejects a description that leaves the cwd or names no directory", () => {
-      const descriptions = [
-        "x (from /etc/.claude/skills \u2014 y)",
-        "x (from ../up/.claude/skills \u2014 y)",
-        "x (from a/../../b/.agents/skills \u2014 y)",
-        "plain description",
-      ];
-
-      expect(descriptions.map((d) => nestedSkillScope(d))).toEqual([
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-      ]);
+  it("coalesces triggers during a running read into one more read", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const getContextUsage = vi.fn(async () => {
+      if (getContextUsage.mock.calls.length === 1) await gate;
+      return { skills: { skillFrontmatter: [] } };
     });
 
-    /**
-     * Scenario:
-     * 1. A skill sits in pkg/.agents/skills/deep/SKILL.md.
-     * 2. Its description says (from pkg/.agents/skills ...).
-     * Expected:
-     * - the path is resolved.
-     */
-    it("resolveNestedSkillPath accepts the .agents/skills container", async () => {
-      const file = path.join(cwd, "pkg", ".agents", "skills", "deep", "SKILL.md");
-      await writeSkill(file);
-
-      expect(resolveNestedSkillPath("deep", "d (from pkg/.agents/skills \u2014 x)", cwd)).toBe(
-        file,
-      );
+    await runTurn({
+      capabilities: AIR_CLIENT_CAPABILITIES,
+      commands: [{ name: "review", description: "Review", argumentHint: "" }],
+      getContextUsage,
+      changes: 2,
     });
+    expect(getContextUsage).toHaveBeenCalledTimes(1);
 
-    /**
-     * Scenario:
-     * 1. The author's description contains "(from PDFs)" before the CLI's "(from sub/.claude/skills".
-     * Expected:
-     * - the scope is sub/.claude/skills, not text from the author's parentheses.
-     */
-    it("nestedSkillScope skips an earlier (from ...) in the author's text", () => {
-      const description =
-        "Extract data (from PDFs) and more (from sub/.claude/skills \u2014 applies) (project)";
+    release();
 
-      expect(nestedSkillScope(description)).toEqual({ rel: "sub", container: ".claude/skills" });
-    });
-
-    /**
-     * Scenario:
-     * 1. sub/.claude/skills/nested/SKILL.md declares `name: other`.
-     * Expected:
-     * - the nested skill stays unmarked.
-     */
-    it("resolveNestedSkillPath rejects a SKILL.md that declares another name", async () => {
-      await writeSkill(path.join(cwd, "sub", ".claude", "skills", "nested", "SKILL.md"), "other");
-
-      expect(resolveNestedSkillPath("nested", NESTED_DESCRIPTION, cwd)).toBeUndefined();
-    });
+    await vi.waitFor(() => expect(getContextUsage).toHaveBeenCalledTimes(2));
   });
 });
 
