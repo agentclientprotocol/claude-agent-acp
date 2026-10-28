@@ -491,21 +491,48 @@ describe("ACP v2 sessions", () => {
 
   it("sets a config option with a v2 value and reports modes only as config options", async () => {
     const client = v2Client();
-    const response = await client.app.connectWith(connectRouter(), async (agent) => {
-      await initializeV2(agent);
-      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
-      const response = await agent.request(v2.methods.agent.session.setConfigOption, {
-        sessionId,
-        configId: "mode",
-        type: "id",
-        value: "plan",
-      });
-      await client.authUpdate(1);
-      return response;
-    });
+    const { response, updatesBeforeResponse } = await client.app.connectWith(
+      connectRouter(),
+      async (agent) => {
+        await initializeV2(agent);
+        const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+        const response = await agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "mode",
+          type: "id",
+          value: "plan",
+        });
+        const updatesBeforeResponse = client.updates("config_option_update");
+        await client.authUpdate(1);
+        return { response, updatesBeforeResponse };
+      },
+    );
 
     expect(response.configOptions[0]).toMatchObject({ configId: "mode", currentValue: "plan" });
     expect(client.updates("current_mode_update")).toEqual([]);
+    // The client also gets the change as an update, before the response.
+    expect(updatesBeforeResponse).toEqual([
+      { sessionUpdate: "config_option_update", configOptions: response.configOptions },
+    ]);
+  });
+
+  it("sends no config_option_update when setting a config option fails", async () => {
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await expect(
+        agent.request(v2.methods.agent.session.setConfigOption, {
+          sessionId,
+          configId: "mode",
+          type: "id",
+          value: "no-such-mode",
+        }),
+      ).rejects.toThrow();
+      await client.authUpdate(1);
+    });
+
+    expect(client.updates("config_option_update")).toEqual([]);
   });
 
   it("tells the agent that a v2 client takes notices and compaction updates", async () => {

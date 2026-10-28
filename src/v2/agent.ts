@@ -123,7 +123,16 @@ export function v2AgentApp(
       const { configOptions, ...response } = await agent.setSessionConfigOption(
         v1SetSessionConfigOptionRequest(params),
       );
-      return { ...response, configOptions: v2ConfigOptions(configOptions) };
+      // v2 asks for a `config_option_update` on every config change, also one
+      // that a client requested, so other attached clients see it. It goes
+      // before the response, as v2 asks of this duplicate. The agent sends v1
+      // clients none: they read the change from the response only.
+      const options = v2ConfigOptions(configOptions);
+      void client.send({
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "config_option_update", configOptions: options },
+      });
+      return { ...response, configOptions: options };
     })
     .onRequest(v2.methods.agent.session.prompt, ({ params }) =>
       v2Prompt(agent, params, (update) => {
