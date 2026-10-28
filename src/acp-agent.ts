@@ -1123,6 +1123,11 @@ export type Session = {
    *  `user_message_uuids`, and leaves the field out for a request that serves
    *  none, such as a cycle that Claude Code started on its own. */
   requestMarkerListsV1?: boolean;
+  /** True once a `system`/init advertised the ask_user_question_unanswered_v1
+   *  capability, so an AskUserQuestion answer may set
+   *  `annotations[question].unanswered`. An older CLI can refuse the whole
+   *  answer when that field is present. */
+  askUserQuestionUnansweredV1?: boolean;
   /** A main-thread model request started (`status: requesting`) since the
    *  last result, so a model cycle runs. Read only with
    *  {@link Session.requestMarkerListsV1}. */
@@ -6161,6 +6166,9 @@ export class ClaudeAcpAgent {
                 if (message.capabilities?.includes("request_marker_lists_v1")) {
                   session.requestMarkerListsV1 = true;
                 }
+                if (message.capabilities?.includes("ask_user_question_unanswered_v1")) {
+                  session.askUserQuestionUnansweredV1 = true;
+                }
                 // A fresh `system`/init (e.g. after reinitialize) can carry an
                 // updated Fast mode state; reconcile it with what we seeded at
                 // session creation.
@@ -10906,7 +10914,9 @@ export class ClaudeAcpAgent {
       throw new Error("Tool use aborted");
     }
 
-    const outcome = applyAskElicitationResponse(response, toolInput, questions);
+    const outcome = applyAskElicitationResponse(response, toolInput, questions, {
+      reportUnanswered: this.sessions[sessionId]?.askUserQuestionUnansweredV1 === true,
+    });
     if (outcome.action === "cancel") {
       throw new Error("Tool use aborted");
     }

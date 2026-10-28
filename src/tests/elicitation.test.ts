@@ -481,6 +481,45 @@ describe("applyAskElicitationResponse", () => {
     });
   });
 
+  it("marks every question dismissed on decline when reportUnanswered is set", () => {
+    const response = { action: "decline" } as CreateElicitationResponse;
+    expect(
+      applyAskElicitationResponse(response, toolInput, questions, { reportUnanswered: true }),
+    ).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: {},
+        annotations: {
+          "Single?": { unanswered: "dismissed" },
+          "Multi?": { unanswered: "dismissed" },
+        },
+      },
+    });
+  });
+
+  it("marks blank questions skipped on accept when reportUnanswered is set", () => {
+    const response = {
+      action: "accept",
+      content: { question_0: "A", question_0_custom: "note", question_1: [] },
+    } as CreateElicitationResponse;
+    expect(
+      applyAskElicitationResponse(response, toolInput, questions, { reportUnanswered: true }),
+    ).toEqual({
+      action: "answered",
+      updatedInput: {
+        questions,
+        metadata: { source: "test" },
+        answers: { "Single?": "A" },
+        annotations: {
+          "Single?": { notes: "note" },
+          "Multi?": { unanswered: "skipped" },
+        },
+      },
+    });
+  });
+
   it("returns cancel on cancel", () => {
     const response = { action: "cancel" } as CreateElicitationResponse;
     expect(applyAskElicitationResponse(response, toolInput, questions)).toEqual({
