@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.99.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.98.0...v0.99.0) (2026-10-28)
+
+
+### Features
+
+* Add thinking display configuration ([#1081](https://github.com/agentclientprotocol/claude-agent-acp/issues/1081)) ([2f1f4d1](https://github.com/agentclientprotocol/claude-agent-acp/commit/2f1f4d144196c7518a7c072f9ae0e70ac9b91a44))
+* send embedded blob resources in prompts to Claude ([#1460](https://github.com/agentclientprotocol/claude-agent-acp/issues/1460)) ([d0ee308](https://github.com/agentclientprotocol/claude-agent-acp/commit/d0ee30813fbc79dbe122f7455c8e1746e09be458))
+* tell the client when an MCP server fails to start ([#1464](https://github.com/agentclientprotocol/claude-agent-acp/issues/1464)) ([54b35ee](https://github.com/agentclientprotocol/claude-agent-acp/commit/54b35ee0f4d765efc5bc39107a524891266c42ac))
+* update to Claude Agent SDK 0.3.312 ([#1471](https://github.com/agentclientprotocol/claude-agent-acp/issues/1471)) ([4cb8906](https://github.com/agentclientprotocol/claude-agent-acp/commit/4cb8906d32a618011cfeba3260e4eb1db2fd829f))
+* **v2:** send the current session info on session/resume ([#1462](https://github.com/agentclientprotocol/claude-agent-acp/issues/1462)) ([f6ed4a4](https://github.com/agentclientprotocol/claude-agent-acp/commit/f6ed4a4f7d9dd5b5e7ed4e9973d9661becb9f583))
+
+
+### Bug Fixes
+
+* deny a background permission request that the client cancels ([#1466](https://github.com/agentclientprotocol/claude-agent-acp/issues/1466)) ([f646c82](https://github.com/agentclientprotocol/claude-agent-acp/commit/f646c821f1b05df471aac8f1018ea08e2a793f6e))
+* don't report decline when the client can't render an MCP elicitation ([#1465](https://github.com/agentclientprotocol/claude-agent-acp/issues/1465)) ([54b869c](https://github.com/agentclientprotocol/claude-agent-acp/commit/54b869c990ad3efa25c976e8eb3ff5a37808a6a3))
+* list the current model among the model config option's values ([#1463](https://github.com/agentclientprotocol/claude-agent-acp/issues/1463)) ([8e6fe92](https://github.com/agentclientprotocol/claude-agent-acp/commit/8e6fe92a98dab8cec868a8a782e0ded55c94e571))
+* report EnterPlanMode tool calls with the switch_mode kind ([#1467](https://github.com/agentclientprotocol/claude-agent-acp/issues/1467)) ([93c1f43](https://github.com/agentclientprotocol/claude-agent-acp/commit/93c1f43519a6a542dc55a39985d0abd12195129d))
+* return ACP error codes for unknown sessions and invalid config values ([#1458](https://github.com/agentclientprotocol/claude-agent-acp/issues/1458)) ([c2e85cb](https://github.com/agentclientprotocol/claude-agent-acp/commit/c2e85cb58067d9b00e6609ce9e90d4ec3a5d0feb))
+* update ACP SDK to 2.1.0 (schema v1.27.0 / v2.0.0-alpha.10) ([9f9aebf](https://github.com/agentclientprotocol/claude-agent-acp/commit/9f9aebf44bdecab887b03871fee8a2885ceac19a))
+* **v2:** keep clients in sync with config changes and replayed tool calls ([#1461](https://github.com/agentclientprotocol/claude-agent-acp/issues/1461)) ([2a0c188](https://github.com/agentclientprotocol/claude-agent-acp/commit/2a0c188a0aebd0ea03fb449f72dfa53f98c7622d))
+* **v2:** reject MCP transports and prompt content the agent doesn't advertise ([#1459](https://github.com/agentclientprotocol/claude-agent-acp/issues/1459)) ([2480888](https://github.com/agentclientprotocol/claude-agent-acp/commit/2480888b90498158054266bdb3bd7f22822e1b73))
+
 ## [0.98.0](https://github.com/agentclientprotocol/claude-agent-acp/compare/v0.97.0...v0.98.0) (2026-10-27)
 
 
