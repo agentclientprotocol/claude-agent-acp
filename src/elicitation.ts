@@ -113,6 +113,18 @@ export function createElicitationResponseToElicitResult(
  */
 export type AskUserQuestion = AskUserQuestionInput["questions"][number];
 
+/** Rejects delays that Node would shorten to one millisecond. */
+export function parseAskUserQuestionTimeout(value: string | undefined): number {
+  if (value === undefined || value === "") return 300_000;
+  const milliseconds = Number(value);
+  if (/^\d+$/.test(value) && Number.isInteger(milliseconds) && milliseconds <= 2_147_483_647) {
+    return milliseconds;
+  }
+  throw new Error(
+    "CLAUDE_AGENT_ACP_ASK_USER_QUESTION_TIMEOUT_MS must be an integer from 0 to 2147483647 milliseconds",
+  );
+}
+
 /**
  * Pull the well-formed questions out of an AskUserQuestion tool input. Returns
  * `null` when there are no usable questions — including the case where every
