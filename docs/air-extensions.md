@@ -515,6 +515,17 @@ While the adapter does not know the path, a report carries no `planFilePath` key
 The adapter never sends a blank path, because AIR reads a present non-file value as a retraction.
 Without `rawInputRendering`, a `planFile` client gets no copy of the plan in `content` either.
 
+### Approved plan identity
+
+For an AIR client with plan operations, the approved plan ID is `plan-mode:<tool-call ID>`.
+Claude uses the SDK tool-call ID of ExitPlanMode.
+Each review keeps its own plan. Repeated updates of that review keep the same plan ID.
+AIR joins the plan to its review by ID, even when the text includes user edits.
+This link needs no extra metadata.
+The live result, history replay, and clear-context approval use the same identity.
+The identity does not depend on `planFile`: it also applies when the request carries inline plan text.
+Other clients keep the `plan-mode` ID.
+
 ### Fallback
 
 The plan text goes out as before in these cases:

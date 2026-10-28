@@ -2826,6 +2826,7 @@ export class ClaudeAcpAgent {
       applyUltracode: (session, enabled) => this.applyUltracode(session, enabled),
       sessionUpdate: (notification) => this.client.sessionUpdate(notification),
       supportsPlanOperations: () => this.clientCapabilities?.plan != null,
+      isAirClient: () => this.toolCallCapabilities.air.client,
       ensureConsumer: (session, id) => this.ensureConsumer(session, id),
       logError: (message, error) => this.logger.error(message, error),
       destroyReplacement: (id, session) => {
@@ -13936,7 +13937,12 @@ export function toAcpNotifications(
             !("is_error" in chunk && chunk.is_error)
           ) {
             const plan = approvedPlan(toolUse.input, toolUseResult);
-            if (plan) approvedPlanUpdate = planModeUpdate(plan);
+            if (plan) {
+              approvedPlanUpdate = planModeUpdate(
+                plan,
+                renderer.capabilities.air.client ? toolUse.id : undefined,
+              );
+            }
           }
           update = finalUpdate;
         }
