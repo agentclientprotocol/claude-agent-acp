@@ -9950,6 +9950,19 @@ export class ClaudeAcpAgent {
     else if (!withdrawnByCancel) work.events.running();
   }
 
+  /** Sends the current title and `updatedAt` of the session `sessionId` as a
+   *  `session_info_update` (see {@link SessionTitles.publishCurrent}). A
+   *  failure is logged: the info is optional, so it does not fail a resume. */
+  async publishCurrentSessionInfo(sessionId: string): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    try {
+      await session.titles.publishCurrent(session);
+    } catch (error) {
+      this.logger.error(`Session ${sessionId}: failed to send the session info:`, error);
+    }
+  }
+
   /** The foreground state of the session `sessionId` now, as v2's
    *  `state_update` names it: `idle` while no work runs, `requires_action`
    *  while the work awaits the user (see {@link syncAwaitingUser}), and

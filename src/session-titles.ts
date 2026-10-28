@@ -296,6 +296,28 @@ export class SessionTitles {
     });
   }
 
+  /** Sends the session's current title and `updatedAt`, even when the client
+   *  was already sent that title: a client that resumes the session may not
+   *  have it. Both come from the session file, as `session/list` reports
+   *  them; a session with no file yet sends the last title published, if any,
+   *  without `updatedAt`. */
+  async publishCurrent(session: Session): Promise<void> {
+    const info = await this.readSessionInfo(session);
+    const title = info?.summary
+      ? sanitizeTitle(this.agent.clientTitle?.(info.summary) ?? info.summary)
+      : this.lastTitle;
+    if (!title) return;
+    this.lastTitle = title;
+    await this.agent.client.sessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        title,
+        ...(info ? { updatedAt: new Date(info.lastModified).toISOString() } : {}),
+      },
+    });
+  }
+
   /** Records a title the CLI took, as soon as it took it. */
   rememberStoredTitle(title: string): void {
     this.persistedTitle = title;

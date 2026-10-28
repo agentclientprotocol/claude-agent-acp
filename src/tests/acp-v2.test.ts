@@ -13,6 +13,7 @@ import * as v1 from "@agentclientprotocol/sdk/unstable";
 import * as v2 from "@agentclientprotocol/sdk/experimental/v2/unstable";
 import {
   forkSession,
+  getSessionInfo,
   getSessionMessages,
   type Options,
   type SDKUserMessage,
@@ -111,6 +112,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => {
       },
     ]),
     getSessionMessages: vi.fn(async () => []),
+    getSessionInfo: vi.fn(async () => undefined),
     forkSession: vi.fn(async () => ({ sessionId: "99999999-8888-4777-8666-555555555555" })),
     deleteSession: vi.fn(async () => {}),
   };
@@ -152,6 +154,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await Promise.all(agents.splice(0).map((agent) => agent.dispose()));
   execFileSpy.mockReset();
+  vi.mocked(getSessionInfo).mockReset();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true, maxRetries: 10 });
 });
@@ -1417,6 +1420,59 @@ describe("ACP v2 prompts", () => {
       expect(
         client.sessionUpdates.slice(afterReplay).map(({ update }) => update.sessionUpdate),
       ).not.toContain("agent_message");
+      await client.authUpdate(1);
+    });
+  });
+
+  it("sends the current session info after the replay and before the resume response", async () => {
+    scriptTurns(async function* (options) {
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+
+      vi.mocked(getSessionInfo).mockResolvedValue({
+        sessionId,
+        summary: "Say hi",
+        lastModified: Date.UTC(2026, 9, 2),
+      } as Awaited<ReturnType<typeof getSessionInfo>>);
+      const info = {
+        sessionUpdate: "session_info_update",
+        title: "Say hi",
+        updatedAt: "2026-10-02T00:00:00.000Z",
+      };
+
+      // Without a replay, and again although the client was already sent it.
+      for (let i = 0; i < 2; i++) {
+        const before = client.sessionUpdates.length;
+        await agent.request(v2.methods.agent.session.resume, { sessionId, cwd });
+        expect(client.sessionUpdates.slice(before).map(({ update }) => update)).toEqual([
+          info,
+          { sessionUpdate: "state_update", state: "idle" },
+        ]);
+      }
+
+      // With a replay, after the replayed history.
+      vi.mocked(getSessionMessages).mockResolvedValueOnce([
+        transcriptEntry("assistant", randomUUID(), {
+          id: "msg_answer",
+          role: "assistant",
+          content: text("Hello!"),
+        }),
+      ] as unknown as Awaited<ReturnType<typeof getSessionMessages>>);
+      const before = client.sessionUpdates.length;
+      await agent.request(v2.methods.agent.session.resume, {
+        sessionId,
+        cwd,
+        replayFrom: { type: "start" },
+      });
+      expect(client.sessionUpdates.slice(before).map(({ update }) => update.sessionUpdate)).toEqual(
+        ["agent_message", "agent_message_chunk", "session_info_update", "state_update"],
+      );
       await client.authUpdate(1);
     });
   });

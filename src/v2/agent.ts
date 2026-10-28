@@ -88,6 +88,10 @@ export function v2AgentApp(
         restore.method === "resume"
           ? await agent.resumeSession(restore.request)
           : await client.replaying(params.sessionId, () => agent.loadSession(restore.request));
+      // v2 asks for the current title and `updatedAt` after the replay and
+      // before the response, also without a replay, as the client may hold
+      // none or stale ones.
+      await agent.publishCurrentSessionInfo(params.sessionId);
       // v2 requires a snapshot of the foreground state after the replay and
       // before the response, also without a replay: a resumed live session can
       // be running a turn, or waiting on a permission request.
