@@ -165,8 +165,10 @@ function v2ConfigOptionsField(options: SessionConfigOption[] | null | undefined)
 /**
  * v2 requires a `type` on every transport and makes the empty lists optional.
  * The agent recognizes a v1 stdio server by its missing `type`, so the v2 tag
- * is dropped. A transport that v1 cannot express is rejected rather than
- * silently left out of the session.
+ * is dropped. Any other transport, such as `acp` or a custom `_` type, fails
+ * the request with invalid params (-32602): the agent advertises only stdio
+ * and HTTP, and the v1 session setup would otherwise drop the server without
+ * telling the client.
  */
 function v1McpServer(server: v2.McpServer): McpServer {
   if (v2.McpServer.isStdio(server)) {
@@ -175,9 +177,6 @@ function v1McpServer(server: v2.McpServer): McpServer {
   }
   if (v2.McpServer.isHttp(server)) {
     return { ...server, headers: server.headers ?? [] };
-  }
-  if (v2.McpServer.isAcp(server)) {
-    return server;
   }
   throw RequestError.invalidParams(
     { type: server.type },

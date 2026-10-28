@@ -452,6 +452,21 @@ describe("ACP v2 sessions", () => {
     expect(sdk.queryOptions).toHaveLength(0);
   });
 
+  it("rejects an MCP-over-ACP server, which the agent does not advertise", async () => {
+    const { app, authUpdate } = v2Client();
+    await app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent);
+      await expect(
+        agent.request(v2.methods.agent.session.new, {
+          cwd,
+          mcpServers: [{ type: "acp", name: "tools", serverId: "server-1" }],
+        }),
+      ).rejects.toMatchObject({ code: -32602, data: { type: "acp" } });
+      await authUpdate(1);
+    });
+    expect(sdk.queryOptions).toHaveLength(0);
+  });
+
   it("lists, resumes, closes, and deletes sessions", async () => {
     const { app, authUpdate } = v2Client();
     await app.connectWith(connectRouter(), async (agent) => {
@@ -5420,6 +5435,32 @@ describe("ACP v2 session translation", () => {
     // Only unknown roles: no audience, rather than an audience of nobody.
     expect(prompt(["_robot"])).toEqual({ priority: 1 });
     expect(prompt([])).toEqual({ audience: [], priority: 1 });
+  });
+
+  it("rejects audio prompt content, which the agent does not advertise", () => {
+    expect(() =>
+      v1PromptRequest({
+        sessionId: "s",
+        prompt: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }],
+      }),
+    ).toThrow(expect.objectContaining({ code: -32602, data: { type: "audio" } }));
+    // An embedded blob resource still converts.
+    expect(
+      v1PromptRequest({
+        sessionId: "s",
+        prompt: [
+          {
+            type: "resource",
+            resource: { uri: "file:///a.bin", blob: "AAAA", mimeType: "application/octet-stream" },
+          },
+        ],
+      }).prompt,
+    ).toEqual([
+      {
+        type: "resource",
+        resource: { uri: "file:///a.bin", blob: "AAAA", mimeType: "application/octet-stream" },
+      },
+    ]);
   });
 
   it("fails on a message chunk without a messageId, which v2 requires", () => {
