@@ -815,6 +815,71 @@ describe("ACP v2 prompts", () => {
     ]);
   });
 
+  it("answers an MCP server's elicitation with cancel when the client cannot render it", async () => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      answer = await options.onElicitation!(
+        {
+          serverName: "linear",
+          message: "Which team?",
+          mode: "form",
+          requestedSchema: { type: "object", properties: { team: { type: "string" } } },
+        },
+        { signal: new AbortController().signal } as Parameters<
+          NonNullable<Options["onElicitation"]>
+        >[1],
+      );
+      yield assistantText(options, "No answer.");
+      yield result(options);
+    });
+    // The client rejects a form it cannot render with -32602.
+    const client = v2Client({
+      answerElicitation: () => {
+        throw v1.RequestError.invalidParams(undefined, "Cannot render this form");
+      },
+    });
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(1);
+    // The user never saw the form, so the MCP server is not told they declined.
+    expect(answer).toEqual({ action: "cancel" });
+  });
+
+  it("answers an MCP server's URL elicitation with cancel when the client supports only forms", async () => {
+    let answer: unknown;
+    scriptTurns(async function* (options) {
+      answer = await options.onElicitation!(
+        {
+          serverName: "linear",
+          message: "Sign in",
+          mode: "url",
+          url: "https://linear.app/oauth",
+          elicitationId: "e1",
+        },
+        { signal: new AbortController().signal } as Parameters<
+          NonNullable<Options["onElicitation"]>
+        >[1],
+      );
+      yield assistantText(options, "No answer.");
+      yield result(options);
+    });
+    const client = v2Client();
+    await client.app.connectWith(connectRouter(), async (agent) => {
+      await initializeV2(agent, { elicitation: { form: {} } });
+      const { sessionId } = await agent.request(v2.methods.agent.session.new, { cwd });
+      await agent.request(v2.methods.agent.session.prompt, { sessionId, prompt: text("hi") });
+      await vi.waitFor(() => expect(turnTrace(client.sessionUpdates)).toContain("idle end_turn"));
+    });
+
+    expect(client.elicitations).toHaveLength(0);
+    expect(answer).toEqual({ action: "cancel" });
+  });
+
   it("does not report the next turn as waiting for a question that its client never settled", async () => {
     // Claude Code's interrupt withdraws the question. The client holds it and
     // ignores $/cancel_request, so only the agent can stop waiting for it.

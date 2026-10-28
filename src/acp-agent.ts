@@ -10720,19 +10720,21 @@ export class ClaudeAcpAgent {
 
   /**
    * Handle elicitation requests that originate from MCP servers by forwarding
-   * them to the client over ACP. Modes the client did not advertise (or
-   * requests we can't represent) are declined.
+   * them to the client over ACP. Only the user's own decline reaches the MCP
+   * server as `decline`. A request the user never saw, because the client did
+   * not advertise its mode, we can't represent it, or the client answered with
+   * an error, is a `cancel`.
    */
   private handleMcpElicitation(sessionId: string, support: ElicitationSupport): OnElicitation {
     return async (request, { signal }) => {
       const isUrl = request.mode === "url";
       if ((isUrl && !support.url) || (!isUrl && !support.form)) {
-        return { action: "decline" };
+        return { action: "cancel" };
       }
 
       const createRequest = mcpElicitationToCreateRequest(request, sessionId);
       if (!createRequest) {
-        return { action: "decline" };
+        return { action: "cancel" };
       }
 
       try {
@@ -10749,8 +10751,11 @@ export class ClaudeAcpAgent {
         if (signal.aborted) {
           return { action: "cancel" };
         }
+        // The client answered with an error, e.g. -32602 for a form it cannot
+        // render, so the user never saw the request. MCP's `decline` means the
+        // user refused; `cancel` means they made no explicit choice.
         this.logger.error(`Failed to forward MCP elicitation: ${error}`);
-        return { action: "decline" };
+        return { action: "cancel" };
       }
     };
   }
