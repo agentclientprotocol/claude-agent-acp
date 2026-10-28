@@ -5,6 +5,7 @@ import { EditReporter, NotebookEditReporter, WriteReporter } from "./file-edit.j
 import {
   AgentControlReporter,
   AskUserQuestionReporter,
+  EnterPlanModeReporter,
   ExitPlanModeReporter,
   GenericReporter,
   PlanToolReporter,
@@ -35,6 +36,7 @@ const reporters: Record<string, ToolReporter> = {
   TaskList: new PlanToolReporter("TaskList"),
   TaskGet: new PlanToolReporter("TaskGet"),
   ReportFindings: new ReportFindingsReporter(),
+  EnterPlanMode: new EnterPlanModeReporter(),
   ExitPlanMode: new ExitPlanModeReporter(),
   AskUserQuestion: new AskUserQuestionReporter(),
   Skill: new SkillReporter(),

@@ -2448,6 +2448,18 @@ describe("toolInfoFromToolUse - ExitPlanMode", () => {
   });
 });
 
+describe("toolInfoFromToolUse - EnterPlanMode", () => {
+  it("reports a mode switch", () => {
+    const info = toolInfoFromToolUse(
+      { name: "EnterPlanMode", id: "toolu_enter", input: {} },
+      false,
+    );
+
+    expect(info.kind).toBe("switch_mode");
+    expect(info.title).toBe("EnterPlanMode");
+  });
+});
+
 describe("toolInfoFromToolUse - Write input aliases", () => {
   it.each([
     ["path + file_text", { path: "/repo/a.ts", file_text: "x" }],
